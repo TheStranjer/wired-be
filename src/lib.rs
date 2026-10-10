@@ -41,14 +41,31 @@ mod tests {
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt as _;
     use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    use crate::config::Config;
+
+    /// A config with only the required variables set, for tests that don't
+    /// exercise config.
+    fn test_config() -> Config {
+        Config::from_lookup(|key| match key {
+            config::DATABASE_URL_VAR => Some("postgres://localhost/unused".to_owned()),
+            config::BASE_URL_VAR => Some("https://test.example".to_owned()),
+            _ => None,
+        })
+        .unwrap()
+    }
 
     /// Router backed by a pool that never connects, for routes that don't touch the DB.
     fn test_app() -> Router {
         let db = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
-        app(AppState { db })
+        app(AppState {
+            db,
+            config: Arc::new(test_config()),
+        })
     }
 
     #[tokio::test]
