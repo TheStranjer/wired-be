@@ -46,8 +46,8 @@ async fn unknown_route_returns_json_not_found(pool: PgPool) {
         .map(str::to_owned);
     assert_eq!(
         error.as_deref(),
-        Some("Record not found"),
-        "the body is the standard error shape"
+        Some("Not found"),
+        "unmatched paths are the router-level 404 (see tests/api_skeleton.rs)"
     );
 }
 
