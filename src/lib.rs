@@ -10,6 +10,7 @@ pub mod models;
 pub mod oauth;
 pub mod pagination;
 pub mod state;
+pub mod uploads;
 pub mod util;
 
 use axum::{
@@ -19,7 +20,7 @@ use axum::{
 };
 use sqlx::PgPool;
 
-use crate::{error::AppError, state::AppState};
+use crate::{api::media_files, error::AppError, state::AppState};
 
 /// The migrations embedded from `migrations/`, applied by [`run_migrations`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -35,13 +36,16 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 }
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
-/// The [`api`] routers are merged under their prefixes; paths no route
-/// matches get the standard JSON error response (decision 8).
+///
+/// The [`api`] routers are merged under their prefixes and the `/media` file
+/// route is merged at the top level; paths no route matches get the standard
+/// JSON error response (decision 8).
 pub fn app(state: AppState) -> Router {
     middleware::apply(
         Router::new()
             .route("/health", get(health))
             .merge(api::router())
+            .merge(media_files::router())
             .fallback(not_found)
             .with_state(state),
     )
@@ -77,7 +81,7 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt as _;
 
-    use crate::{config::Config, http_client::HttpClient};
+    use crate::{config::Config, http_client::HttpClient, uploads::UploaderBackend};
 
     /// A config with only the required variables set, for tests that don't
     /// exercise config.
@@ -92,9 +96,10 @@ mod tests {
             .unwrap();
         let config = Arc::new(test_config());
         app(AppState {
-            http_client: HttpClient::from(config.as_ref()),
             db,
-            config,
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
         })
     }
 

@@ -285,6 +285,7 @@ mod tests {
             UPLOAD_LIMIT_BYTES_VAR, UPLOAD_MAX_FILES_VAR,
         },
         http_client::HttpClient,
+        uploads::UploaderBackend,
     };
 
     /// Boundary the test bodies are written with.
@@ -318,6 +319,7 @@ mod tests {
                 .unwrap(),
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
         }
     }
 

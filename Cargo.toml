@@ -58,6 +58,10 @@ uuid = { version = "1.28.0", features = ["v7", "serde"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
+# Throwaway directories for the upload tests (`src/uploads.rs`,
+# `tests/media.rs`): `TempDir` makes one per test and removes it on drop, so
+# no test writes into the repository.
+tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["test-util"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing-core = "0.1.36"

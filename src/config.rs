@@ -4,6 +4,7 @@ use std::{
     error::Error,
     fmt,
     net::{AddrParseError, SocketAddr},
+    path::PathBuf,
 };
 
 use url::Url;
@@ -37,6 +38,10 @@ pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
 /// Environment variable holding whether outbound HTTP may reach private
 /// hosts (disabling the SSRF guard).
 pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
+/// Environment variable holding the directory uploaded files are stored in.
+pub const UPLOADS_DIR_VAR: &str = "UPLOADS_DIR";
+/// Environment variable holding the public prefix of uploaded files' URLs.
+pub const MEDIA_BASE_URL_VAR: &str = "MEDIA_BASE_URL";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -62,6 +67,13 @@ pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
 /// `HTTP_ALLOW_PRIVATE_HOSTS` is unset: it is on by default, so private
 /// and loopback targets are blocked.
 pub const DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS: bool = false;
+/// Directory uploaded files are stored in when `UPLOADS_DIR` is unset,
+/// relative to the working directory (Pleroma's `Pleroma.Uploaders.Local`
+/// default is a `public/uploads` directory in the same spirit).
+pub const DEFAULT_UPLOADS_DIR: &str = "./uploads";
+/// Path appended to `BASE_URL` for the media URL prefix when
+/// `MEDIA_BASE_URL` is unset: the route in [`crate::api::media_files`].
+pub const DEFAULT_MEDIA_URL_PATH: &str = "/media";
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -98,6 +110,12 @@ pub struct Config {
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
+    /// Directory uploaded files are stored in, from `UPLOADS_DIR`.
+    pub uploads_dir: PathBuf,
+    /// Public prefix uploaded files' URLs are built from, from
+    /// `MEDIA_BASE_URL`; defaults to `{base_url}/media` and never ends in a
+    /// slash, so `/{key}` appends cleanly.
+    pub media_base_url: String,
     /// Whether outbound HTTP may connect to private, loopback and other
     /// reserved addresses, i.e. the SSRF guard is disabled, from
     /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
@@ -161,6 +179,16 @@ impl Config {
             HTTP_ALLOW_PRIVATE_HOSTS_VAR,
             DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
         )?;
+        let uploads_dir = PathBuf::from(
+            lookup(UPLOADS_DIR_VAR)
+                .map(|dir| dir.trim().to_owned())
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| DEFAULT_UPLOADS_DIR.to_owned()),
+        );
+        let media_base_url = lookup(MEDIA_BASE_URL_VAR)
+            .map(|url| url.trim().trim_end_matches('/').to_owned())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"));
         Ok(Self {
             database_url,
             bind_addr,
@@ -173,6 +201,8 @@ impl Config {
             max_media_attachments,
             max_poll_options,
             upload_limits,
+            uploads_dir,
+            media_base_url,
             http_allow_private_hosts,
         })
     }
@@ -236,6 +266,8 @@ impl Config {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
             },
+            uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
+            media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
             http_allow_private_hosts: true,
         }
     }
@@ -329,6 +361,8 @@ impl fmt::Debug for Config {
             .field("max_poll_options", &self.max_poll_options)
             .field("upload_limits", &self.upload_limits)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
+            .field("uploads_dir", &self.uploads_dir)
+            .field("media_base_url", &self.media_base_url)
             .finish()
     }
 }
@@ -526,6 +560,15 @@ mod tests {
             !config.http_allow_private_hosts,
             "the SSRF guard is on by default"
         );
+        assert_eq!(
+            config.uploads_dir,
+            PathBuf::from("./uploads"),
+            "default UPLOADS_DIR"
+        );
+        assert_eq!(
+            config.media_base_url, "https://social.example/media",
+            "MEDIA_BASE_URL defaults to BASE_URL plus /media"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -543,6 +586,8 @@ mod tests {
             (UPLOAD_LIMIT_BYTES_VAR, "1048576"),
             (UPLOAD_MAX_FILES_VAR, "4"),
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
+            (UPLOADS_DIR_VAR, "/srv/wired/uploads"),
+            (MEDIA_BASE_URL_VAR, "https://cdn.example/media"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -574,6 +619,56 @@ mod tests {
             config.http_allow_private_hosts,
             "custom HTTP_ALLOW_PRIVATE_HOSTS"
         );
+        assert_eq!(
+            config.uploads_dir,
+            PathBuf::from("/srv/wired/uploads"),
+            "custom UPLOADS_DIR"
+        );
+        assert_eq!(
+            config.media_base_url, "https://cdn.example/media",
+            "custom MEDIA_BASE_URL"
+        );
+    }
+
+    #[test]
+    fn media_base_url_is_trimmed_and_defaults_to_the_base_url() {
+        for (value, want) in [
+            (
+                " https://cdn.example/media/// ",
+                "https://cdn.example/media",
+            ),
+            ("", "https://social.example/media"),
+            ("/", "https://social.example/media"),
+            ("https://cdn.example/media", "https://cdn.example/media"),
+        ] {
+            let config = config_with(&[(MEDIA_BASE_URL_VAR, value)]);
+            assert_eq!(
+                config.media_base_url, want,
+                "MEDIA_BASE_URL={value:?} means {want}"
+            );
+        }
+        let with_port = config_with(&[(BASE_URL_VAR, "http://localhost:4000")]);
+        assert_eq!(
+            with_port.media_base_url, "http://localhost:4000/media",
+            "the default follows BASE_URL, port included"
+        );
+    }
+
+    #[test]
+    fn uploads_dir_is_trimmed_and_defaults_to_uploads() {
+        for (value, want) in [
+            ("  /var/uploads  ", "/var/uploads"),
+            ("uploads", "uploads"),
+            ("", "./uploads"),
+            ("   ", "./uploads"),
+        ] {
+            let config = config_with(&[(UPLOADS_DIR_VAR, value)]);
+            assert_eq!(
+                config.uploads_dir,
+                PathBuf::from(want),
+                "UPLOADS_DIR={value:?} means {want}"
+            );
+        }
     }
 
     #[test]
@@ -617,6 +712,20 @@ mod tests {
         assert!(
             format!("{config:?}").contains("http_allow_private_hosts: true"),
             "the guard flag is visible in Debug output"
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_upload_storage_settings() {
+        let config = config_with(&[(UPLOADS_DIR_VAR, "/srv/uploads")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("uploads_dir: \"/srv/uploads\""),
+            "the uploads directory is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("media_base_url: \"https://social.example/media\""),
+            "the media URL prefix is visible in Debug output: {debug}"
         );
     }
 
@@ -750,6 +859,15 @@ mod tests {
         assert_eq!(
             config.instance_name, DEFAULT_INSTANCE_NAME,
             "defaults apply"
+        );
+        assert_eq!(
+            config.uploads_dir,
+            PathBuf::from(DEFAULT_UPLOADS_DIR),
+            "test uploads go to the default directory"
+        );
+        assert_eq!(
+            config.media_base_url, "https://test.example/media",
+            "test media URLs hang off the test BASE_URL"
         );
         let expected = Config::from_lookup(lookup_from(&[
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
