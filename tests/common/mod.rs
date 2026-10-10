@@ -38,6 +38,7 @@ use wired_be::{
     models::user::{NewUser, User, insert, local_ap_id},
     state::AppState,
     uploads::UploaderBackend,
+    util::password::hash_password,
 };
 
 /// The configuration [`test_app`] runs with: `BASE_URL` `https://test.example`,
@@ -108,6 +109,41 @@ pub async fn create_local_user(pool: &PgPool, nickname: &str) -> User {
     insert(pool, &NewUser::local(nickname, &ap_id))
         .await
         .expect("local user fixture inserts")
+}
+
+/// Inserts a local [`User`] named `nickname` that can log in with
+/// `password`.
+///
+/// The row carries an Argon2id hash made with
+/// [`hash_password`](wired_be::util::password::hash_password) and the
+/// derived email `<nickname>@example.org`, so both lookup paths of
+/// [`authenticate`] (nickname and email) find it, and only `password`
+/// does.
+///
+/// This deliberately bypasses
+/// [`create_local_user`](wired_be::models::user::register::create_local_user)
+/// and its validation: fixtures need a login-capable row cheaply, so no
+/// RSA key pair is generated and no registration rules are re-checked.
+/// Use the register path itself when a test is about registration.
+///
+/// [`authenticate`]: wired_be::models::user::register::authenticate
+///
+/// # Panics
+///
+/// If hashing or the insert fails, e.g. because the nickname or derived
+/// email is already taken in the test database.
+pub async fn create_user_with_password(pool: &PgPool, nickname: &str, password: &str) -> User {
+    let config = test_config();
+    let new = NewUser {
+        email: Some(format!("{nickname}@example.org")),
+        password_hash: Some(
+            hash_password(password).expect("password hashing succeeds for fixtures"),
+        ),
+        ..NewUser::local(nickname, &local_ap_id(&config.base_url, nickname))
+    };
+    insert(pool, &new)
+        .await
+        .expect("local user fixture with password inserts")
 }
 
 /// A request under construction: the verb methods start a builder, the

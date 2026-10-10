@@ -240,3 +240,50 @@ async fn create_local_user_fixture_inserts_a_row(pool: PgPool) {
         "citext finds the fixture case-insensitively"
     );
 }
+
+/// [`create_user_with_password`](common::create_user_with_password) inserts
+/// a local user whose Argon2id hash and derived email let
+/// [`authenticate`](wired_be::models::user::register::authenticate) find it
+/// by either identifier, and only by the right password.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn create_user_with_password_fixture_authenticates(pool: PgPool) {
+    let user = common::create_user_with_password(&pool, "gina", "a good password").await;
+    assert!(user.local.get(), "the fixture builds a local account");
+    assert_eq!(
+        user.email.as_deref(),
+        Some("gina@example.org"),
+        "the derived email"
+    );
+    let hash = user
+        .password_hash
+        .clone()
+        .expect("the fixture sets a password");
+    assert!(hash.starts_with("$argon2id$"), "the hash is Argon2id");
+    assert_eq!(
+        user.ap_id,
+        format!("{TEST_BASE_URL}/users/gina"),
+        "the actor id is local_ap_id on the test instance"
+    );
+
+    let logged_in =
+        wired_be::models::user::register::authenticate(&pool, "gina", "a good password")
+            .await
+            .expect("the nickname logs the fixture in");
+    assert_eq!(logged_in.id, user.id, "the row itself");
+    assert!(
+        wired_be::models::user::register::authenticate(
+            &pool,
+            "GINA@EXAMPLE.ORG",
+            "a good password"
+        )
+        .await
+        .is_some(),
+        "the citext email logs the fixture in too"
+    );
+    assert!(
+        wired_be::models::user::register::authenticate(&pool, "gina", "wrong password")
+            .await
+            .is_none(),
+        "the wrong password never logs in"
+    );
+}

@@ -42,6 +42,12 @@ pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
 pub const UPLOADS_DIR_VAR: &str = "UPLOADS_DIR";
 /// Environment variable holding the public prefix of uploaded files' URLs.
 pub const MEDIA_BASE_URL_VAR: &str = "MEDIA_BASE_URL";
+/// Environment variable holding whether registration may omit the email
+/// address.
+pub const ACCOUNTS_EMAIL_OPTIONAL_VAR: &str = "ACCOUNTS_EMAIL_OPTIONAL";
+/// Environment variable holding the minimum length of a registration
+/// password.
+pub const MIN_PASSWORD_LENGTH_VAR: &str = "MIN_PASSWORD_LENGTH";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -74,6 +80,12 @@ pub const DEFAULT_UPLOADS_DIR: &str = "./uploads";
 /// Path appended to `BASE_URL` for the media URL prefix when
 /// `MEDIA_BASE_URL` is unset: the route in [`crate::api::media_files`].
 pub const DEFAULT_MEDIA_URL_PATH: &str = "/media";
+/// Email requirement used when `ACCOUNTS_EMAIL_OPTIONAL` is unset: an email
+/// address is required at registration.
+pub const DEFAULT_ACCOUNTS_EMAIL_OPTIONAL: bool = false;
+/// Password length used when `MIN_PASSWORD_LENGTH` is unset: the 8
+/// characters of Pleroma-era Mastodon password minimums.
+pub const DEFAULT_MIN_PASSWORD_LENGTH: usize = 8;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -120,6 +132,13 @@ pub struct Config {
     /// reserved addresses, i.e. the SSRF guard is disabled, from
     /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
     pub http_allow_private_hosts: bool,
+    /// Whether registration may omit the email address, from
+    /// `ACCOUNTS_EMAIL_OPTIONAL`. See
+    /// [`create_local_user`](crate::models::user::register::create_local_user).
+    pub accounts_email_optional: bool,
+    /// Minimum length of a registration password in characters, from
+    /// `MIN_PASSWORD_LENGTH`.
+    pub min_password_length: usize,
 }
 
 impl Config {
@@ -189,6 +208,16 @@ impl Config {
             .map(|url| url.trim().trim_end_matches('/').to_owned())
             .filter(|url| !url.is_empty())
             .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"));
+        let accounts_email_optional = boolean(
+            &lookup,
+            ACCOUNTS_EMAIL_OPTIONAL_VAR,
+            DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
+        )?;
+        let min_password_length = number(
+            &lookup,
+            MIN_PASSWORD_LENGTH_VAR,
+            DEFAULT_MIN_PASSWORD_LENGTH,
+        )?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -204,6 +233,8 @@ impl Config {
             uploads_dir,
             media_base_url,
             http_allow_private_hosts,
+            accounts_email_optional,
+            min_password_length,
         })
     }
 
@@ -269,6 +300,8 @@ impl Config {
             uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
             media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
             http_allow_private_hosts: true,
+            accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
+            min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
         }
     }
 }
@@ -363,6 +396,8 @@ impl fmt::Debug for Config {
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
             .field("media_base_url", &self.media_base_url)
+            .field("accounts_email_optional", &self.accounts_email_optional)
+            .field("min_password_length", &self.min_password_length)
             .finish()
     }
 }
@@ -569,6 +604,11 @@ mod tests {
             config.media_base_url, "https://social.example/media",
             "MEDIA_BASE_URL defaults to BASE_URL plus /media"
         );
+        assert!(
+            !config.accounts_email_optional,
+            "an email address is required at registration by default"
+        );
+        assert_eq!(config.min_password_length, 8, "default MIN_PASSWORD_LENGTH");
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -588,6 +628,8 @@ mod tests {
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
             (UPLOADS_DIR_VAR, "/srv/wired/uploads"),
             (MEDIA_BASE_URL_VAR, "https://cdn.example/media"),
+            (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
+            (MIN_PASSWORD_LENGTH_VAR, "12"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -628,6 +670,11 @@ mod tests {
             config.media_base_url, "https://cdn.example/media",
             "custom MEDIA_BASE_URL"
         );
+        assert!(
+            config.accounts_email_optional,
+            "custom ACCOUNTS_EMAIL_OPTIONAL"
+        );
+        assert_eq!(config.min_password_length, 12, "custom MIN_PASSWORD_LENGTH");
     }
 
     #[test]
@@ -703,6 +750,66 @@ mod tests {
             err.to_string()
                 .starts_with(&format!("invalid {HTTP_ALLOW_PRIVATE_HOSTS_VAR}: ")),
             "message names the variable"
+        );
+    }
+
+    #[test]
+    fn accounts_email_optional_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", false),
+        ] {
+            let config = config_with(&[(ACCOUNTS_EMAIL_OPTIONAL_VAR, value)]);
+            assert_eq!(
+                config.accounts_email_optional, want,
+                "ACCOUNTS_EMAIL_OPTIONAL={value:?} means {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_accounts_email_optional_is_an_error() {
+        let err = try_config_with(&[(ACCOUNTS_EMAIL_OPTIONAL_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(ACCOUNTS_EMAIL_OPTIONAL_VAR),
+            "error variant"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {ACCOUNTS_EMAIL_OPTIONAL_VAR}: ")),
+            "message names the variable"
+        );
+    }
+
+    #[test]
+    fn reads_custom_min_password_length() {
+        let config = config_with(&[(MIN_PASSWORD_LENGTH_VAR, "3")]);
+        assert_eq!(
+            config.min_password_length, 3,
+            "MIN_PASSWORD_LENGTH below the 8-character default is honored"
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_registration_settings() {
+        let config = config_with(&[
+            (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
+            (MIN_PASSWORD_LENGTH_VAR, "10"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("accounts_email_optional: true"),
+            "the email flag is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("min_password_length: 10"),
+            "the password minimum is visible in Debug output: {debug}"
         );
     }
 
@@ -814,6 +921,7 @@ mod tests {
             MAX_POLL_OPTIONS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
+            MIN_PASSWORD_LENGTH_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");
