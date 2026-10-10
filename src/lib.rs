@@ -39,14 +39,17 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes and the `/media` file
-/// route is merged at the top level; paths no route matches get the standard
-/// JSON error response (decision 8).
+/// The [`api`] routers are merged under their prefixes; the two that serve
+/// addresses federation writes into documents — `/media`
+/// ([`media_files`]) and `/users/{nickname}` ([`api::activitypub`]) — are
+/// merged at the top level. Paths no route matches get the standard JSON
+/// error response (decision 8).
 pub fn app(state: AppState) -> Router {
     middleware::apply(
         Router::new()
             .route("/health", get(health))
             .merge(api::router())
+            .merge(api::activitypub::router())
             .merge(media_files::router())
             .fallback(not_found)
             .with_state(state),
