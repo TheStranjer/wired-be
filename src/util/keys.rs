@@ -47,6 +47,36 @@ const RSA_BITS: usize = 2048;
 /// key, so secret material never reaches a log.
 const REDACTED: &str = "[redacted]";
 
+/// A second, unrelated key pair in legacy PKCS#1 PEM (OpenSSL-generated,
+/// 1024 bits, exponent 65537). It proves PKCS#1 input parses and supplies
+/// a "wrong key" without paying for another slow key generation. Test code
+/// across the crate signs with it to stay fast.
+#[cfg(test)]
+pub(crate) const FIXTURE_PRIVATE_PKCS1_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIICXQIBAAKBgQDezaYH6514YK+2mfN5mm+B7L25+Nmwe+SFUZmeugbPx3E4GSqO
+UKyVkqjX39d2gkWt0jb4akV0HEF/XzAGe5aXsBmlH8GXs8aau8vy/ndBaGRYGWMJ
+jzPxDcjta+/1pOjS4+MgQJsNesXbsoQObQbOGCiwPhXkace6OCyOiByIjwIDAQAB
+AoGAQB71MoBXoGZLC4VA8fVFNCIa9COvGsB9IvU5/dlRzoh6iAeOHMkQ8jb0CrSs
+ALo7LWw7T8Dd3i2nl+2gF62Hx/QsAfkCybHnXR1F5hRcCLa9ggm0qTRa9G1Igp+b
+LQdUxPY3/L3zKIxFYjOLA3IvXyjvTO28WxYoqoJSORdhiGkCQQD/RM5HXYYs7Wdm
+cTJdW8mSQHDfZDMl1KGJi1UsEUjN14ao4fdg1hpsTEjwUV7Rw3NEEiKJG1FGLO9w
+8yrkrcIDAkEA33EI/0feKD50aD93Sn8etK4J2St+bmtW174Qc0KF4PcLLOOqhilv
+4aTuuugI4woc5AsuZaCWm1XVERQSTQg/hQJBAJXxdLm21fnN+c7S7yKnp9+guqx9
+zw2JuNlyXrVj8b/3ucG5+fWHzj2PEckYAvp0NGDnxiGDSlpOStet/qQU7MECQE0n
+lPnBcT7oQf31XFXHC21MY24wDJpISlZ49Ok34U7LP3qiqrFlAZMjBqRXlyn+xfcg
+vUauaxL8UnRxP9iFrpkCQQDT53dVyGiJWdztFzZ/cLQrzBO1zIFd/9qpRnd3d8tD
+Wu3YSqmZf+QFmfweXZZ9bHFjo76GP4v6ZaPI8VRYu0Ya
+-----END RSA PRIVATE KEY-----
+";
+/// The public half of [`FIXTURE_PRIVATE_PKCS1_PEM`] in PKCS#1 PEM.
+#[cfg(test)]
+pub(crate) const FIXTURE_PUBLIC_PKCS1_PEM: &str = "-----BEGIN RSA PUBLIC KEY-----
+MIGJAoGBAN7NpgfrnXhgr7aZ83mab4Hsvbn42bB75IVRmZ66Bs/HcTgZKo5QrJWS
+qNff13aCRa3SNvhqRXQcQX9fMAZ7lpewGaUfwZezxpq7y/L+d0FoZFgZYwmPM/EN
+yO1r7/Wk6NLj4yBAmw16xduyhA5tBs4YKLA+FeRpx7o4LI6IHIiPAgMBAAE=
+-----END RSA PUBLIC KEY-----
+";
+
 /// An RSA key pair as PEM text: the two forms other instances exchange.
 #[derive(Clone)]
 pub struct KeyPair {
@@ -205,32 +235,6 @@ mod tests {
     const SIGNATURE_BYTES: usize = 256;
     /// The text every signature in these tests is made over.
     const SIGNED_DATA: &[u8] = b"GET /users/alice HTTP/1.1\nhost: example.com\n";
-    /// A second, unrelated key pair in legacy PKCS#1 PEM (OpenSSL-generated,
-    /// 1024 bits, exponent 65537). It proves PKCS#1 input parses and supplies
-    /// a "wrong key" without paying for another slow key generation.
-    const FIXTURE_PRIVATE_PKCS1_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
-MIICXQIBAAKBgQDezaYH6514YK+2mfN5mm+B7L25+Nmwe+SFUZmeugbPx3E4GSqO
-UKyVkqjX39d2gkWt0jb4akV0HEF/XzAGe5aXsBmlH8GXs8aau8vy/ndBaGRYGWMJ
-jzPxDcjta+/1pOjS4+MgQJsNesXbsoQObQbOGCiwPhXkace6OCyOiByIjwIDAQAB
-AoGAQB71MoBXoGZLC4VA8fVFNCIa9COvGsB9IvU5/dlRzoh6iAeOHMkQ8jb0CrSs
-ALo7LWw7T8Dd3i2nl+2gF62Hx/QsAfkCybHnXR1F5hRcCLa9ggm0qTRa9G1Igp+b
-LQdUxPY3/L3zKIxFYjOLA3IvXyjvTO28WxYoqoJSORdhiGkCQQD/RM5HXYYs7Wdm
-cTJdW8mSQHDfZDMl1KGJi1UsEUjN14ao4fdg1hpsTEjwUV7Rw3NEEiKJG1FGLO9w
-8yrkrcIDAkEA33EI/0feKD50aD93Sn8etK4J2St+bmtW174Qc0KF4PcLLOOqhilv
-4aTuuugI4woc5AsuZaCWm1XVERQSTQg/hQJBAJXxdLm21fnN+c7S7yKnp9+guqx9
-zw2JuNlyXrVj8b/3ucG5+fWHzj2PEckYAvp0NGDnxiGDSlpOStet/qQU7MECQE0n
-lPnBcT7oQf31XFXHC21MY24wDJpISlZ49Ok34U7LP3qiqrFlAZMjBqRXlyn+xfcg
-vUauaxL8UnRxP9iFrpkCQQDT53dVyGiJWdztFzZ/cLQrzBO1zIFd/9qpRnd3d8tD
-Wu3YSqmZf+QFmfweXZZ9bHFjo76GP4v6ZaPI8VRYu0Ya
------END RSA PRIVATE KEY-----
-";
-    /// The public half of [`FIXTURE_PRIVATE_PKCS1_PEM`] in PKCS#1 PEM.
-    const FIXTURE_PUBLIC_PKCS1_PEM: &str = "-----BEGIN RSA PUBLIC KEY-----
-MIGJAoGBAN7NpgfrnXhgr7aZ83mab4Hsvbn42bB75IVRmZ66Bs/HcTgZKo5QrJWS
-qNff13aCRa3SNvhqRXQcQX9fMAZ7lpewGaUfwZezxpq7y/L+d0FoZFgZYwmPM/EN
-yO1r7/Wk6NLj4yBAmw16xduyhA5tBs4YKLA+FeRpx7o4LI6IHIiPAgMBAAE=
------END RSA PUBLIC KEY-----
-";
 
     /// The module's generated key pair: RSA-2048 generation is slow in debug
     /// builds, so every synchronous test shares this one instance.
