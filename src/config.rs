@@ -42,6 +42,14 @@ pub const DEFAULT_MAX_STATUS_CHARS: usize = 5000;
 pub const DEFAULT_MAX_MEDIA_ATTACHMENTS: usize = 4;
 /// Poll option limit used when `MAX_POLL_OPTIONS` is unset.
 pub const DEFAULT_MAX_POLL_OPTIONS: usize = 20;
+/// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
+/// points at nothing; integration tests get their real pool from
+/// `#[sqlx::test]`.
+#[cfg(any(test, feature = "integration-tests"))]
+pub const TEST_DATABASE_URL: &str = "postgres://localhost/wired_test";
+/// `BASE_URL` used by [`Config::for_tests`].
+#[cfg(any(test, feature = "integration-tests"))]
+pub const TEST_BASE_URL: &str = "https://test.example";
 
 /// Application configuration.
 #[derive(Clone, PartialEq, Eq)]
@@ -144,6 +152,46 @@ impl Config {
     #[must_use]
     pub fn is_https(&self) -> bool {
         self.base_url.starts_with("https://")
+    }
+
+    /// Configuration for tests: `BASE_URL` is `https://test.example`, every
+    /// other setting is at its default, and `DATABASE_URL` is an inert
+    /// placeholder (tests get their real pool from `#[sqlx::test]`). Reads no
+    /// environment variables, so it is safe in parallel tests.
+    ///
+    /// Available to unit tests through `cfg(test)` and to the integration
+    /// tests through the `integration-tests` feature.
+    #[cfg(any(test, feature = "integration-tests"))]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        // The inputs are fixed and valid, so `from_lookup` cannot fail; the
+        // fallback arm builds the same config without a panic, keeping this
+        // constructor infallible.
+        Self::from_lookup(|key| match key {
+            DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+            BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|_| Self::test_defaults())
+    }
+
+    /// The [`for_tests`](Self::for_tests) configuration built directly from
+    /// the constants, without any parsing. Only reachable if parsing the
+    /// fixed test values ever failed, which they cannot.
+    #[cfg(any(test, feature = "integration-tests"))]
+    fn test_defaults() -> Self {
+        Self {
+            database_url: TEST_DATABASE_URL.to_owned(),
+            bind_addr: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4000)),
+            base_url: TEST_BASE_URL.to_owned(),
+            instance_name: DEFAULT_INSTANCE_NAME.to_owned(),
+            instance_description: DEFAULT_INSTANCE_DESCRIPTION.to_owned(),
+            contact_email: None,
+            instance_languages: comma_list(DEFAULT_INSTANCE_LANGUAGES),
+            max_status_chars: DEFAULT_MAX_STATUS_CHARS,
+            max_media_attachments: DEFAULT_MAX_MEDIA_ATTACHMENTS,
+            max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
+        }
     }
 }
 
@@ -540,6 +588,41 @@ mod tests {
         assert_eq!(
             from_env, from_lookup,
             "from_env matches the process environment"
+        );
+    }
+
+    #[test]
+    fn for_tests_is_the_fixed_lookup_config() {
+        let config = Config::for_tests();
+        assert_eq!(config.base_url, TEST_BASE_URL, "test base_url");
+        assert_eq!(config.database_url, TEST_DATABASE_URL, "placeholder url");
+        assert_eq!(config.domain(), "test.example", "test domain");
+        assert!(config.is_https(), "test base_url is https");
+        assert_eq!(
+            config.instance_name, DEFAULT_INSTANCE_NAME,
+            "defaults apply"
+        );
+        let expected = Config::from_lookup(lookup_from(&[
+            (DATABASE_URL_VAR, TEST_DATABASE_URL),
+            (BASE_URL_VAR, TEST_BASE_URL),
+        ]))
+        .unwrap();
+        assert_eq!(config, expected, "for_tests equals from_lookup");
+    }
+
+    #[test]
+    fn for_tests_fallback_matches_parsed_config() {
+        // `for_tests` only uses the fallback if parsing its fixed values ever
+        // fails; this proves the fallback builds the very same Config.
+        let parsed = Config::from_lookup(lookup_from(&[
+            (DATABASE_URL_VAR, TEST_DATABASE_URL),
+            (BASE_URL_VAR, TEST_BASE_URL),
+        ]))
+        .unwrap();
+        assert_eq!(
+            Config::test_defaults(),
+            parsed,
+            "fallback equals the parsed test config"
         );
     }
 }

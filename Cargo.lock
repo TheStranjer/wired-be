@@ -2084,6 +2084,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wired-be",
 ]
 
 [[package]]

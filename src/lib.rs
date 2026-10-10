@@ -9,7 +9,7 @@ pub mod util;
 use axum::{Router, http::StatusCode, routing::get};
 use sqlx::PgPool;
 
-use crate::state::AppState;
+use crate::{error::AppError, state::AppState};
 
 /// The migrations embedded from `migrations/`, applied by [`run_migrations`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -25,10 +25,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 }
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
+/// Paths no route matches get the standard JSON error response (decision 8).
 pub fn app(state: AppState) -> Router {
     middleware::apply(
         Router::new()
             .route("/health", get(health))
+            .fallback(not_found)
             .with_state(state),
     )
 }
@@ -36,6 +38,12 @@ pub fn app(state: AppState) -> Router {
 /// Liveness probe.
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+/// Fallback handler: the standard JSON 404 of [`AppError::NotFound`], so even
+/// unmatched routes look like every other error (decision 8).
+async fn not_found() -> AppError {
+    AppError::NotFound
 }
 
 #[cfg(test)]
@@ -52,12 +60,7 @@ mod tests {
     /// A config with only the required variables set, for tests that don't
     /// exercise config.
     fn test_config() -> Config {
-        Config::from_lookup(|key| match key {
-            config::DATABASE_URL_VAR => Some("postgres://localhost/unused".to_owned()),
-            config::BASE_URL_VAR => Some("https://test.example".to_owned()),
-            _ => None,
-        })
-        .unwrap()
+        Config::for_tests()
     }
 
     /// Router backed by a pool that never connects, for routes that don't touch the DB.
@@ -92,6 +95,12 @@ mod tests {
             response.status(),
             StatusCode::NOT_FOUND,
             "unknown route status"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"error":"Record not found"}"#,
+            "unknown route body is the standard error JSON"
         );
     }
 
