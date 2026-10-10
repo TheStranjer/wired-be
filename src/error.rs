@@ -58,6 +58,10 @@ pub enum AppError {
     RouteNotFound,
     /// The request conflicts with existing state, e.g. a duplicate (409).
     Conflict(String),
+    /// The request body, or one part of it, is larger than the endpoint
+    /// accepts (413); see [`crate::extract::multipart`] for the upload
+    /// limits.
+    PayloadTooLarge(String),
     /// The request body's content type is not one the endpoint parses
     /// (415); see [`crate::extract`] for the accepted types.
     UnsupportedMediaType(String),
@@ -80,6 +84,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound | Self::NotImplemented | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -95,6 +100,7 @@ impl AppError {
             | Self::Unauthorized(detail)
             | Self::Forbidden(detail)
             | Self::Conflict(detail)
+            | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
             | Self::Unprocessable(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
@@ -126,6 +132,7 @@ impl fmt::Display for AppError {
             | Self::Unauthorized(detail)
             | Self::Forbidden(detail)
             | Self::Conflict(detail)
+            | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
             | Self::Unprocessable(detail)
             | Self::Internal(detail) => f.write_str(detail),
@@ -149,6 +156,7 @@ impl Error for AppError {
             | Self::NotImplemented
             | Self::RouteNotFound
             | Self::Conflict(_)
+            | Self::PayloadTooLarge(_)
             | Self::UnsupportedMediaType(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
@@ -233,6 +241,7 @@ mod tests {
             (AppError::NotImplemented, NOT_IMPLEMENTED_MESSAGE),
             (AppError::RouteNotFound, ROUTE_NOT_FOUND_MESSAGE),
             (AppError::Conflict("taken".to_owned()), "taken"),
+            (AppError::PayloadTooLarge("too big".to_owned()), "too big"),
             (
                 AppError::UnsupportedMediaType("Unsupported media type".to_owned()),
                 "Unsupported media type",

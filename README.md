@@ -23,6 +23,8 @@ All configuration comes from environment variables. For local development, copy 
 | `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status |
 | `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
 | `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
+| `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
+| `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
 
 ## Development
 

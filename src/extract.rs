@@ -12,15 +12,19 @@
 //! serde helpers that also accept the string spellings of booleans and
 //! integers. Failures are [`AppError`]s (decision 8): malformed JSON 400, a
 //! type mismatch 422, an unsupported content type with a non-empty body 415.
-//! Multipart bodies arrive in a later ticket.
+//! Multipart bodies are handled by [`multipart::MultipartForm`], which
+//! structures its text fields with the same rules and keeps the file parts
+//! beside them.
 //!
 //! [`ApiParams`] additionally parses the query string with the same key
 //! rules and merges it under the body: Mastodon clients put parameters in
 //! either place (e.g. `POST /api/v1/accounts/:id/follow?reblogs=false`),
 //! and when a key appears in both the body wins.
 //!
-//! Both extractors consume the body, so — per Axum's rules — they must be
-//! the last argument of a handler.
+//! All of these extractors consume the body, so — per Axum's rules — they
+//! must be the last argument of a handler.
+
+pub mod multipart;
 
 use std::mem;
 
@@ -119,7 +123,7 @@ where
 /// # Errors
 ///
 /// As [`ApiBody`]'s `from_request`.
-async fn body_value(req: Request<Body>) -> Result<Value, AppError> {
+pub(crate) async fn body_value(req: Request<Body>) -> Result<Value, AppError> {
     let content_type = req
         .headers()
         .get(CONTENT_TYPE)
@@ -157,7 +161,7 @@ fn parse_body(text: &str, content_type: &str) -> Result<Value, AppError> {
 
 /// The media type of a `content-type` header value: everything before the
 /// first `;`, trimmed and lowercased.
-fn media_type_of(content_type: &str) -> String {
+pub(crate) fn media_type_of(content_type: &str) -> String {
     content_type
         .split(';')
         .next()
@@ -171,7 +175,7 @@ fn media_type_of(content_type: &str) -> String {
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] naming what does not fit.
-fn into_params<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
+pub(crate) fn into_params<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
     T::deserialize(value).map_err(|err| AppError::Unprocessable(format!("{INVALID_PARAMS}{err}")))
 }
 
@@ -199,14 +203,26 @@ fn merge_over(query: &Value, body: Value) -> Value {
 /// Values are the percent-decoded strings (`+` a space); containers win
 /// over conflicting scalars, and the last write wins.
 fn parse_form(text: &str) -> Value {
+    parse_pairs(form_urlencoded::parse(text.as_bytes()))
+}
+
+/// Structures already-decoded key/value pairs — the pairs of a urlencoded
+/// body, a query string, or the text fields of a multipart body — into one
+/// parameters value by the same rules as [`parse_form`].
+pub(crate) fn parse_pairs<P, K, V>(pairs: P) -> Value
+where
+    P: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
     let mut root = Value::Object(Map::new());
-    for (key, value) in form_urlencoded::parse(text.as_bytes()) {
-        let path = split_key(&key);
+    for (key, value) in pairs {
+        let path = split_key(key.as_ref());
         // A key starting with `[` (or empty) addresses no name; drop it.
         if matches!(path.first(), Some(first) if first.is_empty()) {
             continue;
         }
-        assign(&mut root, &path, Value::String(value.into_owned()));
+        assign(&mut root, &path, Value::String(value.as_ref().to_owned()));
     }
     root
 }

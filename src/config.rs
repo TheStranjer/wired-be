@@ -8,6 +8,8 @@ use std::{
 
 use url::Url;
 
+use crate::extract::multipart::UploadLimits;
+
 /// Environment variable holding the PostgreSQL connection URL.
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 /// Environment variable holding the address to listen on.
@@ -28,6 +30,10 @@ pub const MAX_STATUS_CHARS_VAR: &str = "MAX_STATUS_CHARS";
 pub const MAX_MEDIA_ATTACHMENTS_VAR: &str = "MAX_MEDIA_ATTACHMENTS";
 /// Environment variable holding the maximum options per poll.
 pub const MAX_POLL_OPTIONS_VAR: &str = "MAX_POLL_OPTIONS";
+/// Environment variable holding the maximum size of one uploaded file.
+pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
+/// Environment variable holding the maximum number of files per request.
+pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -42,6 +48,13 @@ pub const DEFAULT_MAX_STATUS_CHARS: usize = 5000;
 pub const DEFAULT_MAX_MEDIA_ATTACHMENTS: usize = 4;
 /// Poll option limit used when `MAX_POLL_OPTIONS` is unset.
 pub const DEFAULT_MAX_POLL_OPTIONS: usize = 20;
+/// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
+/// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
+/// 16 MiB body cap).
+pub const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 16_000_000;
+/// Upload file count used when `UPLOAD_MAX_FILES` is unset: Pleroma's
+/// `:upload, max_number_of_files`.
+pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -75,6 +88,9 @@ pub struct Config {
     pub max_media_attachments: usize,
     /// Maximum number of options per poll.
     pub max_poll_options: usize,
+    /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
+    /// and `UPLOAD_MAX_FILES`.
+    pub upload_limits: UploadLimits,
 }
 
 impl Config {
@@ -125,6 +141,10 @@ impl Config {
             DEFAULT_MAX_MEDIA_ATTACHMENTS,
         )?;
         let max_poll_options = number(&lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?;
+        let upload_limits = UploadLimits {
+            max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
+            max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
+        };
         Ok(Self {
             database_url,
             bind_addr,
@@ -136,6 +156,7 @@ impl Config {
             max_status_chars,
             max_media_attachments,
             max_poll_options,
+            upload_limits,
         })
     }
 
@@ -191,6 +212,10 @@ impl Config {
             max_status_chars: DEFAULT_MAX_STATUS_CHARS,
             max_media_attachments: DEFAULT_MAX_MEDIA_ATTACHMENTS,
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
+            upload_limits: UploadLimits {
+                max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
+                max_files: DEFAULT_UPLOAD_MAX_FILES,
+            },
         }
     }
 }
@@ -261,6 +286,7 @@ impl fmt::Debug for Config {
             .field("max_status_chars", &self.max_status_chars)
             .field("max_media_attachments", &self.max_media_attachments)
             .field("max_poll_options", &self.max_poll_options)
+            .field("upload_limits", &self.upload_limits)
             .finish()
     }
 }
@@ -439,6 +465,14 @@ mod tests {
             "default max_media_attachments"
         );
         assert_eq!(config.max_poll_options, 20, "default max_poll_options");
+        assert_eq!(
+            config.upload_limits.max_file_bytes, 16_000_000,
+            "default UPLOAD_LIMIT_BYTES"
+        );
+        assert_eq!(
+            config.upload_limits.max_files, 16,
+            "default UPLOAD_MAX_FILES"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -453,6 +487,8 @@ mod tests {
             (MAX_STATUS_CHARS_VAR, "300"),
             (MAX_MEDIA_ATTACHMENTS_VAR, "6"),
             (MAX_POLL_OPTIONS_VAR, "12"),
+            (UPLOAD_LIMIT_BYTES_VAR, "1048576"),
+            (UPLOAD_MAX_FILES_VAR, "4"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -475,6 +511,11 @@ mod tests {
             "custom max_media_attachments"
         );
         assert_eq!(config.max_poll_options, 12, "custom max_poll_options");
+        assert_eq!(
+            config.upload_limits.max_file_bytes, 1_048_576,
+            "custom UPLOAD_LIMIT_BYTES"
+        );
+        assert_eq!(config.upload_limits.max_files, 4, "custom UPLOAD_MAX_FILES");
     }
 
     #[test]
@@ -560,6 +601,8 @@ mod tests {
             MAX_STATUS_CHARS_VAR,
             MAX_MEDIA_ATTACHMENTS_VAR,
             MAX_POLL_OPTIONS_VAR,
+            UPLOAD_LIMIT_BYTES_VAR,
+            UPLOAD_MAX_FILES_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");

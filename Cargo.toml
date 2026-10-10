@@ -23,7 +23,7 @@ ammonia = "4.2.1"
 # what `src/util/password.rs` needs — pbkdf2 and base64 for Pleroma's legacy
 # Comeonin hashes, bcrypt for its bcrypt hashes.
 argon2 = { version = "0.6.0", features = ["password-hash"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["multipart"] }
 base64 = "0.23.1"
 bcrypt = "0.19.3"
 # Byte buffers (`src/http_client.rs`): buffered response bodies and the
