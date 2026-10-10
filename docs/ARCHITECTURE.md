@@ -93,3 +93,57 @@ cite these decisions by number.
     `../pleroma` or `/run/media/neetzsche/BMI60/Code/pleroma`, ticket bodies
     name the relevant files (`lib/pleroma/web/...`). Treat them as behavioural
     reference only; the ticket body is authoritative.
+
+## Writing tests
+
+`tests/common/mod.rs` holds the HTTP test harness (decision 13). It is
+enabled by the `integration-tests` cargo feature (a self dev-dependency
+turns it on for `tests/` only; it is not named `test-support` because the
+denied `redundant_feature_names` lint rejects the `-support` suffix) and
+provides `test_config()` (wraps `Config::for_tests()`), `test_app(pool)`,
+the `TestRequest` verb/body builders, and `TestResponse`. The shape every
+endpoint test takes (`tests/health.rs` is the reference):
+
+```rust
+#![cfg(test)]
+
+pub mod common;
+
+use axum::http::StatusCode;
+use sqlx::PgPool;
+
+/// `/health` answers 204 No Content with an empty body.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn health_returns_no_content(pool: PgPool) {
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/health")
+        .bearer("tok3n") // optional: .json(&v), .form(&[(k, v)]), .header(k, v)
+        .send(&app) // in-process oneshot; no socket
+        .await;
+    assert_eq!(response.status, StatusCode::NO_CONTENT, "health status");
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/json"),
+        "errors are JSON"
+    );
+}
+```
+
+Rules that fall out of the lint gate (all verified against `scripts/ci.sh`):
+
+- Start every `tests/<area>.rs` with `#![cfg(test)]` and declare the harness
+  as `pub mod common;`. Bare `mod common;` makes `unreachable_pub` deny the
+  helpers' `pub`, while `pub(crate)` helpers trip the nursery
+  `redundant_pub_crate`; `pub` in a `pub` module under `#![cfg(test)]` is the
+  only combination that passes — and the `cfg(test)` gate is what lets
+  Clippy's `allow-unwrap-in-tests` family apply at all (integration crates
+  do not get that exemption by virtue of living under `tests/`).
+- `#[sqlx::test(migrator = "wired_be::MIGRATOR")]` gives the test a fresh
+  migrated database and its `PgPool`.
+- `TestResponse` has `status`, `headers` and `body` fields, plus
+  `.json::<T>()`, `.json_value()`, `.text()` and `.header(name)`.
+- Every added code path needs coverage, including the harness itself:
+  `tests/health.rs` checks the builders and accessors against an echo route.
+- Later tickets add fixture helpers (`create_user`, `create_token`, ...) to
+  `tests/common/mod.rs`; keep them there, do not duplicate them per test
+  file.
