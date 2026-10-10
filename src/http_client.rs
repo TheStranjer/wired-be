@@ -3,11 +3,16 @@
 //! [`HttpClient`] wraps one pooled `reqwest` client (cloning is cheap) and
 //! enforces the rules federation needs: only `http`/`https` URLs, a 5 s
 //! connect timeout, a 20 s total timeout that covers the body read, at
-//! most 5 redirects, and — via [`HttpClient::get_limited`] — a hard cap
-//! on how many body bytes are buffered, so a hostile peer cannot exhaust
-//! this process with an endless response. The SSRF guard that pairs these
-//! requests with address filtering arrives in a later ticket;
-//! [`HttpError::Blocked`] is reserved for it.
+//! most 5 redirects, a hard cap on how many body bytes are buffered
+//! (via [`HttpClient::get_limited`]) so a hostile peer cannot exhaust
+//! this process with an endless response, and — through the [`ssrf`]
+//! module — an SSRF guard that refuses targets on loopback, private or
+//! otherwise reserved addresses, at every resolved address and at every
+//! redirect hop, pinning each connection to a validated address. The
+//! guard is on by default and is disabled only by
+//! `HTTP_ALLOW_PRIVATE_HOSTS` (see [`crate::config`]).
+
+pub mod ssrf;
 
 use std::{error::Error, fmt, time::Duration};
 
@@ -22,6 +27,8 @@ use tracing::error;
 use url::Url;
 
 use crate::config::Config;
+
+pub use ssrf::is_blocked_ip;
 
 /// Time allowed to establish the TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,48 +56,95 @@ pub fn user_agent(base_url: &str, contact_email: Option<&str>) -> String {
 pub struct HttpClient {
     /// The wrapped `reqwest` client.
     inner: Client,
+    /// The SSRF guard, or [`None`] when private hosts are allowed (see
+    /// `HTTP_ALLOW_PRIVATE_HOSTS`): pre-flight URL checks consult it, while
+    /// connect-time and redirect-time checks are baked into `inner`'s
+    /// resolver and redirect policy.
+    ssrf: Option<ssrf::SsrfGuard>,
 }
 
 impl HttpClient {
     /// Builds a client with the project's outbound defaults (5 s connect
-    /// timeout, 20 s total timeout, at most 5 redirects) and `user_agent`
-    /// as its `User-Agent`.
+    /// timeout, 20 s total timeout, at most 5 redirects), the SSRF guard
+    /// enabled, and `user_agent` as its `User-Agent`.
     ///
     /// `reqwest`'s builder only rejects a configuration whose `User-Agent`
     /// holds bytes an HTTP header value cannot carry; that cannot happen
     /// for a config-sourced value, and instead of panicking the client
-    /// degrades to `reqwest`'s own default.
+    /// degrades to a rebuilt configuration without that `User-Agent`.
     #[must_use]
     pub fn new(user_agent: &str) -> Self {
-        let built = Client::builder()
-            .user_agent(user_agent)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(TOTAL_TIMEOUT)
-            .redirect(redirect::Policy::limited(MAX_REDIRECTS))
-            .build();
-        match built {
-            Ok(inner) => Self { inner },
+        Self::configured(Some(user_agent), false, TOTAL_TIMEOUT)
+    }
+
+    /// Builds the client a test talking to local mini-servers needs: the
+    /// SSRF guard is disabled (as with `HTTP_ALLOW_PRIVATE_HOSTS=true`,
+    /// see [`crate::config`]), so loopback targets are reachable, and
+    /// every other outbound rule matches [`HttpClient::new`].
+    #[cfg(any(test, feature = "integration-tests"))]
+    #[must_use]
+    pub fn new_for_tests(user_agent: &str) -> Self {
+        Self::configured(Some(user_agent), true, TOTAL_TIMEOUT)
+    }
+
+    /// Test-only client overriding the total timeout, so a timeout test
+    /// does not have to wait out [`TOTAL_TIMEOUT`]. Like
+    /// [`new_for_tests`](Self::new_for_tests) it talks to local servers
+    /// and therefore skips the SSRF guard.
+    #[cfg(test)]
+    #[must_use]
+    fn with_timeout(user_agent: &str, total: Duration) -> Self {
+        Self::configured(Some(user_agent), true, total)
+    }
+
+    /// Assembles the real client for the given knobs, degrading in two
+    /// steps rather than panicking if `reqwest` rejects the configuration
+    /// (which only happens for a `User-Agent` no header value can carry).
+    fn configured(user_agent: Option<&str>, allow_private: bool, total: Duration) -> Self {
+        match Self::try_configured(user_agent, allow_private, total) {
+            Ok(client) => client,
             Err(err) => {
-                error!(%err, "outbound client rejected its configuration; using reqwest defaults");
-                Self::default()
+                error!(%err, "outbound client rejected its User-Agent; rebuilding without it");
+                Self::try_configured(None, allow_private, total).unwrap_or_else(|fallback| {
+                    error!(%fallback, "outbound client rejected its configuration; using reqwest defaults");
+                    Self {
+                        inner: Client::default(),
+                        ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
+                    }
+                })
             }
         }
     }
 
-    /// Test-only client overriding the total timeout, so a timeout test
-    /// does not have to wait out [`TOTAL_TIMEOUT`].
-    #[cfg(test)]
-    #[must_use]
-    fn with_timeout(user_agent: &str, total: Duration) -> Self {
-        let built = Client::builder()
-            .user_agent(user_agent)
+    /// Builds the `reqwest` client, installing the SSRF guard — both its
+    /// pre-flight half (kept on `Self`) and its connect-time halves (the
+    /// pinned DNS resolver and the redirect policy) — unless
+    /// `allow_private` disables it.
+    fn try_configured(
+        user_agent: Option<&str>,
+        allow_private: bool,
+        total: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(total)
-            .redirect(redirect::Policy::limited(MAX_REDIRECTS))
-            .build();
-        Self {
-            inner: built.unwrap_or_default(),
+            .timeout(total);
+        if let Some(agent) = user_agent {
+            builder = builder.user_agent(agent);
         }
+        let inner = if allow_private {
+            builder
+                .redirect(redirect::Policy::limited(MAX_REDIRECTS))
+                .build()?
+        } else {
+            builder
+                .dns_resolver(ssrf::SsrfGuard)
+                .redirect(ssrf::redirect_policy())
+                .build()?
+        };
+        Ok(Self {
+            inner,
+            ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
+        })
     }
 
     /// Fetches `url` with a `GET`, plus `headers`, reading the response
@@ -100,19 +154,20 @@ impl HttpClient {
     /// # Errors
     ///
     /// [`HttpError::InvalidUrl`] if `url` is unparsable or not an
-    /// `http`/`https` URL, [`HttpError::Timeout`] if a timeout elapses,
+    /// `http`/`https` URL, [`HttpError::Blocked`] if the SSRF guard
+    /// refuses the target (or a redirect hop's target),
+    /// [`HttpError::Timeout`] if a timeout elapses,
     /// [`HttpError::TooLarge`] per the body cap, and [`HttpError::Connect`]
-    /// for transport failures (including headers HTTP cannot represent);
-    /// [`HttpError::Blocked`] is reserved for the SSRF guard. Status codes
-    /// are not checked — chain [`HttpResponse::error_for_status`] to fail
-    /// on 4xx/5xx.
+    /// for transport failures (including headers HTTP cannot represent).
+    /// Status codes are not checked — chain
+    /// [`HttpResponse::error_for_status`] to fail on 4xx/5xx.
     pub async fn get_limited(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         max_bytes: usize,
     ) -> Result<HttpResponse, HttpError> {
-        let request = self.build_request(Method::GET, url, headers)?;
+        let request = self.build_request(Method::GET, url, headers).await?;
         read_body(request.send().await?, max_bytes).await
     }
 
@@ -130,19 +185,25 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> Result<HttpResponse, HttpError> {
-        let request = self.build_request(Method::POST, url, headers)?.body(body);
+        let request = self
+            .build_request(Method::POST, url, headers)
+            .await?
+            .body(body);
         read_body(request.send().await?, usize::MAX).await
     }
 
-    /// Validates `url` (`http`/`https` only) and assembles an un-sent
-    /// request carrying `headers` on top of the client defaults.
+    /// Validates `url` (`http`/`https` only), passes it through the SSRF
+    /// guard, and assembles an un-sent request carrying `headers` on top
+    /// of the client defaults. The guard runs after header validation so
+    /// that an unsendable header is reported without touching DNS at all.
     ///
     /// # Errors
     ///
     /// [`HttpError::InvalidUrl`] for a non-`http(s)` or unparsable URL,
     /// [`HttpError::Connect`] if a header name or value is one HTTP cannot
-    /// represent, since such a request could never leave this process.
-    fn build_request(
+    /// represent, since such a request could never leave this process, and
+    /// [`HttpError::Blocked`] when the SSRF guard refuses the target.
+    async fn build_request(
         &self,
         method: Method,
         url: &str,
@@ -154,21 +215,31 @@ impl HttpClient {
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(HttpError::InvalidUrl);
         }
-        Ok(self
+        let builder = self
             .inner
             .request(method, parsed.as_str())
-            .headers(header_map(headers)?))
+            .headers(header_map(headers)?);
+        if let Some(guard) = &self.ssrf {
+            guard.check_target(&parsed).await?;
+        }
+        Ok(builder)
     }
 }
 
 /// The [`HttpClient`] the instance ships with: the public origin and
-/// contact email from `config` formatted per [`user_agent`].
+/// contact email from `config` formatted per [`user_agent`], with the
+/// SSRF guard enabled unless `config.http_allow_private_hosts` (the
+/// `HTTP_ALLOW_PRIVATE_HOSTS` environment variable) disables it.
 impl From<&Config> for HttpClient {
     fn from(config: &Config) -> Self {
-        Self::new(&user_agent(
-            &config.base_url,
-            config.contact_email.as_deref(),
-        ))
+        Self::configured(
+            Some(&user_agent(
+                &config.base_url,
+                config.contact_email.as_deref(),
+            )),
+            config.http_allow_private_hosts,
+            TOTAL_TIMEOUT,
+        )
     }
 }
 
@@ -271,8 +342,9 @@ pub enum HttpError {
     /// as an error (see [`HttpResponse::error_for_status`]); the payload is
     /// the status code.
     Status(u16),
-    /// A local policy refused the request. Reserved: the SSRF guard ticket
-    /// will produce this variant; the payload states the reason.
+    /// A local policy refused the request: today the SSRF guard (see
+    /// [`ssrf`]), which rejects targets whose address is loopback,
+    /// private, or otherwise reserved; the payload states the reason.
     Blocked(String),
 }
 
@@ -292,14 +364,18 @@ impl fmt::Display for HttpError {
 impl Error for HttpError {}
 
 /// Transport outcomes map onto the variants that describe them; timeouts
-/// keep their own variant because callers treat them as retryable.
+/// keep their own variant because callers treat them as retryable, and an
+/// SSRF refusal surfacing through the guard's resolver or redirect policy
+/// keeps [`HttpError::Blocked`] with its reason.
 impl From<reqwest::Error> for HttpError {
     fn from(err: reqwest::Error) -> Self {
         if err.is_timeout() {
-            Self::Timeout
-        } else {
-            Self::Connect(err.to_string())
+            return Self::Timeout;
         }
+        if let Some(reason) = ssrf::blocked_reason(&err) {
+            return Self::Blocked(reason);
+        }
+        Self::Connect(err.to_string())
     }
 }
 
@@ -411,7 +487,7 @@ mod tests {
         let listener = bind().await;
         let url = url_for(&listener, "/ua");
         let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client.get_limited(&url, &[], 1024).await.unwrap();
 
@@ -454,7 +530,7 @@ mod tests {
         let listener = bind().await;
         let url = url_for(&listener, "/marker");
         let server = spawn_server(listener, Router::new().route("/marker", get(echo_marker)));
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client
             .get_limited(&url, &[("x-marker", "yes")], 1024)
@@ -474,7 +550,7 @@ mod tests {
         let listener = bind().await;
         let url = url_for(&listener, "/big");
         let server = spawn_server(listener, Router::new().route("/big", get(big)));
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let tight = client.get_limited(&url, &[], BIG_BODY.len() - 1).await;
         assert_eq!(
@@ -507,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_http_urls_are_rejected_before_any_connection() {
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
         for url in [
             "ftp://example.com/pub",
             "file:///etc/passwd",
@@ -525,6 +601,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loopback_literal_is_blocked_by_default_and_allowed_with_the_flag() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/ua");
+        let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
+
+        let guarded = HttpClient::new(TEST_UA);
+        let blocked = guarded.get_limited(&url, &[], 1024).await;
+        match blocked {
+            Err(HttpError::Blocked(reason)) => {
+                assert!(
+                    reason.contains("127.0.0.1"),
+                    "the reason names the refused address: {reason}"
+                );
+            }
+            other => panic!("a loopback literal must be Blocked, got {other:?}"),
+        }
+
+        // The same client with `HTTP_ALLOW_PRIVATE_HOSTS` semantics.
+        let open = HttpClient::new_for_tests(TEST_UA);
+        let allowed = open.get_limited(&url, &[], 1024).await.unwrap();
+        assert_eq!(allowed.status, 200, "the flag reaches the local server");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn localhost_hostname_is_blocked_before_connecting() {
+        let listener = bind().await;
+        let port = listener.local_addr().unwrap().port();
+        let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
+        let client = HttpClient::new(TEST_UA);
+
+        let result = client
+            .get_limited(&format!("http://localhost:{port}/ua"), &[], 1024)
+            .await;
+
+        match result {
+            Err(HttpError::Blocked(reason)) => {
+                assert!(
+                    reason.contains("127.0.0.1") || reason.contains("::1"),
+                    "the reason names the resolved loopback address: {reason}"
+                );
+            }
+            other => panic!("`localhost` must resolve to a blocked address, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn config_client_blocks_loopback_unless_the_config_flag_allows_it() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/ua");
+        let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
+        // A default config leaves HTTP_ALLOW_PRIVATE_HOSTS unset, so the
+        // shipped client must guard; `Config::for_tests` sets the flag.
+        let guarded = Config::from_lookup(|key| match key {
+            crate::config::DATABASE_URL_VAR => Some("postgres://localhost/wired".to_owned()),
+            crate::config::BASE_URL_VAR => Some("https://test.example".to_owned()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(
+            !guarded.http_allow_private_hosts,
+            "the default config keeps the guard on"
+        );
+
+        let blocked = HttpClient::from(&guarded)
+            .get_limited(&url, &[], 1024)
+            .await;
+        assert!(
+            matches!(blocked, Err(HttpError::Blocked(_))),
+            "a default config's client refuses loopback, got {blocked:?}"
+        );
+
+        let open = HttpClient::from(&Config::for_tests());
+        let allowed = open.get_limited(&url, &[], 1024).await.unwrap();
+        assert_eq!(
+            allowed.status, 200,
+            "the test config's flag reaches the peer"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn post_bytes_is_blocked_by_the_guard_too() {
+        let client = HttpClient::new(TEST_UA);
+        let result = client
+            .post_bytes("http://127.0.0.1:9/ingest", &[], b"x".to_vec())
+            .await;
+        assert!(
+            matches!(result, Err(HttpError::Blocked(_))),
+            "delivery POSTs pass the same guard, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn redirect_is_followed() {
         let listener = bind().await;
         let hop_url = url_for(&listener, "/hop");
@@ -533,7 +704,7 @@ mod tests {
             .route("/hop", get(hop).with_state(target))
             .route("/final", get(redirect_target));
         let server = spawn_server(listener, app);
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client
             .get_limited(&hop_url, &[], 1024)
@@ -557,7 +728,7 @@ mod tests {
         let loop_url = url_for(&listener, "/hop");
         let app = Router::new().route("/hop", get(hop).with_state(loop_url.clone()));
         let server = spawn_server(listener, app);
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let Err(err) = client.get_limited(&loop_url, &[], 1024).await else {
             panic!("a client looping past its redirect limit must not get a response");
@@ -574,7 +745,7 @@ mod tests {
         let listener = bind().await;
         let url = url_for(&listener, "/echo");
         let server = spawn_server(listener, Router::new().route("/echo", post(echo_body)));
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client
             .post_bytes(&url, &[("x-marker", "pong")], b"activity".to_vec())
@@ -592,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsendable_headers_fail_as_connect() {
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
         let result = client
             .get_limited("https://example.com/x", &[("x bad name", "ok")], 1024)
             .await;
@@ -699,8 +870,9 @@ mod tests {
         let url = url_for(&listener, "/ua");
         let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
         // A control character is illegal in a header value, so the builder
-        // rejects the configuration; `new` must degrade, not panic.
-        let client = HttpClient::new("bad\nagent");
+        // rejects the configuration; `configured` must degrade, not panic.
+        // Guard off: the degraded client still fetches the loopback peer.
+        let client = HttpClient::configured(Some("bad\nagent"), true, TOTAL_TIMEOUT);
 
         let response = client.get_limited(&url, &[], 1024).await.unwrap();
 
@@ -713,11 +885,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn degradation_keeps_the_ssrf_guard_enabled() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/ua");
+        let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
+        // Same rejected `User-Agent`, but with the guard on: the rebuild
+        // without it must not quietly drop address filtering.
+        let client = HttpClient::configured(Some("bad\nagent"), false, TOTAL_TIMEOUT);
+
+        let result = client.get_limited(&url, &[], 1024).await;
+
+        assert!(
+            matches!(result, Err(HttpError::Blocked(_))),
+            "a degraded client still blocks loopback, got {result:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn clones_share_the_client() {
         let listener = bind().await;
         let url = url_for(&listener, "/ua");
         let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
-        let client = HttpClient::new(TEST_UA);
+        let client = HttpClient::new_for_tests(TEST_UA);
 
         let via_clone = HttpClient::clone(&client)
             .get_limited(&url, &[], 1024)
