@@ -4,6 +4,7 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod extract;
+pub mod http_client;
 pub mod middleware;
 pub mod models;
 pub mod pagination;
@@ -75,7 +76,7 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt as _;
 
-    use crate::config::Config;
+    use crate::{config::Config, http_client::HttpClient};
 
     /// A config with only the required variables set, for tests that don't
     /// exercise config.
@@ -88,9 +89,11 @@ mod tests {
         let db = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/unused")
             .unwrap();
+        let config = Arc::new(test_config());
         app(AppState {
+            http_client: HttpClient::from(config.as_ref()),
             db,
-            config: Arc::new(test_config()),
+            config,
         })
     }
 

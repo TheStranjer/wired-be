@@ -32,7 +32,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::PgPool;
 use tower::ServiceExt as _;
-use wired_be::{config::Config, state::AppState};
+use wired_be::{config::Config, http_client::HttpClient, state::AppState};
 
 /// The configuration [`test_app`] runs with: `BASE_URL` `https://test.example`,
 /// defaults everywhere else, no environment access.
@@ -44,9 +44,11 @@ pub fn test_config() -> Config {
 /// The real application router from [`wired_be::app`], serving over `pool`
 /// and the [`test_config`] settings.
 pub fn test_app(pool: PgPool) -> Router {
+    let config = Arc::new(test_config());
     wired_be::app(AppState {
         db: pool,
-        config: Arc::new(test_config()),
+        http_client: HttpClient::from(config.as_ref()),
+        config,
     })
 }
 

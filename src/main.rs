@@ -6,7 +6,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use wired_be::{app, config::Config, run_migrations, state::AppState};
+use wired_be::{app, config::Config, http_client::HttpClient, run_migrations, state::AppState};
 
 /// Installs a `tracing-subscriber` formatter filtered by `RUST_LOG`, defaulting to `info`.
 fn init_tracing() {
@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!(addr = %config.bind_addr, "listening");
     let state = AppState {
         db,
+        http_client: HttpClient::from(&config),
         config: Arc::new(config),
     };
     axum::serve(listener, app(state)).await?;
