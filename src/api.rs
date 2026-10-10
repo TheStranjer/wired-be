@@ -13,10 +13,13 @@
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
 //!
-//! [`media_files`] is the one router in this module that [`crate::app`] does
-//! not nest under `/api`: uploaded files live at `/media/{key}`, the address
-//! [`crate::uploads`] writes into activities.
+//! [`media_files`] and [`activitypub`] are the routers in this module that
+//! [`crate::app`] does not nest under `/api`: uploaded files live at
+//! `/media/{key}`, the address [`crate::uploads`] writes into activities,
+//! and `ActivityPub` actors live at `/users/{nickname}`, the address
+//! federation sends as an actor's id.
 
+pub mod activitypub;
 pub mod apps;
 pub mod media_files;
 pub mod v1;
@@ -29,9 +32,11 @@ use crate::state::AppState;
 /// Composes the API area routers under their URL prefixes.
 ///
 /// `/api/v1` ([`v1`]) and `/api/v2` ([`v2`]) hold the Mastodon-compatible
-/// client API; later tickets add the remaining areas (Pleroma extensions,
-/// `ActivityPub`, well-known) here the same way. [`media_files`] is the
-/// exception: it serves `/media` and [`crate::app`] merges it directly.
+/// client API; later tickets add the remaining `/api` areas (Pleroma
+/// extensions, well-known) here the same way. [`media_files`] and
+/// [`activitypub`] are the exceptions: they serve `/media` and `/users`,
+/// addresses that go out in `ActivityPub` documents, and [`crate::app`]
+/// merges them directly.
 pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/api/v1", v1::router())

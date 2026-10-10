@@ -35,7 +35,7 @@ use tower::ServiceExt as _;
 use wired_be::{
     config::Config,
     http_client::HttpClient,
-    models::user::{NewUser, User, insert, local_ap_id},
+    models::user::{NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
     state::AppState,
     uploads::UploaderBackend,
     util::password::hash_password,
@@ -144,6 +144,61 @@ pub async fn create_user_with_password(pool: &PgPool, nickname: &str, password: 
     insert(pool, &new)
         .await
         .expect("local user fixture with password inserts")
+}
+
+/// Inserts a local [`User`] named `nickname` whose columns `customize`
+/// adjusts on top of [`NewUser::local`], and returns its row.
+///
+/// The profile and federation tests need accounts that differ from the
+/// bare [`create_local_user`] fixture — locked, a bot, with an avatar —
+/// without restating the actor id every time.
+///
+/// # Panics
+///
+/// If the insert fails, e.g. because the nickname is already taken in the
+/// test database.
+pub async fn create_local_user_with<F>(pool: &PgPool, nickname: &str, customize: F) -> User
+where
+    F: FnOnce(NewUser) -> NewUser,
+{
+    let config = test_config();
+    let ap_id = local_ap_id(&config.base_url, nickname);
+    let new = customize(NewUser::local(nickname, &ap_id));
+    insert(pool, &new)
+        .await
+        .expect("local user fixture inserts")
+}
+
+/// Inserts a mirror of the remote actor `nickname` on `host`: a non-local
+/// [`User`], the shape a fetch of `https://{host}/users/{nickname}` stores.
+///
+/// The nickname carries `@host` (decision 7) and the actor id, domain and
+/// endpoints are the ones the fetched document would have named.
+///
+/// # Panics
+///
+/// If the insert fails, e.g. because the handle is already taken in the
+/// test database.
+pub async fn create_remote_user(pool: &PgPool, nickname: &str, host: &str) -> User {
+    let ap_id = format!("https://{host}/users/{nickname}");
+    let new = NewUser {
+        nickname: format!("{nickname}@{host}"),
+        ap_id: ap_id.clone(),
+        domain: Some(host.to_owned()),
+        name: nickname.to_owned(),
+        inbox: Some(inbox(&ap_id)),
+        shared_inbox: Some(format!("https://{host}/inbox")),
+        outbox: Some(outbox(&ap_id)),
+        followers_url: Some(followers(&ap_id)),
+        following_url: Some(following(&ap_id)),
+        public_key: Some(
+            "-----BEGIN PUBLIC KEY-----\nREMOTE-DATA\n-----END PUBLIC KEY-----\n".to_owned(),
+        ),
+        ..NewUser::default()
+    };
+    insert(pool, &new)
+        .await
+        .expect("remote user fixture inserts")
 }
 
 /// A request under construction: the verb methods start a builder, the

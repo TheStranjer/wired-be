@@ -8,9 +8,10 @@
 //! `lib/pleroma/web/fallback/redirect_controller.ex`): "Record not found"
 //! for a missing row, "Not implemented" for an unrouted path under `/api`
 //! (Pleroma's `api_not_implemented`), "Not found" for any other unrouted
-//! path, "Throttled" for a rate limit (the wording of its rate limiter) and
-//! "Something went wrong" for server-side failures, whose real cause is
-//! only written to the log.
+//! path, "Throttled" for a rate limit (the wording of its rate limiter),
+//! "Gone" for a resource that used to exist and no longer does (Mastodon's
+//! wording for a deactivated account) and "Something went wrong" for
+//! server-side failures, whose real cause is only written to the log.
 
 use std::{error::Error, fmt};
 
@@ -31,6 +32,9 @@ const NOT_IMPLEMENTED_MESSAGE: &str = "Not implemented";
 /// Body message for [`AppError::RouteNotFound`], the wording of Pleroma's
 /// router-level 404.
 const ROUTE_NOT_FOUND_MESSAGE: &str = "Not found";
+/// Body message for [`AppError::Gone`], the wording Mastodon uses for an
+/// account that is deactivated (and so no longer served).
+const GONE_MESSAGE: &str = "Gone";
 /// Body message for [`AppError::RateLimited`], Pleroma's rate limiter wording.
 const RATE_LIMITED_MESSAGE: &str = "Throttled";
 /// Body message for failures whose real cause must stay in the log.
@@ -56,6 +60,9 @@ pub enum AppError {
     /// [`Self::NotFound`], which reports a missing record to an endpoint
     /// that exists, this is the router-level fallback.
     RouteNotFound,
+    /// The resource is permanently gone: a deactivated local account's
+    /// `ActivityPub` actor (410), so federation stops retrying it.
+    Gone,
     /// The request conflicts with existing state, e.g. a duplicate (409).
     Conflict(String),
     /// The request body, or one part of it, is larger than the endpoint
@@ -83,6 +90,7 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound | Self::NotImplemented | Self::RouteNotFound => StatusCode::NOT_FOUND,
+            Self::Gone => StatusCode::GONE,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -106,6 +114,7 @@ impl AppError {
             Self::NotFound => NOT_FOUND_MESSAGE,
             Self::NotImplemented => NOT_IMPLEMENTED_MESSAGE,
             Self::RouteNotFound => ROUTE_NOT_FOUND_MESSAGE,
+            Self::Gone => GONE_MESSAGE,
             Self::RateLimited => RATE_LIMITED_MESSAGE,
             Self::Internal(_) | Self::Database(_) => INTERNAL_MESSAGE,
         }
@@ -139,6 +148,7 @@ impl fmt::Display for AppError {
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
             Self::NotImplemented => f.write_str(NOT_IMPLEMENTED_MESSAGE),
             Self::RouteNotFound => f.write_str(ROUTE_NOT_FOUND_MESSAGE),
+            Self::Gone => f.write_str(GONE_MESSAGE),
             Self::RateLimited => f.write_str(RATE_LIMITED_MESSAGE),
             Self::Database(err) => write!(f, "database error: {err}"),
         }
@@ -155,6 +165,7 @@ impl Error for AppError {
             | Self::NotFound
             | Self::NotImplemented
             | Self::RouteNotFound
+            | Self::Gone
             | Self::Conflict(_)
             | Self::PayloadTooLarge(_)
             | Self::UnsupportedMediaType(_)
@@ -240,6 +251,7 @@ mod tests {
             (AppError::NotFound, NOT_FOUND_MESSAGE),
             (AppError::NotImplemented, NOT_IMPLEMENTED_MESSAGE),
             (AppError::RouteNotFound, ROUTE_NOT_FOUND_MESSAGE),
+            (AppError::Gone, GONE_MESSAGE),
             (AppError::Conflict("taken".to_owned()), "taken"),
             (AppError::PayloadTooLarge("too big".to_owned()), "too big"),
             (
@@ -341,6 +353,16 @@ mod tests {
             AppError::NotFound.to_string(),
             NOT_FOUND_MESSAGE,
             "display of not found"
+        );
+        assert_eq!(
+            AppError::RouteNotFound.to_string(),
+            ROUTE_NOT_FOUND_MESSAGE,
+            "display of the router-level 404"
+        );
+        assert_eq!(
+            AppError::Gone.to_string(),
+            GONE_MESSAGE,
+            "display of a gone resource"
         );
         assert_eq!(
             AppError::RateLimited.to_string(),
