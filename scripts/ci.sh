@@ -41,6 +41,12 @@ if ! command -v cargo >/dev/null 2>&1; then
   fi
 fi
 
+# The database tests (`#[sqlx::test]`) need a reachable PostgreSQL whose role may
+# create databases. Default to the local dev database from .env.example so the
+# gate also works in worktrees and non-login shells; an exported DATABASE_URL
+# (CI sets one) wins.
+export DATABASE_URL="${DATABASE_URL:-postgres://wired:wired@localhost:5432/wired}"
+
 failed_checks=()
 
 # step LABEL COMMAND... — print the label, stream the command's own output
