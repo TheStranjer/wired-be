@@ -15,6 +15,9 @@ publish = false
 integration-tests = []
 
 [dependencies]
+# HTML sanitizing (`src/util/sanitize.rs`): an allowlist-based sanitizer
+# built on html5ever, matching Pleroma's scrubbing policy.
+ammonia = "4.2.1"
 # Password hashing (`src/util/password.rs`): argon2 for new PHC hashes —
 # 0.6 has no `std` feature, its `password-hash`/`getrandom` defaults cover
 # what `src/util/password.rs` needs — pbkdf2 and base64 for Pleroma's legacy
