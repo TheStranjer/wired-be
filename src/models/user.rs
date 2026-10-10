@@ -14,6 +14,8 @@
 //!
 //! `password_hash` and `private_key` are secrets: the manual `Debug` impls
 //! in this module redact them, so they can never reach a log line.
+//!
+//! Registration and password login live in [`register`].
 
 use std::fmt;
 
@@ -23,6 +25,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::new_id};
+
+pub mod register;
 
 /// `actor_type` a [`NewUser`] starts with: the `ActivityPub` default actor
 /// kind, matching the column default.
