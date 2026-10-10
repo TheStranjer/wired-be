@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod extract;
 pub mod middleware;
+pub mod models;
 pub mod pagination;
 pub mod state;
 pub mod util;

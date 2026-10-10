@@ -1,0 +1,623 @@
+//! The `jobs` table: the Postgres-backed background job queue.
+//!
+//! `docs/ARCHITECTURE.md` decision 11 keeps background work in plain table
+//! rows claimed with `FOR UPDATE SKIP LOCKED` — no Redis, no external queue.
+//! A job moves through five states:
+//!
+//! | State       | Meaning                                              |
+//! |-------------|------------------------------------------------------|
+//! | `available` | enqueued, not yet claimed                             |
+//! | `executing` | claimed by a worker (`locked_at` set, `attempts` up)  |
+//! | `retryable` | failed with attempts left; due again at `run_at`      |
+//! | `completed` | finished successfully (terminal)                      |
+//! | `discarded` | failed for good (terminal)                            |
+//!
+//! [`enqueue`] inserts, [`claim_next`] hands one due job to one worker,
+//! [`complete`] and [`fail`] end an attempt, and [`rescue_stuck`] recovers
+//! jobs whose worker died mid-flight. A live job (`available`, `executing`
+//! or `retryable`) carrying a `unique_key` blocks any further job with the
+//! same key: the deduplication contract of the partial unique index.
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::{error::AppResult, util::id::new_id};
+
+/// One row of `jobs`: a unit of background work.
+#[derive(Debug, sqlx::FromRow)]
+pub struct Job {
+    /// `UUIDv7` primary key, minted by [`enqueue`] (decision 4).
+    pub id: Uuid,
+    /// Queue workers subscribe to; [`claim_next`] filters on it.
+    pub queue: String,
+    /// Key naming the handler that runs this job.
+    pub kind: String,
+    /// JSON arguments handed to the handler.
+    pub args: Value,
+    /// Lifecycle state: `available`, `executing`, `completed`, `retryable`
+    /// or `discarded` (checked by the database).
+    pub state: String,
+    /// Claims made so far; incremented by [`claim_next`].
+    pub attempts: i32,
+    /// Attempts at or beyond which [`fail`] discards instead of retrying.
+    pub max_attempts: i32,
+    /// Earliest time this job may be claimed; `retryable` jobs are due when
+    /// it lies in the past.
+    pub run_at: DateTime<Utc>,
+    /// When the current claim locked the job; `None` in every other state.
+    pub locked_at: Option<DateTime<Utc>>,
+    /// Message recorded by the most recent [`fail`].
+    pub last_error: Option<String>,
+    /// Deduplication key; see [`enqueue`] and [`Job::state`].
+    pub unique_key: Option<String>,
+    /// When the row was inserted.
+    pub inserted_at: DateTime<Utc>,
+    /// When the row last changed; refreshed by every update here.
+    pub updated_at: DateTime<Utc>,
+}
+
+/// What to insert: everything [`enqueue`] needs beyond defaults.
+///
+/// The three `Option`al fields let the database column defaults apply when
+/// left unset.
+#[derive(Debug)]
+pub struct NewJob<'a> {
+    /// Queue to place the job on.
+    pub queue: &'a str,
+    /// Handler key for the job.
+    pub kind: &'a str,
+    /// JSON arguments for the handler.
+    pub args: Value,
+    /// Earliest claim time; `None` schedules the job immediately.
+    pub run_at: Option<DateTime<Utc>>,
+    /// Failure budget; `None` uses the column default (5).
+    pub max_attempts: Option<i32>,
+    /// Deduplication key; `None` (the common case) disables dedup.
+    pub unique_key: Option<&'a str>,
+}
+
+/// Inserts a new job and returns its row, or `None` when the row was
+/// dropped by deduplication.
+///
+/// A job whose `unique_key` already belongs to a live job
+/// (`available`, `executing` or `retryable`) is not inserted: the partial
+/// unique index rejects it and `ON CONFLICT DO NOTHING` turns that into a
+/// silent `None`. `NULL` keys never collide. The id is a fresh `UUIDv7`;
+/// `run_at` and `max_attempts` fall back to their column defaults when
+/// the fields are `None`.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn enqueue(pool: &PgPool, new_job: NewJob<'_>) -> AppResult<Option<Job>> {
+    let inserted = sqlx::query_as::<_, Job>(
+        "INSERT INTO jobs (id, queue, kind, args, run_at, max_attempts, unique_key)
+         VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($6, 5), $7)
+         ON CONFLICT DO NOTHING
+         RETURNING *",
+    )
+    .bind(new_id())
+    .bind(new_job.queue)
+    .bind(new_job.kind)
+    .bind(new_job.args)
+    .bind(new_job.run_at)
+    // 5 mirrors the `max_attempts` column default.
+    .bind(new_job.max_attempts)
+    .bind(new_job.unique_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(inserted)
+}
+
+/// Claims the job in `queues` that is due soonest, or `None` when nothing
+/// is due.
+///
+/// One statement flips the chosen row to `executing`, adds one to
+/// `attempts` and stamps `locked_at`, using `FOR UPDATE SKIP LOCKED` in a
+/// sub-select so concurrent workers scan the same queue without ever
+/// blocking on — or handing out twice — the same job. Only jobs whose
+/// state is `available` or `retryable` and whose `run_at` has passed are
+/// eligible.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn claim_next(pool: &PgPool, queues: &[&str]) -> AppResult<Option<Job>> {
+    let names: Vec<String> = queues.iter().copied().map(str::to_owned).collect();
+    let claimed = sqlx::query_as::<_, Job>(
+        "UPDATE jobs
+            SET state = 'executing',
+                attempts = attempts + 1,
+                locked_at = now(),
+                updated_at = now()
+          WHERE id = (
+              SELECT id
+                FROM jobs
+               WHERE state IN ('available', 'retryable')
+                 AND run_at <= now()
+                 AND queue = ANY($1)
+               ORDER BY run_at
+                  FOR UPDATE SKIP LOCKED
+               LIMIT 1
+          )
+        RETURNING *",
+    )
+    .bind(&names)
+    .fetch_optional(pool)
+    .await?;
+    Ok(claimed)
+}
+
+/// Marks the claimed job `completed` and releases its lock.
+///
+/// An unknown `id` matches no row and changes nothing; completing twice
+/// rewrites the same terminal state.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn complete(pool: &PgPool, id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE jobs
+            SET state = 'completed',
+                locked_at = NULL,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(drop)?;
+    Ok(())
+}
+
+/// Records a failed attempt, retrying or discarding the job.
+///
+/// `error` is stored as `last_error` either way. With `retry_in: Some` and
+/// `attempts < max_attempts` the job becomes `retryable` and is due again
+/// after `retry_in`; with `retry_in: Some` at the attempt budget — or with
+/// `retry_in: None` at all — the job is `discarded`. The lock is released
+/// in both cases. An unknown `id` changes nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError). A `retry_in` finer than
+/// a microsecond or above roughly 292 years cannot be encoded as a
+/// Postgres `interval` and fails the same way.
+pub async fn fail(
+    pool: &PgPool,
+    id: Uuid,
+    error: &str,
+    retry_in: Option<Duration>,
+) -> AppResult<()> {
+    match retry_in {
+        Some(delay) => retry_or_discard(pool, id, error, delay).await,
+        None => discard(pool, id, error).await,
+    }
+}
+
+/// Fails a job that may be retried: `retryable` with a new `run_at` while
+/// attempts remain, `discarded` at the budget; decided in SQL so the check
+/// is atomic with the write.
+async fn retry_or_discard(pool: &PgPool, id: Uuid, error: &str, delay: Duration) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE jobs
+            SET state = CASE
+                    WHEN attempts < max_attempts THEN 'retryable'
+                    ELSE 'discarded'
+                END,
+                run_at = CASE
+                    WHEN attempts < max_attempts THEN now() + $3
+                    ELSE run_at
+                END,
+                last_error = $2,
+                locked_at = NULL,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .bind(delay)
+    .execute(pool)
+    .await
+    .map(drop)?;
+    Ok(())
+}
+
+/// Fails a job for good.
+async fn discard(pool: &PgPool, id: Uuid, error: &str) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE jobs
+            SET state = 'discarded',
+                last_error = $2,
+                locked_at = NULL,
+                updated_at = now()
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await
+    .map(drop)?;
+    Ok(())
+}
+
+/// Returns `executing` jobs locked for longer than `older_than` to the
+/// queue, reporting how many rows changed.
+///
+/// A worker that dies mid-job leaves its row stuck in `executing`; after
+/// its lock has demonstrably expired the row goes back to `retryable`
+/// (claimable again, `attempts` kept) with `locked_at` released. `run_at`
+/// is untouched, so a rescued job is due at once. Jobs in any other state
+/// are invisible to this sweep.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError); an `older_than` that
+/// cannot be encoded as a Postgres `interval` fails the same way as in
+/// [`fail`].
+pub async fn rescue_stuck(pool: &PgPool, older_than: Duration) -> AppResult<u64> {
+    let rescued = sqlx::query(
+        "UPDATE jobs
+            SET state = 'retryable',
+                locked_at = NULL,
+                updated_at = now()
+          WHERE state = 'executing'
+            AND locked_at < now() - $1",
+    )
+    .bind(older_than)
+    .execute(pool)
+    .await?;
+    Ok(rescued.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeDelta;
+    use serde_json::json;
+    use sqlx::PgPool;
+
+    use super::*;
+
+    /// A minimal [`NewJob`] payload on `queue` with `kind`: empty args, no
+    /// schedule, default attempts, no dedup key.
+    fn new_job(queue: &'static str, kind: &'static str) -> NewJob<'static> {
+        NewJob {
+            queue,
+            kind,
+            args: json!({}),
+            run_at: None,
+            max_attempts: None,
+            unique_key: None,
+        }
+    }
+
+    /// Reads the row behind `id` back out of the table.
+    async fn fetch(pool: &PgPool, id: Uuid) -> Job {
+        sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn enqueue_claim_complete_round_trip(pool: PgPool) {
+        let args = json!({ "target": "note/1" });
+        let job = enqueue(
+            &pool,
+            NewJob {
+                args: args.clone(),
+                ..new_job("default", "publish")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a fresh enqueue inserts its row");
+        assert_eq!(job.state, "available", "new jobs start available");
+        assert_eq!(job.attempts, 0, "nothing has been tried yet");
+        assert_eq!(job.max_attempts, 5, "the column default applies");
+        assert_eq!(job.args, args, "args round trip through jsonb");
+        assert!(job.locked_at.is_none(), "an unclaimed job holds no lock");
+        assert!(job.unique_key.is_none(), "no key was asked for");
+        assert!(job.last_error.is_none(), "no failure yet");
+        assert!(job.run_at <= Utc::now(), "unscheduled means due now");
+
+        let wrong_queue = claim_next(&pool, &["other"]).await.unwrap();
+        assert!(
+            wrong_queue.is_none(),
+            "a claim only sees the queues it names"
+        );
+
+        let claimed = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("the job is due and claimable");
+        assert_eq!(claimed.id, job.id, "the enqueued row comes back");
+        assert_eq!(claimed.state, "executing", "claiming marks it running");
+        assert_eq!(claimed.attempts, 1, "a claim counts as an attempt");
+        assert!(claimed.locked_at.is_some(), "a claim stamps the lock");
+
+        let empty = claim_next(&pool, &["default"]).await.unwrap();
+        assert!(empty.is_none(), "an executing job is not claimed again");
+
+        complete(&pool, claimed.id).await.unwrap();
+        let done = fetch(&pool, claimed.id).await;
+        assert_eq!(done.state, "completed", "complete ends the job");
+        assert!(done.locked_at.is_none(), "complete releases the lock");
+
+        let drained = claim_next(&pool, &["default"]).await.unwrap();
+        assert!(drained.is_none(), "a completed job leaves the queue");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn scheduled_job_is_not_claimed_early(pool: PgPool) {
+        let when = Utc::now() + TimeDelta::seconds(3600);
+        let job = enqueue(
+            &pool,
+            NewJob {
+                run_at: Some(when),
+                ..new_job("default", "later")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("scheduled jobs are inserted fine");
+
+        let early = claim_next(&pool, &["default"]).await.unwrap();
+        assert!(early.is_none(), "a job an hour out is not due yet");
+
+        let waiting = fetch(&pool, job.id).await;
+        assert_eq!(
+            waiting.state, "available",
+            "a claim miss leaves the row alone"
+        );
+        assert_eq!(waiting.attempts, 0, "and costs no attempt");
+        assert!(waiting.locked_at.is_none(), "and locks nothing");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn concurrent_claims_never_share_a_job(pool: PgPool) {
+        let first = enqueue(&pool, new_job("ingest", "one"))
+            .await
+            .unwrap()
+            .expect("first job inserts");
+        let second = enqueue(&pool, new_job("ingest", "two"))
+            .await
+            .unwrap()
+            .expect("second job inserts");
+
+        let (left, right) = tokio::join!(
+            claim_next(&pool, &["ingest"]),
+            claim_next(&pool, &["ingest"])
+        );
+        let left = left.unwrap().expect("worker one gets a job");
+        let right = right.unwrap().expect("worker two gets a job");
+        assert_ne!(left.id, right.id, "SKIP LOCKED hands one job to one worker");
+        assert_eq!(left.attempts, 1, "each got a single attempt");
+        assert_eq!(right.attempts, 1, "each got a single attempt");
+        let claimed = [left.id, right.id];
+        assert!(
+            claimed.contains(&first.id) && claimed.contains(&second.id),
+            "both due jobs were handed out, none lost"
+        );
+
+        let third = claim_next(&pool, &["ingest"]).await.unwrap();
+        assert!(third.is_none(), "nothing is left to claim");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unique_key_deduplicates_live_jobs(pool: PgPool) {
+        let job = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("acct/1"),
+                ..new_job("default", "update")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the first job with a key inserts");
+
+        let dup = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("acct/1"),
+                ..new_job("default", "update")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            dup.is_none(),
+            "a second live job with the same key is dropped"
+        );
+        let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM jobs WHERE unique_key = 'acct/1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 1, "only the first row exists");
+
+        let claimed = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("the keyed job is claimable");
+        assert_eq!(claimed.id, job.id, "it is the row first enqueued");
+        assert_eq!(
+            claimed.unique_key.as_deref(),
+            Some("acct/1"),
+            "the key round trips"
+        );
+
+        let while_executing = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("acct/1"),
+                ..new_job("default", "update")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            while_executing.is_none(),
+            "executing counts as live for the dedup index"
+        );
+
+        complete(&pool, claimed.id).await.unwrap();
+        let reopened = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("acct/1"),
+                ..new_job("default", "update")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            reopened.is_some(),
+            "completing frees the key for a fresh job"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn fail_retries_then_discards_at_max_attempts(pool: PgPool) {
+        let job = enqueue(
+            &pool,
+            NewJob {
+                max_attempts: Some(2),
+                ..new_job("default", "flaky")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the flaky job inserts");
+
+        let first = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("it is due at once");
+        assert_eq!(first.id, job.id, "the flaky job was claimed");
+
+        fail(&pool, first.id, "boom", Some(Duration::from_secs(0)))
+            .await
+            .unwrap();
+        let retry = fetch(&pool, job.id).await;
+        assert_eq!(
+            retry.state, "retryable",
+            "an attempt below the budget retries"
+        );
+        assert_eq!(
+            retry.last_error.as_deref(),
+            Some("boom"),
+            "the failure message is stored"
+        );
+        assert!(retry.locked_at.is_none(), "failing releases the lock");
+
+        let second = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("a retryable job due now is claimed again");
+        assert_eq!(second.id, job.id, "the same job comes back");
+        assert_eq!(second.attempts, 2, "the retry is the second attempt");
+
+        fail(&pool, second.id, "bang", Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let dead = fetch(&pool, job.id).await;
+        assert_eq!(
+            dead.state, "discarded",
+            "the budget was spent, so this is terminal"
+        );
+        assert_eq!(
+            dead.last_error.as_deref(),
+            Some("bang"),
+            "the last failure wins the message"
+        );
+
+        let after = claim_next(&pool, &["default"]).await.unwrap();
+        assert!(after.is_none(), "a discarded job never returns");
+
+        let doomed = enqueue(&pool, new_job("default", "doomed"))
+            .await
+            .unwrap()
+            .expect("the doomed job inserts");
+        let third = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("it is due at once");
+        assert_eq!(third.id, doomed.id, "the doomed job was claimed");
+        fail(&pool, third.id, "fatal", None).await.unwrap();
+        let dropped = fetch(&pool, doomed.id).await;
+        assert_eq!(
+            dropped.state, "discarded",
+            "no retry delay discards right away"
+        );
+        assert_eq!(
+            dropped.last_error.as_deref(),
+            Some("fatal"),
+            "and still records the message"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn rescue_stuck_returns_expired_locks(pool: PgPool) {
+        let one = enqueue(&pool, new_job("default", "stuck_a"))
+            .await
+            .unwrap()
+            .expect("first stuck job inserts");
+        let two = enqueue(&pool, new_job("default", "stuck_b"))
+            .await
+            .unwrap()
+            .expect("second stuck job inserts");
+        let claimed_one = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("first claim succeeds");
+        let claimed_two = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("second claim succeeds");
+        let stuck = [claimed_one.id, claimed_two.id];
+        assert!(
+            stuck.contains(&one.id) && stuck.contains(&two.id),
+            "both jobs are now executing with fresh locks"
+        );
+
+        let fresh = rescue_stuck(&pool, Duration::from_secs(3_600))
+            .await
+            .unwrap();
+        assert_eq!(fresh, 0, "a lock younger than the limit is not stuck");
+
+        complete(&pool, claimed_one.id).await.unwrap();
+        let rescued = rescue_stuck(&pool, Duration::from_secs(0)).await.unwrap();
+        assert_eq!(rescued, 1, "only the still-executing job is rescued");
+
+        let back = fetch(&pool, claimed_two.id).await;
+        assert_eq!(
+            back.state, "retryable",
+            "a stuck job goes back to the queue"
+        );
+        assert!(back.locked_at.is_none(), "rescuing releases the lock");
+        let done = fetch(&pool, claimed_one.id).await;
+        assert_eq!(
+            done.state, "completed",
+            "rescuing leaves terminal rows alone"
+        );
+
+        let reclaimed = claim_next(&pool, &["default"])
+            .await
+            .unwrap()
+            .expect("the rescued job is claimable again");
+        assert_eq!(reclaimed.id, claimed_two.id, "it is the rescued row");
+        assert_eq!(reclaimed.attempts, 2, "the lost attempt stays counted");
+    }
+}
