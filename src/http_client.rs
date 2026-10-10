@@ -17,6 +17,7 @@ pub mod ssrf;
 use std::{error::Error, fmt, time::Duration};
 
 use bytes::{Bytes, BytesMut};
+use chrono::Utc;
 use reqwest::{
     Client, Method,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -26,7 +27,10 @@ use serde::de::DeserializeOwned;
 use tracing::error;
 use url::Url;
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    federation::signature::{SignedHeaders, SigningKey, sign_request},
+};
 
 pub use ssrf::is_blocked_ip;
 
@@ -40,6 +44,9 @@ const MAX_REDIRECTS: usize = 5;
 const ERROR_STATUS_MIN: u16 = 400;
 /// Product name the instance identifies itself with in `User-Agent`.
 const USER_AGENT_NAME: &str = "Wired";
+/// Media type federation peers speak: sent as `Content-Type` on signed
+/// POSTs and asked for via `Accept` on signed GETs.
+const ACTIVITY_JSON: &str = "application/activity+json";
 
 /// Formats the instance `User-Agent` header value:
 /// `Wired (<BASE_URL>)`, with `; contact <CONTACT_EMAIL>` appended when a
@@ -224,6 +231,52 @@ impl HttpClient {
         }
         Ok(builder)
     }
+
+    /// Fetches `url` with a `GET` HTTP-signed by the actor key
+    /// `key_id`/`private_pem` (see [`crate::federation::signature`]):
+    /// `Accept: application/activity+json` plus the signed `Host`, `Date`
+    /// and `Signature` headers. This is the shape of an authorized-fetch
+    /// or remote-actor dereference.
+    ///
+    /// # Errors
+    ///
+    /// [`HttpError::Connect`] if the request cannot be signed (`url` is not
+    /// a signable http(s) URL, or `private_pem` does not parse), otherwise
+    /// the same as [`HttpClient::get_limited`] — except that the response
+    /// body is read without a size cap, so [`HttpError::TooLarge`] cannot
+    /// occur.
+    pub async fn signed_get(
+        &self,
+        url: &str,
+        key_id: &str,
+        private_pem: &str,
+    ) -> Result<HttpResponse, HttpError> {
+        let signed = sign_for_send("GET", url, None, key_id, private_pem)?;
+        self.get_limited(url, &ap_headers(&signed, false), usize::MAX)
+            .await
+    }
+
+    /// Delivers `body` to `url` with a HTTP-signed `POST`:
+    /// `Accept` and `Content-Type` of `application/activity+json` plus the
+    /// signed `Host`, `Date`, `Digest` and `Signature` headers. This is the
+    /// shape of an inbox delivery.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`HttpClient::signed_get`] (with `url` also checked for
+    /// signability before anything is sent), then the same as
+    /// [`HttpClient::post_bytes`].
+    pub async fn signed_post(
+        &self,
+        url: &str,
+        body: &[u8],
+        key_id: &str,
+        private_pem: &str,
+    ) -> Result<HttpResponse, HttpError> {
+        let signed = sign_for_send("POST", url, Some(body), key_id, private_pem)?;
+        self.post_bytes(url, &ap_headers(&signed, true), body.to_vec())
+            .await
+    }
 }
 
 /// The [`HttpClient`] the instance ships with: the public origin and
@@ -261,6 +314,48 @@ fn header_map(headers: &[(&str, &str)]) -> Result<HeaderMap, HttpError> {
         drop(replaced);
     }
     Ok(map)
+}
+
+/// Signs `method url` [`at the current moment`](Utc::now), folding a
+/// signing failure into [`HttpError::Connect`]: the request never left
+/// this process because it could not be built.
+///
+/// # Errors
+///
+/// [`HttpError::Connect`] if [`sign_request`] rejects `url` or
+/// `private_pem`, or the RSA operation fails.
+fn sign_for_send(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    key_id: &str,
+    private_pem: &str,
+) -> Result<SignedHeaders, HttpError> {
+    let key = SigningKey {
+        key_id,
+        private_pem,
+    };
+    sign_request(method, url, body, &key, Utc::now())
+        .map_err(|err| HttpError::Connect(format!("could not sign the request: {err}")))
+}
+
+/// The header pairs of a signed federation exchange: `Accept` (and, with
+/// `with_body`, the `Content-Type` the body is labelled by) plus the
+/// signed `Host`, `Date`, optional `Digest` and `Signature`. `Host` is
+/// sent explicitly so the peer sees exactly the host that was signed.
+#[must_use]
+fn ap_headers(signed: &SignedHeaders, with_body: bool) -> Vec<(&str, &str)> {
+    let mut headers = vec![("accept", ACTIVITY_JSON)];
+    if with_body {
+        headers.push(("content-type", ACTIVITY_JSON));
+    }
+    headers.push(("host", &signed.host));
+    headers.push(("date", &signed.date));
+    if let Some(digest) = &signed.digest {
+        headers.push(("digest", digest));
+    }
+    headers.push(("signature", &signed.signature));
+    headers
 }
 
 /// Reads `response`'s body incrementally into memory, stopping with
@@ -382,19 +477,31 @@ impl From<reqwest::Error> for HttpError {
 #[cfg(test)]
 mod tests {
     use axum::{
-        Router,
+        Json, Router,
         body::Body,
         extract::State,
-        http::{HeaderMap, StatusCode, header},
+        http::{HeaderMap, Method, StatusCode, Uri, header},
         response::Response,
         routing::{get, post},
     };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use serde_json::Value;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
+    use crate::{
+        federation::signature::{digest_header, signing_string},
+        util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM, verify_sha256},
+    };
 
     /// `User-Agent` used by clients that only exercise request handling.
     const TEST_UA: &str = "Wired (https://wired.test)";
+    /// The key id the signed-request tests present.
+    const TEST_KEY_ID: &str = "https://wired.test/actor#main-key";
+    /// The `headers` parameter of a signed bodyless GET.
+    const GET_HEADERS_PARAM: &str = "(request-target) host date";
+    /// The `headers` parameter of a signed POST (with digest).
+    const POST_HEADERS_PARAM: &str = "(request-target) host date digest";
     /// A 100-byte body served by the `/big` route.
     const BIG_BODY: [u8; 100] = [b'x'; 100];
     /// Total timeout small enough to let a sleeping handler lose the race.
@@ -816,13 +923,13 @@ mod tests {
             headers: HeaderMap::new(),
             body: Bytes::from_static(br#"{"name":"wired"}"#),
         };
-        let value: serde_json::Value = response.json().unwrap();
+        let value: Value = response.json().unwrap();
         assert_eq!(value["name"], "wired", "body parsed");
         let broken = HttpResponse {
             body: Bytes::from_static(b"{oops"),
             ..response
         };
-        let parse_err = broken.json::<serde_json::Value>().unwrap_err();
+        let parse_err = broken.json::<Value>().unwrap_err();
         assert!(
             !parse_err.to_string().is_empty(),
             "malformed JSON reports a parse error"
@@ -920,5 +1027,211 @@ mod tests {
             "a clone sends with the same configuration"
         );
         server.abort();
+    }
+
+    /// Reports what a federation peer would see: the request target as
+    /// `(request-target)` is signed, plus the header values a signed
+    /// request must carry (absent keys are omitted).
+    async fn echo_ap_request(method: Method, uri: Uri, headers: HeaderMap) -> Json<Value> {
+        let target = format!(
+            "{} {}",
+            method.as_str().to_lowercase(),
+            uri.query().map_or_else(
+                || uri.path().to_owned(),
+                |query| format!("{}?{query}", uri.path()),
+            ),
+        );
+        let mut seen = serde_json::Map::new();
+        drop(seen.insert("request-target".to_owned(), Value::String(target)));
+        for name in [
+            "accept",
+            "content-type",
+            "host",
+            "date",
+            "digest",
+            "signature",
+        ] {
+            if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                drop(seen.insert(name.to_owned(), Value::String(value.to_owned())));
+            }
+        }
+        Json(Value::Object(seen))
+    }
+
+    /// The named parameter of a `Signature` header value, unquoted.
+    fn signature_param(header: &str, name: &str) -> String {
+        let prefix = format!("{name}=\"");
+        let pair = header
+            .split(',')
+            .find(|p| p.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("signature header carries a {name} parameter: {header}"));
+        let value = pair
+            .strip_prefix(prefix.as_str())
+            .unwrap_or_else(|| panic!("the {name} parameter is quoted: {header}"));
+        value.trim_end_matches('"').to_owned()
+    }
+
+    /// The raw signature bytes out of a peer-observed `Signature` header,
+    /// checking the other three parameters name this test's key, the
+    /// `rsa-sha256` algorithm and `headers_param`.
+    fn observed_signature(header: &str, headers_param: &str) -> Vec<u8> {
+        assert_eq!(
+            signature_param(header, "keyId"),
+            TEST_KEY_ID,
+            "the signature names our key id"
+        );
+        assert_eq!(
+            signature_param(header, "algorithm"),
+            "rsa-sha256",
+            "the algorithm Mastodon and Pleroma speak"
+        );
+        assert_eq!(
+            signature_param(header, "headers"),
+            headers_param,
+            "the signed header list"
+        );
+        BASE64.decode(signature_param(header, "signature")).unwrap()
+    }
+
+    /// The four lines a peer can rebuild for us, as the text the signature
+    /// must verify over.
+    fn peer_signing_string(seen: &Value) -> String {
+        signing_string(
+            seen["request-target"].as_str().unwrap(),
+            seen["host"].as_str().unwrap(),
+            seen["date"].as_str().unwrap(),
+            seen.get("digest").and_then(Value::as_str),
+        )
+    }
+
+    #[tokio::test]
+    async fn signed_get_sends_activity_json_and_a_verifiable_signature() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/actor?page=2");
+        let server = spawn_server(
+            listener,
+            Router::new().route("/actor", get(echo_ap_request)),
+        );
+        let client = HttpClient::new_for_tests(TEST_UA);
+
+        let response = client
+            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM)
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let seen: Value = response.json().unwrap();
+        server.abort();
+
+        assert_eq!(seen["accept"], ACTIVITY_JSON, "asks for AP JSON");
+        assert!(
+            seen.get("content-type").is_none(),
+            "a GET sends no body to label"
+        );
+        assert_eq!(
+            seen["request-target"], "get /actor?page=2",
+            "the peer sees method and path with the query"
+        );
+        assert!(seen.get("digest").is_none(), "a GET signs no digest");
+        assert!(
+            seen["date"].as_str().unwrap().ends_with(" GMT"),
+            "an IMF-fixdate date"
+        );
+        let signature = observed_signature(seen["signature"].as_str().unwrap(), GET_HEADERS_PARAM);
+        assert!(
+            verify_sha256(
+                FIXTURE_PUBLIC_PKCS1_PEM,
+                peer_signing_string(&seen).as_bytes(),
+                &signature,
+            ),
+            "the signature verifies over exactly what the peer saw"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_get_sends_the_host_it_signed() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/actor");
+        let port = listener.local_addr().unwrap().port();
+        let server = spawn_server(
+            listener,
+            Router::new().route("/actor", get(echo_ap_request)),
+        );
+        let client = HttpClient::new_for_tests(TEST_UA);
+
+        let response = client
+            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM)
+            .await
+            .unwrap();
+        let seen: Value = response.json().unwrap();
+        server.abort();
+
+        assert_eq!(
+            seen["host"],
+            format!("127.0.0.1:{port}"),
+            "the non-default port rides into the signed host"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_post_adds_digest_and_content_type_to_the_signature() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/inbox");
+        let server = spawn_server(
+            listener,
+            Router::new().route("/inbox", post(echo_ap_request)),
+        );
+        let client = HttpClient::new_for_tests(TEST_UA);
+        let body = br#"{"type":"Create"}"#;
+
+        let response = client
+            .signed_post(&url, body, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM)
+            .await
+            .unwrap();
+        let seen: Value = response.json().unwrap();
+        server.abort();
+
+        assert_eq!(seen["accept"], ACTIVITY_JSON, "asks for AP JSON");
+        assert_eq!(
+            seen["content-type"], ACTIVITY_JSON,
+            "labels the activity body"
+        );
+        assert_eq!(
+            seen["digest"],
+            digest_header(body),
+            "the peer sees the digest we signed"
+        );
+        let signature = observed_signature(seen["signature"].as_str().unwrap(), POST_HEADERS_PARAM);
+        assert!(
+            verify_sha256(
+                FIXTURE_PUBLIC_PKCS1_PEM,
+                peer_signing_string(&seen).as_bytes(),
+                &signature,
+            ),
+            "the four-line signing string verifies"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsignable_requests_fail_before_any_connection() {
+        let client = HttpClient::new_for_tests(TEST_UA);
+        let bad_url = client
+            .signed_get(
+                "ftp://example.com/pub",
+                TEST_KEY_ID,
+                FIXTURE_PRIVATE_PKCS1_PEM,
+            )
+            .await;
+        assert!(
+            matches!(bad_url, Err(HttpError::Connect(_))),
+            "a non-http(s) URL cannot be signed, got {bad_url:?}"
+        );
+        let junk_key = client
+            .signed_get("https://peer.invalid/actor", TEST_KEY_ID, "not a key")
+            .await;
+        assert!(
+            matches!(junk_key, Err(HttpError::Connect(_))),
+            "unparseable key material fails the same way, got {junk_key:?}"
+        );
     }
 }
