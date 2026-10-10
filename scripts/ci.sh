@@ -24,6 +24,23 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(dirname -- "$script_dir")"
 cd "$repo_root" || exit 1
 
+# Make the Rust toolchain findable even when this runs from a non-login shell:
+# rustup installs into ~/.cargo/bin and exports it only from shell profile
+# files, which such shells never source. Fail loudly rather than reporting
+# every check as broken when the toolchain is genuinely absent.
+if ! command -v cargo >/dev/null 2>&1; then
+  if [[ -f "${HOME:-}/.cargo/env" ]]; then
+    . "$HOME/.cargo/env"
+  fi
+  if ! command -v cargo >/dev/null 2>&1 && [[ -x "${HOME:-}/.cargo/bin/cargo" ]]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    printf 'cargo not found on PATH; install the Rust toolchain (rustup)\n' >&2
+    exit 1
+  fi
+fi
+
 failed_checks=()
 
 # step LABEL COMMAND... — print the label, stream the command's own output
