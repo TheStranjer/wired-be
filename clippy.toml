@@ -1,0 +1,14 @@
+# Strict thresholds. Do not loosen these; fix the code instead.
+avoid-breaking-exported-api = false
+cognitive-complexity-threshold = 15
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 80
+type-complexity-threshold = 150
+excessive-nesting-threshold = 4
+max-fn-params-bools = 1
+max-struct-bools = 2
+missing-docs-in-crate-items = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
