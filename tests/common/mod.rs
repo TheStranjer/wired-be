@@ -18,7 +18,7 @@
 
 #![cfg(test)]
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use axum::{
     Router,
@@ -37,6 +37,7 @@ use wired_be::{
     http_client::HttpClient,
     models::user::{NewUser, User, insert, local_ap_id},
     state::AppState,
+    uploads::UploaderBackend,
 };
 
 /// The configuration [`test_app`] runs with: `BASE_URL` `https://test.example`,
@@ -46,14 +47,48 @@ pub fn test_config() -> Config {
     Config::for_tests()
 }
 
+/// [`test_config`] with its uploads moved to `uploads_dir`, for tests that
+/// store files and must not write into the repository.
+#[must_use]
+pub fn test_config_with_uploads_dir(uploads_dir: &Path) -> Config {
+    let mut config = test_config();
+    config.uploads_dir = uploads_dir.to_path_buf();
+    config
+}
+
+/// The local-file [`UploaderBackend`] storing in `uploads_dir`: the same
+/// storage [`test_app_with_uploads_dir`] serves from.
+///
+/// Use it to put or delete a file before requesting it over HTTP.
+#[must_use]
+pub fn test_uploader(uploads_dir: &Path) -> UploaderBackend {
+    UploaderBackend::from(&test_config_with_uploads_dir(uploads_dir))
+}
+
 /// The real application router from [`wired_be::app`], serving over `pool`
 /// and the [`test_config`] settings.
+///
+/// Uploads go to the default `UPLOADS_DIR`, which is inside the working
+/// directory: tests that store a file want [`test_app_with_uploads_dir`]
+/// instead.
 pub fn test_app(pool: PgPool) -> Router {
-    let config = Arc::new(test_config());
+    test_app_with_config(pool, test_config())
+}
+
+/// The real application router, serving uploads out of `uploads_dir`.
+pub fn test_app_with_uploads_dir(pool: PgPool, uploads_dir: &Path) -> Router {
+    test_app_with_config(pool, test_config_with_uploads_dir(uploads_dir))
+}
+
+/// The real application router from [`wired_be::app`] over `pool` and
+/// `config`.
+fn test_app_with_config(pool: PgPool, config: Config) -> Router {
+    let config = Arc::new(config);
     wired_be::app(AppState {
         db: pool,
+        config: Arc::clone(&config),
         http_client: HttpClient::from(config.as_ref()),
-        config,
+        uploader: UploaderBackend::from(config.as_ref()),
     })
 }
 

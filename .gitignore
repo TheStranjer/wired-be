@@ -1,2 +1,4 @@
 /target
 .env
+# Runtime data: the default `UPLOADS_DIR` the local uploader writes into.
+/uploads

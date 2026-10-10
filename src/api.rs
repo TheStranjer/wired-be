@@ -12,8 +12,13 @@
 //! `lib/pleroma/web/fallback/redirect_controller.ex`), so the area routers
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
+//!
+//! [`media_files`] is the one router in this module that [`crate::app`] does
+//! not nest under `/api`: uploaded files live at `/media/{key}`, the address
+//! [`crate::uploads`] writes into activities.
 
 pub mod apps;
+pub mod media_files;
 pub mod v1;
 pub mod v2;
 
@@ -21,11 +26,12 @@ use axum::Router;
 
 use crate::state::AppState;
 
-/// Composes every API area router under its URL prefix.
+/// Composes the API area routers under their URL prefixes.
 ///
 /// `/api/v1` ([`v1`]) and `/api/v2` ([`v2`]) hold the Mastodon-compatible
 /// client API; later tickets add the remaining areas (Pleroma extensions,
-/// `ActivityPub`, well-known) here the same way.
+/// `ActivityPub`, well-known) here the same way. [`media_files`] is the
+/// exception: it serves `/media` and [`crate::app`] merges it directly.
 pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/api/v1", v1::router())
