@@ -1,6 +1,7 @@
 //! wired-be: an API-only fediverse backend built on Axum.
 
 pub mod config;
+pub mod error;
 pub mod state;
 
 use axum::{Router, http::StatusCode, routing::get};
