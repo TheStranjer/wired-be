@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod state;
+pub mod util;
 
 use axum::{Router, http::StatusCode, routing::get};
 
