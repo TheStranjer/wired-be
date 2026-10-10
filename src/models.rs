@@ -10,6 +10,7 @@
 //! handlers can use `?`.
 
 pub mod job;
+pub mod media_attachment;
 pub mod oauth_app;
 pub mod oauth_token;
 pub mod user;
