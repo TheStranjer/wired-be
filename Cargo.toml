@@ -33,6 +33,11 @@ bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 dotenvy = "0.15.7"
 pbkdf2 = { version = "0.13.0", features = ["sha2"] }
+# Markdown for `text/markdown` statuses (`src/util/format.rs`): only the pull
+# parser is used, so the default features (`html`, `getopts`,
+# `pulldown-cmark-escape`) are off — `render_markdown` renders the event stream
+# itself and sanitizes it with `ammonia`.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 # RSA key pairs and SHA-256 signing (`src/util/keys.rs`): rsa with PEM and
 # PKCS#1 v1.5 support, rand pinned to the 0.8 line because rsa 0.9 takes a
 # `rand_core` 0.6 RNG (rand 0.9+ switched lines), and sha2 with `oid` so the
