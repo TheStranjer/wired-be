@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod extract;
 pub mod middleware;
 pub mod pagination;
 pub mod state;

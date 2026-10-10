@@ -58,6 +58,9 @@ pub enum AppError {
     RouteNotFound,
     /// The request conflicts with existing state, e.g. a duplicate (409).
     Conflict(String),
+    /// The request body's content type is not one the endpoint parses
+    /// (415); see [`crate::extract`] for the accepted types.
+    UnsupportedMediaType(String),
     /// The request is well formed but semantically invalid (422).
     Unprocessable(String),
     /// The caller exceeded its rate limit (429).
@@ -77,6 +80,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound | Self::NotImplemented | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,6 +95,7 @@ impl AppError {
             | Self::Unauthorized(detail)
             | Self::Forbidden(detail)
             | Self::Conflict(detail)
+            | Self::UnsupportedMediaType(detail)
             | Self::Unprocessable(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
             Self::NotImplemented => NOT_IMPLEMENTED_MESSAGE,
@@ -121,6 +126,7 @@ impl fmt::Display for AppError {
             | Self::Unauthorized(detail)
             | Self::Forbidden(detail)
             | Self::Conflict(detail)
+            | Self::UnsupportedMediaType(detail)
             | Self::Unprocessable(detail)
             | Self::Internal(detail) => f.write_str(detail),
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
@@ -143,6 +149,7 @@ impl Error for AppError {
             | Self::NotImplemented
             | Self::RouteNotFound
             | Self::Conflict(_)
+            | Self::UnsupportedMediaType(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
             | Self::Internal(_) => None,
@@ -226,6 +233,10 @@ mod tests {
             (AppError::NotImplemented, NOT_IMPLEMENTED_MESSAGE),
             (AppError::RouteNotFound, ROUTE_NOT_FOUND_MESSAGE),
             (AppError::Conflict("taken".to_owned()), "taken"),
+            (
+                AppError::UnsupportedMediaType("Unsupported media type".to_owned()),
+                "Unsupported media type",
+            ),
             (AppError::Unprocessable("too long".to_owned()), "too long"),
             (AppError::RateLimited, RATE_LIMITED_MESSAGE),
             (AppError::Internal(SECRET.to_owned()), INTERNAL_MESSAGE),
