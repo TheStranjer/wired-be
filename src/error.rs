@@ -3,11 +3,14 @@
 //! Every failure becomes a response whose status comes from the variant, whose
 //! `content-type` is `application/json` and whose body is
 //! `{"error": "<message>"}`, following `docs/ARCHITECTURE.md` decision 8. The
-//! messages mirror Pleroma's fallback controller
-//! (`lib/pleroma/web/mastodon_api/controllers/fallback_controller.ex`):
-//! "Record not found" for a missing row, "Throttled" for a rate limit (the
-//! wording of its rate limiter) and "Something went wrong" for server-side
-//! failures, whose real cause is only written to the log.
+//! messages mirror Pleroma's fallback controllers
+//! (`lib/pleroma/web/mastodon_api/controllers/fallback_controller.ex` and
+//! `lib/pleroma/web/fallback/redirect_controller.ex`): "Record not found"
+//! for a missing row, "Not implemented" for an unrouted path under `/api`
+//! (Pleroma's `api_not_implemented`), "Not found" for any other unrouted
+//! path, "Throttled" for a rate limit (the wording of its rate limiter) and
+//! "Something went wrong" for server-side failures, whose real cause is
+//! only written to the log.
 
 use std::{error::Error, fmt};
 
@@ -22,6 +25,12 @@ use tracing::error;
 
 /// Body message for [`AppError::NotFound`], Pleroma's wording.
 const NOT_FOUND_MESSAGE: &str = "Record not found";
+/// Body message for [`AppError::NotImplemented`], Pleroma's
+/// `api_not_implemented` wording.
+const NOT_IMPLEMENTED_MESSAGE: &str = "Not implemented";
+/// Body message for [`AppError::RouteNotFound`], the wording of Pleroma's
+/// router-level 404.
+const ROUTE_NOT_FOUND_MESSAGE: &str = "Not found";
 /// Body message for [`AppError::RateLimited`], Pleroma's rate limiter wording.
 const RATE_LIMITED_MESSAGE: &str = "Throttled";
 /// Body message for failures whose real cause must stay in the log.
@@ -40,6 +49,13 @@ pub enum AppError {
     Forbidden(String),
     /// No record matches the request (404).
     NotFound,
+    /// The request path is under `/api` but no endpoint is routed there
+    /// (404), Pleroma's `api_not_implemented`.
+    NotImplemented,
+    /// No route matches the request path at all (404). Unlike
+    /// [`Self::NotFound`], which reports a missing record to an endpoint
+    /// that exists, this is the router-level fallback.
+    RouteNotFound,
     /// The request conflicts with existing state, e.g. a duplicate (409).
     Conflict(String),
     /// The request is well formed but semantically invalid (422).
@@ -59,7 +75,7 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound | Self::NotImplemented | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -77,6 +93,8 @@ impl AppError {
             | Self::Conflict(detail)
             | Self::Unprocessable(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
+            Self::NotImplemented => NOT_IMPLEMENTED_MESSAGE,
+            Self::RouteNotFound => ROUTE_NOT_FOUND_MESSAGE,
             Self::RateLimited => RATE_LIMITED_MESSAGE,
             Self::Internal(_) | Self::Database(_) => INTERNAL_MESSAGE,
         }
@@ -106,6 +124,8 @@ impl fmt::Display for AppError {
             | Self::Unprocessable(detail)
             | Self::Internal(detail) => f.write_str(detail),
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
+            Self::NotImplemented => f.write_str(NOT_IMPLEMENTED_MESSAGE),
+            Self::RouteNotFound => f.write_str(ROUTE_NOT_FOUND_MESSAGE),
             Self::RateLimited => f.write_str(RATE_LIMITED_MESSAGE),
             Self::Database(err) => write!(f, "database error: {err}"),
         }
@@ -120,6 +140,8 @@ impl Error for AppError {
             | Self::Unauthorized(_)
             | Self::Forbidden(_)
             | Self::NotFound
+            | Self::NotImplemented
+            | Self::RouteNotFound
             | Self::Conflict(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
@@ -201,6 +223,8 @@ mod tests {
             (AppError::Unauthorized("no token".to_owned()), "no token"),
             (AppError::Forbidden("denied".to_owned()), "denied"),
             (AppError::NotFound, NOT_FOUND_MESSAGE),
+            (AppError::NotImplemented, NOT_IMPLEMENTED_MESSAGE),
+            (AppError::RouteNotFound, ROUTE_NOT_FOUND_MESSAGE),
             (AppError::Conflict("taken".to_owned()), "taken"),
             (AppError::Unprocessable("too long".to_owned()), "too long"),
             (AppError::RateLimited, RATE_LIMITED_MESSAGE),

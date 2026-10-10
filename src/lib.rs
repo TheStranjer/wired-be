@@ -1,12 +1,17 @@
 //! wired-be: an API-only fediverse backend built on Axum.
 
+pub mod api;
 pub mod config;
 pub mod error;
 pub mod middleware;
 pub mod state;
 pub mod util;
 
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{
+    Router,
+    http::{StatusCode, Uri},
+    routing::get,
+};
 use sqlx::PgPool;
 
 use crate::{error::AppError, state::AppState};
@@ -25,11 +30,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 }
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
-/// Paths no route matches get the standard JSON error response (decision 8).
+/// The [`api`] routers are merged under their prefixes; paths no route
+/// matches get the standard JSON error response (decision 8).
 pub fn app(state: AppState) -> Router {
     middleware::apply(
         Router::new()
             .route("/health", get(health))
+            .merge(api::router())
             .fallback(not_found)
             .with_state(state),
     )
@@ -40,10 +47,20 @@ async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-/// Fallback handler: the standard JSON 404 of [`AppError::NotFound`], so even
-/// unmatched routes look like every other error (decision 8).
-async fn not_found() -> AppError {
-    AppError::NotFound
+/// Fallback handler for every unmatched path, answered as a JSON 404
+/// (decision 8). Pleroma's router-level fallback distinguishes unknown
+/// endpoints under `/api` — 404 "Not implemented"
+/// (`lib/pleroma/web/fallback/redirect_controller.ex`, `api_not_implemented`)
+/// — from every other unknown path, 404 "Not found"; both are produced here
+/// as [`AppError`]s. Known paths called with the wrong method never reach
+/// this handler, so they keep axum's default 405.
+async fn not_found(uri: Uri) -> AppError {
+    let path = uri.path();
+    if path == "/api" || path.starts_with("/api/") {
+        AppError::NotImplemented
+    } else {
+        AppError::RouteNotFound
+    }
 }
 
 #[cfg(test)]
@@ -99,8 +116,27 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"error":"Record not found"}"#,
-            "unknown route body is the standard error JSON"
+            r#"{"error":"Not found"}"#,
+            "unknown non-API route body is the router-level 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_api_route_returns_not_implemented() {
+        let response = test_app()
+            .oneshot(Request::get("/api/v1/nothing").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "unrouted API path status"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"error":"Not implemented"}"#,
+            "unrouted path under /api is Pleroma's api_not_implemented"
         );
     }
 
