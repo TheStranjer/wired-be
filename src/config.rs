@@ -34,6 +34,9 @@ pub const MAX_POLL_OPTIONS_VAR: &str = "MAX_POLL_OPTIONS";
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum number of files per request.
 pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
+/// Environment variable holding whether outbound HTTP may reach private
+/// hosts (disabling the SSRF guard).
+pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -55,6 +58,10 @@ pub const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 16_000_000;
 /// Upload file count used when `UPLOAD_MAX_FILES` is unset: Pleroma's
 /// `:upload, max_number_of_files`.
 pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
+/// Whether the outbound SSRF guard is disabled when
+/// `HTTP_ALLOW_PRIVATE_HOSTS` is unset: it is on by default, so private
+/// and loopback targets are blocked.
+pub const DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS: bool = false;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -91,6 +98,10 @@ pub struct Config {
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
+    /// Whether outbound HTTP may connect to private, loopback and other
+    /// reserved addresses, i.e. the SSRF guard is disabled, from
+    /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
+    pub http_allow_private_hosts: bool,
 }
 
 impl Config {
@@ -145,6 +156,11 @@ impl Config {
             max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
             max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
         };
+        let http_allow_private_hosts = boolean(
+            &lookup,
+            HTTP_ALLOW_PRIVATE_HOSTS_VAR,
+            DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
+        )?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -157,6 +173,7 @@ impl Config {
             max_media_attachments,
             max_poll_options,
             upload_limits,
+            http_allow_private_hosts,
         })
     }
 
@@ -175,10 +192,12 @@ impl Config {
         self.base_url.starts_with("https://")
     }
 
-    /// Configuration for tests: `BASE_URL` is `https://test.example`, every
-    /// other setting is at its default, and `DATABASE_URL` is an inert
-    /// placeholder (tests get their real pool from `#[sqlx::test]`). Reads no
-    /// environment variables, so it is safe in parallel tests.
+    /// Configuration for tests: `BASE_URL` is `https://test.example`,
+    /// `HTTP_ALLOW_PRIVATE_HOSTS` is `true` (the suites talk to local
+    /// mini-servers), every other setting is at its default, and
+    /// `DATABASE_URL` is an inert placeholder (tests get their real pool
+    /// from `#[sqlx::test]`). Reads no environment variables, so it is
+    /// safe in parallel tests.
     ///
     /// Available to unit tests through `cfg(test)` and to the integration
     /// tests through the `integration-tests` feature.
@@ -191,6 +210,7 @@ impl Config {
         Self::from_lookup(|key| match key {
             DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
             BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
             _ => None,
         })
         .unwrap_or_else(|_| Self::test_defaults())
@@ -216,6 +236,7 @@ impl Config {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
             },
+            http_allow_private_hosts: true,
         }
     }
 }
@@ -262,6 +283,26 @@ where
     raw.parse().ok().ok_or(ConfigError::InvalidNumber(var))
 }
 
+/// Reads a boolean setting, applying `default` when the variable is unset or
+/// empty. Accepted spellings are `true`/`false` (case-insensitive) and `1`/`0`.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] if the value is neither spelling.
+fn boolean<F>(lookup: &F, var: &'static str, default: bool) -> Result<bool, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) = lookup(var).filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(ConfigError::InvalidBoolean(var)),
+    }
+}
+
 /// Splits a comma-separated list into trimmed, non-empty owned values.
 fn comma_list(value: &str) -> Vec<String> {
     value
@@ -287,6 +328,7 @@ impl fmt::Debug for Config {
             .field("max_media_attachments", &self.max_media_attachments)
             .field("max_poll_options", &self.max_poll_options)
             .field("upload_limits", &self.upload_limits)
+            .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .finish()
     }
 }
@@ -302,6 +344,9 @@ pub enum ConfigError {
     InvalidBaseUrl,
     /// A numeric setting is not a whole number; the value is the variable name.
     InvalidNumber(&'static str),
+    /// A boolean setting is not `true`/`false` (or `1`/`0`); the value is the
+    /// variable name.
+    InvalidBoolean(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -315,6 +360,7 @@ impl fmt::Display for ConfigError {
                  https://social.example with no path or query"
             ),
             Self::InvalidNumber(var) => write!(f, "invalid {var}: expected a whole number"),
+            Self::InvalidBoolean(var) => write!(f, "invalid {var}: expected true or false"),
         }
     }
 }
@@ -322,8 +368,11 @@ impl fmt::Display for ConfigError {
 impl Error for ConfigError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Missing(_) | Self::InvalidBaseUrl | Self::InvalidNumber(_) => None,
             Self::InvalidBindAddr(err) => Some(err),
+            Self::Missing(_)
+            | Self::InvalidBaseUrl
+            | Self::InvalidNumber(_)
+            | Self::InvalidBoolean(_) => None,
         }
     }
 }
@@ -473,6 +522,10 @@ mod tests {
             config.upload_limits.max_files, 16,
             "default UPLOAD_MAX_FILES"
         );
+        assert!(
+            !config.http_allow_private_hosts,
+            "the SSRF guard is on by default"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -489,6 +542,7 @@ mod tests {
             (MAX_POLL_OPTIONS_VAR, "12"),
             (UPLOAD_LIMIT_BYTES_VAR, "1048576"),
             (UPLOAD_MAX_FILES_VAR, "4"),
+            (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -516,6 +570,54 @@ mod tests {
             "custom UPLOAD_LIMIT_BYTES"
         );
         assert_eq!(config.upload_limits.max_files, 4, "custom UPLOAD_MAX_FILES");
+        assert!(
+            config.http_allow_private_hosts,
+            "custom HTTP_ALLOW_PRIVATE_HOSTS"
+        );
+    }
+
+    #[test]
+    fn http_allow_private_hosts_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", false),
+        ] {
+            let config = config_with(&[(HTTP_ALLOW_PRIVATE_HOSTS_VAR, value)]);
+            assert_eq!(
+                config.http_allow_private_hosts, want,
+                "HTTP_ALLOW_PRIVATE_HOSTS={value:?} means {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_http_allow_private_hosts_is_an_error() {
+        let err = try_config_with(&[(HTTP_ALLOW_PRIVATE_HOSTS_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(HTTP_ALLOW_PRIVATE_HOSTS_VAR),
+            "error variant"
+        );
+        assert!(err.source().is_none(), "no source");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {HTTP_ALLOW_PRIVATE_HOSTS_VAR}: ")),
+            "message names the variable"
+        );
+    }
+
+    #[test]
+    fn debug_shows_http_allow_private_hosts() {
+        let config = config_with(&[(HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true")]);
+        assert!(
+            format!("{config:?}").contains("http_allow_private_hosts: true"),
+            "the guard flag is visible in Debug output"
+        );
     }
 
     #[test]
@@ -641,6 +743,10 @@ mod tests {
         assert_eq!(config.database_url, TEST_DATABASE_URL, "placeholder url");
         assert_eq!(config.domain(), "test.example", "test domain");
         assert!(config.is_https(), "test base_url is https");
+        assert!(
+            config.http_allow_private_hosts,
+            "test config disables the SSRF guard for local mini-servers"
+        );
         assert_eq!(
             config.instance_name, DEFAULT_INSTANCE_NAME,
             "defaults apply"
@@ -648,6 +754,7 @@ mod tests {
         let expected = Config::from_lookup(lookup_from(&[
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
             (BASE_URL_VAR, TEST_BASE_URL),
+            (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
         ]))
         .unwrap();
         assert_eq!(config, expected, "for_tests equals from_lookup");
@@ -660,6 +767,7 @@ mod tests {
         let parsed = Config::from_lookup(lookup_from(&[
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
             (BASE_URL_VAR, TEST_BASE_URL),
+            (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
         ]))
         .unwrap();
         assert_eq!(

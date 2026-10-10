@@ -14,7 +14,9 @@ use axum::{Json, Router, extract::Request, http::StatusCode, routing::any};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::config::{BASE_URL_VAR, DATABASE_URL_VAR, TEST_BASE_URL, TEST_DATABASE_URL};
+use wired_be::config::{
+    BASE_URL_VAR, DATABASE_URL_VAR, HTTP_ALLOW_PRIVATE_HOSTS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+};
 
 /// `/health` answers 204 No Content with an empty body.
 #[sqlx::test(migrator = "wired_be::MIGRATOR")]
@@ -202,9 +204,14 @@ fn test_config_is_the_fixed_configuration() {
     let expected = wired_be::config::Config::from_lookup(|key| match key {
         DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
         BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
         _ => None,
     })
     .expect("the fixed test values are valid");
     assert_eq!(config, expected, "test_config equals the fixed lookup");
+    assert!(
+        config.http_allow_private_hosts,
+        "the harness disables the SSRF guard so integration tests can reach local servers"
+    );
     assert_eq!(config.domain(), "test.example", "test domain");
 }
