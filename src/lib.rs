@@ -5,8 +5,22 @@ pub mod error;
 pub mod state;
 
 use axum::{Router, http::StatusCode, routing::get};
+use sqlx::PgPool;
 
 use crate::state::AppState;
+
+/// The migrations embedded from `migrations/`, applied by [`run_migrations`].
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+/// Applies all pending migrations to the database behind `pool`.
+///
+/// # Errors
+///
+/// Returns a [`sqlx::migrate::MigrateError`] if any migration fails to run or
+/// the migration bookkeeping table cannot be read or written.
+pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    MIGRATOR.run(pool).await
+}
 
 /// Builds the application router.
 pub fn app(state: AppState) -> Router {
@@ -58,5 +72,22 @@ mod tests {
             StatusCode::NOT_FOUND,
             "unknown route status"
         );
+    }
+
+    /// Migration tests, run against the throwaway database created by `#[sqlx::test]`.
+    mod migrations {
+        use sqlx::PgPool;
+
+        /// The base extensions migration installs `citext`, `pg_trgm` and `pgcrypto`.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn extensions_migration_installs_all_three_extensions(pool: PgPool) {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pg_extension WHERE extname IN ('citext','pg_trgm','pgcrypto')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(row.0, 3, "all three extensions should be installed");
+        }
     }
 }
