@@ -1403,7 +1403,10 @@ mod tests {
         let hash = hash_password(PASSWORD).expect("the fixture hash is made");
         let frank = insert_login(&pool, "frank", "frank@example.org", Some(&hash)).await;
         assert_eq!(frank.nickname, "frank", "the fixture exists");
-        let dropped = sqlx::query("DROP TABLE users")
+        // CASCADE because the OAuth token and authorization tables now
+        // hold foreign keys to `users`; the point of the exercise is the
+        // same — no readable `users` table for the lookup to hit.
+        let dropped = sqlx::query("DROP TABLE users CASCADE")
             .execute(&pool)
             .await
             .expect("the table can be dropped in a throwaway database");

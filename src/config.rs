@@ -48,6 +48,9 @@ pub const ACCOUNTS_EMAIL_OPTIONAL_VAR: &str = "ACCOUNTS_EMAIL_OPTIONAL";
 /// Environment variable holding the minimum length of a registration
 /// password.
 pub const MIN_PASSWORD_LENGTH_VAR: &str = "MIN_PASSWORD_LENGTH";
+/// Environment variable holding the lifetime of issued OAuth access
+/// tokens, in seconds.
+pub const OAUTH_TOKEN_TTL_SECS_VAR: &str = "OAUTH_TOKEN_TTL_SECS";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -86,6 +89,16 @@ pub const DEFAULT_ACCOUNTS_EMAIL_OPTIONAL: bool = false;
 /// Password length used when `MIN_PASSWORD_LENGTH` is unset: the 8
 /// characters of Pleroma-era Mastodon password minimums.
 pub const DEFAULT_MIN_PASSWORD_LENGTH: usize = 8;
+/// Access-token lifetime used when `OAUTH_TOKEN_TTL_SECS` is unset:
+/// `2_592_000` seconds, 30 days.
+///
+/// Pleroma's own `[:oauth2, :token_expires_in]` ships far longer; the
+/// ticket default rules here. [`DEFAULT_TOKEN_TTL`] is the same span as
+/// a [`std::time::Duration`], kept consistent by a test in
+/// [`crate::models::oauth_token`].
+///
+/// [`DEFAULT_TOKEN_TTL`]: crate::models::oauth_token::DEFAULT_TOKEN_TTL
+pub const DEFAULT_OAUTH_TOKEN_TTL_SECS: usize = 2_592_000;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -139,6 +152,11 @@ pub struct Config {
     /// Minimum length of a registration password in characters, from
     /// `MIN_PASSWORD_LENGTH`.
     pub min_password_length: usize,
+    /// Lifetime granted to newly issued OAuth access tokens, in seconds,
+    /// from `OAUTH_TOKEN_TTL_SECS`. The `/oauth` endpoints pass it to
+    /// [`create_token`](crate::models::oauth_token::create_token) as the
+    /// token's `ttl`.
+    pub oauth_token_ttl_secs: usize,
 }
 
 impl Config {
@@ -208,16 +226,8 @@ impl Config {
             .map(|url| url.trim().trim_end_matches('/').to_owned())
             .filter(|url| !url.is_empty())
             .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"));
-        let accounts_email_optional = boolean(
-            &lookup,
-            ACCOUNTS_EMAIL_OPTIONAL_VAR,
-            DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
-        )?;
-        let min_password_length = number(
-            &lookup,
-            MIN_PASSWORD_LENGTH_VAR,
-            DEFAULT_MIN_PASSWORD_LENGTH,
-        )?;
+        let (accounts_email_optional, min_password_length, oauth_token_ttl_secs) =
+            auth_settings(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -235,6 +245,7 @@ impl Config {
             http_allow_private_hosts,
             accounts_email_optional,
             min_password_length,
+            oauth_token_ttl_secs,
         })
     }
 
@@ -302,6 +313,7 @@ impl Config {
             http_allow_private_hosts: true,
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
+            oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
         }
     }
 }
@@ -330,6 +342,33 @@ fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
         .port()
         .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
     Ok(format!("{}://{domain}", url.scheme()))
+}
+
+/// Reads the three settings that gate registration and token issuance:
+/// whether registration may omit the email address, the registration
+/// password minimum and the access-token lifetime. Grouped because each
+/// is a plain default-or-parse and [`Config::from_lookup`] has a size
+/// budget (AGENTS.md); the tuple comes back in field order.
+fn auth_settings<F>(lookup: &F) -> Result<(bool, usize, usize), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let accounts_email_optional = boolean(
+        lookup,
+        ACCOUNTS_EMAIL_OPTIONAL_VAR,
+        DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
+    )?;
+    let min_password_length = number(lookup, MIN_PASSWORD_LENGTH_VAR, DEFAULT_MIN_PASSWORD_LENGTH)?;
+    let oauth_token_ttl_secs = number(
+        lookup,
+        OAUTH_TOKEN_TTL_SECS_VAR,
+        DEFAULT_OAUTH_TOKEN_TTL_SECS,
+    )?;
+    Ok((
+        accounts_email_optional,
+        min_password_length,
+        oauth_token_ttl_secs,
+    ))
 }
 
 /// Reads a non-negative integer setting, applying `default` when the variable
@@ -398,6 +437,7 @@ impl fmt::Debug for Config {
             .field("media_base_url", &self.media_base_url)
             .field("accounts_email_optional", &self.accounts_email_optional)
             .field("min_password_length", &self.min_password_length)
+            .field("oauth_token_ttl_secs", &self.oauth_token_ttl_secs)
             .finish()
     }
 }
@@ -609,6 +649,10 @@ mod tests {
             "an email address is required at registration by default"
         );
         assert_eq!(config.min_password_length, 8, "default MIN_PASSWORD_LENGTH");
+        assert_eq!(
+            config.oauth_token_ttl_secs, 2_592_000,
+            "default OAUTH_TOKEN_TTL_SECS is 30 days"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -630,6 +674,7 @@ mod tests {
             (MEDIA_BASE_URL_VAR, "https://cdn.example/media"),
             (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
             (MIN_PASSWORD_LENGTH_VAR, "12"),
+            (OAUTH_TOKEN_TTL_SECS_VAR, "3600"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -675,6 +720,10 @@ mod tests {
             "custom ACCOUNTS_EMAIL_OPTIONAL"
         );
         assert_eq!(config.min_password_length, 12, "custom MIN_PASSWORD_LENGTH");
+        assert_eq!(
+            config.oauth_token_ttl_secs, 3_600,
+            "custom OAUTH_TOKEN_TTL_SECS"
+        );
     }
 
     #[test]
@@ -837,6 +886,16 @@ mod tests {
     }
 
     #[test]
+    fn debug_shows_the_token_ttl_setting() {
+        let config = config_with(&[(OAUTH_TOKEN_TTL_SECS_VAR, "600")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("oauth_token_ttl_secs: 600"),
+            "the token lifetime is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
     fn empty_contact_email_is_none() {
         let config = config_with(&[(CONTACT_EMAIL_VAR, "")]);
         assert_eq!(config.contact_email, None, "empty contact_email");
@@ -922,6 +981,7 @@ mod tests {
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
+            OAUTH_TOKEN_TTL_SECS_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");
