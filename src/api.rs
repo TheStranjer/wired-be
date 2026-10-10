@@ -13,6 +13,7 @@
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
 
+pub mod apps;
 pub mod v1;
 pub mod v2;
 
