@@ -32,7 +32,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::PgPool;
 use tower::ServiceExt as _;
-use wired_be::{config::Config, http_client::HttpClient, state::AppState};
+use wired_be::{
+    config::Config,
+    http_client::HttpClient,
+    models::user::{NewUser, User, insert, local_ap_id},
+    state::AppState,
+};
 
 /// The configuration [`test_app`] runs with: `BASE_URL` `https://test.example`,
 /// defaults everywhere else, no environment access.
@@ -50,6 +55,24 @@ pub fn test_app(pool: PgPool) -> Router {
         http_client: HttpClient::from(config.as_ref()),
         config,
     })
+}
+
+/// Inserts a local [`User`] named `nickname` straight through
+/// [`wired_be::models::user`], with no password, and returns its row.
+///
+/// The actor id is [`local_ap_id`] on the [`test_config`] instance, so
+/// fixtures and federation-shaped code agree on the URL.
+///
+/// # Panics
+///
+/// If the insert fails, e.g. because the nickname is already taken in the
+/// test database.
+pub async fn create_local_user(pool: &PgPool, nickname: &str) -> User {
+    let config = test_config();
+    let ap_id = local_ap_id(&config.base_url, nickname);
+    insert(pool, &NewUser::local(nickname, &ap_id))
+        .await
+        .expect("local user fixture inserts")
 }
 
 /// A request under construction: the verb methods start a builder, the
