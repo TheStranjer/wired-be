@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod middleware;
 pub mod state;
 pub mod util;
 
@@ -23,11 +24,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     MIGRATOR.run(pool).await
 }
 
-/// Builds the application router.
+/// Builds the application router, wrapped in the [`middleware`] stack.
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .with_state(state)
+    middleware::apply(
+        Router::new()
+            .route("/health", get(health))
+            .with_state(state),
+    )
 }
 
 /// Liveness probe.
