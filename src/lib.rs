@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod entities;
 pub mod error;
 pub mod extract;
 pub mod federation;
