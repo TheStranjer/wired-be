@@ -8,3 +8,4 @@
 //! handlers can use `?`.
 
 pub mod job;
+pub mod user;

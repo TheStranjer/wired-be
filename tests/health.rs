@@ -215,3 +215,28 @@ fn test_config_is_the_fixed_configuration() {
     );
     assert_eq!(config.domain(), "test.example", "test domain");
 }
+
+/// [`create_local_user`](common::create_local_user) inserts a local,
+/// passwordless row through the model layer, with the test instance's
+/// actor URL, and the row is readable back case-insensitively.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn create_local_user_fixture_inserts_a_row(pool: PgPool) {
+    let user = common::create_local_user(&pool, "tess").await;
+    assert_eq!(user.nickname, "tess", "the nickname is stored as given");
+    assert!(user.local.get(), "the fixture builds a local account");
+    assert!(user.password_hash.is_none(), "the fixture sets no password");
+    assert_eq!(
+        user.ap_id,
+        format!("{TEST_BASE_URL}/users/tess"),
+        "the actor id is local_ap_id on the test instance"
+    );
+
+    let fetched = wired_be::models::user::get_by_nickname(&pool, "TESS")
+        .await
+        .expect("the lookup reaches the database")
+        .expect("the fixture row exists");
+    assert_eq!(
+        fetched.id, user.id,
+        "citext finds the fixture case-insensitively"
+    );
+}
