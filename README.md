@@ -14,7 +14,15 @@ All configuration comes from environment variables. For local development, copy 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
+| `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
+| `INSTANCE_NAME` | no | `Wired` | Instance display name |
+| `INSTANCE_DESCRIPTION` | no | `A Pleroma-compatible instance` | Short instance description |
+| `CONTACT_EMAIL` | no | | Admin contact email |
+| `INSTANCE_LANGUAGES` | no | `en` | Comma-separated content language codes |
+| `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status |
+| `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
+| `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
 
 ## Development
 

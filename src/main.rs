@@ -1,6 +1,6 @@
 //! Server entry point: load config, connect to PostgreSQL, migrate, serve.
 
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
@@ -32,6 +32,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("database migrations applied");
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(addr = %config.bind_addr, "listening");
-    axum::serve(listener, app(AppState { db })).await?;
+    let state = AppState {
+        db,
+        config: Arc::new(config),
+    };
+    axum::serve(listener, app(state)).await?;
     Ok(())
 }
