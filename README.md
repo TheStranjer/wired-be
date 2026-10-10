@@ -28,3 +28,7 @@ scripts/ci.sh          # full gate (same as CI): exits 0 if everything passes, 1
 ```
 
 Lint configuration lives in `Cargo.toml` (`[lints]`) and `clippy.toml`. See `AGENTS.md` for contribution rules.
+
+## Tests
+
+Tests need a reachable PostgreSQL, given by `DATABASE_URL` (or `.env`). They use `#[sqlx::test]`, which creates a fresh throwaway database per test, applies the migrations from `migrations/`, and drops the database afterwards; the database named in `DATABASE_URL` itself is never mutated. The connecting role must be able to create databases.
