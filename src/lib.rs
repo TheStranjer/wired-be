@@ -7,6 +7,7 @@ pub mod extract;
 pub mod http_client;
 pub mod middleware;
 pub mod models;
+pub mod oauth;
 pub mod pagination;
 pub mod state;
 pub mod util;
