@@ -24,6 +24,7 @@ cargo run              # serves on BIND_ADDR
 cargo test
 cargo clippy --all-targets --all-features
 cargo fmt
+scripts/ci.sh          # full gate (same as CI): exits 0 if everything passes, 1 otherwise
 ```
 
 Lint configuration lives in `Cargo.toml` (`[lints]`) and `clippy.toml`. See `AGENTS.md` for contribution rules.

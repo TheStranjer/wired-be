@@ -2,6 +2,10 @@
 
 Rules for anyone (human or AI) changing this codebase.
 
+## The gate
+
+`scripts/ci.sh` runs every check: `cargo fmt --check`, Clippy, the tests, and rustdoc with warnings denied. It keeps going after a failure, so one run reports everything that's broken. It exits 0 only when all checks pass and 1 otherwise. `.github/workflows/ci.yml` runs this same script, so a green local run means a green pipeline. A change is not done until `scripts/ci.sh` exits 0. To add a check, add it to the script, not the workflow.
+
 ## Testing
 
 - Every code path you add or change must be covered by tests: success paths, error paths, and edge cases.
