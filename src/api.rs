@@ -22,6 +22,7 @@
 
 pub mod activitypub;
 pub mod apps;
+pub mod custom_emojis;
 pub mod media_files;
 pub mod v1;
 pub mod v2;
