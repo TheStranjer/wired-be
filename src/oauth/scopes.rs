@@ -36,6 +36,13 @@ pub const READ_FOLLOWS: &str = "read:follows";
 /// The write side of the follow actions, granted by `write` and by `follow`.
 pub const WRITE_FOLLOWS: &str = "write:follows";
 
+/// The read side of account security: `GET /api/pleroma/accounts/mfa`
+/// (Pleroma's `read:security` scope on the MFA settings action).
+pub const READ_SECURITY: &str = "read:security";
+/// The write side of account security: the MFA setup, confirmation,
+/// backup-code and disable actions (Pleroma's `write:security`).
+pub const WRITE_SECURITY: &str = "write:security";
+
 /// The roots of the scope trees [`Scopes::validate`] accepts.
 const VALID_ROOTS: [&str; 6] = [READ, WRITE, FOLLOW, PUSH, ADMIN_READ, ADMIN_WRITE];
 
