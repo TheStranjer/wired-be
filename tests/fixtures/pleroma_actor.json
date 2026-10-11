@@ -1,0 +1,72 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/v1",
+    {
+      "litepub": "http://litepub.social/ns#",
+      "capabilities": "litepub:capabilities",
+      "movedTo": { "@id": "as:movedTo", "@type": "@id" },
+      "PropertyValue": "schema:PropertyValue",
+      "value": "schema:value"
+    }
+  ],
+  "id": "https://pleroma.example/users/bob.the-bot",
+  "type": "Service",
+  "preferredUsername": "bob.the-bot",
+  "name": "Bob",
+  "summary": "<p>Hi <span class=\"h-card\"><a href=\"https://pleroma.example/users/alice\" class=\"u-url mention\">@<span>alice</span></a></span><br>bot here<br><script>alert(1)</script><style>p{}</style>bye</p>",
+  "url": [
+    {
+      "type": "Link",
+      "href": "https://pleroma.example/users/bob.the-bot",
+      "mediaType": "text/html"
+    },
+    {
+      "type": "Link",
+      "href": "https://pleroma.example/@bob",
+      "mediaType": "application/activity+json"
+    }
+  ],
+  "inbox": "https://pleroma.example/users/bob.the-bot/inbox",
+  "outbox": {
+    "id": "https://pleroma.example/users/bob.the-bot/outbox",
+    "type": "OrderedCollection",
+    "totalItems": 3
+  },
+  "followers": "https://pleroma.example/users/bob.the-bot/followers",
+  "following": "https://pleroma.example/users/bob.the-bot/following",
+  "featured": "https://pleroma.example/users/bob.the-bot/collections/featured",
+  "endpoints": {
+    "sharedInbox": "https://pleroma.example/inbox"
+  },
+  "publicKey": [
+    {
+      "id": "https://pleroma.example/users/bob.the-bot#main-key",
+      "owner": "https://pleroma.example/users/bob.the-bot",
+      "publicKeyPem": "-----BEGIN RSA PUBLIC KEY-----\nMIIBCgKCAQEAq3Z2rPbFh0T8xvKpLm5tNqRsUvWxYzA1bCdEfGhIjKlMnOpQrSt\nUvWxYz0123456789abcdefghijABCDEFGHIJ0123456789abcdefghijABCDEFGHI\nJ01234567890QIDAV==\n-----END RSA PUBLIC KEY-----\n"
+    }
+  ],
+  "icon": [
+    {
+      "type": "Image",
+      "mediaType": "image/png",
+      "url": [
+        {
+          "type": "Link",
+          "href": "https://pleroma.example/images/bob/avatar.png",
+          "mediaType": "image/png"
+        }
+      ]
+    }
+  ],
+  "image": "https://pleroma.example/images/bob/banner.png",
+  "manuallyApprovesFollowers": true,
+  "attachment": [
+    { "type": "PropertyValue", "name": "web", "value": "https://bob.example" },
+    { "type": "Hashtag", "name": "ignored", "value": "not a field" }
+  ],
+  "alsoKnownAs": "https://old.example/users/bob",
+  "capabilities": { "acceptsChatMessages": true },
+  "movedTo": "https://new.example/users/bob.the-bot",
+  "published": "2019-06-01T00:00:00.000Z"
+}
