@@ -32,7 +32,10 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::user::{self, User},
+    models::{
+        oauth_app::OauthApp,
+        user::{self, User},
+    },
     util::{
         id::new_id,
         token::{CREDENTIAL_BYTES, random_token},
@@ -250,6 +253,96 @@ pub async fn get_valid_token(
         None => None,
     };
     Ok(Some((found, user)))
+}
+
+/// The `SELECT` behind [`get_with_app`]: the `oauth_tokens` row
+/// verbatim, then every `oauth_apps` column but its `id` aliased under
+/// an `app_` prefix — the two tables share `scopes`, `user_id` and the
+/// timestamps, so a bare `a.*` would read the token's values into the
+/// app. `a.id` needs no alias or column: the join condition makes it
+/// [`OauthToken::app_id`], so it is not selected at all, and the
+/// `ON DELETE CASCADE` foreign key on `app_id` makes the joined app
+/// total.
+const TOKEN_WITH_APP_SQL: &str = "SELECT t.*,
+        a.client_name AS app_client_name,
+        a.redirect_uris AS app_redirect_uris, a.scopes AS app_scopes,
+        a.website AS app_website, a.client_id AS app_client_id,
+        a.client_secret AS app_client_secret, a.trusted AS app_trusted,
+        a.user_id AS app_user_id, a.inserted_at AS app_inserted_at,
+        a.updated_at AS app_updated_at
+   FROM oauth_tokens t
+   JOIN oauth_apps a ON a.id = t.app_id
+  WHERE t.token = $1";
+
+/// Join row for [`get_with_app`]: the [`OauthToken`] flattened from the
+/// leading `t.*` columns (the first match wins every shared name) and
+/// the [`OauthApp`]'s columns read through their `app_` aliases.
+#[derive(sqlx::FromRow)]
+struct TokenWithAppRow {
+    /// The `oauth_tokens` row.
+    #[sqlx(flatten)]
+    token: OauthToken,
+    /// `oauth_apps.client_name`.
+    app_client_name: String,
+    /// `oauth_apps.redirect_uris`.
+    app_redirect_uris: String,
+    /// `oauth_apps.scopes`, aliased `app_scopes` in SQL.
+    app_scopes: String,
+    /// `oauth_apps.website`.
+    app_website: Option<String>,
+    /// `oauth_apps.client_id`.
+    app_client_id: String,
+    /// `oauth_apps.client_secret`.
+    app_client_secret: String,
+    /// `oauth_apps.trusted`.
+    app_trusted: bool,
+    /// `oauth_apps.user_id`.
+    app_user_id: Option<Uuid>,
+    /// `oauth_apps.inserted_at`.
+    app_inserted_at: DateTime<Utc>,
+    /// `oauth_apps.updated_at`.
+    app_updated_at: DateTime<Utc>,
+}
+
+impl TokenWithAppRow {
+    /// Splits the join row into its token and app; the app's primary key
+    /// is the join's other side, [`OauthToken::app_id`].
+    fn into_parts(self) -> (OauthToken, OauthApp) {
+        let app = OauthApp {
+            id: self.token.app_id,
+            client_name: self.app_client_name,
+            redirect_uris: self.app_redirect_uris,
+            scopes: self.app_scopes,
+            website: self.app_website,
+            client_id: self.app_client_id,
+            client_secret: self.app_client_secret,
+            trusted: self.app_trusted,
+            user_id: self.app_user_id,
+            inserted_at: self.app_inserted_at,
+            updated_at: self.app_updated_at,
+        };
+        (self.token, app)
+    }
+}
+
+/// Fetches the access token `token` together with the application that
+/// issued it, exactly as stored.
+///
+/// **No validity filter**: an expired row is still returned, leaving
+/// expiry and account activity to the caller (unlike
+/// [`get_valid_token`], which hides both). [`crate::auth`] uses it to
+/// tell an expired token (401) from a deactivated owner (403).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_with_app(pool: &PgPool, token: &str) -> AppResult<Option<(OauthToken, OauthApp)>> {
+    let row = sqlx::query_as::<_, TokenWithAppRow>(TOKEN_WITH_APP_SQL)
+        .bind(token)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(TokenWithAppRow::into_parts))
 }
 
 /// Fetches the token whose `refresh_token` is `refresh_token`, `None`
@@ -695,6 +788,100 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a suspended user's bearer token stops working"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn get_with_app_returns_the_stored_rows_verbatim(pool: PgPool) {
+        let nina = insert_user(&pool, "nina").await;
+        let app = insert_app(&pool, "Bearer").await;
+        let token = create_token(
+            &pool,
+            &NewToken {
+                scopes: "write follow".to_owned(),
+                ..new_token(Some(nina.id), app.id)
+            },
+        )
+        .await
+        .unwrap();
+
+        let (found, found_app) = get_with_app(&pool, &token.token)
+            .await
+            .unwrap()
+            .expect("a stored token is found with its app");
+        assert_eq!(found.id, token.id, "the token row comes back");
+        assert_eq!(found.token, token.token, "the secret round trips");
+        assert_eq!(found.scopes, "write follow", "the token keeps its scopes");
+        assert_eq!(found_app.id, app.id, "the app id is the join target");
+        assert_eq!(found_app.client_name, app.client_name, "name round trips");
+        assert_eq!(
+            found_app.redirect_uris, app.redirect_uris,
+            "redirect uris round trip"
+        );
+        assert_eq!(
+            found_app.scopes, app.scopes,
+            "the app reads its own aliased scopes, not the token's"
+        );
+        assert_eq!(found_app.website, app.website, "website round trips");
+        assert_eq!(found_app.client_id, app.client_id, "client id round trips");
+        assert_eq!(
+            found_app.client_secret, app.client_secret,
+            "the whole app row arrives"
+        );
+        assert_eq!(found_app.trusted, app.trusted, "trusted round trips");
+        assert_eq!(
+            found_app.user_id, app.user_id,
+            "the app reads its own NULL owner, not the token's user"
+        );
+        assert_eq!(
+            found_app.inserted_at, app.inserted_at,
+            "the app keeps its own timestamps"
+        );
+
+        // App-only tokens join their app just the same.
+        let app_only = create_token(&pool, &new_token(None, app.id)).await.unwrap();
+        let (_, app_of_it) = get_with_app(&pool, &app_only.token)
+            .await
+            .unwrap()
+            .expect("a client_credentials token is found too");
+        assert_eq!(app_of_it.id, app.id, "same issuing app");
+
+        assert!(
+            get_with_app(&pool, "no-such-token")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown access token finds nothing"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn get_with_app_applies_no_validity_filter(pool: PgPool) {
+        let oscar = insert_user(&pool, "oscar").await;
+        let app = insert_app(&pool, "Unfiltered").await;
+        let token = create_token(&pool, &new_token(Some(oscar.id), app.id))
+            .await
+            .unwrap();
+        assert!(
+            get_with_app(&pool, &token.token).await.unwrap().is_some(),
+            "fresh, it is found"
+        );
+        expire_token(&pool, token.id).await;
+        assert!(
+            get_with_app(&pool, &token.token).await.unwrap().is_some(),
+            "an expired row still arrives (expiry is the caller's call)"
+        );
+        assert!(
+            get_valid_token(&pool, &token.token)
+                .await
+                .unwrap()
+                .is_none(),
+            "whereas the validity-filtered lookup hides it"
+        );
+        deactivate_user(&pool, oscar.id).await;
+        assert!(
+            get_with_app(&pool, &token.token).await.unwrap().is_some(),
+            "and a deactivated owner hides it neither"
         );
     }
 
