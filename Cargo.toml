@@ -24,6 +24,9 @@ ammonia = "4.2.1"
 # Comeonin hashes, bcrypt for its bcrypt hashes.
 argon2 = { version = "0.6.0", features = ["password-hash"] }
 axum = { version = "0.8.9", features = ["multipart"] }
+# Base32 secrets for two-factor auth (`src/util/totp.rs`): RFC 4648
+# encoding/decoding is what authenticator apps display and consume.
+base32 = "0.5.1"
 base64 = "0.23.1"
 bcrypt = "0.19.3"
 # Byte buffers (`src/http_client.rs`): buffered response bodies and the
@@ -32,6 +35,9 @@ bcrypt = "0.19.3"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 dotenvy = "0.15.7"
+# HMAC (`src/util/totp.rs`): RFC 6238/4226 TOTP is HMAC-SHA1 over the time
+# step; `sha1` below supplies the hash, `subtle` the constant-time compare.
+hmac = "0.13.0"
 pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 # Markdown for `text/markdown` statuses (`src/util/format.rs`): only the pull
 # parser is used, so the default features (`html`, `getopts`,
@@ -56,8 +62,15 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rsa = { version = "0.9.10", features = ["sha2", "pem"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# SHA-1 (`src/util/totp.rs`): the hash RFC 6238 pins for TOTP. (SHA-256 for
+# backup-code hashes stays on `sha2` above; SHA-1 here is a MAC ingredient,
+# never a collision-resistant digest.)
+sha1 = "0.11.0"
 sha2 = { version = "0.10", features = ["oid"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "json", "chrono"] }
+# Constant-time equality (`src/util/totp.rs`): comparing user-supplied
+# one-time codes must not leak how close they were through timing.
+subtle = "2.6.1"
 tokio = { version = "1.53.2", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "limit", "request-id", "compression-gzip"] }
 tracing = "0.1.44"
