@@ -32,10 +32,15 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use sqlx::PgPool;
 use tower::ServiceExt as _;
+use uuid::Uuid;
 use wired_be::{
     config::Config,
     http_client::HttpClient,
-    models::user::{NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
+    models::{
+        oauth_app::{self, NewOauthApp},
+        oauth_token::{self, NewToken},
+        user::{NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
+    },
     state::AppState,
     uploads::UploaderBackend,
     util::password::hash_password,
@@ -199,6 +204,78 @@ pub async fn create_remote_user(pool: &PgPool, nickname: &str, host: &str) -> Us
     insert(pool, &new)
         .await
         .expect("remote user fixture inserts")
+}
+
+/// The redirect URI every app fixture registers.
+const TEST_REDIRECT_URIS: &str = "https://client.example/callback";
+
+/// Registers a test app and mints a user-bound bearer token, both
+/// granting `scopes` (one space-separated string,
+/// [`Scopes::parse`](wired_be::oauth::scopes::Scopes::parse) form);
+/// returns the access token string to send as `Authorization: Bearer`.
+///
+/// The token carries the default lifetime; tests that need another
+/// state (expired, deactivated owner) mint through
+/// [`wired_be::models::oauth_token`] themselves and adjust the row.
+///
+/// # Panics
+///
+/// If the app or token insert fails.
+pub async fn create_app_and_token(pool: &PgPool, user: &User, scopes: &str) -> String {
+    let app = oauth_app::create(pool, &test_app_registration(Some(user.id), scopes))
+        .await
+        .expect("app fixture inserts");
+    create_token_for(pool, Some(user.id), app.id, scopes).await
+}
+
+/// Registers a test app and mints an app-only (`client_credentials`)
+/// bearer token granting `scopes`; returns the access token string.
+///
+/// The user-unbound counterpart of [`create_app_and_token`], for the
+/// app-only behaviour of the extractors.
+///
+/// # Panics
+///
+/// If the app or token insert fails.
+pub async fn create_app_only_token(pool: &PgPool, scopes: &str) -> String {
+    let app = oauth_app::create(pool, &test_app_registration(None, scopes))
+        .await
+        .expect("app fixture inserts");
+    create_token_for(pool, None, app.id, scopes).await
+}
+
+/// The [`NewOauthApp`] both token fixtures register: a named test
+/// client granted `scopes` on behalf of `user_id`.
+fn test_app_registration(user_id: Option<Uuid>, scopes: &str) -> NewOauthApp {
+    NewOauthApp {
+        client_name: "Test Client".to_owned(),
+        redirect_uris: TEST_REDIRECT_URIS.to_owned(),
+        scopes: scopes.to_owned(),
+        website: None,
+        user_id,
+    }
+}
+
+/// Mints a token for `user_id` (`None` app-only) issued by `app_id`
+/// with `scopes` and returns its access token string.
+async fn create_token_for(
+    pool: &PgPool,
+    user_id: Option<Uuid>,
+    app_id: Uuid,
+    scopes: &str,
+) -> String {
+    let token = oauth_token::create_token(
+        pool,
+        &NewToken {
+            user_id,
+            app_id,
+            scopes: scopes.to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("token fixture inserts");
+    token.token
 }
 
 /// A request under construction: the verb methods start a builder, the
