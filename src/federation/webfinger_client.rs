@@ -168,8 +168,10 @@ pub async fn resolve_acct(http: &HttpClient, acct: &str) -> Result<String, Webfi
 /// spec-fixed `https://{domain}` base of both the `WebFinger` and the
 /// host-meta URL. `WebFinger` is HTTPS-only by RFC 7033, but the tests
 /// serve their mocks over plain HTTP on loopback, so they go through here;
-/// production resolves with [`None`] and speaks the spec.
-async fn resolve_acct_with_base(
+/// production resolves with [`None`] and speaks the spec. Crate-visible
+/// for the same reason: [`crate::federation::fetch_actor`]'s account tests
+/// drive the full resolve-then-fetch round trip against loopback mocks.
+pub(crate) async fn resolve_acct_with_base(
     http: &HttpClient,
     acct: &str,
     scheme_and_authority_override: Option<&str>,
@@ -333,8 +335,10 @@ pub fn split_acct(acct: &str) -> Option<(String, String)> {
 }
 
 /// `acct` without its leading `@` and `acct:` prefixes (each optional, in
-/// either order).
-fn strip_finger_prefixes(acct: &str) -> &str {
+/// either order). Crate-visible so [`crate::federation::fetch_actor`]'s
+/// handle round trip can fold a requested `acct:` to the bare
+/// `nick@domain` its mirrors store.
+pub(crate) fn strip_finger_prefixes(acct: &str) -> &str {
     let without_at = acct.strip_prefix('@').unwrap_or(acct);
     let without_scheme = strip_prefix_ignore_case(without_at, ACCT_PREFIX).unwrap_or(without_at);
     without_scheme.strip_prefix('@').unwrap_or(without_scheme)

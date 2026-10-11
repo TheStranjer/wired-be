@@ -91,6 +91,9 @@ pub enum AppError {
     Unprocessable(String),
     /// The caller exceeded its rate limit (429).
     RateLimited,
+    /// An instance this one talked to upstream failed or misbehaved (502),
+    /// the federation-gateway error: its detail is logged, never sent.
+    BadGateway(String),
     /// A server-side failure; its detail is logged, never sent (500).
     Internal(String),
     /// A PostgreSQL failure; its detail is logged, never sent (500).
@@ -133,6 +136,7 @@ impl AppError {
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -155,7 +159,7 @@ impl AppError {
             Self::RouteNotFound => ROUTE_NOT_FOUND_MESSAGE,
             Self::Gone => GONE_MESSAGE,
             Self::RateLimited => RATE_LIMITED_MESSAGE,
-            Self::Internal(_) | Self::Database(_) => INTERNAL_MESSAGE,
+            Self::BadGateway(_) | Self::Internal(_) | Self::Database(_) => INTERNAL_MESSAGE,
         }
     }
 
@@ -167,6 +171,9 @@ impl AppError {
         }
         if let Self::Database(detail) = self {
             error!(%detail, %status, "database error");
+        }
+        if let Self::BadGateway(detail) = self {
+            error!(%detail, %status, "bad gateway");
         }
     }
 }
@@ -185,6 +192,7 @@ impl fmt::Display for AppError {
             | Self::UnsupportedMediaType(detail)
             | Self::Unprocessable(detail)
             | Self::Internal(detail)
+            | Self::BadGateway(detail)
             | Self::NotFoundMessage(detail) => f.write_str(detail),
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
             Self::NotImplemented => f.write_str(NOT_IMPLEMENTED_MESSAGE),
@@ -214,6 +222,7 @@ impl Error for AppError {
             | Self::UnsupportedMediaType(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
+            | Self::BadGateway(_)
             | Self::Internal(_) => None,
         }
     }
@@ -330,6 +339,7 @@ mod tests {
             ),
             (AppError::Unprocessable("too long".to_owned()), "too long"),
             (AppError::RateLimited, RATE_LIMITED_MESSAGE),
+            (AppError::BadGateway(SECRET.to_owned()), INTERNAL_MESSAGE),
             (AppError::Internal(SECRET.to_owned()), INTERNAL_MESSAGE),
             (
                 AppError::Database(SqlxError::Protocol(SECRET.to_owned())),
@@ -423,6 +433,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bad_gateway_hides_its_upstream_detail() {
+        let (status, _, body) = render(AppError::BadGateway(SECRET.to_owned())).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "502 status");
+        assert_eq!(body, json_body(INTERNAL_MESSAGE), "generic 502 body");
+        assert!(!body.contains(SECRET), "upstream detail must not leak");
+    }
+
+    #[tokio::test]
     async fn database_error_hides_its_detail() {
         let error = AppError::from(SqlxError::Protocol(SECRET.to_owned()));
         assert!(
@@ -475,6 +493,11 @@ mod tests {
             AppError::Internal(SECRET.to_owned()).to_string(),
             SECRET,
             "display keeps the detail a 500 hides"
+        );
+        assert_eq!(
+            AppError::BadGateway(SECRET.to_owned()).to_string(),
+            SECRET,
+            "display keeps the detail a 502 hides"
         );
         assert_eq!(
             AppError::forbidden_with_identifier("disabled", ACCOUNT_ID).to_string(),
