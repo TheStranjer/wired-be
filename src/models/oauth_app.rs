@@ -161,6 +161,37 @@ pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<OauthApp>> {
     Ok(app)
 }
 
+/// The `SELECT` behind [`list_for_user`]: the whole `oauth_apps` row,
+/// kept when the user owns the app or holds any token issued for it —
+/// the `EXISTS` subquery deduplicates multi-token apps to one row —
+/// newest app first (`UUIDv7` text sorts by mint time, decision 4).
+const LIST_FOR_USER_SQL: &str = "SELECT * FROM oauth_apps a
+  WHERE a.user_id = $1
+     OR EXISTS (
+            SELECT 1 FROM oauth_tokens t
+             WHERE t.app_id = a.id AND t.user_id = $1
+        )
+  ORDER BY a.id DESC";
+
+/// Fetches the apps visible to `GET /api/v1/pleroma/apps` for `user_id`:
+/// the ones they registered ([`OauthApp::user_id`]) plus the ones they
+/// hold a token for, deduplicated and newest first.
+///
+/// Expiry is not considered: holding a (even lapsed) token still names
+/// the app. An unknown user yields an empty `Vec`.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<OauthApp>> {
+    let apps = sqlx::query_as::<_, OauthApp>(LIST_FOR_USER_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(apps)
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
@@ -300,5 +331,95 @@ mod tests {
             debug.contains("Secretive"),
             "the rest of the row is visible"
         );
+    }
+
+    /// Inserts a local user named `nickname` and returns its id.
+    async fn insert_user(pool: &PgPool, nickname: &str) -> Uuid {
+        use crate::models::user::{self, NewUser};
+
+        let ap_id = format!("https://test.example/users/{nickname}");
+        user::insert(pool, &NewUser::local(nickname, &ap_id))
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Mints a token acting as `user_id` issued by `app` and returns it.
+    async fn insert_token(
+        pool: &PgPool,
+        user_id: Uuid,
+        app: &OauthApp,
+    ) -> crate::models::oauth_token::OauthToken {
+        use crate::models::oauth_token::{self, NewToken};
+
+        oauth_token::create_token(
+            pool,
+            &NewToken {
+                user_id: Some(user_id),
+                app_id: app.id,
+                scopes: "read".to_owned(),
+                ttl: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_for_user_covers_owned_and_tokened_apps_deduped(pool: PgPool) {
+        use crate::models::oauth_token;
+
+        let alice = insert_user(&pool, "alice").await;
+        let bob = insert_user(&pool, "bob").await;
+        let owned = create(
+            &pool,
+            &NewOauthApp {
+                user_id: Some(alice),
+                ..new_app("Owned")
+            },
+        )
+        .await
+        .unwrap();
+        let tokened = create(&pool, &new_app("Tokened")).await.unwrap();
+        let foreign = create(
+            &pool,
+            &NewOauthApp {
+                user_id: Some(bob),
+                ..new_app("Foreign")
+            },
+        )
+        .await
+        .unwrap();
+        let _stranger = create(&pool, &new_app("Stranger")).await.unwrap();
+        let older_token = insert_token(&pool, alice, &tokened).await;
+        let _newer_token = insert_token(&pool, alice, &tokened).await;
+        let _bobs_token = insert_token(&pool, bob, &foreign).await;
+
+        let listed = list_for_user(&pool, alice).await.unwrap();
+        let ids: Vec<Uuid> = listed.iter().map(|app| app.id).collect();
+        assert_eq!(
+            ids,
+            vec![tokened.id, owned.id],
+            "owned plus tokened apps, deduplicated, newest first"
+        );
+        assert!(
+            !ids.contains(&foreign.id),
+            "another user's app stays out even when that user holds its token"
+        );
+        assert_eq!(
+            list_for_user(&pool, bob).await.unwrap().len(),
+            1,
+            "bob sees only his own app"
+        );
+        assert!(
+            list_for_user(&pool, new_id()).await.unwrap().is_empty(),
+            "an unknown user sees no apps"
+        );
+        // Tokens exist for the tokened app (checked through the model).
+        let (found, _) = oauth_token::get_with_app(&pool, &older_token.token)
+            .await
+            .unwrap()
+            .expect("the fixture token is stored");
+        assert_eq!(found.app_id, tokened.id, "and names the tokened app");
     }
 }

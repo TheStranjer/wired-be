@@ -38,6 +38,7 @@ pub mod media;
 pub mod media_files;
 pub mod mfa;
 pub mod oauth;
+pub mod oauth_tokens;
 pub mod pleroma;
 pub mod v1;
 pub mod v2;
@@ -50,11 +51,12 @@ use crate::{config::Config, state::AppState};
 /// Composes the API area routers under their URL prefixes.
 ///
 /// `/api/v1` ([`v1`]) and `/api/v2` ([`v2`]) hold the Mastodon-compatible
-/// client API, `/api/pleroma` ([`pleroma`]) Pleroma's own extensions;
-/// later tickets add the remaining `/api` areas (admin) here the same
-/// way. [`media_files`] and [`activitypub`] are the exceptions: they serve
-/// `/media` and `/users`, addresses that go out in `ActivityPub`
-/// documents, and [`crate::app`] merges them directly.
+/// client API, `/api/pleroma` ([`pleroma`]) Pleroma's own extensions, and
+/// `/api/oauth_tokens` ([`oauth_tokens`]) Pleroma's token-management
+/// endpoints; later tickets add the remaining `/api` areas (admin) here
+/// the same way. [`media_files`] and [`activitypub`] are the exceptions:
+/// they serve `/media` and `/users`, addresses that go out in
+/// `ActivityPub` documents, and [`crate::app`] merges them directly.
 ///
 /// `config` is passed down to the two version routers because the media
 /// upload route sizes its body limit from the configured upload limits (see
@@ -64,4 +66,5 @@ pub fn router(config: &Config) -> Router<AppState> {
         .nest("/api/v1", v1::router(config))
         .nest("/api/v2", v2::router(config))
         .nest("/api/pleroma", pleroma::router())
+        .nest("/api/oauth_tokens", oauth_tokens::router())
 }

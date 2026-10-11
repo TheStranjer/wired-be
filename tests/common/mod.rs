@@ -324,7 +324,9 @@ pub async fn create_app_and_token(pool: &PgPool, user: &User, scopes: &str) -> S
     let app = oauth_app::create(pool, &test_app_registration(Some(user.id), scopes))
         .await
         .expect("app fixture inserts");
-    create_token_for(pool, Some(user.id), app.id, scopes).await
+    create_token_for(pool, Some(user.id), app.id, scopes)
+        .await
+        .token
 }
 
 /// Registers a test app and mints an app-only (`client_credentials`)
@@ -340,7 +342,69 @@ pub async fn create_app_only_token(pool: &PgPool, scopes: &str) -> String {
     let app = oauth_app::create(pool, &test_app_registration(None, scopes))
         .await
         .expect("app fixture inserts");
-    create_token_for(pool, None, app.id, scopes).await
+    create_token_for(pool, None, app.id, scopes).await.token
+}
+
+/// Registers an app named `name` owned by `owner` (`None` for a
+/// user-unbound registration) and returns its row.
+///
+/// The named counterpart of [`create_app`] and
+/// [`create_app_and_token`], for tests that key on the client name or
+/// the owner column and not on the fixed `"Test Client"` fixture.
+///
+/// # Panics
+///
+/// If the app insert fails.
+pub async fn create_app_named(
+    pool: &PgPool,
+    name: &str,
+    owner: Option<&User>,
+) -> oauth_app::OauthApp {
+    oauth_app::create(
+        pool,
+        &NewOauthApp {
+            client_name: name.to_owned(),
+            redirect_uris: TEST_REDIRECT_URIS.to_owned(),
+            scopes: "read".to_owned(),
+            website: None,
+            user_id: owner.map(|found| found.id),
+        },
+    )
+    .await
+    .expect("named app fixture inserts")
+}
+
+/// Mints a token acting as `user` issued by `app` and granting `scopes`,
+/// returning the whole stored row (id, access token and expiry included)
+/// for tests that revoke it over HTTP or expire it first.
+///
+/// # Panics
+///
+/// If the token insert fails.
+pub async fn create_token(
+    pool: &PgPool,
+    user: &User,
+    app: &oauth_app::OauthApp,
+    scopes: &str,
+) -> oauth_token::OauthToken {
+    create_token_for(pool, Some(user.id), app.id, scopes).await
+}
+
+/// Moves the token row `id`'s `valid_until` an hour into the past: the
+/// state a lapsed token has, which the validity checks refuse.
+///
+/// # Panics
+///
+/// If the update fails or hits no row.
+pub async fn expire_token(pool: &PgPool, id: Uuid) {
+    let outcome = sqlx::query(
+        "UPDATE oauth_tokens SET valid_until = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("the expiry update runs");
+    assert_eq!(outcome.rows_affected(), 1, "the update hit the token row");
 }
 
 /// The [`NewOauthApp`] both token fixtures register: a named test
@@ -356,14 +420,14 @@ fn test_app_registration(user_id: Option<Uuid>, scopes: &str) -> NewOauthApp {
 }
 
 /// Mints a token for `user_id` (`None` app-only) issued by `app_id`
-/// with `scopes` and returns its access token string.
+/// with `scopes` and returns the stored row.
 async fn create_token_for(
     pool: &PgPool,
     user_id: Option<Uuid>,
     app_id: Uuid,
     scopes: &str,
-) -> String {
-    let token = oauth_token::create_token(
+) -> oauth_token::OauthToken {
+    oauth_token::create_token(
         pool,
         &NewToken {
             user_id,
@@ -373,8 +437,7 @@ async fn create_token_for(
         },
     )
     .await
-    .expect("token fixture inserts");
-    token.token
+    .expect("token fixture inserts")
 }
 
 /// A request under construction: the verb methods start a builder, the
