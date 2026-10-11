@@ -63,6 +63,11 @@ pub enum AppError {
     ForbiddenWithIdentifier(String, &'static str),
     /// No record matches the request (404).
     NotFound,
+    /// No record matches the request, with the endpoint-specific message
+    /// the client is owed (404): Pleroma's emoji pack endpoints answer an
+    /// unknown pack with `{"error": "Pack not found"}` rather than the
+    /// generic "Record not found".
+    NotFoundMessage(String),
     /// The request path is under `/api` but no endpoint is routed there
     /// (404), Pleroma's `api_not_implemented`.
     NotImplemented,
@@ -118,7 +123,10 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) | Self::ForbiddenWithIdentifier(_, _) => StatusCode::FORBIDDEN,
-            Self::NotFound | Self::NotImplemented | Self::RouteNotFound => StatusCode::NOT_FOUND,
+            Self::NotFound
+            | Self::NotFoundMessage(_)
+            | Self::NotImplemented
+            | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::Gone => StatusCode::GONE,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -140,7 +148,8 @@ impl AppError {
             | Self::Conflict(detail)
             | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
-            | Self::Unprocessable(detail) => detail,
+            | Self::Unprocessable(detail)
+            | Self::NotFoundMessage(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
             Self::NotImplemented => NOT_IMPLEMENTED_MESSAGE,
             Self::RouteNotFound => ROUTE_NOT_FOUND_MESSAGE,
@@ -175,7 +184,8 @@ impl fmt::Display for AppError {
             | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
             | Self::Unprocessable(detail)
-            | Self::Internal(detail) => f.write_str(detail),
+            | Self::Internal(detail)
+            | Self::NotFoundMessage(detail) => f.write_str(detail),
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
             Self::NotImplemented => f.write_str(NOT_IMPLEMENTED_MESSAGE),
             Self::RouteNotFound => f.write_str(ROUTE_NOT_FOUND_MESSAGE),
@@ -195,6 +205,7 @@ impl Error for AppError {
             | Self::Forbidden(_)
             | Self::ForbiddenWithIdentifier(_, _)
             | Self::NotFound
+            | Self::NotFoundMessage(_)
             | Self::NotImplemented
             | Self::RouteNotFound
             | Self::Gone
@@ -304,6 +315,10 @@ mod tests {
             (AppError::Unauthorized("no token".to_owned()), "no token"),
             (AppError::Forbidden("denied".to_owned()), "denied"),
             (AppError::NotFound, NOT_FOUND_MESSAGE),
+            (
+                AppError::NotFoundMessage("Pack not found".to_owned()),
+                "Pack not found",
+            ),
             (AppError::NotImplemented, NOT_IMPLEMENTED_MESSAGE),
             (AppError::RouteNotFound, ROUTE_NOT_FOUND_MESSAGE),
             (AppError::Gone, GONE_MESSAGE),

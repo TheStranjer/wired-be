@@ -40,6 +40,8 @@ pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
 pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
 /// Environment variable holding the directory uploaded files are stored in.
 pub const UPLOADS_DIR_VAR: &str = "UPLOADS_DIR";
+/// Environment variable holding the directory emoji packs are stored in.
+pub const EMOJI_DIR_VAR: &str = "EMOJI_DIR";
 /// Environment variable holding the public prefix of uploaded files' URLs.
 pub const MEDIA_BASE_URL_VAR: &str = "MEDIA_BASE_URL";
 /// Environment variable holding whether registration may omit the email
@@ -80,6 +82,12 @@ pub const DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS: bool = false;
 /// relative to the working directory (Pleroma's `Pleroma.Uploaders.Local`
 /// default is a `public/uploads` directory in the same spirit).
 pub const DEFAULT_UPLOADS_DIR: &str = "./uploads";
+/// Directory emoji packs live in when `EMOJI_DIR` is unset, relative to
+/// the working directory.
+///
+/// Pleroma keeps them in an `emoji` subdirectory of its static dir
+/// (`lib/pleroma/emoji/pack.ex`), one directory per pack.
+pub const DEFAULT_EMOJI_DIR: &str = "./emoji";
 /// Path appended to `BASE_URL` for the media URL prefix when
 /// `MEDIA_BASE_URL` is unset: the route in [`crate::api::media_files`].
 pub const DEFAULT_MEDIA_URL_PATH: &str = "/media";
@@ -137,6 +145,10 @@ pub struct Config {
     pub upload_limits: UploadLimits,
     /// Directory uploaded files are stored in, from `UPLOADS_DIR`.
     pub uploads_dir: PathBuf,
+    /// Directory emoji packs are stored in, from `EMOJI_DIR`: one
+    /// subdirectory per pack holding a `pack.json` and its image files
+    /// (see [`crate::services::emoji_packs`]).
+    pub emoji_dir: PathBuf,
     /// Public prefix uploaded files' URLs are built from, from
     /// `MEDIA_BASE_URL`; defaults to `{base_url}/media` and never ends in a
     /// slash, so `/{key}` appends cleanly.
@@ -222,6 +234,12 @@ impl Config {
                 .filter(|dir| !dir.is_empty())
                 .unwrap_or_else(|| DEFAULT_UPLOADS_DIR.to_owned()),
         );
+        let emoji_dir = PathBuf::from(
+            lookup(EMOJI_DIR_VAR)
+                .map(|dir| dir.trim().to_owned())
+                .filter(|dir| !dir.is_empty())
+                .unwrap_or_else(|| DEFAULT_EMOJI_DIR.to_owned()),
+        );
         let media_base_url = lookup(MEDIA_BASE_URL_VAR)
             .map(|url| url.trim().trim_end_matches('/').to_owned())
             .filter(|url| !url.is_empty())
@@ -241,6 +259,7 @@ impl Config {
             max_poll_options,
             upload_limits,
             uploads_dir,
+            emoji_dir,
             media_base_url,
             http_allow_private_hosts,
             accounts_email_optional,
@@ -309,6 +328,7 @@ impl Config {
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
             },
             uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
+            emoji_dir: PathBuf::from(DEFAULT_EMOJI_DIR),
             media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
             http_allow_private_hosts: true,
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
@@ -434,6 +454,7 @@ impl fmt::Debug for Config {
             .field("upload_limits", &self.upload_limits)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
+            .field("emoji_dir", &self.emoji_dir)
             .field("media_base_url", &self.media_base_url)
             .field("accounts_email_optional", &self.accounts_email_optional)
             .field("min_password_length", &self.min_password_length)
@@ -641,6 +662,11 @@ mod tests {
             "default UPLOADS_DIR"
         );
         assert_eq!(
+            config.emoji_dir,
+            PathBuf::from("./emoji"),
+            "default EMOJI_DIR"
+        );
+        assert_eq!(
             config.media_base_url, "https://social.example/media",
             "MEDIA_BASE_URL defaults to BASE_URL plus /media"
         );
@@ -671,6 +697,7 @@ mod tests {
             (UPLOAD_MAX_FILES_VAR, "4"),
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
             (UPLOADS_DIR_VAR, "/srv/wired/uploads"),
+            (EMOJI_DIR_VAR, "/srv/wired/emoji"),
             (MEDIA_BASE_URL_VAR, "https://cdn.example/media"),
             (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
             (MIN_PASSWORD_LENGTH_VAR, "12"),
@@ -710,6 +737,11 @@ mod tests {
             config.uploads_dir,
             PathBuf::from("/srv/wired/uploads"),
             "custom UPLOADS_DIR"
+        );
+        assert_eq!(
+            config.emoji_dir,
+            PathBuf::from("/srv/wired/emoji"),
+            "custom EMOJI_DIR"
         );
         assert_eq!(
             config.media_base_url, "https://cdn.example/media",
@@ -763,6 +795,23 @@ mod tests {
                 config.uploads_dir,
                 PathBuf::from(want),
                 "UPLOADS_DIR={value:?} means {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_dir_is_trimmed_and_defaults_to_emoji() {
+        for (value, want) in [
+            ("  /var/emoji  ", "/var/emoji"),
+            ("emoji", "emoji"),
+            ("", "./emoji"),
+            ("   ", "./emoji"),
+        ] {
+            let config = config_with(&[(EMOJI_DIR_VAR, value)]);
+            assert_eq!(
+                config.emoji_dir,
+                PathBuf::from(want),
+                "EMOJI_DIR={value:?} means {want}"
             );
         }
     }
@@ -882,6 +931,10 @@ mod tests {
         assert!(
             debug.contains("media_base_url: \"https://social.example/media\""),
             "the media URL prefix is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("emoji_dir: \"./emoji\""),
+            "the emoji packs directory is visible in Debug output: {debug}"
         );
     }
 
@@ -1032,6 +1085,11 @@ mod tests {
             config.uploads_dir,
             PathBuf::from(DEFAULT_UPLOADS_DIR),
             "test uploads go to the default directory"
+        );
+        assert_eq!(
+            config.emoji_dir,
+            PathBuf::from(DEFAULT_EMOJI_DIR),
+            "test packs are read from the default directory"
         );
         assert_eq!(
             config.media_base_url, "https://test.example/media",

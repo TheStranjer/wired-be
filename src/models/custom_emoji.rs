@@ -225,6 +225,54 @@ pub async fn delete(pool: &PgPool, shortcode: &str, domain: Option<&str>) -> App
     Ok(deleted.rows_affected() > 0)
 }
 
+/// Deletes the local (`domain IS NULL`) emojis whose `image_url` starts
+/// with `url_prefix` and whose shortcode is not in `keep`, returning how
+/// many rows went.
+///
+/// This is the sweep [`sync_custom_emojis`] runs after re-upserting every
+/// pack file: local emojis served from under `{base_url}/emoji/` that
+/// no pack names any more leave the table, while remote rows, rows of other
+/// hosts and the still-present pack emojis stay.
+///
+/// [`sync_custom_emojis`]: crate::services::emoji_packs::sync_custom_emojis
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_local_under(
+    pool: &PgPool,
+    url_prefix: &str,
+    keep: &[String],
+) -> AppResult<u64> {
+    let pattern = format!("{}%", escape_like(url_prefix));
+    let deleted = sqlx::query(
+        "DELETE FROM custom_emojis
+          WHERE domain IS NULL
+            AND image_url LIKE $1
+            AND NOT (shortcode = ANY($2))",
+    )
+    .bind(&pattern)
+    .bind(keep)
+    .execute(pool)
+    .await?;
+    Ok(deleted.rows_affected())
+}
+
+/// Escapes the LIKE metacharacters (`\\`, `%`, `_`) in `text` so it matches
+/// those bytes literally, letting [`delete_local_under`] build its pattern
+/// from an untrusted URL prefix.
+fn escape_like(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
@@ -548,5 +596,101 @@ mod tests {
                 .is_empty(),
             "no cat rows are left"
         );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delete_local_under_sweeps_only_prefix_local_rows(pool: PgPool) {
+        let prefix = format!("{BASE}/emoji/");
+        seed(
+            &pool,
+            &NewCustomEmoji::local("kept", &format!("{prefix}pack/kept.png")),
+        )
+        .await;
+        seed(
+            &pool,
+            &NewCustomEmoji::local("stale", &format!("{prefix}pack/stale.png")),
+        )
+        .await;
+        seed(
+            &pool,
+            &NewCustomEmoji::local("elsewhere", "https://cdn.example/emoji/pack/x.png"),
+        )
+        .await;
+        seed(
+            &pool,
+            &NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                ..NewCustomEmoji::local("remote-in", &format!("{prefix}pack/remote.png"))
+            },
+        )
+        .await;
+
+        let keep = vec!["kept".to_owned()];
+        let removed = delete_local_under(&pool, &prefix, &keep).await.unwrap();
+        assert_eq!(removed, 1, "only the stale local row inside goes");
+        for shortcode in ["kept", "elsewhere", "remote-in"] {
+            let domain = (shortcode == "remote-in").then_some("remote.example");
+            assert_eq!(
+                get_by_shortcodes(&pool, &[shortcode.to_owned()], domain)
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{shortcode} survives the sweep"
+            );
+        }
+        assert!(
+            get_by_shortcodes(&pool, &["stale".to_owned()], None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the swept row is gone"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delete_local_under_matches_prefix_bytes_literally(pool: PgPool) {
+        // The `_` in the prefix must match an underscore, not any character:
+        // the underscored host goes, the look-alike without one stays.
+        seed(
+            &pool,
+            &NewCustomEmoji::local("under", "https://ex_ample.test/emoji/pack/x.png"),
+        )
+        .await;
+        seed(
+            &pool,
+            &NewCustomEmoji::local("plain", "https://exxample.test/emoji/pack/x.png"),
+        )
+        .await;
+
+        let removed = delete_local_under(&pool, "https://ex_ample.test/emoji/", &[])
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "the underscore is not a single-char wildcard");
+        assert!(
+            get_by_shortcodes(&pool, &["under".to_owned()], None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the row inside the escaped prefix is gone"
+        );
+        assert_eq!(
+            get_by_shortcodes(&pool, &["plain".to_owned()], None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the look-alike host survives"
+        );
+    }
+
+    #[test]
+    fn escape_like_quotes_every_wildcard() {
+        assert_eq!(
+            escape_like(r"a%b_c\d"),
+            r"a\%b\_c\\d",
+            "backslash, percent and underscore are all escaped"
+        );
+        assert_eq!(escape_like("plain/text"), "plain/text", "nothing to escape");
     }
 }

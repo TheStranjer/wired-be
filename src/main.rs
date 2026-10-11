@@ -1,4 +1,5 @@
-//! Server entry point: load config, connect to PostgreSQL, migrate, serve.
+//! Server entry point: read config, connect to PostgreSQL, migrate, sync
+//! the emoji packs, serve.
 
 use std::{error::Error, sync::Arc};
 
@@ -7,8 +8,8 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use wired_be::{
-    app, config::Config, http_client::HttpClient, run_migrations, state::AppState,
-    uploads::UploaderBackend,
+    app, config::Config, http_client::HttpClient, run_migrations, services::emoji_packs,
+    state::AppState, uploads::UploaderBackend,
 };
 
 /// Installs a `tracing-subscriber` formatter filtered by `RUST_LOG`, defaulting to `info`.
@@ -33,6 +34,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err(err.into());
     }
     info!("database migrations applied");
+    let emoji_count =
+        emoji_packs::sync_custom_emojis(&db, &config.base_url, &config.emoji_dir).await?;
+    info!(emoji_count, "emoji packs synced into custom_emojis");
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(addr = %config.bind_addr, "listening");
     let state = AppState {
