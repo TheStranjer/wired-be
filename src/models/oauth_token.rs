@@ -421,6 +421,71 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<OauthT
     Ok(tokens)
 }
 
+/// One row of [`list_valid_with_app_names`]: a still-valid token joined
+/// with the name of the application that issued it.
+#[derive(Debug, sqlx::FromRow)]
+pub struct TokenWithAppName {
+    /// The token's `UUIDv7` primary key (decision 4).
+    pub id: Uuid,
+    /// `oauth_apps.client_name` of the issuing application.
+    pub app_name: String,
+    /// When the token stops being valid; always in the future.
+    pub valid_until: DateTime<Utc>,
+}
+
+/// The `SELECT` behind [`list_valid_with_app_names`]: only the three
+/// columns the token list renders, `JOIN`ed for the app name (the
+/// `ON DELETE CASCADE` foreign key on `app_id` makes the join total),
+/// unexpired rows only, and `ORDER BY t.id DESC` so the newest token
+/// leads (`UUIDv7` text sorts by mint time, decision 4).
+const LIST_VALID_WITH_APP_NAMES_SQL: &str = "SELECT t.id, a.client_name AS app_name, t.valid_until
+   FROM oauth_tokens t
+   JOIN oauth_apps a ON a.id = t.app_id
+  WHERE t.user_id = $1 AND t.valid_until > now()
+  ORDER BY t.id DESC";
+
+/// Fetches the still-valid (unexpired) tokens of user `user_id` with
+/// their app names, newest first: what `GET /api/oauth_tokens` lists.
+///
+/// Expired and app-only rows (no `user_id`) never appear; a user with
+/// no live tokens yields an empty `Vec`.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn list_valid_with_app_names(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> AppResult<Vec<TokenWithAppName>> {
+    let rows = sqlx::query_as::<_, TokenWithAppName>(LIST_VALID_WITH_APP_NAMES_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Deletes the token `id` only when it belongs to user `user_id`,
+/// reporting whether a row went: this backs
+/// `DELETE /api/oauth_tokens/{id}`.
+///
+/// A foreign, unknown or app-only (NULL `user_id`) token deletes
+/// nothing and answers `false`, which is how the endpoint tells "gone"
+/// from 404.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_for_user(pool: &PgPool, user_id: Uuid, id: Uuid) -> AppResult<bool> {
+    let deleted = sqlx::query("DELETE FROM oauth_tokens WHERE id = $1 AND user_id = $2")
+        .bind(id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected() == 1)
+}
+
 /// The `INSERT` behind [`create_authorization`]: the code is minted by
 /// the caller of the statement, its ten-minute lifetime is computed
 /// from the bound interval by the database clock, and `RETURNING *`
@@ -1159,5 +1224,92 @@ mod tests {
             "the redaction marker names the field"
         );
         assert!(auth_debug.contains("read"), "the rest shows");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_valid_with_app_names_skips_expired_and_sorts_newest_first(pool: PgPool) {
+        let grace = insert_user(&pool, "grace").await;
+        let heidi = insert_user(&pool, "heidi").await;
+        let first_app = insert_app(&pool, "First App").await;
+        let second_app = insert_app(&pool, "Second App").await;
+        let older = create_token(&pool, &new_token(Some(grace.id), first_app.id))
+            .await
+            .unwrap();
+        let stale = create_token(&pool, &new_token(Some(grace.id), second_app.id))
+            .await
+            .unwrap();
+        expire_token(&pool, stale.id).await;
+        let newest = create_token(&pool, &new_token(Some(grace.id), second_app.id))
+            .await
+            .unwrap();
+        let hers = create_token(&pool, &new_token(Some(heidi.id), first_app.id))
+            .await
+            .unwrap();
+        let app_only = create_token(&pool, &new_token(None, first_app.id))
+            .await
+            .unwrap();
+
+        let listed = list_valid_with_app_names(&pool, grace.id).await.unwrap();
+        let ids: Vec<Uuid> = listed.iter().map(|row| row.id).collect();
+        assert_eq!(
+            ids,
+            vec![newest.id, older.id],
+            "own unexpired rows only, newest first (decision 4)"
+        );
+        assert!(
+            !ids.contains(&hers.id) && !ids.contains(&stale.id) && !ids.contains(&app_only.id),
+            "foreign, expired and app-only tokens stay out of the list"
+        );
+        let first = listed.first().unwrap();
+        assert_eq!(first.app_name, "Second App", "the joined app name");
+        assert!(
+            first.valid_until > Utc::now(),
+            "what comes back is still valid"
+        );
+        assert_eq!(
+            listed.get(1).map(|row| row.app_name.as_str()),
+            Some("First App"),
+            "each row carries its own app's name"
+        );
+        assert!(
+            list_valid_with_app_names(&pool, new_id())
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unknown user has no valid tokens"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delete_for_user_only_removes_the_owners_row(pool: PgPool) {
+        let grace = insert_user(&pool, "grace").await;
+        let heidi = insert_user(&pool, "heidi").await;
+        let app = insert_app(&pool, "Revoke").await;
+        let mine = create_token(&pool, &new_token(Some(grace.id), app.id))
+            .await
+            .unwrap();
+        let theirs = create_token(&pool, &new_token(Some(heidi.id), app.id))
+            .await
+            .unwrap();
+        let app_only = create_token(&pool, &new_token(None, app.id)).await.unwrap();
+
+        assert!(
+            !delete_for_user(&pool, grace.id, theirs.id).await.unwrap(),
+            "a foreign token is not the caller's to delete"
+        );
+        assert_eq!(token_rows(&pool, theirs.id).await, 1, "and stays");
+        assert!(
+            !delete_for_user(&pool, grace.id, app_only.id).await.unwrap(),
+            "an app-only token belongs to no user"
+        );
+        assert!(
+            !delete_for_user(&pool, grace.id, new_id()).await.unwrap(),
+            "an unknown id deletes nothing"
+        );
+        assert!(
+            delete_for_user(&pool, grace.id, mine.id).await.unwrap(),
+            "the own row goes"
+        );
+        assert_eq!(token_rows(&pool, mine.id).await, 0, "gone for good");
     }
 }
