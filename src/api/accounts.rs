@@ -1,16 +1,30 @@
-//! The read endpoints for accounts: `GET /api/v1/accounts/{id}`,
-//! `GET /api/v1/accounts/lookup` and `GET /api/v1/accounts/relationships`.
+//! The read endpoints for accounts: `GET /api/v1/accounts/verify_credentials`,
+//! `GET /api/v1/accounts/{id}`, `GET /api/v1/accounts/lookup` and
+//! `GET /api/v1/accounts/relationships`.
 //!
-//! Pleroma's `AccountController.show`, `.lookup` and `.relationships`
-//! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`) are
-//! the reference. The first two answer the core [`Account`] entity
-//! (decision 3: rendered from the row by [`Account::from_user_for`]), both
-//! serve local and remote mirrors alike (decision 7), and both treat an
+//! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup` and
+//! `.relationships` (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`)
+//! are the reference. The last three answer the core [`Account`] entity
+//! (decision 3: rendered from the row by [`Account::from_user_for`]); all
+//! three serve local and remote mirrors alike (decision 7) and treat an
 //! account that is unknown, unresolvable or deactivated as a 404 "Record
 //! not found" — the answer Pleroma's `visible_for` check renders through
 //! its fallback controller.
 //!
-//! Authentication on those two is optional, as in Pleroma's
+//! `verify_credentials` is the account's own view of itself: [`AuthUser`]
+//! plus the `read:accounts` scope, and the entity rendered with the
+//! caller as its [`AccountViewer`], so the owner-only keys of the
+//! `pleroma` block are in and nothing is hidden. Its addition over `show`
+//! is the [`source`](crate::entities::account::AccountSource) object — the
+//! raw note and fields a client edits, the posting defaults, and the size
+//! of the pending follow-request queue, the one value here that is not on
+//! the row and so arrives from
+//! [`pending_count`](crate::models::follow::pending_count). Pleroma gates
+//! that block on the viewer being the account itself
+//! (`AccountView.maybe_put_settings`), which is why no other route on this
+//! module carries it.
+//!
+//! Authentication on `show` and `lookup` is optional, as in Pleroma's
 //! `OAuthScopesPlug … fallback: :proceed_unauthenticated`: the routes
 //! answer without a token. A token is not ignored, though: it names the
 //! [`AccountViewer`] the entity is
@@ -61,8 +75,11 @@ use crate::{
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
-    models::user::{self, User},
-    oauth::scopes::READ_FOLLOWS,
+    models::{
+        follow,
+        user::{self, User},
+    },
+    oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS},
     state::AppState,
     util::id::parse_id,
 };
@@ -74,9 +91,35 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 /// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/accounts/verify_credentials", get(verify_credentials))
         .route("/accounts/relationships", get(relationships))
         .route("/accounts/lookup", get(lookup_account))
         .route("/accounts/{id}", get(show_account))
+}
+
+/// `GET /api/v1/accounts/verify_credentials` — the caller's own account,
+/// rendered as they see it: the owner view of [`Account::from_user_for`]
+/// (hidden counters visible, the owner-only `pleroma` keys present) with
+/// the `source` block [`Account::for_owner`] attaches.
+///
+/// The only thing that block needs beyond the token's row is the pending
+/// follow-request queue, counted by
+/// [`pending_count`](crate::models::follow::pending_count).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] from [`AuthUser`] without a valid user
+/// token; [`AppError::Forbidden`] when the token is app-only or does not
+/// grant `read:accounts`. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn verify_credentials(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> AppResult<Json<Account>> {
+    auth.require(READ_ACCOUNTS)?;
+    let owner = &auth.0;
+    let requests = follow::pending_count(&state.db, owner.id).await?;
+    Ok(Json(Account::for_owner(owner, &state.config, requests)))
 }
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or

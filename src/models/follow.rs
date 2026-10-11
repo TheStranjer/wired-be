@@ -117,6 +117,12 @@ const PENDING_REQUESTS_SQL: &str = "SELECT u.* FROM follows f
     JOIN users u ON u.id = f.follower_id
      WHERE f.state = 'pending' AND f.followee_id = ";
 
+/// [`pending_count`]: the same queue [`pending_requests_for`] pages through,
+/// counted rather than listed. The `::int` cast is what makes `count(*)`'s
+/// `bigint` arrive as the `i32` this layer's counters all are.
+const PENDING_COUNT_SQL: &str = "SELECT count(*)::int FROM follows
+     WHERE followee_id = $1 AND state = 'pending'";
+
 /// Lifecycle state of a [`Follow`] row, stored in the `state` text column as
 /// its lowercase variant name (`pending`, `accepted` or `rejected`, which is
 /// exactly what the column's `CHECK` constraint allows).
@@ -381,6 +387,28 @@ pub async fn pending_requests_for(
     page: PageParams,
 ) -> AppResult<Vec<User>> {
     user_page(pool, PENDING_REQUESTS_SQL, target_id, &page).await
+}
+
+/// How many follow requests are waiting for `user_id` to answer them: the
+/// `state = 'pending'` rows that name the account as their followee, which is
+/// exactly what [`pending_requests_for`] pages through.
+///
+/// The account's own outgoing requests are not counted (a request the account
+/// sent is someone else's to answer), and neither is anything already
+/// accepted or rejected: the answer is the size of the queue the account has
+/// still to work through, the `source.follow_requests_count` the credentials
+/// endpoints render.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn pending_count(pool: &PgPool, user_id: Uuid) -> AppResult<i32> {
+    let row = sqlx::query_as::<_, (i32,)>(PENDING_COUNT_SQL)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
 }
 
 /// The state [`follow`] starts a new relationship in: this instance can grant
@@ -1435,6 +1463,79 @@ mod tests {
             ids(&followers_page(&pool, carol.id, page("")).await.unwrap()),
             vec![first[0].id],
             "into the follower list"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn pending_counts_the_requests_one_account_has_to_answer(pool: PgPool) {
+        let carol = locked_user(&pool, "carol").await;
+        let dave = local_user(&pool, "dave").await;
+        let erin = local_user(&pool, "erin").await;
+        let one = local_user(&pool, "one").await;
+        let two = local_user(&pool, "two").await;
+
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            0,
+            "an account nobody has asked to follow has an empty queue"
+        );
+
+        let first = follow(&pool, TEST_BASE_URL, &one, &carol).await.unwrap();
+        let second = follow(&pool, TEST_BASE_URL, &two, &carol).await.unwrap();
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            2,
+            "both requests wait for carol"
+        );
+        assert_eq!(
+            pending_count(&pool, one.id).await.unwrap(),
+            0,
+            "the requester's own queue is empty: the request is carol's to answer"
+        );
+        assert_eq!(
+            pending_count(&pool, dave.id).await.unwrap(),
+            0,
+            "an account with no rows at all counts nothing"
+        );
+
+        let granted = accept(&pool, first.id).await.unwrap();
+        assert_eq!(granted.state, FollowState::Accepted, "one is answered");
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            1,
+            "and leaves the count"
+        );
+
+        let withdrawn = reject(&pool, second.id).await.unwrap();
+        assert_eq!(withdrawn.state, FollowState::Pending, "one is refused");
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            0,
+            "which empties the queue too"
+        );
+
+        let open = follow(&pool, TEST_BASE_URL, &dave, &carol).await.unwrap();
+        assert_eq!(
+            accept(&pool, open.id).await.unwrap().state,
+            FollowState::Accepted,
+            "a locked account can grant a request as well"
+        );
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            0,
+            "an accepted relationship never counts as pending"
+        );
+
+        let mirrored = rejected_relation(&pool, &erin, &carol).await;
+        assert_eq!(
+            mirrored.state,
+            FollowState::Rejected,
+            "a mirrored rejection sits in the table as `rejected`"
+        );
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            0,
+            "and is not a request waiting for an answer"
         );
     }
 
