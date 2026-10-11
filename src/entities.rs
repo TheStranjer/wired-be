@@ -10,7 +10,8 @@
 //! [`announcement`] the Mastodon `Announcement` entity,
 //! [`media_attachment`] the Mastodon `Attachment` entity,
 //! [`custom_emoji`] the Mastodon `CustomEmoji` entity, [`filter`] the
-//! Mastodon v1 `Filter` entity, [`chat`] the
+//! Mastodon v1 `Filter` entity, [`list`] the Mastodon v1 `List` entity,
+//! [`chat`] the
 //! Pleroma chat `Chat` and `ChatMessage` entities, [`marker`] the
 //! Mastodon v1 `Marker` entity and [`relationship`]
 //! the Mastodon `Relationship` entity (with Pleroma's `subscribing`
@@ -22,6 +23,7 @@ pub mod announcement;
 pub mod chat;
 pub mod custom_emoji;
 pub mod filter;
+pub mod list;
 pub mod marker;
 pub mod media_attachment;
 pub mod relationship;

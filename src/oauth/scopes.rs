@@ -52,6 +52,14 @@ pub const READ_FILTERS: &str = "read:filters";
 /// (Pleroma's `write:filters` on the remaining actions).
 pub const WRITE_FILTERS: &str = "write:filters";
 
+/// The read side of lists: `GET /api/v1/lists`, `GET /api/v1/lists/{id}`
+/// and `GET /api/v1/accounts/{id}/lists`, the collections a client shows
+/// its user (Pleroma's `read:lists` on the read actions).
+pub const READ_LISTS: &str = "read:lists";
+/// The write side of lists: creating, updating and deleting a list
+/// (Pleroma's `write:lists` on the remaining actions).
+pub const WRITE_LISTS: &str = "write:lists";
+
 /// The read side of statuses and the positions in them:
 /// `GET /api/v1/markers`, the read markers a client shows its user
 /// (Pleroma's `read:statuses` on the marker `index` action).
