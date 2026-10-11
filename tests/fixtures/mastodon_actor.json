@@ -1,0 +1,59 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/v1",
+    {
+      "manuallyApprovesFollowers": "as:manuallyApprovesFollowers",
+      "toot": "http://joinmastodon.org/ns#",
+      "discoverable": "toot:discoverable",
+      "featured": { "@id": "toot:featured", "@type": "@id" },
+      "alsoKnownAs": { "@id": "as:alsoKnownAs", "@type": "@id" },
+      "movedTo": { "@id": "as:movedTo", "@type": "@id" },
+      "PropertyValue": "schema:PropertyValue",
+      "value": "schema:value"
+    }
+  ],
+  "id": "https://mastodon.example/users/alice",
+  "type": "Person",
+  "following": "https://mastodon.example/users/alice/following",
+  "followers": "https://mastodon.example/users/alice/followers",
+  "inbox": "https://mastodon.example/users/alice/inbox",
+  "outbox": "https://mastodon.example/users/alice/outbox",
+  "featured": "https://mastodon.example/users/alice/collections/featured",
+  "preferredUsername": "alice",
+  "name": "Alice \ud83e\udd8a",
+  "summary": "<p>A curator of <a href=\"https://alice.example\" rel=\"nofollow noopener noreferrer\" target=\"_blank\"><span class=\"invisible\">https://</span><span class=\"ellipsis\">alice.example</span><span class=\"invisible\">/feed</span></a></p><p>Bio &amp; notes <script>steal()</script></p>",
+  "url": "https://mastodon.example/@alice",
+  "manuallyApprovesFollowers": false,
+  "discoverable": true,
+  "publicKey": {
+    "id": "https://mastodon.example/users/alice#main-key",
+    "owner": "https://mastodon.example/users/alice",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzK7U4P8xh0Nq2mVnXmP8\nvT1sQwYd3rHbKpL0oZ5Xc7vN2mS0kT6xhA1pQ9wL4jF8dGh3nKsV0bT7yRm2PaQI\nDVW6cJxZ3fB7sGKdLm5tPqRvXwYzA0bNcEdFgHiJkLmNoPqRsTuVwXyZ012345678\n9abcdefgIDAQAB\n-----END PUBLIC KEY-----\n"
+  },
+  "icon": {
+    "type": "Image",
+    "mediaType": "image/png",
+    "url": "https://mastodon.example/avatar/alice.png"
+  },
+  "image": {
+    "type": "Image",
+    "mediaType": "image/png",
+    "url": "https://mastodon.example/banner/alice.png"
+  },
+  "endpoints": {
+    "sharedInbox": "https://mastodon.example/inbox"
+  },
+  "attachment": [
+    {
+      "type": "PropertyValue",
+      "name": "Site",
+      "value": "<a href=\"https://alice.example\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">alice.example</a>"
+    },
+    { "type": "PropertyValue", "name": "Pronouns", "value": "she/her" },
+    { "name": "no type", "value": "skipped, not a PropertyValue" }
+  ],
+  "alsoKnownAs": ["https://old.example/users/alice"],
+  "published": "2022-01-31T12:34:56Z",
+  "tag": []
+}

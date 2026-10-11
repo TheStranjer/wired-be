@@ -1,12 +1,16 @@
 //! The `ActivityPub` federation layer (`docs/ARCHITECTURE.md` decision 3):
 //! everything that speaks the wire protocol with other instances.
 //!
-//! Today this is the actor document ([`actor`]) and outbound
+//! Today this is the actor document ([`actor`]) and its inbound counterpart,
+//! the remote-actor parser and mirror ([`remote_actor`]), plus outbound
 //! authentication, the [`signature`] module that creates the HTTP
 //! Signatures (draft-cavage-http-signatures-12) Mastodon and Pleroma expect
-//! on every fetch and delivery. Inbound signature verification, activity
+//! on every fetch and delivery. [`json`] holds the shared JSON-LD shape
+//! normalizers those readers use. Inbound signature verification, activity
 //! documents, inboxes and outboxes arrive in later tickets and get their
 //! modules beside them.
 
 pub mod actor;
+pub mod json;
+pub mod remote_actor;
 pub mod signature;
