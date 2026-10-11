@@ -300,6 +300,8 @@ mod tests {
             show_role: Flag::new(true),
             no_rich_text: Flag::new(false),
             default_scope: DEFAULT_SCOPE.to_owned(),
+            sensitive_default: Flag::new(false),
+            language: None,
             tags: Vec::new(),
             settings_store: json!({}),
             mfa_settings: crate::models::user::mfa::MfaSettings::default_value(),

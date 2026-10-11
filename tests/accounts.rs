@@ -1,6 +1,11 @@
-//! Integration tests for `GET /api/v1/accounts/{id}` and
+//! Integration tests for `GET /api/v1/accounts/verify_credentials`,
+//! `GET /api/v1/accounts/{id}` and
 //! `GET /api/v1/accounts/lookup`: the core `Account` entity with its
 //! `pleroma` extension block for local and remote rows without credentials,
+//! the `source` block and owner view only `verify_credentials` renders
+//! (raw note and fields, posting defaults, the pending follow-request
+//! count, and the `read:accounts` scope, user-token auth and 401/403
+//! rejections in front of them),
 //! the privacy rules the request's token decides (hidden follow counts and
 //! hidden role flags, and the owner-only keys of the block), the status
 //! counters a posted status moves, an invalid token still a 401, every miss
@@ -20,9 +25,13 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::models::{
-    status::Visibility,
-    user::{Flag, User},
+use wired_be::{
+    config::TEST_BASE_URL,
+    models::{
+        follow::{self, FollowState},
+        status::Visibility,
+        user::{Flag, User},
+    },
 };
 
 /// The instance origin the fixtures live on (`Config::for_tests`).
@@ -33,6 +42,28 @@ const NOT_FOUND: &str = r#"{"error":"Record not found"}"#;
 const INVALID_TOKEN: &str = r#"{"error":"The access token is invalid"}"#;
 /// The 400 body when the `acct` parameter is absent or blank.
 const MISSING_ACCT: &str = r#"{"error":"Missing parameter: acct"}"#;
+/// The 401 body `AuthUser` renders when no token was presented at all.
+const NO_TOKEN: &str = r#"{"error":"Invalid credentials"}"#;
+/// The 403 body `AuthUser` renders for an app-only token.
+const USER_REQUIRED: &str = r#"{"error":"This API requires an authenticated user"}"#;
+/// The 403 body the scope check renders for a token that lacks the scope.
+const NO_SCOPE: &str = r#"{"error":"Insufficient permissions: read:accounts."}"#;
+
+/// `GET /api/v1/accounts/verify_credentials` with `token` as bearer.
+async fn verify_credentials(app: &Router, token: &str) -> common::TestResponse {
+    common::TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(token)
+        .send(app)
+        .await
+}
+
+/// The `source` object of a rendered account, present or panicked over:
+/// the tests that ask for it are the ones asserting its shape.
+fn source_of(body: &Value) -> Value {
+    body.get("source")
+        .cloned()
+        .expect("verify_credentials renders the source block")
+}
 
 /// `GET /api/v1/accounts/{id}` for `id`, without credentials.
 async fn show(app: &Router, id: &str) -> common::TestResponse {
@@ -58,6 +89,335 @@ fn assert_identity(body: &Value, account: &User, full: &str, username: &str, url
     assert_eq!(body["username"], username, "username drops the domain");
     assert_eq!(body["url"], url, "url is the profile page");
     assert_eq!(body["uri"], account.ap_id, "uri is the actor id");
+}
+
+/// `verify_credentials` answers the caller's own account as they see it,
+/// with the `source` block built from the stored settings: the raw note and
+/// posting defaults, the owner-only `pleroma` keys, and the hidden counters
+/// visible.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool) {
+    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+        new.raw_bio = "hi **there**".to_owned();
+        new.bio = "<p>hi <strong>there</strong></p>".to_owned();
+        new.default_scope = "unlisted".to_owned();
+        new.sensitive_default = Flag::new(true);
+        new.language = Some("eo".to_owned());
+        new.no_rich_text = Flag::new(true);
+        new.discoverable = Flag::new(true);
+        new.followers_count = 5;
+        new.hide_followers_count = Flag::new(true);
+        new.is_admin = Flag::new(true);
+        new.show_role = Flag::new(false);
+        new.settings_store = json!({"pleroma_fe": {"theme": "dark"}});
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
+    let app = common::test_app(pool);
+    let response = verify_credentials(&app, &token).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the account's own token answers"
+    );
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/json"),
+        "the entity is JSON"
+    );
+    let body = response.json_value();
+    assert_identity(
+        &body,
+        &alice,
+        "alice",
+        "alice",
+        &format!("{BASE}/users/alice"),
+    );
+    assert_eq!(
+        body["note"], "<p>hi <strong>there</strong></p>",
+        "the public note keeps rendering the sanitized HTML"
+    );
+    assert_eq!(
+        body["followers_count"], 5,
+        "a count hidden from strangers is the owner's own"
+    );
+    assert_eq!(
+        body["pleroma"]["is_admin"], true,
+        "show_role: false hides the role from others, never from the owner"
+    );
+    assert_eq!(
+        body["pleroma"]["settings_store"],
+        json!({"pleroma_fe": {"theme": "dark"}}),
+        "the owner-only keys of the pleroma block are in the answer"
+    );
+    assert_eq!(
+        body["pleroma"]["relationship"],
+        json!({}),
+        "an account has no relationship to itself to embed"
+    );
+    assert_eq!(
+        source_of(&body),
+        json!({
+            "privacy": "unlisted",
+            "sensitive": true,
+            "language": "eo",
+            "note": "hi **there**",
+            "fields": [],
+            "follow_requests_count": 0,
+            "pleroma": {
+                "show_role": false,
+                "no_rich_text": true,
+                "discoverable": true,
+                "actor_type": "Person",
+            },
+        }),
+        "the source block is the account's own editing state: the raw note, \
+         the stored posting defaults and the four Pleroma settings"
+    );
+}
+
+/// The columns an account never edited answer the block's documented
+/// defaults: public, not sensitive, no language, no note, no fields and an
+/// empty request queue.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_source_defaults_are_the_column_defaults(pool: PgPool) {
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
+    let app = common::test_app(pool);
+    let body = verify_credentials(&app, &token).await.json_value();
+    assert_eq!(
+        source_of(&body),
+        json!({
+            "privacy": "public",
+            "sensitive": false,
+            "language": null,
+            "note": "",
+            "fields": [],
+            "follow_requests_count": 0,
+            "pleroma": {
+                "show_role": true,
+                "no_rich_text": false,
+                "discoverable": false,
+                "actor_type": "Person",
+            },
+        }),
+        "a freshly registered account has edited none of it"
+    );
+}
+
+/// The `source` fields are the text an owner edits, not the markup a
+/// stranger reads: a field stored only as HTML is reduced to its text, and
+/// one stored with a raw value round-trips that value.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_source_fields_are_the_raw_text(pool: PgPool) {
+    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+        new.fields = json!([
+            {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"},
+            {"name": "motto", "value": "<b>beep</b>", "value_plaintext": "**beep**"},
+        ]);
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
+    let app = common::test_app(pool);
+    let body = verify_credentials(&app, &token).await.json_value();
+    assert_eq!(
+        body["fields"],
+        json!([
+            {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>", "verified_at": null},
+            {"name": "motto", "value": "<b>beep</b>", "verified_at": null},
+        ]),
+        "the public entity keeps rendering the stored markup"
+    );
+    assert_eq!(
+        source_of(&body)["fields"],
+        json!([
+            {"name": "site", "value": "alice.example", "verified_at": null},
+            {"name": "motto", "value": "**beep**", "verified_at": null},
+        ]),
+        "the source block hands back what the account typed: stripped where \
+         only HTML was stored, verbatim where a raw value was"
+    );
+}
+
+/// `follow_requests_count` is the queue waiting for this account: incoming
+/// pending requests only — not an answered one, not a request this account
+/// sent somewhere else — and it shrinks as the account answers it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_counts_the_pending_follow_requests(pool: PgPool) {
+    let carol = common::create_local_user_with(&pool, "carol", |mut new| {
+        new.locked = Flag::new(true);
+        new
+    })
+    .await;
+    let erin = common::create_local_user_with(&pool, "erin", |mut new| {
+        new.locked = Flag::new(true);
+        new
+    })
+    .await;
+    let one = common::create_local_user(&pool, "one").await;
+    let two = common::create_local_user(&pool, "two").await;
+    let dave = common::create_local_user(&pool, "dave").await;
+
+    let mut waiting = Vec::new();
+    for follower in [&one, &two] {
+        let queued = follow::follow(&pool, TEST_BASE_URL, follower, &carol)
+            .await
+            .expect("the request is recorded");
+        assert_eq!(
+            queued.state,
+            FollowState::Pending,
+            "a locked account answers its own requests"
+        );
+        waiting.push(queued.id);
+    }
+    let granted = follow::follow(&pool, TEST_BASE_URL, &dave, &carol)
+        .await
+        .expect("the third request is recorded");
+    let answered = follow::accept(&pool, granted.id)
+        .await
+        .expect("one request is answered");
+    assert_eq!(
+        answered.state,
+        FollowState::Accepted,
+        "the answered one is out of the queue"
+    );
+    let outgoing = follow::follow(&pool, TEST_BASE_URL, &carol, &erin)
+        .await
+        .expect("carol asks to follow erin too");
+    assert_eq!(
+        outgoing.state,
+        FollowState::Pending,
+        "and hers waits in erin's queue"
+    );
+
+    let token = common::create_app_and_token(&pool, &carol, "read:accounts").await;
+    let db = pool.clone();
+    let app = common::test_app(pool);
+    let body = verify_credentials(&app, &token).await.json_value();
+    assert_eq!(
+        source_of(&body)["follow_requests_count"],
+        2,
+        "the two requests still waiting for carol, neither the answered one \
+         nor her own outgoing request"
+    );
+
+    let carol_answered = follow::accept(&db, waiting[0])
+        .await
+        .expect("carol answers one");
+    assert_eq!(
+        carol_answered.state,
+        FollowState::Accepted,
+        "and the answered request leaves the queue the count reads"
+    );
+    let after = verify_credentials(&app, &token).await.json_value();
+    assert_eq!(
+        source_of(&after)["follow_requests_count"],
+        1,
+        "answering a request takes it out of the count"
+    );
+}
+
+/// A token that does not grant `read:accounts` is a 403 naming the scope,
+/// even when it is a valid user token.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_without_the_scope_is_forbidden(pool: PgPool) {
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    let app = common::test_app(pool);
+    let response = verify_credentials(&app, &token).await;
+    assert_eq!(
+        response.status,
+        StatusCode::FORBIDDEN,
+        "a valid token outside the scope is refused"
+    );
+    assert_eq!(response.text(), NO_SCOPE, "the denial names the scope");
+}
+
+/// The broad `read` scope covers `read:accounts` (decision 9), so a client
+/// that never asked for the sub-scope still gets its own account.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_accepts_a_broad_read_token(pool: PgPool) {
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "read").await;
+    let app = common::test_app(pool);
+    let response = verify_credentials(&app, &token).await;
+    assert_eq!(response.status, StatusCode::OK, "`read` grants the check");
+    let body = response.json_value();
+    assert_eq!(
+        body["id"],
+        alice.id.to_string(),
+        "and answers the token's own account"
+    );
+    assert!(
+        source_of(&body).get("privacy").is_some(),
+        "with the source block attached"
+    );
+}
+
+/// An app-only (`client_credentials`) token has no account to describe: 403
+/// from the extractor, before the scope is even read.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_requires_a_user_token(pool: PgPool) {
+    let token = common::create_app_only_token(&pool, "read:accounts").await;
+    let app = common::test_app(pool);
+    let response = verify_credentials(&app, &token).await;
+    assert_eq!(
+        response.status,
+        StatusCode::FORBIDDEN,
+        "an app-only token is not a user"
+    );
+    assert_eq!(response.text(), USER_REQUIRED, "AuthUser's wording");
+}
+
+/// No token at all is the 401 [`AuthUser`] owes, and a token that does not
+/// resolve is the invalid-credential 401: the endpoint never answers
+/// anonymously.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_without_valid_credentials_is_unauthorized(pool: PgPool) {
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool);
+    let anonymous = common::TestRequest::get("/api/v1/accounts/verify_credentials")
+        .send(&app)
+        .await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "the endpoint requires auth"
+    );
+    assert_eq!(anonymous.text(), NO_TOKEN, "AuthUser's no-token body");
+
+    let lapsed = common::TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer("bogus-token")
+        .send(&app)
+        .await;
+    assert_eq!(
+        lapsed.status,
+        StatusCode::UNAUTHORIZED,
+        "a token that resolves to nothing is refused too"
+    );
+    assert_eq!(lapsed.text(), INVALID_TOKEN, "and says which");
+}
+
+/// `GET /api/v1/accounts/{id}` for one's own id is still the plain account:
+/// the `source` block belongs to the credentials endpoints and no other
+/// route renders it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn show_never_renders_the_source_block(pool: PgPool) {
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
+    let app = common::test_app(pool);
+    let body = common::TestRequest::get(&format!("/api/v1/accounts/{}", alice.id))
+        .bearer(&token)
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(body["id"], alice.id.to_string(), "the same account");
+    assert!(
+        body.get("source").is_none(),
+        "the owner view of `show` keeps the editing block out"
+    );
 }
 
 /// A local account renders its full entity to an anonymous request: auth

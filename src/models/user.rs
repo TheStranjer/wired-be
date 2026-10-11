@@ -164,6 +164,13 @@ pub struct User {
     /// Visibility new statuses default to (`public`, `unlisted`,
     /// `private`, `direct`).
     pub default_scope: String,
+    /// Whether new statuses are flagged sensitive by default; the
+    /// `source.sensitive` of the entity, `false` until a profile update
+    /// says otherwise.
+    pub sensitive_default: Flag,
+    /// BCP 47 language tag new statuses default to, the `source.language`
+    /// of the entity; `None` when the account stated no preference.
+    pub language: Option<String>,
     /// Profile tags (`pleroma.tags`).
     pub tags: Vec<String>,
     /// Client settings the server only stores and round-trips
@@ -254,6 +261,8 @@ impl fmt::Debug for User {
             .field("show_role", &self.show_role)
             .field("no_rich_text", &self.no_rich_text)
             .field("default_scope", &self.default_scope)
+            .field("sensitive_default", &self.sensitive_default)
+            .field("language", &self.language)
             .field("tags", &self.tags)
             .field("settings_store", &self.settings_store)
             .field("background_image_url", &self.background_image_url)
@@ -362,6 +371,12 @@ pub struct NewUser {
     pub no_rich_text: Flag,
     /// Visibility new statuses default to; [`DEFAULT_SCOPE`] by default.
     pub default_scope: String,
+    /// Whether new statuses are flagged sensitive by default; `false` by
+    /// default, the `source.sensitive` of the entity.
+    pub sensitive_default: Flag,
+    /// BCP 47 language tag new statuses default to; `None` (no preference)
+    /// by default, the `source.language` of the entity.
+    pub language: Option<String>,
     /// Profile tags; the empty array by default.
     pub tags: Vec<String>,
     /// Client settings blob; the empty JSON object by default.
@@ -443,6 +458,8 @@ impl fmt::Debug for NewUser {
             .field("show_role", &self.show_role)
             .field("no_rich_text", &self.no_rich_text)
             .field("default_scope", &self.default_scope)
+            .field("sensitive_default", &self.sensitive_default)
+            .field("language", &self.language)
             .field("tags", &self.tags)
             .field("settings_store", &self.settings_store)
             .field("background_image_url", &self.background_image_url)
@@ -507,6 +524,8 @@ impl Default for NewUser {
             show_role: Flag::new(true),
             no_rich_text: Flag::new(false),
             default_scope: DEFAULT_SCOPE.to_owned(),
+            sensitive_default: Flag::new(false),
+            language: None,
             tags: Vec::new(),
             settings_store: json!({}),
             background_image_url: None,
@@ -567,17 +586,17 @@ const INSERT_SQL: &str = "INSERT INTO users (
      is_moderator, is_active, hide_followers, hide_follows,
      hide_followers_count, hide_follows_count, hide_favorites,
      allow_following_move, skip_thread_containment, accepts_chat_messages,
-     show_role, no_rich_text, default_scope, tags, settings_store,
-     background_image_url, birthday, show_birthday, also_known_as,
-     moved_to_ap_id, email_confirmed, approval_pending, last_active_at,
-     followers_count, following_count, statuses_count, last_status_at,
-     last_fetched_at, mfa_settings
+     show_role, no_rich_text, default_scope, sensitive_default, language,
+     tags, settings_store, background_image_url, birthday, show_birthday,
+     also_known_as, moved_to_ap_id, email_confirmed, approval_pending,
+     last_active_at, followers_count, following_count, statuses_count,
+     last_status_at, last_fetched_at, mfa_settings
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56
+     $55, $56, $57, $58
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -635,6 +654,8 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.show_role)
         .bind(new_user.no_rich_text)
         .bind(new_user.default_scope.as_str())
+        .bind(new_user.sensitive_default)
+        .bind(new_user.language.as_deref())
         .bind(&new_user.tags)
         .bind(new_user.settings_store.clone())
         .bind(new_user.background_image_url.as_deref())
@@ -1060,6 +1081,14 @@ mod tests {
             user.default_scope, DEFAULT_SCOPE,
             "statuses default to public"
         );
+        assert!(
+            !user.sensitive_default.get(),
+            "new statuses are not flagged sensitive by default"
+        );
+        assert!(
+            user.language.is_none(),
+            "an account that named no language has no default"
+        );
         assert!(user.tags.is_empty(), "tags default to the empty array");
         assert!(
             user.also_known_as.is_empty(),
@@ -1118,6 +1147,8 @@ mod tests {
             show_role: Flag::new(false),
             no_rich_text: Flag::new(true),
             default_scope: "private".to_owned(),
+            sensitive_default: Flag::new(true),
+            language: Some("eo".to_owned()),
             tags: vec!["gnw".to_owned(), "rust".to_owned()],
             settings_store: json!({"pleroma_fe": {"theme": "dark"}}),
             background_image_url: Some(format!("{BASE}/bg.png")),
@@ -1158,6 +1189,15 @@ mod tests {
         assert_eq!(
             user.default_scope, "private",
             "the default scope round trips"
+        );
+        assert!(
+            user.sensitive_default.get(),
+            "the sensitive default round trips through its flag"
+        );
+        assert_eq!(
+            user.language.as_deref(),
+            Some("eo"),
+            "the default language round trips"
         );
         assert_eq!(
             user.tags,
@@ -1564,6 +1604,7 @@ mod tests {
                 && !new.skip_thread_containment.get()
                 && !new.no_rich_text.get()
                 && !new.show_birthday.get()
+                && !new.sensitive_default.get()
                 && !new.approval_pending.get(),
             "and every other Pleroma flag is clear"
         );
@@ -1584,7 +1625,8 @@ mod tests {
             new.background_image_url.is_none()
                 && new.birthday.is_none()
                 && new.moved_to_ap_id.is_none()
-                && new.last_active_at.is_none(),
+                && new.last_active_at.is_none()
+                && new.language.is_none(),
             "the nullable columns start NULL"
         );
         assert_eq!(

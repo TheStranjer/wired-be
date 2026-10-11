@@ -1,4 +1,5 @@
-//! The Mastodon `Account` entity: its core fields and `pleroma` block.
+//! The Mastodon `Account` entity: its core fields, `source` object and
+//! `pleroma` block.
 //!
 //! The reference shape is Pleroma's `AccountView.do_render("show.json", …)`
 //! (`lib/pleroma/web/mastodon_api/views/account_view.ex`); the JSON keys are
@@ -8,9 +9,12 @@
 //! remote users' counts come from the stored counters and nothing is
 //! recomputed per request.
 //!
-//! Deliberately absent here: the `source` extension object (a later ticket
-//! adds it as an `Account` option that `skip_serializing_if` it is unset),
-//! `hide_collections`, and any media proxying.
+//! [`Account::source`] is the one key not every render answers with:
+//! Pleroma puts the editing block in only when the viewer is the account
+//! itself, so it is an `Option` that `skip_serializing_if` hides and only
+//! [`Account::for_owner`] — the `verify_credentials` and
+//! `update_credentials` render — sets. Deliberately absent here:
+//! `hide_collections` and any media proxying.
 //!
 //! The `pleroma` block is [`PleromaMetadata`]: it renders the Pleroma
 //! columns of `users` (see the `users_pleroma_extensions` migration), and
@@ -28,7 +32,10 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{config::Config, entities::relationship::RelationshipMap, models::user::User};
+use crate::{
+    config::Config, entities::relationship::RelationshipMap, models::user::User,
+    util::sanitize::strip_html,
+};
 
 /// The `actor_type` value that makes the entity's `group` flag true.
 const GROUP_ACTOR_TYPE: &str = "Group";
@@ -57,16 +64,97 @@ pub struct JsonBool(pub bool);
 
 /// One profile metadata line, as Mastodon renders it: the stored
 /// `{name, value}` pair of the `fields` jsonb plus a verification time.
+///
+/// The same shape serves both renderings: the top-level
+/// [`fields`](Account::fields) carry the stored value as sanitized HTML,
+/// while [`AccountSource::fields`] hands the owner the raw text to edit.
 #[derive(Debug, Serialize)]
 pub struct Field {
     /// The field label, as the user typed it.
     pub name: String,
-    /// The field contents as sanitized HTML.
+    /// The field contents: sanitized HTML in the top-level entity, raw
+    /// source text in [`AccountSource::fields`].
     pub value: String,
     /// When a linked `value` was verified against the account, in Mastodon
     /// timestamp format; nothing verifies links yet, so this is always
     /// JSON `null`.
     pub verified_at: Option<String>,
+}
+
+/// The `pleroma` half of an [`AccountSource`]: the account's own settings,
+/// as Pleroma's `maybe_put_settings` renders them beside the base `source`
+/// map (`lib/pleroma/web/mastodon_api/views/account_view.ex`).
+#[derive(Debug, Serialize)]
+pub struct SourcePleroma {
+    /// `show_role`: whether the admin/moderator flags may be shown to
+    /// others.
+    pub show_role: JsonBool,
+    /// `no_rich_text`: whether clients should render this account's
+    /// content as plain text.
+    pub no_rich_text: JsonBool,
+    /// `discoverable`: whether the account opted into discovery.
+    pub discoverable: JsonBool,
+    /// `actor_type`: the `ActivityPub` actor kind (`Person`, `Service`,
+    /// `Group`, …) as stored.
+    pub actor_type: String,
+}
+
+/// The `source` object of an [`Account`]: the profile as its owner edits
+/// it, which the public entity renders sanitized or not at all.
+///
+/// Pleroma builds it in `AccountView.do_render("show.json", …)`
+/// (`lib/pleroma/web/mastodon_api/views/account_view.ex`): the base map
+/// holds the raw note and fields, and `maybe_put_settings` adds the
+/// posting defaults — but only when the viewer is the account itself.
+/// That is why [`Account::source`] is an `Option` this entity only fills
+/// for `verify_credentials` and `update_credentials`; every other render
+/// leaves it `None` and serde omits the key entirely.
+#[derive(Debug, Serialize)]
+pub struct AccountSource {
+    /// `privacy`: the visibility new statuses default to
+    /// (`public`, `unlisted`, `private` or `direct`).
+    pub privacy: String,
+    /// `sensitive`: whether new statuses are flagged sensitive by default.
+    pub sensitive: JsonBool,
+    /// `language`: the BCP 47 tag new statuses default to, JSON `null`
+    /// when the account stated no preference.
+    pub language: Option<String>,
+    /// `note`: the profile note as its raw source text, not the sanitized
+    /// HTML the top-level `note` renders.
+    pub note: String,
+    /// `fields`: the profile metadata as raw text, in storage order.
+    pub fields: Vec<Field>,
+    /// `follow_requests_count`: how many follow requests are waiting for
+    /// this account to answer them.
+    pub follow_requests_count: i32,
+    /// Pleroma's extension block of the source object (see
+    /// [`SourcePleroma`]).
+    pub pleroma: SourcePleroma,
+}
+
+impl AccountSource {
+    /// Renders the `source` block of `user` for `user` itself, with
+    /// `follow_requests_count` as the pending queue
+    /// [`pending_count`](crate::models::follow::pending_count) counted.
+    ///
+    /// Pure (decision 3): everything but that count comes off the row.
+    #[must_use]
+    pub fn for_owner(user: &User, follow_requests_count: i32) -> Self {
+        Self {
+            privacy: user.default_scope.clone(),
+            sensitive: JsonBool(user.sensitive_default.get()),
+            language: user.language.clone(),
+            note: user.raw_bio.clone(),
+            fields: raw_fields_from_json(&user.fields),
+            follow_requests_count,
+            pleroma: SourcePleroma {
+                show_role: JsonBool(user.show_role.get()),
+                no_rich_text: JsonBool(user.no_rich_text.get()),
+                discoverable: JsonBool(user.discoverable.get()),
+                actor_type: user.actor_type.clone(),
+            },
+        }
+    }
 }
 
 /// The account making a request, as [`Account::from_user_for`] takes it:
@@ -238,6 +326,12 @@ pub struct Account {
     /// Whether the account is rate-limited by moderation; nothing limits
     /// accounts yet, so this is always false.
     pub limited: JsonBool,
+    /// Mastodon's `source` object: the profile as its owner edits it (see
+    /// [`AccountSource`]). Only ever set by `verify_credentials` and
+    /// `update_credentials` through [`Account::for_owner`]; every other
+    /// render leaves it `None`, which serde omits entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<AccountSource>,
     /// Pleroma's extension block: the privacy flags, the role flags and
     /// the account-state keys (see [`PleromaMetadata`]).
     pub pleroma: PleromaMetadata,
@@ -326,12 +420,32 @@ impl Account {
             moved: None,
             suspended: JsonBool(!user.is_active.get()),
             limited: JsonBool(false),
+            source: None,
             pleroma: pleroma_metadata(
                 user,
                 is_self,
                 embedded_relationship(viewer, user, is_self, relationships),
             ),
         }
+    }
+
+    /// Renders `user` as its own credentials endpoints answer it —
+    /// `verify_credentials` and `update_credentials` — by attaching the
+    /// [`source`](Self::source) block to the self view of
+    /// [`from_user_for`](Self::from_user_for).
+    ///
+    /// `follow_requests_count` is the pending queue
+    /// [`pending_count`](crate::models::follow::pending_count) counted:
+    /// the one part of the block no row carries, so the caller reads it
+    /// from the database and hands it in, keeping the entity pure
+    /// (decision 3). The viewer is the account itself, so the owner-only
+    /// keys of [`pleroma`](Self::pleroma) are in, the hidden counters are
+    /// visible and `pleroma.relationship` is Pleroma's empty object.
+    #[must_use]
+    pub fn for_owner(user: &User, config: &Config, follow_requests_count: i32) -> Self {
+        let mut account = Self::from_user_for(Some(user), user, config, None);
+        account.source = Some(AccountSource::for_owner(user, follow_requests_count));
+        account
     }
 }
 
@@ -510,6 +624,45 @@ fn fields_from_json(stored: &Value) -> Vec<Field> {
         .unwrap_or_default()
 }
 
+/// The key a stored field's raw text value would sit under: Pleroma keeps
+/// the editing spelling beside the rendered one (its `raw_fields`, whose
+/// entries `put_fields` derives `fields` from), so a field stored with one
+/// round-trips verbatim instead of being re-derived from its markup.
+const FIELD_RAW_KEY: &str = "value_plaintext";
+
+/// Maps the `fields` jsonb into the [`AccountSource::fields`] an owner
+/// edits: the same entries as [`fields_from_json`], with the value as
+/// plain text rather than as markup. A field that stores a raw value under
+/// [`FIELD_RAW_KEY`] round-trips it verbatim; one that only stores the
+/// sanitized HTML (every field this instance has today) is reduced to its
+/// text by [`strip_html`], so what a client puts in a textarea is what the
+/// account wrote, not the markup around it.
+fn raw_fields_from_json(stored: &Value) -> Vec<Field> {
+    stored
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name").and_then(Value::as_str)?;
+                    let raw = entry.get(FIELD_RAW_KEY).and_then(Value::as_str);
+                    let html = entry.get("value").and_then(Value::as_str);
+                    let value = match (raw, html) {
+                        (Some(raw), _) => raw.to_owned(),
+                        (None, Some(html)) => strip_html(html),
+                        (None, None) => return None,
+                    };
+                    Some(Field {
+                        name: name.to_owned(),
+                        value,
+                        verified_at: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::NaiveDate;
@@ -662,6 +815,8 @@ mod tests {
             show_role: Flag::new(true),
             no_rich_text: Flag::new(false),
             default_scope: DEFAULT_SCOPE.to_owned(),
+            sensitive_default: Flag::new(false),
+            language: None,
             tags: Vec::new(),
             settings_store: json!({}),
             mfa_settings: crate::models::user::mfa::MfaSettings::default_value(),
@@ -1444,6 +1599,172 @@ mod tests {
             unrelated["relationship"],
             json!({}),
             "the map is keyed by the rendered account, not any account"
+        );
+    }
+
+    /// `user` rendered by [`Account::for_owner`] — the
+    /// `verify_credentials` view — with `requests` pending follow requests.
+    fn render_for_owner(user: &User, config: &Config, requests: i32) -> Value {
+        serde_json::to_value(Account::for_owner(user, config, requests)).unwrap()
+    }
+
+    /// The `source` block of a rendered account, owned so a test can bind
+    /// it in the same statement it renders in.
+    fn source_of(value: &Value) -> Value {
+        value
+            .get("source")
+            .cloned()
+            .expect("source block is rendered")
+    }
+
+    /// The key set of a value, for the presence assertions below.
+    fn has_key(value: &Value, key: &str) -> bool {
+        value.get(key).is_some()
+    }
+
+    #[test]
+    fn no_render_but_the_owner_s_gets_a_source_block() {
+        let config = Config::for_tests();
+        let alice = alice_with_pleroma_profile();
+        let stranger = mallory();
+        for value in [
+            render(&alice, &config),
+            render_for(Some(&stranger), &alice, &config),
+            render_for(Some(&alice), &alice, &config),
+        ] {
+            assert!(
+                !has_key(&value, "source"),
+                "`skip_serializing_if` keeps the editing block out of a \
+                 render that did not ask for it"
+            );
+        }
+        let own = render_for_owner(&alice, &config, 0);
+        assert!(
+            has_key(&own, "source"),
+            "the owner render is the one that carries it"
+        );
+        let mut keys = EXPECTED_KEYS.to_vec();
+        keys.push("source");
+        keys.sort_unstable();
+        assert_eq!(json_keys(&own), keys, "source is the one added key");
+    }
+
+    #[test]
+    fn the_source_block_at_the_column_defaults_is_the_documented_shape() {
+        let config = Config::for_tests();
+        let alice = base_user("alice", &format!("{BASE}/users/alice"));
+        assert_eq!(
+            source_of(&render_for_owner(&alice, &config, 0)),
+            json!({
+                "privacy": "public",
+                "sensitive": false,
+                "language": null,
+                "note": "",
+                "fields": [],
+                "follow_requests_count": 0,
+                "pleroma": {
+                    "show_role": true,
+                    "no_rich_text": false,
+                    "discoverable": false,
+                    "actor_type": "Person",
+                },
+            }),
+            "a row nobody has edited answers the defaults of the columns"
+        );
+    }
+
+    #[test]
+    fn the_source_block_reads_the_account_s_own_settings() {
+        let config = Config::for_tests();
+        let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
+        alice.default_scope = "unlisted".to_owned();
+        alice.sensitive_default = Flag::new(true);
+        alice.language = Some("eo".to_owned());
+        alice.raw_bio = "hi **there**".to_owned();
+        alice.bio = "<p>hi <strong>there</strong></p>".to_owned();
+        alice.no_rich_text = Flag::new(true);
+        alice.show_role = Flag::new(false);
+        alice.discoverable = Flag::new(true);
+        alice.actor_type = "Service".to_owned();
+        let value = render_for_owner(&alice, &config, 4);
+        assert_eq!(
+            source_of(&value),
+            json!({
+                "privacy": "unlisted",
+                "sensitive": true,
+                "language": "eo",
+                "note": "hi **there**",
+                "fields": [],
+                "follow_requests_count": 4,
+                "pleroma": {
+                    "show_role": false,
+                    "no_rich_text": true,
+                    "discoverable": true,
+                    "actor_type": "Service",
+                },
+            }),
+            "the block renders the stored settings, the raw note rather \
+             than the sanitized one, and the count the caller passed in"
+        );
+        assert_eq!(
+            value["note"], "<p>hi <strong>there</strong></p>",
+            "the top-level note keeps rendering the sanitized HTML"
+        );
+    }
+
+    #[test]
+    fn source_fields_are_the_raw_text_of_the_stored_ones() {
+        let config = Config::for_tests();
+        let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
+        alice.fields = json!([
+            {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"},
+            {"name": "raw", "value": "<b>kept as stored</b>", "value_plaintext": "**kept as stored**"},
+            {"name": "no value"},
+            {"name": 3, "value": "four"},
+            "not an object",
+        ]);
+        let fields = source_of(&render_for_owner(&alice, &config, 0))["fields"].clone();
+        assert_eq!(
+            fields,
+            json!([
+                {"name": "site", "value": "alice.example", "verified_at": null},
+                {"name": "raw", "value": "**kept as stored**", "verified_at": null},
+            ]),
+            "an HTML-only field is reduced to its text, one stored with a \
+             plaintext value round-trips it verbatim, and malformed \
+             entries are skipped like the top-level render skips them"
+        );
+
+        alice.fields = json!({"not": "an array"});
+        assert_eq!(
+            source_of(&render_for_owner(&alice, &config, 0))["fields"],
+            json!([]),
+            "jsonb of another shape renders as the empty list"
+        );
+    }
+
+    #[test]
+    fn the_owner_render_keeps_everything_the_self_view_shows() {
+        let config = Config::for_tests();
+        let mut alice = alice_with_pleroma_profile();
+        alice.followers_count = 5;
+        alice.hide_followers_count = Flag::new(true);
+        alice.is_admin = Flag::new(true);
+        alice.show_role = Flag::new(false);
+        let own = render_for_owner(&alice, &config, 1);
+        let self_view = render_for(Some(&alice), &alice, &config);
+        assert_eq!(
+            own["followers_count"], 5,
+            "a count hidden from strangers is visible to the owner here too"
+        );
+        assert_eq!(
+            own["pleroma"], self_view["pleroma"],
+            "the pleroma block of the owner render is the self view's, \
+             owner-only keys and all"
+        );
+        assert_eq!(
+            own["id"], self_view["id"],
+            "and the core entity is the same account either way"
         );
     }
 }
