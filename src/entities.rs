@@ -8,10 +8,14 @@
 //! request, so every entity is testable with `serde_json::to_value`
 //! alone. [`account`] renders the Mastodon `Account` entity,
 //! [`media_attachment`] the Mastodon `Attachment` entity,
-//! [`custom_emoji`] the Mastodon `CustomEmoji` entity and [`chat`] the
-//! Pleroma chat `Chat` and `ChatMessage` entities.
+//! [`custom_emoji`] the Mastodon `CustomEmoji` entity, [`chat`] the
+//! Pleroma chat `Chat` and `ChatMessage` entities and [`relationship`]
+//! the Mastodon `Relationship` entity (with Pleroma's `subscribing`
+//! alias), which [`models::relationship`](crate::models::relationship)
+//! batch-loads.
 
 pub mod account;
 pub mod chat;
 pub mod custom_emoji;
 pub mod media_attachment;
+pub mod relationship;

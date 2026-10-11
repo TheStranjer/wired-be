@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::{config::Config, models::user::User};
+use crate::{config::Config, entities::relationship::RelationshipMap, models::user::User};
 
 /// The `actor_type` value that makes the entity's `group` flag true.
 const GROUP_ACTOR_TYPE: &str = "Group";
@@ -52,7 +52,7 @@ const DATE_FORMAT: &str = "%Y-%m-%d";
 /// threshold, so each is wrapped in this newtype; serde serializes a
 /// newtype struct as its inner value, so on the wire these stay plain
 /// `true`/`false`.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct JsonBool(pub bool);
 
 /// One profile metadata line, as Mastodon renders it: the stored
@@ -92,8 +92,12 @@ pub struct PleromaMetadata {
     pub background_image: Option<String>,
     /// `tags`: the profile tags as stored.
     pub tags: Vec<String>,
-    /// `relationship`: `{}` until the relationships ticket fills it with a
-    /// rendered `Relationship`.
+    /// `relationship`: the viewer's
+    /// [`Relationship`](crate::entities::relationship::Relationship) to
+    /// this account when one is embedded — an authenticated viewer looking
+    /// at someone other than themselves, with the relationship preloaded
+    /// in the map (see [`Account::from_user_for`]); `{}` for every other
+    /// view, as Pleroma renders an anonymous `relationship.json`.
     pub relationship: Value,
     /// `is_admin`: the admin role, or `false` when hidden
     /// (`visible_roles` decides).
@@ -242,20 +246,23 @@ pub struct Account {
 impl Account {
     /// Renders `user` as an `Account` of the instance described by
     /// `config`, as an anonymous viewer sees it: what the account hides
-    /// stays hidden and the owner-only keys of [`pleroma`](Self::pleroma)
-    /// are absent.
+    /// stays hidden, the owner-only keys of [`pleroma`](Self::pleroma)
+    /// are absent, and `pleroma.relationship` is the empty object (an
+    /// anonymous request has no relationship to embed).
     ///
     /// Pure (decision 3): every value comes from the row, from `config`,
     /// or from a documented constant — counts included, which for remote
     /// users are exactly the counters federation stored.
     #[must_use]
     pub fn from_user(user: &User, config: &Config) -> Self {
-        Self::from_user_for(None, user, config)
+        Self::from_user_for(None, user, config, None)
     }
 
     /// Renders `user` as an `Account` of the instance described by
     /// `config`, as seen by `viewer` (an [`AccountViewer`]: `None` for an
-    /// anonymous request).
+    /// anonymous request), with `relationships` as the optional preload
+    /// of the viewer's [`Relationship`](crate::entities::relationship::Relationship)
+    /// rows keyed by target id (see [`RelationshipMap`]).
     ///
     /// The viewer decides three things, as Pleroma's `show.json` renderer
     /// does: [`followers_count`](Self::followers_count) and
@@ -266,9 +273,17 @@ impl Account {
     /// `false` for anyone but the owner when the account hides its role,
     /// and the owner-only keys of [`PleromaMetadata`] appear only for the
     /// owner (`birthday` reaches a stranger too, when the account shows
-    /// it).
+    /// it). And `pleroma.relationship` embeds the viewer's relationship
+    /// to this account — for a viewer looking at someone other than
+    /// themselves, when `relationships` carries that account's row;
+    /// `{}` otherwise, Pleroma's anonymous rendering.
     #[must_use]
-    pub fn from_user_for(viewer: AccountViewer<'_>, user: &User, config: &Config) -> Self {
+    pub fn from_user_for(
+        viewer: AccountViewer<'_>,
+        user: &User,
+        config: &Config,
+        relationships: Option<&RelationshipMap>,
+    ) -> Self {
         let is_self = is_owner_of(viewer, user);
         let avatar = user
             .avatar_url
@@ -311,7 +326,11 @@ impl Account {
             moved: None,
             suspended: JsonBool(!user.is_active.get()),
             limited: JsonBool(false),
-            pleroma: pleroma_metadata(user, is_self),
+            pleroma: pleroma_metadata(
+                user,
+                is_self,
+                embedded_relationship(viewer, user, is_self, relationships),
+            ),
         }
     }
 }
@@ -379,14 +398,38 @@ fn birthday_json(user: &User) -> Value {
     user.birthday.map_or(Value::Null, |day| json!(day))
 }
 
+/// The `pleroma.relationship` value: the viewer's embedded
+/// [`Relationship`](crate::entities::relationship::Relationship) when
+/// there is one to embed — a viewer (anonymous requests never get one),
+/// not the account's own row (Pleroma keeps the owner's own relationship
+/// out of `show.json`), and an entry for this account in the preloaded
+/// `relationships` map — and `{}` in every other case. Serializing the
+/// entity cannot fail (its fields are strings and booleans), so the
+/// degenerate error branch just renders the same empty object.
+fn embedded_relationship(
+    viewer: AccountViewer<'_>,
+    user: &User,
+    is_self: bool,
+    relationships: Option<&RelationshipMap>,
+) -> Value {
+    if viewer.is_none() || is_self {
+        return json!({});
+    }
+    relationships.and_then(|map| map.get(&user.id)).map_or_else(
+        || json!({}),
+        |relationship| serde_json::to_value(relationship).unwrap_or_else(|_| json!({})),
+    )
+}
+
 /// Builds the `pleroma` block for `user` as seen by a viewer who is the
-/// account (`is_self`) or someone else.
-fn pleroma_metadata(user: &User, is_self: bool) -> PleromaMetadata {
+/// account (`is_self`) or someone else; `relationship` is the
+/// [`embedded_relationship`] value the caller's viewer gets.
+fn pleroma_metadata(user: &User, is_self: bool, relationship: Value) -> PleromaMetadata {
     let (is_admin, is_moderator) = visible_roles(user, is_self);
     PleromaMetadata {
         background_image: user.background_image_url.clone(),
         tags: user.tags.clone(),
-        relationship: json!({}),
+        relationship,
         is_admin: JsonBool(is_admin),
         is_moderator: JsonBool(is_moderator),
         confirmation_pending: JsonBool(!user.email_confirmed.get()),
@@ -474,6 +517,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        entities::relationship::Relationship,
         models::user::{DEFAULT_SCOPE, Flag},
         util::time::parse_time,
     };
@@ -643,9 +687,21 @@ mod tests {
         serde_json::to_value(Account::from_user(user, config)).unwrap()
     }
 
-    /// `user` rendered as `viewer` sees it (`None` is anonymous).
+    /// `user` rendered as `viewer` sees it (`None` is anonymous), without
+    /// any preloaded relationships.
     fn render_for(viewer: Option<&User>, user: &User, config: &Config) -> Value {
-        serde_json::to_value(Account::from_user_for(viewer, user, config)).unwrap()
+        render_for_with(viewer, user, config, None)
+    }
+
+    /// `user` rendered as `viewer` sees it with `relationships` as the
+    /// optional preload for the embedded `pleroma.relationship`.
+    fn render_for_with(
+        viewer: Option<&User>,
+        user: &User,
+        config: &Config,
+        relationships: Option<&RelationshipMap>,
+    ) -> Value {
+        serde_json::to_value(Account::from_user_for(viewer, user, config, relationships)).unwrap()
     }
 
     /// The `pleroma` block of a rendered account, owned so a test can bind
@@ -1272,8 +1328,7 @@ mod tests {
         assert_eq!(
             pleroma["relationship"],
             json!({}),
-            "the relationship placeholder is the empty object until the \
-             relationships ticket fills it"
+            "with no viewer and no preload there is no relationship to embed"
         );
         assert_eq!(
             pleroma["favicon"],
@@ -1294,6 +1349,100 @@ mod tests {
             filled["background_image"],
             format!("{BASE}/bg.png"),
             "the stored background url renders as itself"
+        );
+    }
+
+    /// A loaded relationship for `target`: the follow-derived flags a
+    /// viewer who follows them with notifications on and reblogs hidden
+    /// would have; the rest at the constructor's defaults.
+    fn following_relationship(target: &User) -> Relationship {
+        Relationship {
+            following: JsonBool(true),
+            notifying: JsonBool(true),
+            subscribing: JsonBool(true),
+            showing_reblogs: JsonBool(false),
+            ..Relationship::unconnected(target.id)
+        }
+    }
+
+    #[test]
+    fn a_stranger_viewer_gets_the_relationship_embedded_in_pleroma() {
+        let config = Config::for_tests();
+        let alice = alice_with_pleroma_profile();
+        let stranger = mallory();
+        let relationship = following_relationship(&alice);
+        let map = RelationshipMap::from([(alice.id, relationship.clone())]);
+
+        let pleroma = pleroma_of(&render_for_with(
+            Some(&stranger),
+            &alice,
+            &config,
+            Some(&map),
+        ));
+        assert_eq!(
+            pleroma["relationship"],
+            serde_json::to_value(&relationship).unwrap(),
+            "the preloaded relationship for the rendered account is embedded \
+             verbatim, keys and all"
+        );
+        assert_eq!(
+            json_keys(&pleroma),
+            PLEROMA_KEYS_FOR_OTHERS,
+            "embedding changes the value of `relationship`, not the key set"
+        );
+    }
+
+    #[test]
+    fn the_relationship_stays_empty_without_a_stranger_or_a_preload() {
+        let config = Config::for_tests();
+        let alice = alice_with_pleroma_profile();
+        let stranger = mallory();
+        let relationship = following_relationship(&alice);
+        let map = RelationshipMap::from([(alice.id, relationship)]);
+
+        // An anonymous viewer never gets one, however full the preload is.
+        let anonymous = pleroma_of(&render_for_with(None, &alice, &config, Some(&map)));
+        assert_eq!(
+            anonymous["relationship"],
+            json!({}),
+            "rendering an anonymous `relationship.json` is Pleroma's empty object"
+        );
+        // The account's own viewer does not either: it is no one's target here.
+        let own = pleroma_of(&render_for_with(Some(&alice), &alice, &config, Some(&map)));
+        assert_eq!(
+            own["relationship"],
+            json!({}),
+            "a self relationship is not embedded"
+        );
+        // A viewer without the preload (or without this account in it)
+        // falls back to the placeholder, as every other caller renders.
+        for who in [
+            render_for(Some(&stranger), &alice, &config),
+            render_for_with(
+                Some(&stranger),
+                &alice,
+                &config,
+                Some(&RelationshipMap::new()),
+            ),
+        ] {
+            assert_eq!(
+                pleroma_of(&who)["relationship"],
+                json!({}),
+                "no preloaded row for the target means the empty object"
+            );
+        }
+        // A preload that only knows about someone else embeds nothing.
+        let other = RelationshipMap::from([(mallory().id, following_relationship(&mallory()))]);
+        let unrelated = pleroma_of(&render_for_with(
+            Some(&stranger),
+            &alice,
+            &config,
+            Some(&other),
+        ));
+        assert_eq!(
+            unrelated["relationship"],
+            json!({}),
+            "the map is keyed by the rendered account, not any account"
         );
     }
 }

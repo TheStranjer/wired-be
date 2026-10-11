@@ -5,7 +5,10 @@
 //! authorization-code tables, or the three that make up a chat): a
 //! `FromRow` struct for the row plus the
 //! runtime-checked queries that touch
-//! it (`sqlx::query_as::<_, T>`; never the `query!` family). Nothing here
+//! it (`sqlx::query_as::<_, T>`; never the `query!` family). One module is
+//! the exception: [`relationship`] owns no table; it is the batched loader
+//! that reads `follows` to build the `Relationship` entity (and will read
+//! each later flag table as its ticket lands). Nothing here
 //! knows about HTTP, though every fallible function returns
 //! [`AppError`](crate::error::AppError), the crate's single error type, so
 //! handlers can use `?`.
@@ -17,5 +20,6 @@ pub mod job;
 pub mod media_attachment;
 pub mod oauth_app;
 pub mod oauth_token;
+pub mod relationship;
 pub mod status;
 pub mod user;
