@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{config::Config, error::AppResult, util::id::new_id};
 
 pub mod register;
 
@@ -514,6 +514,40 @@ pub async fn get_by_email(pool: &PgPool, email: &str) -> AppResult<Option<User>>
     Ok(user)
 }
 
+/// Fetches the user an `acct` handle names, `None` when absent.
+///
+/// The resolution mirrors `GET /api/v1/accounts/lookup` (Pleroma's
+/// `AccountController.lookup`): the handle is first tried verbatim as a
+/// stored nickname — case-insensitively, because the column is citext, so
+/// `ALICE` and the remote handle `BOB@Remote.Example` find their rows just
+/// like their stored spellings. When nothing matches and the handle
+/// carries this instance's own domain (`alice@test.example`, compared
+/// case-insensitively), the domain is stripped and the bare nickname is
+/// tried again: local rows are stored without their domain (decision 7).
+/// Resolving a handle this instance has never seen (via `WebFinger`)
+/// belongs to the federation ticket.
+///
+/// This is a pure resolver: deactivated rows are found like any other;
+/// callers that must hide them filter on [`is_active`](User::is_active)
+/// themselves.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_acct(pool: &PgPool, config: &Config, acct: &str) -> AppResult<Option<User>> {
+    if let Some(found) = get_by_nickname(pool, acct).await? {
+        return Ok(Some(found));
+    }
+    let Some((nickname, domain)) = acct.split_once('@') else {
+        return Ok(None);
+    };
+    if domain.eq_ignore_ascii_case(config.domain()) {
+        return get_by_nickname(pool, nickname).await;
+    }
+    Ok(None)
+}
+
 /// Fetches the users whose ids are in `ids`, in `id` order (`UUIDv7` text
 /// sorts by creation, decision 4). Ids with no row are skipped; an empty
 /// `ids` yields an empty `Vec`.
@@ -875,6 +909,44 @@ mod tests {
             .unwrap()
             .expect("the remote handle finds the row");
         assert_eq!(fetched.ap_id, ap_id, "same row by nickname");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn get_by_acct_folds_case_and_strips_the_local_domain(pool: PgPool) {
+        let config = Config::for_tests();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        let bob = insert(
+            &pool,
+            &NewUser {
+                nickname: "bob@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/bob".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        for (acct, expected) in [
+            ("alice", Some(alice.id)),
+            ("ALICE", Some(alice.id)),
+            ("alice@test.example", Some(alice.id)),
+            ("AlIce@TEST.example", Some(alice.id)),
+            ("bob@remote.example", Some(bob.id)),
+            ("BOB@Remote.Example", Some(bob.id)),
+            ("nobody", None),
+            ("nobody@test.example", None),
+            ("alice@other.example", None),
+            ("carol@remote.example", None),
+            ("@test.example", None),
+        ] {
+            let found = get_by_acct(&pool, &config, acct).await.unwrap();
+            let got = found.map(|user| user.id);
+            assert_eq!(
+                got, expected,
+                "`{acct}` must resolve to {expected:?}, got {got:?}"
+            );
+        }
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

@@ -5,7 +5,7 @@
 use axum::Router;
 
 use crate::{
-    api::{apps, custom_emojis},
+    api::{accounts, apps, custom_emojis},
     state::AppState,
 };
 
@@ -19,6 +19,7 @@ use crate::{
 /// a fallback panics.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(accounts::router())
         .merge(apps::router())
         .merge(custom_emojis::router())
 }
