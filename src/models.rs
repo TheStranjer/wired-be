@@ -16,6 +16,7 @@
 pub mod announcement;
 pub mod chat;
 pub mod custom_emoji;
+pub mod filter;
 pub mod follow;
 pub mod job;
 pub mod media_attachment;

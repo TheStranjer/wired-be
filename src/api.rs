@@ -30,6 +30,7 @@ pub mod announcements;
 pub mod apps;
 pub mod custom_emojis;
 pub mod emoji_packs;
+pub mod filters;
 pub mod helpers;
 pub mod media_files;
 pub mod mfa;
