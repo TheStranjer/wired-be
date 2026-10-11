@@ -43,13 +43,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the five that serve
-/// addresses outside `/api` fixed by their protocols or by stored URLs —
-/// `/media` ([`media_files`]), `/emoji` ([`api::emoji_packs`]),
-/// `/users/{nickname}` ([`api::activitypub`]), `/.well-known`
-/// ([`api::well_known`]) and `/oauth` ([`api::oauth`]) — are merged at the
-/// top level. Paths no route matches get the standard JSON error response
-/// (decision 8).
+/// The [`api`] routers are merged under their prefixes; the six that serve
+/// addresses outside `/api` fixed by their protocols, by stored URLs or by
+/// the clients that call them — `/media` ([`media_files`]), `/emoji`
+/// ([`api::emoji_packs`]), `/users/{nickname}` ([`api::activitypub`]),
+/// `/.well-known` ([`api::well_known`]), `/oauth` ([`api::oauth`]) and the
+/// `MongooseIM` auth endpoints plus `/manifest.json` ([`api::misc`]) — are
+/// merged at the top level. Paths no route matches get the standard JSON
+/// error response (decision 8).
 ///
 /// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
@@ -65,6 +66,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::well_known::router())
             .merge(media_files::router())
             .merge(api::emoji_packs::files_router())
+            .merge(api::misc::router())
             .fallback(not_found)
             .with_state(state),
     )
@@ -451,6 +453,66 @@ mod tests {
                 one("chat_messages", "deleted_at").column_default.is_none()
                     && one("chat_messages", "deleted_at").is_nullable == "YES",
                 "a live message has no deleted_at until it is withdrawn"
+            );
+        }
+
+        /// The instance-settings migration creates the tiny key/value
+        /// table `src/models/instance_setting.rs` reads: the `text`
+        /// primary key its upsert conflicts on, the jsonb value and the
+        /// `now()`-defaulted `updated_at`.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn instance_settings_migration_creates_the_settings_table(pool: PgPool) {
+            let columns: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'instance_settings'
+               ORDER BY column_name",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                columns,
+                vec![
+                    ("key".to_owned(), "text".to_owned(), "NO".to_owned()),
+                    (
+                        "updated_at".to_owned(),
+                        "timestamp with time zone".to_owned(),
+                        "NO".to_owned()
+                    ),
+                    ("value".to_owned(), "jsonb".to_owned(), "NO".to_owned()),
+                ],
+                "the ticket's three columns with the ticket's types"
+            );
+
+            let (primary_key, key_columns): (String, String) = sqlx::query_as(
+                "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'instance_settings'
+               GROUP BY con.conname",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                key_columns, "key",
+                "the key alone is the primary key {primary_key}"
+            );
+
+            let updated_default: Option<String> = sqlx::query_scalar(
+                "SELECT column_default FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'instance_settings'
+                    AND column_name = 'updated_at'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                updated_default.as_deref(),
+                Some("now()"),
+                "updated_at defaults to now()"
             );
         }
     }

@@ -119,7 +119,11 @@ pub fn test_app_with_upload_limits(
 
 /// The real application router from [`wired_be::app`] over `pool` and
 /// `config`.
-fn test_app_with_config(pool: PgPool, config: Config) -> Router {
+///
+/// Tickets whose endpoints read a config setting test the non-default
+/// values through here: build a [`test_config`], set the fields, and
+/// mount the router.
+pub fn test_app_with_config(pool: PgPool, config: Config) -> Router {
     let config = Arc::new(config);
     wired_be::app(AppState {
         db: pool,
