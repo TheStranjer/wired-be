@@ -5,7 +5,10 @@
 use axum::Router;
 
 use crate::{
-    api::{accounts, announcements, apps, custom_emojis, emoji_packs, filters, lists, markers},
+    api::{
+        accounts, announcements, apps, custom_emojis, emoji_packs, filters, lists, markers, media,
+    },
+    config::Config,
     state::AppState,
 };
 
@@ -17,7 +20,12 @@ use crate::{
 /// app-wide JSON fallback in [`crate::app`], which answers them with
 /// Pleroma's `api_not_implemented`, and merging two routers that each set
 /// a fallback panics.
-pub fn router() -> Router<AppState> {
+///
+/// `config` reaches [`media::router`], the one merged router that needs it:
+/// the upload route carries its own body limit (see
+/// [`crate::extract::multipart::upload_body_limit`]), which axum's multipart
+/// extractor cannot read from the state on its own.
+pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .merge(accounts::router())
         .merge(announcements::router())
@@ -26,5 +34,6 @@ pub fn router() -> Router<AppState> {
         .merge(filters::router())
         .merge(lists::router())
         .merge(markers::router())
+        .merge(media::router(config))
         .nest("/pleroma/emoji", emoji_packs::router())
 }

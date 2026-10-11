@@ -182,6 +182,63 @@ async fn form_body_reaches_the_handler() {
     );
 }
 
+/// `multipart`: the boundary is announced by the `content-type` and every part
+/// is framed the way a `FormData` body frames it — text fields without a file
+/// name, file parts with a `filename` and their own `content-type`.
+#[tokio::test]
+async fn multipart_body_reaches_the_handler() {
+    let app = echo_app();
+    let parts = [
+        common::MultipartPart::text("description", "a cat"),
+        common::MultipartPart::file(
+            "file",
+            "cat.png",
+            "image/png",
+            axum::body::Bytes::from_static(b"magic-bytes"),
+        ),
+    ];
+    let response = common::TestRequest::post("/echo")
+        .multipart("wired-echo-boundary", &parts)
+        .send(&app)
+        .await;
+    let seen: EchoSeen = response.json();
+    assert_eq!(seen.method, "POST", "the verb builder reached the handler");
+    assert_eq!(
+        seen.content_type, "multipart/form-data; boundary=wired-echo-boundary",
+        "multipart() announces the body and its boundary"
+    );
+    assert_eq!(
+        seen.body,
+        "--wired-echo-boundary\r\n\
+         Content-Disposition: form-data; name=\"description\"\r\n\
+         \r\n\
+         a cat\r\n\
+         --wired-echo-boundary\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"cat.png\"\r\n\
+         Content-Type: image/png\r\n\
+         \r\n\
+         magic-bytes\r\n\
+         --wired-echo-boundary--\r\n",
+        "the parts are framed with their headers and closed off"
+    );
+}
+
+/// `multipart()` with no parts is a body that holds only the closing boundary,
+/// which is how an empty form arrives.
+#[tokio::test]
+async fn multipart_without_parts_sends_an_empty_form() {
+    let app = echo_app();
+    let response = common::TestRequest::post("/echo")
+        .multipart("empty-boundary", &[])
+        .send(&app)
+        .await;
+    let seen: EchoSeen = response.json();
+    assert_eq!(
+        seen.body, "--empty-boundary--\r\n",
+        "the body is the closed-off form alone"
+    );
+}
+
 /// A bare `get` sends no body and no custom headers.
 #[tokio::test]
 async fn empty_get_carries_no_body_or_headers() {

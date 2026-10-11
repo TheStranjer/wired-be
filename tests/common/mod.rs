@@ -101,6 +101,22 @@ pub fn test_app_with_emoji_dir(pool: PgPool, emoji_dir: &Path) -> Router {
     test_app_with_config(pool, test_config_with_emoji_dir(emoji_dir))
 }
 
+/// The real application router, storing uploads in `uploads_dir` and
+/// capping one uploaded file at `max_file_bytes`.
+///
+/// The upload endpoints answer 413 at `UPLOAD_LIMIT_BYTES`; tests that want
+/// to see that without sending 16 MB of bytes set a small limit here. The
+/// other upload setting keeps its test default.
+pub fn test_app_with_upload_limits(
+    pool: PgPool,
+    uploads_dir: &Path,
+    max_file_bytes: usize,
+) -> Router {
+    let mut config = test_config_with_uploads_dir(uploads_dir);
+    config.upload_limits.max_file_bytes = max_file_bytes;
+    test_app_with_config(pool, config)
+}
+
 /// The real application router from [`wired_be::app`] over `pool` and
 /// `config`.
 fn test_app_with_config(pool: PgPool, config: Config) -> Router {
@@ -468,6 +484,31 @@ impl TestRequest {
         self.push_header(name, value)
     }
 
+    /// Sets the body to `parts` framed as `multipart/form-data` with
+    /// `boundary`, and the `content-type` that announces it, so an upload
+    /// endpoint sees exactly what a browser's `FormData` would send.
+    ///
+    /// A file part is one with a `filename`; the endpoint under test decides
+    /// which fields hold files.
+    ///
+    /// # Panics
+    ///
+    /// If the resulting `content-type` is not a valid header value; test
+    /// boundaries are plain ASCII.
+    #[must_use]
+    pub fn multipart(self, boundary: &str, parts: &[MultipartPart]) -> Self {
+        let mut body: Vec<u8> = Vec::new();
+        for part in parts {
+            write_multipart_part(&mut body, boundary, part);
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        self.header(
+            "content-type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .raw_body(Bytes::from(body))
+    }
+
     /// Sets the `content-type` header, for the body methods.
     fn content_type(self, mime: &'static str) -> Self {
         self.push_header(header::CONTENT_TYPE, HeaderValue::from_static(mime))
@@ -513,6 +554,80 @@ impl TestRequest {
         };
         TestResponse::from_response(response).await
     }
+}
+
+/// One part of a `multipart/form-data` body built by
+/// [`TestRequest::multipart`].
+///
+/// The part's `content-type` is what the *client* claims for it: upload
+/// endpoints read the type from the bytes instead, so a test that wants to
+/// prove that sends a mismatching one.
+#[derive(Clone, Debug)]
+pub struct MultipartPart {
+    /// Name of the form field the part arrives under.
+    pub name: &'static str,
+    /// Client file name, which is what makes a part a file part.
+    pub filename: Option<&'static str>,
+    /// The part's `content-type`, if it carries one.
+    pub content_type: Option<&'static str>,
+    /// The part's bytes: a text field's value or a file's contents.
+    pub bytes: Bytes,
+}
+
+impl MultipartPart {
+    /// A text field part: `name` with `value` and no file name, so the
+    /// extractor structures it into the parameters like a form key.
+    #[must_use]
+    pub fn text(name: &'static str, value: &'static str) -> Self {
+        Self {
+            name,
+            filename: None,
+            content_type: None,
+            bytes: Bytes::from_static(value.as_bytes()),
+        }
+    }
+
+    /// A file part: `name` holding `bytes`, uploaded as `filename` and
+    /// announced by the client as `content_type`.
+    #[must_use]
+    pub fn file(
+        name: &'static str,
+        filename: &'static str,
+        content_type: &'static str,
+        bytes: Bytes,
+    ) -> Self {
+        Self {
+            name,
+            filename: Some(filename),
+            content_type: Some(content_type),
+            bytes,
+        }
+    }
+}
+
+/// Appends one `part` of a multipart body to `body`, framed with `boundary`:
+/// the `Content-Disposition` line, an optional `Content-Type`, a blank line,
+/// the bytes and the crlf that closes the part.
+fn write_multipart_part(body: &mut Vec<u8>, boundary: &str, part: &MultipartPart) {
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    match part.filename {
+        Some(filename) => body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"; filename=\"{filename}\"\r\n",
+                part.name
+            )
+            .as_bytes(),
+        ),
+        None => body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{}\"\r\n", part.name).as_bytes(),
+        ),
+    }
+    if let Some(content_type) = part.content_type {
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+    }
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(&part.bytes);
+    body.extend_from_slice(b"\r\n");
 }
 
 /// The response captured by [`TestRequest::send`]: status, headers and the

@@ -38,6 +38,10 @@ dotenvy = "0.15.7"
 # HMAC (`src/util/totp.rs`): RFC 6238/4226 TOTP is HMAC-SHA1 over the time
 # step; `sha1` below supplies the hash, `subtle` the constant-time compare.
 hmac = "0.13.0"
+# Magic-byte media detection for uploads (`src/api/media.rs`): an upload's type
+# is what its bytes say, not what the client's part header claimed. The default
+# matchers (image, video and audio among them) are all the endpoint needs.
+infer = "0.22.0"
 pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 # Markdown for `text/markdown` statuses (`src/util/format.rs`): only the pull
 # parser is used, so the default features (`html`, `getopts`,
