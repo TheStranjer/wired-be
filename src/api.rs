@@ -13,17 +13,19 @@
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
 //!
-//! [`media_files`] and [`activitypub`] are the routers in this module that
-//! [`crate::app`] does not nest under `/api`: uploaded files live at
-//! `/media/{key}`, the address [`crate::uploads`] writes into activities,
-//! and `ActivityPub` actors live at `/users/{nickname}`, the address
-//! federation sends as an actor's id.
+//! [`media_files`], [`activitypub`] and [`well_known`] are the routers in
+//! this module that [`crate::app`] does not nest under `/api`: uploaded
+//! files live at `/media/{key}`, the address [`crate::uploads`] writes into
+//! activities; `ActivityPub` actors live at `/users/{nickname}`, the address
+//! federation sends as an actor's id; and `WebFinger` and host-meta live at
+//! `/.well-known/…`, the discovery addresses fixed by their RFCs.
 
 pub mod activitypub;
 pub mod apps;
 pub mod media_files;
 pub mod v1;
 pub mod v2;
+pub mod well_known;
 
 use axum::Router;
 

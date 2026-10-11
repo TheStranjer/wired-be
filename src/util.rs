@@ -4,8 +4,8 @@
 //! the layers above are built on, following `docs/ARCHITECTURE.md` — ids from
 //! [`id`] (decision 4), timestamps from [`time`] (decision 5), password
 //! hashes from [`password`], random OAuth tokens from [`token`], the RSA key
-//! helpers in [`keys`], the HTML sanitizer in [`sanitize`] and the content
-//! formatter in [`mod@format`].
+//! helpers in [`keys`], the HTML sanitizer in [`sanitize`], the content
+//! formatter in [`mod@format`] and the XML escaper in [`xml`].
 
 pub mod format;
 pub mod id;
@@ -14,3 +14,4 @@ pub mod password;
 pub mod sanitize;
 pub mod time;
 pub mod token;
+pub mod xml;
