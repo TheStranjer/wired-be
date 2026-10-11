@@ -9,9 +9,11 @@
 //! unique constraints maps to the same field error as the up-front
 //! availability check.
 //!
-//! [`authenticate`] is the login path: it finds the local, active user by
-//! nickname or email, verifies the password against any supported hash,
-//! and transparently upgrades legacy (bcrypt / PBKDF2) hashes to Argon2id.
+//! [`authenticate`] is the login path: it verifies the password against
+//! any supported hash for the local, active user found by nickname or
+//! email, transparently upgrading legacy (bcrypt / PBKDF2) hashes to
+//! Argon2id; [`authenticate_any_status`] skips the active-user gate for
+//! flows that check account readiness themselves.
 //! Unknown identifiers are answered with a verification against a built-in
 //! dummy hash so a wrong password and a missing account cost roughly the
 //! same work.
@@ -95,10 +97,13 @@ const RESERVED_NICKNAMES: [&str; 24] = [
 /// pays the cost of one real verification.
 const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$/uRDL24D8QHL5NRLmAficA$Eoza8QsFsJDqfi2oMa05IbXRgPgZ7Kb4t6nxTSc4sIs";
 
-/// The login lookup: local, active rows only, matched by citext nickname or
-/// email against the single bind `$1`.
+/// The login lookup: local rows at any account status, matched by citext
+/// nickname or email against the single bind `$1`. Whether a found account
+/// is ready to receive a token is the caller's decision
+/// ([`authenticate`] demands an active one; the OAuth password grant runs
+/// its own, richer check); a remote mirror is never a candidate.
 const LOGIN_LOOKUP_SQL: &str = "SELECT * FROM users
-     WHERE local AND is_active
+     WHERE local
        AND (nickname = $1::citext OR email = $1::citext)";
 
 /// Characters the email local part may use: ASCII alphanumerics plus the
@@ -249,11 +254,37 @@ pub async fn create_local_user(
 ///
 /// A remote mirror, a deactivated account, an unknown identifier, an
 /// account without a password hash or simply the wrong password all answer
-/// `None`. Unknown identifiers and hashless accounts are checked against a
-/// built-in dummy hash so they cost about the same as verifying a wrong
-/// password, and a password that matches a legacy hash ([`needs_rehash`])
-/// is transparently re-stored as Argon2id before the row is returned.
+/// `None`. This is the strict gate every ordinary login path wants; the
+/// OAuth password grant instead authenticates with
+/// [`authenticate_any_status`] and reports a deactivated account as a
+/// distinct `account_is_disabled` error, so it does not route that case
+/// through here.
 pub async fn authenticate(pool: &PgPool, nickname_or_email: &str, password: &str) -> Option<User> {
+    let user = authenticate_any_status(pool, nickname_or_email, password).await?;
+    // The credential was correct; now enforce the ordinary active-user rule.
+    user.is_active.get().then_some(user)
+}
+
+/// Verifies `password` for the local user whose nickname or email is
+/// `nickname_or_email`, regardless of whether that account is active,
+/// returning the row on success.
+///
+/// This is [`authenticate`] minus the active-user gate, for callers that
+/// must distinguish a wrong password from a deactivated account (the OAuth
+/// password grant answers the former with `Invalid credentials` and the
+/// latter with `account_is_disabled`). A remote mirror, an unknown
+/// identifier, an account without a password hash and the wrong password
+/// all answer `None`; unknown identifiers and hashless accounts are checked
+/// against a built-in dummy hash so they cost about the same as verifying a
+/// wrong password, and a password that matches a legacy hash
+/// ([`needs_rehash`]) is transparently re-stored as Argon2id before the row
+/// is returned. A deactivated account whose password matches is returned
+/// with its `is_active` flag `false`; the caller decides what that means.
+pub async fn authenticate_any_status(
+    pool: &PgPool,
+    nickname_or_email: &str,
+    password: &str,
+) -> Option<User> {
     let Some(mut user) = find_login_candidate(pool, nickname_or_email).await else {
         verify_dummy_password(password);
         return None;
@@ -271,9 +302,10 @@ pub async fn authenticate(pool: &PgPool, nickname_or_email: &str, password: &str
     Some(user)
 }
 
-/// The login lookup: the local, active row whose nickname or email matches
-/// `identifier` (citext folds case in both). A database failure is logged
-/// and answered `None`, like an unknown account.
+/// The login lookup: the local row whose nickname or email matches
+/// `identifier` (citext folds case in both), whatever the account's
+/// status. A database failure is logged and answered `None`, like an
+/// unknown account.
 async fn find_login_candidate(pool: &PgPool, identifier: &str) -> Option<User> {
     let found = sqlx::query_as::<_, User>(LOGIN_LOOKUP_SQL)
         .bind(identifier)
@@ -1329,6 +1361,33 @@ mod tests {
                 .await
                 .is_none(),
             "remote users never authenticate by password"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn authenticate_any_status_returns_a_deactivated_user(pool: PgPool) {
+        let hash = hash_password(PASSWORD).expect("the fixture hash is made");
+        let alice = insert_login(&pool, "henry", "henry@example.org", Some(&hash)).await;
+        set_active(&pool, alice.id, false).await;
+        let found = authenticate_any_status(&pool, "henry", PASSWORD)
+            .await
+            .expect("the password of a deactivated account still verifies");
+        assert_eq!(found.id, alice.id, "the row itself comes back");
+        assert!(
+            !found.is_active.get(),
+            "and it still reports the account as inactive"
+        );
+        assert!(
+            authenticate_any_status(&pool, "henry", "wrong password")
+                .await
+                .is_none(),
+            "but the wrong password never logs in either"
+        );
+        assert!(
+            authenticate_any_status(&pool, "nobody-here", PASSWORD)
+                .await
+                .is_none(),
+            "and an unknown identifier finds nothing (dummy-hash path)"
         );
     }
 
