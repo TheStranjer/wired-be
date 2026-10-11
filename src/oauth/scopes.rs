@@ -60,6 +60,11 @@ pub const READ_LISTS: &str = "read:lists";
 /// (Pleroma's `write:lists` on the remaining actions).
 pub const WRITE_LISTS: &str = "write:lists";
 
+/// The write side of media: `POST /api/v1/media` and `POST /api/v2/media`,
+/// the upload of a file a later status attaches (Pleroma's `write:media` on
+/// the media `create`/`create2` actions).
+pub const WRITE_MEDIA: &str = "write:media";
+
 /// The read side of statuses and the positions in them:
 /// `GET /api/v1/markers`, the read markers a client shows its user
 /// (Pleroma's `read:statuses` on the marker `index` action).

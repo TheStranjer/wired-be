@@ -34,6 +34,7 @@ pub mod filters;
 pub mod helpers;
 pub mod lists;
 pub mod markers;
+pub mod media;
 pub mod media_files;
 pub mod mfa;
 pub mod oauth;
@@ -44,7 +45,7 @@ pub mod well_known;
 
 use axum::Router;
 
-use crate::state::AppState;
+use crate::{config::Config, state::AppState};
 
 /// Composes the API area routers under their URL prefixes.
 ///
@@ -54,9 +55,13 @@ use crate::state::AppState;
 /// way. [`media_files`] and [`activitypub`] are the exceptions: they serve
 /// `/media` and `/users`, addresses that go out in `ActivityPub`
 /// documents, and [`crate::app`] merges them directly.
-pub fn router() -> Router<AppState> {
+///
+/// `config` is passed down to the two version routers because the media
+/// upload route sizes its body limit from the configured upload limits (see
+/// [`crate::extract::multipart::upload_body_limit`]); no other area needs it.
+pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
-        .nest("/api/v1", v1::router())
-        .nest("/api/v2", v2::router())
+        .nest("/api/v1", v1::router(config))
+        .nest("/api/v2", v2::router(config))
         .nest("/api/pleroma", pleroma::router())
 }

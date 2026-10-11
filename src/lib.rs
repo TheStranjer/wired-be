@@ -17,6 +17,8 @@ pub mod state;
 pub mod uploads;
 pub mod util;
 
+use std::sync::Arc;
+
 use axum::{
     Router,
     http::{StatusCode, Uri},
@@ -51,10 +53,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 ///
 /// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
+    // The `/api` routers need the configuration itself (the upload route's
+    // body limit is sized from it), so the `Arc` is cloned and not the config.
+    let config = Arc::clone(&state.config);
     middleware::apply(
         Router::new()
             .route("/health", get(health))
-            .merge(api::router())
+            .merge(api::router(&config))
             .merge(api::activitypub::router())
             .merge(api::oauth::router())
             .merge(api::well_known::router())
