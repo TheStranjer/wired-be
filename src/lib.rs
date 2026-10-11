@@ -12,6 +12,7 @@ pub mod middleware;
 pub mod models;
 pub mod oauth;
 pub mod pagination;
+pub mod services;
 pub mod state;
 pub mod uploads;
 pub mod util;
@@ -40,12 +41,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the four that serve
-/// addresses outside `/api` fixed by their protocols — `/media`
-/// ([`media_files`]), `/users/{nickname}` ([`api::activitypub`]),
-/// `/.well-known` ([`api::well_known`]) and `/oauth` ([`api::oauth`]) — are
-/// merged at the top level. Paths no route matches get the standard JSON
-/// error response (decision 8).
+/// The [`api`] routers are merged under their prefixes; the five that serve
+/// addresses outside `/api` fixed by their protocols or by stored URLs —
+/// `/media` ([`media_files`]), `/emoji` ([`api::emoji_packs`]),
+/// `/users/{nickname}` ([`api::activitypub`]), `/.well-known`
+/// ([`api::well_known`]) and `/oauth` ([`api::oauth`]) — are merged at the
+/// top level. Paths no route matches get the standard JSON error response
+/// (decision 8).
+///
+/// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
     middleware::apply(
         Router::new()
@@ -55,6 +59,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::oauth::router())
             .merge(api::well_known::router())
             .merge(media_files::router())
+            .merge(api::emoji_packs::files_router())
             .fallback(not_found)
             .with_state(state),
     )

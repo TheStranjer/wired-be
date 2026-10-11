@@ -77,6 +77,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v7", "serde"] }
+# Emoji pack archives (`src/services/emoji_packs.rs`): the `GET
+# /api/v1/pleroma/emoji/packs/archive` download is a zip; only in-memory
+# writing with the deflate method is used, so the default features (crypto,
+# zstd, bzip2, …) stay off.
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
@@ -89,6 +94,9 @@ tower = { version = "0.5.3", features = ["util"] }
 tracing-core = "0.1.36"
 # Self-dependency: turns on `integration-tests` for the integration tests only.
 wired-be = { path = ".", features = ["integration-tests"] }
+# Reading the archive download back in `tests/emoji_packs.rs`; same build of
+# `zip` the library uses (see `[dependencies]`).
+zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 [lints.rust]
 unsafe_code = "forbid"

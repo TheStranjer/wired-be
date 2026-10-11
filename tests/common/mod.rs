@@ -63,6 +63,15 @@ pub fn test_config_with_uploads_dir(uploads_dir: &Path) -> Config {
     config
 }
 
+/// [`test_config`] with the emoji packs root moved to `emoji_dir`, for
+/// tests that read packs from disk and must not touch the repository.
+#[must_use]
+pub fn test_config_with_emoji_dir(emoji_dir: &Path) -> Config {
+    let mut config = test_config();
+    config.emoji_dir = emoji_dir.to_path_buf();
+    config
+}
+
 /// The local-file [`UploaderBackend`] storing in `uploads_dir`: the same
 /// storage [`test_app_with_uploads_dir`] serves from.
 ///
@@ -85,6 +94,11 @@ pub fn test_app(pool: PgPool) -> Router {
 /// The real application router, serving uploads out of `uploads_dir`.
 pub fn test_app_with_uploads_dir(pool: PgPool, uploads_dir: &Path) -> Router {
     test_app_with_config(pool, test_config_with_uploads_dir(uploads_dir))
+}
+
+/// The real application router, reading emoji packs from `emoji_dir`.
+pub fn test_app_with_emoji_dir(pool: PgPool, emoji_dir: &Path) -> Router {
+    test_app_with_config(pool, test_config_with_emoji_dir(emoji_dir))
 }
 
 /// The real application router from [`wired_be::app`] over `pool` and
