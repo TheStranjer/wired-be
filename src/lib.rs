@@ -176,5 +176,67 @@ mod tests {
             .unwrap();
             assert_eq!(row.0, 3, "all three extensions should be installed");
         }
+
+        /// The statuses migration creates the six indexes the timeline and
+        /// thread queries need — the two newest-first ones partial on
+        /// `deleted_at IS NULL`, so tombstones drop out of them for free —
+        /// and gives `media_attachments.status_id` its foreign key into the
+        /// new table.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn statuses_migration_indexes_statuses_and_links_media(pool: PgPool) {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT indexname, indexdef FROM pg_indexes
+                  WHERE schemaname = 'public' AND tablename = 'statuses'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+            for expected in [
+                "statuses_pkey",
+                "statuses_uri_key",
+                "statuses_user_id_idx",
+                "statuses_in_reply_to_id_idx",
+                "statuses_conversation_id_idx",
+                "statuses_reblog_of_id_idx",
+                "statuses_visibility_idx",
+                "statuses_quote_of_id_idx",
+            ] {
+                assert!(names.contains(&expected), "{expected} indexes statuses");
+            }
+            for partial in ["statuses_user_id_idx", "statuses_visibility_idx"] {
+                let definition = rows
+                    .iter()
+                    .find(|(name, _)| name == partial)
+                    .map(|(_, definition)| definition.as_str())
+                    .unwrap();
+                assert!(
+                    definition.contains("deleted_at IS NULL"),
+                    "{partial} is partial on live rows only"
+                );
+            }
+
+            let keys: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT con.conname, con.confdeltype::text, con.confrelid::regclass::text
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                  WHERE cls.relname = 'media_attachments' AND con.contype = 'f'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let status_key = keys
+                .iter()
+                .find(|(name, _, _)| name == "media_attachments_status_id_fkey")
+                .unwrap();
+            assert_eq!(
+                status_key.1, "c",
+                "status_id's foreign key deletes its media"
+            );
+            assert_eq!(
+                status_key.2, "statuses",
+                "and points at the table this migration created"
+            );
+        }
     }
 }

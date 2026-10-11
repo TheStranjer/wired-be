@@ -39,6 +39,7 @@ use wired_be::{
     models::{
         oauth_app::{self, NewOauthApp},
         oauth_token::{self, NewToken},
+        status::{self, NewStatus, Status, Visibility},
         user::{Flag, NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
     },
     state::AppState,
@@ -206,9 +207,38 @@ pub async fn create_remote_user(pool: &PgPool, nickname: &str, host: &str) -> Us
         .expect("remote user fixture inserts")
 }
 
+/// Inserts a local [`Status`] posted by `user` — `text` as a plain-text
+/// status of `visibility` — straight through
+/// [`wired_be::models::status`], and returns its row.
+///
+/// The model derives everything a local post owns from its minted id on the
+/// [`test_config`] instance: the `{base_url}/objects/{uuid}` uri, the
+/// `{base_url}/notice/{uuid}` url, the conversation (its own id, since this
+/// replies to nothing) and the author's `statuses_count`, so a fixture made
+/// here looks exactly like a post the API would have written. A status that
+/// replies, reblogs or quotes needs more of [`NewStatus`] than this passes:
+/// build it and call the model directly.
+///
+/// # Panics
+///
+/// If the insert fails, e.g. because `user` has no row in the test database.
+pub async fn create_status(
+    pool: &PgPool,
+    user: &User,
+    text: &str,
+    visibility: Visibility,
+) -> Status {
+    let new = NewStatus {
+        visibility,
+        ..NewStatus::local(user, text)
+    };
+    status::insert(pool, &test_config().base_url, &new)
+        .await
+        .expect("status fixture inserts")
+}
+
 /// The redirect URI every app fixture registers.
 const TEST_REDIRECT_URIS: &str = "https://client.example/callback";
-
 /// Registers a test app named "Test Client" granting `scopes` (one
 /// space-separated string) and returns its row: the `/oauth/token` tests
 /// need the credential pair, not a minted token.
