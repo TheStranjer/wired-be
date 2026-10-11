@@ -345,6 +345,7 @@ mod tests {
             default_scope: DEFAULT_SCOPE.to_owned(),
             tags: Vec::new(),
             settings_store: json!({}),
+            mfa_settings: crate::models::user::mfa::MfaSettings::default_value(),
             background_image_url: None,
             birthday: None,
             show_birthday: Flag::new(false),

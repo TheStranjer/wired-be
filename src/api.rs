@@ -31,7 +31,9 @@ pub mod custom_emojis;
 pub mod emoji_packs;
 pub mod helpers;
 pub mod media_files;
+pub mod mfa;
 pub mod oauth;
+pub mod pleroma;
 pub mod v1;
 pub mod v2;
 pub mod well_known;
@@ -43,13 +45,14 @@ use crate::state::AppState;
 /// Composes the API area routers under their URL prefixes.
 ///
 /// `/api/v1` ([`v1`]) and `/api/v2` ([`v2`]) hold the Mastodon-compatible
-/// client API; later tickets add the remaining `/api` areas (Pleroma
-/// extensions, well-known) here the same way. [`media_files`] and
-/// [`activitypub`] are the exceptions: they serve `/media` and `/users`,
-/// addresses that go out in `ActivityPub` documents, and [`crate::app`]
-/// merges them directly.
+/// client API, `/api/pleroma` ([`pleroma`]) Pleroma's own extensions;
+/// later tickets add the remaining `/api` areas (admin) here the same
+/// way. [`media_files`] and [`activitypub`] are the exceptions: they serve
+/// `/media` and `/users`, addresses that go out in `ActivityPub`
+/// documents, and [`crate::app`] merges them directly.
 pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/api/v1", v1::router())
         .nest("/api/v2", v2::router())
+        .nest("/api/pleroma", pleroma::router())
 }

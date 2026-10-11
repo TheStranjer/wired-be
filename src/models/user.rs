@@ -12,10 +12,12 @@
 //! and its endpoints come from [`local_ap_id`] and the helpers beside it,
 //! so federation and the API build them the same way.
 //!
-//! `password_hash` and `private_key` are secrets: the manual `Debug` impls
-//! in this module redact them, so they can never reach a log line.
+//! `password_hash`, `private_key` and `mfa_settings` (which holds the TOTP
+//! secret) are secrets: the manual `Debug` impls in this module redact
+//! them, so they can never reach a log line.
 //!
-//! Registration and password login live in [`register`].
+//! Registration and password login live in [`register`]; the MFA column's
+//! shape and updates live in [`mfa`].
 
 use std::fmt;
 
@@ -26,6 +28,7 @@ use uuid::Uuid;
 
 use crate::{config::Config, error::AppResult, util::id::new_id};
 
+pub mod mfa;
 pub mod register;
 
 /// `actor_type` a [`NewUser`] starts with: the `ActivityPub` default actor
@@ -198,10 +201,16 @@ pub struct User {
     pub inserted_at: DateTime<Utc>,
     /// When the row last changed; refreshed by every update here.
     pub updated_at: DateTime<Utc>,
+    /// Multi-factor authentication state: the jsonb blob parsed by
+    /// [`mfa::MfaSettings`] (enabled flag, TOTP secret and confirmation,
+    /// backup-code hashes). Holds the TOTP secret; never in `Debug`
+    /// output.
+    pub mfa_settings: Value,
 }
 
-/// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
-/// are secrets and render as `<redacted>`; everything else shows.
+/// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
+/// and [`mfa_settings`](Self::mfa_settings) are secrets and render as
+/// `<redacted>`; everything else shows.
 impl fmt::Debug for User {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("User")
@@ -262,6 +271,7 @@ impl fmt::Debug for User {
             .field("last_fetched_at", &self.last_fetched_at)
             .field("inserted_at", &self.inserted_at)
             .field("updated_at", &self.updated_at)
+            .field("mfa_settings", &"<redacted>")
             .finish()
     }
 }
@@ -382,10 +392,15 @@ pub struct NewUser {
     pub last_status_at: Option<DateTime<Utc>>,
     /// Initial last-fetch time; `None` by default.
     pub last_fetched_at: Option<DateTime<Utc>>,
+    /// Multi-factor authentication state; the all-off [`mfa::MfaSettings`]
+    /// blob by default, matching the column default. Holds the TOTP
+    /// secret; never in `Debug` output.
+    pub mfa_settings: Value,
 }
 
 /// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
-/// are secrets and render as `<redacted>`; everything else shows.
+/// are secrets and render as `<redacted>`; [`mfa_settings`](Self::mfa_settings)
+/// holds the TOTP secret and is redacted too; everything else shows.
 impl fmt::Debug for NewUser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NewUser")
@@ -443,6 +458,7 @@ impl fmt::Debug for NewUser {
             .field("statuses_count", &self.statuses_count)
             .field("last_status_at", &self.last_status_at)
             .field("last_fetched_at", &self.last_fetched_at)
+            .field("mfa_settings", &"<redacted>")
             .finish()
     }
 }
@@ -506,6 +522,7 @@ impl Default for NewUser {
             statuses_count: 0,
             last_status_at: None,
             last_fetched_at: None,
+            mfa_settings: mfa::MfaSettings::default_value(),
         }
     }
 }
@@ -554,12 +571,13 @@ const INSERT_SQL: &str = "INSERT INTO users (
      background_image_url, birthday, show_birthday, also_known_as,
      moved_to_ap_id, email_confirmed, approval_pending, last_active_at,
      followers_count, following_count, statuses_count, last_status_at,
-     last_fetched_at
+     last_fetched_at, mfa_settings
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
-     $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55
+     $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
+     $55, $56
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -632,6 +650,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.statuses_count)
         .bind(new_user.last_status_at)
         .bind(new_user.last_fetched_at)
+        .bind(new_user.mfa_settings.clone())
         .fetch_one(pool)
         .await?;
     Ok(user)
@@ -836,6 +855,9 @@ mod tests {
     const SECRET_HASH: &str = "$argon2id$v=19$secret-digest";
     /// Private key material that must never surface in `Debug` output.
     const SECRET_KEY: &str = "BEGIN RSA PRIVATE KEY secret END";
+    /// A TOTP secret (inside `mfa_settings`) that must never surface in
+    /// `Debug` output.
+    const SECRET_TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 
     /// A local [`NewUser`] named `nickname` at this module's [`BASE`] url.
     fn local_new(nickname: &str) -> NewUser {
@@ -1071,6 +1093,11 @@ mod tests {
             user.last_active_at.is_none(),
             "an account that never logged in has no last-active time"
         );
+        assert_eq!(
+            user.mfa_settings,
+            json!({"enabled": false, "totp": {"secret": null, "confirmed": false}, "backup_codes": []}),
+            "mfa_settings defaults to the migration's all-off blob"
+        );
     }
 
     /// The Pleroma extension columns round trip through [`insert`]: arrays
@@ -1101,6 +1128,11 @@ mod tests {
             email_confirmed: Flag::new(false),
             approval_pending: Flag::new(true),
             last_active_at: Some(active_at),
+            mfa_settings: json!({
+                "enabled": true,
+                "totp": {"secret": "BASE32SECRET", "confirmed": true},
+                "backup_codes": ["0123456789abcdef"],
+            }),
             ..local_new("dora")
         };
         let user = insert(&pool, &new).await.unwrap();
@@ -1167,6 +1199,15 @@ mod tests {
             user.last_active_at,
             Some(active_at),
             "the last-active timestamp round trips"
+        );
+        assert_eq!(
+            user.mfa_settings,
+            json!({
+                "enabled": true,
+                "totp": {"secret": "BASE32SECRET", "confirmed": true},
+                "backup_codes": ["0123456789abcdef"],
+            }),
+            "the mfa_settings blob round trips through jsonb"
         );
     }
 
@@ -1380,6 +1421,11 @@ mod tests {
             &NewUser {
                 password_hash: Some(SECRET_HASH.to_owned()),
                 private_key: Some(SECRET_KEY.to_owned()),
+                mfa_settings: json!({
+                    "enabled": true,
+                    "totp": {"secret": SECRET_TOTP, "confirmed": true},
+                    "backup_codes": [],
+                }),
                 ..local_new("erin")
             },
         )
@@ -1392,6 +1438,10 @@ mod tests {
         );
         assert!(!debug.contains(SECRET_KEY), "the private key must not leak");
         assert!(
+            !debug.contains(SECRET_TOTP),
+            "the TOTP secret inside mfa_settings must not leak"
+        );
+        assert!(
             debug.contains(r#"password_hash: "<redacted>""#),
             "the redaction marker names the field"
         );
@@ -1399,17 +1449,28 @@ mod tests {
             debug.contains(r#"private_key: "<redacted>""#),
             "the redaction marker names the field"
         );
+        assert!(
+            debug.contains(r#"mfa_settings: "<redacted>""#),
+            "the MFA blob is redacted whole, secret included"
+        );
         assert!(debug.contains("erin"), "the rest of the row is visible");
 
         let new = NewUser {
             password_hash: Some(SECRET_HASH.to_owned()),
             private_key: Some(SECRET_KEY.to_owned()),
+            mfa_settings: json!({
+                "enabled": true,
+                "totp": {"secret": SECRET_TOTP, "confirmed": true},
+                "backup_codes": [],
+            }),
             ..local_new("erin")
         };
         let new_debug = format!("{new:?}");
         assert!(
-            !new_debug.contains(SECRET_HASH) && !new_debug.contains(SECRET_KEY),
-            "NewUser redacts the same two fields"
+            !new_debug.contains(SECRET_HASH)
+                && !new_debug.contains(SECRET_KEY)
+                && !new_debug.contains(SECRET_TOTP),
+            "NewUser redacts the same secrets"
         );
         assert!(
             new_debug.contains(r#"password_hash: "<redacted>""#),
@@ -1525,6 +1586,11 @@ mod tests {
                 && new.moved_to_ap_id.is_none()
                 && new.last_active_at.is_none(),
             "the nullable columns start NULL"
+        );
+        assert_eq!(
+            new.mfa_settings,
+            mfa::MfaSettings::default_value(),
+            "the MFA blob starts at the migration's all-off default"
         );
     }
 }
