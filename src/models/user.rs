@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -32,9 +32,13 @@ pub mod register;
 /// kind, matching the column default.
 pub const DEFAULT_ACTOR_TYPE: &str = "Person";
 
+/// `default_scope` a [`NewUser`] starts with: the visibility new statuses
+/// get, matching the column default (Pleroma's `:defaults` `access`).
+pub const DEFAULT_SCOPE: &str = "public";
+
 /// A Postgres `boolean` column as a named flag.
 ///
-/// `User` and `NewUser` carry seven booleans each; Clippy's
+/// `User` and `NewUser` carry twenty booleans each; Clippy's
 /// `struct_excessive_bools` (denied, threshold 2) wants them modelled, not
 /// piled up, so every boolean column is a `Flag`. The `sqlx` transparent
 /// derive makes it encode, decode and compare exactly like the inner
@@ -128,6 +132,58 @@ pub struct User {
     pub is_moderator: Flag,
     /// Whether the account is active (not deactivated or suspended).
     pub is_active: Flag,
+    /// Whether the follower collection is hidden from other accounts.
+    pub hide_followers: Flag,
+    /// Whether the follow collection is hidden from other accounts.
+    pub hide_follows: Flag,
+    /// Whether [`followers_count`](Self::followers_count) renders as zero
+    /// for everyone but the owner.
+    pub hide_followers_count: Flag,
+    /// Whether [`following_count`](Self::following_count) renders as zero
+    /// for everyone but the owner.
+    pub hide_follows_count: Flag,
+    /// Whether the favourites list is private to the account.
+    pub hide_favorites: Flag,
+    /// Whether a `Move` of this account may take the following list with
+    /// it (Pleroma's `allow_following_move`).
+    pub allow_following_move: Flag,
+    /// Whether this account's statuses skip thread containment.
+    pub skip_thread_containment: Flag,
+    /// Whether the account accepts chat messages. A remote mirror keeps
+    /// the column default until federation sees the capability; see
+    /// [`Account`](crate::entities::account::Account) for how that
+    /// renders.
+    pub accepts_chat_messages: Flag,
+    /// Whether the admin/moderator flags may be shown to other accounts.
+    pub show_role: Flag,
+    /// Whether the account asked clients not to render rich text.
+    pub no_rich_text: Flag,
+    /// Visibility new statuses default to (`public`, `unlisted`,
+    /// `private`, `direct`).
+    pub default_scope: String,
+    /// Profile tags (`pleroma.tags`).
+    pub tags: Vec<String>,
+    /// Client settings the server only stores and round-trips
+    /// (`pleroma.settings_store`): a JSON object.
+    pub settings_store: Value,
+    /// Profile background image URL, if set (unlike the avatar and banner
+    /// it has no instance default).
+    pub background_image_url: Option<String>,
+    /// The account's birthday, if it gave one.
+    pub birthday: Option<NaiveDate>,
+    /// Whether strangers may see [`birthday`](Self::birthday).
+    pub show_birthday: Flag,
+    /// Other actor ids this account is also known as.
+    pub also_known_as: Vec<String>,
+    /// Actor id this account moved to, if it moved; the entity's top-level
+    /// `moved` renders from it.
+    pub moved_to_ap_id: Option<String>,
+    /// Whether the account email has been confirmed.
+    pub email_confirmed: Flag,
+    /// Whether a moderator still has to approve the account.
+    pub approval_pending: Flag,
+    /// When the account was last seen; `None` when it never was.
+    pub last_active_at: Option<DateTime<Utc>>,
     /// Number of followers; moved by [`update_counts`].
     pub followers_count: i32,
     /// Number of follows; moved by [`update_counts`].
@@ -178,6 +234,27 @@ impl fmt::Debug for User {
             .field("is_admin", &self.is_admin)
             .field("is_moderator", &self.is_moderator)
             .field("is_active", &self.is_active)
+            .field("hide_followers", &self.hide_followers)
+            .field("hide_follows", &self.hide_follows)
+            .field("hide_followers_count", &self.hide_followers_count)
+            .field("hide_follows_count", &self.hide_follows_count)
+            .field("hide_favorites", &self.hide_favorites)
+            .field("allow_following_move", &self.allow_following_move)
+            .field("skip_thread_containment", &self.skip_thread_containment)
+            .field("accepts_chat_messages", &self.accepts_chat_messages)
+            .field("show_role", &self.show_role)
+            .field("no_rich_text", &self.no_rich_text)
+            .field("default_scope", &self.default_scope)
+            .field("tags", &self.tags)
+            .field("settings_store", &self.settings_store)
+            .field("background_image_url", &self.background_image_url)
+            .field("birthday", &self.birthday)
+            .field("show_birthday", &self.show_birthday)
+            .field("also_known_as", &self.also_known_as)
+            .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("email_confirmed", &self.email_confirmed)
+            .field("approval_pending", &self.approval_pending)
+            .field("last_active_at", &self.last_active_at)
             .field("followers_count", &self.followers_count)
             .field("following_count", &self.following_count)
             .field("statuses_count", &self.statuses_count)
@@ -253,6 +330,48 @@ pub struct NewUser {
     pub is_moderator: Flag,
     /// Whether the account is active; `true` by default.
     pub is_active: Flag,
+    /// Whether the follower collection is hidden; `false` by default.
+    pub hide_followers: Flag,
+    /// Whether the follow collection is hidden; `false` by default.
+    pub hide_follows: Flag,
+    /// Whether the follower count is hidden; `false` by default.
+    pub hide_followers_count: Flag,
+    /// Whether the follow count is hidden; `false` by default.
+    pub hide_follows_count: Flag,
+    /// Whether favourites are private; `true` by default.
+    pub hide_favorites: Flag,
+    /// Whether a move may take the following list; `true` by default.
+    pub allow_following_move: Flag,
+    /// Whether statuses skip thread containment; `false` by default.
+    pub skip_thread_containment: Flag,
+    /// Whether the account accepts chat messages; `true` by default.
+    pub accepts_chat_messages: Flag,
+    /// Whether the role flags may be shown; `true` by default.
+    pub show_role: Flag,
+    /// Whether the account asked for plain text; `false` by default.
+    pub no_rich_text: Flag,
+    /// Visibility new statuses default to; [`DEFAULT_SCOPE`] by default.
+    pub default_scope: String,
+    /// Profile tags; the empty array by default.
+    pub tags: Vec<String>,
+    /// Client settings blob; the empty JSON object by default.
+    pub settings_store: Value,
+    /// Profile background image URL.
+    pub background_image_url: Option<String>,
+    /// The account's birthday, if any.
+    pub birthday: Option<NaiveDate>,
+    /// Whether strangers may see the birthday; `false` by default.
+    pub show_birthday: Flag,
+    /// Other actor ids this account is also known as; empty by default.
+    pub also_known_as: Vec<String>,
+    /// Actor id this account moved to, if it moved.
+    pub moved_to_ap_id: Option<String>,
+    /// Whether the email is confirmed; `true` by default.
+    pub email_confirmed: Flag,
+    /// Whether the account awaits moderator approval; `false` by default.
+    pub approval_pending: Flag,
+    /// When the account was last seen.
+    pub last_active_at: Option<DateTime<Utc>>,
     /// Initial follower count; `0` by default.
     pub followers_count: i32,
     /// Initial following count; `0` by default.
@@ -298,6 +417,27 @@ impl fmt::Debug for NewUser {
             .field("is_admin", &self.is_admin)
             .field("is_moderator", &self.is_moderator)
             .field("is_active", &self.is_active)
+            .field("hide_followers", &self.hide_followers)
+            .field("hide_follows", &self.hide_follows)
+            .field("hide_followers_count", &self.hide_followers_count)
+            .field("hide_follows_count", &self.hide_follows_count)
+            .field("hide_favorites", &self.hide_favorites)
+            .field("allow_following_move", &self.allow_following_move)
+            .field("skip_thread_containment", &self.skip_thread_containment)
+            .field("accepts_chat_messages", &self.accepts_chat_messages)
+            .field("show_role", &self.show_role)
+            .field("no_rich_text", &self.no_rich_text)
+            .field("default_scope", &self.default_scope)
+            .field("tags", &self.tags)
+            .field("settings_store", &self.settings_store)
+            .field("background_image_url", &self.background_image_url)
+            .field("birthday", &self.birthday)
+            .field("show_birthday", &self.show_birthday)
+            .field("also_known_as", &self.also_known_as)
+            .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("email_confirmed", &self.email_confirmed)
+            .field("approval_pending", &self.approval_pending)
+            .field("last_active_at", &self.last_active_at)
             .field("followers_count", &self.followers_count)
             .field("following_count", &self.following_count)
             .field("statuses_count", &self.statuses_count)
@@ -340,6 +480,27 @@ impl Default for NewUser {
             is_admin: Flag::new(false),
             is_moderator: Flag::new(false),
             is_active: Flag::new(true),
+            hide_followers: Flag::new(false),
+            hide_follows: Flag::new(false),
+            hide_followers_count: Flag::new(false),
+            hide_follows_count: Flag::new(false),
+            hide_favorites: Flag::new(true),
+            allow_following_move: Flag::new(true),
+            skip_thread_containment: Flag::new(false),
+            accepts_chat_messages: Flag::new(true),
+            show_role: Flag::new(true),
+            no_rich_text: Flag::new(false),
+            default_scope: DEFAULT_SCOPE.to_owned(),
+            tags: Vec::new(),
+            settings_store: json!({}),
+            background_image_url: None,
+            birthday: None,
+            show_birthday: Flag::new(false),
+            also_known_as: Vec::new(),
+            moved_to_ap_id: None,
+            email_confirmed: Flag::new(true),
+            approval_pending: Flag::new(false),
+            last_active_at: None,
             followers_count: 0,
             following_count: 0,
             statuses_count: 0,
@@ -386,12 +547,19 @@ const INSERT_SQL: &str = "INSERT INTO users (
      name, bio, raw_bio, avatar_url, banner_url, profile_url, locked, bot,
      discoverable, fields, inbox, shared_inbox, outbox, followers_url,
      following_url, featured_url, public_key, private_key, is_admin,
-     is_moderator, is_active, followers_count, following_count,
-     statuses_count, last_status_at, last_fetched_at
+     is_moderator, is_active, hide_followers, hide_follows,
+     hide_followers_count, hide_follows_count, hide_favorites,
+     allow_following_move, skip_thread_containment, accepts_chat_messages,
+     show_role, no_rich_text, default_scope, tags, settings_store,
+     background_image_url, birthday, show_birthday, also_known_as,
+     moved_to_ap_id, email_confirmed, approval_pending, last_active_at,
+     followers_count, following_count, statuses_count, last_status_at,
+     last_fetched_at
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
-     $29, $30, $31, $32, $33, $34
+     $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
+     $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -438,6 +606,27 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.is_admin)
         .bind(new_user.is_moderator)
         .bind(new_user.is_active)
+        .bind(new_user.hide_followers)
+        .bind(new_user.hide_follows)
+        .bind(new_user.hide_followers_count)
+        .bind(new_user.hide_follows_count)
+        .bind(new_user.hide_favorites)
+        .bind(new_user.allow_following_move)
+        .bind(new_user.skip_thread_containment)
+        .bind(new_user.accepts_chat_messages)
+        .bind(new_user.show_role)
+        .bind(new_user.no_rich_text)
+        .bind(new_user.default_scope.as_str())
+        .bind(&new_user.tags)
+        .bind(new_user.settings_store.clone())
+        .bind(new_user.background_image_url.as_deref())
+        .bind(new_user.birthday)
+        .bind(new_user.show_birthday)
+        .bind(&new_user.also_known_as)
+        .bind(new_user.moved_to_ap_id.as_deref())
+        .bind(new_user.email_confirmed)
+        .bind(new_user.approval_pending)
+        .bind(new_user.last_active_at)
         .bind(new_user.followers_count)
         .bind(new_user.following_count)
         .bind(new_user.statuses_count)
@@ -810,6 +999,177 @@ mod tests {
         );
     }
 
+    /// Every Pleroma extension column at the default the migration states,
+    /// for a row inserted through the plain [`NewUser::local`] constructor
+    /// (which mirrors those defaults).
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn pleroma_columns_default_as_the_migration_states(pool: PgPool) {
+        let user = insert(&pool, &local_new("cara")).await.unwrap();
+        assert!(
+            !user.hide_followers.get() && !user.hide_follows.get(),
+            "the follow collections are public by default"
+        );
+        assert!(
+            !user.hide_followers_count.get() && !user.hide_follows_count.get(),
+            "and so are both counters"
+        );
+        assert!(
+            user.hide_favorites.get(),
+            "hide_favorites is the one privacy flag that defaults to true"
+        );
+        assert!(
+            user.allow_following_move.get(),
+            "a move takes the following list unless the account says otherwise"
+        );
+        assert!(
+            !user.skip_thread_containment.get(),
+            "thread containment applies by default"
+        );
+        assert!(
+            user.accepts_chat_messages.get(),
+            "chat is accepted unless the account opts out"
+        );
+        assert!(user.show_role.get(), "roles are shown by default");
+        assert!(
+            !user.no_rich_text.get(),
+            "rich text is on unless the account asks for plain text"
+        );
+        assert_eq!(
+            user.default_scope, DEFAULT_SCOPE,
+            "statuses default to public"
+        );
+        assert!(user.tags.is_empty(), "tags default to the empty array");
+        assert!(
+            user.also_known_as.is_empty(),
+            "aliases default to the empty array"
+        );
+        assert_eq!(
+            user.settings_store,
+            json!({}),
+            "the settings blob defaults to an empty object"
+        );
+        assert!(
+            user.background_image_url.is_none(),
+            "there is no default background image"
+        );
+        assert!(user.birthday.is_none(), "no birthday is stored by default");
+        assert!(
+            !user.show_birthday.get(),
+            "a birthday stays private by default"
+        );
+        assert!(user.moved_to_ap_id.is_none(), "nobody has moved by default");
+        assert!(
+            user.email_confirmed.get(),
+            "email_confirmed defaults to true: an account is not pending \
+             confirmation until the confirmation flow says otherwise"
+        );
+        assert!(
+            !user.approval_pending.get(),
+            "approval is not pending by default"
+        );
+        assert!(
+            user.last_active_at.is_none(),
+            "an account that never logged in has no last-active time"
+        );
+    }
+
+    /// The Pleroma extension columns round trip through [`insert`]: arrays
+    /// keep their order, the jsonb blob keeps its shape, the date and the
+    /// timestamp come back as stored, and every flag keeps its value.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn pleroma_columns_round_trip(pool: PgPool) {
+        let active_at = Utc::now().trunc_subsecs(6);
+        let new = NewUser {
+            hide_followers: Flag::new(true),
+            hide_follows: Flag::new(true),
+            hide_followers_count: Flag::new(true),
+            hide_follows_count: Flag::new(true),
+            hide_favorites: Flag::new(false),
+            allow_following_move: Flag::new(false),
+            skip_thread_containment: Flag::new(true),
+            accepts_chat_messages: Flag::new(false),
+            show_role: Flag::new(false),
+            no_rich_text: Flag::new(true),
+            default_scope: "private".to_owned(),
+            tags: vec!["gnw".to_owned(), "rust".to_owned()],
+            settings_store: json!({"pleroma_fe": {"theme": "dark"}}),
+            background_image_url: Some(format!("{BASE}/bg.png")),
+            birthday: NaiveDate::from_ymd_opt(1990, 1, 31),
+            show_birthday: Flag::new(true),
+            also_known_as: vec![local_ap_id(BASE, "alicia"), local_ap_id(BASE, "alice2")],
+            moved_to_ap_id: Some("https://other.example/users/alice".to_owned()),
+            email_confirmed: Flag::new(false),
+            approval_pending: Flag::new(true),
+            last_active_at: Some(active_at),
+            ..local_new("dora")
+        };
+        let user = insert(&pool, &new).await.unwrap();
+        assert!(
+            user.hide_followers.get()
+                && user.hide_follows.get()
+                && user.hide_followers_count.get()
+                && user.hide_follows_count.get(),
+            "the four hiding flags round trip as set"
+        );
+        assert!(
+            !user.hide_favorites.get(),
+            "so does the one defaulting to true, flipped"
+        );
+        assert!(
+            !user.allow_following_move.get()
+                && user.skip_thread_containment.get()
+                && !user.accepts_chat_messages.get()
+                && !user.show_role.get()
+                && user.no_rich_text.get(),
+            "behaviour and role flags round trip"
+        );
+        assert_eq!(
+            user.default_scope, "private",
+            "the default scope round trips"
+        );
+        assert_eq!(
+            user.tags,
+            vec!["gnw".to_owned(), "rust".to_owned()],
+            "a text[] keeps its order"
+        );
+        assert_eq!(
+            user.also_known_as,
+            vec![local_ap_id(BASE, "alicia"), local_ap_id(BASE, "alice2")],
+            "the alias array keeps its order"
+        );
+        assert_eq!(
+            user.settings_store,
+            json!({"pleroma_fe": {"theme": "dark"}}),
+            "the settings blob round trips through jsonb"
+        );
+        assert_eq!(
+            user.background_image_url.as_deref(),
+            Some("https://test.example/bg.png"),
+            "the background url round trips"
+        );
+        assert_eq!(
+            user.birthday,
+            NaiveDate::from_ymd_opt(1990, 1, 31),
+            "a date column round trips"
+        );
+        assert!(user.show_birthday.get(), "the birthday switch round trips");
+        assert_eq!(
+            user.moved_to_ap_id.as_deref(),
+            Some("https://other.example/users/alice"),
+            "the move target round trips"
+        );
+        assert!(
+            !user.email_confirmed.get(),
+            "an unconfirmed email round trips"
+        );
+        assert!(user.approval_pending.get(), "pending approval round trips");
+        assert_eq!(
+            user.last_active_at,
+            Some(active_at),
+            "the last-active timestamp round trips"
+        );
+    }
+
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn duplicate_nickname_in_other_case_is_rejected(pool: PgPool) {
         let alice = insert(&pool, &local_new("Alice")).await.unwrap();
@@ -1126,6 +1486,45 @@ mod tests {
             (new.followers_count, new.following_count, new.statuses_count),
             (0, 0, 0),
             "counts default to zero"
+        );
+        assert!(
+            new.hide_favorites.get()
+                && new.allow_following_move.get()
+                && new.accepts_chat_messages.get()
+                && new.show_role.get()
+                && new.email_confirmed.get(),
+            "the Pleroma flags whose column defaults to true are set"
+        );
+        assert!(
+            !new.hide_followers.get()
+                && !new.hide_follows.get()
+                && !new.hide_followers_count.get()
+                && !new.hide_follows_count.get()
+                && !new.skip_thread_containment.get()
+                && !new.no_rich_text.get()
+                && !new.show_birthday.get()
+                && !new.approval_pending.get(),
+            "and every other Pleroma flag is clear"
+        );
+        assert_eq!(
+            new.default_scope, DEFAULT_SCOPE,
+            "statuses default to the public scope"
+        );
+        assert!(
+            new.tags.is_empty() && new.also_known_as.is_empty(),
+            "the array columns start empty"
+        );
+        assert_eq!(
+            new.settings_store,
+            json!({}),
+            "the settings blob starts as an empty object"
+        );
+        assert!(
+            new.background_image_url.is_none()
+                && new.birthday.is_none()
+                && new.moved_to_ap_id.is_none()
+                && new.last_active_at.is_none(),
+            "the nullable columns start NULL"
         );
     }
 }
