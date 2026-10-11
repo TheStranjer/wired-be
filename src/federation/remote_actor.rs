@@ -166,12 +166,13 @@ impl From<SqlxError> for ActorError {
 /// A remote actor document parsed into upsert-ready data.
 ///
 /// The field set is what [`parse_actor`] validates and extracts: the
-/// [`User`] columns a document can fill, plus the four fields the `users`
-/// table has no column for yet ([`also_known_as`](Self::also_known_as),
+/// [`User`] columns a document can fill, plus the four fields
+/// [`upsert_remote_user`] does not store yet ([`also_known_as`](Self::also_known_as),
 /// [`moved_to`](Self::moved_to),
 /// [`accepts_chat_messages`](Self::accepts_chat_messages),
-/// [`published`](Self::published)). [`upsert_remote_user`] stores the
-/// former and leaves the latter to the tickets that need them.
+/// [`published`](Self::published)). The first three have `users` columns
+/// since the Pleroma extension migration, `published` has none at all;
+/// storing any of them belongs to the alias, move and chat tickets.
 #[derive(Clone, Debug)]
 pub struct NewRemoteUser {
     /// `{preferredUsername}@{host of ap_id}`, decision 7.
@@ -219,11 +220,13 @@ pub struct NewRemoteUser {
     pub featured_url: Option<String>,
     /// The required `publicKey.publicKeyPem` signing key.
     pub public_key: String,
-    /// The `alsoKnownAs` entries (no column yet; verified aliases).
+    /// The `alsoKnownAs` entries (the column exists; the upsert does not write it).
     pub also_known_as: Vec<String>,
-    /// The `movedTo` actor id (no column yet; migration target).
+    /// The `movedTo` actor id (the column exists; the upsert does not write it).
     pub moved_to: Option<String>,
-    /// `capabilities.acceptsChatMessages` (no column yet).
+    /// `capabilities.acceptsChatMessages`. The column exists but the upsert
+    /// does not write it, so a mirror keeps the column default — which is
+    /// what `pleroma.accepts_chat_messages` renders as JSON `null`.
     pub accepts_chat_messages: Flag,
     /// The actor's `published` creation time (no column yet;
     /// unparseable or absent is `None`).

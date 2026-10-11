@@ -4,7 +4,7 @@
 //! Pleroma's `AccountController.show` and `.lookup`
 //! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`) are
 //! the reference. Both answer the core [`Account`] entity (decision 3:
-//! rendered from the row by [`Account::from_user`]), both serve local and
+//! rendered from the row by [`Account::from_user_for`]), both serve local and
 //! remote mirrors alike (decision 7), and both treat an account that is
 //! unknown, unresolvable or deactivated as a 404 "Record not found" — the
 //! answer Pleroma's `visible_for` check renders through its fallback
@@ -12,11 +12,15 @@
 //!
 //! Authentication is optional, as in Pleroma's
 //! `OAuthScopesPlug … fallback: :proceed_unauthenticated`: the routes
-//! answer without a token, and a valid token changes nothing yet
-//! (relationship fields arrive with a later ticket). The [`MaybeAuthUser`]
-//! extractor is still attached to both, so a request presenting an
-//! invalid, expired or deactivated token is answered 401 "The access
-//! token is invalid" instead of being silently treated as anonymous.
+//! answer without a token. A token is not ignored, though: it names the
+//! [`AccountViewer`](crate::entities::account::AccountViewer) the entity is
+//! rendered for, so the account's own user sees what the row hides from
+//! strangers (hidden follow counts, hidden role flags, and the owner-only
+//! keys of the `pleroma` block) while anyone else sees the restricted view.
+//! Relationship fields still arrive with a later ticket. The
+//! [`MaybeAuthUser`] extractor is attached to both routes, so a request
+//! presenting an invalid, expired or deactivated token is answered 401 "The
+//! access token is invalid" instead of being silently treated as anonymous.
 //!
 //! `lookup` resolves its `acct` parameter through
 //! [`get_by_acct`](crate::models::user::get_by_acct): a stored nickname,
@@ -55,8 +59,9 @@ pub fn router() -> Router<AppState> {
 /// remote. An id that is not `UUID` text is a 404, not a 400, like every
 /// other miss (see [`account_or_404`]).
 ///
-/// The viewer behind an optional token is resolved and ignored for now;
-/// relationship fields come with a later ticket.
+/// The viewer behind an optional token is the account the entity is
+/// rendered for; without one the anonymous view is answered. Relationship
+/// fields come with a later ticket.
 ///
 /// # Errors
 ///
@@ -65,11 +70,15 @@ pub fn router() -> Router<AppState> {
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn show_account(
     State(state): State<AppState>,
-    MaybeAuthUser(_): MaybeAuthUser,
+    MaybeAuthUser(viewer): MaybeAuthUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Account>> {
     let found = account_or_404(&state, &id).await?;
-    Ok(Json(Account::from_user(&found, &state.config)))
+    Ok(Json(Account::from_user_for(
+        viewer.as_ref(),
+        &found,
+        &state.config,
+    )))
 }
 
 /// The query parameters of `GET /api/v1/accounts/lookup`. The absent and
@@ -84,7 +93,8 @@ struct LookupQuery {
 
 /// `GET /api/v1/accounts/lookup?acct=…` — the account a handle names,
 /// resolved by [`get_by_acct`](crate::models::user::get_by_acct). The
-/// viewer behind an optional token is resolved and ignored for now.
+/// viewer behind an optional token is the account the entity is rendered
+/// for, as in `show`.
 ///
 /// # Errors
 ///
@@ -95,7 +105,7 @@ struct LookupQuery {
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn lookup_account(
     State(state): State<AppState>,
-    MaybeAuthUser(_): MaybeAuthUser,
+    MaybeAuthUser(viewer): MaybeAuthUser,
     Query(query): Query<LookupQuery>,
 ) -> AppResult<Json<Account>> {
     let Some(acct) = query
@@ -110,5 +120,9 @@ async fn lookup_account(
         .await?
         .filter(|found| found.is_active.get())
         .ok_or(AppError::NotFound)?;
-    Ok(Json(Account::from_user(&found, &state.config)))
+    Ok(Json(Account::from_user_for(
+        viewer.as_ref(),
+        &found,
+        &state.config,
+    )))
 }

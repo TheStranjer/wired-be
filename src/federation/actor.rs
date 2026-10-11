@@ -217,7 +217,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{models::user::Flag, util::time::parse_time};
+    use crate::{
+        models::user::{DEFAULT_SCOPE, Flag},
+        util::time::parse_time,
+    };
 
     /// The instance origin of [`Config::for_tests`].
     const BASE: &str = "https://test.example";
@@ -286,6 +289,27 @@ mod tests {
             is_admin: Flag::new(false),
             is_moderator: Flag::new(false),
             is_active: Flag::new(true),
+            hide_followers: Flag::new(false),
+            hide_follows: Flag::new(false),
+            hide_followers_count: Flag::new(false),
+            hide_follows_count: Flag::new(false),
+            hide_favorites: Flag::new(true),
+            allow_following_move: Flag::new(true),
+            skip_thread_containment: Flag::new(false),
+            accepts_chat_messages: Flag::new(true),
+            show_role: Flag::new(true),
+            no_rich_text: Flag::new(false),
+            default_scope: DEFAULT_SCOPE.to_owned(),
+            tags: Vec::new(),
+            settings_store: json!({}),
+            background_image_url: None,
+            birthday: None,
+            show_birthday: Flag::new(false),
+            also_known_as: Vec::new(),
+            moved_to_ap_id: None,
+            email_confirmed: Flag::new(true),
+            approval_pending: Flag::new(false),
+            last_active_at: None,
             followers_count: 0,
             following_count: 0,
             statuses_count: 0,
