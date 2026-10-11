@@ -120,6 +120,14 @@ impl Scopes {
         self.0.iter().any(|granted| grants(granted, required))
     }
 
+    /// The scope names, in parse order, duplicates already dropped: what
+    /// the consent page renders one checkbox for
+    /// (`crate::oauth::authorize_page`).
+    #[must_use]
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+
     /// Whether every scope in `self` is satisfied by some scope of `other`
     /// (through [`Scopes::contains`] and the same hierarchy): requested
     /// scopes are allowed by an application's registered scopes when the
@@ -217,6 +225,22 @@ fn is_valid_segment(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_returns_the_parsed_order() {
+        let scopes = Scopes::parse("read write+follow read");
+        assert_eq!(
+            scopes.names().join(" "),
+            "read write follow",
+            "deduplicated, in parse order"
+        );
+        assert_eq!(
+            Scopes::default().names().join(" "),
+            "read",
+            "the default holds just `read`"
+        );
+        assert!(Scopes::parse("").names().is_empty(), "nothing parsed");
+    }
 
     #[test]
     fn parse_splits_on_spaces_and_plusses() {
