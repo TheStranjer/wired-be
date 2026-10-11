@@ -26,5 +26,6 @@ pub mod media_attachment;
 pub mod oauth_app;
 pub mod oauth_token;
 pub mod relationship;
+pub mod scrobble;
 pub mod status;
 pub mod user;

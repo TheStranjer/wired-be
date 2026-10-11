@@ -44,6 +44,7 @@ pub mod misc;
 pub mod oauth;
 pub mod oauth_tokens;
 pub mod pleroma;
+pub mod scrobbles;
 pub mod v1;
 pub mod v2;
 pub mod well_known;

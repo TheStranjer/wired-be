@@ -14,7 +14,8 @@
 //! Mastodon v1 `Filter` entity, [`list`] the Mastodon v1 `List` entity,
 //! [`chat`] the
 //! Pleroma chat `Chat` and `ChatMessage` entities, [`marker`] the
-//! Mastodon v1 `Marker` entity and [`relationship`]
+//! Mastodon v1 `Marker` entity, [`scrobble`] the Pleroma `Scrobble` entity
+//! and [`relationship`]
 //! the Mastodon `Relationship` entity (with Pleroma's `subscribing`
 //! alias), which [`models::relationship`](crate::models::relationship)
 //! batch-loads.
@@ -29,3 +30,4 @@ pub mod list;
 pub mod marker;
 pub mod media_attachment;
 pub mod relationship;
+pub mod scrobble;
