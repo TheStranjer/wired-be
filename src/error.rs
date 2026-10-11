@@ -3,6 +3,11 @@
 //! Every failure becomes a response whose status comes from the variant, whose
 //! `content-type` is `application/json` and whose body is
 //! `{"error": "<message>"}`, following `docs/ARCHITECTURE.md` decision 8. The
+//! [`AppError::ForbiddenWithIdentifier`] variant adds Pleroma's
+//! machine-readable reason code to that body
+//! (`{"error": "<message>", "identifier": "<code>"}`), the shape the OAuth
+//! endpoints use for account-status refusals like `account_is_disabled`;
+//! [`AppError::forbidden_with_identifier`] builds one. The
 //! messages mirror Pleroma's fallback controllers
 //! (`lib/pleroma/web/mastodon_api/controllers/fallback_controller.ex` and
 //! `lib/pleroma/web/fallback/redirect_controller.ex`): "Record not found"
@@ -51,6 +56,11 @@ pub enum AppError {
     Unauthorized(String),
     /// The caller is known but not allowed to do this (403).
     Forbidden(String),
+    /// A [`Self::Forbidden`] whose body additionally carries Pleroma's
+    /// machine-readable reason code: `{"error": message, "identifier": id}`
+    /// (the OAuth account-status refusals, e.g. `account_is_disabled`).
+    /// Build one with [`AppError::forbidden_with_identifier`].
+    ForbiddenWithIdentifier(String, &'static str),
     /// No record matches the request (404).
     NotFound,
     /// The request path is under `/api` but no endpoint is routed there
@@ -83,12 +93,31 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// The machine-readable reason code this error adds to its body, if
+    /// any. Only [`Self::ForbiddenWithIdentifier`] carries one.
+    #[must_use]
+    const fn identifier(&self) -> Option<&'static str> {
+        let Self::ForbiddenWithIdentifier(_, identifier) = self else {
+            return None;
+        };
+        Some(identifier)
+    }
+
+    /// Build a 403 whose body is Pleroma's
+    /// `{"error": message, "identifier": id}`: a forbidden response that
+    /// also names a stable reason code (e.g. `account_is_disabled`).
+    /// Later tickets use this for the other OAuth account-status refusals.
+    #[must_use]
+    pub fn forbidden_with_identifier(message: &str, identifier: &'static str) -> Self {
+        Self::ForbiddenWithIdentifier(message.to_owned(), identifier)
+    }
+
     /// The HTTP status code this error is answered with.
     const fn status(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-            Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::Forbidden(_) | Self::ForbiddenWithIdentifier(_, _) => StatusCode::FORBIDDEN,
             Self::NotFound | Self::NotImplemented | Self::RouteNotFound => StatusCode::NOT_FOUND,
             Self::Gone => StatusCode::GONE,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -107,6 +136,7 @@ impl AppError {
             Self::BadRequest(detail)
             | Self::Unauthorized(detail)
             | Self::Forbidden(detail)
+            | Self::ForbiddenWithIdentifier(detail, _)
             | Self::Conflict(detail)
             | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
@@ -140,6 +170,7 @@ impl fmt::Display for AppError {
             Self::BadRequest(detail)
             | Self::Unauthorized(detail)
             | Self::Forbidden(detail)
+            | Self::ForbiddenWithIdentifier(detail, _)
             | Self::Conflict(detail)
             | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
@@ -162,6 +193,7 @@ impl Error for AppError {
             Self::BadRequest(_)
             | Self::Unauthorized(_)
             | Self::Forbidden(_)
+            | Self::ForbiddenWithIdentifier(_, _)
             | Self::NotFound
             | Self::NotImplemented
             | Self::RouteNotFound
@@ -192,9 +224,17 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         self.log_hidden_detail();
         let status = self.status();
-        let body = Json(ErrorBody {
-            error: self.message(),
-        });
+        let message = self.message();
+        let body = self.identifier().map_or_else(
+            || Json(ErrorBody { error: message }).into_response(),
+            |identifier| {
+                Json(IdentifiedErrorBody {
+                    error: message,
+                    identifier,
+                })
+                .into_response()
+            },
+        );
         if matches!(self, Self::Unauthorized(_)) {
             (
                 status,
@@ -215,6 +255,18 @@ struct ErrorBody<'a> {
     error: &'a str,
 }
 
+/// The JSON shape of an error response that carries Pleroma's
+/// machine-readable reason code beside the message
+/// (`{"error": msg, "identifier": id}`), built by
+/// [`AppError::ForbiddenWithIdentifier`].
+#[derive(Debug, Serialize)]
+struct IdentifiedErrorBody<'a> {
+    /// The client-safe description of what went wrong.
+    error: &'a str,
+    /// Pleroma's stable reason code, e.g. `account_is_disabled`.
+    identifier: &'a str,
+}
+
 /// A result that fails with [`AppError`], the return type of every handler.
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -226,6 +278,9 @@ mod tests {
 
     /// Text that must never reach a client.
     const SECRET: &str = "password=hunter2";
+    /// A Pleroma-style machine-readable reason code, as the identifier
+    /// variant puts it in the body.
+    const ACCOUNT_ID: &str = "account_is_disabled";
 
     /// The exact body an [`AppError`] is answered with for `message`.
     fn json_body(message: &str) -> String {
@@ -298,6 +353,38 @@ mod tests {
             "a 401 carries the bearer challenge"
         );
         assert_eq!(body, json_body("no token"), "401 body");
+    }
+
+    #[tokio::test]
+    async fn forbidden_with_identifier_adds_the_reason_code_to_the_body() {
+        let error =
+            AppError::forbidden_with_identifier("Your account is currently disabled", ACCOUNT_ID);
+        let (status, headers, body) = render(error).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "the identifier 403 status");
+        assert_eq!(
+            headers.get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json")),
+            "the identifier 403 is JSON"
+        );
+        assert!(
+            !headers.contains_key(WWW_AUTHENTICATE),
+            "a 403 does not challenge"
+        );
+        assert_eq!(
+            body,
+            format!(
+                r#"{{"error":"Your account is currently disabled","identifier":"{ACCOUNT_ID}"}}"#
+            ),
+            "the body carries error first and identifier second"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_errors_do_not_leak_the_identifier_key() {
+        for (error, _, body) in cases() {
+            let (_, _, got_body) = render(error).await;
+            assert_eq!(got_body, body, "no extra key in {body}");
+        }
     }
 
     #[tokio::test]
@@ -375,6 +462,11 @@ mod tests {
             "display keeps the detail a 500 hides"
         );
         assert_eq!(
+            AppError::forbidden_with_identifier("disabled", ACCOUNT_ID).to_string(),
+            "disabled",
+            "display keeps the message; the identifier is only in the body"
+        );
+        assert_eq!(
             AppError::from(SqlxError::ColumnNotFound("nope".to_owned())).to_string(),
             "database error: no column found for name: nope",
             "display of a database error"
@@ -393,6 +485,12 @@ mod tests {
         assert!(
             AppError::RateLimited.source().is_none(),
             "a plain error has no source"
+        );
+        assert!(
+            AppError::forbidden_with_identifier("disabled", ACCOUNT_ID)
+                .source()
+                .is_none(),
+            "the identifier variant is a plain error too"
         );
     }
 

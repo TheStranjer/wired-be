@@ -39,7 +39,7 @@ use wired_be::{
     models::{
         oauth_app::{self, NewOauthApp},
         oauth_token::{self, NewToken},
-        user::{NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
+        user::{Flag, NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
     },
     state::AppState,
     uploads::UploaderBackend,
@@ -208,6 +208,45 @@ pub async fn create_remote_user(pool: &PgPool, nickname: &str, host: &str) -> Us
 
 /// The redirect URI every app fixture registers.
 const TEST_REDIRECT_URIS: &str = "https://client.example/callback";
+
+/// Registers a test app named "Test Client" granting `scopes` (one
+/// space-separated string) and returns its row: the `/oauth/token` tests
+/// need the credential pair, not a minted token.
+///
+/// # Panics
+///
+/// If the app insert fails.
+pub async fn create_app(pool: &PgPool, scopes: &str) -> oauth_app::OauthApp {
+    oauth_app::create(pool, &test_app_registration(None, scopes))
+        .await
+        .expect("app fixture inserts")
+}
+
+/// Inserts a local [`User`] named `nickname` that can log in with
+/// `password` but is deactivated (`is_active = false`): the shape a
+/// suspended account has.
+///
+/// # Panics
+///
+/// If hashing or the insert fails.
+pub async fn create_deactivated_user_with_password(
+    pool: &PgPool,
+    nickname: &str,
+    password: &str,
+) -> User {
+    let config = test_config();
+    let new = NewUser {
+        email: Some(format!("{nickname}@example.org")),
+        password_hash: Some(
+            hash_password(password).expect("password hashing succeeds for fixtures"),
+        ),
+        is_active: Flag::new(false),
+        ..NewUser::local(nickname, &local_ap_id(&config.base_url, nickname))
+    };
+    insert(pool, &new)
+        .await
+        .expect("deactivated local user fixture inserts")
+}
 
 /// Registers a test app and mints a user-bound bearer token, both
 /// granting `scopes` (one space-separated string,
