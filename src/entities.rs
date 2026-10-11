@@ -7,9 +7,11 @@
 //! needed — by pure functions. Nothing here touches the database or a
 //! request, so every entity is testable with `serde_json::to_value`
 //! alone. [`account`] renders the Mastodon `Account` entity,
-//! [`media_attachment`] the Mastodon `Attachment` entity and
-//! [`custom_emoji`] the Mastodon `CustomEmoji` entity.
+//! [`media_attachment`] the Mastodon `Attachment` entity,
+//! [`custom_emoji`] the Mastodon `CustomEmoji` entity and [`chat`] the
+//! Pleroma chat `Chat` and `ChatMessage` entities.
 
 pub mod account;
+pub mod chat;
 pub mod custom_emoji;
 pub mod media_attachment;
