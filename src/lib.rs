@@ -238,5 +238,210 @@ mod tests {
                 "and points at the table this migration created"
             );
         }
+
+        /// The chats migration creates the three tables `src/models/chat.rs`
+        /// reads and writes — one chat per participant, the shared message,
+        /// and one reference per participant's chat — and links each of them
+        /// the way the model's queries assume: the accounts and the media a
+        /// message may name, the cascades that take a conversation apart with
+        /// its owners, and the keys its upserts conflict on.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn chats_migration_links_both_sides_of_a_conversation(pool: PgPool) {
+            /// One foreign key of the three tables: its name, the table it
+            /// was declared on, its delete action and what it points at.
+            #[derive(Debug, sqlx::FromRow)]
+            struct ForeignKey {
+                /// The table carrying the constraint.
+                relname: String,
+                /// The constraint's name.
+                conname: String,
+                /// Its `ON DELETE` action, as PostgreSQL spells it.
+                confdeltype: String,
+                /// The table it references.
+                target: String,
+            }
+
+            let keys: Vec<ForeignKey> = sqlx::query_as(
+                "SELECT cls.relname, con.conname, con.confdeltype::text, conf.relname AS target
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_class conf ON conf.oid = con.confrelid
+                  WHERE con.contype = 'f'
+                    AND cls.relname IN ('chats', 'chat_messages', 'chat_message_references')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for (table, constraint, action, target) in [
+                ("chats", "chats_user_id_fkey", "c", "users"),
+                ("chats", "chats_recipient_id_fkey", "c", "users"),
+                (
+                    "chat_messages",
+                    "chat_messages_sender_id_fkey",
+                    "c",
+                    "users",
+                ),
+                (
+                    "chat_messages",
+                    "chat_messages_attachment_media_id_fkey",
+                    "n",
+                    "media_attachments",
+                ),
+                (
+                    "chat_message_references",
+                    "chat_message_references_chat_id_fkey",
+                    "c",
+                    "chats",
+                ),
+                (
+                    "chat_message_references",
+                    "chat_message_references_message_id_fkey",
+                    "c",
+                    "chat_messages",
+                ),
+            ] {
+                let found = keys
+                    .iter()
+                    .find(|key| key.relname == table && key.conname == constraint)
+                    .unwrap_or_else(|| panic!("{constraint} links {table}"));
+                assert_eq!(
+                    found.confdeltype, action,
+                    "{constraint} deletes as {action}"
+                );
+                assert_eq!(found.target, target, "{constraint} points at {target}");
+            }
+        }
+
+        /// The unique keys and indexes the chats migration adds: one chat per
+        /// participant and account, one reference per chat and message, a
+        /// reserved `ap_id`, and the newest-first and unread-only indexes the
+        /// list queries read.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn chats_migration_keys_and_indexes_the_chat_tables(pool: PgPool) {
+            let uniques: Vec<(String, String)> = sqlx::query_as(
+                "SELECT cls.relname, con.conname
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                  WHERE con.contype = 'u'
+                    AND cls.relname IN ('chats', 'chat_messages', 'chat_message_references')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for (table, constraint) in [
+                ("chats", "chats_user_id_recipient_id_key"),
+                (
+                    "chat_message_references",
+                    "chat_message_references_chat_id_message_id_key",
+                ),
+                ("chat_messages", "chat_messages_ap_id_key"),
+            ] {
+                assert!(
+                    uniques
+                        .iter()
+                        .any(|(relname, conname)| relname == table && conname == constraint),
+                    "{constraint} keeps {table} free of duplicates"
+                );
+            }
+
+            let indexes: Vec<(String, String)> = sqlx::query_as(
+                "SELECT indexname, indexdef FROM pg_indexes
+                  WHERE schemaname = 'public'
+                    AND tablename IN ('chats', 'chat_messages', 'chat_message_references')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for name in [
+                "chats_user_id_updated_at_idx",
+                "chats_recipient_id_idx",
+                "chat_messages_sender_id_idx",
+                "chat_message_references_chat_id_idx",
+                "chat_message_references_chat_id_unread_idx",
+                "chat_message_references_message_id_idx",
+            ] {
+                assert!(
+                    indexes.iter().any(|(indexname, _)| indexname == name),
+                    "{name} serves a chat query"
+                );
+            }
+            let (unread_name, unread_def) = indexes
+                .iter()
+                .find(|(indexname, _)| indexname == "chat_message_references_chat_id_unread_idx")
+                .unwrap();
+            assert!(
+                unread_def.contains("WHERE unread"),
+                "the unread index {unread_name} holds only unread references: {unread_def}"
+            );
+        }
+
+        /// The column defaults and `NOT NULL`s the chats migration gives the
+        /// three tables, which are exactly what `src/models/chat.rs` leaves
+        /// for the database to fill.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn chats_migration_defaults_match_the_model(pool: PgPool) {
+            /// One column of the three tables, as `information_schema`
+            /// describes it.
+            #[derive(Debug, sqlx::FromRow)]
+            struct SchemaColumn {
+                /// The table it belongs to.
+                table_name: String,
+                /// Its own name.
+                column_name: String,
+                /// The default expression, `None` when it has none.
+                column_default: Option<String>,
+                /// `NO` for a `NOT NULL` column, `YES` otherwise.
+                is_nullable: String,
+            }
+
+            let columns: Vec<SchemaColumn> = sqlx::query_as(
+                "SELECT table_name, column_name, column_default, is_nullable
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name IN ('chats', 'chat_messages', 'chat_message_references')",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let one = |table: &str, column: &str| -> &SchemaColumn {
+                columns
+                    .iter()
+                    .find(|row| row.table_name == table && row.column_name == column)
+                    .unwrap_or_else(|| panic!("{table}.{column} exists"))
+            };
+
+            for (table, column, default) in [
+                ("chats", "pinned", "false"),
+                ("chat_messages", "content", "''::text"),
+                ("chat_messages", "raw_text", "''::text"),
+                ("chat_message_references", "unread", "true"),
+            ] {
+                let row = one(table, column);
+                assert_eq!(
+                    row.column_default.as_deref(),
+                    Some(default),
+                    "{table}.{column} defaults to {default}"
+                );
+                assert_eq!(row.is_nullable, "NO", "{table}.{column} is NOT NULL");
+            }
+            for (table, column) in [
+                ("chats", "user_id"),
+                ("chats", "recipient_id"),
+                ("chat_messages", "sender_id"),
+                ("chat_message_references", "chat_id"),
+                ("chat_message_references", "message_id"),
+            ] {
+                assert_eq!(
+                    one(table, column).is_nullable,
+                    "NO",
+                    "{table}.{column} cannot be null"
+                );
+            }
+            assert!(
+                one("chat_messages", "deleted_at").column_default.is_none()
+                    && one("chat_messages", "deleted_at").is_nullable == "YES",
+                "a live message has no deleted_at until it is withdrawn"
+            );
+        }
     }
 }
