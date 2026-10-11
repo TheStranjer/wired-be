@@ -415,6 +415,25 @@ pub mod flex {
         })
     }
 
+    /// An `i32` that also accepts a numeric string: the spelling of a column
+    /// the schema gives as `integer`, like a scrobble's `length`.
+    ///
+    /// # Errors
+    ///
+    /// A serde error when the value is not an integer in `i32`'s range,
+    /// string or number alike.
+    pub fn opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<Value>::deserialize(deserializer)?;
+        value.map_or(Ok(None), |value| {
+            coerce_int::<i32>(&value)
+                .map(Some)
+                .ok_or_else(|| SerdeError::custom(expected("a number", &value)))
+        })
+    }
+
     /// An `i64` that also accepts a numeric string.
     ///
     /// # Errors
@@ -521,7 +540,7 @@ mod tests {
         ids: Vec<String>,
     }
 
-    /// A parameter shape with required (non-`Option`) flex fields.
+    /// A parameter shape with a required (non-`Option`) flex field.
     #[derive(Debug, Deserialize, PartialEq)]
     struct Strict {
         /// A required flex boolean.
@@ -530,6 +549,15 @@ mod tests {
         /// A required flex unsigned integer.
         #[serde(deserialize_with = "flex::u32")]
         n: u32,
+    }
+
+    /// A parameter shape with an optional flex 32-bit integer, the width of
+    /// a schema `integer` column (a scrobble's `length`).
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Timed {
+        /// An optional flex signed 32-bit integer.
+        #[serde(default, deserialize_with = "flex::opt_i32")]
+        length: Option<i32>,
     }
 
     /// Builds a POST `uri` with an optional `content-type` and `body`.
@@ -807,6 +835,41 @@ mod tests {
                 status_of(err),
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "{text} is out of range or not an integer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn flex_32_bit_integers_coerce_from_forms_and_json() {
+        for (text, want) in [
+            ("length=243000", Some(243_000)),
+            ("length= 8 ", Some(8)),
+            ("length=-1", Some(-1)),
+        ] {
+            let timed: Timed = body_of(Some(FORM_MIME), text)
+                .await
+                .unwrap_or_else(|err| panic!("{text}: {err}"));
+            assert_eq!(timed.length, want, "i32 from {text:?}");
+        }
+
+        let timed: Timed = body_of(Some(JSON_MIME), r#"{"length":7}"#).await.unwrap();
+        assert_eq!(timed.length, Some(7), "a real json number");
+
+        for body in ["{}", r#"{"length":null}"#, r#"{"other":1}"#] {
+            let parsed: Timed = body_of(Some(JSON_MIME), body)
+                .await
+                .unwrap_or_else(|err| panic!("{body} is no length: {err}"));
+            assert_eq!(parsed.length, None, "`{body}` leaves the field None");
+        }
+
+        for text in ["length=abc", "length=1.5", "length=2147483648"] {
+            let err = body_of::<Timed>(Some(FORM_MIME), text)
+                .await
+                .expect_err(&format!("{text} must be rejected"));
+            assert_eq!(
+                status_of(err),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{text} is not an integer the column could hold"
             );
         }
     }
