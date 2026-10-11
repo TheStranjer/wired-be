@@ -36,6 +36,14 @@ pub const READ_FOLLOWS: &str = "read:follows";
 /// The write side of the follow actions, granted by `write` and by `follow`.
 pub const WRITE_FOLLOWS: &str = "write:follows";
 
+/// The read side of account data: `GET /api/v1/announcements`, the list a
+/// client shows its user (Pleroma's own pipeline asks only for a user token
+/// here, the ticket for its `read:accounts` sub-scope).
+pub const READ_ACCOUNTS: &str = "read:accounts";
+/// The write side of account data: `POST /api/v1/announcements/{id}/dismiss`,
+/// a dismissal a user stores about themselves (Pleroma's `write:accounts`).
+pub const WRITE_ACCOUNTS: &str = "write:accounts";
+
 /// The read side of account security: `GET /api/pleroma/accounts/mfa`
 /// (Pleroma's `read:security` scope on the MFA settings action).
 pub const READ_SECURITY: &str = "read:security";
