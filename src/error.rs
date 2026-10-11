@@ -39,6 +39,9 @@ pub enum AppError {
     NotFound,
     /// The request clashes with the record as it stands: 409.
     Conflict(String),
+    /// The request body's content type is not one the endpoint parses
+    /// (415); see [`crate::extract`] for the accepted types.
+    UnsupportedMediaType(String),
     /// The request was understood but cannot be carried out: 422.
     Unprocessable(String),
     /// The caller has been throttled: 429.
@@ -60,6 +63,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound | Self::Database(sqlx::Error::RowNotFound) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -76,6 +80,7 @@ impl AppError {
             | Self::Unauthorized(message)
             | Self::Forbidden(message)
             | Self::Conflict(message)
+            | Self::UnsupportedMediaType(message)
             | Self::Unprocessable(message) => message,
             Self::NotFound | Self::Database(sqlx::Error::RowNotFound) => NOT_FOUND_MESSAGE,
             Self::RateLimited => RATE_LIMITED_MESSAGE,
@@ -99,6 +104,7 @@ impl AppError {
             | Self::Forbidden(_)
             | Self::NotFound
             | Self::Conflict(_)
+            | Self::UnsupportedMediaType(_)
             | Self::Unprocessable(_)
             | Self::RateLimited => {}
         }
@@ -116,6 +122,7 @@ impl AppError {
             | Self::Forbidden(_)
             | Self::NotFound
             | Self::Conflict(_)
+            | Self::UnsupportedMediaType(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
             | Self::Internal(_)
@@ -146,6 +153,7 @@ impl fmt::Display for AppError {
             | Self::Unauthorized(message)
             | Self::Forbidden(message)
             | Self::Conflict(message)
+            | Self::UnsupportedMediaType(message)
             | Self::Unprocessable(message)
             | Self::Internal(message) => f.write_str(message),
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
@@ -164,6 +172,7 @@ impl Error for AppError {
             | Self::Forbidden(_)
             | Self::NotFound
             | Self::Conflict(_)
+            | Self::UnsupportedMediaType(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
             | Self::Internal(_) => None,
@@ -251,6 +260,11 @@ mod tests {
                 AppError::Conflict("already taken".to_owned()),
                 StatusCode::CONFLICT,
                 body_of("already taken"),
+            ),
+            (
+                AppError::UnsupportedMediaType("nope".to_owned()),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                body_of("nope"),
             ),
             (
                 AppError::Unprocessable("too long".to_owned()),
@@ -406,6 +420,7 @@ mod tests {
             AppError::Forbidden("x".to_owned()),
             AppError::NotFound,
             AppError::Conflict("x".to_owned()),
+            AppError::UnsupportedMediaType("x".to_owned()),
             AppError::Unprocessable("x".to_owned()),
             AppError::RateLimited,
             AppError::Internal("x".to_owned()),

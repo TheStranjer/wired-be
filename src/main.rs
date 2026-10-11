@@ -16,6 +16,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let config = Config::from_env()?;
     let db = PgPoolOptions::new().connect(&config.database_url).await?;
+    wired_be::run_migrations(&db).await?;
     let listener = TcpListener::bind(config.bind_addr).await?;
     axum::serve(listener, app(AppState { db })).await?;
     Ok(())

@@ -27,4 +27,8 @@ cargo fmt
 scripts/ci.sh          # full gate (same as CI): exits 0 if everything passes, 1 otherwise
 ```
 
+`#[sqlx::test]` integration and model tests read `DATABASE_URL`; `.cargo/config.toml`
+supplies the throwaway CI default (`postgres://postgres:postgres@localhost:5432/postgres`)
+when the environment does not set one, and an exported `DATABASE_URL` always wins.
+
 Lint configuration lives in `Cargo.toml` (`[lints]`) and `clippy.toml`. See `AGENTS.md` for contribution rules.
