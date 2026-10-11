@@ -22,9 +22,11 @@
 //! addresses fixed by their RFCs; and the OAuth endpoints live at
 //! `/oauth/…`, the token addresses fixed by RFC 6749.
 
+pub mod accounts;
 pub mod activitypub;
 pub mod apps;
 pub mod custom_emojis;
+pub mod helpers;
 pub mod media_files;
 pub mod oauth;
 pub mod v1;
