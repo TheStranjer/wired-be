@@ -9,6 +9,7 @@
 //! [`AppError`](crate::error::AppError), the crate's single error type, so
 //! handlers can use `?`.
 
+pub mod follow;
 pub mod job;
 pub mod media_attachment;
 pub mod oauth_app;
