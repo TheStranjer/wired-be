@@ -19,6 +19,7 @@ pub mod custom_emoji;
 pub mod filter;
 pub mod follow;
 pub mod job;
+pub mod marker;
 pub mod media_attachment;
 pub mod oauth_app;
 pub mod oauth_token;
