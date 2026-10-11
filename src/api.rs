@@ -26,6 +26,7 @@
 
 pub mod accounts;
 pub mod activitypub;
+pub mod announcements;
 pub mod apps;
 pub mod custom_emojis;
 pub mod emoji_packs;
