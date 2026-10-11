@@ -52,6 +52,15 @@ pub const READ_FILTERS: &str = "read:filters";
 /// (Pleroma's `write:filters` on the remaining actions).
 pub const WRITE_FILTERS: &str = "write:filters";
 
+/// The read side of statuses and the positions in them:
+/// `GET /api/v1/markers`, the read markers a client shows its user
+/// (Pleroma's `read:statuses` on the marker `index` action).
+pub const READ_STATUSES: &str = "read:statuses";
+/// The write side of statuses and the positions in them:
+/// `POST /api/v1/markers`, storing where the account left off reading
+/// (Pleroma's `write:statuses` on the marker `upsert` action).
+pub const WRITE_STATUSES: &str = "write:statuses";
+
 /// The read side of account security: `GET /api/pleroma/accounts/mfa`
 /// (Pleroma's `read:security` scope on the MFA settings action).
 pub const READ_SECURITY: &str = "read:security";
