@@ -44,6 +44,14 @@ pub const READ_ACCOUNTS: &str = "read:accounts";
 /// a dismissal a user stores about themselves (Pleroma's `write:accounts`).
 pub const WRITE_ACCOUNTS: &str = "write:accounts";
 
+/// The read side of filters: `GET /api/v1/filters` and
+/// `GET /api/v1/filters/{id}`, the list a client shows its user
+/// (Pleroma's `read:filters` on the `show`/`index` actions).
+pub const READ_FILTERS: &str = "read:filters";
+/// The write side of filters: creating, updating and deleting a filter
+/// (Pleroma's `write:filters` on the remaining actions).
+pub const WRITE_FILTERS: &str = "write:filters";
+
 /// The read side of account security: `GET /api/pleroma/accounts/mfa`
 /// (Pleroma's `read:security` scope on the MFA settings action).
 pub const READ_SECURITY: &str = "read:security";

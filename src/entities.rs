@@ -9,7 +9,8 @@
 //! alone. [`account`] renders the Mastodon `Account` entity,
 //! [`announcement`] the Mastodon `Announcement` entity,
 //! [`media_attachment`] the Mastodon `Attachment` entity,
-//! [`custom_emoji`] the Mastodon `CustomEmoji` entity, [`chat`] the
+//! [`custom_emoji`] the Mastodon `CustomEmoji` entity, [`filter`] the
+//! Mastodon v1 `Filter` entity, [`chat`] the
 //! Pleroma chat `Chat` and `ChatMessage` entities and [`relationship`]
 //! the Mastodon `Relationship` entity (with Pleroma's `subscribing`
 //! alias), which [`models::relationship`](crate::models::relationship)
@@ -19,5 +20,6 @@ pub mod account;
 pub mod announcement;
 pub mod chat;
 pub mod custom_emoji;
+pub mod filter;
 pub mod media_attachment;
 pub mod relationship;
