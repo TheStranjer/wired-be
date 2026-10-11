@@ -4,7 +4,10 @@
 
 use axum::Router;
 
-use crate::{api::apps, state::AppState};
+use crate::{
+    api::{apps, custom_emojis},
+    state::AppState,
+};
 
 /// The `/api/v1` router.
 ///
@@ -15,5 +18,7 @@ use crate::{api::apps, state::AppState};
 /// Pleroma's `api_not_implemented`, and merging two routers that each set
 /// a fallback panics.
 pub fn router() -> Router<AppState> {
-    Router::new().merge(apps::router())
+    Router::new()
+        .merge(apps::router())
+        .merge(custom_emojis::router())
 }

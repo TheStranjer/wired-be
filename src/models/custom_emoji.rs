@@ -1,0 +1,552 @@
+//! The `custom_emojis` table: shortcodes this instance serves as images.
+//!
+//! One row per emoji, local or mirrored from a remote instance: Pleroma
+//! keeps custom emojis as pack files on disk plus remote emoji maps
+//! (`lib/pleroma/emoji.ex`, `lib/pleroma/emoji/pack.ex`); the row shape
+//! follows `docs/ARCHITECTURE.md` decision 3. A `NULL`
+//! [`domain`](CustomEmoji::domain) marks a local emoji; remote ones carry
+//! their origin instance so the same shortcode can coexist per domain
+//! (the unique index folds `domain` through `coalesce(domain, '')`).
+//!
+//! [`upsert`] mints the primary key (`UUIDv7`, decision 4) and writes
+//! everything else from a [`NewCustomEmoji`], whose
+//! [`Default`](NewCustomEmoji::default) mirrors the column defaults; the
+//! row identity it conflicts on is `(shortcode, coalesce(domain, ''))`,
+//! so re-upserting an emoji updates it in place and keeps its id.
+
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::{error::AppResult, util::id::new_id};
+
+/// One row of `custom_emojis`: a single shortcode-to-image mapping.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct CustomEmoji {
+    /// `UUIDv7` primary key, minted by [`upsert`] (decision 4).
+    pub id: Uuid,
+    /// Shortcode without surrounding colons, e.g. `railroad_track`.
+    pub shortcode: String,
+    /// Origin instance of a remote emoji; `None` for a local one.
+    pub domain: Option<String>,
+    /// URL of the emoji image (animated included).
+    pub image_url: String,
+    /// URL of the still variant; `None` means clients use
+    /// [`image_url`](Self::image_url) for both.
+    pub static_url: Option<String>,
+    /// Pack name the emoji belongs to; `None` for an ungrouped one.
+    pub category: Option<String>,
+    /// Picker tags, e.g. `["transport", "trains"]`; empty by default.
+    pub tags: Vec<String>,
+    /// Whether clients show the emoji in their pickers.
+    pub visible_in_picker: bool,
+    /// Moderation kill switch: disabled emojis are served to nobody.
+    pub disabled: bool,
+    /// When the row was inserted.
+    pub inserted_at: DateTime<Utc>,
+    /// When the row last changed; refreshed by every [`upsert`].
+    pub updated_at: DateTime<Utc>,
+}
+
+/// What to upsert: every `custom_emojis` column except the `id` [`upsert`]
+/// mints itself and the timestamps the database stamps.
+///
+/// [`Default::default`] mirrors the column defaults, so a caller sets
+/// only what it knows; the usual minimum is `shortcode` and `image_url`.
+#[derive(Clone, Debug)]
+pub struct NewCustomEmoji {
+    /// Shortcode; required, empty in the default.
+    pub shortcode: String,
+    /// Origin instance; `None` for a local emoji.
+    pub domain: Option<String>,
+    /// Image URL; required, empty in the default.
+    pub image_url: String,
+    /// Still-variant URL.
+    pub static_url: Option<String>,
+    /// Pack name.
+    pub category: Option<String>,
+    /// Picker tags; empty in the default, like the column.
+    pub tags: Vec<String>,
+    /// Picker visibility; `true` by default, like the column.
+    pub visible_in_picker: bool,
+    /// Moderation flag; `false` by default, like the column.
+    pub disabled: bool,
+}
+
+/// The column defaults: empty required fields, everything optional
+/// absent, an empty tag array, visible in pickers and enabled.
+impl Default for NewCustomEmoji {
+    fn default() -> Self {
+        Self {
+            shortcode: String::new(),
+            domain: None,
+            image_url: String::new(),
+            static_url: None,
+            category: None,
+            tags: Vec::new(),
+            visible_in_picker: true,
+            disabled: false,
+        }
+    }
+}
+
+impl NewCustomEmoji {
+    /// A visible, enabled local emoji named `shortcode` whose image is at
+    /// `image_url`, with no still URL, no pack and no tags: the shape the
+    /// tests and pack importers start from.
+    #[must_use]
+    pub fn local(shortcode: &str, image_url: &str) -> Self {
+        Self {
+            shortcode: shortcode.to_owned(),
+            image_url: image_url.to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The `INSERT` behind [`upsert`]: the row identity `(shortcode,
+/// coalesce(domain, ''))` matches the unique index, so a repeat write
+/// updates every content column in place — keeping the minted `id` and
+/// the insertion timestamp — instead of failing.
+const UPSERT_SQL: &str = "INSERT INTO custom_emojis (
+     id, shortcode, domain, image_url, static_url, category, tags,
+     visible_in_picker, disabled
+) VALUES (
+     $1, $2, $3, $4, $5, $6, $7, $8, $9
+) ON CONFLICT (shortcode, (coalesce(domain, ''))) DO UPDATE SET
+     image_url = EXCLUDED.image_url,
+     static_url = EXCLUDED.static_url,
+     category = EXCLUDED.category,
+     tags = EXCLUDED.tags,
+     visible_in_picker = EXCLUDED.visible_in_picker,
+     disabled = EXCLUDED.disabled,
+     updated_at = now()
+RETURNING *";
+
+/// Inserts `emoji` or updates the existing row with the same `(shortcode,
+/// domain)` in place, and returns the stored row.
+///
+/// Idempotent: a second upsert of an unchanged emoji changes nothing but
+/// `updated_at`, and the row keeps the `UUIDv7` id the first upsert
+/// minted (decision 4). `domain` is part of the identity, so a local and
+/// a remote emoji of the same shortcode are two rows.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn upsert(pool: &PgPool, emoji: &NewCustomEmoji) -> AppResult<CustomEmoji> {
+    let row = sqlx::query_as::<_, CustomEmoji>(UPSERT_SQL)
+        .bind(new_id())
+        .bind(emoji.shortcode.as_str())
+        .bind(emoji.domain.as_deref())
+        .bind(emoji.image_url.as_str())
+        .bind(emoji.static_url.as_deref())
+        .bind(emoji.category.as_deref())
+        .bind(&emoji.tags)
+        .bind(emoji.visible_in_picker)
+        .bind(emoji.disabled)
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
+/// Fetches every local (`domain IS NULL`), enabled emoji, ordered by
+/// category then shortcode — the list `GET /api/v1/custom_emojis` serves.
+///
+/// Disabled emojis are hidden the way Pleroma hides them from
+/// `Pleroma.Emoji.get_all/0`; `visible_in_picker` is *not* filtered here,
+/// it travels in the entity for the client to honour. Rows with no
+/// category sort last (`NULLS LAST` is `ORDER BY`'s default), keeping the
+/// grouped packs together up front.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn list_local(pool: &PgPool) -> AppResult<Vec<CustomEmoji>> {
+    let rows = sqlx::query_as::<_, CustomEmoji>(
+        "SELECT * FROM custom_emojis
+          WHERE domain IS NULL AND NOT disabled
+          ORDER BY category, shortcode",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetches the emojis of `domain` (`None` = local) whose shortcodes are
+/// in `shortcodes`, ordered by shortcode. Shortcodes with no row are
+/// skipped; an empty `shortcodes` yields an empty `Vec`.
+///
+/// Unlike [`list_local`] this is a lookup for post-rendering and pack
+/// sync, so it returns disabled emojis too — callers that hide them
+/// filter the result.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_shortcodes(
+    pool: &PgPool,
+    shortcodes: &[String],
+    domain: Option<&str>,
+) -> AppResult<Vec<CustomEmoji>> {
+    let shortcodes = shortcodes.to_vec();
+    let rows = sqlx::query_as::<_, CustomEmoji>(
+        "SELECT * FROM custom_emojis
+          WHERE shortcode = ANY($1) AND domain IS NOT DISTINCT FROM $2
+          ORDER BY shortcode",
+    )
+    .bind(&shortcodes)
+    .bind(domain)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Deletes the emoji `shortcode` of `domain` (`None` = local), reporting
+/// whether a row went. Other domains carrying the same shortcode are
+/// untouched; this is how a pack removal retires one emoji.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete(pool: &PgPool, shortcode: &str, domain: Option<&str>) -> AppResult<bool> {
+    let deleted = sqlx::query(
+        "DELETE FROM custom_emojis
+          WHERE shortcode = $1 AND domain IS NOT DISTINCT FROM $2",
+    )
+    .bind(shortcode)
+    .bind(domain)
+    .execute(pool)
+    .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+
+    use super::*;
+
+    /// The instance origin the fixture URLs point at.
+    const BASE: &str = "https://test.example";
+
+    /// A local emoji named `shortcode` in pack `category`, stored under
+    /// [`BASE`].
+    fn local_emoji(shortcode: &str, category: Option<&str>) -> NewCustomEmoji {
+        NewCustomEmoji {
+            category: category.map(str::to_owned),
+            ..NewCustomEmoji::local(shortcode, &format!("{BASE}/emoji/custom/{shortcode}.png"))
+        }
+    }
+
+    /// Reads the local row named `shortcode` back, panicking if absent.
+    async fn fetch(pool: &PgPool, shortcode: &str) -> CustomEmoji {
+        get_by_shortcodes(pool, &[shortcode.to_owned()], None)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("local emoji {shortcode} exists"))
+    }
+
+    /// Upserts `emoji`, discarding the stored row.
+    async fn seed(pool: &PgPool, emoji: &NewCustomEmoji) {
+        let _stored: CustomEmoji = upsert(pool, emoji).await.unwrap();
+    }
+
+    /// Flags the local emoji named `shortcode` as disabled, asserting the
+    /// fixture row exists.
+    async fn set_disabled(pool: &PgPool, shortcode: &str) {
+        let summary = sqlx::query("UPDATE custom_emojis SET disabled = true WHERE shortcode = $1")
+            .bind(shortcode)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(summary.rows_affected(), 1, "the {shortcode} row exists");
+    }
+
+    /// The shortcodes of `rows`, in row order.
+    fn shortcodes(rows: &[CustomEmoji]) -> Vec<&str> {
+        rows.iter().map(|row| row.shortcode.as_str()).collect()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn upsert_round_trips_every_column(pool: PgPool) {
+        let stored = upsert(
+            &pool,
+            &NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                static_url: Some(format!("{BASE}/emoji/custom/cat-still.png")),
+                category: Some("cats".to_owned()),
+                tags: vec!["cat".to_owned(), "animal".to_owned()],
+                visible_in_picker: false,
+                disabled: true,
+                ..NewCustomEmoji::local("cat", "https://remote.example/emoji/cat.gif")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stored.id.get_version_num() == 7, "id is a UUIDv7");
+        assert_eq!(stored.shortcode, "cat", "shortcode round trips");
+        assert_eq!(
+            stored.domain.as_deref(),
+            Some("remote.example"),
+            "domain round trips"
+        );
+        assert_eq!(
+            stored.image_url, "https://remote.example/emoji/cat.gif",
+            "image url round trips"
+        );
+        assert_eq!(
+            stored.static_url.as_deref(),
+            Some("https://test.example/emoji/custom/cat-still.png"),
+            "static url round trips"
+        );
+        assert_eq!(stored.category.as_deref(), Some("cats"), "pack round trips");
+        assert_eq!(stored.tags, ["cat", "animal"], "tags round trips");
+        assert!(!stored.visible_in_picker, "picker visibility round trips");
+        assert!(stored.disabled, "the disabled flag round trips");
+        assert_eq!(
+            stored.inserted_at, stored.updated_at,
+            "a fresh row is stamped once"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn upsert_defaults_match_the_column_defaults(pool: PgPool) {
+        let stored = upsert(
+            &pool,
+            &NewCustomEmoji::local("blob", &format!("{BASE}/e/blob.png")),
+        )
+        .await
+        .unwrap();
+        assert!(stored.domain.is_none(), "a default emoji is local");
+        assert!(stored.static_url.is_none(), "no still url by default");
+        assert!(stored.category.is_none(), "no pack by default");
+        assert!(stored.tags.is_empty(), "the tag array defaults to empty");
+        assert!(stored.visible_in_picker, "the picker default is visible");
+        assert!(!stored.disabled, "fresh emojis are enabled");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn upsert_is_idempotent_and_updates_in_place(pool: PgPool) {
+        let first = upsert(&pool, &local_emoji("cat", Some("cats")))
+            .await
+            .unwrap();
+        let again = upsert(&pool, &local_emoji("cat", Some("cats")))
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "a repeat upsert keeps the row id");
+        assert_eq!(
+            again.inserted_at, first.inserted_at,
+            "and the insertion stamp"
+        );
+        assert_eq!(again.category, first.category, "unchanged fields stay");
+        assert_eq!(
+            fetch(&pool, "cat").await.id,
+            first.id,
+            "there is still exactly one row for the shortcode"
+        );
+
+        let moved = upsert(
+            &pool,
+            &NewCustomEmoji {
+                category: Some("animals".to_owned()),
+                tags: vec!["pet".to_owned()],
+                disabled: true,
+                ..local_emoji("cat", Some("cats"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(moved.id, first.id, "an update rewrites the same row");
+        assert_eq!(
+            moved.category.as_deref(),
+            Some("animals"),
+            "the pack is rewritten"
+        );
+        assert_eq!(moved.tags, ["pet"], "the tags are rewritten");
+        assert!(moved.disabled, "the flag is rewritten");
+        assert!(
+            moved.updated_at >= first.updated_at,
+            "the update stamp moves forward"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_same_shortcode_coexists_across_domains(pool: PgPool) {
+        let mine = upsert(&pool, &local_emoji("cat", None)).await.unwrap();
+        let theirs = upsert(
+            &pool,
+            &NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                ..local_emoji("cat", None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(mine.id, theirs.id, "local and remote cats are two rows");
+        assert!(
+            mine.domain.is_none() && theirs.domain.is_some(),
+            "each keeps its own domain"
+        );
+
+        // Upserting one domain again must not touch the other.
+        let again = upsert(
+            &pool,
+            &NewCustomEmoji {
+                image_url: format!("{BASE}/emoji/custom/cat-v2.png"),
+                ..local_emoji("cat", None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, mine.id, "the local row is updated in place");
+        let local = fetch(&pool, "cat").await;
+        assert_eq!(local.image_url, again.image_url, "the local rewrite landed");
+        let remote = get_by_shortcodes(&pool, &["cat".to_owned()], Some("remote.example"))
+            .await
+            .unwrap();
+        assert_eq!(shortcodes(&remote), ["cat"], "the remote cat still exists");
+        assert_eq!(
+            remote.first().map(|row| row.image_url.as_str()),
+            Some(theirs.image_url.as_str()),
+            "and was not rewritten by the local upsert"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_local_serves_enabled_local_emojis_ordered(pool: PgPool) {
+        seed(&pool, &local_emoji("uncategorised", None)).await;
+        seed(&pool, &local_emoji("zebra", Some("animals"))).await;
+        seed(&pool, &local_emoji("aardvark", Some("animals"))).await;
+        seed(&pool, &local_emoji("hidden", Some("secret"))).await;
+        set_disabled(&pool, "hidden").await;
+        seed(
+            &pool,
+            &NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                ..local_emoji("remote", None)
+            },
+        )
+        .await;
+
+        let listed = list_local(&pool).await.unwrap();
+        assert_eq!(
+            shortcodes(&listed),
+            ["aardvark", "zebra", "uncategorised"],
+            "category order, then shortcode, no pack last; remote and disabled are out"
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|row| row.domain.is_none() && !row.disabled),
+            "every listed row is a local, enabled emoji"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_local_of_an_empty_table_is_empty(pool: PgPool) {
+        assert!(
+            list_local(&pool).await.unwrap().is_empty(),
+            "no rows, no emojis"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn get_by_shortcodes_selects_domain_and_skips_misses(pool: PgPool) {
+        seed(&pool, &local_emoji("cat", None)).await;
+        seed(&pool, &local_emoji("dog", Some("pets"))).await;
+        seed(
+            &pool,
+            &NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                ..local_emoji("cat", None)
+            },
+        )
+        .await;
+        set_disabled(&pool, "dog").await;
+
+        let locals = get_by_shortcodes(
+            &pool,
+            &["cat".to_owned(), "dog".to_owned(), "ghost".to_owned()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            shortcodes(&locals),
+            ["cat", "dog"],
+            "unknown shortcodes are skipped, disabled local rows are still found"
+        );
+
+        let remote = get_by_shortcodes(&pool, &["cat".to_owned()], Some("remote.example"))
+            .await
+            .unwrap();
+        assert_eq!(
+            shortcodes(&remote),
+            ["cat"],
+            "the remote domain has its cat"
+        );
+        assert!(
+            remote.iter().all(|row| row.domain.is_some()),
+            "the local cat is not in it"
+        );
+
+        assert!(
+            get_by_shortcodes(&pool, &[], None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no shortcodes, no rows"
+        );
+        assert!(
+            get_by_shortcodes(&pool, &["cat".to_owned()], Some("nowhere.example"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unknown domain finds nothing"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn delete_removes_one_domain_row_once(pool: PgPool) {
+        seed(&pool, &local_emoji("cat", None)).await;
+        seed(
+            &pool,
+            &NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                ..local_emoji("cat", None)
+            },
+        )
+        .await;
+
+        assert!(
+            delete(&pool, "cat", Some("remote.example")).await.unwrap(),
+            "the remote row goes first"
+        );
+        assert!(
+            delete(&pool, "cat", None).await.unwrap(),
+            "then the local one"
+        );
+        assert!(
+            !(delete(&pool, "cat", None).await.unwrap()),
+            "deleting again finds nothing"
+        );
+        assert!(
+            !(delete(&pool, "ghost", None).await.unwrap()),
+            "an unknown shortcode deletes nothing"
+        );
+        assert!(
+            get_by_shortcodes(&pool, &["cat".to_owned()], None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no cat rows are left"
+        );
+    }
+}

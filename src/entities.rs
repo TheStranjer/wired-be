@@ -6,8 +6,10 @@
 //! [`Config`](crate::config::Config) wherever URLs or the domain are
 //! needed — by pure functions. Nothing here touches the database or a
 //! request, so every entity is testable with `serde_json::to_value`
-//! alone. [`account`] renders the Mastodon `Account` entity and
-//! [`media_attachment`] the Mastodon `Attachment` entity.
+//! alone. [`account`] renders the Mastodon `Account` entity,
+//! [`media_attachment`] the Mastodon `Attachment` entity and
+//! [`custom_emoji`] the Mastodon `CustomEmoji` entity.
 
 pub mod account;
+pub mod custom_emoji;
 pub mod media_attachment;
