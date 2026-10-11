@@ -2,8 +2,9 @@
 //! everything that speaks the wire protocol with other instances.
 //!
 //! Today this is the actor document ([`actor`]) and its inbound counterpart,
-//! the remote-actor parser and mirror ([`remote_actor`]), plus outbound
-//! authentication, the [`signature`] module that creates the HTTP
+//! the remote-actor parser and mirror ([`remote_actor`]), the outbound
+//! [`webfinger_client`] that resolves an `acct:` handle to an actor URL, plus
+//! outbound authentication, the [`signature`] module that creates the HTTP
 //! Signatures (draft-cavage-http-signatures-12) Mastodon and Pleroma expect
 //! on every fetch and delivery. [`json`] holds the shared JSON-LD shape
 //! normalizers those readers use. Inbound signature verification, activity
@@ -14,3 +15,4 @@ pub mod actor;
 pub mod json;
 pub mod remote_actor;
 pub mod signature;
+pub mod webfinger_client;
