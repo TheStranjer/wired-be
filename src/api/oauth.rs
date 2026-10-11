@@ -1,6 +1,13 @@
-//! `POST /oauth/token`: the OAuth 2.0 password grant
-//! (Pleroma's `OAuthController.token_exchange`,
+//! `POST /oauth/token`: the OAuth 2.0 `password` and `client_credentials`
+//! grants (Pleroma's `OAuthController.token_exchange`,
 //! `lib/pleroma/web/o_auth/o_auth_controller.ex`).
+//!
+//! The `client_credentials` grant authenticates the application the same
+//! way (body fields or HTTP Basic), defaults its `scope` to `read`,
+//! bounds it by the app's registration, and mints an app-only token
+//! (`user_id = NULL`) that acts as the application itself; its answer
+//! carries no `refresh_token` and no `me`, since there is no user behind
+//! it.
 //!
 //! Rendered the way Pleroma's "token.json" view
 //! (`lib/pleroma/web/o_auth/token_view.ex`) renders it. A client that
@@ -58,8 +65,12 @@ use crate::{
 
 pub mod authorize;
 
-/// The only grant type implemented here.
+/// The password grant type: account credentials in exchange for a
+/// user-bound token pair.
 const GRANT_TYPE_PASSWORD: &str = "password";
+/// The client-credentials grant type: the application authenticates
+/// itself and receives an app-only token.
+const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 /// 400 body when the request omits `grant_type` entirely.
 const MISSING_GRANT_TYPE: &str = "Missing parameter: grant_type";
 /// 400 body when `grant_type` names a grant this endpoint does not speak.
@@ -111,21 +122,60 @@ async fn token(
     no_cache_headers(response)
 }
 
-/// The password grant, in order: the grant type, the client application,
-/// the requested scopes, the user's credentials, the account's readiness
-/// — then mint and render the token pair.
+/// The grant [`require_grant`] accepts, and which half of the endpoint
+/// then runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    /// `grant_type=password`: client credentials plus a user's login,
+    /// answered with a user-bound token pair.
+    Password,
+    /// `grant_type=client_credentials`: client credentials alone,
+    /// answered with an app-only token.
+    ClientCredentials,
+}
+
+/// The token exchange, in order: the grant type, then per grant — the
+/// client application, the requested scopes, (for the password grant)
+/// the user's credentials and the account's readiness — and the minted
+/// token rendered.
 async fn exchange(
     state: &AppState,
     headers: &HeaderMap,
     params: TokenParams,
 ) -> AppResult<Json<TokenResponse>> {
-    require_password_grant(&params)?;
-    let app = validate_app(state, headers, &params).await?;
-    let scopes = requested_scopes(&params, &app)?;
-    let user = authenticate_user(&state.db, &params).await?;
+    match require_grant(&params)? {
+        Grant::Password => password_grant(state, headers, &params).await,
+        Grant::ClientCredentials => client_credentials_grant(state, headers, &params).await,
+    }
+}
+
+/// The password grant: app, scopes, user login, account readiness, then
+/// the user-bound token pair.
+async fn password_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: &TokenParams,
+) -> AppResult<Json<TokenResponse>> {
+    let app = validate_app(state, headers, params).await?;
+    let scopes = requested_scopes(params, &app)?;
+    let user = authenticate_user(&state.db, params).await?;
     check_account_ready(&user)?;
-    let token = issue_token(state, &user, &app, scopes).await?;
-    Ok(Json(TokenResponse::new(token, &user)))
+    let token = issue_token(state, Some(&user), &app, scopes).await?;
+    Ok(Json(TokenResponse::new(token, Some(&user))))
+}
+
+/// The `client_credentials` grant: the application authenticates itself
+/// (no user login) and receives an app-only token, `user_id = NULL`,
+/// acting as the application.
+async fn client_credentials_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: &TokenParams,
+) -> AppResult<Json<TokenResponse>> {
+    let app = validate_app(state, headers, params).await?;
+    let scopes = requested_scopes(params, &app)?;
+    let token = issue_token(state, None, &app, scopes).await?;
+    Ok(Json(TokenResponse::new(token, None)))
 }
 
 /// The request parameters of `POST /oauth/token`.
@@ -137,7 +187,8 @@ async fn exchange(
 /// (see below) because two fields are secret material.
 #[derive(Deserialize)]
 struct TokenParams {
-    /// Which grant to run; only [`GRANT_TYPE_PASSWORD`] is implemented.
+    /// Which grant to run; [`GRANT_TYPE_PASSWORD`] and
+    /// [`GRANT_TYPE_CLIENT_CREDENTIALS`] are implemented.
     #[serde(default)]
     grant_type: Option<String>,
     /// The account's nickname or email. Required by the password grant.
@@ -183,23 +234,24 @@ impl TokenParams {
     }
 }
 
-/// Checks the grant type. The password grant is the only one implemented
-/// here; the refresh-token and authorization-code exchanges join in later
-/// tickets.
+/// Checks the grant type and names the grant to run. The password and
+/// `client_credentials` grants are the ones implemented here; the
+/// refresh-token and authorization-code exchanges join in later tickets.
 ///
 /// # Errors
 ///
 /// 400 [`MISSING_GRANT_TYPE`] when the field is absent, 400
-/// [`UNSUPPORTED_GRANT_TYPE`] for any other value than
-/// [`GRANT_TYPE_PASSWORD`].
-fn require_password_grant(params: &TokenParams) -> AppResult<()> {
+/// [`UNSUPPORTED_GRANT_TYPE`] for any value other than
+/// [`GRANT_TYPE_PASSWORD`] or [`GRANT_TYPE_CLIENT_CREDENTIALS`].
+fn require_grant(params: &TokenParams) -> AppResult<Grant> {
     let Some(grant_type) = params.grant_type.as_deref() else {
         return Err(AppError::BadRequest(MISSING_GRANT_TYPE.to_owned()));
     };
-    if grant_type != GRANT_TYPE_PASSWORD {
-        return Err(AppError::BadRequest(UNSUPPORTED_GRANT_TYPE.to_owned()));
+    match grant_type {
+        GRANT_TYPE_PASSWORD => Ok(Grant::Password),
+        GRANT_TYPE_CLIENT_CREDENTIALS => Ok(Grant::ClientCredentials),
+        _ => Err(AppError::BadRequest(UNSUPPORTED_GRANT_TYPE.to_owned())),
     }
-    Ok(())
 }
 
 /// The registered application behind the presented client credentials,
@@ -317,14 +369,16 @@ fn check_account_ready(user: &User) -> Result<(), AppError> {
 }
 
 /// Mints the access/refresh token pair for the granted scopes, valid for
-/// the configured `OAUTH_TOKEN_TTL_SECS`.
+/// the configured `OAUTH_TOKEN_TTL_SECS`. `user` is the account the
+/// token acts as; `None` mints the app-only token of the
+/// `client_credentials` grant (`user_id = NULL`).
 ///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
 async fn issue_token(
     state: &AppState,
-    user: &User,
+    user: Option<&User>,
     app: &OauthApp,
     scopes: Scopes,
 ) -> AppResult<OauthToken> {
@@ -335,7 +389,7 @@ async fn issue_token(
     oauth_token::create_token(
         &state.db,
         &NewToken {
-            user_id: Some(user.id),
+            user_id: user.map(|user| user.id),
             app_id: app.id,
             scopes: scopes.to_string(),
             ttl: Some(Duration::from_secs(ttl_secs)),
@@ -346,15 +400,19 @@ async fn issue_token(
 
 /// The 200 body of a successful exchange: Pleroma's "token.json"
 /// (`lib/pleroma/web/o_auth/token_view.ex`), extended with the owner's
-/// actor id — which the password grant always has.
+/// actor id — which only a user-bound token has. For an app-only
+/// `client_credentials` token the `refresh_token` and `me` keys are left
+/// out of the JSON entirely.
 #[derive(Debug, Serialize)]
 struct TokenResponse {
     /// Token type, always `Bearer`.
     token_type: &'static str,
     /// The access token, to present as `Authorization: Bearer`.
     access_token: String,
-    /// The refresh token, to exchange for a fresh pair.
-    refresh_token: String,
+    /// The refresh token, to exchange for a fresh pair; absent for an
+    /// app-only token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
     /// The granted scopes, space-separated.
     scope: String,
     /// Issue time, in unix seconds (Pleroma's `format_created_at`).
@@ -363,17 +421,22 @@ struct TokenResponse {
     expires_in: i64,
     /// The token row's `UUIDv7` id, hyphenated (decision 4).
     id: String,
-    /// The authenticated user's `ActivityPub` actor id.
-    me: String,
+    /// The authenticated user's `ActivityPub` actor id; absent for an
+    /// app-only token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    me: Option<String>,
 }
 
 impl TokenResponse {
-    /// Renders the freshly minted `token` of `user` as the API body.
-    fn new(token: OauthToken, user: &User) -> Self {
+    /// Renders the freshly minted `token`, owned by `user` — `None` for
+    /// an app-only `client_credentials` token, which then serializes
+    /// without `refresh_token` and `me`.
+    fn new(token: OauthToken, user: Option<&User>) -> Self {
+        let owner = user.map(|user| user.ap_id.clone());
         Self {
             token_type: TOKEN_TYPE_BEARER,
             access_token: token.token,
-            refresh_token: token.refresh_token,
+            refresh_token: owner.is_some().then_some(token.refresh_token),
             scope: token.scopes,
             created_at: token.inserted_at.timestamp(),
             expires_in: token
@@ -381,7 +444,7 @@ impl TokenResponse {
                 .signed_duration_since(Utc::now())
                 .num_seconds(),
             id: token.id.to_string(),
-            me: user.ap_id.clone(),
+            me: owner,
         }
     }
 }
@@ -546,7 +609,7 @@ mod tests {
 
     #[test]
     fn a_missing_grant_type_is_pleromas_missing_parameter_error() {
-        let err = require_password_grant(&params_with_grant(None)).unwrap_err();
+        let err = require_grant(&params_with_grant(None)).unwrap_err();
         assert_eq!(
             message_of(&err),
             MISSING_GRANT_TYPE,
@@ -556,19 +619,32 @@ mod tests {
 
     #[test]
     fn an_unknown_grant_type_is_unsupported() {
-        let err =
-            require_password_grant(&params_with_grant(Some("client_credentials"))).unwrap_err();
-        assert_eq!(
-            message_of(&err),
-            UNSUPPORTED_GRANT_TYPE,
-            "the grant is named"
-        );
+        for grant in ["authorization_code", "refresh_token", "bogus"] {
+            let err = require_grant(&params_with_grant(Some(grant))).unwrap_err();
+            assert_eq!(
+                message_of(&err),
+                UNSUPPORTED_GRANT_TYPE,
+                "`{grant}` is named as unsupported"
+            );
+        }
     }
 
     #[test]
     fn the_password_grant_passes_the_gate() {
-        require_password_grant(&params_with_grant(Some(GRANT_TYPE_PASSWORD)))
-            .expect("password is the implemented grant");
+        assert_eq!(
+            require_grant(&params_with_grant(Some(GRANT_TYPE_PASSWORD))).unwrap(),
+            Grant::Password,
+            "password selects the user-bound grant"
+        );
+    }
+
+    #[test]
+    fn the_client_credentials_grant_passes_the_gate() {
+        assert_eq!(
+            require_grant(&params_with_grant(Some(GRANT_TYPE_CLIENT_CREDENTIALS))).unwrap(),
+            Grant::ClientCredentials,
+            "client_credentials selects the app-only grant"
+        );
     }
 
     #[test]
@@ -686,7 +762,7 @@ mod tests {
         let expected_created = token.inserted_at.timestamp();
         let user = user_row(true);
         let expected_ap_id = user.ap_id.clone();
-        let json = serde_json::to_value(TokenResponse::new(token, &user)).unwrap();
+        let json = serde_json::to_value(TokenResponse::new(token, Some(&user))).unwrap();
         assert_eq!(json["token_type"], "Bearer", "the token type");
         assert_eq!(json["access_token"], "access-secret", "the access token");
         assert_eq!(json["refresh_token"], "refresh-secret", "the refresh token");
@@ -712,6 +788,25 @@ mod tests {
             json.as_object().expect("an object").len(),
             8,
             "exactly the documented keys"
+        );
+    }
+
+    #[test]
+    fn an_app_only_response_drops_the_refresh_token_and_me() {
+        let token = token_row(new_id(), "read");
+        let json = serde_json::to_value(TokenResponse::new(token, None)).unwrap();
+        assert_eq!(json["token_type"], "Bearer", "the token type");
+        assert_eq!(json["access_token"], "access-secret", "the access token");
+        assert_eq!(json["scope"], "read", "the granted scopes");
+        assert!(
+            json.get("refresh_token").is_none(),
+            "an app-only answer carries no refresh token: {json}"
+        );
+        assert!(json.get("me").is_none(), "and no actor id: {json}");
+        assert_eq!(
+            json.as_object().expect("an object").len(),
+            6,
+            "exactly the app-only documented keys"
         );
     }
 
