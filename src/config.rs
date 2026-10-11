@@ -53,6 +53,15 @@ pub const MIN_PASSWORD_LENGTH_VAR: &str = "MIN_PASSWORD_LENGTH";
 /// Environment variable holding the lifetime of issued OAuth access
 /// tokens, in seconds.
 pub const OAUTH_TOKEN_TTL_SECS_VAR: &str = "OAUTH_TOKEN_TTL_SECS";
+/// Environment variable holding whether the `MongooseIM` auth endpoints
+/// (`GET /user_exists`, `GET /check_password`) are served.
+pub const MONGOOSEIM_ENABLED_VAR: &str = "MONGOOSEIM_ENABLED";
+/// Environment variable holding whether a captcha provider is configured
+/// for `GET /api/v1/pleroma/captcha`.
+pub const CAPTCHA_ENABLED_VAR: &str = "CAPTCHA_ENABLED";
+/// Environment variable holding whether `GET /api/v1/pleroma/healthcheck`
+/// reports pool and liveness data.
+pub const HEALTHCHECK_ENABLED_VAR: &str = "HEALTHCHECK_ENABLED";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -107,6 +116,17 @@ pub const DEFAULT_MIN_PASSWORD_LENGTH: usize = 8;
 ///
 /// [`DEFAULT_TOKEN_TTL`]: crate::models::oauth_token::DEFAULT_TOKEN_TTL
 pub const DEFAULT_OAUTH_TOKEN_TTL_SECS: usize = 2_592_000;
+/// `MongooseIM` auth endpoint state used when `MONGOOSEIM_ENABLED` is
+/// unset: the endpoints answer the standard fallback 404 until an operator
+/// turns them on for their `extauth` backend.
+pub const DEFAULT_MONGOOSEIM_ENABLED: bool = false;
+/// Captcha state used when `CAPTCHA_ENABLED` is unset: no captcha provider
+/// is configured, so `GET /api/v1/pleroma/captcha` reports `{"type":"none"}`
+/// like Pleroma with no captcha plugin.
+pub const DEFAULT_CAPTCHA_ENABLED: bool = false;
+/// Healthcheck state used when `HEALTHCHECK_ENABLED` is unset: the
+/// endpoint answers the standard fallback 404 until it is turned on.
+pub const DEFAULT_HEALTHCHECK_ENABLED: bool = false;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -115,6 +135,39 @@ pub const TEST_DATABASE_URL: &str = "postgres://localhost/wired_test";
 /// `BASE_URL` used by [`Config::for_tests`].
 #[cfg(any(test, feature = "integration-tests"))]
 pub const TEST_BASE_URL: &str = "https://test.example";
+
+/// A boolean feature toggle held by [`Config`].
+///
+/// [`Config`] already carries the two registration/SSRF-guard booleans, and
+/// Clippy's denied `struct_excessive_bools` (threshold 2) wants more
+/// booleans modelled, not piled up — the same reason
+/// [`Flag`](crate::models::user::Flag) exists for `users`' columns. A
+/// `Toggle` is a plain named wrapper: parsed from the environment by the
+/// `boolean` reader below, read by the gated handlers with
+/// [`get`](Self::get).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Toggle(bool);
+
+impl Toggle {
+    /// Wraps a raw boolean as a toggle.
+    #[must_use]
+    pub const fn new(value: bool) -> Self {
+        Self(value)
+    }
+
+    /// The raw boolean behind the toggle.
+    #[must_use]
+    pub const fn get(self) -> bool {
+        self.0
+    }
+}
+
+/// A `bool` is already a valid toggle value; `true.into()` sets one.
+impl From<bool> for Toggle {
+    fn from(value: bool) -> Self {
+        Self(value)
+    }
+}
 
 /// Application configuration.
 #[derive(Clone, PartialEq, Eq)]
@@ -169,6 +222,17 @@ pub struct Config {
     /// [`create_token`](crate::models::oauth_token::create_token) as the
     /// token's `ttl`.
     pub oauth_token_ttl_secs: usize,
+    /// Whether the `MongooseIM` auth endpoints (`GET /user_exists`,
+    /// `GET /check_password`) are served, from `MONGOOSEIM_ENABLED`. See
+    /// [`crate::api::misc`].
+    pub mongooseim_enabled: Toggle,
+    /// Whether a captcha provider is configured, from `CAPTCHA_ENABLED`.
+    /// While no captcha implementation exists, a set toggle makes
+    /// `GET /api/v1/pleroma/captcha` answer 501; see [`crate::api::misc`].
+    pub captcha_enabled: Toggle,
+    /// Whether `GET /api/v1/pleroma/healthcheck` reports pool and
+    /// liveness data, from `HEALTHCHECK_ENABLED`. See [`crate::api::misc`].
+    pub healthcheck_enabled: Toggle,
 }
 
 impl Config {
@@ -228,24 +292,10 @@ impl Config {
             HTTP_ALLOW_PRIVATE_HOSTS_VAR,
             DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
         )?;
-        let uploads_dir = PathBuf::from(
-            lookup(UPLOADS_DIR_VAR)
-                .map(|dir| dir.trim().to_owned())
-                .filter(|dir| !dir.is_empty())
-                .unwrap_or_else(|| DEFAULT_UPLOADS_DIR.to_owned()),
-        );
-        let emoji_dir = PathBuf::from(
-            lookup(EMOJI_DIR_VAR)
-                .map(|dir| dir.trim().to_owned())
-                .filter(|dir| !dir.is_empty())
-                .unwrap_or_else(|| DEFAULT_EMOJI_DIR.to_owned()),
-        );
-        let media_base_url = lookup(MEDIA_BASE_URL_VAR)
-            .map(|url| url.trim().trim_end_matches('/').to_owned())
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"));
+        let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
         let (accounts_email_optional, min_password_length, oauth_token_ttl_secs) =
             auth_settings(&lookup)?;
+        let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -265,6 +315,9 @@ impl Config {
             accounts_email_optional,
             min_password_length,
             oauth_token_ttl_secs,
+            mongooseim_enabled,
+            captcha_enabled,
+            healthcheck_enabled,
         })
     }
 
@@ -334,6 +387,9 @@ impl Config {
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
             oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
+            mongooseim_enabled: Toggle::new(DEFAULT_MONGOOSEIM_ENABLED),
+            captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
+            healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
         }
     }
 }
@@ -388,6 +444,56 @@ where
         accounts_email_optional,
         min_password_length,
         oauth_token_ttl_secs,
+    ))
+}
+
+/// Reads the three settings that locate stored files and the URLs they
+/// are served under: the uploads directory, the emoji packs directory and
+/// the media URL prefix. Grouped because each is a plain trim-or-default
+/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
+/// comes back in field order. `base_url` is the normalized origin the
+/// media prefix defaults onto.
+fn storage_paths<F>(lookup: &F, base_url: &str) -> (PathBuf, PathBuf, String)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let uploads_dir = PathBuf::from(
+        lookup(UPLOADS_DIR_VAR)
+            .map(|dir| dir.trim().to_owned())
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| DEFAULT_UPLOADS_DIR.to_owned()),
+    );
+    let emoji_dir = PathBuf::from(
+        lookup(EMOJI_DIR_VAR)
+            .map(|dir| dir.trim().to_owned())
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| DEFAULT_EMOJI_DIR.to_owned()),
+    );
+    let media_base_url = lookup(MEDIA_BASE_URL_VAR)
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"));
+    (uploads_dir, emoji_dir, media_base_url)
+}
+
+/// Reads the three feature toggles that gate the endpoints of
+/// [`crate::api::misc`]: the `MongooseIM` auth endpoints, the captcha
+/// provider and the healthcheck. Grouped because each is a plain
+/// default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] for whichever variable holds a
+/// value that is neither spelling.
+fn misc_toggles<F>(lookup: &F) -> Result<(Toggle, Toggle, Toggle), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        boolean(lookup, MONGOOSEIM_ENABLED_VAR, DEFAULT_MONGOOSEIM_ENABLED)?.into(),
+        boolean(lookup, CAPTCHA_ENABLED_VAR, DEFAULT_CAPTCHA_ENABLED)?.into(),
+        boolean(lookup, HEALTHCHECK_ENABLED_VAR, DEFAULT_HEALTHCHECK_ENABLED)?.into(),
     ))
 }
 
@@ -459,6 +565,9 @@ impl fmt::Debug for Config {
             .field("accounts_email_optional", &self.accounts_email_optional)
             .field("min_password_length", &self.min_password_length)
             .field("oauth_token_ttl_secs", &self.oauth_token_ttl_secs)
+            .field("mongooseim_enabled", &self.mongooseim_enabled)
+            .field("captcha_enabled", &self.captcha_enabled)
+            .field("healthcheck_enabled", &self.healthcheck_enabled)
             .finish()
     }
 }
@@ -679,6 +788,18 @@ mod tests {
             config.oauth_token_ttl_secs, 2_592_000,
             "default OAUTH_TOKEN_TTL_SECS is 30 days"
         );
+        assert!(
+            !config.mongooseim_enabled.get(),
+            "the `MongooseIM` auth endpoints are off by default"
+        );
+        assert!(
+            !config.captcha_enabled.get(),
+            "no captcha provider is configured by default"
+        );
+        assert!(
+            !config.healthcheck_enabled.get(),
+            "the healthcheck is off by default"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -702,6 +823,9 @@ mod tests {
             (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
             (MIN_PASSWORD_LENGTH_VAR, "12"),
             (OAUTH_TOKEN_TTL_SECS_VAR, "3600"),
+            (MONGOOSEIM_ENABLED_VAR, "true"),
+            (CAPTCHA_ENABLED_VAR, "true"),
+            (HEALTHCHECK_ENABLED_VAR, "true"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -755,6 +879,12 @@ mod tests {
         assert_eq!(
             config.oauth_token_ttl_secs, 3_600,
             "custom OAUTH_TOKEN_TTL_SECS"
+        );
+        assert!(config.mongooseim_enabled.get(), "custom MONGOOSEIM_ENABLED");
+        assert!(config.captcha_enabled.get(), "custom CAPTCHA_ENABLED");
+        assert!(
+            config.healthcheck_enabled.get(),
+            "custom HEALTHCHECK_ENABLED"
         );
     }
 
@@ -945,6 +1075,71 @@ mod tests {
         assert!(
             debug.contains("oauth_token_ttl_secs: 600"),
             "the token lifetime is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn misc_toggles_parse_booleans() {
+        for var in [
+            MONGOOSEIM_ENABLED_VAR,
+            CAPTCHA_ENABLED_VAR,
+            HEALTHCHECK_ENABLED_VAR,
+        ] {
+            for (value, want) in [
+                ("true", true),
+                ("TRUE", true),
+                (" 1 ", true),
+                ("false", false),
+                ("FaLsE", false),
+                ("0", false),
+                ("", false),
+            ] {
+                let config = config_with(&[(var, value)]);
+                let got = match var {
+                    MONGOOSEIM_ENABLED_VAR => config.mongooseim_enabled,
+                    CAPTCHA_ENABLED_VAR => config.captcha_enabled,
+                    _ => config.healthcheck_enabled,
+                };
+                assert_eq!(got.get(), want, "{var}={value:?} means {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_misc_toggles_are_errors() {
+        for var in [
+            MONGOOSEIM_ENABLED_VAR,
+            CAPTCHA_ENABLED_VAR,
+            HEALTHCHECK_ENABLED_VAR,
+        ] {
+            let err = try_config_with(&[(var, "maybe")]).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidBoolean(var), "error for {var}");
+            assert!(
+                err.to_string().starts_with(&format!("invalid {var}: ")),
+                "message names {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_shows_the_misc_toggles() {
+        let config = config_with(&[
+            (MONGOOSEIM_ENABLED_VAR, "true"),
+            (CAPTCHA_ENABLED_VAR, "false"),
+            (HEALTHCHECK_ENABLED_VAR, "true"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("mongooseim_enabled: Toggle(true)"),
+            "the `MongooseIM` toggle is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("captcha_enabled: Toggle(false)"),
+            "the captcha toggle is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("healthcheck_enabled: Toggle(true)"),
+            "the healthcheck toggle is visible in Debug output: {debug}"
         );
     }
 

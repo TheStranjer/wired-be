@@ -23,6 +23,9 @@
 //! endpoints live at `/oauth/…`, the token addresses fixed by RFC 6749; and
 //! pack images live at `/emoji/{pack}/{file}`, the address
 //! [`crate::services::emoji_packs`] stores in `custom_emojis`.
+//! [`misc::router`] joins that list at the root: the `MongooseIM` auth
+//! endpoints and `manifest.json` live at `/…`, the addresses `MongooseIM`'s
+//! `extauth` http contract and the manifest `<link>` convention fix.
 
 pub mod accounts;
 pub mod activitypub;
@@ -37,6 +40,7 @@ pub mod markers;
 pub mod media;
 pub mod media_files;
 pub mod mfa;
+pub mod misc;
 pub mod oauth;
 pub mod oauth_tokens;
 pub mod pleroma;
