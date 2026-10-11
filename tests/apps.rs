@@ -1,8 +1,13 @@
-//! Integration tests for `POST /api/v1/apps`: application registration
-//! answers 200 with the Mastodon `Application` entity plus credentials
-//! for JSON and form bodies, rejects missing or empty required fields
-//! and unknown scopes with 422, and the stored row matches what the
-//! response says. No authentication is required (decision 9).
+//! Integration tests for `/api/v1/apps`: `POST /api/v1/apps` answers 200
+//! with the Mastodon `Application` entity plus credentials for JSON and
+//! form bodies, rejects missing or empty required fields and unknown
+//! scopes with 422, and the stored row matches what the response says.
+//! No authentication is required (decision 9).
+//! `GET /api/v1/apps/verify_credentials` answers with the same entity
+//! minus its secrets for any valid bearer token — user-bound or app-only
+//! — and with a 401 when the request carries no bearer token
+//! ("Invalid credentials") or the token is unknown, expired or owned by
+//! a deactivated account ("The access token is invalid").
 
 #![cfg(test)]
 
@@ -15,7 +20,10 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::models::oauth_app;
+use wired_be::models::{
+    oauth_app,
+    oauth_token::{self, NewToken},
+};
 
 /// POSTs `body` as JSON to the registration endpoint.
 async fn post_json(app: &Router, body: &Value) -> common::TestResponse {
@@ -32,6 +40,9 @@ fn error_text(response: &common::TestResponse) -> String {
         .expect("errors carry a string error field")
         .to_owned()
 }
+
+/// The secret fields only the registration response carries.
+const SECRET_FIELDS: [&str; 3] = ["client_id", "client_secret", "client_secret_expires_at"];
 
 /// A full JSON registration: every documented field echoes back, the
 /// credentials have Pleroma's shape, and the stored row is the response.
@@ -321,4 +332,268 @@ async fn two_registrations_get_distinct_credentials(pool: PgPool) {
         a["client_secret"], b["client_secret"],
         "the client secrets differ"
     );
+}
+
+/// A user-bound bearer token reaches `verify_credentials`: 200 with the
+/// application the token was issued for, and none of the secrets.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_accepts_a_user_token(pool: PgPool) {
+    let router = common::test_app(pool.clone());
+    let user = common::create_local_user(&pool, "appverifier").await;
+    let app_row = common::create_app(&pool, "read write").await;
+    let token = oauth_token::create_token(
+        &pool,
+        &NewToken {
+            user_id: Some(user.id),
+            app_id: app_row.id,
+            scopes: "read".to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("token fixture inserts");
+
+    let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer(&token.token)
+        .send(&router)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "200 for a user token");
+    let body = response.json_value();
+    assert_eq!(
+        body["id"],
+        app_row.id.to_string(),
+        "the entity names the issuing app"
+    );
+    assert_eq!(body["name"], "Test Client", "client_name becomes name");
+    assert!(body["website"].is_null(), "an unset website is null");
+    assert_eq!(
+        body["redirect_uri"], "https://client.example/callback",
+        "the stored redirect_uris"
+    );
+    assert!(body["vapid_key"].is_null(), "vapid_key is null");
+    assert_eq!(
+        body["scopes"],
+        json!(["read", "write"]),
+        "the app's registered scopes as an array"
+    );
+    assert_no_secrets(&body);
+}
+
+/// An app-only (`client_credentials`-shaped) token — minted straight
+/// through the token model with no user — satisfies `verify_credentials`
+/// too.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_accepts_an_app_only_token(pool: PgPool) {
+    let router = common::test_app(pool.clone());
+    let app_row = common::create_app(&pool, "read").await;
+    let token = oauth_token::create_token(
+        &pool,
+        &NewToken {
+            user_id: None,
+            app_id: app_row.id,
+            scopes: "read".to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("the app-only token mints straight through the model");
+
+    let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer(&token.token)
+        .send(&router)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "200 for an app-only token");
+    let body = response.json_value();
+    assert_eq!(body["id"], app_row.id.to_string(), "the same entity");
+    assert_no_secrets(&body);
+}
+
+/// The `verify_credentials` entity is exactly the registration entity
+/// with the credential fields removed: register over HTTP, mint a token
+/// for the registered app, and compare the two bodies key by key.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_is_the_registration_response_minus_the_secrets(pool: PgPool) {
+    let router = common::test_app(pool.clone());
+    let registration = post_json(
+        &router,
+        &json!({
+            "client_name": "Mirror",
+            "redirect_uris": "https://mirror.example/cb",
+            "scopes": "read write follow",
+            "website": "https://mirror.example",
+        }),
+    )
+    .await;
+    assert_eq!(registration.status, StatusCode::OK, "registered");
+    let registered = registration.json_value();
+
+    let app_row = oauth_app::get_by_client_id(
+        &pool,
+        registered["client_id"].as_str().expect("a client id"),
+    )
+    .await
+    .expect("the lookup reaches the database")
+    .expect("the registration stored a row");
+    let token = oauth_token::create_token(
+        &pool,
+        &NewToken {
+            user_id: None,
+            app_id: app_row.id,
+            scopes: "read".to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("token fixture inserts");
+
+    let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer(&token.token)
+        .send(&router)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "200");
+    let verified = response.json_value();
+
+    let mut expected = registered
+        .as_object()
+        .expect("the registration body is an object")
+        .clone();
+    for secret in SECRET_FIELDS {
+        let shown = expected.remove(secret);
+        assert!(shown.is_some(), "the registration carries `{secret}`");
+    }
+    assert_eq!(
+        verified,
+        Value::Object(expected),
+        "the verified body is the registration body without its secrets"
+    );
+}
+
+/// No token at all is a 401 with Pleroma's anonymous-challenge wording
+/// ("Invalid credentials", `EnsureAuthenticatedPlug`), still carrying the
+/// bearer challenge header.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_without_a_token_is_unauthorized(pool: PgPool) {
+    let router = common::test_app(pool);
+    let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .send(&router)
+        .await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED, "401");
+    assert_eq!(
+        response.header("www-authenticate"),
+        Some("Bearer"),
+        "the bearer challenge"
+    );
+    assert_eq!(
+        response.text(),
+        r#"{"error":"Invalid credentials"}"#,
+        "the exact 401 body"
+    );
+}
+
+/// An unknown token and one past its expiry are the same 401.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_rejects_unknown_and_expired_tokens(pool: PgPool) {
+    let router = common::test_app(pool.clone());
+    let app_row = common::create_app(&pool, "read").await;
+    let lapsed = oauth_token::create_token(
+        &pool,
+        &NewToken {
+            user_id: None,
+            app_id: app_row.id,
+            scopes: "read".to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("token fixture inserts");
+    common::expire_token(&pool, lapsed.id).await;
+
+    let unknown = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer("never-minted-token")
+        .send(&router)
+        .await;
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "401");
+    assert_eq!(
+        unknown.text(),
+        r#"{"error":"The access token is invalid"}"#,
+        "the exact body for the unknown token"
+    );
+
+    let lapsed_response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer(&lapsed.token)
+        .send(&router)
+        .await;
+    assert_eq!(
+        lapsed_response.status,
+        StatusCode::UNAUTHORIZED,
+        "an expired token is a 401"
+    );
+    assert_eq!(
+        lapsed_response.text(),
+        r#"{"error":"The access token is invalid"}"#,
+        "the exact body for an expired token"
+    );
+}
+
+/// A token whose owner's account is deactivated is refused too, matching
+/// the extractors' rules.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_rejects_a_deactivated_owners_token(pool: PgPool) {
+    let router = common::test_app(pool.clone());
+    let user = common::create_deactivated_user_with_password(&pool, "gone", "pw12345!").await;
+    let app_row = common::create_app(&pool, "read").await;
+    let token = oauth_token::create_token(
+        &pool,
+        &NewToken {
+            user_id: Some(user.id),
+            app_id: app_row.id,
+            scopes: "read".to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("token fixture inserts");
+
+    let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer(&token.token)
+        .send(&router)
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::UNAUTHORIZED,
+        "a deactivated owner's token is a 401"
+    );
+    assert_eq!(
+        response.text(),
+        r#"{"error":"The access token is invalid"}"#,
+        "the exact 401 body"
+    );
+}
+
+/// The fixture app is also reachable through the [`create_app_and_token`]
+/// helper: a user-bound token minted with the app in one step.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn verify_credentials_accepts_the_combined_fixture_token(pool: PgPool) {
+    let router = common::test_app(pool.clone());
+    let user = common::create_local_user(&pool, "combined").await;
+    let raw = common::create_app_and_token(&pool, &user, "read").await;
+    let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
+        .bearer(&raw)
+        .send(&router)
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the one-step fixture authenticates"
+    );
+    assert_no_secrets(&response.json_value());
+}
+
+/// The entity carries none of the three secret fields, as an object
+/// shape (the key must not appear at all, not even as null).
+fn assert_no_secrets(body: &Value) {
+    let fields = body.as_object().expect("the entity is an object");
+    for secret in SECRET_FIELDS {
+        assert!(!fields.contains_key(secret), "`{secret}` must be absent");
+    }
 }

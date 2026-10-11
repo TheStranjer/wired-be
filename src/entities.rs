@@ -8,6 +8,7 @@
 //! request, so every entity is testable with `serde_json::to_value`
 //! alone. [`account`] renders the Mastodon `Account` entity,
 //! [`announcement`] the Mastodon `Announcement` entity,
+//! [`application`] the Mastodon `Application` entity,
 //! [`media_attachment`] the Mastodon `Attachment` entity,
 //! [`custom_emoji`] the Mastodon `CustomEmoji` entity, [`filter`] the
 //! Mastodon v1 `Filter` entity, [`list`] the Mastodon v1 `List` entity,
@@ -20,6 +21,7 @@
 
 pub mod account;
 pub mod announcement;
+pub mod application;
 pub mod chat;
 pub mod custom_emoji;
 pub mod filter;

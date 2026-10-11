@@ -1,5 +1,5 @@
-//! `POST /api/v1/apps`: client application registration
-//! (Pleroma's `AppController.create`,
+//! `POST /api/v1/apps` and `GET /api/v1/apps/verify_credentials`
+//! (Pleroma's `AppController`,
 //! `lib/pleroma/web/mastodon_api/controllers/app_controller.ex`).
 //!
 //! Registering is how a client obtains the `client_id`/`client_secret`
@@ -10,15 +10,29 @@
 //! read through the [`ApiBody`] extractor (decision 10). Missing or
 //! empty required fields, and unknown scopes, are 422s (decision 8).
 //!
-//! The response is the Mastodon `Application` entity with credentials —
-//! Pleroma's `show.json` (`lib/pleroma/web/mastodon_api/views/app_view.ex`)
-//! extended with the Mastodon fields. `vapid_key` is emitted as `null`
-//! here; the web-push ticket fills it in.
+//! `GET /api/v1/apps/verify_credentials` is the same
+//! [`Application`] entity without its secrets, so a client can confirm
+//! the token it was issued and learn which application it belongs to.
+//! It authenticates with [`AppAuth`]: any valid bearer token —
+//! user-bound or app-only — and no scope is required (Pleroma's
+//! `verify_credentials` accepts both,
+//! `AppController.verify_credentials`). A missing bearer token is the
+//! 401 "Invalid credentials"; an unknown, expired or deactivated-owner
+//! token is the 401 "The access token is invalid".
+//!
+//! The response shape of both lives in
+//! [`crate::entities::application`].
 
-use axum::{Json, Router, extract::State, routing::post};
-use serde::{Deserialize, Serialize};
+use axum::{
+    Json, Router,
+    extract::State,
+    routing::{get, post},
+};
+use serde::Deserialize;
 
 use crate::{
+    auth::AppAuth,
+    entities::application::Application,
     error::{AppError, AppResult},
     extract::ApiBody,
     models::oauth_app::{self, NewOauthApp},
@@ -26,13 +40,11 @@ use crate::{
     state::AppState,
 };
 
-/// `client_secret_expires_at` of the response: these secrets never
-/// expire, which Mastodon spells `0`.
-const NEVER_EXPIRES: i64 = 0;
-
 /// The `/api/v1/apps` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
-    Router::new().route("/apps", post(create_app))
+    Router::new()
+        .route("/apps", post(create_app))
+        .route("/apps/verify_credentials", get(verify_credentials))
 }
 
 /// `POST /api/v1/apps` — register an application and hand back its OAuth
@@ -47,7 +59,7 @@ pub fn router() -> Router<AppState> {
 async fn create_app(
     State(state): State<AppState>,
     ApiBody(params): ApiBody<CreateAppParams>,
-) -> AppResult<Json<ApplicationWithCredentials>> {
+) -> AppResult<Json<Application>> {
     let scopes = resolve_scopes(params.scopes.as_deref())?;
     let redirect_uris = normalize_redirect_uris(params.redirect_uris);
     if redirect_uris.trim().is_empty() {
@@ -66,7 +78,17 @@ async fn create_app(
         },
     )
     .await?;
-    Ok(Json(ApplicationWithCredentials::from(app)))
+    Ok(Json(Application::from_app(&app, true)))
+}
+
+/// `GET /api/v1/apps/verify_credentials` — the application behind the
+/// presented bearer token, without its secrets.
+///
+/// [`AppAuth`] has already resolved the token to its issuing
+/// application (rejecting missing, unknown, expired or deactivated-owner
+/// tokens with a 401), so there is nothing left to fail here.
+async fn verify_credentials(AppAuth(app, _token): AppAuth) -> Json<Application> {
+    Json(Application::from_app(&app, false))
 }
 
 /// The request parameters of `POST /api/v1/apps`.
@@ -131,57 +153,6 @@ fn resolve_scopes(text: Option<&str>) -> AppResult<Scopes> {
         .validate()
         .map_err(|reason| AppError::Unprocessable(format!("Invalid scopes: {reason}")))?;
     Ok(scopes)
-}
-
-/// The Mastodon `Application` entity with credentials, the 200 body of a
-/// successful registration. `vapid_key` stays `null` until the push
-/// ticket owns it.
-#[derive(Debug, Serialize)]
-struct ApplicationWithCredentials {
-    /// The app's `UUIDv7` id as lowercase hyphenated text (decision 4).
-    id: String,
-    /// The registered application name.
-    name: String,
-    /// The application homepage, `null` when unset.
-    website: Option<String>,
-    /// The redirect URIs, exactly as stored.
-    redirect_uri: String,
-    /// The public OAuth client id.
-    client_id: String,
-    /// The OAuth client secret.
-    client_secret: String,
-    /// `0`: client secrets do not expire.
-    client_secret_expires_at: i64,
-    /// Web-push public key; `null` until the push ticket fills it in.
-    vapid_key: Option<String>,
-    /// The registered scopes as a list.
-    scopes: Vec<String>,
-}
-
-/// The stored scope string as the JSON list the API returns.
-fn scope_list(stored: &str) -> Vec<String> {
-    stored
-        .split(' ')
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Renders a freshly created row as the API response.
-impl From<oauth_app::OauthApp> for ApplicationWithCredentials {
-    fn from(app: oauth_app::OauthApp) -> Self {
-        Self {
-            id: app.id.to_string(),
-            name: app.client_name,
-            website: app.website,
-            redirect_uri: app.redirect_uris,
-            client_id: app.client_id,
-            scopes: scope_list(&app.scopes),
-            vapid_key: None,
-            client_secret: app.client_secret,
-            client_secret_expires_at: NEVER_EXPIRES,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -354,39 +325,5 @@ mod tests {
             "a\nb",
             "list form keys join"
         );
-    }
-
-    #[test]
-    fn the_response_renders_the_entity() {
-        let app = oauth_app::OauthApp {
-            id: crate::util::id::new_id(),
-            client_name: "Entity".to_owned(),
-            redirect_uris: "https://a.example/cb\nhttps://b.example/cb".to_owned(),
-            scopes: "read write".to_owned(),
-            website: None,
-            client_id: "cid".to_owned(),
-            client_secret: "csec".to_owned(),
-            trusted: false,
-            user_id: None,
-            inserted_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        let id = app.id.to_string();
-        let json = serde_json::to_value(ApplicationWithCredentials::from(app)).unwrap();
-        assert_eq!(json["id"], json!(id), "the uuid as hyphenated text");
-        assert_eq!(json["name"], "Entity", "client_name becomes name");
-        assert!(json["website"].is_null(), "an unset website is null");
-        assert_eq!(
-            json["redirect_uri"], "https://a.example/cb\nhttps://b.example/cb",
-            "redirect_uri is the stored string"
-        );
-        assert_eq!(json["client_id"], "cid", "the client id is handed back");
-        assert_eq!(
-            json["client_secret"], "csec",
-            "the client secret is handed back"
-        );
-        assert_eq!(json["client_secret_expires_at"], 0, "secrets do not expire");
-        assert!(json["vapid_key"].is_null(), "vapid_key is null for now");
-        assert_eq!(json["scopes"], json!(["read", "write"]), "the scope list");
     }
 }
