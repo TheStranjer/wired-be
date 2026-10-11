@@ -22,6 +22,9 @@
 //! [`crate::app`] merges this router at the top level. Per RFC 6749 §5.1
 //! every answer — success or error — carries `Cache-Control: no-store`
 //! and `Pragma: no-cache`.
+//!
+//! The authorization-code half of `/oauth` — `GET`/`POST
+//! /oauth/authorize` — lives in [`authorize`].
 
 use std::{fmt, time::Duration};
 
@@ -53,6 +56,8 @@ use crate::{
     state::AppState,
 };
 
+pub mod authorize;
+
 /// The only grant type implemented here.
 const GRANT_TYPE_PASSWORD: &str = "password";
 /// 400 body when the request omits `grant_type` entirely.
@@ -83,10 +88,12 @@ const NO_STORE: &str = "no-store";
 const NO_CACHE: &str = "no-cache";
 
 /// The `/oauth` router, merged at the top level of [`crate::app`]: the
-/// paths are fixed by OAuth (`/oauth/token` today, `/oauth/authorize` and
-/// the rest in later tickets), not nested under `/api`.
+/// paths are fixed by OAuth (`/oauth/token`, `/oauth/authorize` and the
+/// rest in later tickets), not nested under `/api`.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/oauth/token", post(token))
+    Router::new()
+        .route("/oauth/token", post(token))
+        .merge(authorize::router())
 }
 
 /// `POST /oauth/token` — exchange credentials for a bearer token pair.
