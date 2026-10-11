@@ -2,11 +2,12 @@
 //! `GET /api/v1/accounts/lookup`: the core `Account` entity with its
 //! `pleroma` extension block for local and remote rows without credentials,
 //! the privacy rules the request's token decides (hidden follow counts and
-//! hidden role flags, and the owner-only keys of the block), an invalid
-//! token still a 401, every miss (garbage id, unknown id, deactivated
-//! account, unresolvable acct) the same 404 "Record not found", `acct`
-//! resolved case-insensitively with this instance's own domain stripped, and
-//! an absent `acct` a 400 "Missing parameter: acct".
+//! hidden role flags, and the owner-only keys of the block), the status
+//! counters a posted status moves, an invalid token still a 401, every miss
+//! (garbage id, unknown id, deactivated account, unresolvable acct) the same
+//! 404 "Record not found", `acct` resolved case-insensitively with this
+//! instance's own domain stripped, and an absent `acct` a 400 "Missing
+//! parameter: acct".
 
 #![cfg(test)]
 
@@ -19,7 +20,10 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::models::user::{Flag, User};
+use wired_be::models::{
+    status::Visibility,
+    user::{Flag, User},
+};
 
 /// The instance origin the fixtures live on (`Config::for_tests`).
 const BASE: &str = "https://test.example";
@@ -91,6 +95,36 @@ async fn show_renders_a_local_account_without_auth(pool: PgPool) {
         body["emojis"],
         json!([]),
         "emojis is the empty list for now"
+    );
+}
+
+/// A posted status shows up in the account's stored counters: the entity
+/// reads `statuses_count` and `last_status_at` off the `users` row, and both
+/// are what [`wired_be::models::status`] moved when
+/// [`common::create_status`](common::create_status) wrote the status.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn show_counts_the_statuses_an_account_has_posted(pool: PgPool) {
+    let alice = common::create_local_user(&pool, "alice").await;
+    let status = common::create_status(&pool, &alice, "hello fediverse", Visibility::Public).await;
+    let app = common::test_app(pool);
+    let body = show(&app, &alice.id.to_string()).await.json_value();
+
+    assert_eq!(
+        status.visibility,
+        Visibility::Public,
+        "the fixture keeps the visibility it was given"
+    );
+    assert_eq!(
+        status.url.as_deref(),
+        Some(format!("{BASE}/notice/{}", status.id).as_str()),
+        "and the local post's URL derives from its id"
+    );
+    assert_eq!(body["statuses_count"], 1, "one posted status counts");
+    let posted = status.inserted_at.format("%Y-%m-%d").to_string();
+    assert_eq!(
+        body["last_status_at"],
+        posted.as_str(),
+        "last_status_at is the day of that status"
     );
 }
 

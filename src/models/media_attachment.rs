@@ -9,10 +9,11 @@
 //! claims one — `user_id` is `NULL` for it, and survives the deletion of
 //! an uploader through `ON DELETE SET NULL`.
 //!
-//! [`status_id`](MediaAttachment::status_id) is a plain uuid column for
-//! now: the `statuses` table arrives in a later ticket, which adds the
-//! foreign key. [`attach_to_status`] is the only writer, and it attaches
-//! exactly the rows the given user owns that no status has claimed yet.
+//! [`status_id`](MediaAttachment::status_id) is a foreign key into
+//! `statuses` (added by the statuses migration) and cascades on a hard
+//! delete. [`attach_to_status`] is the only writer that claims media for a
+//! status after the fact, and it attaches exactly the rows the given user
+//! owns that no status has claimed yet.
 //!
 //! [`insert`] mints the primary key (`UUIDv7`, decision 4); everything
 //! else comes from a [`NewMediaAttachment`], whose
@@ -33,8 +34,8 @@ pub struct MediaAttachment {
     /// Uploading user; `None` for remote media (and for rows whose
     /// uploader has since been deleted).
     pub user_id: Option<Uuid>,
-    /// Status this attachment belongs to; `None` while unposted. A plain
-    /// uuid, no foreign key yet.
+    /// Status this attachment belongs to; `None` while unposted. A foreign
+    /// key, so a status that is hard-deleted takes its media with it.
     pub status_id: Option<Uuid>,
     /// Order within the status's attachment list.
     pub position: i32,
@@ -133,9 +134,8 @@ const INSERT_SQL: &str = "INSERT INTO media_attachments (
 /// Inserts one media attachment and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4); every other column comes from
-/// `new_attachment`. `user_id` has a foreign key, so an uploader that
-/// does not exist is rejected; `status_id` is a plain uuid and is not
-/// checked against anything yet.
+/// `new_attachment`. Both `user_id` and `status_id` have foreign keys, so an
+/// uploader that does not exist or a status that is not stored is rejected.
 ///
 /// # Errors
 ///
@@ -213,6 +213,10 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<MediaAttachm
 /// neither steal foreign media nor move media between statuses behind a
 /// status's back. Callers that must reject foreign ids outright compare
 /// the count against `ids.len()`.
+///
+/// `status_id` names a row of `statuses` (the foreign key the statuses
+/// migration added), so an unknown status fails the whole write rather
+/// than attaching anything.
 ///
 /// # Errors
 ///
@@ -330,7 +334,10 @@ mod tests {
     use super::*;
     use crate::{
         error::AppError,
-        models::user::{NewUser, User, insert as insert_user, local_ap_id},
+        models::{
+            status::{self, NewStatus, Status},
+            user::{NewUser, User, insert as insert_user, local_ap_id},
+        },
     };
 
     /// The instance origin the fixtures pretend to serve.
@@ -344,6 +351,24 @@ mod tests {
         )
         .await
         .expect("fixture user inserts")
+    }
+
+    /// Inserts a local status of `author`, because `status_id` is a foreign
+    /// key and so every fixture that sets one needs a stored row.
+    async fn create_status(pool: &PgPool, author: &User) -> Status {
+        status::insert(pool, BASE, &NewStatus::local(author, "a posted photo"))
+            .await
+            .expect("fixture status inserts")
+    }
+
+    /// Deletes `status` for real, which is what takes its media with it.
+    async fn hard_delete(pool: &PgPool, status: Status) {
+        let removed = sqlx::query("DELETE FROM statuses WHERE id = $1")
+            .bind(status.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(removed.rows_affected(), 1, "the fixture status existed");
     }
 
     /// A [`NewMediaAttachment`] uploaded by `user_id` and stored at a key
@@ -366,12 +391,12 @@ mod tests {
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn insert_round_trips_every_column(pool: PgPool) {
         let alice = create_user(&pool, "alice").await;
-        let status = new_id();
+        let posted = create_status(&pool, &alice).await;
         let stored = insert(
             &pool,
             &NewMediaAttachment {
                 user_id: Some(alice.id),
-                status_id: Some(status),
+                status_id: Some(posted.id),
                 position: 2,
                 storage_key: Some("alice/9b3c1d0e4f5a6b7c.png".to_owned()),
                 remote_url: None,
@@ -393,7 +418,7 @@ mod tests {
         .unwrap();
         assert!(stored.id.get_version_num() == 7, "id is a UUIDv7");
         assert_eq!(stored.user_id, Some(alice.id), "uploader round trips");
-        assert_eq!(stored.status_id, Some(status), "status id round trips");
+        assert_eq!(stored.status_id, Some(posted.id), "status id round trips");
         assert_eq!(stored.position, 2, "position round trips");
         assert_eq!(
             stored.storage_key.as_deref(),
@@ -531,10 +556,11 @@ mod tests {
         let mine1 = insert(&pool, &new_upload(alice.id)).await.unwrap();
         let mine2 = insert(&pool, &new_upload(alice.id)).await.unwrap();
         let foreign = insert(&pool, &new_upload(bob.id)).await.unwrap();
+        let claimed = create_status(&pool, &alice).await;
         let already = insert(
             &pool,
             &NewMediaAttachment {
-                status_id: Some(new_id()),
+                status_id: Some(claimed.id),
                 ..new_upload(alice.id)
             },
         )
@@ -550,7 +576,7 @@ mod tests {
         .await
         .unwrap();
 
-        let status = new_id();
+        let posted = create_status(&pool, &alice).await;
         let ids = [
             mine1.id,
             mine2.id,
@@ -559,18 +585,18 @@ mod tests {
             mine_remote.id,
             new_id(),
         ];
-        let attached = attach_to_status(&pool, &ids, status, alice.id)
+        let attached = attach_to_status(&pool, &ids, posted.id, alice.id)
             .await
             .unwrap();
         assert_eq!(attached, 2, "only alice's two unattached rows went");
         assert_eq!(
             fetch(&pool, mine1.id).await.status_id,
-            Some(status),
+            Some(posted.id),
             "the first row now names the status"
         );
         assert_eq!(
             fetch(&pool, mine2.id).await.status_id,
-            Some(status),
+            Some(posted.id),
             "so does the second"
         );
         assert!(
@@ -588,27 +614,104 @@ mod tests {
             "ownerless (remote) media cannot be attached"
         );
 
-        let again = attach_to_status(&pool, &[mine1.id, mine2.id], status, alice.id)
+        let again = attach_to_status(&pool, &[mine1.id, mine2.id], posted.id, alice.id)
             .await
             .unwrap();
         assert_eq!(again, 0, "a double attach is ignored");
-        let empty = attach_to_status(&pool, &[], status, alice.id)
+        let empty = attach_to_status(&pool, &[], posted.id, alice.id)
             .await
             .unwrap();
         assert_eq!(empty, 0, "no ids attach nothing");
     }
 
+    /// The foreign key this ticket added: `status_id` names a stored status,
+    /// both on the way in and when attaching afterwards.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn media_can_only_name_a_status_that_exists(pool: PgPool) {
+        let alice = create_user(&pool, "alice").await;
+        let err = insert(
+            &pool,
+            &NewMediaAttachment {
+                user_id: Some(alice.id),
+                status_id: Some(new_id()),
+                url: format!("{BASE}/media/alice/9b3c1d0e4f5a6b7c.png"),
+                content_type: "image/png".to_owned(),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .expect_err("media cannot name a status that was never posted");
+        let AppError::Database(SqlxError::Database(db_err)) = err else {
+            panic!("a status_id collision must surface as a database error")
+        };
+        assert_eq!(
+            db_err.code().as_deref(),
+            Some("23503"),
+            "the failure is the statuses foreign key"
+        );
+
+        let unattached = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let attach_err = attach_to_status(&pool, &[unattached.id], new_id(), alice.id)
+            .await
+            .expect_err("attaching to an unknown status is not possible");
+        let AppError::Database(SqlxError::Database(attach_db_err)) = attach_err else {
+            panic!("a status_id collision must surface as a database error")
+        };
+        assert_eq!(
+            attach_db_err.code().as_deref(),
+            Some("23503"),
+            "and the same key stops the attach"
+        );
+        assert!(
+            fetch(&pool, unattached.id).await.status_id.is_none(),
+            "the rejected attach left the media unposted"
+        );
+    }
+
+    /// A soft delete keeps the status row, so its media stays; the cascade
+    /// runs when the row actually goes.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn deleting_a_status_takes_its_media_with_it(pool: PgPool) {
+        let alice = create_user(&pool, "alice").await;
+        let posted = create_status(&pool, &alice).await;
+        let attached = insert(
+            &pool,
+            &NewMediaAttachment {
+                user_id: Some(alice.id),
+                status_id: Some(posted.id),
+                url: format!("{BASE}/media/alice/9b3c1d0e4f5a6b7c.png"),
+                content_type: "image/png".to_owned(),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let tombstone = status::soft_delete(&pool, posted.id).await.unwrap();
+        assert!(tombstone.is_some(), "the status is soft-deleted");
+        assert!(
+            get_by_id(&pool, attached.id).await.unwrap().is_some(),
+            "and its media survives, because the row stayed"
+        );
+
+        hard_delete(&pool, posted).await;
+        assert!(
+            get_by_id(&pool, attached.id).await.unwrap().is_none(),
+            "the cascade removed the media with the row"
+        );
+    }
+
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn for_statuses_groups_by_status_and_orders_by_position(pool: PgPool) {
         let alice = create_user(&pool, "alice").await;
-        let first = new_id();
-        let second = new_id();
+        let first = create_status(&pool, &alice).await;
+        let second = create_status(&pool, &alice).await;
         // Insert out of order: positions shuffled against id order, and
         // the second status gets a position tie broken by id.
         let late = insert(
             &pool,
             &NewMediaAttachment {
-                status_id: Some(first),
+                status_id: Some(first.id),
                 position: 2,
                 ..new_upload(alice.id)
             },
@@ -618,7 +721,7 @@ mod tests {
         let early = insert(
             &pool,
             &NewMediaAttachment {
-                status_id: Some(first),
+                status_id: Some(first.id),
                 position: 0,
                 ..new_upload(alice.id)
             },
@@ -628,7 +731,7 @@ mod tests {
         let middle = insert(
             &pool,
             &NewMediaAttachment {
-                status_id: Some(first),
+                status_id: Some(first.id),
                 position: 1,
                 ..new_upload(alice.id)
             },
@@ -638,7 +741,7 @@ mod tests {
         let tie_b = insert(
             &pool,
             &NewMediaAttachment {
-                status_id: Some(second),
+                status_id: Some(second.id),
                 position: 1,
                 ..new_upload(alice.id)
             },
@@ -648,7 +751,7 @@ mod tests {
         let tie_a = insert(
             &pool,
             &NewMediaAttachment {
-                status_id: Some(second),
+                status_id: Some(second.id),
                 position: 1,
                 ..new_upload(alice.id)
             },
@@ -656,21 +759,24 @@ mod tests {
         .await
         .unwrap();
 
-        let grouped = for_statuses(&pool, &[first, second, new_id()])
+        let grouped = for_statuses(&pool, &[first.id, second.id, new_id()])
             .await
             .unwrap();
         assert_eq!(grouped.len(), 2, "the status with no media has no key");
-        let positions: Vec<i32> = grouped[&first].iter().map(|row| row.position).collect();
+        let positions: Vec<i32> = grouped[&first.id].iter().map(|row| row.position).collect();
         assert_eq!(positions, vec![0, 1, 2], "the group is ordered by position");
         assert_eq!(
-            grouped[&first].iter().map(|row| row.id).collect::<Vec<_>>(),
+            grouped[&first.id]
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
             vec![early.id, middle.id, late.id],
             "each row is the right one"
         );
         let mut tied = vec![tie_a.id, tie_b.id];
         tied.sort_unstable();
         assert_eq!(
-            grouped[&second]
+            grouped[&second.id]
                 .iter()
                 .map(|row| row.id)
                 .collect::<Vec<_>>(),
