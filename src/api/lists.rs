@@ -33,26 +33,58 @@
 //! Pleroma's `CastAndValidate` plug precedent, validation runs ahead of
 //! any lookup.
 //!
-//! All routes require a user token ([`AuthUser`]) and, per the ticket's
-//! scope pair, `read:lists` to look and `write:lists` to change.
+//! The members of one list are the three routes on
+//! `/api/v1/lists/{id}/accounts`, Pleroma's `list_accounts`, `add_to_list`
+//! and `remove_from_list`:
+//!
+//! - `GET` answers the members as [`Account`] entities, newest membership
+//!   first, [`OrdinalPageParams`] keyset pagination over the membership
+//!   ordinal (`limit` default 20, `limit=0` every member) and a `Link` header
+//!   whose cursors are [`list::MemberEntry::position`] values — the order
+//!   accounts were added in, the one order a list's members have.
+//! - `POST` takes `account_ids[]` (decision 10: [`ApiBody`], so the JSON and
+//!   the form spelling both work) and adds those accounts, answering `{}`.
+//!   Mastodon's and Pleroma's rule applies: an account the caller does not
+//!   follow (no *accepted* `follows` row) may not be added — the 422
+//!   `{"error":"Validation failed: Account is not followed"}` — and an id
+//!   that names no account is the 404, checked for the whole batch before any
+//!   of it is written. Adding a member twice writes nothing the second time.
+//! - `DELETE` takes `account_ids[]` in the body *or* the query
+//!   ([`ApiParams`], the spellings Pleroma accepts for this action) and
+//!   removes those members, answering `{}`; an id that is not a member of
+//!   that list — account or not — is ignored.
+//!
+//! Every route of both groups requires a user token ([`AuthUser`]) and, per
+//! the ticket's scope pair, `read:lists` to look and `write:lists` to change.
+//! The `{id}` of a list that is malformed, unknown or someone else's is one
+//! and the same 404 everywhere, including on the three member routes.
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
+    http::HeaderMap,
     routing::get,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     api::helpers::account_or_404,
     auth::AuthUser,
-    entities::list::List,
+    entities::{
+        account::{Account, AccountViewer},
+        list::List,
+    },
     error::{AppError, AppResult},
-    extract::{ApiBody, flex},
-    models::list,
+    extract::{ApiBody, ApiParams, flex},
+    models::{
+        follow::{self, FollowState},
+        list, user,
+    },
     oauth::scopes::{READ_LISTS, WRITE_LISTS},
+    pagination::{MAX_LIMIT, OrdinalPageParams, link_header, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -67,6 +99,13 @@ const DEFAULT_REPLIES_POLICY: &str = "list";
 const TITLE_BLANK: &str = "Validation failed: Title can't be blank";
 /// 422 body for a policy outside [`VALID_REPLIES_POLICIES`] (likewise).
 const POLICY_INVALID: &str = "Validation failed: Replies policy is not included in the list";
+/// 422 body for an account the caller does not follow (Mastodon's changeset
+/// wording for `List`'s `account_ids` validation; the ticket's exact text).
+const NOT_FOLLOWED: &str = "Validation failed: Account is not followed";
+/// The `Link` header's query parameters carry nothing but the cursor: the
+/// members page has no filter to repeat on either link (the relationship
+/// listings' constant, same rule).
+const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/lists` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -75,6 +114,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/lists/{id}",
             get(show_list).put(update_list).delete(delete_list),
+        )
+        .route(
+            "/lists/{id}/accounts",
+            get(list_list_accounts)
+                .post(add_list_accounts)
+                .delete(remove_list_accounts),
         )
         .route("/accounts/{id}/lists", get(lists_for_account))
 }
@@ -195,7 +240,7 @@ async fn delete_list(
     if !list::delete(&state.db, auth.0.id, list_id).await? {
         return Err(AppError::NotFound);
     }
-    Ok(Json(Value::Object(Map::new())))
+    Ok(empty_object())
 }
 
 /// `GET /api/v1/accounts/{id}/lists` — the caller's lists that hold that
@@ -224,6 +269,234 @@ async fn lists_for_account(
         "account memberships listed"
     );
     Ok(Json(rows.iter().map(List::from_row).collect()))
+}
+
+/// `GET /api/v1/lists/{id}/accounts` — the members of one of the caller's
+/// lists as [`Account`] entities, newest membership first, one
+/// [`OrdinalPageParams`] page at a time (default 20, at most
+/// [`MAX_LIMIT`], `limit=0` for every member) under a `Link` header keyed on
+/// [`list::MemberEntry::position`] — the order accounts were added in.
+/// Pleroma's `list_accounts` answers its whole `following` array at once;
+/// Mastodon's page size and cursor spelling is what the ticket pins here.
+///
+/// The members are rendered as the caller sees them ([`AccountViewer`]);
+/// their relationship to the caller is not embedded — Pleroma's
+/// `AccountView` index render does not carry one for this action either.
+///
+/// The `Link` header's path is the request's own [`OriginalUri`], not the
+/// [`axum::http::Uri`] the router hands a nested handler: axum strips the
+/// `/api/v1` prefix off the latter, and Pleroma links to `conn.request_path`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `read:lists` check; [`AppError::NotFound`] when the id is malformed,
+/// names no list or names one of another account (see [`owned_list`]);
+/// [`AppError::BadRequest`] from [`OrdinalPageParams`] for a cursor that is
+/// not a number. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value that
+/// is not header-safe as [`AppError::Internal`].
+async fn list_list_accounts(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
+    auth.require(READ_LISTS)?;
+    let list_id = owned_list(&state, &auth, &id).await?;
+    let page = OrdinalPageParams::from_query(uri.query(), MAX_LIMIT)?;
+    let entries = list::members_page(&state.db, list_id, page).await?;
+    debug!(
+        count = entries.len(),
+        list = %list_id,
+        user = %auth.0.id,
+        "list members listed"
+    );
+    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    let mut headers = HeaderMap::new();
+    set_link_header(&mut headers, link.as_deref())?;
+    let viewer: AccountViewer<'_> = Some(&auth.0);
+    let accounts = entries
+        .iter()
+        .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
+        .collect();
+    Ok((headers, Json(accounts)))
+}
+
+/// `POST /api/v1/lists/{id}/accounts` — add `account_ids[]` to one of the
+/// caller's lists and answer `{}`.
+///
+/// The whole batch is settled before any of it is written: every id has to
+/// name an account (else the 404) and every one of them has to be an account
+/// the caller follows with an *accepted* relationship (else the 422
+/// [`NOT_FOLLOWED`]) — Mastodon's `List` validation and the rule Pleroma's
+/// `add_to_list` enforces by only ever looking at followed accounts. A member
+/// who is already on the list is left exactly where they are
+/// ([`list::add_members`]), so adding twice is one membership; an empty
+/// `account_ids` adds nobody and still answers `{}`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `write:lists` check; [`AppError::Unprocessable`] when the body has no
+/// `account_ids` array (the extractor's 422) or names an account the caller
+/// does not follow; [`AppError::NotFound`] for a list that is malformed,
+/// unknown or foreign, and for an account id that is malformed or names no
+/// account. Any database failure arrives through `?` as [`AppError::Database`].
+async fn add_list_accounts(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiBody(body): ApiBody<MemberParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_LISTS)?;
+    let list_id = owned_list(&state, &auth, &id).await?;
+    let members = requested_accounts(&state, &body.account_ids).await?;
+    ensure_followed(&state, auth.0.id, &members).await?;
+    let added = list::add_members(&state.db, list_id, &members).await?;
+    debug!(
+        added,
+        list = %list_id,
+        user = %auth.0.id,
+        "list members added"
+    );
+    Ok(empty_object())
+}
+
+/// `DELETE /api/v1/lists/{id}/accounts` — remove `account_ids[]` from one of
+/// the caller's lists and answer `{}`.
+///
+/// Pleroma's `remove_from_list` takes the ids from the query *or* the body,
+/// which is what [`ApiParams`] is for; the removal is the plain delete
+/// ([`list::remove_members`]), so an id that is not a member of that list —
+/// an unknown account, a malformed id, an account on another owner's list —
+/// matches nothing and is ignored rather than refused.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `write:lists` check; [`AppError::Unprocessable`] when neither the body
+/// nor the query carries an `account_ids` array; [`AppError::NotFound`] for a
+/// list that is malformed, unknown or foreign. Any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn remove_list_accounts(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiParams(params): ApiParams<MemberParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_LISTS)?;
+    let list_id = owned_list(&state, &auth, &id).await?;
+    let (members, _unknown_ignored) = requested_ids(&params.account_ids);
+    let removed = list::remove_members(&state.db, list_id, &members).await?;
+    debug!(
+        removed,
+        list = %list_id,
+        user = %auth.0.id,
+        "list members removed"
+    );
+    Ok(empty_object())
+}
+
+/// The `{id}` path segment of a list route, resolved to the caller's list:
+/// [`AppError::NotFound`] for an id that is malformed, names no list or names
+/// one of another account — Pleroma's `list_by_id_and_user` plug, which
+/// answers all three the same way before any action runs.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives through
+/// `?` as [`AppError::Database`].
+async fn owned_list(state: &AppState, auth: &AuthUser, id: &str) -> AppResult<Uuid> {
+    let Some(list_id) = parse_id(id) else {
+        return Err(AppError::NotFound);
+    };
+    if list::get_owned(&state.db, auth.0.id, list_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+    Ok(list_id)
+}
+
+/// The account ids of an `account_ids[]` parameter, in the order the client
+/// sent them and with repeats folded into one, plus whether every entry was an
+/// id at all: the strict caller ([`requested_accounts`]) turns a `false` into
+/// the 404 an unknown account owes, the lenient one
+/// ([`remove_list_accounts`]) has nothing to refuse, because an id that names
+/// no account is, literally, not a member.
+fn requested_ids(texts: &[String]) -> (Vec<Uuid>, bool) {
+    let mut ids: Vec<Uuid> = Vec::with_capacity(texts.len());
+    let mut all_ids = true;
+    for text in texts {
+        match parse_id(text) {
+            Some(id) if !ids.contains(&id) => ids.push(id),
+            Some(_) => {}
+            None => all_ids = false,
+        }
+    }
+    (ids, all_ids)
+}
+
+/// The accounts an `add` names: every id of [`requested_ids`] must be parseable
+/// and must name an account this instance knows, or the whole batch is the
+/// 404 — nothing is added for a request that names somebody who does not
+/// exist.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives through
+/// `?` as [`AppError::Database`].
+async fn requested_accounts(state: &AppState, texts: &[String]) -> AppResult<Vec<Uuid>> {
+    let (ids, all_ids) = requested_ids(texts);
+    if !all_ids {
+        return Err(AppError::NotFound);
+    }
+    let found = user::get_many(&state.db, &ids).await?;
+    if found.len() != ids.len() {
+        return Err(AppError::NotFound);
+    }
+    Ok(ids)
+}
+
+/// The rule [`add_list_accounts`] validates the batch against: every account
+/// named must be one `follower` follows with an *accepted* relationship — a
+/// pending request is not a follow, the same fact [`follow::is_following`]
+/// states for a pair of rows, read here off [`follow::get`] because the
+/// endpoint has ids, not rows.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`NOT_FOLLOWED`] for the first account
+/// that fails the rule; any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn ensure_followed(state: &AppState, follower: Uuid, targets: &[Uuid]) -> AppResult<()> {
+    for target in targets {
+        let granted = follow::get(&state.db, follower, *target).await?;
+        if !granted.is_some_and(|row| row.state == FollowState::Accepted) {
+            return Err(AppError::Unprocessable(NOT_FOLLOWED.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+/// The `Link` header value for a fetched members page: Pleroma's
+/// `add_link_headers` over the first (newest) and last (oldest) entry's
+/// [`list::MemberEntry::position`] — the cursors key on the membership
+/// ordinal, not on the members' ids — and `None` for an empty page.
+///
+/// [`list::MemberEntry::position`]: crate::models::list::MemberEntry::position
+fn page_link(base_url: &str, path: &str, entries: &[list::MemberEntry]) -> Option<String> {
+    let newest = entries.first()?.position.to_string();
+    let oldest = entries.last()?.position.to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+}
+
+/// The body both membership writes answer: `{}`, Pleroma's
+/// `json(conn, %{})` for `add_to_list` and `remove_from_list`.
+fn empty_object() -> Json<Value> {
+    Json(Value::Object(Map::new()))
 }
 
 /// The request parameters of `POST` and `PUT /api/v1/lists`.
@@ -280,6 +553,19 @@ impl ListParams {
             exclusive: self.exclusive,
         })
     }
+}
+
+/// The request parameters of the two membership writes: Mastodon's
+/// `account_ids[]`.
+///
+/// The field is required — a `POST`/`DELETE` without it anywhere is the
+/// extractor's 422 — and every id arrives as text, which is both decision 10's
+/// form spelling (`account_ids[]=1&account_ids[]=2`) and what a JSON body of
+/// id strings gives.
+#[derive(Debug, Deserialize)]
+struct MemberParams {
+    /// The accounts to add to, or remove from, the list.
+    account_ids: Vec<String>,
 }
 
 /// The title a create without one validates — and fails on.
@@ -482,6 +768,86 @@ mod tests {
         assert!(
             err.to_string().contains("expected a boolean"),
             "and the flex message says so: {err}"
+        );
+    }
+
+    /// The account ids the `account_ids` of `params` name, asserted to be
+    /// ids all the way through.
+    fn requested(texts: &[String]) -> Vec<Uuid> {
+        let (ids, all_ids) = requested_ids(texts);
+        assert!(all_ids, "the fixture names only ids");
+        ids
+    }
+
+    #[test]
+    fn membership_ids_arrive_in_either_body_spelling() {
+        let first = Uuid::now_v7().to_string();
+        let second = Uuid::now_v7().to_string();
+        let from_json: MemberParams =
+            crate::extract::into_params(json!({"account_ids": [first, second]}))
+                .expect("a JSON array of id strings");
+        let form = crate::extract::parse_pairs([
+            ("account_ids[]", first.as_str()),
+            ("account_ids[]", second.as_str()),
+        ]);
+        let from_form: MemberParams =
+            crate::extract::into_params(form).expect("the repeated-bracket form spelling");
+
+        assert_eq!(
+            from_form.account_ids, from_json.account_ids,
+            "decision 10's two spellings reach the same parameter"
+        );
+        assert_eq!(
+            requested(&from_json.account_ids),
+            vec![parse_id(&first).unwrap(), parse_id(&second).unwrap()],
+            "and the ids come out in the order the client sent them"
+        );
+    }
+
+    #[test]
+    fn a_membership_body_without_account_ids_is_unprocessable() {
+        for value in [json!({}), json!({"ids": []})] {
+            let err = crate::extract::into_params::<MemberParams>(value.clone())
+                .expect_err("`account_ids` is required");
+            assert!(
+                err.to_string().contains("missing field `account_ids`"),
+                "{value} is refused by name: {err}"
+            );
+        }
+        let not_an_array = crate::extract::into_params::<MemberParams>(json!({"account_ids": "1"}))
+            .expect_err("one id is not the parameter");
+        assert!(
+            not_an_array.to_string().contains("expected a sequence"),
+            "and the shape it wanted is stated: {not_an_array}"
+        );
+    }
+
+    #[test]
+    fn repeated_membership_ids_are_one_request_and_garbage_is_reported() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let texts: Vec<String> = vec![
+            first.to_string(),
+            first.to_string(),
+            "not-a-uuid".to_owned(),
+            second.to_string(),
+        ];
+        let (ids, all_ids) = requested_ids(&texts);
+        assert!(!all_ids, "one of the four entries is no id at all");
+        assert_eq!(
+            ids,
+            vec![first, second],
+            "the lenient read folds the repeat, keeps the order and drops the \
+             garbage"
+        );
+    }
+
+    #[test]
+    fn an_empty_membership_parameter_names_nobody() {
+        assert_eq!(
+            requested_ids(&[]),
+            (Vec::new(), true),
+            "no ids is not the same as a bad id: an empty batch is complete"
         );
     }
 }

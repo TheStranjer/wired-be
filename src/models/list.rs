@@ -21,12 +21,22 @@
 //! [`update`] is the partial write the API's `PUT` performs: a `NULL`
 //! (absent) parameter keeps the stored column, so only what the request
 //! names changes.
+//!
+//! A list's members are written by [`add_members`] and [`remove_members`] and
+//! read by [`members_page`] and [`member_ids`]. A list's own order is the order
+//! its members were added in, which no `UUIDv7` column of this table can state
+//! (the member's id orders the accounts, not the memberships), so
+//! `list_members.position` — a `bigserial` ordinal the database fills on
+//! insert — is what [`members_page`] keys its `max_id`/`min_id`/`since_id`
+//! cursors on, the same column Mastodon's list-accounts page keys on.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, QueryBuilder, postgres::Postgres};
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{
+    error::AppResult, models::user::User, pagination::OrdinalPageParams, util::id::new_id,
+};
 
 /// [`create`]: the id this module mints (decision 4), the owner and what
 /// the caller decided, with `inserted_at` and `updated_at` left to the
@@ -68,6 +78,38 @@ const LISTS_CONTAINING_SQL: &str = "SELECT lists.* FROM lists
      JOIN list_members ON list_members.list_id = lists.id
      WHERE lists.user_id = $1 AND list_members.user_id = $2
      ORDER BY lists.id";
+
+/// [`add_members`]: every requested member in one statement, each row taking
+/// the next `position` from the sequence (so the array's order is the order the
+/// members were added in). A pair that is already a member conflicts on the
+/// primary key and is left exactly where it was — Pleroma's `Enum.uniq` on the
+/// list's address array, expressed as the upsert this table's key allows, and
+/// what makes adding twice succeed without writing a second row.
+const ADD_MEMBERS_SQL: &str = "INSERT INTO list_members (list_id, user_id)
+     SELECT $1::uuid, id FROM unnest($2::uuid[]) AS requested(id)
+ON CONFLICT (list_id, user_id) DO NOTHING";
+
+/// [`remove_members`]: the memberships of the given accounts in this one list.
+/// An id that is not a member matches nothing and changes nothing, which is
+/// Pleroma's `List.unfollow` being content with an address the array never
+/// held.
+const REMOVE_MEMBERS_SQL: &str = "DELETE FROM list_members
+     WHERE list_id = $1 AND user_id = ANY($2)";
+
+/// [`members_page`]: one page of a list's members as their `users` rows, each
+/// entry led by the `position` of the membership row behind it — the ordinal
+/// the page keys on. The text stops where its one placeholder belongs, because
+/// that is where [`members_page`] pushes its bind and the builder is what
+/// numbers it `$1`; the keyset it then appends runs on `lm.position`.
+const MEMBERS_PAGE_SQL: &str = "SELECT lm.position, u.* FROM list_members lm
+     JOIN users u ON u.id = lm.user_id
+     WHERE lm.list_id = ";
+
+/// [`member_ids`]: every member of one list, in the order they were added —
+/// the whole membership, which is what a later federation ticket walks when it
+/// delivers a status to a list.
+const MEMBER_IDS_SQL: &str = "SELECT user_id FROM list_members
+     WHERE list_id = $1 ORDER BY position";
 
 /// One row of `lists`: a named collection of accounts one user keeps.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -131,6 +173,24 @@ pub struct ListChanges {
     pub replies_policy: Option<String>,
     /// The new exclusiveness; `None` keeps the stored one.
     pub exclusive: Option<bool>,
+}
+
+/// One entry of a paged member list: the member's [`User`] row plus the
+/// `position` of the `list_members` row that put them on the page.
+///
+/// The membership ordinal — not the member's id — is what [`members_page`]
+/// keys on (WBE-104: the order members were added in is the list's own order),
+/// so the endpoint's `max_id`/`min_id`/`since_id` cursors and its `Link`
+/// header carry [`MemberEntry::position`] values, as
+/// [`crate::models::follow::FollowPageEntry`] carries follow row ids.
+#[derive(Debug, sqlx::FromRow)]
+pub struct MemberEntry {
+    /// `list_members.position`: the sequence ordinal the membership was
+    /// inserted at, and so the member's place in the list's own order.
+    pub position: i64,
+    /// The member's account row.
+    #[sqlx(flatten)]
+    pub user: User,
 }
 
 /// Inserts `list` owned by `user_id` and returns the stored row.
@@ -255,12 +315,108 @@ pub async fn lists_containing(
     Ok(rows)
 }
 
+/// Adds `member_ids` to the list `list_id`, returning how many memberships
+/// were new.
+///
+/// Every id takes the next [`list_members.position`][MemberEntry::position]
+/// ordinal, in the order given, so the array's order is the order the accounts
+/// joined the list in. An id that is already a member is kept as it was — its
+/// position included, which is why re-adding a member is idempotent and does
+/// not move them to the end of the list. An empty `member_ids` writes nothing.
+///
+/// The owner's right to the list, and Mastodon's rule that only followed
+/// accounts may be added, are the API's question (see
+/// [`crate::api::lists`]); this write trusts its caller and only needs the list
+/// row to exist, which the `list_id` foreign key enforces.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding, a list that does not exist)
+/// arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn add_members(pool: &PgPool, list_id: Uuid, member_ids: &[Uuid]) -> AppResult<u64> {
+    let inserted = sqlx::query(ADD_MEMBERS_SQL)
+        .bind(list_id)
+        .bind(member_ids)
+        .execute(pool)
+        .await?;
+    Ok(inserted.rows_affected())
+}
+
+/// Removes `member_ids` from the list `list_id`, returning how many
+/// memberships went away.
+///
+/// An id that is not a member of this list — or that is not a member of any
+/// list at all — matches no row and changes nothing (Pleroma's `List.unfollow`
+/// on an address the list's array never held), so removing twice removes once
+/// and the second call answers `0`. An empty `member_ids` matches nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remove_members(pool: &PgPool, list_id: Uuid, member_ids: &[Uuid]) -> AppResult<u64> {
+    let deleted = sqlx::query(REMOVE_MEMBERS_SQL)
+        .bind(list_id)
+        .bind(member_ids)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
+/// The members of `list_id`, newest membership first and `page`'s `limit` at a
+/// time, each entry carrying its [`MemberEntry::position`] next to the [`User`]
+/// (see [`MemberEntry`]).
+///
+/// [`OrdinalPageParams`]'s cursors are position ordinals, and the page is
+/// ordered by them: the order the accounts were added in, newest first — the
+/// insertion order the membership's own `position` sequence records, not the
+/// members' `UUIDv7` ids (decision 4's rule applies to id-keyed listings).
+/// `limit=0` answers every member.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn members_page(
+    pool: &PgPool,
+    list_id: Uuid,
+    page: OrdinalPageParams,
+) -> AppResult<Vec<MemberEntry>> {
+    let mut builder = QueryBuilder::<Postgres>::new(MEMBERS_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(list_id);
+    page.apply_keyset(&mut builder, "lm.position");
+    let rows = builder
+        .build_query_as::<MemberEntry>()
+        .fetch_all(pool)
+        .await?;
+    Ok(page.finish(rows))
+}
+
+/// The ids of `list_id`'s members, oldest membership first — the whole
+/// membership, unordered by anything but the order it was added in.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn member_ids(pool: &PgPool, list_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let rows = sqlx::query_as::<_, (Uuid,)>(MEMBER_IDS_SQL)
+        .bind(list_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         config::TEST_BASE_URL,
+        error::AppError,
         models::user::{NewUser, User, insert, local_ap_id},
+        pagination::MAX_LIMIT,
     };
 
     /// Inserts a local user named `nickname`.
@@ -288,21 +444,14 @@ mod tests {
             .expect("the fixture list creates")
     }
 
-    /// Adds `member` to `list` straight through the join table (the
-    /// membership endpoints are a later ticket; the model only reads this
-    /// table).
+    /// Adds `member` to `list` through [`add_members`], the model's own write
+    /// (the membership endpoints' `WHERE` clauses and follow rule are their
+    /// ticket's business, and [`crate::api::lists`] tests them over HTTP).
     async fn add_member(pool: &PgPool, list: &List, member: &User) {
-        let inserted = sqlx::query("INSERT INTO list_members (list_id, user_id) VALUES ($1, $2)")
-            .bind(list.id)
-            .bind(member.id)
-            .execute(pool)
+        let added = add_members(pool, list.id, &[member.id])
             .await
-            .expect("the fixture membership inserts");
-        assert_eq!(
-            inserted.rows_affected(),
-            1,
-            "exactly one membership went in"
-        );
+            .expect("the fixture membership adds");
+        assert_eq!(added, 1, "exactly one membership went in");
     }
 
     /// The titles of `rows`, in row order — what a list test compares
@@ -704,5 +853,322 @@ mod tests {
             "and its memberships everywhere"
         );
         assert_eq!(count_lists(&pool).await, 1, "while alice's list stands");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn add_members_records_the_order_it_was_given(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let hers = seed(&pool, &alice, "hers").await;
+
+        let added = add_members(&pool, hers.id, &[carol.id, bob.id])
+            .await
+            .expect("both members add");
+        assert_eq!(added, 2, "two memberships went in");
+        assert_eq!(
+            member_ids(&pool, hers.id).await.expect("members read"),
+            vec![carol.id, bob.id],
+            "and the list holds them in the order they were added, not the \
+             order of their ids"
+        );
+
+        let positions = positions(&pool, hers.id).await;
+        assert!(
+            positions.first() < positions.get(1),
+            "the earlier member has the smaller ordinal: {positions:?}"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn adding_a_member_twice_writes_no_second_row(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let hers = seed(&pool, &alice, "hers").await;
+        add_member(&pool, &hers, &bob).await;
+        let before = positions(&pool, hers.id).await;
+
+        let added = add_members(&pool, hers.id, &[bob.id, carol.id])
+            .await
+            .expect("adding a member twice is not a failure");
+        assert_eq!(added, 1, "only the new account became a member");
+        assert_eq!(
+            member_ids(&pool, hers.id).await.expect("members read"),
+            vec![bob.id, carol.id],
+            "bob stayed, carol joined"
+        );
+        let after = positions(&pool, hers.id).await;
+        assert_eq!(
+            after.first(),
+            before.first(),
+            "and re-adding did not move bob to the end of the list"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn adding_nobody_writes_nobody(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let hers = seed(&pool, &alice, "hers").await;
+
+        assert_eq!(
+            add_members(&pool, hers.id, &[])
+                .await
+                .expect("an empty add succeeds"),
+            0,
+            "no id, no membership"
+        );
+        assert!(
+            member_ids(&pool, hers.id)
+                .await
+                .expect("members read")
+                .is_empty(),
+            "and the list is still empty"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn adding_to_a_list_that_does_not_exist_fails(pool: PgPool) {
+        let bob = user(&pool, "bob").await;
+
+        let err = add_members(&pool, Uuid::now_v7(), &[bob.id])
+            .await
+            .expect_err("no list row, no membership");
+        assert!(
+            matches!(err, AppError::Database(_)),
+            "the list_id foreign key refuses it: {err}"
+        );
+        assert_eq!(count_members(&pool).await, 0, "and nothing was written");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn remove_members_takes_one_list_only(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let first = seed(&pool, &alice, "first").await;
+        let second = seed(&pool, &alice, "second").await;
+        add_member(&pool, &first, &bob).await;
+        add_member(&pool, &second, &bob).await;
+
+        let removed = remove_members(&pool, first.id, &[bob.id])
+            .await
+            .expect("the member goes");
+        assert_eq!(removed, 1, "one membership ended");
+        assert!(
+            member_ids(&pool, first.id)
+                .await
+                .expect("members read")
+                .is_empty(),
+            "of the list it was named in"
+        );
+        assert_eq!(
+            member_ids(&pool, second.id).await.expect("members read"),
+            vec![bob.id],
+            "while his other membership stands"
+        );
+
+        assert_eq!(
+            remove_members(&pool, first.id, &[bob.id])
+                .await
+                .expect("removing a non-member succeeds"),
+            0,
+            "and removing him again removes nobody"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn removing_nobody_takes_nobody(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let carol = user(&pool, "carol").await;
+        let hers = seed(&pool, &alice, "hers").await;
+
+        for ids in [Vec::new(), vec![carol.id]] {
+            assert_eq!(
+                remove_members(&pool, hers.id, &ids)
+                    .await
+                    .expect("an empty or unmatched remove succeeds"),
+                0,
+                "{ids:?} named no member"
+            );
+        }
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn members_page_is_newest_membership_first(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let dave = user(&pool, "dave").await;
+        let hers = seed(&pool, &alice, "hers").await;
+        add_member(&pool, &hers, &bob).await;
+        add_member(&pool, &hers, &carol).await;
+        add_member(&pool, &hers, &dave).await;
+        let theirs = seed(&pool, &alice, "theirs").await;
+        add_member(&pool, &theirs, &bob).await;
+
+        let first = members_page(&pool, hers.id, ordinal_page("limit=2"))
+            .await
+            .expect("the first page reads");
+        assert_eq!(
+            nicks(&first),
+            ["dave", "carol"],
+            "newest membership first, and only the named list's"
+        );
+        let oldest = first
+            .last()
+            .expect("the page holds two entries")
+            .position
+            .to_string();
+
+        let second = members_page(
+            &pool,
+            hers.id,
+            ordinal_page(&format!("limit=2&max_id={oldest}")),
+        )
+        .await
+        .expect("the next page reads");
+        assert_eq!(
+            nicks(&second),
+            ["bob"],
+            "max_id walks to the older memberships"
+        );
+
+        let back = members_page(
+            &pool,
+            hers.id,
+            ordinal_page(&format!(
+                "limit=2&min_id={}",
+                second
+                    .first()
+                    .expect("the second page holds one entry")
+                    .position
+            )),
+        )
+        .await
+        .expect("and min_id walks back");
+        assert_eq!(nicks(&back), ["dave", "carol"], "newer ones, newest first");
+
+        let since_newest = members_page(
+            &pool,
+            hers.id,
+            ordinal_page(&format!(
+                "limit=2&since_id={}",
+                first
+                    .first()
+                    .expect("the first page holds two entries")
+                    .position
+            )),
+        )
+        .await
+        .expect("since_id reads unseen rows");
+        assert!(
+            since_newest.is_empty(),
+            "nothing is newer than the newest membership the client has seen"
+        );
+
+        let since_oldest = members_page(
+            &pool,
+            hers.id,
+            ordinal_page(&format!(
+                "limit=2&since_id={}",
+                second
+                    .first()
+                    .expect("the second page holds one entry")
+                    .position
+            )),
+        )
+        .await
+        .expect("and a cursor further back reads forward");
+        assert_eq!(
+            nicks(&since_oldest),
+            ["dave", "carol"],
+            "since_id answers everything newer than the cursor, newest first"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_zero_limit_answers_every_member(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let hers = seed(&pool, &alice, "hers").await;
+        let mut added = Vec::new();
+        for index in 0..25 {
+            let member = user(&pool, &format!("member{index}")).await;
+            add_member(&pool, &hers, &member).await;
+            added.push(member);
+        }
+        assert_eq!(added.len(), 25, "twenty-five members, over a page");
+
+        let capped = members_page(&pool, hers.id, ordinal_page(""))
+            .await
+            .expect("the default page reads");
+        assert_eq!(capped.len(), 20, "and the default page is 20 of them");
+
+        let every = members_page(&pool, hers.id, ordinal_page("limit=0"))
+            .await
+            .expect("limit=0 reads");
+        assert_eq!(every.len(), 25, "and every member is on it");
+        assert_eq!(
+            every.first().expect("the page is not empty").user.id,
+            added.last().expect("twenty-five members were added").id,
+            "newest membership first"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn members_of_an_empty_list_are_nobody(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let hers = seed(&pool, &alice, "hers").await;
+
+        assert!(
+            members_page(&pool, hers.id, ordinal_page(""))
+                .await
+                .expect("reading an empty list succeeds")
+                .is_empty(),
+            "no memberships, no entries"
+        );
+        assert!(
+            member_ids(&pool, hers.id)
+                .await
+                .expect("reading an empty list succeeds")
+                .is_empty(),
+            "and no ids"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn member_ids_of_an_unknown_list_are_nobody(pool: PgPool) {
+        assert!(
+            member_ids(&pool, Uuid::now_v7())
+                .await
+                .expect("reading nothing is not a failure")
+                .is_empty(),
+            "a list that never existed has no members"
+        );
+    }
+
+    /// The `list_members.position` ordinals of `list_id`'s members, oldest
+    /// first — what the page keys on.
+    async fn positions(pool: &PgPool, list_id: Uuid) -> Vec<i64> {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT position FROM list_members WHERE list_id = $1 ORDER BY position",
+        )
+        .bind(list_id)
+        .fetch_all(pool)
+        .await
+        .expect("the positions read")
+    }
+
+    /// Ordinal page params built from a query string, the way the endpoint's
+    /// parse makes them.
+    fn ordinal_page(query: &str) -> OrdinalPageParams {
+        OrdinalPageParams::from_query(Some(query), MAX_LIMIT).expect("the fixture query parses")
+    }
+
+    /// The nicknames of `entries`' members, in the order they came back.
+    fn nicks(entries: &[MemberEntry]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|entry| entry.user.nickname.as_str())
+            .collect()
     }
 }

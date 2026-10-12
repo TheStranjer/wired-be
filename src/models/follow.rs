@@ -103,6 +103,16 @@ const SEVER_BETWEEN_SQL: &str = "DELETE FROM follows
           OR (follower_id = $2 AND followee_id = $1))
    RETURNING *";
 
+/// [`unfollow`]: the memberships the unfollowing account kept of the account
+/// they just stopped following. An account in someone's list is an account
+/// they follow (the rule [`crate::api::lists`] enforces on the way in), so
+/// taking the follow back takes those rows with it: the delete runs over the
+/// list's *owner*, which is why the follower's rows in other people's lists
+/// are untouched.
+const UNFOLLOW_LIST_MEMBERSHIPS_SQL: &str = "DELETE FROM list_members AS lm
+     USING lists AS l
+     WHERE l.id = lm.list_id AND l.user_id = $1 AND lm.user_id = $2";
+
 /// [`reject`]: the request is gone, and the removed row comes back.
 const REJECT_SQL: &str = "DELETE FROM follows WHERE id = $1 RETURNING *";
 
@@ -313,7 +323,11 @@ pub async fn follow(
 /// change nothing. Deleting an accepted relationship steps both denormalised
 /// counters down again. An endorsement of `target` by `follower` goes with
 /// the relationship: an endorsement is a pinned *follow*, and unfollowing
-/// clears it (the same pair of facts Pleroma's `unfollow` drops together).
+/// clears it (the same pair of facts Pleroma's `unfollow` drops together). So
+/// does every membership of `target` in `follower`'s own lists: a list member
+/// is a followed account, so unfollowing ends the membership too
+/// — the memberships of other owners' lists are nobody else's to touch, and
+/// stay.
 ///
 /// # Errors
 ///
@@ -332,6 +346,12 @@ pub async fn unfollow(pool: &PgPool, follower: &User, target: &User) -> AppResul
         step_counters(pool, &follow, -1).await?;
     }
     endorsement::unendorse(pool, follower.id, target.id).await?;
+    sqlx::query(UNFOLLOW_LIST_MEMBERSHIPS_SQL)
+        .bind(follower.id)
+        .bind(target.id)
+        .execute(pool)
+        .await
+        .map(drop)?;
     Ok(true)
 }
 
@@ -872,7 +892,10 @@ mod tests {
     use super::*;
     use crate::{
         config::TEST_BASE_URL,
-        models::user::{Flag, NewUser, get_by_id, insert, local_ap_id},
+        models::{
+            list::{self, NewList},
+            user::{Flag, NewUser, get_by_id, insert, local_ap_id},
+        },
         pagination::MAX_LIMIT,
         util::id::parse_id,
     };
@@ -1459,6 +1482,94 @@ mod tests {
             endorsement::endorsed_ids(&pool, dave.id).await.unwrap(),
             vec![carol.id],
             "and the failed unfollow pinned nothing away"
+        );
+    }
+
+    /// A list titled `title` owned by `owner`, for the membership cleanup.
+    async fn seeded_list(pool: &PgPool, owner: &User, title: &str) -> list::List {
+        list::create(
+            pool,
+            owner.id,
+            &NewList {
+                title: title.to_owned(),
+                ..NewList::default()
+            },
+        )
+        .await
+        .expect("the fixture list creates")
+    }
+
+    /// [`unfollow`]'s list cleanup: the account stops being a member of the
+    /// unfollowing account's own lists — an accepted relationship and a
+    /// withdrawn request alike — while another owner's membership of the same
+    /// account is not theirs to prune.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unfollowing_takes_the_target_out_of_the_followers_lists(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        let erin = locked_user(&pool, "erin").await;
+        let hers = seeded_list(&pool, &alice, "hers").await;
+        let also_hers = seeded_list(&pool, &alice, "also hers").await;
+        let carols = seeded_list(&pool, &carol, "carol's own").await;
+        for row in [&hers, &also_hers, &carols] {
+            let added = list::add_members(&pool, row.id, &[bob.id, erin.id])
+                .await
+                .expect("the fixture members add");
+            assert_eq!(added, 2, "both accounts joined the fixture list");
+        }
+        let _accepted = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("alice follows bob");
+        let _waiting = follow(&pool, TEST_BASE_URL, &alice, &erin)
+            .await
+            .expect("and alice's request to erin waits");
+
+        assert!(
+            unfollow(&pool, &alice, &bob).await.unwrap(),
+            "the granted follow is removed"
+        );
+        assert!(
+            unfollow(&pool, &alice, &erin).await.unwrap(),
+            "and the withdrawn request is an open relationship too"
+        );
+        for list in [&hers, &also_hers] {
+            assert!(
+                list::member_ids(&pool, list.id)
+                    .await
+                    .expect("members read")
+                    .is_empty(),
+                "both of alice's lists are pruned of both accounts"
+            );
+        }
+        assert_eq!(
+            list::member_ids(&pool, carols.id).await.unwrap(),
+            vec![bob.id, erin.id],
+            "while carol's membership of the same two accounts stands"
+        );
+    }
+
+    /// The cleanup rides the removal: an [`unfollow`] that found nothing to
+    /// remove leaves the memberships exactly where they were, too.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_unfollow_that_removed_nothing_keeps_the_memberships(pool: PgPool) {
+        let dave = local_user(&pool, "dave").await;
+        let carol = locked_user(&pool, "carol").await;
+        let _rejected = rejected_relation(&pool, &dave, &carol).await;
+        let hers = seeded_list(&pool, &dave, "hers").await;
+        let seeded = list::add_members(&pool, hers.id, &[carol.id])
+            .await
+            .expect("the seed membership adds");
+        assert_eq!(seeded, 1, "one membership went in");
+
+        assert!(
+            !unfollow(&pool, &dave, &carol).await.unwrap(),
+            "a rejected row is not an open relationship"
+        );
+        assert_eq!(
+            list::member_ids(&pool, hers.id).await.unwrap(),
+            vec![carol.id],
+            "and the failed unfollow listed nobody out"
         );
     }
 

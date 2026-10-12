@@ -2,6 +2,12 @@
 //! parameters, the SQL they add to a list query, and the `Link` response
 //! header.
 //!
+//! Two shapes of the same parameters live here. [`PageParams`] is the usual
+//! one, keyset on a `UUIDv7` primary key. [`OrdinalPageParams`] is its
+//! counterpart for a listing whose order is a `bigint` ordinal column rather
+//! than an id (a list's members, keyed on `list_members.position`): its
+//! cursors are those numbers and `limit=0` asks for every row.
+//!
 //! Per `docs/ARCHITECTURE.md` decision 4 every id is a `UUIDv7` whose text
 //! sorts in creation order, so keyset pagination is plain comparison on the
 //! id column — this mirrors Pleroma's `lib/pleroma/pagination.ex`
@@ -196,6 +202,119 @@ where
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         future::ready(Self::with_cap(MAX_LIMIT, parts))
     }
+}
+
+/// The pagination parameters of a listing whose keyset column is a `bigint`
+/// ordinal rather than a [`UUIDv7`](uuid::Uuid) primary key.
+///
+/// One listing needs it: [`crate::models::list::members_page`] pages over the
+/// order members were added in — `list_members.position`, the sequence its
+/// migration adds — so its cursors and its [`Link`](link_header) header carry
+/// position numbers instead of ids, and a client that wants the whole list at
+/// once sends `limit=0`. Everything else is [`PageParams`]'s rule: default
+/// page 20, capped at the caller's `cap`, `min_id` read ascending and flipped,
+/// every other page newest-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrdinalPageParams {
+    /// `max_id`: only rows with a strictly smaller position; the cursor a
+    /// `rel="next"` link moves to.
+    pub max_id: Option<i64>,
+    /// `min_id`: only rows with a strictly larger position, read ascending
+    /// and flipped by [`Self::finish`] so the page is still newest-first.
+    pub min_id: Option<i64>,
+    /// `since_id`: only rows with a strictly larger position, read descending
+    /// like a first page.
+    pub since_id: Option<i64>,
+    /// `limit`: rows to fetch, defaulted to 20 and capped; `None` when the
+    /// request asked for every row with `limit=0`.
+    pub limit: Option<i64>,
+}
+
+impl OrdinalPageParams {
+    /// Parses the ordinal pagination parameters out of a raw query string the
+    /// way [`PageParams::from_query`] does, with two differences: a cursor has
+    /// to be a number rather than an id, and `limit=0` means "every row"
+    /// ([`Self::limit`] is `None`) instead of falling back to the default page.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::BadRequest`] with `"Invalid id"` when `max_id`, `min_id` or
+    /// `since_id` is present but is not a number.
+    pub fn from_query(query: Option<&str>, cap: i64) -> Result<Self, AppError> {
+        let mut raw = RawParams::default();
+        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            raw.record(key.as_ref(), value);
+        }
+        Ok(Self {
+            max_id: ordinal_param(raw.max_id.as_deref())?,
+            min_id: ordinal_param(raw.min_id.as_deref())?,
+            since_id: ordinal_param(raw.since_id.as_deref())?,
+            limit: limit_or_all(raw.limit.as_deref(), cap),
+        })
+    }
+
+    /// Appends these parameters' keyset conditions, position ordering and
+    /// `LIMIT` to `qb`, continuing the statement it already holds, exactly as
+    /// [`PageParams::apply_keyset`] does for an id column — except that no
+    /// `LIMIT` is appended when [`Self::limit`] is `None`, the `limit=0` page
+    /// that answers every row.
+    pub fn apply_keyset(&self, qb: &mut QueryBuilder<Postgres>, column: &str) {
+        if let Some(max_id) = self.max_id {
+            let _with_max: &mut _ = qb.push(" AND ").push(column).push(" < ").push_bind(max_id);
+        }
+        if let Some(min_id) = self.min_id {
+            let _with_min: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(min_id);
+        }
+        if let Some(since_id) = self.since_id {
+            let _with_since: &mut _ = qb
+                .push(" AND ")
+                .push(column)
+                .push(" > ")
+                .push_bind(since_id);
+        }
+        let _ordered: &mut _ = qb
+            .push(" ORDER BY ")
+            .push(column)
+            .push(if self.min_id.is_some() {
+                " ASC"
+            } else {
+                " DESC"
+            });
+        if let Some(limit) = self.limit {
+            let _limited: &mut _ = qb.push(" LIMIT ").push_bind(limit);
+        }
+    }
+
+    /// [`PageParams::finish`] for an ordinal page: a `min_id` fetch came back
+    /// ascending and goes out reversed, every other page unchanged.
+    #[must_use]
+    pub fn finish<T>(&self, mut rows: Vec<T>) -> Vec<T> {
+        if self.min_id.is_some() {
+            rows.reverse();
+        }
+        rows
+    }
+}
+
+/// One ordinal cursor: `None` when absent, the number when it parses, a 400
+/// `"Invalid id"` when it is present but is not a number.
+fn ordinal_param(text: Option<&str>) -> Result<Option<i64>, AppError> {
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    text.parse::<i64>()
+        .ok()
+        .map(Some)
+        .ok_or_else(|| AppError::BadRequest(INVALID_ID.to_owned()))
+}
+
+/// `limit` of an ordinal page: `0` — and only `0` — asks for every row, which
+/// is no `LIMIT` at all; every other spelling follows [`clamp_limit`].
+fn limit_or_all(text: Option<&str>, cap: i64) -> Option<i64> {
+    if text.and_then(|text| text.parse::<i64>().ok()) == Some(0) {
+        return None;
+    }
+    Some(clamp_limit(text, DEFAULT_LIMIT, cap))
 }
 
 /// The pagination keys found in a query string; anything else is never
@@ -827,5 +946,101 @@ mod tests {
         let err = set_link_header(&mut headers, Some("evil\nvalue"))
             .expect_err("a newline cannot ride in a header");
         assert!(matches!(err, AppError::Internal(_)), "a server bug: {err}");
+    }
+
+    #[test]
+    fn ordinal_pages_default_to_twenty_and_read_zero_as_every_row() {
+        for (query, want) in [
+            (None, Some(20)),
+            (Some(""), Some(20)),
+            (Some("limit=5"), Some(5)),
+            (Some("limit=40"), Some(40)),
+            (Some("limit=41"), Some(40)),
+            (Some("limit=100"), Some(40)),
+            (Some("limit=0"), None),
+            (Some("limit=-3"), Some(20)),
+            (Some("limit=abc"), Some(20)),
+        ] {
+            let params = OrdinalPageParams::from_query(query, MAX_LIMIT).unwrap();
+            assert_eq!(params.limit, want, "`limit` of query {query:?}");
+        }
+    }
+
+    #[test]
+    fn ordinal_cursors_are_numbers() {
+        let params =
+            OrdinalPageParams::from_query(Some("max_id=9&min_id=4&since_id=7"), MAX_LIMIT).unwrap();
+        assert_eq!(
+            params,
+            OrdinalPageParams {
+                max_id: Some(9),
+                min_id: Some(4),
+                since_id: Some(7),
+                limit: Some(20),
+            },
+            "the three cursors and the default page"
+        );
+    }
+
+    #[test]
+    fn an_ordinal_cursor_that_is_not_a_number_is_a_bad_request() {
+        for value in ["", "nope", "1.5", MAX_ID] {
+            for key in ["max_id", "min_id", "since_id"] {
+                let query = format!("{key}={value}");
+                let err = OrdinalPageParams::from_query(Some(&query), MAX_LIMIT)
+                    .expect_err(&format!("{query} must be rejected"));
+                assert!(
+                    matches!(err, AppError::BadRequest(_)),
+                    "{query} is a 400, not {err}"
+                );
+                assert_eq!(err.to_string(), "Invalid id", "message for {query}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinal_keyset_orders_on_the_given_column() {
+        let mut qb = QueryBuilder::new("SELECT position FROM list_members WHERE 1=1");
+        let params = OrdinalPageParams::from_query(Some("max_id=9&limit=5"), MAX_LIMIT).unwrap();
+        params.apply_keyset(&mut qb, "lm.position");
+        assert_eq!(
+            qb.into_sql(),
+            "SELECT position FROM list_members WHERE 1=1 AND lm.position < $1 \
+             ORDER BY lm.position DESC LIMIT $2",
+            "the cursor walks to smaller positions, newest first"
+        );
+    }
+
+    #[test]
+    fn an_ordinal_page_without_a_limit_fetches_every_row() {
+        let mut qb = QueryBuilder::new("SELECT position FROM list_members WHERE 1=1");
+        OrdinalPageParams::from_query(Some("limit=0"), MAX_LIMIT)
+            .unwrap()
+            .apply_keyset(&mut qb, "position");
+        assert_eq!(
+            qb.into_sql(),
+            "SELECT position FROM list_members WHERE 1=1 ORDER BY position DESC",
+            "limit=0 appends no LIMIT at all"
+        );
+    }
+
+    #[test]
+    fn an_ordinal_min_id_page_is_read_ascending_and_flipped() {
+        let mut qb = QueryBuilder::new("SELECT position FROM list_members WHERE 1=1");
+        let params = OrdinalPageParams::from_query(Some("min_id=4"), MAX_LIMIT).unwrap();
+        params.apply_keyset(&mut qb, "position");
+        assert_eq!(
+            qb.into_sql(),
+            "SELECT position FROM list_members WHERE 1=1 AND position > $1 \
+             ORDER BY position ASC LIMIT $2",
+            "the page just after the cursor, read forward"
+        );
+        assert_eq!(
+            params.finish(vec![4, 5, 6]),
+            vec![6, 5, 4],
+            "and answered newest-first"
+        );
+        let first = OrdinalPageParams::from_query(None, MAX_LIMIT).unwrap();
+        assert_eq!(first.finish(vec![4, 5, 6]), vec![4, 5, 6], "no flip");
     }
 }

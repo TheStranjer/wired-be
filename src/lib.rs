@@ -633,5 +633,76 @@ mod tests {
                 "the id alone is the primary key {primary_key}"
             );
         }
+
+        /// The list-members position migration gives `list_members` the
+        /// ordinal `GET /api/v1/lists/:id/accounts` pages on: a `bigint`
+        /// `NOT NULL` column defaulted from the sequence it owns (so a plain
+        /// insert takes the next number, which is the order members were added
+        /// in), the primary key still the `(list_id, user_id)` pair that makes
+        /// membership idempotent, and one index serving a list's own positions.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn list_members_position_migration_adds_the_ordinal(pool: PgPool) {
+            let (data_type, is_nullable, default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'list_members'
+                        AND column_name = 'position'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(data_type, "bigint", "position is a bigint ordinal");
+            assert_eq!(is_nullable, "NO", "and every membership has one");
+            assert_eq!(
+                default.as_deref(),
+                Some("nextval('list_members_position_seq'::regclass)"),
+                "the database fills it: {default:?}"
+            );
+
+            let sequence: (String,) =
+                sqlx::query_as("SELECT pg_get_serial_sequence('list_members', 'position')")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                sequence.0, "public.list_members_position_seq",
+                "one sequence, owned by the column and dropped with it"
+            );
+
+            let key: Vec<String> = sqlx::query_scalar(
+                "SELECT att.attname
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'list_members'
+               ORDER BY att.attname",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                key,
+                vec!["list_id".to_owned(), "user_id".to_owned()],
+                "the pair is still the key: position is an order, not an id"
+            );
+
+            let indexes: Vec<(String, String)> = sqlx::query_as(
+                "SELECT indexname, indexdef FROM pg_indexes
+                  WHERE schemaname = 'public' AND tablename = 'list_members'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let (_, definition) = indexes
+                .iter()
+                .find(|(name, _)| name == "list_members_list_id_position_idx")
+                .unwrap();
+            assert!(
+                definition.contains("list_id") && definition.contains("position"),
+                "the page's index covers the list filter and its cursor: {definition}"
+            );
+        }
     }
 }
