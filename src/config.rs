@@ -62,6 +62,9 @@ pub const CAPTCHA_ENABLED_VAR: &str = "CAPTCHA_ENABLED";
 /// Environment variable holding whether `GET /api/v1/pleroma/healthcheck`
 /// reports pool and liveness data.
 pub const HEALTHCHECK_ENABLED_VAR: &str = "HEALTHCHECK_ENABLED";
+/// Environment variable holding whether the instance accepts new local
+/// registrations; `NodeInfo` reports it as `openRegistrations`.
+pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -127,6 +130,10 @@ pub const DEFAULT_CAPTCHA_ENABLED: bool = false;
 /// Healthcheck state used when `HEALTHCHECK_ENABLED` is unset: the
 /// endpoint answers the standard fallback 404 until it is turned on.
 pub const DEFAULT_HEALTHCHECK_ENABLED: bool = false;
+/// Registration state used when `REGISTRATIONS_OPEN` is unset: Pleroma's
+/// `[:instance, :registrations_open]` default is open, so closing
+/// registration is always an explicit operator decision.
+pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -144,8 +151,10 @@ pub const TEST_BASE_URL: &str = "https://test.example";
 /// [`Flag`](crate::models::user::Flag) exists for `users`' columns. A
 /// `Toggle` is a plain named wrapper: parsed from the environment by the
 /// `boolean` reader below, read by the gated handlers with
-/// [`get`](Self::get).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// [`get`](Self::get). `Serialize` writes it as its inner `bool`, so the
+/// JSON documents that read a toggle (`NodeInfo`'s `openRegistrations`)
+/// see a plain `true`/`false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Toggle(bool);
 
 impl Toggle {
@@ -233,6 +242,10 @@ pub struct Config {
     /// Whether `GET /api/v1/pleroma/healthcheck` reports pool and
     /// liveness data, from `HEALTHCHECK_ENABLED`. See [`crate::api::misc`].
     pub healthcheck_enabled: Toggle,
+    /// Whether the instance accepts new local registrations, from
+    /// `REGISTRATIONS_OPEN`; `NodeInfo` reports it as `openRegistrations`
+    /// (see [`crate::api::nodeinfo`]).
+    pub registrations_open: Toggle,
 }
 
 impl Config {
@@ -296,6 +309,8 @@ impl Config {
         let (accounts_email_optional, min_password_length, oauth_token_ttl_secs) =
             auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
+        let registrations_open =
+            boolean(&lookup, REGISTRATIONS_OPEN_VAR, DEFAULT_REGISTRATIONS_OPEN)?.into();
         Ok(Self {
             database_url,
             bind_addr,
@@ -318,6 +333,7 @@ impl Config {
             mongooseim_enabled,
             captcha_enabled,
             healthcheck_enabled,
+            registrations_open,
         })
     }
 
@@ -390,6 +406,7 @@ impl Config {
             mongooseim_enabled: Toggle::new(DEFAULT_MONGOOSEIM_ENABLED),
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
+            registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
         }
     }
 }
@@ -568,6 +585,7 @@ impl fmt::Debug for Config {
             .field("mongooseim_enabled", &self.mongooseim_enabled)
             .field("captcha_enabled", &self.captcha_enabled)
             .field("healthcheck_enabled", &self.healthcheck_enabled)
+            .field("registrations_open", &self.registrations_open)
             .finish()
     }
 }
@@ -618,6 +636,8 @@ impl Error for ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     const URL: &str = "postgres://user:secret@localhost/wired";
@@ -800,6 +820,10 @@ mod tests {
             !config.healthcheck_enabled.get(),
             "the healthcheck is off by default"
         );
+        assert!(
+            config.registrations_open.get(),
+            "registration is open by default (Pleroma's default)"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -885,6 +909,63 @@ mod tests {
         assert!(
             config.healthcheck_enabled.get(),
             "custom HEALTHCHECK_ENABLED"
+        );
+    }
+
+    #[test]
+    fn registrations_open_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", true),
+        ] {
+            let config = config_with(&[(REGISTRATIONS_OPEN_VAR, value)]);
+            assert_eq!(
+                config.registrations_open.get(),
+                want,
+                "REGISTRATIONS_OPEN={value:?} means {want} (unset is open)"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_registrations_open_is_an_error() {
+        let err = try_config_with(&[(REGISTRATIONS_OPEN_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(REGISTRATIONS_OPEN_VAR),
+            "error variant"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {REGISTRATIONS_OPEN_VAR}: ")),
+            "message names the variable"
+        );
+    }
+
+    #[test]
+    fn debug_shows_registrations_open() {
+        let config = config_with(&[(REGISTRATIONS_OPEN_VAR, "false")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("registrations_open: Toggle(false)"),
+            "the registration toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn toggle_serializes_as_its_inner_bool() {
+        assert_eq!(
+            serde_json::to_value(Toggle::new(true)).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            serde_json::to_value(Toggle::new(false)).unwrap(),
+            json!(false)
         );
     }
 

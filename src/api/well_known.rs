@@ -9,7 +9,8 @@
 //! Pleroma's `WebFingerController.webfinger/2` and `host_meta/2`
 //! (`lib/pleroma/web/web_finger/web_finger_controller.ex`) rendering
 //! `Pleroma.Web.WebFinger` (`lib/pleroma/web/web_finger.ex`). `NodeInfo`
-//! arrives with its own ticket and gets its handler here.
+//! got its own ticket, module ([`crate::api::nodeinfo`]) and mount point,
+//! merged beside this one.
 //!
 //! `WebFinger` answers the same document in two representations: the JRD
 //! JSON body by default, `application/jrd+json`, and the XRD XML body —

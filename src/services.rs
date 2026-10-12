@@ -6,3 +6,4 @@
 //! reconcile disk and database; handlers call it, never the other way round.
 
 pub mod emoji_packs;
+pub mod instance_meta;
