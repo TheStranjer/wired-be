@@ -145,7 +145,7 @@ async fn create_scrobble(
 /// [`Uri`]: axum::http::Uri
 async fn list_scrobbles(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer): MaybeAuthUser,
+    MaybeAuthUser(viewer, _): MaybeAuthUser,
     Path(id): Path<String>,
     page: PageParams,
     OriginalUri(uri): OriginalUri,

@@ -27,7 +27,12 @@
 //!   requires an authenticated user".
 //! - [`MaybeAuthUser`]: no token yields `None`, a valid user token the
 //!   user, an app-only token `None` — but an invalid, expired or
-//!   deactivated token is a 401, never a silently ignored one.
+//!   deactivated token is a 401, never a silently ignored one. The
+//!   presented token rides along, and
+//!   [`MaybeAuthUser::require_user_scope`] is the gate of the routes
+//!   Pleroma runs with `OAuthScopesPlug … fallback:
+//!   :proceed_unauthenticated`: an authenticated request needs the
+//!   scope, an anonymous one proceeds.
 //! - [`AppAuth`] and [`AuthContext`]: require a valid token, app-only or
 //!   user-bound alike (Pleroma's `OAuthPlug` assigns `token` and `app`;
 //!   `POST /api/v1/accounts` is the endpoint that asks for this rather
@@ -104,16 +109,23 @@ pub struct AuthUser(
 );
 
 /// Extractor for endpoints that answer anonymously:
-/// `MaybeAuthUser(user)`.
+/// `MaybeAuthUser(user, token)`.
 ///
-/// `None` when the request carried no token or an app-only one. An
-/// invalid, expired or deactivated token is still a 401 "The access
-/// token is invalid" — it is never silently ignored.
+/// The user is `None` when the request carried no token or an app-only
+/// one. An invalid, expired or deactivated token is still a 401 "The
+/// access token is invalid" — it is never silently ignored. The token
+/// rides along so a scope-gated endpoint with optional auth can check
+/// what a *presented* credential grants (see
+/// [`require_user_scope`](Self::require_user_scope)); handlers that
+/// only need the viewer destructure it away.
 #[derive(Debug)]
 pub struct MaybeAuthUser(
     /// The user behind a valid user token; `None` when no (or no
     /// user-bound) token was presented.
     pub Option<User>,
+    /// The valid token the request presented; `None` when it presented
+    /// no token at all.
+    pub Option<OauthToken>,
 );
 
 /// Extractor for endpoints that any valid token satisfies — app-only or
@@ -173,16 +185,36 @@ impl FromRequestParts<AppState> for MaybeAuthUser {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let Some(raw) = bearer_string(parts) else {
-            return Ok(Self(None));
+            return Ok(Self(None, None));
         };
         match resolve(state, &raw).await? {
             Auth::Valid(ctx) => {
-                let AuthContext { user, .. } = *ctx;
-                Ok(Self(user))
+                let AuthContext { token, user, .. } = *ctx;
+                Ok(Self(user, Some(token)))
             }
             Auth::Deactivated | Auth::Invalid => {
                 Err(AppError::Unauthorized(INVALID_TOKEN.to_owned()))
             }
+        }
+    }
+}
+
+impl MaybeAuthUser {
+    /// The scope check of an optionally-authenticated route (Pleroma's
+    /// `OAuthScopesPlug` with `fallback: :proceed_unauthenticated`): a
+    /// request that presented a valid *user* token must grant `needed`,
+    /// while an anonymous request and an app-only token (which assigns no
+    /// user) proceed unauthenticated.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Forbidden`] with Pleroma's
+    /// "Insufficient permissions: \<needed\>." wording when the request is
+    /// authenticated and its token does not cover `needed`.
+    pub fn require_user_scope(&self, needed: &str) -> Result<(), AppError> {
+        match (&self.0, &self.1) {
+            (Some(_), Some(token)) => require_scope(token, needed),
+            _ => Ok(()),
         }
     }
 }
@@ -410,6 +442,19 @@ mod tests {
             "Insufficient permissions: read:accounts | read.",
             "the denial joins the missing scopes with the `|` operator"
         );
+    }
+
+    #[test]
+    fn require_user_scope_passes_everything_without_a_user_token() {
+        // The gated arm — a user and its token — needs a stored user row,
+        // so the endpoint tests in `tests/accounts.rs` drive it over HTTP;
+        // what can be built from nothing is the gate's pass-through side.
+        MaybeAuthUser(None, None)
+            .require_user_scope("read:accounts")
+            .expect("an anonymous request proceeds unauthenticated");
+        MaybeAuthUser(None, Some(token_with("write")))
+            .require_user_scope("read:accounts")
+            .expect("an app-only token names no user, so the gate does not bind");
     }
 
     #[test]

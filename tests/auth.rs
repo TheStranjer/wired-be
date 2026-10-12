@@ -59,9 +59,13 @@ async fn auth_user_view(AuthUser(user, token): AuthUser) -> Json<Value> {
     }))
 }
 
-/// `MaybeAuthUser`: the user or `null`.
-async fn maybe_auth_user_view(MaybeAuthUser(user): MaybeAuthUser) -> Json<Value> {
-    Json(json!({ "user_id": user.map(|found| found.id.to_string()) }))
+/// `MaybeAuthUser`: the user or `null`, and the scopes of the token the
+/// request presented (absent when it presented none).
+async fn maybe_auth_user_view(MaybeAuthUser(user, token): MaybeAuthUser) -> Json<Value> {
+    Json(json!({
+        "user_id": user.map(|found| found.id.to_string()),
+        "token_scopes": token.map(|found| found.scopes),
+    }))
 }
 
 /// `AppAuth`: the issuing app and whether its token is user-bound.
@@ -316,6 +320,10 @@ async fn maybe_auth_user_without_a_token_is_none(pool: PgPool) {
         response.json_value()["user_id"].is_null(),
         "and resolves to None"
     );
+    assert!(
+        response.json_value()["token_scopes"].is_null(),
+        "with no token presented there is no token to carry either"
+    );
 }
 
 #[sqlx::test(migrator = "wired_be::MIGRATOR")]
@@ -333,6 +341,11 @@ async fn maybe_auth_user_resolves_a_valid_user_token(pool: PgPool) {
         response.json_value()["user_id"],
         grace.id.to_string(),
         "the user is carried along"
+    );
+    assert_eq!(
+        response.json_value()["token_scopes"],
+        "read",
+        "and the token rides along for a scope gate to read"
     );
 }
 
@@ -395,6 +408,11 @@ async fn maybe_auth_user_treats_an_app_only_token_as_none(pool: PgPool) {
     assert!(
         response.json_value()["user_id"].is_null(),
         "as None, there is no user to hand over"
+    );
+    assert_eq!(
+        response.json_value()["token_scopes"],
+        "read",
+        "the token itself is still carried: the app-only request presented one"
     );
 }
 
