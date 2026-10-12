@@ -23,10 +23,14 @@
 //!
 //! Message text is never markdown: [`render_chat_content`] escapes plain text
 //! and linkifies URLs with [`text_to_html`], and [`add_message`] refuses
-//! anything longer than [`MAX_CHAT_MESSAGE_CHARS`] characters. Withdrawing a
-//! message is a soft delete ([`delete_message_for`]) that leaves the row as a
-//! tombstone, while a participant who merely wants a message out of *their*
-//! list drops only their own reference and leaves the other side untouched.
+//! anything longer than [`MAX_CHAT_MESSAGE_CHARS`] characters. A message can
+//! carry the `Idempotency-Key` its creator sent ([`NewChatMessage`]'s field of
+//! that name): [`sender_reference_for_key`] replays a key written within the
+//! last hour, which is what makes a retried `POST` answer its first message
+//! instead of a duplicate. Withdrawing a message is a soft delete
+//! ([`delete_message_for`]) that leaves the row as a tombstone, while a
+//! participant who merely wants a message out of *their* list drops only their
+//! own reference and leaves the other side untouched.
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
@@ -44,6 +48,11 @@ use crate::{
 /// It is the chat counterpart of the `MAX_STATUS_CHARS` limit on a status:
 /// Pleroma keeps its number in `[:instance, :chat_limit]` and refuses longer
 /// content in `CommonAPI.post_chat_message` (`lib/pleroma/web/common_api.ex`).
+/// The HTTP endpoint answers with the operator's
+/// [`max_chat_message_chars`](crate::config::Config::max_chat_message_chars)
+/// setting; this constant is the storage backstop no caller may raise, and
+/// the config's default is the same number (pinned by a test in
+/// [`crate::config`]).
 pub const MAX_CHAT_MESSAGE_CHARS: usize = 5_000;
 
 /// The joined shape of a reference and its message: the reference's own
@@ -54,11 +63,12 @@ pub const MAX_CHAT_MESSAGE_CHARS: usize = 5_000;
 /// The text stops at `WHERE`, where each caller pushes the literal condition it
 /// needs and binds the ids it names: [`messages_page`] (`m.deleted_at IS NULL
 /// AND r.chat_id = …`, then the keyset), [`reference_in_chat`]
-/// (`r.chat_id = … AND r.message_id = …`) and [`reference_by_id`] (`r.id = …`).
+/// (`r.chat_id = … AND r.message_id = …`), [`message_reference`]
+/// (`r.id = … AND r.chat_id = …`) and [`reference_by_id`] (`r.id = …`).
 /// Only ids are bound, so nothing supplied by a client ever reaches the text.
 const REFERENCE_SELECT_SQL: &str = "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
            m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
-           m.inserted_at AS message_inserted_at
+           m.idempotency_key, m.inserted_at AS message_inserted_at
       FROM chat_message_references r
       JOIN chat_messages m ON m.id = r.message_id
      WHERE ";
@@ -112,8 +122,8 @@ const UNREAD_COUNT_SQL: &str = "SELECT count(*) FROM chat_message_references
 /// and what the caller decided, with `inserted_at` left to the column default.
 /// `RETURNING *` brings the row back with the timestamps the database stamped.
 const INSERT_MESSAGE_SQL: &str = "INSERT INTO chat_messages (
-     id, sender_id, content, raw_text, attachment_media_id, ap_id
-) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *";
+     id, sender_id, content, raw_text, attachment_media_id, ap_id, idempotency_key
+) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *";
 
 /// One side's link between a chat and a message. `ON CONFLICT DO NOTHING` keeps
 /// a redelivered message from being listed twice in the same chat; the row is
@@ -144,6 +154,25 @@ const DELETE_REFERENCE_SQL: &str = "DELETE FROM chat_message_references WHERE id
 const SOFT_DELETE_MESSAGE_SQL: &str = "UPDATE chat_messages
       SET content = '', raw_text = '', deleted_at = now()
     WHERE id = $1 AND deleted_at IS NULL";
+
+/// [`sender_reference_for_key`]: the replay of a key inside its window — the
+/// sender's own reference to the newest live message they created under
+/// `idempotency_key` within the hour. Pleroma caches that key→id mapping in a
+/// TTL cache for `Pipeline.common_pipeline`'s `idempotency_key` option; here
+/// the key rides on the message row and the window is its `inserted_at`. The
+/// `chats` join is what picks the *sender's* side out of a message's two
+/// references, and the tombstone plus time guards leave an expired or
+/// withdrawn answer without a row, which reads as "no replay".
+const IDEMPOTENT_REPLAY_SQL: &str = "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
+           m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
+           m.idempotency_key, m.inserted_at AS message_inserted_at
+      FROM chat_message_references r
+      JOIN chat_messages m ON m.id = r.message_id
+      JOIN chats c ON c.id = r.chat_id
+     WHERE c.user_id = $1 AND m.sender_id = $1 AND m.idempotency_key = $2
+       AND m.deleted_at IS NULL AND m.inserted_at > now() - interval '1 hour'
+     ORDER BY m.inserted_at DESC
+     LIMIT 1";
 
 /// [`mark_read`]: every unread message of one chat up to a point, Pleroma's
 /// `set_all_seen_for_chat`. A `None` `last_read_id` arrives as SQL `NULL` in
@@ -204,6 +233,11 @@ pub struct ChatMessage {
     /// Unique, and it survives the tombstone, so a withdrawn remote message is
     /// never re-imported.
     pub ap_id: Option<String>,
+    /// The `Idempotency-Key` the creating request sent, kept so
+    /// [`sender_reference_for_key`] can replay it within its window; `None`
+    /// for a message posted without a key (and for a mirrored remote one,
+    /// whose key lives on the sender's instance).
+    pub idempotency_key: Option<String>,
     /// When the sender withdrew this message; `None` while it is live.
     pub deleted_at: Option<DateTime<Utc>>,
     /// When it was sent; for a mirrored remote message the `published` timestamp
@@ -244,6 +278,9 @@ pub struct ChatMessageReference {
     pub attachment_media_id: Option<Uuid>,
     /// The message's `ActivityPub` object id.
     pub ap_id: Option<String>,
+    /// The `Idempotency-Key` the message was created with, `None` when it
+    /// was created without one; the entity echoes it as `idempotency_key`.
+    pub idempotency_key: Option<String>,
     /// When the message was sent: the entity's `created_at`.
     pub message_inserted_at: DateTime<Utc>,
 }
@@ -270,13 +307,17 @@ pub struct NewChatMessage {
     /// A local caller leaves `None` until the federation ticket mints
     /// `{BASE_URL}/objects/{uuid}` ids for chat messages.
     pub ap_id: Option<String>,
+    /// The `Idempotency-Key` of the request that creates this message, kept
+    /// for [`sender_reference_for_key`]'s replay; `None` posts as usual.
+    pub idempotency_key: Option<String>,
 }
 
 impl NewChatMessage {
     /// A message whose source text is `text`, formatted the only way chat
     /// messages are formatted: [`render_chat_content`] in
     /// [`content`](Self::content), `text` kept verbatim in
-    /// [`raw_text`](Self::raw_text), no attachment, no `ActivityPub` id.
+    /// [`raw_text`](Self::raw_text), no attachment, no `ActivityPub` id, no
+    /// idempotency key.
     #[must_use]
     pub fn text(text: &str) -> Self {
         Self {
@@ -284,6 +325,7 @@ impl NewChatMessage {
             raw_text: text.to_owned(),
             attachment_media_id: None,
             ap_id: None,
+            idempotency_key: None,
         }
     }
 }
@@ -519,6 +561,63 @@ pub async fn messages_page(
     Ok(page.finish(references))
 }
 
+/// The one reference `ref_id` of chat `chat_id`, `None` when no reference
+/// has that id **in that chat**.
+///
+/// This is how a per-chat route tells a foreign chat's reference from the
+/// caller's own: reference ids are drawn from one space (decision 4), so
+/// one of somebody else's chat simply is not here — Pleroma's
+/// `delete_message` `with` clause answers the same way.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn message_reference(
+    pool: &PgPool,
+    chat_id: Uuid,
+    ref_id: Uuid,
+) -> AppResult<Option<ChatMessageReference>> {
+    let mut builder = QueryBuilder::<Postgres>::new(REFERENCE_SELECT_SQL);
+    let _pair: &mut _ = builder
+        .push("r.id = ")
+        .push_bind(ref_id)
+        .push(" AND r.chat_id = ")
+        .push_bind(chat_id);
+    let reference = builder
+        .build_query_as::<ChatMessageReference>()
+        .fetch_optional(pool)
+        .await?;
+    Ok(reference)
+}
+
+/// The sender's own view of the message their `key` created, `None` when no
+/// live message of `sender_id` carries that key within the replay window —
+/// the one hour its lookup statement measures.
+///
+/// The answer is the reference [`add_message`] wrote for the sender — already
+/// read, in the chat the message was posted to — so a replayed `POST` renders
+/// exactly what the original one answered with. A key that is unknown, older
+/// than the hour, or whose message the sender has since withdrawn all answer
+/// `None`, and the caller posts as if the key were fresh.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn sender_reference_for_key(
+    pool: &PgPool,
+    sender_id: Uuid,
+    key: &str,
+) -> AppResult<Option<ChatMessageReference>> {
+    let reference = sqlx::query_as::<_, ChatMessageReference>(IDEMPOTENT_REPLAY_SQL)
+        .bind(sender_id)
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(reference)
+}
+
 /// Hides one message from `user_id`, the owner of the reference `ref_id`, and
 /// reports whether there was such a reference to hide.
 ///
@@ -675,6 +774,7 @@ async fn write_message(
         .bind(new_message.raw_text.as_str())
         .bind(new_message.attachment_media_id)
         .bind(new_message.ap_id.as_deref())
+        .bind(new_message.idempotency_key.as_deref())
         .fetch_one(conn)
         .await?;
     Ok(message)
@@ -827,10 +927,25 @@ mod tests {
         ChatMessageReference,
         Option<ChatMessageReference>,
     ) {
+        send_with(pool, sender, recipient, &NewChatMessage::text(text)).await
+    }
+
+    /// Like [`send`], but with the caller's own [`NewChatMessage`] instead of
+    /// a plain text one.
+    async fn send_with(
+        pool: &PgPool,
+        sender: &User,
+        recipient: &User,
+        new_message: &NewChatMessage,
+    ) -> (
+        ChatMessage,
+        ChatMessageReference,
+        Option<ChatMessageReference>,
+    ) {
         let mut conn = pool.begin().await.expect("a transaction begins");
-        let sent = add_message(&mut conn, sender, recipient, &NewChatMessage::text(text))
+        let sent = add_message(&mut conn, sender, recipient, new_message)
             .await
-            .expect("a plain chat message is written");
+            .expect("the fixture chat message is written");
         conn.commit().await.expect("the transaction commits");
         sent
     }
@@ -1123,6 +1238,10 @@ mod tests {
         assert_eq!(alice_ref.sender_id, alice.id, "the join carries the writer");
         assert!(!alice_ref.unread, "alice has read what she wrote");
         assert!(bob_ref.unread, "bob has not read it yet");
+        assert!(
+            message.idempotency_key.is_none(),
+            "a plain send carries no idempotency key"
+        );
         assert_eq!(alice_ref.content, message.content, "and the text");
         assert_eq!(
             alice_ref.message_inserted_at, message.inserted_at,
@@ -1703,6 +1822,177 @@ mod tests {
         row.0
     }
 
+    /// Moves message `id`'s `inserted_at` two hours into the past — outside
+    /// the idempotency replay window, whatever the machine's clock speed.
+    async fn expire_message(pool: &PgPool, id: Uuid) {
+        sqlx::query(
+            "UPDATE chat_messages SET inserted_at = now() - interval '2 hours' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(drop)
+        .expect("the backdate runs");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_idempotency_key_rides_the_row_and_replays_once(pool: PgPool) {
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+
+        let (message, alice_ref, bob_ref) = send_with(
+            &pool,
+            &alice,
+            &bob,
+            &NewChatMessage {
+                idempotency_key: Some("key-1".to_owned()),
+                ..NewChatMessage::text("once")
+            },
+        )
+        .await;
+
+        assert_eq!(
+            message.idempotency_key.as_deref(),
+            Some("key-1"),
+            "the column keeps the key"
+        );
+        assert_eq!(
+            alice_ref.idempotency_key.as_deref(),
+            Some("key-1"),
+            "the joined view carries it"
+        );
+        assert_eq!(
+            bob_ref.expect("bob is local").idempotency_key.as_deref(),
+            Some("key-1"),
+            "on both sides"
+        );
+
+        let replay = sender_reference_for_key(&pool, alice.id, "key-1")
+            .await
+            .unwrap()
+            .expect("the key replays");
+        assert_eq!(replay.id, alice_ref.id, "as the sender's own reference");
+        assert_eq!(replay.chat_id, alice_ref.chat_id, "in its own chat");
+        assert!(!replay.unread, "which the sender has read");
+
+        assert!(
+            sender_reference_for_key(&pool, alice.id, "other-key")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown key replays nothing"
+        );
+        assert!(
+            sender_reference_for_key(&pool, bob.id, "key-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "and never for another user, holder of the same key or not"
+        );
+
+        // A keyless message stores no key, and NULL never answers a lookup —
+        // not even for the empty key a client might send.
+        let (keyless, _, _) = send(&pool, &alice, &bob, "no key").await;
+        assert!(keyless.idempotency_key.is_none(), "no key on the row");
+        assert!(
+            sender_reference_for_key(&pool, alice.id, "")
+                .await
+                .unwrap()
+                .is_none(),
+            "and the empty key matches nothing"
+        );
+
+        expire_message(&pool, message.id).await;
+        assert!(
+            sender_reference_for_key(&pool, alice.id, "key-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "an hour out of the window replays nothing"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_withdrawn_message_is_not_replayed_and_a_dropped_reference_goes_with_it(
+        pool: PgPool,
+    ) {
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let (message, alice_ref, _) = send_with(
+            &pool,
+            &alice,
+            &bob,
+            &NewChatMessage {
+                idempotency_key: Some("gone".to_owned()),
+                ..NewChatMessage::text("take it back")
+            },
+        )
+        .await;
+
+        assert!(
+            sender_reference_for_key(&pool, alice.id, "gone")
+                .await
+                .unwrap()
+                .is_some(),
+            "the key starts out replayable"
+        );
+        assert!(
+            delete_message_for(&pool, alice.id, alice_ref.id)
+                .await
+                .unwrap(),
+            "alice withdraws the message"
+        );
+        assert!(
+            sender_reference_for_key(&pool, alice.id, "gone")
+                .await
+                .unwrap()
+                .is_none(),
+            "gone is no longer a replayable key: tombstone and sender's \
+             reference both went, so the next same-key post writes afresh"
+        );
+        assert_eq!(
+            message.idempotency_key.as_deref(),
+            Some("gone"),
+            "the key itself stays on the row — it is the message that is gone"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_reference_is_only_its_own_chats(pool: PgPool) {
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let (message, alice_ref, bob_ref) = send(&pool, &alice, &bob, "pair").await;
+        let bobs = bob_ref.expect("bob is local");
+
+        let own = message_reference(&pool, alice_ref.chat_id, alice_ref.id)
+            .await
+            .unwrap()
+            .expect("a chat holds its own reference");
+        assert_eq!(own, alice_ref, "as the joined view it is");
+        assert_eq!(own.message_id, message.id, "pointing at the message");
+        assert!(
+            message_reference(&pool, bobs.chat_id, alice_ref.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "alice's reference is not in bob's chat"
+        );
+        assert!(
+            message_reference(&pool, alice_ref.chat_id, bobs.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "nor his in hers"
+        );
+        assert!(
+            message_reference(&pool, new_id(), alice_ref.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "and an unknown chat holds nothing"
+        );
+    }
+
     #[test]
     fn chat_content_is_escaped_text_with_links() {
         assert_eq!(
@@ -1740,6 +2030,14 @@ mod tests {
             NewChatMessage::default().content,
             "",
             "a default new message carries nothing"
+        );
+        assert!(
+            NewChatMessage::text("x").idempotency_key.is_none(),
+            "and neither text() nor the default sets an idempotency key"
+        );
+        assert!(
+            NewChatMessage::default().idempotency_key.is_none(),
+            "on either construction"
         );
     }
 

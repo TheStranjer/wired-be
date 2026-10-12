@@ -31,6 +31,9 @@ pub const MAX_STATUS_CHARS_VAR: &str = "MAX_STATUS_CHARS";
 pub const MAX_MEDIA_ATTACHMENTS_VAR: &str = "MAX_MEDIA_ATTACHMENTS";
 /// Environment variable holding the maximum options per poll.
 pub const MAX_POLL_OPTIONS_VAR: &str = "MAX_POLL_OPTIONS";
+/// Environment variable holding the maximum chat message length in
+/// characters.
+pub const MAX_CHAT_MESSAGE_CHARS_VAR: &str = "MAX_CHAT_MESSAGE_CHARS";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum number of files per request.
@@ -79,6 +82,12 @@ pub const DEFAULT_MAX_STATUS_CHARS: usize = 5000;
 pub const DEFAULT_MAX_MEDIA_ATTACHMENTS: usize = 4;
 /// Poll option limit used when `MAX_POLL_OPTIONS` is unset.
 pub const DEFAULT_MAX_POLL_OPTIONS: usize = 20;
+/// Chat message length used when `MAX_CHAT_MESSAGE_CHARS` is unset.
+///
+/// The 5000 characters of Pleroma's `[:instance, :chat_limit]` default —
+/// the same number the chat model's storage backstop keeps, pinned together
+/// by a test in this module.
+pub const DEFAULT_MAX_CHAT_MESSAGE_CHARS: usize = 5_000;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -202,6 +211,10 @@ pub struct Config {
     pub max_media_attachments: usize,
     /// Maximum number of options per poll.
     pub max_poll_options: usize,
+    /// Maximum length of a chat message in characters, from
+    /// `MAX_CHAT_MESSAGE_CHARS`; `POST /api/v1/pleroma/chats/{id}/messages`
+    /// refuses longer content.
+    pub max_chat_message_chars: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -296,6 +309,11 @@ impl Config {
             DEFAULT_MAX_MEDIA_ATTACHMENTS,
         )?;
         let max_poll_options = number(&lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?;
+        let max_chat_message_chars = number(
+            &lookup,
+            MAX_CHAT_MESSAGE_CHARS_VAR,
+            DEFAULT_MAX_CHAT_MESSAGE_CHARS,
+        )?;
         let upload_limits = UploadLimits {
             max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
             max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
@@ -322,6 +340,7 @@ impl Config {
             max_status_chars,
             max_media_attachments,
             max_poll_options,
+            max_chat_message_chars,
             upload_limits,
             uploads_dir,
             emoji_dir,
@@ -392,6 +411,7 @@ impl Config {
             max_status_chars: DEFAULT_MAX_STATUS_CHARS,
             max_media_attachments: DEFAULT_MAX_MEDIA_ATTACHMENTS,
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
+            max_chat_message_chars: DEFAULT_MAX_CHAT_MESSAGE_CHARS,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
@@ -574,6 +594,7 @@ impl fmt::Debug for Config {
             .field("max_status_chars", &self.max_status_chars)
             .field("max_media_attachments", &self.max_media_attachments)
             .field("max_poll_options", &self.max_poll_options)
+            .field("max_chat_message_chars", &self.max_chat_message_chars)
             .field("upload_limits", &self.upload_limits)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
@@ -774,6 +795,10 @@ mod tests {
         );
         assert_eq!(config.max_poll_options, 20, "default max_poll_options");
         assert_eq!(
+            config.max_chat_message_chars, 5_000,
+            "default max_chat_message_chars"
+        );
+        assert_eq!(
             config.upload_limits.max_file_bytes, 16_000_000,
             "default UPLOAD_LIMIT_BYTES"
         );
@@ -909,6 +934,33 @@ mod tests {
         assert!(
             config.healthcheck_enabled.get(),
             "custom HEALTHCHECK_ENABLED"
+        );
+    }
+
+    #[test]
+    fn reads_custom_max_chat_message_chars() {
+        let config = config_with(&[(MAX_CHAT_MESSAGE_CHARS_VAR, "140")]);
+        assert_eq!(
+            config.max_chat_message_chars, 140,
+            "custom MAX_CHAT_MESSAGE_CHARS"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_chat_message_chars: 140"),
+            "the chat length is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn the_chat_length_default_matches_the_storage_backstop() {
+        // Same pairing as `models::oauth_token` keeps between the token-ttl
+        // default and its model constant: the endpoint refuses above the
+        // config number, the model above its own, and by default the two
+        // numbers are one number.
+        assert_eq!(
+            DEFAULT_MAX_CHAT_MESSAGE_CHARS,
+            crate::models::chat::MAX_CHAT_MESSAGE_CHARS,
+            "the config default and the model's backstop agree"
         );
     }
 
@@ -1307,6 +1359,7 @@ mod tests {
             MAX_STATUS_CHARS_VAR,
             MAX_MEDIA_ATTACHMENTS_VAR,
             MAX_POLL_OPTIONS_VAR,
+            MAX_CHAT_MESSAGE_CHARS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             MIN_PASSWORD_LENGTH_VAR,

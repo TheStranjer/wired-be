@@ -23,6 +23,7 @@ All configuration comes from environment variables. For local development, copy 
 | `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status |
 | `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
 | `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
+| `MAX_CHAT_MESSAGE_CHARS` | no | `5000` | Maximum characters per chat message; longer posted content is refused with 400 |
 | `ACCOUNTS_EMAIL_OPTIONAL` | no | `false` | Allow registering local accounts without an email address (`true`/`false`, or `1`/`0`) |
 | `MIN_PASSWORD_LENGTH` | no | `8` | Minimum length of a registration password, in characters |
 | `OAUTH_TOKEN_TTL_SECS` | no | `2592000` | Lifetime granted to newly issued OAuth access tokens, in seconds (default: 30 days) |

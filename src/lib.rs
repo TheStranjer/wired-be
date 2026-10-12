@@ -704,5 +704,46 @@ mod tests {
                 "the page's index covers the list filter and its cursor: {definition}"
             );
         }
+
+        /// The chat message idempotency migration (WBE-147) adds the one
+        /// column the `Idempotency-Key` replay lookup needs — a nullable
+        /// `text` `idempotency_key` on `chat_messages` — and the partial
+        /// index that serves the sender-and-key search, keeping every
+        /// keyless message out of it.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn chat_message_idempotency_migration_adds_the_key(pool: PgPool) {
+            let (data_type, is_nullable, default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'chat_messages'
+                        AND column_name = 'idempotency_key'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(data_type, "text", "the key is stored as text");
+            assert_eq!(is_nullable, "YES", "a keyless message keeps NULL");
+            assert!(default.is_none(), "and nothing defaults to a key");
+
+            let indexes: Vec<(String, String)> = sqlx::query_as(
+                "SELECT indexname, indexdef FROM pg_indexes
+                  WHERE schemaname = 'public' AND tablename = 'chat_messages'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let (_, definition) = indexes
+                .iter()
+                .find(|(name, _)| name == "chat_messages_sender_id_idempotency_key_idx")
+                .unwrap_or_else(|| panic!("the replay index exists: {indexes:?}"));
+            assert!(
+                definition.contains("sender_id")
+                    && definition.contains("idempotency_key")
+                    && definition.contains("idempotency_key IS NOT NULL"),
+                "the index covers sender and key, keyed rows only: {definition}"
+            );
+        }
     }
 }

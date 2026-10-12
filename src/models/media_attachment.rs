@@ -185,6 +185,40 @@ pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<MediaAttachm
     Ok(attachment)
 }
 
+/// [`get_chat_attachment`]: the media a chat message may carry — `user_id`'s
+/// own, claimed by no status yet, and `image/*`, `video/*` or `audio/*`.
+/// Pleroma's `ChatController` posts `media_id` through
+/// `Object.authorize_access` and its api spec names the kind the same way.
+const CHAT_ATTACHMENT_SQL: &str = "SELECT * FROM media_attachments
+     WHERE id = $1 AND user_id = $2 AND status_id IS NULL
+       AND lower(split_part(content_type, '/', 1)) IN ('image', 'video', 'audio')";
+
+/// The media row `id`, provided `user_id` uploaded it, no status has claimed
+/// it, and its `MIME` type is image, video or audio — the media a chat
+/// message may attach ([`crate::api::chats`]' `POST …/messages` gate).
+///
+/// An id with no row, one owned by somebody else, one already posted with a
+/// status, and a non-media file are all answered `None`: the chat route gives
+/// them all its one 400, and naming the difference would tell a caller which
+/// foreign ids exist.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_chat_attachment(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+) -> AppResult<Option<MediaAttachment>> {
+    let attachment = sqlx::query_as::<_, MediaAttachment>(CHAT_ATTACHMENT_SQL)
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(attachment)
+}
+
 /// Fetches the attachments whose ids are in `ids`, in `id` order
 /// (`UUIDv7` text sorts by creation, decision 4). Ids with no row are
 /// skipped; an empty `ids` yields an empty `Vec`.
@@ -547,6 +581,68 @@ mod tests {
             get_many(&pool, &[new_id()]).await.unwrap().is_empty(),
             "only unknown ids, still no rows"
         );
+    }
+
+    /// A [`NewMediaAttachment`] of `user_id` with the given `content_type`.
+    fn upload_of(user_id: Uuid, content_type: &str) -> NewMediaAttachment {
+        NewMediaAttachment {
+            content_type: content_type.to_owned(),
+            ..new_upload(user_id)
+        }
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn chat_media_is_own_unattached_image_video_or_audio(pool: PgPool) {
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let image = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let video = insert(&pool, &upload_of(alice.id, "video/mp4"))
+            .await
+            .unwrap();
+        let audio = insert(&pool, &upload_of(alice.id, "audio/mpeg"))
+            .await
+            .unwrap();
+        let claim = create_status(&pool, &alice).await;
+        let posted = insert(
+            &pool,
+            &NewMediaAttachment {
+                status_id: Some(claim.id),
+                ..new_upload(alice.id)
+            },
+        )
+        .await
+        .unwrap();
+        let foreign = insert(&pool, &new_upload(bob.id)).await.unwrap();
+        let document = insert(&pool, &upload_of(alice.id, "application/pdf"))
+            .await
+            .unwrap();
+        let ownerless = insert(
+            &pool,
+            &NewMediaAttachment {
+                user_id: None,
+                ..new_upload(alice.id)
+            },
+        )
+        .await
+        .unwrap();
+
+        for mine in [image.id, video.id, audio.id] {
+            let found = get_chat_attachment(&pool, mine, alice.id)
+                .await
+                .unwrap()
+                .expect("alice's own unattached media is attachable");
+            assert_eq!(found.id, mine, "and it is the row named");
+        }
+        for nope in [new_id(), posted.id, foreign.id, document.id, ownerless.id] {
+            assert!(
+                get_chat_attachment(&pool, nope, alice.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "`{nope}` is no chat media for alice: unknown, claimed, \
+                 foreign, not media, or ownerless alike"
+            );
+        }
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

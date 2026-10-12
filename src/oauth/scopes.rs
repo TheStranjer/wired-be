@@ -53,13 +53,19 @@ pub const READ_BLOCKS: &str = "read:blocks";
 /// remaining actions, with the `follow` root as an accepted alternative).
 pub const WRITE_BLOCKS: &str = "write:blocks";
 
-/// The read side of chats: the `/api/v1` and `/api/v2` chat lists and
-/// `GET /api/v1/pleroma/chats/{id}` (Pleroma's `read:chats` on `ChatController`'s
-/// `index`, `index2` and `show` actions).
+/// The read side of chats, listing and looking.
+///
+/// The `/api/v1` and `/api/v2` chat lists, `GET /api/v1/pleroma/chats/{id}`
+/// and the message listing `GET /api/v1/pleroma/chats/{id}/messages`
+/// (Pleroma's `read:chats` on `ChatController`'s `index`, `index2`, `show`
+/// and `messages` actions).
 pub const READ_CHATS: &str = "read:chats";
-/// The write side of chats: opening a chat and the read markers and
-/// pin/unpin toggles of `/api/v1/pleroma/chats` (Pleroma's `write:chats`
-/// on the matching `ChatController` actions).
+/// The write side of chats, opening, marking, pinning and messaging.
+///
+/// `POST …/chats/by-account-id/{id}`, the read markers, the pin/unpin
+/// toggles and posting and deleting messages under
+/// `/api/v1/pleroma/chats` (Pleroma's `write:chats` on the matching
+/// `ChatController` actions).
 pub const WRITE_CHATS: &str = "write:chats";
 
 /// The read side of filters: `GET /api/v1/filters` and
