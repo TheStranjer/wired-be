@@ -71,6 +71,9 @@ pub const HEALTHCHECK_ENABLED_VAR: &str = "HEALTHCHECK_ENABLED";
 /// Environment variable holding whether the instance accepts new local
 /// registrations; `NodeInfo` reports it as `openRegistrations`.
 pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
+/// Environment variable holding the external OAuth login providers, as the
+/// JSON text of an [`OauthProvider`] array.
+pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -152,6 +155,10 @@ pub const DEFAULT_HEALTHCHECK_ENABLED: bool = false;
 /// `[:instance, :registrations_open]` default is open, so closing
 /// registration is always an explicit operator decision.
 pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
+/// The provider list used when `OAUTH_PROVIDERS` is unset: no external
+/// login provider is configured, so `GET /oauth/prepare_request` and the
+/// provider endpoints answer their errors for every name.
+pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -193,6 +200,82 @@ impl Toggle {
 impl From<bool> for Toggle {
     fn from(value: bool) -> Self {
         Self(value)
+    }
+}
+
+/// One external OAuth login provider, as one element of the
+/// `OAUTH_PROVIDERS` JSON array (Pleroma's `config :ueberauth, Ueberauth,
+/// providers:` list, expressed as data instead of compiled-in strategies).
+///
+/// The four `*_field` names say where the provider's userinfo document
+/// carries each fact; a dotted path digs into nested objects (`"data.id"`),
+/// and an empty name means the provider does not tell us that much.
+/// `client_secret` is secret material: the manual `Debug` impl below
+/// redacts it, so a configuration written to the log never carries it.
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OauthProvider {
+    /// Provider name: the `{provider}` path segment and the value of the
+    /// `provider` parameter, e.g. `github`.
+    pub name: String,
+    /// The id this instance registered with the provider, sent as
+    /// `client_id`.
+    pub client_id: String,
+    /// The provider's client secret, sent to the token endpoint. Never in
+    /// `Debug` output.
+    pub client_secret: String,
+    /// Where the browser is redirected to authorize us, sent the provider
+    /// `client_id`, our callback URL and our state.
+    pub authorize_url: String,
+    /// Where the returned code is exchanged for an `access_token`.
+    pub token_url: String,
+    /// Where the `access_token` fetches the account document from.
+    pub userinfo_url: String,
+    /// The `scope` string sent to the provider (its own vocabulary, not
+    /// Mastodon scopes); empty sends none.
+    #[serde(default)]
+    pub scopes: String,
+    /// Dotted path of the stable provider account id in the userinfo
+    /// document, the key `user_identities.uid` stores.
+    #[serde(default = "default_uid_field")]
+    pub uid_field: String,
+    /// Dotted path of the login name, offered to the registration form.
+    /// Empty means the document carries no such name.
+    #[serde(default)]
+    pub nickname_field: String,
+    /// Dotted path of the email address, offered to the registration form.
+    #[serde(default)]
+    pub email_field: String,
+    /// Dotted path of the display name, offered to the registration form.
+    #[serde(default)]
+    pub name_field: String,
+}
+
+/// [`OauthProvider::uid_field`] when a provider object omits it: the
+/// top-level `id` key, the spelling the majority of providers use for the
+/// stable account id (GitHub's `id`; a provider that names it otherwise,
+/// like Keycloak's `sub`, says so in its own object).
+fn default_uid_field() -> String {
+    "id".to_owned()
+}
+
+/// [`client_secret`](Self::client_secret) is secret material and renders as
+/// `<redacted>`; everything else shows.
+impl fmt::Debug for OauthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OauthProvider")
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("authorize_url", &self.authorize_url)
+            .field("token_url", &self.token_url)
+            .field("userinfo_url", &self.userinfo_url)
+            .field("scopes", &self.scopes)
+            .field("uid_field", &self.uid_field)
+            .field("nickname_field", &self.nickname_field)
+            .field("email_field", &self.email_field)
+            .field("name_field", &self.name_field)
+            .finish()
     }
 }
 
@@ -272,6 +355,10 @@ pub struct Config {
     /// `REGISTRATIONS_OPEN`; `NodeInfo` reports it as `openRegistrations`
     /// (see [`crate::api::nodeinfo`]).
     pub registrations_open: Toggle,
+    /// The external OAuth login providers, from `OAUTH_PROVIDERS`; empty
+    /// when none is configured. Each one answers the `/oauth` provider
+    /// endpoints under its own name (see [`crate::api::oauth_external`]).
+    pub oauth_providers: Vec<OauthProvider>,
 }
 
 impl Config {
@@ -342,7 +429,7 @@ impl Config {
             DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
         )?;
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
-        let (accounts_email_optional, min_password_length, oauth_token_ttl_secs) =
+        let (accounts_email_optional, min_password_length, oauth_token_ttl_secs, oauth_providers) =
             auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let registrations_open =
@@ -372,6 +459,7 @@ impl Config {
             captcha_enabled,
             healthcheck_enabled,
             registrations_open,
+            oauth_providers,
         })
     }
 
@@ -388,6 +476,16 @@ impl Config {
     #[must_use]
     pub fn is_https(&self) -> bool {
         self.base_url.starts_with("https://")
+    }
+
+    /// The [`OAUTH_PROVIDERS`](OAUTH_PROVIDERS_VAR) entry named `name`,
+    /// matched case-sensitively against [`OauthProvider::name`]; `None` is
+    /// the endpoints' "Unknown provider" answer.
+    #[must_use]
+    pub fn oauth_provider(&self, name: &str) -> Option<&OauthProvider> {
+        self.oauth_providers
+            .iter()
+            .find(|provider| provider.name == name)
     }
 
     /// Configuration for tests: `BASE_URL` is `https://test.example`,
@@ -447,6 +545,7 @@ impl Config {
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
+            oauth_providers: Vec::new(),
         }
     }
 }
@@ -477,12 +576,17 @@ fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
     Ok(format!("{}://{domain}", url.scheme()))
 }
 
-/// Reads the three settings that gate registration and token issuance:
-/// whether registration may omit the email address, the registration
-/// password minimum and the access-token lifetime. Grouped because each
-/// is a plain default-or-parse and [`Config::from_lookup`] has a size
-/// budget (AGENTS.md); the tuple comes back in field order.
-fn auth_settings<F>(lookup: &F) -> Result<(bool, usize, usize), ConfigError>
+/// What [`auth_settings`] reads, in [`Config`] field order: the email
+/// requirement, the password minimum, the token lifetime and the providers.
+type AuthSettings = (bool, usize, usize, Vec<OauthProvider>);
+
+/// Reads the four settings that gate registration, token issuance and the
+/// external logins: whether registration may omit the email address, the
+/// registration password minimum, the access-token lifetime and the
+/// provider list. Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
+/// back in field order.
+fn auth_settings<F>(lookup: &F) -> Result<AuthSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -501,6 +605,7 @@ where
         accounts_email_optional,
         min_password_length,
         oauth_token_ttl_secs,
+        oauth_providers(lookup)?,
     ))
 }
 
@@ -552,6 +657,28 @@ where
         boolean(lookup, CAPTCHA_ENABLED_VAR, DEFAULT_CAPTCHA_ENABLED)?.into(),
         boolean(lookup, HEALTHCHECK_ENABLED_VAR, DEFAULT_HEALTHCHECK_ENABLED)?.into(),
     ))
+}
+
+/// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login
+/// provider array, [`DEFAULT_OAUTH_PROVIDERS`] when the variable is unset
+/// or blank.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidOauthProviders`] when the text is not a JSON array
+/// of provider objects; the parser's own wording rides along so an operator
+/// can see which key broke.
+fn oauth_providers<F>(lookup: &F) -> Result<Vec<OauthProvider>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let configured = lookup(OAUTH_PROVIDERS_VAR).unwrap_or_default();
+    let text = if configured.trim().is_empty() {
+        DEFAULT_OAUTH_PROVIDERS
+    } else {
+        configured.as_str()
+    };
+    serde_json::from_str(text).map_err(|err| ConfigError::InvalidOauthProviders(err.to_string()))
 }
 
 /// Reads a non-negative integer setting, applying `default` when the variable
@@ -628,6 +755,7 @@ impl fmt::Debug for Config {
             .field("captcha_enabled", &self.captcha_enabled)
             .field("healthcheck_enabled", &self.healthcheck_enabled)
             .field("registrations_open", &self.registrations_open)
+            .field("oauth_providers", &self.oauth_providers)
             .finish()
     }
 }
@@ -646,6 +774,9 @@ pub enum ConfigError {
     /// A boolean setting is not `true`/`false` (or `1`/`0`); the value is the
     /// variable name.
     InvalidBoolean(&'static str),
+    /// `OAUTH_PROVIDERS` is not the JSON text of an array of provider
+    /// objects; the value is what the JSON parser said.
+    InvalidOauthProviders(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -660,6 +791,10 @@ impl fmt::Display for ConfigError {
             ),
             Self::InvalidNumber(var) => write!(f, "invalid {var}: expected a whole number"),
             Self::InvalidBoolean(var) => write!(f, "invalid {var}: expected true or false"),
+            Self::InvalidOauthProviders(detail) => write!(
+                f,
+                "invalid {OAUTH_PROVIDERS_VAR}: expected a JSON array of provider objects: {detail}"
+            ),
         }
     }
 }
@@ -671,7 +806,8 @@ impl Error for ConfigError {
             Self::Missing(_)
             | Self::InvalidBaseUrl
             | Self::InvalidNumber(_)
-            | Self::InvalidBoolean(_) => None,
+            | Self::InvalidBoolean(_)
+            | Self::InvalidOauthProviders(_) => None,
         }
     }
 }
@@ -1319,6 +1455,129 @@ mod tests {
     fn empty_contact_email_is_none() {
         let config = config_with(&[(CONTACT_EMAIL_VAR, "")]);
         assert_eq!(config.contact_email, None, "empty contact_email");
+    }
+
+    /// The ticket's one-provider `OAUTH_PROVIDERS` document, verbatim.
+    const GITHUB_PROVIDERS: &str = r#"[{"name":"github","client_id":"cid","client_secret":"csecret","authorize_url":"https://github.com/login/oauth/authorize","token_url":"https://github.com/login/oauth/access_token","userinfo_url":"https://api.github.com/user","scopes":"read:user user:email","uid_field":"id","nickname_field":"login","email_field":"email","name_field":"name"}]"#;
+
+    #[test]
+    fn oauth_providers_default_to_empty() {
+        for value in [None, Some(""), Some("   ")] {
+            let extra = value.map_or_else(Vec::new, |text| vec![(OAUTH_PROVIDERS_VAR, text)]);
+            let config = config_with(&extra);
+            assert!(
+                config.oauth_providers.is_empty(),
+                "OAUTH_PROVIDERS={value:?} means no provider"
+            );
+            assert!(
+                config.oauth_provider("github").is_none(),
+                "and no name is configured"
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_providers_parses_the_documented_shape() {
+        let config = config_with(&[(OAUTH_PROVIDERS_VAR, GITHUB_PROVIDERS)]);
+        assert_eq!(config.oauth_providers.len(), 1, "one provider");
+        let github = config.oauth_provider("github").expect("github");
+        assert_eq!(github.name, "github", "name");
+        assert_eq!(github.client_id, "cid", "client_id");
+        assert_eq!(github.client_secret, "csecret", "client_secret");
+        assert_eq!(
+            github.authorize_url, "https://github.com/login/oauth/authorize",
+            "authorize_url"
+        );
+        assert_eq!(
+            github.token_url, "https://github.com/login/oauth/access_token",
+            "token_url"
+        );
+        assert_eq!(
+            github.userinfo_url, "https://api.github.com/user",
+            "userinfo_url"
+        );
+        assert_eq!(github.scopes, "read:user user:email", "scopes");
+        assert_eq!(github.uid_field, "id", "uid_field");
+        assert_eq!(github.nickname_field, "login", "nickname_field");
+        assert_eq!(github.email_field, "email", "email_field");
+        assert_eq!(github.name_field, "name", "name_field");
+        assert!(
+            config.oauth_provider("GitLab").is_none(),
+            "a name nobody configured is not found"
+        );
+    }
+
+    #[test]
+    fn oauth_providers_lists_them_all_and_applies_the_defaults() {
+        let config = config_with(&[(
+            OAUTH_PROVIDERS_VAR,
+            r#"[{"name":"github","client_id":"a","client_secret":"b","authorize_url":"https://g.example/authorize","token_url":"https://g.example/token","userinfo_url":"https://g.example/user"},{"name":"keycloak","client_id":"c","client_secret":"d","authorize_url":"https://k.example/authorize","token_url":"https://k.example/token","userinfo_url":"https://k.example/userinfo","scopes":"openid","uid_field":"sub","nickname_field":"preferred_username","email_field":"email","name_field":"name"}]"#,
+        )]);
+        let names: Vec<&str> = config
+            .oauth_providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["github", "keycloak"],
+            "the array keeps its order"
+        );
+        let github = config.oauth_provider("github").expect("github");
+        assert_eq!(github.scopes, "", "scopes defaults to sending none");
+        assert_eq!(github.uid_field, "id", "uid_field defaults to id");
+        assert_eq!(
+            github.nickname_field, "",
+            "an unnamed field reads as absent"
+        );
+        assert_eq!(
+            config
+                .oauth_provider("keycloak")
+                .map(|p| p.uid_field.as_str()),
+            Some("sub"),
+            "an explicit name wins"
+        );
+    }
+
+    #[test]
+    fn invalid_oauth_providers_is_a_startup_error() {
+        for value in [
+            "not json",
+            r#"{"name":"github"}"#,
+            "[]]",
+            r#"[{"name":"github","client_id":"a","client_secret":"b","authorize_url":"https://g.example/a","token_url":"https://g.example/t","userinfo_url":"https://g.example/u","bogus":1}]"#,
+            r#"[{"client_id":"a","client_secret":"b","authorize_url":"https://g.example/a","token_url":"https://g.example/t","userinfo_url":"https://g.example/u"}]"#,
+        ] {
+            let err = try_config_with(&[(OAUTH_PROVIDERS_VAR, value)]).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidOauthProviders(_)),
+                "`{value}` is refused, got {err}"
+            );
+            assert!(
+                err.to_string()
+                    .starts_with(&format!("invalid {OAUTH_PROVIDERS_VAR}: ")),
+                "the message names the variable"
+            );
+            assert!(err.source().is_none(), "no source");
+        }
+    }
+
+    #[test]
+    fn debug_redacts_the_provider_client_secret() {
+        let config = config_with(&[(OAUTH_PROVIDERS_VAR, GITHUB_PROVIDERS)]);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("csecret"),
+            "the provider secret must not leak: {debug}"
+        );
+        assert!(
+            debug.contains(r#"client_secret: "<redacted>""#),
+            "the marker names the field: {debug}"
+        );
+        assert!(
+            debug.contains("https://api.github.com/user"),
+            "the rest of the provider shows: {debug}"
+        );
     }
 
     #[test]

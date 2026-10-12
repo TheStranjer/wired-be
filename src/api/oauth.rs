@@ -372,7 +372,7 @@ async fn authenticate_user(pool: &PgPool, params: &TokenParams) -> AppResult<Use
 ///
 /// 403 [`ACCOUNT_DISABLED`] with identifier [`ACCOUNT_IS_DISABLED`] for a
 /// deactivated account.
-fn check_account_ready(user: &User) -> Result<(), AppError> {
+pub(crate) fn check_account_ready(user: &User) -> Result<(), AppError> {
     if user.is_active.get() {
         Ok(())
     } else {
