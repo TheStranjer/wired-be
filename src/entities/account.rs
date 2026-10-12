@@ -318,9 +318,20 @@ pub struct Account {
     pub emojis: Vec<Value>,
     /// Profile metadata, in storage order.
     pub fields: Vec<Field>,
-    /// The account this one moved to; always `null` until the move ticket
-    /// fills it with a rendered `Account`.
+    /// The account this one moved to; `null` until the render resolves
+    /// [`moved_to_ap_id`](User::moved_to_ap_id) to a stored row and
+    /// [`Account::with_moved`] attaches it (non-recursive: the nested
+    /// account is a plain [`Account::from_user`] render, so its own
+    /// `moved` is always `null`).
     pub moved: Option<Value>,
+    /// The account's `also_known_as` actor ids as stored: the one Pleroma
+    /// extension Mastodon clients expect for alias management, present as
+    /// a top-level key only on the owner view [`Account::for_owner`]
+    /// renders (Pleroma nests it in the `pleroma` block; this instance
+    /// exposes it here and keeps the block to its own keys), so for every
+    /// other viewer serde omits the key entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub also_known_as: Option<Vec<String>>,
     /// Whether the account is deactivated: `is_active` inverted.
     pub suspended: JsonBool,
     /// Whether the account is rate-limited by moderation; nothing limits
@@ -418,6 +429,7 @@ impl Account {
             emojis: Vec::new(),
             fields: fields_from_json(&user.fields),
             moved: None,
+            also_known_as: None,
             suspended: JsonBool(!user.is_active.get()),
             limited: JsonBool(false),
             source: None,
@@ -445,7 +457,27 @@ impl Account {
     pub fn for_owner(user: &User, config: &Config, follow_requests_count: i32) -> Self {
         let mut account = Self::from_user_for(Some(user), user, config, None);
         account.source = Some(AccountSource::for_owner(user, follow_requests_count));
+        // The own view is the one alias clients read and write: the stored
+        // actor ids come out verbatim, as a top-level key (ticket decision:
+        // not inside the `pleroma` block).
+        account.also_known_as = Some(user.also_known_as.clone());
         account
+    }
+
+    /// Attaches the nested [`moved`](Self::moved) entity: renders the move
+    /// target `target` with [`Account::from_user`] — the plain, non-owner
+    /// view — and stores it as this account's `moved` value. The render is
+    /// built by this method and never looks at `target`'s own
+    /// `moved_to_ap_id`, so the nesting is one level deep: the nested
+    /// account's `moved` is `null` even if that account moved on (Pleroma's
+    /// `AccountView` renders `moved` non-recursively for the same reason).
+    ///
+    /// Resolving `moved_to_ap_id` to a row is the caller's job (it needs
+    /// the database); an unresolvable target simply keeps `moved: null`.
+    #[must_use]
+    pub fn with_moved(mut self, target: &User, config: &Config) -> Self {
+        self.moved = serde_json::to_value(Self::from_user(target, config)).ok();
+        self
     }
 }
 
@@ -590,8 +622,11 @@ fn nickname_part(nickname: &str) -> &str {
 
 /// The fully-qualified `nick@domain` handle (Pleroma's
 /// `User.full_nickname`): a remote nickname is stored with its host and
-/// passes through; a local one gains [`Config::domain`].
-fn full_nickname(user: &User, config: &Config) -> String {
+/// passes through; a local one gains [`Config::domain`]. Crate-visible
+/// because the alias endpoints render stored actor ids back as these
+/// handles (see [`crate::api::pleroma_account_settings`]).
+#[must_use]
+pub(crate) fn full_nickname(user: &User, config: &Config) -> String {
     if user.nickname.contains('@') {
         user.nickname.clone()
     } else {
@@ -825,6 +860,7 @@ mod tests {
             show_birthday: Flag::new(false),
             also_known_as: Vec::new(),
             moved_to_ap_id: None,
+            last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
             last_active_at: None,
@@ -1637,6 +1673,10 @@ mod tests {
                 "`skip_serializing_if` keeps the editing block out of a \
                  render that did not ask for it"
             );
+            assert!(
+                !has_key(&value, "also_known_as"),
+                "the top-level alias list belongs to the owner view only"
+            );
         }
         let own = render_for_owner(&alice, &config, 0);
         assert!(
@@ -1645,8 +1685,77 @@ mod tests {
         );
         let mut keys = EXPECTED_KEYS.to_vec();
         keys.push("source");
+        keys.push("also_known_as");
         keys.sort_unstable();
-        assert_eq!(json_keys(&own), keys, "source is the one added key");
+        assert_eq!(
+            json_keys(&own),
+            keys,
+            "source and also_known_as are the keys only the owner render adds"
+        );
+    }
+
+    #[test]
+    fn the_owner_view_renders_the_stored_aliases_verbatim() {
+        let config = Config::for_tests();
+        let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
+        alice.local = Flag::new(true);
+        assert_eq!(
+            render_for_owner(&alice, &config, 0)["also_known_as"],
+            json!([]),
+            "an account with no aliases renders the empty array, not a \
+             missing key"
+        );
+
+        alice.also_known_as = vec![
+            format!("{BASE}/users/alicia"),
+            "https://old.example/users/alice".to_owned(),
+        ];
+        assert_eq!(
+            render_for_owner(&alice, &config, 0)["also_known_as"],
+            json!([
+                format!("{BASE}/users/alicia"),
+                "https://old.example/users/alice",
+            ]),
+            "the owner view carries the stored actor ids, in order"
+        );
+    }
+
+    #[test]
+    fn with_moved_nests_a_plain_non_recursive_account_render() {
+        let config = Config::for_tests();
+        let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
+        alice.local = Flag::new(true);
+        alice.moved_to_ap_id = Some("https://new.example/users/alice".to_owned());
+        let target = base_user("alice@new.example", "https://new.example/users/alice");
+
+        // The caller decides whether the account moved: attaching is what
+        // renders the key. Without it the entity still answers moved: null.
+        let bare = serde_json::to_value(Account::from_user(&alice, &config)).unwrap();
+        assert_eq!(bare["moved"], Value::Null, "from_user never attaches it");
+
+        let moved =
+            serde_json::to_value(Account::from_user(&alice, &config).with_moved(&target, &config))
+                .unwrap();
+        assert_eq!(
+            moved["moved"]["id"],
+            serde_json::json!(target.id.to_string()),
+            "the nested entity is the target's own account"
+        );
+        assert_eq!(
+            moved["moved"]["acct"],
+            serde_json::json!("alice@new.example"),
+            "rendered with the target's handle"
+        );
+        assert_eq!(
+            moved["moved"]["moved"],
+            Value::Null,
+            "the nesting is one level deep: the target's own move (if any) \
+             is not followed"
+        );
+        assert!(
+            moved["moved"].get("also_known_as").is_none(),
+            "the nested render is the plain viewer's, not an owner view"
+        );
     }
 
     #[test]

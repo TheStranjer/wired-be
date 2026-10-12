@@ -7,14 +7,16 @@
 //! it at the path Pleroma serves it on. [`mfa`] is the first; the rest of
 //! the `/api/pleroma` surface joins here the same way. Today [`misc`]
 //! adds one route: `frontend_configurations`, Pleroma's
-//! `UtilController.frontend_configurations/2`. Do not call
+//! `UtilController.frontend_configurations/2`, and
+//! [`pleroma_account_settings`] adds the account utilities of the same
+//! controller: `aliases` and `move_account`. Do not call
 //! [`Router::fallback`] here: unmatched paths must reach the app-wide JSON
 //! fallback in [`crate::app`].
 
 use axum::Router;
 
 use crate::{
-    api::{mfa, misc},
+    api::{mfa, misc, pleroma_account_settings},
     state::AppState,
 };
 
@@ -23,4 +25,5 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/accounts/mfa", mfa::router())
         .merge(misc::frontend_configurations_router())
+        .merge(pleroma_account_settings::router())
 }

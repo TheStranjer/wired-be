@@ -353,6 +353,7 @@ mod tests {
             show_birthday: Flag::new(false),
             also_known_as: Vec::new(),
             moved_to_ap_id: None,
+            last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
             last_active_at: None,
