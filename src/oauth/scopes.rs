@@ -44,9 +44,13 @@ pub const READ_ACCOUNTS: &str = "read:accounts";
 /// a dismissal a user stores about themselves (Pleroma's `write:accounts`).
 pub const WRITE_ACCOUNTS: &str = "write:accounts";
 
-/// The write side of chats: the whole-chat and single-message read markers
-/// and the pin/unpin toggles of `/api/v1/pleroma/chats` (Pleroma's
-/// `write:chats` on the matching `ChatController` actions).
+/// The read side of chats: the `/api/v1` and `/api/v2` chat lists and
+/// `GET /api/v1/pleroma/chats/{id}` (Pleroma's `read:chats` on `ChatController`'s
+/// `index`, `index2` and `show` actions).
+pub const READ_CHATS: &str = "read:chats";
+/// The write side of chats: opening a chat and the read markers and
+/// pin/unpin toggles of `/api/v1/pleroma/chats` (Pleroma's `write:chats`
+/// on the matching `ChatController` actions).
 pub const WRITE_CHATS: &str = "write:chats";
 
 /// The read side of filters: `GET /api/v1/filters` and
