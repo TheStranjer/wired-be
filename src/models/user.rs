@@ -23,7 +23,7 @@ use std::fmt;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::{config::Config, error::AppResult, util::id::new_id};
@@ -811,11 +811,19 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<User>> {
 /// counts are never negative. An unknown `id` matches no row and changes
 /// nothing.
 ///
+/// The step runs on any Postgres executor, so callers either fire it
+/// against the pool or join it to a transaction of their own (see
+/// [`remove_follower`](crate::models::follow::remove_follower), which
+/// commits its row removal and its counter steps together).
+///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn update_counts(pool: &PgPool, id: Uuid, delta: CountDelta) -> AppResult<()> {
+pub async fn update_counts<'e, E>(executor: E, id: Uuid, delta: CountDelta) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         "UPDATE users
             SET followers_count = GREATEST(0, followers_count + $2),
@@ -828,7 +836,7 @@ pub async fn update_counts(pool: &PgPool, id: Uuid, delta: CountDelta) -> AppRes
     .bind(delta.followers)
     .bind(delta.following)
     .bind(delta.statuses)
-    .execute(pool)
+    .execute(executor)
     .await
     .map(drop)?;
     Ok(())

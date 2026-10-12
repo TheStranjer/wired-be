@@ -14,9 +14,9 @@
 //! the accepted rows through
 //! [`update_counts`]: one step up when a
 //! relationship becomes accepted, one step down when an accepted relationship
-//! goes away. [`follow`], [`accept`], [`unfollow`] and [`reject`] are the
-//! only ways either happens, and each moves the counters exactly once per
-//! transition.
+//! goes away. [`follow`], [`accept`], [`unfollow`], [`reject`] and
+//! [`remove_follower`] are the only ways either happens, and each moves the
+//! counters exactly once per transition.
 //!
 //! Signatures name the two ends of a relationship `follower` and `target`
 //! (the word Pleroma's `subscribe(subscriber, target)` and Mastodon's
@@ -31,7 +31,7 @@
 //! and Pleroma's `subscribe` / `unsubscribe` are the same one column.
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, postgres::PgRow};
+use sqlx::{FromRow, PgConnection, PgPool, Postgres, QueryBuilder, postgres::PgRow};
 use uuid::Uuid;
 
 use crate::{
@@ -70,6 +70,13 @@ const REOPEN_SQL: &str = "UPDATE follows
 const UNFOLLOW_SQL: &str = "DELETE FROM follows
       WHERE follower_id = $1 AND followee_id = $2
         AND state IN ('pending', 'accepted')
+  RETURNING *";
+
+/// [`remove_follower`]: the follower is gone, and only an *accepted* row ever
+/// counted, so the removed row is what decides whether the counters step down
+/// and anything else in the table stays exactly as it was.
+const REMOVE_FOLLOWER_SQL: &str = "DELETE FROM follows
+      WHERE follower_id = $1 AND followee_id = $2 AND state = 'accepted'
   RETURNING *";
 
 /// [`accept`]: every not-yet-accepted state becomes accepted. A `rejected`
@@ -303,6 +310,47 @@ pub async fn unfollow(pool: &PgPool, follower: &User, target: &User) -> AppResul
         step_counters(pool, &follow, -1).await?;
     }
     Ok(true)
+}
+
+/// Removes `follower_id`'s accepted follow of `user_id` — the followed
+/// account, the row's [`Follow::followee_id`] — and returns the removed
+/// relationship, `None` when the account had no such follower to remove.
+///
+/// The followee's side of [`unfollow`] (Pleroma's `User.remove_follower`,
+/// the write behind `remove_from_followers`): the same accepted relationship
+/// taken back, but asked for by the account it points at instead of the one
+/// that granted it. Only a follower is ever removed: a `pending` request
+/// waits for its owner's own answer ([`accept`] / [`reject`], the
+/// `/api/v1/follow_requests` routes), a `rejected` row (see
+/// [`FollowState::Rejected`]) and an unknown pair are the `None` answer, and
+/// none of them changes anything. Removing the row steps both denormalised
+/// counters down, in the same transaction as the delete: the row and the
+/// counts it fed always move together or not at all.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remove_follower(
+    pool: &PgPool,
+    user_id: Uuid,
+    follower_id: Uuid,
+) -> AppResult<Option<Follow>> {
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query_as::<_, Follow>(REMOVE_FOLLOWER_SQL)
+        .bind(follower_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(follow) = removed else {
+        // Nothing was a follower: nothing was written, and the empty
+        // transaction ends with the connection (`chat::delete_message_for`
+        // does the same).
+        return Ok(None);
+    };
+    uncount_removed_follower(&mut tx, &follow).await?;
+    tx.commit().await?;
+    Ok(Some(follow))
 }
 
 /// Grants a follow request and returns the accepted relationship.
@@ -676,6 +724,32 @@ async fn step_counters(pool: &PgPool, follow: &Follow, step: i32) -> AppResult<(
         follow.follower_id,
         CountDelta {
             following: step,
+            ..CountDelta::default()
+        },
+    )
+    .await
+}
+
+/// Steps the two counters an accepted relationship fed back down on `conn`,
+/// inside the open transaction of [`remove_follower`]: the same pair
+/// [`step_counters`] writes, one step of `-1` each, committed together with
+/// the row's `DELETE` so a crash never leaves a counted follower without its
+/// row (or the other way round).
+async fn uncount_removed_follower(conn: &mut PgConnection, follow: &Follow) -> AppResult<()> {
+    update_counts(
+        &mut *conn,
+        follow.followee_id,
+        CountDelta {
+            followers: -1,
+            ..CountDelta::default()
+        },
+    )
+    .await?;
+    update_counts(
+        &mut *conn,
+        follow.follower_id,
+        CountDelta {
+            following: -1,
             ..CountDelta::default()
         },
     )
@@ -1213,6 +1287,120 @@ mod tests {
             relation(&pool, &dave, &carol).await,
             rejected,
             "and unfollowing leaves it in place"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn remove_follower_takes_an_accepted_follower_and_uncounts_it(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let accepted = follow(&pool, TEST_BASE_URL, &alice, &bob).await.unwrap();
+
+        let removed = remove_follower(&pool, bob.id, alice.id).await.unwrap();
+        assert_eq!(
+            removed.as_ref(),
+            Some(&accepted),
+            "the removed row comes back as it stood"
+        );
+        assert!(
+            get(&pool, alice.id, bob.id).await.unwrap().is_none(),
+            "the follower is gone from the table"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.followers_count,
+            0,
+            "the followee's count steps down with the row"
+        );
+        assert_eq!(
+            fresh_user(&pool, alice.id).await.following_count,
+            0,
+            "and the follower's"
+        );
+
+        let again = remove_follower(&pool, bob.id, alice.id).await.unwrap();
+        assert!(again.is_none(), "a second call finds no follower");
+        assert_eq!(follow_count(&pool).await, 0, "and writes nothing");
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.followers_count,
+            0,
+            "with no row left, no counter moves a second time"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn remove_follower_leaves_everything_but_a_follower_alone(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = locked_user(&pool, "carol").await;
+        let erin = local_user(&pool, "erin").await;
+
+        let pending = follow(&pool, TEST_BASE_URL, &alice, &carol).await.unwrap();
+        assert_eq!(pending.state, FollowState::Pending, "the fixture waits");
+        assert!(
+            remove_follower(&pool, carol.id, alice.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a request nobody answered is not a follower"
+        );
+        assert_eq!(
+            relation(&pool, &alice, &carol).await,
+            pending,
+            "the request waits on, untouched"
+        );
+
+        let mirrored = rejected_relation(&pool, &erin, &carol).await;
+        assert!(
+            remove_follower(&pool, carol.id, erin.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a mirrored rejection is not a follower either"
+        );
+        assert_eq!(
+            relation(&pool, &erin, &carol).await,
+            mirrored,
+            "and its row stays in place"
+        );
+
+        // The reverse of the pair the caller follows: that is the caller's
+        // own follow to give back through unfollow, not a follower to remove.
+        let outgoing = follow(&pool, TEST_BASE_URL, &carol, &bob).await.unwrap();
+        assert_eq!(outgoing.state, FollowState::Accepted, "carol follows bob");
+        assert!(
+            remove_follower(&pool, carol.id, bob.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "bob is not a follower of carol"
+        );
+        assert_eq!(
+            relation(&pool, &carol, &bob).await,
+            outgoing,
+            "the outgoing follow stays"
+        );
+
+        assert!(
+            remove_follower(&pool, carol.id, new_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "an account with no row at all is no follower"
+        );
+
+        assert_eq!(
+            (
+                fresh_user(&pool, carol.id).await.followers_count,
+                fresh_user(&pool, alice.id).await.following_count,
+                fresh_user(&pool, erin.id).await.following_count
+            ),
+            (0, 0, 0),
+            "none of these removals counted anything"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.followers_count,
+            1,
+            "and the one accepted relationship that exists is still on the books"
         );
     }
 

@@ -4,7 +4,8 @@
 //! `GET /api/v1/accounts/verify_credentials`, `GET /api/v1/accounts/{id}`,
 //! `…/lookup`, `…/relationships` and the relationship listings
 //! `…/{id}/followers` and `…/{id}/following` are the reads;
-//! `POST /api/v1/accounts/{id}/note` is the write.
+//! `POST /api/v1/accounts/{id}/note` and `…/{id}/remove_from_followers` are
+//! the writes.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
 //! `.relationships`, `.followers` and `.following`
@@ -97,6 +98,25 @@
 //! it too. An unknown, malformed or deactivated account id is the same
 //! 404 as every other route here; noting *yourself* is allowed, unlike
 //! Pleroma's follow-side checks.
+//!
+//! `POST /api/v1/accounts/{id}/remove_from_followers` is Pleroma's
+//! `AccountController.remove_from_followers` over `User.remove_follower`
+//! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`,
+//! `lib/pleroma/user.ex`): [`AuthUser`] plus the `follow` / `write:follows`
+//! scope, and the write takes the account's accepted follow of the caller
+//! out of the table through [`remove_follower`](crate::models::follow::remove_follower),
+//! counters adjusted in the same transaction. The answer is the caller's
+//! [`Relationship`] to the account, so `followed_by` reads `false`
+//! afterwards. An account that is not a follower — no row, a `pending`
+//! request of its own (those wait on the `/api/v1/follow_requests` answers,
+//! this route never touches them), or one the caller follows only — is no
+//! error: the unchanged [`Relationship`] answers it with 200. The malformed,
+//! unknown or deactivated id is the usual 404, resolved ahead of the guard
+//! that answers the caller's *own* id with 422 `{"error":"Can not remove
+//! yourself from followers"}`. A follower actually removed is the moment
+//! federation will owe that account a `Reject` for its `Follow`; the later
+//! federation ticket wires the delivery into this module's
+//! `after_follower_removed` hook.
 
 use std::collections::HashSet;
 
@@ -107,6 +127,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use tracing::debug;
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -120,10 +141,11 @@ use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
-        account_note, follow,
+        account_note,
+        follow::{self, Follow},
         user::{self, User},
     },
-    oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS},
+    oauth::scopes::{FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
     state::AppState,
     util::id::parse_id,
@@ -136,6 +158,11 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 /// The longest `comment` `POST /api/v1/accounts/{id}/note` accepts
 /// (Mastodon's `AccountNote` limit).
 const MAX_COMMENT_CHARS: usize = 2000;
+
+/// The 422 message `POST /api/v1/accounts/{id}/remove_from_followers`
+/// answers when the path names the caller: this endpoint's ticket pins the
+/// wording for the action.
+const SELF_REMOVE: &str = "Can not remove yourself from followers";
 
 /// The `Link` header's query parameters carry nothing but the cursor: the
 /// relationship listings have no filter to repeat on either link (the
@@ -151,6 +178,10 @@ pub fn router() -> Router<AppState> {
         .route("/accounts/{id}/followers", get(list_followers))
         .route("/accounts/{id}/following", get(list_following))
         .route("/accounts/{id}/note", post(set_note))
+        .route(
+            "/accounts/{id}/remove_from_followers",
+            post(remove_from_followers),
+        )
         .route("/accounts/{id}", get(show_account))
 }
 
@@ -378,12 +409,88 @@ async fn set_note(
     }
     let target = account_or_404(&state, &id).await?;
     account_note::set(&state.db, auth.0.id, target.id, &params.comment).await?;
-    let loaded = Relationship::load_many(&state.db, auth.0.id, &[target.id]).await?;
+    one_relationship(&state, auth.0.id, target.id).await
+}
+
+/// `POST /api/v1/accounts/{id}/remove_from_followers` — drop the account
+/// from the caller's followers: the accepted follow of the caller it holds
+/// is removed ([`remove_follower`](crate::models::follow::remove_follower),
+/// counters adjusted in the same transaction) and the caller's
+/// [`Relationship`] to it answered, `followed_by: false` afterwards.
+///
+/// Not being a follower is not an error: an account with no row, one whose
+/// follow of the caller is still `pending` (requests are answered through
+/// `/api/v1/follow_requests`, never removed here) or one the caller follows
+/// without being followed back changes nothing, and the unchanged
+/// [`Relationship`] answers the call with 200. The account is resolved
+/// before the self guard, as Pleroma's plug order does: a malformed,
+/// unknown or deactivated id is the shared 404 whatever it would have
+/// meant, and only a live account that turns out to be the caller is the
+/// 422.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:follows | follow` check; [`AppError::NotFound`] for a
+/// malformed, unknown or deactivated account id; [`AppError::Unprocessable`]
+/// with [`SELF_REMOVE`] when the id names the caller. Any database failure
+/// arrives through `?` as [`AppError::Database`].
+async fn remove_from_followers(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Relationship>> {
+    auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
+    let follower = account_or_404(&state, &id).await?;
+    if follower.id == auth.0.id {
+        return Err(AppError::Unprocessable(SELF_REMOVE.to_owned()));
+    }
+    let removed = follow::remove_follower(&state.db, auth.0.id, follower.id).await?;
+    if let Some(row) = removed.as_ref() {
+        debug!(
+            follow = %row.id,
+            user = %auth.0.id,
+            "follower removed"
+        );
+        after_follower_removed(&state, &auth.0, row);
+    }
+    one_relationship(&state, auth.0.id, follower.id).await
+}
+
+/// The caller's [`Relationship`] to one account, rendered after a write:
+/// [`Relationship::load_many`] over the single target, so the answer states
+/// the stored fact rather than trusting the request (the write-behind read
+/// of Pleroma's `relationship.json`). Shared by [`set_note`] and
+/// [`remove_from_followers`].
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`]; the
+/// [`AppError::Internal`] arm only documents that the loader answers one row
+/// per requested id, which a single-target batch always does.
+async fn one_relationship(
+    state: &AppState,
+    viewer_id: Uuid,
+    target_id: Uuid,
+) -> AppResult<Json<Relationship>> {
+    let loaded = Relationship::load_many(&state.db, viewer_id, &[target_id]).await?;
     let relationship = loaded.into_iter().next().ok_or_else(|| {
         AppError::Internal("the relationship loader skipped its only target".to_owned())
     })?;
     Ok(Json(relationship))
 }
+
+/// Post-removal hook of [`remove_from_followers`], run once per actually
+/// removed follower: the federation ticket that answers a dropped follower
+/// with a `Reject` for its `Follow` wires the delivery in here — the
+/// activity to reject is [`Follow::ap_id`], its sender [`Follow::follower_id`],
+/// and the queueing happens through `state` (decision 11).
+///
+/// Intentionally empty until then, like the follow-request answers'
+/// [`after_follow_request_resolved`](crate::api::follow_requests): Pleroma's
+/// `User.remove_follower` delivers the `Reject` inline, and this server's
+/// delivery queue is a later ticket.
+const fn after_follower_removed(_state: &AppState, _followee: &User, _removed: &Follow) {}
 
 /// `GET /api/v1/accounts/{id}/followers` — the accounts that follow `id`
 /// with an accepted relationship, newest follow first, one [`PageParams`]
