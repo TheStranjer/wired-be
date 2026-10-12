@@ -44,6 +44,15 @@ pub const READ_ACCOUNTS: &str = "read:accounts";
 /// a dismissal a user stores about themselves (Pleroma's `write:accounts`).
 pub const WRITE_ACCOUNTS: &str = "write:accounts";
 
+/// The read side of domain blocks: `GET /api/v1/domain_blocks`, the list
+/// a client shows its user (Pleroma's `read:blocks` on the
+/// `DomainBlockController` `index` action, there aliased by `follow`).
+pub const READ_BLOCKS: &str = "read:blocks";
+/// The write side of domain blocks: `POST` and `DELETE`
+/// `/api/v1/domain_blocks` (Pleroma's `write:blocks` on the controller's
+/// remaining actions, with the `follow` root as an accepted alternative).
+pub const WRITE_BLOCKS: &str = "write:blocks";
+
 /// The read side of chats: the `/api/v1` and `/api/v2` chat lists and
 /// `GET /api/v1/pleroma/chats/{id}` (Pleroma's `read:chats` on `ChatController`'s
 /// `index`, `index2` and `show` actions).

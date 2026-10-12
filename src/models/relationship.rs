@@ -12,16 +12,18 @@
 //! `showing_reblogs` / `notifying` from the viewer's own follow rows, and
 //! `followed_by` from the accepted incoming rows. The `account_notes`
 //! table (owned by [`crate::models::account_note`]) supplies `note`: the
-//! viewer's stored comment, the empty string where they have none. Every
-//! other flag of the entity is a documented default until its own ticket
-//! lands; each one then adds exactly one field to `FlagSources`, one line
-//! (one query) to `flag_sources` and one flag line to `assemble`:
+//! viewer's stored comment, the empty string where they have none. The
+//! `user_domain_blocks` table (owned by [`crate::models::domain_block`])
+//! supplies `domain_blocking`: true for a remote target whose host the
+//! viewer has blocked, never for a local one. Every other flag of the
+//! entity is a documented default until its own ticket lands; each one
+//! then adds exactly one field to `FlagSources`, one line (one query) to
+//! `flag_sources` and one flag line to `assemble`:
 //!
 //! - the blocks ticket: `blocking`, `blocked_by` (one query over `blocks`);
 //! - the mutes ticket: `muting`, `muting_notifications` (one query over
 //!   `mutes`);
-//! - the endorsements ticket: `endorsed` (one query);
-//! - the domain-blocks ticket: `domain_blocking` (one query).
+//! - the endorsements ticket: `endorsed` (one query).
 
 use std::collections::{HashMap, HashSet};
 
@@ -47,6 +49,17 @@ const OUTGOING_SQL: &str = "SELECT followee_id AS target_id, state, show_reblogs
 const INCOMING_SQL: &str = "SELECT follower_id AS target_id
       FROM follows
      WHERE followee_id = $1 AND follower_id = ANY($2) AND state = 'accepted'";
+
+/// [`load_many`](Relationship::load_many)'s domain-block side: which of
+/// the requested targets are remote accounts on a domain the viewer
+/// blocks — the whole answer behind `domain_blocking`, in one statement.
+/// `NOT t.local` states the ticket's rule that a local account is never
+/// domain-blocked (its `domain` is `NULL` and joins nowhere anyway); the
+/// join matches the canonical stored spelling of the block exactly, with
+/// no subdomain widening.
+const DOMAIN_BLOCKING_SQL: &str = "SELECT t.id AS target_id FROM users t
+      JOIN user_domain_blocks b ON b.user_id = $1 AND b.domain = t.domain
+     WHERE t.id = ANY($2) AND NOT t.local";
 
 /// One `follows` row of the viewer's, narrowed to the columns that feed
 /// relationship flags. The full row type lives in
@@ -82,6 +95,11 @@ struct FlagSources {
     /// by [`account_note::get_many`] — one query. Targets without a stored
     /// note are absent, and [`assemble`] renders them the empty string.
     notes: HashMap<Uuid, String>,
+    /// The remote targets on a domain the viewer blocks: decides
+    /// `domain_blocking`. Loaded by [`domain_blocked_targets`] — one
+    /// query. Local targets and unblocked domains are absent, and
+    /// [`assemble`] renders them the flag's `false` default.
+    domain_blocking: HashSet<Uuid>,
 }
 
 /// The single inherent implementation of the entity: the constructor that
@@ -162,6 +180,9 @@ async fn flag_sources(
         followed_by: incoming_follows(pool, viewer_id, target_ids).await?,
         // The account_notes table: one batched read of the viewer's notes.
         notes: account_note::get_many(pool, viewer_id, target_ids).await?,
+        // The user_domain_blocks table: one join deciding the flag for
+        // every target at once.
+        domain_blocking: domain_blocked_targets(pool, viewer_id, target_ids).await?,
     })
 }
 
@@ -195,9 +216,26 @@ async fn incoming_follows(
     Ok(rows.into_iter().map(|(target_id,)| target_id).collect())
 }
 
+/// The ids among `target_ids` of remote accounts on one of `viewer_id`'s
+/// blocked domains — the whole `domain_blocking` answer, in one
+/// statement (see [`DOMAIN_BLOCKING_SQL`]).
+async fn domain_blocked_targets(
+    pool: &PgPool,
+    viewer_id: Uuid,
+    target_ids: &[Uuid],
+) -> AppResult<HashSet<Uuid>> {
+    let rows = sqlx::query_as::<_, (Uuid,)>(DOMAIN_BLOCKING_SQL)
+        .bind(viewer_id)
+        .bind(target_ids.to_vec())
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(target_id,)| target_id).collect())
+}
+
 /// Folds the loaded sources into the entity for one target: the six flags
-/// the follows table answers and the [`note`] the notes table holds take
-/// their sources' values, every other flag keeps the default
+/// the follows table answers, the [`note`] the notes table holds and the
+/// `domain_blocking` the domain-block join decided take their sources'
+/// values, every other flag keeps the default
 /// [`Relationship::unconnected`] states.
 ///
 /// [`note`]: Relationship::note
@@ -213,6 +251,7 @@ fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
         notifying: JsonBool(notifying),
         subscribing: JsonBool(notifying),
         showing_reblogs: JsonBool(follow.is_none_or(|row| row.show_reblogs)),
+        domain_blocking: JsonBool(sources.domain_blocking.contains(&target_id)),
         note: sources.notes.get(&target_id).cloned().unwrap_or_default(),
         ..Relationship::unconnected(target_id)
     }
@@ -226,7 +265,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            account_note, follow,
+            account_note, domain_block, follow,
             user::{Flag, NewUser, User, insert, local_ap_id},
         },
         util::id::new_id,
@@ -264,6 +303,24 @@ mod tests {
         )
         .await
         .expect("the locked fixture inserts")
+    }
+
+    /// Inserts a mirror of the remote actor `nickname` on `host`: the
+    /// non-local row a fetched actor leaves behind (decision 7), with its
+    /// host in `domain` — the column the domain-block join reads.
+    async fn remote_user(pool: &PgPool, nickname: &str, host: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("{nickname}@{host}"),
+                ap_id: format!("https://{host}/users/{nickname}"),
+                domain: Some(host.to_owned()),
+                name: nickname.to_owned(),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts")
     }
 
     /// The relationship [`Relationship::load_many`] answers for `viewer`
@@ -333,7 +390,10 @@ mod tests {
     /// Asserts the flags no source has computed (yet) keep their defaults:
     /// the constants the ticket promises until each flag's own ticket
     /// stores its data. `note` is computed now, but these fixtures store
-    /// no note, so its source answers the empty default here too.
+    /// no note, so its source answers the empty default here too;
+    /// `domain_blocking` is computed as well, and its dedicated fixtures
+    /// below test it — these tests pair viewers with local targets, which
+    /// that flag can never light up for.
     fn assert_placeholder_flags(relationship: &Relationship) {
         assert!(!relationship.endorsed.0, "endorsements have no table yet");
         assert!(
@@ -348,10 +408,6 @@ mod tests {
         assert!(
             !relationship.muting_notifications.0,
             "notification mutes have no table yet"
-        );
-        assert!(
-            !relationship.domain_blocking.0,
-            "domain blocks have no table yet"
         );
         assert!(
             relationship.note.is_empty(),
@@ -654,5 +710,58 @@ mod tests {
         let alice = local_user(&pool, "alice").await;
         let loaded = Relationship::load_many(&pool, alice.id, &[]).await.unwrap();
         assert!(loaded.is_empty(), "no targets, no relationships");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_remote_target_on_a_blocked_domain_is_domain_blocking(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = remote_user(&pool, "bob", "spam.example").await;
+        let carol = remote_user(&pool, "carol", "other.example").await;
+        domain_block::block_domain(&pool, alice.id, "spam.example")
+            .await
+            .expect("the fixture block stores");
+
+        let loaded = Relationship::load_many(&pool, alice.id, &[bob.id, carol.id])
+            .await
+            .expect("the batch reads");
+        let flags: Vec<bool> = loaded.iter().map(|row| row.domain_blocking.0).collect();
+        assert_eq!(
+            flags,
+            vec![true, false],
+            "the blocked host's remote account is domain-blocking, another host's is not"
+        );
+
+        // The flag is the viewer's own: another account that has not
+        // blocked anything reads the same target unblocked.
+        let dave = local_user(&pool, "dave").await;
+        let other_view = one_relationship(&pool, &dave, &bob).await;
+        assert!(
+            !other_view.domain_blocking.0,
+            "dave blocked nothing, so bob's host is open to him"
+        );
+
+        domain_block::unblock_domain(&pool, alice.id, "spam.example")
+            .await
+            .expect("the fixture unblock runs");
+        let after = one_relationship(&pool, &alice, &bob).await;
+        assert!(!after.domain_blocking.0, "lifting the block lifts the flag");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn local_accounts_are_never_domain_blocking(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        // Block this very instance's domain: even a "blocked" host cannot
+        // make a local target domain-blocking (the join's `NOT local`).
+        domain_block::block_domain(&pool, alice.id, "test.example")
+            .await
+            .expect("the fixture block stores");
+
+        let relationship = one_relationship(&pool, &alice, &bob).await;
+        assert!(
+            !relationship.domain_blocking.0,
+            "the local target of a local viewer stands unblocked"
+        );
+        assert_placeholder_flags(&relationship);
     }
 }

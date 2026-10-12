@@ -17,6 +17,7 @@ pub mod account_note;
 pub mod announcement;
 pub mod chat;
 pub mod custom_emoji;
+pub mod domain_block;
 pub mod filter;
 pub mod follow;
 pub mod instance_rule;
