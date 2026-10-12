@@ -34,6 +34,9 @@ pub const MAX_POLL_OPTIONS_VAR: &str = "MAX_POLL_OPTIONS";
 /// Environment variable holding the maximum chat message length in
 /// characters.
 pub const MAX_CHAT_MESSAGE_CHARS_VAR: &str = "MAX_CHAT_MESSAGE_CHARS";
+/// Environment variable holding the maximum media description length in
+/// characters.
+pub const MAX_MEDIA_DESCRIPTION_VAR: &str = "MAX_MEDIA_DESCRIPTION";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum number of files per request.
@@ -88,6 +91,12 @@ pub const DEFAULT_MAX_POLL_OPTIONS: usize = 20;
 /// the same number the chat model's storage backstop keeps, pinned together
 /// by a test in this module.
 pub const DEFAULT_MAX_CHAT_MESSAGE_CHARS: usize = 5_000;
+/// Media description length used when `MAX_MEDIA_DESCRIPTION` is unset.
+///
+/// It is the 1500 characters Mastodon caps an attachment's alt text at
+/// (`MAX_ALTERNATIVE_TEXT_SIZE` in `config/settings.yml`);
+/// `PUT /api/v1/media/{id}` refuses a longer `description`.
+pub const DEFAULT_MAX_MEDIA_DESCRIPTION: usize = 1_500;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -215,6 +224,10 @@ pub struct Config {
     /// `MAX_CHAT_MESSAGE_CHARS`; `POST /api/v1/pleroma/chats/{id}/messages`
     /// refuses longer content.
     pub max_chat_message_chars: usize,
+    /// Maximum length of a media attachment's `description` (alt text) in
+    /// characters, from `MAX_MEDIA_DESCRIPTION`; `PUT /api/v1/media/{id}`
+    /// refuses longer values.
+    pub max_media_description: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -314,6 +327,11 @@ impl Config {
             MAX_CHAT_MESSAGE_CHARS_VAR,
             DEFAULT_MAX_CHAT_MESSAGE_CHARS,
         )?;
+        let max_media_description = number(
+            &lookup,
+            MAX_MEDIA_DESCRIPTION_VAR,
+            DEFAULT_MAX_MEDIA_DESCRIPTION,
+        )?;
         let upload_limits = UploadLimits {
             max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
             max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
@@ -341,6 +359,7 @@ impl Config {
             max_media_attachments,
             max_poll_options,
             max_chat_message_chars,
+            max_media_description,
             upload_limits,
             uploads_dir,
             emoji_dir,
@@ -412,6 +431,7 @@ impl Config {
             max_media_attachments: DEFAULT_MAX_MEDIA_ATTACHMENTS,
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
             max_chat_message_chars: DEFAULT_MAX_CHAT_MESSAGE_CHARS,
+            max_media_description: DEFAULT_MAX_MEDIA_DESCRIPTION,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
@@ -595,6 +615,7 @@ impl fmt::Debug for Config {
             .field("max_media_attachments", &self.max_media_attachments)
             .field("max_poll_options", &self.max_poll_options)
             .field("max_chat_message_chars", &self.max_chat_message_chars)
+            .field("max_media_description", &self.max_media_description)
             .field("upload_limits", &self.upload_limits)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
@@ -799,6 +820,10 @@ mod tests {
             "default max_chat_message_chars"
         );
         assert_eq!(
+            config.max_media_description, 1_500,
+            "default max_media_description"
+        );
+        assert_eq!(
             config.upload_limits.max_file_bytes, 16_000_000,
             "default UPLOAD_LIMIT_BYTES"
         );
@@ -948,6 +973,20 @@ mod tests {
         assert!(
             debug.contains("max_chat_message_chars: 140"),
             "the chat length is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn reads_custom_max_media_description() {
+        let config = config_with(&[(MAX_MEDIA_DESCRIPTION_VAR, "100")]);
+        assert_eq!(
+            config.max_media_description, 100,
+            "custom MAX_MEDIA_DESCRIPTION"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_media_description: 100"),
+            "the description limit is visible in Debug output: {debug}"
         );
     }
 

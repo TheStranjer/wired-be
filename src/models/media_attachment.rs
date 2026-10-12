@@ -310,36 +310,84 @@ pub async fn for_statuses(
     Ok(grouped)
 }
 
-/// Writes `description` and the focal point (`focus_x`, `focus_y`) onto
-/// attachment `id` and returns the updated row, `None` when no row
-/// matches.
+/// The media `GET` and `PUT /api/v1/media/{id}` serve: the row `id`,
+/// provided `user_id` uploaded it and no status has claimed it.
 ///
-/// The three columns are set wholesale: a `None` argument clears what was
-/// stored (which is how a client removes alt text or a focal point). The
-/// update is not scoped by user — the endpoint using it (Mastodon's
-/// `PUT /api/v1/media/{id}`) checks ownership itself before calling.
+/// Mastodon's semantics for these endpoints: media attached to a status is
+/// edited through the status, not here, so an attached row is answered the
+/// same as an unknown or foreign one — the caller's one 404 keeps a client
+/// from learning which foreign or claimed ids exist.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn update_description_focus(
+pub async fn get_own_unattached(
     pool: &PgPool,
     id: Uuid,
-    description: Option<&str>,
-    focus_x: Option<f32>,
-    focus_y: Option<f32>,
+    user_id: Uuid,
+) -> AppResult<Option<MediaAttachment>> {
+    let attachment = sqlx::query_as::<_, MediaAttachment>(
+        "SELECT * FROM media_attachments
+          WHERE id = $1 AND user_id = $2 AND status_id IS NULL",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(attachment)
+}
+
+/// The metadata `PUT /api/v1/media/{id}` writes onto a row: alt text, the
+/// focal point and the preview URL.
+///
+/// Like [`NewMediaAttachment`], every column is written wholesale — a `None`
+/// clears what was stored. The endpoint merges present-only parameters over
+/// the stored row before building one, so an absent parameter arrives here
+/// as the value already kept.
+#[derive(Clone, Debug, Default)]
+pub struct MediaMetadata {
+    /// Alt text.
+    pub description: Option<String>,
+    /// Horizontal focal point.
+    pub focus_x: Option<f32>,
+    /// Vertical focal point.
+    pub focus_y: Option<f32>,
+    /// Preview/thumbnail URL.
+    pub preview_url: Option<String>,
+}
+
+/// Writes `metadata` onto attachment `id` and returns the updated row.
+///
+/// `None` when the row is gone or has fallen outside the endpoint's reach:
+/// not `user_id`'s own, or claimed by a status since
+/// [`get_own_unattached`] read it. The `WHERE` clause repeats that gate so
+/// the check and the write are one statement; callers answer `None` with
+/// their 404.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn update_own_metadata(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    metadata: &MediaMetadata,
 ) -> AppResult<Option<MediaAttachment>> {
     let attachment = sqlx::query_as::<_, MediaAttachment>(
         "UPDATE media_attachments
-            SET description = $2, focus_x = $3, focus_y = $4, updated_at = now()
-          WHERE id = $1
+            SET description = $3, focus_x = $4, focus_y = $5,
+                preview_url = $6, updated_at = now()
+          WHERE id = $1 AND user_id = $2 AND status_id IS NULL
         RETURNING *",
     )
     .bind(id)
-    .bind(description)
-    .bind(focus_x)
-    .bind(focus_y)
+    .bind(user_id)
+    .bind(metadata.description.as_deref())
+    .bind(metadata.focus_x)
+    .bind(metadata.focus_y)
+    .bind(metadata.preview_url.as_deref())
     .fetch_optional(pool)
     .await?;
     Ok(attachment)
@@ -892,15 +940,75 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_description_focus_writes_all_three_columns(pool: PgPool) {
+    async fn get_own_unattached_serves_only_the_caller_s_unposted_media(pool: PgPool) {
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let mine = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let posted = create_status(&pool, &alice).await;
+        let attached = insert(
+            &pool,
+            &NewMediaAttachment {
+                status_id: Some(posted.id),
+                ..new_upload(alice.id)
+            },
+        )
+        .await
+        .unwrap();
+        let foreign = insert(&pool, &new_upload(bob.id)).await.unwrap();
+        let ownerless = insert(
+            &pool,
+            &NewMediaAttachment {
+                user_id: None,
+                ..new_upload(alice.id)
+            },
+        )
+        .await
+        .unwrap();
+
+        let found = get_own_unattached(&pool, mine.id, alice.id)
+            .await
+            .unwrap()
+            .expect("alice's own unattached media reads back");
+        assert_eq!(found.id, mine.id, "and it is the row named");
+
+        for nope in [new_id(), attached.id, foreign.id, ownerless.id] {
+            assert!(
+                get_own_unattached(&pool, nope, alice.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "`{nope}` is no readable media for alice: unknown, attached, \
+                 foreign, or ownerless alike"
+            );
+        }
+        assert!(
+            get_own_unattached(&pool, mine.id, bob.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "bob cannot read alice's media either"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_own_metadata_writes_all_four_columns(pool: PgPool) {
         let alice = create_user(&pool, "alice").await;
         let stored = insert(&pool, &new_upload(alice.id)).await.unwrap();
 
-        let updated =
-            update_description_focus(&pool, stored.id, Some("a cat"), Some(0.5), Some(-0.5))
-                .await
-                .unwrap()
-                .expect("the row exists");
+        let updated = update_own_metadata(
+            &pool,
+            stored.id,
+            alice.id,
+            &MediaMetadata {
+                description: Some("a cat".to_owned()),
+                focus_x: Some(0.5),
+                focus_y: Some(-0.5),
+                preview_url: Some(format!("{BASE}/media/alice/9b3c-small.png")),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the row exists and is alice's unattached media");
         assert_eq!(
             updated.description.as_deref(),
             Some("a cat"),
@@ -908,23 +1016,73 @@ mod tests {
         );
         assert_eq!(updated.focus_x, Some(0.5), "focal point x is written");
         assert_eq!(updated.focus_y, Some(-0.5), "focal point y is written");
+        assert_eq!(
+            updated.preview_url.as_deref(),
+            Some("https://test.example/media/alice/9b3c-small.png"),
+            "the preview url is written"
+        );
         assert_eq!(updated.url, stored.url, "the rest of the row is kept");
 
-        let cleared = update_description_focus(&pool, stored.id, None, None, None)
+        let cleared = update_own_metadata(&pool, stored.id, alice.id, &MediaMetadata::default())
             .await
             .unwrap()
             .expect("the row still exists");
         assert!(
-            cleared.description.is_none() && cleared.focus_x.is_none() && cleared.focus_y.is_none(),
-            "None arguments clear the columns"
+            cleared.description.is_none()
+                && cleared.focus_x.is_none()
+                && cleared.focus_y.is_none()
+                && cleared.preview_url.is_none(),
+            "absent metadata clears the columns"
         );
 
         assert!(
-            update_description_focus(&pool, new_id(), Some("x"), None, None)
+            update_own_metadata(&pool, new_id(), alice.id, &MediaMetadata::default())
                 .await
                 .unwrap()
                 .is_none(),
             "an unknown id updates nothing"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_own_metadata_only_touches_own_unattached_media(pool: PgPool) {
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let metadata = MediaMetadata {
+            description: Some("hijacked".to_owned()),
+            ..MediaMetadata::default()
+        };
+
+        let posted = create_status(&pool, &alice).await;
+        let attached = insert(
+            &pool,
+            &NewMediaAttachment {
+                status_id: Some(posted.id),
+                ..new_upload(alice.id)
+            },
+        )
+        .await
+        .unwrap();
+        let foreign = insert(&pool, &new_upload(bob.id)).await.unwrap();
+
+        for nope in [attached.id, foreign.id] {
+            assert!(
+                update_own_metadata(&pool, nope, alice.id, &metadata)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "`{nope}` is out of alice's reach: attached or foreign"
+            );
+        }
+        assert_eq!(
+            fetch(&pool, attached.id).await.description,
+            None,
+            "the attached row kept its (empty) description"
+        );
+        assert_eq!(
+            fetch(&pool, foreign.id).await.description,
+            None,
+            "and the foreign row never heard of alice"
         );
     }
 
