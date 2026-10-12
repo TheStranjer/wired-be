@@ -23,6 +23,12 @@
 //! `target_account` use for the followed account), because `follower` next to
 //! `followee` is one Clippy `similar_names` error; the row keeps the table's
 //! own `follower_id` and `followee_id` names.
+//!
+//! The two per-follow toggles the row carries are read by
+//! [`crate::models::relationship`] for the
+//! [`Relationship`](crate::entities::relationship::Relationship) entity, and
+//! [`set_notify`] is the only writer of `notify`: Mastodon's `follow?notify`
+//! and Pleroma's `subscribe` / `unsubscribe` are the same one column.
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, postgres::PgRow};
@@ -78,6 +84,16 @@ const ACCEPT_SQL: &str = "UPDATE follows
 /// [`reject`]: the request is gone, and the removed row comes back.
 const REJECT_SQL: &str = "DELETE FROM follows WHERE id = $1 RETURNING *";
 
+/// [`set_notify`]: the `notify` toggle, written only onto an *accepted*
+/// relationship — Pleroma's `subscribe`/`unsubscribe` and Mastodon's
+/// `follow?notify` all act on a granted follow — and refreshing
+/// `updated_at` the way [`ACCEPT_SQL`] does.
+const SET_NOTIFY_SQL: &str = "UPDATE follows
+       SET notify = $3,
+           updated_at = now()
+     WHERE follower_id = $1 AND followee_id = $2 AND state = 'accepted'
+   RETURNING *";
+
 /// [`get`]: the one relationship of an ordered pair, whatever its state.
 const GET_SQL: &str = "SELECT * FROM follows WHERE follower_id = $1 AND followee_id = $2";
 
@@ -122,6 +138,17 @@ const FOLLOWING_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
 const PENDING_REQUESTS_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.follower_id
      WHERE f.state = 'pending' AND f.followee_id = ";
+
+/// The outgoing side of [`outgoing_requests_from`]: the users whose follow of
+/// the bound account is still waiting on their answer — the accounts a pending
+/// row names as its `followee`, the mirror of [`PENDING_REQUESTS_SQL`] — each
+/// entry led by the `follow_id` of the request row behind it, the id the page
+/// keys on. The text stops where its one placeholder belongs, because that is
+/// where [`page_rows`] pushes its bind and the builder is what numbers it
+/// `$1`; the keyset it then appends runs on the relationship id `f.id`.
+const PENDING_OUTGOING_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
+    JOIN users u ON u.id = f.followee_id
+     WHERE f.state = 'pending' AND f.follower_id = ";
 
 /// [`pending_count`]: the same queue [`pending_requests_for`] pages through,
 /// counted rather than listed. The `::int` cast is what makes `count(*)`'s
@@ -328,6 +355,39 @@ pub async fn reject(pool: &PgPool, follow_id: Uuid) -> AppResult<Follow> {
     Ok(follow)
 }
 
+/// Sets the `notify` toggle of the accepted relationship between
+/// `follower_id` and `target_id` and returns the updated row.
+///
+/// The one column the notification flags of
+/// [`Relationship`](crate::entities::relationship::Relationship) are read
+/// from: Pleroma's `POST /api/v1/pleroma/accounts/{id}/subscribe` and
+/// `…/unsubscribe` (`User.subscribe` / `User.unsubscribe`) write it here, and
+/// Mastodon's `follow?notify` param writes the same flag on the relationship
+/// it creates.
+///
+/// Only a *granted* follow can be subscribed to: a `pending` request nobody
+/// answered and a pair with no row at all are answered `None` with nothing
+/// written, which is the fact the endpoints turn into their refusal.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_notify(
+    pool: &PgPool,
+    follower_id: Uuid,
+    target_id: Uuid,
+    notify: bool,
+) -> AppResult<Option<Follow>> {
+    let updated = sqlx::query_as::<_, Follow>(SET_NOTIFY_SQL)
+        .bind(follower_id)
+        .bind(target_id)
+        .bind(notify)
+        .fetch_optional(pool)
+        .await?;
+    Ok(updated)
+}
+
 /// The relationship between the ordered pair (`follower_id`,
 /// `target_id`), whatever its state, `None` when the pair has none.
 ///
@@ -428,6 +488,31 @@ pub async fn pending_requests_for(
     page: PageParams,
 ) -> AppResult<Vec<FollowPageEntry>> {
     page_rows(pool, PENDING_REQUESTS_SQL, target_id, &page).await
+}
+
+/// The users `follower_id` has asked to follow and who have not answered: the
+/// caller's own outgoing requests, newest request first and `page`'s `limit`
+/// at a time.
+///
+/// Pleroma's `get_outgoing_follow_requests_query`, the list behind
+/// `GET /api/v1/pleroma/outgoing_follow_requests`. It is the mirror of
+/// [`pending_requests_for`], the other end of the same rows: here the bound
+/// account is [`Follow::follower_id`] rather than [`Follow::followee_id`], so
+/// these are requests to withdraw, not to answer. Like it, each entry carries
+/// the [`Follow`] row's id next to the [`User`] (see [`FollowPageEntry`]) and
+/// keysets on that id (decision 4), so the endpoint's `max_id`/`min_id`
+/// cursors and `Link` header carry follow row ids.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn outgoing_requests_from(
+    pool: &PgPool,
+    follower_id: Uuid,
+    page: PageParams,
+) -> AppResult<Vec<FollowPageEntry>> {
+    page_rows(pool, PENDING_OUTGOING_SQL, follower_id, &page).await
 }
 
 /// How many follow requests are waiting for `user_id` to answer them: the
@@ -1827,6 +1912,186 @@ mod tests {
         assert!(
             move_followers_of(&pool, new_id()).await.unwrap().is_empty(),
             "an account nobody follows has an empty move set"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn set_notify_writes_only_an_accepted_relationship(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = locked_user(&pool, "carol").await;
+        let accepted = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("the outgoing follow is granted");
+        assert_eq!(accepted.state, FollowState::Accepted, "the fixture counts");
+        let waiting = follow(&pool, TEST_BASE_URL, &alice, &carol)
+            .await
+            .expect("the request to the locked account waits");
+        assert_eq!(waiting.state, FollowState::Pending, "the fixture waits");
+
+        assert!(
+            set_notify(&pool, alice.id, new_id(), true)
+                .await
+                .unwrap()
+                .is_none(),
+            "a pair with no row has nothing to toggle"
+        );
+        assert!(
+            set_notify(&pool, alice.id, carol.id, true)
+                .await
+                .unwrap()
+                .is_none(),
+            "a request nobody answered cannot be subscribed to"
+        );
+        assert!(
+            set_notify(&pool, bob.id, alice.id, true)
+                .await
+                .unwrap()
+                .is_none(),
+            "the other direction of the accepted pair has no row"
+        );
+        assert!(
+            !relation(&pool, &alice, &carol).await.notify,
+            "the refused writes stored nothing"
+        );
+
+        let subscribed = set_notify(&pool, alice.id, bob.id, true)
+            .await
+            .unwrap()
+            .expect("the accepted row toggles");
+        assert_eq!(subscribed.id, accepted.id, "the same row, updated in place");
+        assert_eq!(
+            subscribed.state,
+            FollowState::Accepted,
+            "toggling does not unfollow"
+        );
+        assert!(subscribed.notify, "the row comes back with the flag on");
+        assert!(
+            relation(&pool, &alice, &bob).await.notify,
+            "and the column holds it"
+        );
+        assert_eq!(
+            (
+                fresh_user(&pool, bob.id).await.followers_count,
+                fresh_user(&pool, alice.id).await.following_count
+            ),
+            (1, 1),
+            "the toggle moves no counters"
+        );
+
+        let unsubscribed = set_notify(&pool, alice.id, bob.id, false)
+            .await
+            .unwrap()
+            .expect("the flag goes back the same way");
+        assert!(!unsubscribed.notify, "the row comes back with the flag off");
+        assert!(
+            !relation(&pool, &alice, &bob).await.notify,
+            "and so does the stored column"
+        );
+        assert!(
+            relation(&pool, &alice, &bob).await.show_reblogs,
+            "the write touches only the notify toggle"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn outgoing_requests_are_the_callers_own_asks(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = locked_user(&pool, "carol").await;
+        let dave = locked_user(&pool, "dave").await;
+
+        let to_carol = follow(&pool, TEST_BASE_URL, &alice, &carol)
+            .await
+            .expect("carol has to answer alice");
+        let to_dave = follow(&pool, TEST_BASE_URL, &alice, &dave)
+            .await
+            .expect("so does dave");
+        assert_eq!(to_carol.state, FollowState::Pending, "both wait");
+        assert_eq!(to_dave.state, FollowState::Pending, "both wait");
+        // Alice's granted follow of bob is a follow, not a request, and
+        // carol's own request to dave is dave's queue to answer.
+        let granted = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("bob answers on the spot");
+        assert_eq!(granted.state, FollowState::Accepted, "the fixture counts");
+        let incoming = follow(&pool, TEST_BASE_URL, &carol, &dave)
+            .await
+            .expect("carol asks dave too");
+        assert_eq!(incoming.state, FollowState::Pending, "and that waits");
+
+        let rows = vec![to_carol, to_dave];
+        let newest_first = followed_newest_first(&rows);
+        let newest_ids: Vec<Uuid> = by_age(&rows).iter().rev().map(|row| row.id).collect();
+
+        assert_eq!(
+            entry_ids(
+                &outgoing_requests_from(&pool, alice.id, page(""))
+                    .await
+                    .unwrap()
+            ),
+            newest_first,
+            "both of alice's asks, newest row first; the granted follow and \
+             the incoming request stay out"
+        );
+        let first = outgoing_requests_from(&pool, alice.id, page("limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            entry_ids(&first),
+            newest_first[..1].to_vec(),
+            "one ask per page"
+        );
+        assert_eq!(
+            follow_ids(&first),
+            newest_ids[..1].to_vec(),
+            "the entry carries the request row id the page keys on"
+        );
+        assert_eq!(
+            entry_ids(
+                &outgoing_requests_from(
+                    &pool,
+                    alice.id,
+                    page(&format!("max_id={}", newest_ids[0]))
+                )
+                .await
+                .unwrap()
+            ),
+            newest_first[1..].to_vec(),
+            "max_id continues where the page ended"
+        );
+        assert!(
+            outgoing_requests_from(&pool, bob.id, page(""))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an account that asked nobody has an empty list"
+        );
+        assert!(
+            outgoing_requests_from(&pool, dave.id, page(""))
+                .await
+                .unwrap()
+                .is_empty(),
+            "requests made to an account are not its own outgoing asks"
+        );
+
+        let answered = accept(&pool, newest_ids[1])
+            .await
+            .expect("the older ask is answered");
+        assert_eq!(
+            answered.state,
+            FollowState::Accepted,
+            "and the answer grants it"
+        );
+        let rest: Vec<Uuid> = entry_ids(
+            &outgoing_requests_from(&pool, alice.id, page(""))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rest,
+            newest_first[..1].to_vec(),
+            "an answered ask leaves the outgoing list"
         );
     }
 }
