@@ -195,6 +195,10 @@ pub struct User {
     pub email_confirmed: Flag,
     /// Whether a moderator still has to approve the account.
     pub approval_pending: Flag,
+    /// The `reason` text given at registration, kept for the later
+    /// approval flow (Pleroma's `users.registration_reason`); `None` when
+    /// the account stated none.
+    pub registration_reason: Option<String>,
     /// When the account was last seen; `None` when it never was.
     pub last_active_at: Option<DateTime<Utc>>,
     /// Number of followers; moved by [`update_counts`].
@@ -276,6 +280,7 @@ impl fmt::Debug for User {
             .field("last_move_at", &self.last_move_at)
             .field("email_confirmed", &self.email_confirmed)
             .field("approval_pending", &self.approval_pending)
+            .field("registration_reason", &self.registration_reason)
             .field("last_active_at", &self.last_active_at)
             .field("followers_count", &self.followers_count)
             .field("following_count", &self.following_count)
@@ -401,6 +406,9 @@ pub struct NewUser {
     pub email_confirmed: Flag,
     /// Whether the account awaits moderator approval; `false` by default.
     pub approval_pending: Flag,
+    /// The registration `reason` text to store; `None` (no reason stated)
+    /// by default.
+    pub registration_reason: Option<String>,
     /// When the account was last seen.
     pub last_active_at: Option<DateTime<Utc>>,
     /// Initial follower count; `0` by default.
@@ -476,6 +484,7 @@ impl fmt::Debug for NewUser {
             .field("last_move_at", &self.last_move_at)
             .field("email_confirmed", &self.email_confirmed)
             .field("approval_pending", &self.approval_pending)
+            .field("registration_reason", &self.registration_reason)
             .field("last_active_at", &self.last_active_at)
             .field("followers_count", &self.followers_count)
             .field("following_count", &self.following_count)
@@ -543,6 +552,7 @@ impl Default for NewUser {
             last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
+            registration_reason: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,
@@ -598,13 +608,14 @@ const INSERT_SQL: &str = "INSERT INTO users (
      tags, settings_store, background_image_url, birthday, show_birthday,
      also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
      approval_pending, last_active_at, followers_count, following_count,
-     statuses_count, last_status_at, last_fetched_at, mfa_settings
+     statuses_count, last_status_at, last_fetched_at, mfa_settings,
+     registration_reason
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59
+     $55, $56, $57, $58, $59, $60
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -681,6 +692,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.last_status_at)
         .bind(new_user.last_fetched_at)
         .bind(new_user.mfa_settings.clone())
+        .bind(new_user.registration_reason.as_deref())
         .fetch_one(pool)
         .await?;
     Ok(user)
@@ -1194,6 +1206,10 @@ mod tests {
             "approval is not pending by default"
         );
         assert!(
+            user.registration_reason.is_none(),
+            "an account that stated no registration reason has none stored"
+        );
+        assert!(
             user.last_active_at.is_none(),
             "an account that never logged in has no last-active time"
         );
@@ -1234,6 +1250,7 @@ mod tests {
             last_move_at: Some(active_at),
             email_confirmed: Flag::new(false),
             approval_pending: Flag::new(true),
+            registration_reason: Some("please let me in".to_owned()),
             last_active_at: Some(active_at),
             mfa_settings: json!({
                 "enabled": true,
@@ -1316,6 +1333,11 @@ mod tests {
             "an unconfirmed email round trips"
         );
         assert!(user.approval_pending.get(), "pending approval round trips");
+        assert_eq!(
+            user.registration_reason.as_deref(),
+            Some("please let me in"),
+            "the registration reason round trips"
+        );
         assert_eq!(
             user.last_active_at,
             Some(active_at),
@@ -1707,6 +1729,7 @@ mod tests {
                 && new.birthday.is_none()
                 && new.moved_to_ap_id.is_none()
                 && new.last_active_at.is_none()
+                && new.registration_reason.is_none()
                 && new.language.is_none(),
             "the nullable columns start NULL"
         );
