@@ -124,6 +124,17 @@ const PENDING_REQUESTS_SQL: &str = "SELECT u.* FROM follows f
 const PENDING_COUNT_SQL: &str = "SELECT count(*)::int FROM follows
      WHERE followee_id = $1 AND state = 'pending'";
 
+/// [`move_followers_of`]: the followers whose follow of the moving account
+/// an account move may carry over — accepted relationships held by *local*
+/// accounts that still allow their following list to move (Pleroma's
+/// `FollowingRelationship.move_following` filters `f.local == true` and
+/// `f.allow_following_move == true`). Oldest relationship first.
+const MOVE_FOLLOWERS_SQL: &str = "SELECT u.* FROM follows f
+     JOIN users u ON u.id = f.follower_id
+      WHERE f.followee_id = $1 AND f.state = 'accepted'
+        AND u.local = true AND u.allow_following_move = true
+   ORDER BY f.id";
+
 /// Lifecycle state of a [`Follow`] row, stored in the `state` text column as
 /// its lowercase variant name (`pending`, `accepted` or `rejected`, which is
 /// exactly what the column's `CHECK` constraint allows).
@@ -428,6 +439,29 @@ pub async fn pending_count(pool: &PgPool, user_id: Uuid) -> AppResult<i32> {
         .fetch_one(pool)
         .await?;
     Ok(row.0)
+}
+
+/// The local followers of `user_id` whose follow an account move carries
+/// over.
+///
+/// Accepted relationships held by accounts this instance owns that still
+/// allow their following list to move
+/// ([`allow_following_move`](crate::models::user::User::allow_following_move)),
+/// oldest relationship first. This is the candidate set Pleroma's
+/// `FollowingRelationship.move_following` walks when `move_account`
+/// transfers followers to the move target; the endpoint that consumes it
+/// ([`crate::api::pleroma_account_settings`]) does the re-following.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn move_followers_of(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
+    let rows = sqlx::query_as::<_, User>(MOVE_FOLLOWERS_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// The state [`follow`] starts a new relationship in: this instance can grant
@@ -1723,6 +1757,53 @@ mod tests {
             required(Some(stored.clone())).unwrap(),
             stored,
             "a row that is there passes through"
+        );
+    }
+
+    /// The move-follower query keeps exactly the accounts the move may
+    /// carry: local, with an accepted follow of the moving account, and
+    /// still allowing their following list to move. Remote mirrors,
+    /// rejected relationships and opted-out followers stay out of the set.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn move_followers_of_selects_local_accepted_permitters(pool: PgPool) {
+        let mover = local_user(&pool, "mover").await;
+        let carried = local_user(&pool, "carried").await;
+        let opted_out = insert(
+            &pool,
+            &NewUser {
+                allow_following_move: Flag::new(false),
+                ..local_new("opted_out")
+            },
+        )
+        .await
+        .expect("the opted-out fixture inserts");
+        let rejected = local_user(&pool, "rejected").await;
+        let remote = remote_user(&pool, "remote_fan").await;
+
+        let _accepted = follow(&pool, TEST_BASE_URL, &carried, &mover)
+            .await
+            .expect("the carried follow is accepted");
+        let _opted_out = follow(&pool, TEST_BASE_URL, &opted_out, &mover)
+            .await
+            .expect("the opted-out follow is accepted");
+        let _stale = rejected_relation(&pool, &rejected, &mover).await;
+        let _remote = follow(&pool, TEST_BASE_URL, &remote, &mover)
+            .await
+            .expect("the remote follow is accepted");
+        // An accepted local follow of someone else must not qualify either.
+        let other = local_user(&pool, "other").await;
+        let _unrelated = follow(&pool, TEST_BASE_URL, &carried, &other)
+            .await
+            .expect("the unrelated follow is accepted");
+
+        assert_eq!(
+            ids(&move_followers_of(&pool, mover.id).await.unwrap()),
+            vec![carried.id],
+            "only the local, accepted, non-opted-out follower of the mover"
+        );
+        assert!(
+            move_followers_of(&pool, new_id()).await.unwrap().is_empty(),
+            "an account nobody follows has an empty move set"
         );
     }
 }

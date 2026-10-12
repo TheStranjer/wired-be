@@ -188,6 +188,9 @@ pub struct User {
     /// Actor id this account moved to, if it moved; the entity's top-level
     /// `moved` renders from it.
     pub moved_to_ap_id: Option<String>,
+    /// When the account last moved; `None` when it never did. The move
+    /// endpoint's once-per-30-days cooldown reads it.
+    pub last_move_at: Option<DateTime<Utc>>,
     /// Whether the account email has been confirmed.
     pub email_confirmed: Flag,
     /// Whether a moderator still has to approve the account.
@@ -270,6 +273,7 @@ impl fmt::Debug for User {
             .field("show_birthday", &self.show_birthday)
             .field("also_known_as", &self.also_known_as)
             .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("last_move_at", &self.last_move_at)
             .field("email_confirmed", &self.email_confirmed)
             .field("approval_pending", &self.approval_pending)
             .field("last_active_at", &self.last_active_at)
@@ -391,6 +395,8 @@ pub struct NewUser {
     pub also_known_as: Vec<String>,
     /// Actor id this account moved to, if it moved.
     pub moved_to_ap_id: Option<String>,
+    /// When the account last moved; `None` (never moved) by default.
+    pub last_move_at: Option<DateTime<Utc>>,
     /// Whether the email is confirmed; `true` by default.
     pub email_confirmed: Flag,
     /// Whether the account awaits moderator approval; `false` by default.
@@ -467,6 +473,7 @@ impl fmt::Debug for NewUser {
             .field("show_birthday", &self.show_birthday)
             .field("also_known_as", &self.also_known_as)
             .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("last_move_at", &self.last_move_at)
             .field("email_confirmed", &self.email_confirmed)
             .field("approval_pending", &self.approval_pending)
             .field("last_active_at", &self.last_active_at)
@@ -533,6 +540,7 @@ impl Default for NewUser {
             show_birthday: Flag::new(false),
             also_known_as: Vec::new(),
             moved_to_ap_id: None,
+            last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
             last_active_at: None,
@@ -588,15 +596,15 @@ const INSERT_SQL: &str = "INSERT INTO users (
      allow_following_move, skip_thread_containment, accepts_chat_messages,
      show_role, no_rich_text, default_scope, sensitive_default, language,
      tags, settings_store, background_image_url, birthday, show_birthday,
-     also_known_as, moved_to_ap_id, email_confirmed, approval_pending,
-     last_active_at, followers_count, following_count, statuses_count,
-     last_status_at, last_fetched_at, mfa_settings
+     also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
+     approval_pending, last_active_at, followers_count, following_count,
+     statuses_count, last_status_at, last_fetched_at, mfa_settings
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58
+     $55, $56, $57, $58, $59
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -663,6 +671,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.show_birthday)
         .bind(&new_user.also_known_as)
         .bind(new_user.moved_to_ap_id.as_deref())
+        .bind(new_user.last_move_at)
         .bind(new_user.email_confirmed)
         .bind(new_user.approval_pending)
         .bind(new_user.last_active_at)
@@ -822,6 +831,60 @@ pub async fn update_counts(pool: &PgPool, id: Uuid, delta: CountDelta) -> AppRes
     .execute(pool)
     .await
     .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_also_known_as`]: writes the whole alias
+/// array in one statement and refreshes `updated_at`.
+const SET_ALSO_KNOWN_AS_SQL: &str =
+    "UPDATE users SET also_known_as = $2, updated_at = now() WHERE id = $1";
+
+/// Stores `aliases` as user `id`'s `also_known_as` column, replacing what
+/// was there.
+///
+/// The alias endpoints keep the add/remove logic (order-preserving append,
+/// set-style removal) in the API layer and hand the whole new array in
+/// here, so the column is written exactly as computed. Unknown ids match
+/// no row and change nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_also_known_as(pool: &PgPool, id: Uuid, aliases: &[String]) -> AppResult<()> {
+    sqlx::query(SET_ALSO_KNOWN_AS_SQL)
+        .bind(id)
+        .bind(aliases.to_vec())
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`mark_moved`]: records the move target and stamps
+/// the cooldown timestamp in one statement, refreshing `updated_at`.
+const MARK_MOVED_SQL: &str = "UPDATE users
+      SET moved_to_ap_id = $2,
+          last_move_at = now(),
+          updated_at = now()
+    WHERE id = $1";
+
+/// Records that user `id` moved to the actor `target_ap_id`: writes
+/// [`moved_to_ap_id`](User::moved_to_ap_id) and stamps
+/// [`last_move_at`](User::last_move_at) with `now()`, the pair the move
+/// endpoint's once-per-30-days cooldown reads back.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn mark_moved(pool: &PgPool, id: Uuid, target_ap_id: &str) -> AppResult<()> {
+    sqlx::query(MARK_MOVED_SQL)
+        .bind(id)
+        .bind(target_ap_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
     Ok(())
 }
 
@@ -1110,6 +1173,10 @@ mod tests {
         );
         assert!(user.moved_to_ap_id.is_none(), "nobody has moved by default");
         assert!(
+            user.last_move_at.is_none(),
+            "an account that never moved has no move stamp"
+        );
+        assert!(
             user.email_confirmed.get(),
             "email_confirmed defaults to true: an account is not pending \
              confirmation until the confirmation flow says otherwise"
@@ -1156,6 +1223,7 @@ mod tests {
             show_birthday: Flag::new(true),
             also_known_as: vec![local_ap_id(BASE, "alicia"), local_ap_id(BASE, "alice2")],
             moved_to_ap_id: Some("https://other.example/users/alice".to_owned()),
+            last_move_at: Some(active_at),
             email_confirmed: Flag::new(false),
             approval_pending: Flag::new(true),
             last_active_at: Some(active_at),
@@ -1229,6 +1297,11 @@ mod tests {
             user.moved_to_ap_id.as_deref(),
             Some("https://other.example/users/alice"),
             "the move target round trips"
+        );
+        assert_eq!(
+            user.last_move_at,
+            Some(active_at),
+            "the last-move timestamp round trips"
         );
         assert!(
             !user.email_confirmed.get(),
@@ -1633,6 +1706,45 @@ mod tests {
             new.mfa_settings,
             mfa::MfaSettings::default_value(),
             "the MFA blob starts at the migration's all-off default"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn set_also_known_as_replaces_the_array(pool: PgPool) {
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        let first = vec![local_ap_id(BASE, "alicia")];
+        set_also_known_as(&pool, alice.id, &first).await.unwrap();
+        let stored = fetch(&pool, alice.id).await;
+        assert_eq!(
+            stored.also_known_as, first,
+            "the written array is what reads back"
+        );
+
+        set_also_known_as(&pool, alice.id, &[]).await.unwrap();
+        assert!(
+            fetch(&pool, alice.id).await.also_known_as.is_empty(),
+            "an empty array clears what was there"
+        );
+
+        // An unknown id matches no row and is not an error.
+        set_also_known_as(&pool, new_id(), &first).await.unwrap();
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn mark_moved_records_target_and_stamp(pool: PgPool) {
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert!(alice.last_move_at.is_none(), "the fixture never moved");
+        let target = "https://other.example/users/alice";
+        mark_moved(&pool, alice.id, target).await.unwrap();
+        let moved = fetch(&pool, alice.id).await;
+        assert_eq!(
+            moved.moved_to_ap_id.as_deref(),
+            Some(target),
+            "the target actor id is recorded"
+        );
+        assert!(
+            moved.last_move_at.is_some(),
+            "the cooldown stamp is set to the move time"
         );
     }
 }

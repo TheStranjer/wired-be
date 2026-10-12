@@ -17,13 +17,16 @@
 //! `verify_credentials` is the account's own view of itself: [`AuthUser`]
 //! plus the `read:accounts` scope, and the entity rendered with the
 //! caller as its [`AccountViewer`], so the owner-only keys of the
-//! `pleroma` block are in and nothing is hidden. Its addition over `show`
-//! is the [`source`](crate::entities::account::AccountSource) object — the
+//! `pleroma` block are in and nothing is hidden. Its additions over `show`
+//! are the [`source`](crate::entities::account::AccountSource) object — the
 //! raw note and fields a client edits, the posting defaults, and the size
 //! of the pending follow-request queue, the one value here that is not on
 //! the row and so arrives from
-//! [`pending_count`](crate::models::follow::pending_count). Pleroma gates
-//! that block on the viewer being the account itself
+//! [`pending_count`](crate::models::follow::pending_count) — and the
+//! top-level `also_known_as` alias list the account manages through
+//! `/api/pleroma/aliases` (see
+//! [`crate::api::pleroma_account_settings`]). Pleroma gates the `source`
+//! block on the viewer being the account itself
 //! (`AccountView.maybe_put_settings`), which is why no other route on this
 //! module carries it.
 //!
@@ -150,7 +153,28 @@ async fn verify_credentials(
     auth.require(READ_ACCOUNTS)?;
     let owner = &auth.0;
     let requests = follow::pending_count(&state.db, owner.id).await?;
-    Ok(Json(Account::for_owner(owner, &state.config, requests)))
+    let account = Account::for_owner(owner, &state.config, requests);
+    Ok(Json(with_moved(&state, account, owner).await?))
+}
+
+/// Resolves [`moved_to_ap_id`](User::moved_to_ap_id) for one rendered
+/// [`Account`]: when the row names a move target this instance has a row
+/// for, [`Account::with_moved`] nests the target's plain entity. A move
+/// to an actor id not mirrored here keeps `moved: null` (the alias and
+/// move flows are what create that row; federation of a remote `Move`
+/// arrives with a later ticket).
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn with_moved(state: &AppState, account: Account, user: &User) -> AppResult<Account> {
+    let Some(ap_id) = user.moved_to_ap_id.as_deref() else {
+        return Ok(account);
+    };
+    Ok(match user::get_by_ap_id(&state.db, ap_id).await? {
+        Some(target) => account.with_moved(&target, &state.config),
+        None => account,
+    })
 }
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or
@@ -362,18 +386,16 @@ async fn list_following(
 /// viewer who is not the account itself, answered by a single-target
 /// [`Relationship::load_many`]. Anyone else — anonymous, self — renders
 /// with no preload, which keeps `pleroma.relationship` the empty object.
+/// A stored move target is attached as the nested `moved` entity (see
+/// [`with_moved`]).
 async fn render_account(
     state: &AppState,
     viewer: AccountViewer<'_>,
     found: &User,
 ) -> AppResult<Account> {
     let relationships = preload_relationship(state, viewer, found).await?;
-    Ok(Account::from_user_for(
-        viewer,
-        found,
-        &state.config,
-        relationships.as_ref(),
-    ))
+    let account = Account::from_user_for(viewer, found, &state.config, relationships.as_ref());
+    with_moved(state, account, found).await
 }
 
 /// The single-account [`RelationshipMap`] for the `show`/`lookup` view:

@@ -93,8 +93,8 @@ fn assert_identity(body: &Value, account: &User, full: &str, username: &str, url
 
 /// `verify_credentials` answers the caller's own account as they see it,
 /// with the `source` block built from the stored settings: the raw note and
-/// posting defaults, the owner-only `pleroma` keys, and the hidden counters
-/// visible.
+/// posting defaults, the owner-only `pleroma` keys, the top-level
+/// `also_known_as` list, and the hidden counters visible.
 #[sqlx::test(migrator = "wired_be::MIGRATOR")]
 async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool) {
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
@@ -110,6 +110,7 @@ async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool)
         new.is_admin = Flag::new(true);
         new.show_role = Flag::new(false);
         new.settings_store = json!({"pleroma_fe": {"theme": "dark"}});
+        new.also_known_as = vec!["https://old.example/users/alice".to_owned()];
         new
     })
     .await;
@@ -155,6 +156,11 @@ async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool)
         body["pleroma"]["relationship"],
         json!({}),
         "an account has no relationship to itself to embed"
+    );
+    assert_eq!(
+        body["also_known_as"],
+        json!(["https://old.example/users/alice"]),
+        "the own view carries the alias list as a top-level key"
     );
     assert_eq!(
         source_of(&body),
