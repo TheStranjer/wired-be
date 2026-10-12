@@ -14,15 +14,17 @@
 //! app-wide one, and merging two routers that each set one panics.
 //!
 //! [`media_files`], [`activitypub`], [`well_known`], [`nodeinfo`],
-//! [`oauth`] and [`emoji_packs::files_router`] are the routers in this
-//! module that [`crate::app`] does not nest under `/api`: uploaded files
-//! live at `/media/{key}`, the address [`crate::uploads`] writes into
-//! activities; `ActivityPub` actors live at `/users/{nickname}`, the
-//! address federation sends as an actor's id; `WebFinger` and host-meta
+//! [`oauth`], [`oauth_external`] and [`emoji_packs::files_router`] are the
+//! routers in this module that [`crate::app`] does not nest under `/api`:
+//! uploaded files live at `/media/{key}`, the address [`crate::uploads`]
+//! writes into activities; `ActivityPub` actors live at `/users/{nickname}`,
+//! the address federation sends as an actor's id; `WebFinger` and host-meta
 //! live at `/.well-known/…`, the discovery addresses fixed by their RFCs;
 //! `NodeInfo` lives at `/.well-known/nodeinfo` and `/nodeinfo/{version}`,
 //! the addresses fixed by its schema; the OAuth endpoints live at
-//! `/oauth/…`, the token addresses fixed by RFC 6749; and pack images
+//! `/oauth/…`, the token addresses fixed by RFC 6749, and so do the
+//! external-provider logins of [`oauth_external`], whose paths the
+//! providers are configured to answer to; and pack images
 //! live at `/emoji/{pack}/{file}`, the address
 //! [`crate::services::emoji_packs`] stores in `custom_emojis`.
 //! [`misc::router`] joins that list at the root: the `MongooseIM` auth
@@ -51,6 +53,7 @@ pub mod mfa;
 pub mod misc;
 pub mod nodeinfo;
 pub mod oauth;
+pub mod oauth_external;
 pub mod oauth_tokens;
 pub mod pleroma;
 pub mod pleroma_account_settings;

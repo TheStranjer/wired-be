@@ -65,17 +65,17 @@ use crate::{
 };
 
 /// The only response type this endpoint speaks (RFC 6749 §4.1.2).
-const RESPONSE_TYPE_CODE: &str = "code";
+pub(crate) const RESPONSE_TYPE_CODE: &str = "code";
 /// 400 body when `response_type` is absent or names another flow; the
 /// RFC 6749 §4.2.2.1 error code, spelled the way this endpoint's token
 /// sibling spells `unsupported_grant_type`.
-const UNSUPPORTED_RESPONSE_TYPE: &str = "unsupported_response_type";
+pub(crate) const UNSUPPORTED_RESPONSE_TYPE: &str = "unsupported_response_type";
 /// 400 body when `client_id` names no registered application.
-const INVALID_CLIENT: &str = "Invalid client";
+pub(crate) const INVALID_CLIENT: &str = "Invalid client";
 /// 400 body when `redirect_uri` is not one of the app's registered URIs.
-const INVALID_REDIRECT_URI: &str = "Invalid redirect_uri";
+pub(crate) const INVALID_REDIRECT_URI: &str = "Invalid redirect_uri";
 /// 400 body when the requested scopes reach outside the registration.
-const INVALID_SCOPE: &str = "Invalid scope";
+pub(crate) const INVALID_SCOPE: &str = "Invalid scope";
 /// The error line of a re-rendered consent page after a failed login —
 /// Pleroma's `FallbackController` flash "Invalid Username/Password",
 /// shown here by re-rendering `authorize` the way Pleroma does, at
@@ -83,9 +83,9 @@ const INVALID_SCOPE: &str = "Invalid scope";
 const INVALID_LOGIN: &str = "Invalid Username/Password";
 /// The out-of-band `redirect_uri` whose client reads the code off the
 /// page instead of a redirect (Pleroma's `@oob_token_redirect_uri`).
-const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
+pub(crate) const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The `error` value of a denied authorization (RFC 6749 §4.1.2.1).
-const ACCESS_DENIED: &str = "access_denied";
+pub(crate) const ACCESS_DENIED: &str = "access_denied";
 /// The path both halves are mounted on, and the consent form posts to.
 const AUTHORIZE_PATH: &str = "/oauth/authorize";
 
@@ -93,6 +93,20 @@ const AUTHORIZE_PATH: &str = "/oauth/authorize";
 /// [`super::router`].
 pub fn router() -> Router<AppState> {
     Router::new().route(AUTHORIZE_PATH, get(show).post(create))
+}
+
+/// Where a finished authorization goes back to: the request's registered
+/// `redirect_uri` and the client's own `state`, which the reply echoes.
+/// [`crate::api::oauth_external`] recovers both from a stored login state,
+/// so the provider callback's success answer is built by exactly the code
+/// the consent form's is.
+#[derive(Debug)]
+pub(crate) struct Delivery<'a> {
+    /// The app's registered redirect URI verbatim, or the out-of-band
+    /// [`OOB_REDIRECT_URI`] spelling.
+    pub redirect_uri: &'a str,
+    /// The client's `state`, when it sent one.
+    pub state: Option<&'a str>,
 }
 
 /// `GET /oauth/authorize` — validate the request and render the
@@ -155,12 +169,12 @@ async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResul
     let redirect_uri = attrs.redirect_uri.as_deref().unwrap_or_default();
     require_registered_redirect(&app, redirect_uri)?;
     if attrs.deny.is_some() {
-        return denied(&attrs);
+        return denied(&attrs.delivery());
     }
     let scopes = submitted_scopes(attrs.scope.as_ref());
     check_scopes_subset(&scopes, &app)?;
     match authenticate_attrs(&state.db, &attrs).await {
-        Some(user) => grant_code(state, &user, &app, &attrs, &scopes).await,
+        Some(user) => grant_code(state, &user, &app, &scopes, &attrs.delivery()).await,
         None => Ok(AuthorizeReply::Page(consent_html(
             &app,
             &attrs,
@@ -242,6 +256,17 @@ struct AuthorizationAttrs {
     deny: Option<Value>,
 }
 
+impl AuthorizationAttrs {
+    /// The delivery target this submission names: its own `redirect_uri`
+    /// and `state`, which [`grant_code`] and [`denied`] answer with.
+    fn delivery(&self) -> Delivery<'_> {
+        Delivery {
+            redirect_uri: self.redirect_uri.as_deref().unwrap_or_default(),
+            state: self.state.as_deref(),
+        }
+    }
+}
+
 /// [`password`](Self::password) is secret material and renders as
 /// `<redacted>`; everything else shows.
 impl fmt::Debug for AuthorizationAttrs {
@@ -260,7 +285,7 @@ impl fmt::Debug for AuthorizationAttrs {
 
 /// What a validated `POST /oauth/authorize` answers with.
 #[derive(Debug)]
-enum AuthorizeReply {
+pub(crate) enum AuthorizeReply {
     /// 302 with this `Location`: the registered redirect URI carrying
     /// `code` (or `error=access_denied`), merged over its query.
     Found(HeaderValue),
@@ -279,13 +304,14 @@ impl IntoResponse for AuthorizeReply {
 }
 
 /// Checks `response_type`: the authorization-code flow is the only one
-/// this endpoint runs.
+/// this endpoint runs. [`crate::api::oauth_external`] gates
+/// `GET /oauth/prepare_request` with it, since it names the same flow.
 ///
 /// # Errors
 ///
 /// 400 [`UNSUPPORTED_RESPONSE_TYPE`] when the parameter is absent or
 /// names anything else.
-fn require_code_response(response_type: Option<&str>) -> AppResult<()> {
+pub(crate) fn require_code_response(response_type: Option<&str>) -> AppResult<()> {
     if response_type == Some(RESPONSE_TYPE_CODE) {
         return Ok(());
     }
@@ -298,7 +324,7 @@ fn require_code_response(response_type: Option<&str>) -> AppResult<()> {
 ///
 /// 400 [`INVALID_CLIENT`] when no id is presented or it belongs to no
 /// application; database failures arrive as [`AppError::Database`].
-async fn load_app(pool: &PgPool, client_id: Option<&str>) -> AppResult<OauthApp> {
+pub(crate) async fn load_app(pool: &PgPool, client_id: Option<&str>) -> AppResult<OauthApp> {
     let Some(presented) = client_id else {
         return Err(invalid_client());
     };
@@ -307,7 +333,7 @@ async fn load_app(pool: &PgPool, client_id: Option<&str>) -> AppResult<OauthApp>
 }
 
 /// The one 400 for a missing and an unknown client id alike.
-fn invalid_client() -> AppError {
+pub(crate) fn invalid_client() -> AppError {
     AppError::BadRequest(INVALID_CLIENT.to_owned())
 }
 
@@ -318,7 +344,7 @@ fn invalid_client() -> AppError {
 /// # Errors
 ///
 /// 400 [`INVALID_REDIRECT_URI`] when the URI is not registered.
-fn require_registered_redirect(app: &OauthApp, redirect_uri: &str) -> AppResult<()> {
+pub(crate) fn require_registered_redirect(app: &OauthApp, redirect_uri: &str) -> AppResult<()> {
     let registered = app
         .redirect_uris
         .split_whitespace()
@@ -332,7 +358,7 @@ fn require_registered_redirect(app: &OauthApp, redirect_uri: &str) -> AppResult<
 /// The scopes a `GET` asks for: parsed from `scope`, [`Scopes::default`]
 /// (`read`) when the field is absent or blank — the token endpoint's
 /// rule, applied to the consent page.
-fn requested_scopes(scope: Option<&str>) -> Scopes {
+pub(crate) fn requested_scopes(scope: Option<&str>) -> Scopes {
     scope
         .map(str::trim)
         .filter(|text| !text.is_empty())
@@ -366,7 +392,7 @@ fn submitted_scopes(scope: Option<&Value>) -> Scopes {
 ///
 /// 400 [`INVALID_SCOPE`] when any requested scope is not covered by the
 /// app's registered scopes ([`Scopes::is_subset_of`]).
-fn check_scopes_subset(requested: &Scopes, app: &OauthApp) -> AppResult<()> {
+pub(crate) fn check_scopes_subset(requested: &Scopes, app: &OauthApp) -> AppResult<()> {
     if requested.is_subset_of(&Scopes::parse(&app.scopes)) {
         return Ok(());
     }
@@ -389,54 +415,56 @@ async fn authenticate_attrs(pool: &PgPool, attrs: &AuthorizationAttrs) -> Option
 /// Mints the authorization code for the approved scopes and answers with
 /// it (Pleroma's `after_create_authorization`): the out-of-band page for
 /// the `urn:ietf:wg:oauth:2.0:oob` client, the 302 carrying `code` (and
-/// `state`) for every other registered URI.
+/// `state`) for every other registered URI. [`crate::api::oauth_external`]
+/// hands a returning provider login through here too, which is what makes
+/// its success answer *exactly* this one.
 ///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`]; a redirect
 /// URI that cannot become a header value is a 400
 /// [`INVALID_REDIRECT_URI`].
-async fn grant_code(
+pub(crate) async fn grant_code(
     state: &AppState,
     user: &User,
     app: &OauthApp,
-    attrs: &AuthorizationAttrs,
     scopes: &Scopes,
+    delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
     let authorization =
         oauth_token::create_authorization(&state.db, user.id, app.id, &scopes.to_string()).await?;
-    let redirect_uri = attrs.redirect_uri.as_deref().unwrap_or_default();
-    if redirect_uri == OOB_REDIRECT_URI {
+    if delivery.redirect_uri == OOB_REDIRECT_URI {
         return Ok(AuthorizeReply::Page(authorize_page::render_oob(
             &authorization.token,
         )));
     }
     let mut params: Vec<(&str, &str)> = vec![("code", authorization.token.as_str())];
-    if let Some(client_state) = &attrs.state {
-        params.push(("state", client_state.as_str()));
+    if let Some(client_state) = delivery.state {
+        params.push(("state", client_state));
     }
-    redirect_to(redirect_uri, &params)
+    redirect_to(delivery.redirect_uri, &params)
 }
 
 /// The denial reply: `error=access_denied` (and `state`) on the
-/// registered URI; no code was, and none is, minted.
+/// registered URI; no code was, and none is, minted. Pleroma's callback
+/// redirects its provider failures the same way, so
+/// [`crate::api::oauth_external`] shares it.
 ///
 /// # Errors
 ///
 /// A redirect URI that cannot become a header value is a 400
 /// [`INVALID_REDIRECT_URI`].
-fn denied(attrs: &AuthorizationAttrs) -> AppResult<AuthorizeReply> {
-    let redirect_uri = attrs.redirect_uri.as_deref().unwrap_or_default();
+pub(crate) fn denied(delivery: &Delivery<'_>) -> AppResult<AuthorizeReply> {
     let mut params: Vec<(&str, &str)> = vec![("error", ACCESS_DENIED)];
-    if let Some(client_state) = &attrs.state {
-        params.push(("state", client_state.as_str()));
+    if let Some(client_state) = delivery.state {
+        params.push(("state", client_state));
     }
-    redirect_to(redirect_uri, &params)
+    redirect_to(delivery.redirect_uri, &params)
 }
 
 /// A 302 to `uri` with `params` in its query, the `Location` validated
 /// as a header value on the way.
-fn redirect_to(uri: &str, params: &[(&str, &str)]) -> AppResult<AuthorizeReply> {
+pub(crate) fn redirect_to(uri: &str, params: &[(&str, &str)]) -> AppResult<AuthorizeReply> {
     let url = with_query_params(uri, params);
     let location = HeaderValue::from_str(&url)
         .map_err(|_header_error| AppError::BadRequest(INVALID_REDIRECT_URI.to_owned()))?;
@@ -468,7 +496,7 @@ fn consent_html(
 /// pair whose key is re-added takes the new value, and a fragment stays
 /// at the end. Values are urlencoded, so a `state` holding `&`, spaces
 /// or `=` survives the round trip.
-fn with_query_params(uri: &str, params: &[(&str, &str)]) -> String {
+pub(crate) fn with_query_params(uri: &str, params: &[(&str, &str)]) -> String {
     let (uri, fragment) = uri
         .split_once('#')
         .map_or((uri, ""), |(base, frag)| (base, frag));
@@ -502,7 +530,7 @@ fn with_query_params(uri: &str, params: &[(&str, &str)]) -> String {
 /// Stamps the `Cache-Control: no-store` every authorize answer carries:
 /// the consent page holds the live redirect target and state, and a code
 /// is single-use material.
-fn no_store(mut response: Response) -> Response {
+pub(crate) fn no_store(mut response: Response) -> Response {
     let stored: Option<HeaderValue> = response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
