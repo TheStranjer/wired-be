@@ -13,14 +13,16 @@
 //! The flags the `follows` and `account_notes` tables can answer are
 //! computed: `following`, `requested`, `followed_by`, `showing_reblogs`,
 //! `notifying` and its Pleroma alias `subscribing`, and `note` (the
-//! viewer's stored comment, the empty string where they have none). Every
-//! other flag renders `false` until its own ticket stores
-//! the data behind it and adds one batched query to the loader:
+//! viewer's stored comment, the empty string where they have none).
+//! `domain_blocking` is computed from the `user_domain_blocks` table
+//! (see [`crate::models::domain_block`]): true exactly when the target is
+//! a remote account on a domain the viewer blocks. Every other flag
+//! renders `false` until its own ticket stores the data behind it and
+//! adds one batched query to the loader:
 //!
 //! - `blocking` and `blocked_by`: the blocks ticket.
 //! - `endorsed`: the endorsements ticket.
 //! - `muting` and `muting_notifications`: the mutes ticket.
-//! - `domain_blocking`: the domain-blocks ticket.
 
 use std::collections::HashMap;
 
@@ -80,8 +82,10 @@ pub struct Relationship {
     /// `show_reblogs` toggle of the `viewer → target` follow row, `true`
     /// with no row (nothing was ever hidden).
     pub showing_reblogs: JsonBool,
-    /// Whether the viewer blocks the target's whole domain: `false` until
-    /// the domain-blocks ticket stores domain blocks.
+    /// Whether the viewer blocks the target's whole domain: `true` exactly
+    /// when the target is a remote account on one of the viewer's blocked
+    /// domains (see [`crate::models::domain_block`]); a local account is
+    /// never domain-blocked.
     pub domain_blocking: JsonBool,
     /// The viewer's private note on the target: the stored comment of
     /// their `account_notes` row for it, the empty string when they have
