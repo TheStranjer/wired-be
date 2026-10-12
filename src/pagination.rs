@@ -79,6 +79,23 @@ impl PageParams {
     /// [`AppError::BadRequest`] with `"Invalid id"` when `max_id`, `min_id`
     /// or `since_id` is present but is not a valid id.
     pub fn from_query(query: Option<&str>, cap: i64) -> Result<Self, AppError> {
+        Self::from_query_with_default(query, DEFAULT_LIMIT, cap)
+    }
+
+    /// [`Self::from_query`] with an endpoint-specific default page size:
+    /// Mastodon's account listings (the follow-request queue) answer
+    /// `default_limit` rows when `limit` is absent or unusable, where the
+    /// plain parse falls back to Pleroma's 20. `cap` still bounds an
+    /// explicit `limit` the way [`Self::from_query`] caps it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_query`].
+    pub fn from_query_with_default(
+        query: Option<&str>,
+        default_limit: i64,
+        cap: i64,
+    ) -> Result<Self, AppError> {
         let mut raw = RawParams::default();
         for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
             raw.record(key.as_ref(), value);
@@ -87,7 +104,7 @@ impl PageParams {
             max_id: id_param(raw.max_id.as_deref())?,
             min_id: id_param(raw.min_id.as_deref())?,
             since_id: id_param(raw.since_id.as_deref())?,
-            limit: clamp_limit(raw.limit.as_deref(), cap),
+            limit: clamp_limit(raw.limit.as_deref(), default_limit, cap),
             offset: parse_offset(raw.offset.as_deref()),
         })
     }
@@ -225,14 +242,14 @@ fn id_param(text: Option<&str>) -> Result<Option<Uuid>, AppError> {
 }
 
 /// `limit`: absent, non-numeric or non-positive text falls back to the
-/// default, larger values fall to the endpoint's `cap` (Pleroma's
-/// `restrict(:limit)`).
-fn clamp_limit(text: Option<&str>, cap: i64) -> i64 {
+/// endpoint's `default` (Pleroma's 20, Mastodon's account listings 40),
+/// larger values fall to the endpoint's `cap` (Pleroma's `restrict(:limit)`).
+fn clamp_limit(text: Option<&str>, default: i64, cap: i64) -> i64 {
     let parsed = text
         .and_then(|text| text.parse::<i64>().ok())
-        .unwrap_or(DEFAULT_LIMIT);
+        .unwrap_or(default);
     if parsed <= 0 {
-        DEFAULT_LIMIT
+        default
     } else {
         parsed.min(cap)
     }
@@ -424,6 +441,31 @@ mod tests {
         ] {
             assert_eq!(parse_query(query).limit, want, "limit from {query}");
         }
+    }
+
+    #[test]
+    fn a_custom_default_sizes_absent_and_unusable_pages() {
+        // The follow-request queue's pair: default 40, cap 80.
+        for query in [
+            None,
+            Some(""),
+            Some("limit=abc"),
+            Some("limit=0"),
+            Some("limit=-5"),
+        ] {
+            let params = PageParams::from_query_with_default(query, 40, 80).unwrap();
+            assert_eq!(params.limit, 40, "default of 40 for query {query:?}");
+        }
+        for (query, want) in [("limit=5", 5), ("limit=60", 60), ("limit=100", 80)] {
+            let params = PageParams::from_query_with_default(Some(query), 40, 80).unwrap();
+            assert_eq!(params.limit, want, "explicit {query} under cap 80");
+        }
+        // The plain parse keeps Pleroma's 20 as its default.
+        assert_eq!(
+            PageParams::from_query(Some("limit=0"), 80).unwrap().limit,
+            20,
+            "from_query is from_query_with_default at the global default"
+        );
     }
 
     #[test]
