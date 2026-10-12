@@ -123,6 +123,7 @@ mod tests {
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
         })
     }
 
@@ -515,6 +516,121 @@ mod tests {
                 updated_default.as_deref(),
                 Some("now()"),
                 "updated_at defaults to now()"
+            );
+        }
+
+        /// The instance-rules migration creates the ordered rule list
+        /// `src/models/instance_rule.rs` reads and writes: the minted
+        /// `uuid` primary key, the rule text, the defaulted hint and
+        /// priority, and the `now()`-stamped timestamps.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn instance_rules_migration_creates_the_rules_table(pool: PgPool) {
+            /// One column of the table, as `information_schema` describes
+            /// it.
+            #[derive(Debug, sqlx::FromRow)]
+            struct RuleColumn {
+                /// Its name.
+                column_name: String,
+                /// The declared type.
+                data_type: String,
+                /// `NO` for a `NOT NULL` column, `YES` otherwise.
+                is_nullable: String,
+                /// The default expression, `None` when it has none.
+                column_default: Option<String>,
+            }
+
+            let columns: Vec<RuleColumn> = sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'instance_rules'
+               ORDER BY ordinal_position",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let names: Vec<&str> = columns
+                .iter()
+                .map(|column| column.column_name.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    "id",
+                    "text",
+                    "hint",
+                    "priority",
+                    "inserted_at",
+                    "updated_at"
+                ],
+                "the ticket's columns, in the ticket's order"
+            );
+            let one = |name: &str| -> &RuleColumn {
+                columns
+                    .iter()
+                    .find(|column| column.column_name == name)
+                    .unwrap_or_else(|| panic!("instance_rules.{name} exists"))
+            };
+            for (name, data_type) in [
+                ("id", "uuid"),
+                ("text", "text"),
+                ("hint", "text"),
+                ("priority", "integer"),
+                ("inserted_at", "timestamp with time zone"),
+                ("updated_at", "timestamp with time zone"),
+            ] {
+                assert_eq!(
+                    one(name).data_type,
+                    data_type,
+                    "instance_rules.{name} is {data_type}"
+                );
+                assert_eq!(
+                    one(name).is_nullable,
+                    "NO",
+                    "instance_rules.{name} is NOT NULL"
+                );
+            }
+            assert_eq!(
+                one("id").column_default,
+                None,
+                "the id is minted in Rust (decision 4)"
+            );
+            assert_eq!(
+                one("text").column_default,
+                None,
+                "text has no default: the rule is required"
+            );
+            assert_eq!(
+                one("hint").column_default.as_deref(),
+                Some("''::text"),
+                "the hint defaults to empty"
+            );
+            assert_eq!(
+                one("priority").column_default.as_deref(),
+                Some("0"),
+                "the priority defaults to the middle of the list"
+            );
+            for name in ["inserted_at", "updated_at"] {
+                assert_eq!(
+                    one(name).column_default.as_deref(),
+                    Some("now()"),
+                    "{name} defaults to now()"
+                );
+            }
+
+            let (primary_key, key_columns): (String, String) = sqlx::query_as(
+                "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'instance_rules'
+               GROUP BY con.conname",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                key_columns, "id",
+                "the id alone is the primary key {primary_key}"
             );
         }
     }
