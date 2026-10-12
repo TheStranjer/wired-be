@@ -15,15 +15,17 @@
 //! viewer's stored comment, the empty string where they have none. The
 //! `user_domain_blocks` table (owned by [`crate::models::domain_block`])
 //! supplies `domain_blocking`: true for a remote target whose host the
-//! viewer has blocked, never for a local one. Every other flag of the
-//! entity is a documented default until its own ticket lands; each one
-//! then adds exactly one field to `FlagSources`, one line (one query) to
-//! `flag_sources` and one flag line to `assemble`:
+//! viewer has blocked, never for a local one. The `endorsements` table
+//! (owned by [`crate::models::endorsement`]) supplies `endorsed`: one read
+//! of the viewer's whole endorsed set, so a target pinned by the viewer
+//! lights the flag. Every other flag of the entity is a documented default
+//! until its own ticket lands; each one then adds exactly one field to
+//! `FlagSources`, one line (one query) to `flag_sources` and one flag line
+//! to `assemble`:
 //!
 //! - the blocks ticket: `blocking`, `blocked_by` (one query over `blocks`);
 //! - the mutes ticket: `muting`, `muting_notifications` (one query over
-//!   `mutes`);
-//! - the endorsements ticket: `endorsed` (one query).
+//!   `mutes`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,7 +35,7 @@ use uuid::Uuid;
 use crate::{
     entities::{account::JsonBool, relationship::Relationship},
     error::AppResult,
-    models::{account_note, follow::FollowState},
+    models::{account_note, endorsement, follow::FollowState},
 };
 
 /// [`load_many`](Relationship::load_many)'s outgoing side: the viewer's own
@@ -100,6 +102,11 @@ struct FlagSources {
     /// query. Local targets and unblocked domains are absent, and
     /// [`assemble`] renders them the flag's `false` default.
     domain_blocking: HashSet<Uuid>,
+    /// The accounts the viewer endorses: decides `endorsed`. Loaded by
+    /// [`endorsement::endorsed_ids`] — one query over the viewer's whole
+    /// set. Targets the viewer has not pinned are absent, and
+    /// [`assemble`] renders them the flag's `false` default.
+    endorsed: HashSet<Uuid>,
 }
 
 /// The single inherent implementation of the entity: the constructor that
@@ -183,6 +190,12 @@ async fn flag_sources(
         // The user_domain_blocks table: one join deciding the flag for
         // every target at once.
         domain_blocking: domain_blocked_targets(pool, viewer_id, target_ids).await?,
+        // The endorsements table: one read of the viewer's whole pinned
+        // set; membership answers the flag for every target at once.
+        endorsed: endorsement::endorsed_ids(pool, viewer_id)
+            .await?
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -233,10 +246,10 @@ async fn domain_blocked_targets(
 }
 
 /// Folds the loaded sources into the entity for one target: the six flags
-/// the follows table answers, the [`note`] the notes table holds and the
-/// `domain_blocking` the domain-block join decided take their sources'
-/// values, every other flag keeps the default
-/// [`Relationship::unconnected`] states.
+/// the follows table answers, the [`note`] the notes table holds, the
+/// `domain_blocking` the domain-block join decided and the `endorsed` the
+/// viewer's endorsement set contains take their sources' values, every
+/// other flag keeps the default [`Relationship::unconnected`] states.
 ///
 /// [`note`]: Relationship::note
 fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
@@ -252,6 +265,7 @@ fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
         subscribing: JsonBool(notifying),
         showing_reblogs: JsonBool(follow.is_none_or(|row| row.show_reblogs)),
         domain_blocking: JsonBool(sources.domain_blocking.contains(&target_id)),
+        endorsed: JsonBool(sources.endorsed.contains(&target_id)),
         note: sources.notes.get(&target_id).cloned().unwrap_or_default(),
         ..Relationship::unconnected(target_id)
     }
@@ -393,9 +407,11 @@ mod tests {
     /// no note, so its source answers the empty default here too;
     /// `domain_blocking` is computed as well, and its dedicated fixtures
     /// below test it — these tests pair viewers with local targets, which
-    /// that flag can never light up for.
+    /// that flag can never light up for; `endorsed` is computed too, and
+    /// its dedicated fixture below tests it — these tests record no
+    /// endorsement, so the flag keeps its default.
     fn assert_placeholder_flags(relationship: &Relationship) {
-        assert!(!relationship.endorsed.0, "endorsements have no table yet");
+        assert!(!relationship.endorsed.0, "no endorsement recorded");
         assert!(
             !relationship.blocking.0,
             "blocks have no table yet, outgoing"
@@ -763,5 +779,47 @@ mod tests {
             "the local target of a local viewer stands unblocked"
         );
         assert_placeholder_flags(&relationship);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_endorsement_lights_the_endorsed_flag(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        let granted = follow::follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .unwrap();
+        assert_eq!(granted.state, FollowState::Accepted, "the fixture follows");
+        endorsement::endorse(&pool, alice.id, bob.id)
+            .await
+            .expect("the fixture endorsement stores");
+
+        let relationship = one_relationship(&pool, &alice, &bob).await;
+        assert!(
+            relationship.endorsed.0,
+            "a target the viewer pinned is endorsed"
+        );
+        assert!(relationship.following.0, "with the follow flags beside it");
+
+        // The flag is the viewer's own: carol, who pinned nothing, reads
+        // the same target unendorsed, and within alice's batch only the
+        // pinned target lights up.
+        let other_view = one_relationship(&pool, &carol, &bob).await;
+        assert!(!other_view.endorsed.0, "carol endorsed nothing");
+        let loaded = Relationship::load_many(&pool, alice.id, &[bob.id, carol.id])
+            .await
+            .unwrap();
+        let flags: Vec<bool> = loaded.iter().map(|row| row.endorsed.0).collect();
+        assert_eq!(flags, vec![true, false], "pinned, then not");
+
+        endorsement::unendorse(&pool, alice.id, bob.id)
+            .await
+            .expect("the fixture withdrawal runs");
+        let after = one_relationship(&pool, &alice, &bob).await;
+        assert!(
+            !after.endorsed.0,
+            "withdrawing the pin falls back to the default"
+        );
+        assert!(after.following.0, "and nothing else about the pair changed");
     }
 }

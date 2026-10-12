@@ -16,12 +16,13 @@
 //! viewer's stored comment, the empty string where they have none).
 //! `domain_blocking` is computed from the `user_domain_blocks` table
 //! (see [`crate::models::domain_block`]): true exactly when the target is
-//! a remote account on a domain the viewer blocks. Every other flag
-//! renders `false` until its own ticket stores the data behind it and
-//! adds one batched query to the loader:
+//! a remote account on a domain the viewer blocks. `endorsed` is computed
+//! from the `endorsements` table (see [`crate::models::endorsement`]):
+//! true exactly when the viewer pins the target to their profile. Every
+//! other flag renders `false` until its own ticket stores the data behind
+//! it and adds one batched query to the loader:
 //!
 //! - `blocking` and `blocked_by`: the blocks ticket.
-//! - `endorsed`: the endorsements ticket.
 //! - `muting` and `muting_notifications`: the mutes ticket.
 
 use std::collections::HashMap;
@@ -57,8 +58,9 @@ pub struct Relationship {
     /// Whether the viewer's follow of the target is still waiting to be
     /// answered: a pending `viewer → target` row.
     pub requested: JsonBool,
-    /// Whether the viewer endorses the follower relationship: `false`
-    /// until the endorsements ticket stores endorsements.
+    /// Whether the viewer endorses the target: an `endorsements` row of
+    /// theirs naming it (see [`crate::models::endorsement`]); `false`
+    /// while the viewer pins nothing.
     pub endorsed: JsonBool,
     /// Whether the target follows the viewer: an accepted
     /// `target → viewer` row.
@@ -186,7 +188,7 @@ mod tests {
         assert_eq!(value["subscribing"], true, "flag");
         assert_eq!(
             value["endorsed"], false,
-            "flags no source computed yet keep their default"
+            "flags the fixture did not set keep their default"
         );
         assert_eq!(
             value["note"], "",
