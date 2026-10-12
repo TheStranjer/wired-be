@@ -51,6 +51,7 @@ pub mod oauth;
 pub mod oauth_tokens;
 pub mod pleroma;
 pub mod pleroma_account_settings;
+pub mod pleroma_accounts;
 pub mod scrobbles;
 pub mod v1;
 pub mod v2;
