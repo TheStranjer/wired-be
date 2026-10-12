@@ -38,6 +38,7 @@ fn auth_test_app(pool: PgPool) -> Router {
         config: Arc::clone(&config),
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
+        instance_stats_cache: Arc::default(),
     };
     Router::new()
         .route("/auth-user", get(auth_user_view))

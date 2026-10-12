@@ -44,6 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config: Arc::clone(&config),
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
+        instance_stats_cache: Arc::default(),
     };
     axum::serve(listener, app(state)).await?;
     Ok(())

@@ -513,6 +513,7 @@ mod tests {
             config: Arc::clone(&config),
             http_client: HttpClient::new_for_tests(TEST_UA),
             uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
         }
     }
 

@@ -18,6 +18,7 @@ pub mod chat;
 pub mod custom_emoji;
 pub mod filter;
 pub mod follow;
+pub mod instance_rule;
 pub mod instance_setting;
 pub mod job;
 pub mod list;
