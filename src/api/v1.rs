@@ -6,7 +6,7 @@ use axum::Router;
 
 use crate::{
     api::{
-        accounts, announcements, apps, custom_emojis, emoji_packs, filters, instance, lists,
+        accounts, announcements, apps, chats, custom_emojis, emoji_packs, filters, instance, lists,
         markers, media, misc, oauth_tokens, scrobbles,
     },
     config::Config,
@@ -40,5 +40,6 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(scrobbles::router())
         .nest("/pleroma", misc::util_router())
         .nest("/pleroma/apps", oauth_tokens::apps_router())
+        .nest("/pleroma/chats", chats::router())
         .nest("/pleroma/emoji", emoji_packs::router())
 }

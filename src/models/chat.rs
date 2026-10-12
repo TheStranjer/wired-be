@@ -153,12 +153,16 @@ const MARK_READ_SQL: &str = "UPDATE chat_message_references
       SET unread = false
     WHERE chat_id = $1 AND unread AND ($2::uuid IS NULL OR id <= $2)";
 
-/// [`mark_message_read`]: one message of one chat. No `unread` condition, so
-/// marking a read reference is the no-op update Pleroma's `mark_as_read` makes
-/// of it, and the statement still reports the row it touched.
+/// [`mark_message_read`]: one message of one chat. The `chat_id` condition is
+/// what keeps a route that names *the caller's* chat from marking a reference
+/// that merely shares its id space: one whose chat is another's matches no
+/// row here, exactly as Pleroma's `mark_message_as_read` `with` clause fails
+/// its `^chat_id <- to_string(cm_ref.chat_id)` match. No `unread` condition,
+/// so marking a read reference is the no-op update Pleroma's `mark_as_read`
+/// makes of it, and the statement still reports the row it touched.
 const MARK_MESSAGE_READ_SQL: &str = "UPDATE chat_message_references
       SET unread = false
-    WHERE id = $1";
+    WHERE id = $1 AND chat_id = $2";
 
 /// One row of `chats`: one participant's view of a conversation with one other
 /// account (see the module docs for why a pair owns two rows).
@@ -574,8 +578,11 @@ pub async fn mark_read(pool: &PgPool, chat_id: Uuid, last_read_id: Option<Uuid>)
     Ok(updated.rows_affected())
 }
 
-/// Marks the message behind `ref_id` read and returns it, `None` when no
-/// reference has that id.
+/// Marks the message behind `ref_id` in chat `chat_id` read and returns it.
+///
+/// `None` when no reference has that id **in that chat** — the one statement
+/// answering both the unknown id and the id of a reference living in somebody
+/// else's chat.
 ///
 /// Marking an already read reference is idempotent: it comes back unchanged, as
 /// Pleroma's `MessageReference.mark_as_read` leaves it.
@@ -586,10 +593,12 @@ pub async fn mark_read(pool: &PgPool, chat_id: Uuid, last_read_id: Option<Uuid>)
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn mark_message_read(
     pool: &PgPool,
+    chat_id: Uuid,
     ref_id: Uuid,
 ) -> AppResult<Option<ChatMessageReference>> {
     let marked = sqlx::query(MARK_MESSAGE_READ_SQL)
         .bind(ref_id)
+        .bind(chat_id)
         .execute(pool)
         .await?;
     if marked.rows_affected() == 0 {
@@ -1632,13 +1641,25 @@ mod tests {
     async fn marking_one_message_read_returns_it(pool: PgPool) {
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
-        let (message, _, recipient_ref) = send(&pool, &alice, &bob, "read me").await;
+        let (message, alice_ref, recipient_ref) = send(&pool, &alice, &bob, "read me").await;
         let unread = recipient_ref.expect("bob is local");
 
-        let read = mark_message_read(&pool, unread.id)
+        assert!(
+            mark_message_read(&pool, alice_ref.chat_id, unread.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a reference of bob's chat is nothing for alice's chat to mark"
+        );
+        assert!(
+            reference_still_unread(&pool, unread.id).await,
+            "and the refused mark left it unread"
+        );
+
+        let read = mark_message_read(&pool, unread.chat_id, unread.id)
             .await
             .unwrap()
-            .expect("the reference exists");
+            .expect("the reference exists in its own chat");
 
         assert_eq!(read.id, unread.id, "the same reference");
         assert!(!read.unread, "now read");
@@ -1650,15 +1671,36 @@ mod tests {
             0,
             "so the chat counts nothing unread"
         );
-        let again = mark_message_read(&pool, read.id)
+        let again = mark_message_read(&pool, read.chat_id, read.id)
             .await
             .unwrap()
             .expect("marking it twice still finds it");
         assert_eq!(again, read, "and changes nothing");
         assert!(
-            mark_message_read(&pool, new_id()).await.unwrap().is_none(),
+            mark_message_read(&pool, unread.chat_id, new_id())
+                .await
+                .unwrap()
+                .is_none(),
             "an unknown reference is nothing to mark"
         );
+        assert!(
+            mark_message_read(&pool, new_id(), unread.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "and so is a known reference under an unknown chat"
+        );
+    }
+
+    /// Whether reference `ref_id` still carries its unread flag.
+    async fn reference_still_unread(pool: &PgPool, ref_id: Uuid) -> bool {
+        let row: (bool,) =
+            sqlx::query_as("SELECT unread FROM chat_message_references WHERE id = $1")
+                .bind(ref_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        row.0
     }
 
     #[test]
