@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{
-        endorsement,
+        block, endorsement,
         user::{CountDelta, User, update_counts},
     },
     pagination::PageParams,
@@ -90,6 +90,18 @@ const ACCEPT_SQL: &str = "UPDATE follows
           updated_at = now()
     WHERE id = $1 AND state <> 'accepted'
   RETURNING *";
+
+/// [`sever_between`]: the open relationships of a pair in *both* directions,
+/// which is what a block severs — the same `pending`/`accepted` states
+/// [`UNFOLLOW_SQL`] takes back (a mirrored `rejected` row is nobody's active
+/// relationship and stays where it is), stated once for the ordered pair and
+/// once for its reverse. The removed rows come back, because only an accepted
+/// one ever counted and the caller fixes the counters from them.
+const SEVER_BETWEEN_SQL: &str = "DELETE FROM follows
+      WHERE state IN ('pending', 'accepted')
+        AND ((follower_id = $1 AND followee_id = $2)
+          OR (follower_id = $2 AND followee_id = $1))
+   RETURNING *";
 
 /// [`reject`]: the request is gone, and the removed row comes back.
 const REJECT_SQL: &str = "DELETE FROM follows WHERE id = $1 RETURNING *";
@@ -259,8 +271,13 @@ pub struct FollowPageEntry {
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with `"Can not follow yourself"` when the two
-/// users are the same account, or with Pleroma's "blocked you" message when
-/// either has blocked the other (see `blocked_between` below); any database
+/// users are the same account, and [`AppError::Forbidden`] with Pleroma's
+/// `deny_follow_blocked` wording when either has blocked the other: `"Could
+/// not follow user: <nick> is blocking you."` when the target blocks the
+/// follower, `"Could not follow user: You are blocking <nick>."` when the
+/// follower blocks the target (the module's `blocked_between` hook and its
+/// `blocked_error`, both reading the `blocks` table through
+/// [`block::blocked_between`] and [`block::is_blocking`]). Any database
 /// failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn follow(
@@ -272,8 +289,8 @@ pub async fn follow(
     if follower.id == target.id {
         return Err(AppError::Unprocessable(SELF_FOLLOW.to_owned()));
     }
-    if blocked_between(follower, target) {
-        return Err(blocked_error(target));
+    if blocked_between(pool, follower, target).await? {
+        return Err(blocked_error(pool, follower, target).await?);
     }
     let state = initial_state(target);
     let ap_id = local_activity_id(base_url, follower);
@@ -357,6 +374,39 @@ pub async fn remove_follower(
     uncount_removed_follower(&mut tx, &follow).await?;
     tx.commit().await?;
     Ok(Some(follow))
+}
+
+/// Severs every open relationship between `first` and `second` — in *both*
+/// directions — on the open transaction `conn`, and returns nothing but the
+/// outcome of the write.
+///
+/// This is the follow-side half of a block: [`block`] owns the transaction
+/// and calls this inside it, so the block row and the relationships it
+/// sever land (or vanish) together — Pleroma's `User.block` unfollowing the
+/// pair and withdrawing both directions' pending requests before it stores
+/// the block. Every removed row that had been *accepted* steps both
+/// denormalised counters down through the module's
+/// `uncount_removed_follower`, a `pending` request moves nothing, and a
+/// mirrored `rejected` row is left exactly where it was, because it is
+/// nobody's active relationship (see [`unfollow`]'s same rule).
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn sever_between(conn: &mut PgConnection, first: Uuid, second: Uuid) -> AppResult<()> {
+    let removed = sqlx::query_as::<_, Follow>(SEVER_BETWEEN_SQL)
+        .bind(first)
+        .bind(second)
+        .fetch_all(&mut *conn)
+        .await?;
+    for follow in removed
+        .iter()
+        .filter(|row| row.state == FollowState::Accepted)
+    {
+        uncount_removed_follower(conn, follow).await?;
+    }
+    Ok(())
 }
 
 /// Grants a follow request and returns the accepted relationship.
@@ -640,22 +690,29 @@ fn local_activity_id(base_url: &str, follower: &User) -> Option<String> {
 /// Whether `follower` and `target` have blocked each other, in either
 /// direction.
 ///
-/// No pair is blocked yet: the relationship table that records blocks arrives
-/// with the blocks ticket, which wires this hook up to it and keeps
-/// [`follow`]'s refusal below from being the dead branch it is now. Until
-/// then the answer is `false` for every pair.
-const fn blocked_between(_follower: &User, _target: &User) -> bool {
-    false
+/// The hook [`follow`] refuses through: [`block::blocked_between`] is the
+/// `blocks` table's own answer (decision 6), asked once per pair, so a
+/// blocked pair never reaches the write below.
+async fn blocked_between(pool: &PgPool, follower: &User, target: &User) -> AppResult<bool> {
+    block::blocked_between(pool, follower.id, target.id).await
 }
 
 /// The refusal [`follow`] answers when [`blocked_between`] says the pair is
 /// blocked: Pleroma's `deny_follow_blocked` message
-/// (`lib/pleroma/user.ex`, `follow/3`), naming the target who blocked.
-fn blocked_error(target: &User) -> AppError {
-    AppError::Unprocessable(format!(
-        "Could not follow user: {} blocked you.",
+/// (`lib/pleroma/user.ex`, `follow/3`) in this ticket's wording, naming which
+/// way the block runs — the target's block of the follower is stated first, so
+/// a pair that blocked each other both ways hears the one that answers them.
+async fn blocked_error(pool: &PgPool, follower: &User, target: &User) -> AppResult<AppError> {
+    if block::is_blocking(pool, target.id, follower.id).await? {
+        return Ok(AppError::Forbidden(format!(
+            "Could not follow user: {} is blocking you.",
+            target.nickname
+        )));
+    }
+    Ok(AppError::Forbidden(format!(
+        "Could not follow user: You are blocking {}.",
         target.nickname
-    ))
+    )))
 }
 
 /// Writes the first relationship of a pair and returns it, stepping the
@@ -737,10 +794,11 @@ async fn step_counters(pool: &PgPool, follow: &Follow, step: i32) -> AppResult<(
 }
 
 /// Steps the two counters an accepted relationship fed back down on `conn`,
-/// inside the open transaction of [`remove_follower`]: the same pair
-/// [`step_counters`] writes, one step of `-1` each, committed together with
-/// the row's `DELETE` so a crash never leaves a counted follower without its
-/// row (or the other way round).
+/// inside an open transaction: the same pair [`step_counters`] writes, one
+/// step of `-1` each, committed together with the row's `DELETE` so a crash
+/// never leaves a counted relationship without its row (or the other way
+/// round). Both [`remove_follower`] and [`sever_between`] run every row they
+/// deleted through it.
 async fn uncount_removed_follower(conn: &mut PgConnection, follow: &Follow) -> AppResult<()> {
     update_counts(
         &mut *conn,
@@ -895,6 +953,18 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    /// Records `blocker` blocking `target` through the table's own module:
+    /// the fixture the follow guard below reads.
+    async fn block_pair(pool: &PgPool, blocker: &User, target: &User) {
+        let stored = block::block(pool, TEST_BASE_URL, blocker, target)
+            .await
+            .expect("the fixture block stores");
+        assert_eq!(
+            stored.blocked_id, target.id,
+            "the row is the pair that was asked for"
+        );
     }
 
     /// The raw `state` text of one row, to check the enum's database mapping.
@@ -2117,20 +2187,98 @@ mod tests {
             local_activity_id(TEST_BASE_URL, &bob).is_none(),
             "a remote follower's id is the one its own instance minted"
         );
+    }
+
+    /// [`follow`] refuses a pair with a block between them in either
+    /// direction, with the 403 and the wording this ticket pins, and every
+    /// other pair's follows are untouched by it.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_blocked_pair_cannot_follow(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
 
         assert!(
-            !blocked_between(&alice, &bob) && !blocked_between(&bob, &alice),
-            "no pair is blocked until the blocks ticket wires the hook up"
+            !blocked_between(&pool, &alice, &bob).await.unwrap(),
+            "no pair is blocked until somebody blocks somebody"
         );
-        let err = blocked_error(&bob);
+        let granted = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("an unblocked pair still follows");
+        assert_eq!(
+            granted.state,
+            FollowState::Accepted,
+            "and the follow goes through"
+        );
+
+        block_pair(&pool, &bob, &alice).await;
+        let refused = follow(&pool, TEST_BASE_URL, &alice, &carol)
+            .await
+            .expect("alice may still follow someone else");
+        assert_eq!(
+            refused.state,
+            FollowState::Accepted,
+            "the guard is per pair, not global"
+        );
+
+        let inbound = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect_err("the target's block refuses the follow");
         assert!(
-            matches!(err, AppError::Unprocessable(_)),
-            "a block is refused with a 422, the way the follow itself is"
+            matches!(inbound, AppError::Forbidden(_)),
+            "a block is a 403, the way Pleroma's fallback renders it"
         );
         assert_eq!(
-            err.to_string(),
-            "Could not follow user: bob@remote.example blocked you.",
-            "Pleroma's wording, naming who blocked"
+            inbound.to_string(),
+            "Could not follow user: bob is blocking you.",
+            "the message names the target who blocks"
+        );
+
+        block_pair(&pool, &alice, &carol).await;
+        let outbound = follow(&pool, TEST_BASE_URL, &alice, &carol)
+            .await
+            .expect_err("the follower's own block refuses the follow");
+        assert!(
+            matches!(outbound, AppError::Forbidden(_)),
+            "the other direction is a 403 too"
+        );
+        assert_eq!(
+            outbound.to_string(),
+            "Could not follow user: You are blocking carol.",
+            "and it is worded for the follower's own block"
+        );
+
+        let blockers_own = follow(&pool, TEST_BASE_URL, &bob, &alice)
+            .await
+            .expect_err("bob's own block of alice refuses his follow of her");
+        assert_eq!(
+            blockers_own.to_string(),
+            "Could not follow user: You are blocking alice.",
+            "the same pair's other direction is worded for the blocker"
+        );
+    }
+
+    /// [`blocked_error`] names the target's block when a pair blocked each
+    /// other both ways: the answer the blocked follower gets is the one about
+    /// the account that holds the block over them.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_mutually_blocked_pair_hears_the_incoming_block_first(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        block_pair(&pool, &alice, &bob).await;
+        block_pair(&pool, &bob, &alice).await;
+
+        let alice_hears = blocked_error(&pool, &alice, &bob).await.unwrap();
+        assert_eq!(
+            alice_hears.to_string(),
+            "Could not follow user: bob is blocking you.",
+            "bob's block of alice is the fact that answers her"
+        );
+        let bob_hears = blocked_error(&pool, &bob, &alice).await.unwrap();
+        assert_eq!(
+            bob_hears.to_string(),
+            "Could not follow user: alice is blocking you.",
+            "and alice's block of bob is the fact that answers him"
         );
     }
 

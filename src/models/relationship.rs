@@ -18,12 +18,14 @@
 //! viewer has blocked, never for a local one. The `endorsements` table
 //! (owned by [`crate::models::endorsement`]) supplies `endorsed`: one read
 //! of the viewer's whole endorsed set, so a target pinned by the viewer
-//! lights the flag. Every other flag of the entity is a documented default
-//! until its own ticket lands; each one then adds exactly one field to
-//! `FlagSources`, one line (one query) to `flag_sources` and one flag line
-//! to `assemble`:
+//! lights the flag. The `blocks` table (owned by
+//! [`crate::models::block`]) supplies `blocking` and `blocked_by`: one
+//! statement over both directions of the pair, so a target the viewer
+//! blocked lights the first flag and a target who blocked the viewer the
+//! second. Every other flag of the entity is a documented default until its
+//! own ticket lands; each one then adds exactly one field to `FlagSources`,
+//! one line (one query) to `flag_sources` and one flag line to `assemble`:
 //!
-//! - the blocks ticket: `blocking`, `blocked_by` (one query over `blocks`);
 //! - the mutes ticket: `muting`, `muting_notifications` (one query over
 //!   `mutes`).
 
@@ -62,6 +64,18 @@ const INCOMING_SQL: &str = "SELECT follower_id AS target_id
 const DOMAIN_BLOCKING_SQL: &str = "SELECT t.id AS target_id FROM users t
       JOIN user_domain_blocks b ON b.user_id = $1 AND b.domain = t.domain
      WHERE t.id = ANY($2) AND NOT t.local";
+
+/// [`load_many`](Relationship::load_many)'s block side: both directions of
+/// the viewer's blocks among the requested targets in one statement — the
+/// whole `blocking` and `blocked_by` answer. Each arm keys its rows on the
+/// account the entity is about (the *other* end of the pair) and carries the
+/// direction as a literal, so the two flags need no second query and no
+/// post-hoc matching between arms.
+const BLOCKS_SQL: &str = "SELECT blocked_id AS target_id, true AS outgoing FROM blocks
+      WHERE blocker_id = $1 AND blocked_id = ANY($2)
+  UNION ALL
+    SELECT blocker_id AS target_id, false AS outgoing FROM blocks
+      WHERE blocked_id = $1 AND blocker_id = ANY($2)";
 
 /// One `follows` row of the viewer's, narrowed to the columns that feed
 /// relationship flags. The full row type lives in
@@ -107,6 +121,40 @@ struct FlagSources {
     /// set. Targets the viewer has not pinned are absent, and
     /// [`assemble`] renders them the flag's `false` default.
     endorsed: HashSet<Uuid>,
+    /// The blocks between the viewer and the targets, in both directions:
+    /// decides `blocking` and `blocked_by`. Loaded by [`block_flags`] —
+    /// one query over the `blocks` table. Targets with no block either way
+    /// are absent from both sets, and [`assemble`] renders them the flags'
+    /// `false` defaults.
+    blocks: BlockFlags,
+}
+
+/// Both directions of one viewer's blocks among the targets of a batch, read
+/// off [`BLOCKS_SQL`]'s single statement: the two [`FlagSources`] fields the
+/// blocks table answers.
+///
+/// The two sets are disjoint by construction — a target the viewer blocked is
+/// `blocking`, one who blocked the viewer is `blocked_by` — except for a pair
+/// that blocked each other both ways, which lights both flags exactly as the
+/// two stored rows mean it.
+#[derive(Debug)]
+struct BlockFlags {
+    /// The targets the viewer has blocked: the `blocking` flag.
+    blocking: HashSet<Uuid>,
+    /// The targets who have blocked the viewer: the `blocked_by` flag.
+    blocked_by: HashSet<Uuid>,
+}
+
+/// One [`BLOCKS_SQL`] row: a target with a block between them and the viewer
+/// and the direction that block runs. Only ever a query result; the row type
+/// the table owns is [`Block`](crate::models::block::Block).
+#[derive(Debug, sqlx::FromRow)]
+struct BlockFlag {
+    /// The account this relationship is about: the other end of the pair.
+    target_id: Uuid,
+    /// Whether the block runs from the viewer (`true`, the statement's first
+    /// arm) or towards them (`false`, its second arm).
+    outgoing: bool,
 }
 
 /// The single inherent implementation of the entity: the constructor that
@@ -196,6 +244,9 @@ async fn flag_sources(
             .await?
             .into_iter()
             .collect(),
+        // The blocks table: one statement over both directions of the
+        // pair; membership answers each of the two flags.
+        blocks: block_flags(pool, viewer_id, target_ids).await?,
     })
 }
 
@@ -245,11 +296,37 @@ async fn domain_blocked_targets(
     Ok(rows.into_iter().map(|(target_id,)| target_id).collect())
 }
 
+/// Both directions of `viewer_id`'s blocks among `target_ids` — the whole
+/// `blocking` and `blocked_by` answer, in the one statement
+/// [`BLOCKS_SQL`] is (see [`BlockFlags`]).
+async fn block_flags(pool: &PgPool, viewer_id: Uuid, target_ids: &[Uuid]) -> AppResult<BlockFlags> {
+    let rows = sqlx::query_as::<_, BlockFlag>(BLOCKS_SQL)
+        .bind(viewer_id)
+        .bind(target_ids.to_vec())
+        .fetch_all(pool)
+        .await?;
+    let mut blocking = HashSet::new();
+    let mut blocked_by = HashSet::new();
+    for row in rows {
+        let set = if row.outgoing {
+            &mut blocking
+        } else {
+            &mut blocked_by
+        };
+        let _added: bool = set.insert(row.target_id);
+    }
+    Ok(BlockFlags {
+        blocking,
+        blocked_by,
+    })
+}
+
 /// Folds the loaded sources into the entity for one target: the six flags
 /// the follows table answers, the [`note`] the notes table holds, the
-/// `domain_blocking` the domain-block join decided and the `endorsed` the
-/// viewer's endorsement set contains take their sources' values, every
-/// other flag keeps the default [`Relationship::unconnected`] states.
+/// `domain_blocking` the domain-block join decided, the `endorsed` the
+/// viewer's endorsement set contains and the two directions of the blocks
+/// table take their sources' values, every other flag keeps the default
+/// [`Relationship::unconnected`] states.
 ///
 /// [`note`]: Relationship::note
 fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
@@ -266,6 +343,8 @@ fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
         showing_reblogs: JsonBool(follow.is_none_or(|row| row.show_reblogs)),
         domain_blocking: JsonBool(sources.domain_blocking.contains(&target_id)),
         endorsed: JsonBool(sources.endorsed.contains(&target_id)),
+        blocking: JsonBool(sources.blocks.blocking.contains(&target_id)),
+        blocked_by: JsonBool(sources.blocks.blocked_by.contains(&target_id)),
         note: sources.notes.get(&target_id).cloned().unwrap_or_default(),
         ..Relationship::unconnected(target_id)
     }
@@ -279,7 +358,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            account_note, domain_block, follow,
+            account_note, block, domain_block, follow,
             user::{Flag, NewUser, User, insert, local_ap_id},
         },
         util::id::new_id,
@@ -409,17 +488,14 @@ mod tests {
     /// below test it — these tests pair viewers with local targets, which
     /// that flag can never light up for; `endorsed` is computed too, and
     /// its dedicated fixture below tests it — these tests record no
-    /// endorsement, so the flag keeps its default.
+    /// endorsement, so the flag keeps its default; `blocking` and
+    /// `blocked_by` are computed as well, and their dedicated fixture
+    /// below tests them — these tests record no block, so both flags keep
+    /// their defaults.
     fn assert_placeholder_flags(relationship: &Relationship) {
         assert!(!relationship.endorsed.0, "no endorsement recorded");
-        assert!(
-            !relationship.blocking.0,
-            "blocks have no table yet, outgoing"
-        );
-        assert!(
-            !relationship.blocked_by.0,
-            "blocks have no table yet, incoming"
-        );
+        assert!(!relationship.blocking.0, "no block recorded, outgoing");
+        assert!(!relationship.blocked_by.0, "no block recorded, incoming");
         assert!(!relationship.muting.0, "mutes have no table yet");
         assert!(
             !relationship.muting_notifications.0,
@@ -821,5 +897,91 @@ mod tests {
             "withdrawing the pin falls back to the default"
         );
         assert!(after.following.0, "and nothing else about the pair changed");
+    }
+
+    /// The `(blocking, blocked_by)` pair [`Relationship::load_many`] answers
+    /// for `viewer` over `targets`, in the order requested.
+    async fn blocks_of(pool: &PgPool, viewer: &User, targets: &[&User]) -> Vec<(bool, bool)> {
+        let ids: Vec<Uuid> = targets.iter().map(|target| target.id).collect();
+        Relationship::load_many(pool, viewer.id, &ids)
+            .await
+            .expect("the batch reads")
+            .iter()
+            .map(|row| (row.blocking.0, row.blocked_by.0))
+            .collect()
+    }
+
+    /// Records `blocker` blocking `target` through the model the table is
+    /// owned by — the fixture this loader only ever reads.
+    async fn block_pair(pool: &PgPool, blocker: &User, target: &User) {
+        let stored = block::block(pool, TEST_BASE_URL, blocker, target)
+            .await
+            .expect("the fixture block stores");
+        assert_eq!(
+            stored.blocked_id, target.id,
+            "the row is the pair that was asked for"
+        );
+    }
+
+    /// Lifts `blocker`'s block on `target`, asserting one was there to lift.
+    async fn unblock_pair(pool: &PgPool, blocker: &User, target: &User) {
+        let removed = block::unblock(pool, blocker, target)
+            .await
+            .expect("the fixture unblock runs");
+        assert!(removed.is_some(), "the pair's block was there to lift");
+    }
+
+    /// The two directions of the blocks table ride the same batch: the
+    /// viewer's own block lights `blocking`, a target's block of the viewer
+    /// lights `blocked_by`, a pair blocked both ways lights both, and a
+    /// target with no block either way keeps both defaults — as does every
+    /// account once its block is lifted.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn blocks_light_blocking_and_blocked_by(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        let dave = local_user(&pool, "dave").await;
+        block_pair(&pool, &alice, &bob).await;
+        block_pair(&pool, &dave, &alice).await;
+
+        assert_eq!(
+            blocks_of(&pool, &alice, &[&bob, &carol, &dave]).await,
+            vec![(true, false), (false, false), (false, true)],
+            "alice blocks bob, blocks nothing about carol, and is blocked by dave"
+        );
+        assert_eq!(
+            blocks_of(&pool, &bob, &[&alice]).await,
+            vec![(false, true)],
+            "and bob sees the same row from his own end"
+        );
+
+        block_pair(&pool, &bob, &alice).await;
+        assert_eq!(
+            blocks_of(&pool, &alice, &[&bob]).await,
+            vec![(true, true)],
+            "a pair blocked both ways lights both flags"
+        );
+
+        unblock_pair(&pool, &alice, &bob).await;
+        assert_eq!(
+            blocks_of(&pool, &alice, &[&bob]).await,
+            vec![(false, true)],
+            "lifting one direction leaves the other one flag lit"
+        );
+
+        unblock_pair(&pool, &bob, &alice).await;
+        unblock_pair(&pool, &dave, &alice).await;
+        let cleared = one_relationship(&pool, &alice, &bob).await;
+        assert!(
+            !cleared.blocking.0 && !cleared.blocked_by.0,
+            "with nothing blocked the pair falls back to the defaults"
+        );
+        assert_eq!(
+            blocks_of(&pool, &alice, &[&bob, &carol, &dave]).await,
+            vec![(false, false); 3],
+            "and the whole batch reads clean"
+        );
+        assert_placeholder_flags(&cleared);
     }
 }
