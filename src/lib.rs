@@ -43,14 +43,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the six that serve
-/// addresses outside `/api` fixed by their protocols, by stored URLs or by
-/// the clients that call them — `/media` ([`media_files`]), `/emoji`
+/// The [`api`] routers are merged under their prefixes; the seven that
+/// serve addresses outside `/api` fixed by their protocols, by stored URLs
+/// or by the clients that call them — `/media` ([`media_files`]), `/emoji`
 /// ([`api::emoji_packs`]), `/users/{nickname}` ([`api::activitypub`]),
-/// `/.well-known` ([`api::well_known`]), `/oauth` ([`api::oauth`]) and the
-/// `MongooseIM` auth endpoints plus `/manifest.json` ([`api::misc`]) — are
-/// merged at the top level. Paths no route matches get the standard JSON
-/// error response (decision 8).
+/// `/.well-known` ([`api::well_known`]), `/.well-known/nodeinfo` and
+/// `/nodeinfo/{version}` ([`api::nodeinfo`]), `/oauth` ([`api::oauth`]) and
+/// the `MongooseIM` auth endpoints plus `/manifest.json` ([`api::misc`]) —
+/// are merged at the top level. Paths no route matches get the standard
+/// JSON error response (decision 8).
 ///
 /// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
@@ -64,6 +65,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::activitypub::router())
             .merge(api::oauth::router())
             .merge(api::well_known::router())
+            .merge(api::nodeinfo::router())
             .merge(media_files::router())
             .merge(api::emoji_packs::files_router())
             .merge(api::misc::router())
