@@ -36,7 +36,10 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    models::user::{CountDelta, User, update_counts},
+    models::{
+        endorsement,
+        user::{CountDelta, User, update_counts},
+    },
     pagination::PageParams,
     util::id::new_id,
 };
@@ -291,7 +294,9 @@ pub async fn follow(
 /// A `pending` or `accepted` row is deleted; a `rejected` row (see
 /// [`FollowState::Rejected`]) and an unknown pair are answered `false` and
 /// change nothing. Deleting an accepted relationship steps both denormalised
-/// counters down again.
+/// counters down again. An endorsement of `target` by `follower` goes with
+/// the relationship: an endorsement is a pinned *follow*, and unfollowing
+/// clears it (the same pair of facts Pleroma's `unfollow` drops together).
 ///
 /// # Errors
 ///
@@ -309,6 +314,7 @@ pub async fn unfollow(pool: &PgPool, follower: &User, target: &User) -> AppResul
     if follow.state == FollowState::Accepted {
         step_counters(pool, &follow, -1).await?;
     }
+    endorsement::unendorse(pool, follower.id, target.id).await?;
     Ok(true)
 }
 
@@ -1287,6 +1293,102 @@ mod tests {
             relation(&pool, &dave, &carol).await,
             rejected,
             "and unfollowing leaves it in place"
+        );
+    }
+
+    /// An endorsement is a pinned *follow*: [`unfollow`] clears the pair's
+    /// endorsement together with the relationship — granted follows and
+    /// withdrawn requests alike — while the reverse pin and another
+    /// account's pin on the same target stay exactly where they were.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unfollowing_removes_the_endorsement(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = locked_user(&pool, "carol").await;
+        let dave = local_user(&pool, "dave").await;
+
+        let accepted = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("the fixture follow is granted");
+        assert_eq!(accepted.state, FollowState::Accepted, "it counts");
+        endorsement::endorse(&pool, alice.id, bob.id)
+            .await
+            .expect("alice pins bob");
+        endorsement::endorse(&pool, bob.id, alice.id)
+            .await
+            .expect("and bob pins alice back");
+        endorsement::endorse(&pool, dave.id, bob.id)
+            .await
+            .expect("dave pins bob too");
+        let waiting = follow(&pool, TEST_BASE_URL, &alice, &carol)
+            .await
+            .expect("the request to the locked account waits");
+        assert_eq!(waiting.state, FollowState::Pending, "it waits");
+        endorsement::endorse(&pool, alice.id, carol.id)
+            .await
+            .expect("a hand-seeded pin rides the request");
+
+        assert!(
+            unfollow(&pool, &alice, &bob).await.unwrap(),
+            "the accepted follow is removed"
+        );
+        assert!(
+            endorsement::endorsed_ids(&pool, alice.id)
+                .await
+                .unwrap()
+                .contains(&carol.id),
+            "alice's withdrawal took only the bob pair: the carol pin stands"
+        );
+        assert!(
+            !endorsement::endorsed_ids(&pool, alice.id)
+                .await
+                .unwrap()
+                .contains(&bob.id),
+            "and the pair she unfollowed is unpinned"
+        );
+        assert_eq!(
+            endorsement::endorsed_ids(&pool, bob.id).await.unwrap(),
+            vec![alice.id],
+            "bob's own pin was not alice's to drop"
+        );
+        assert_eq!(
+            endorsement::endorsed_ids(&pool, dave.id).await.unwrap(),
+            vec![bob.id],
+            "and dave's pin on bob was nobody else's to drop"
+        );
+
+        assert!(
+            unfollow(&pool, &alice, &carol).await.unwrap(),
+            "a withdrawn request is an open relationship too"
+        );
+        assert!(
+            endorsement::endorsed_ids(&pool, alice.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and its seed pin went with it"
+        );
+    }
+
+    /// The cleanup rides the removal: an [`unfollow`] that found nothing to
+    /// remove (here a `rejected` row) leaves an existing endorsement alone.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_unfollow_that_removed_nothing_keeps_the_endorsement(pool: PgPool) {
+        let dave = local_user(&pool, "dave").await;
+        let carol = locked_user(&pool, "carol").await;
+        let _rejected = rejected_relation(&pool, &dave, &carol).await;
+        endorsement::endorse(&pool, dave.id, carol.id)
+            .await
+            .expect("the seed pin stores");
+
+        assert!(
+            !unfollow(&pool, &dave, &carol).await.unwrap(),
+            "a rejected row is not an open relationship"
+        );
+        assert_eq!(
+            endorsement::endorsed_ids(&pool, dave.id).await.unwrap(),
+            vec![carol.id],
+            "and the failed unfollow pinned nothing away"
         );
     }
 

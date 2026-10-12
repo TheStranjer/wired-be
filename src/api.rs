@@ -37,6 +37,7 @@ pub mod chats;
 pub mod custom_emojis;
 pub mod domain_blocks;
 pub mod emoji_packs;
+pub mod endorsements;
 pub mod filters;
 pub mod follow_requests;
 pub mod helpers;
