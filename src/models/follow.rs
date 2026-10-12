@@ -113,8 +113,13 @@ const FOLLOWING_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
      WHERE f.state = 'accepted' AND f.follower_id = ";
 
 /// The incoming side of [`pending_requests_for`]: the users still waiting for
-/// the bound account to answer their follow request.
-const PENDING_REQUESTS_SQL: &str = "SELECT u.* FROM follows f
+/// the bound account to answer their follow request, each entry led by the
+/// `follow_id` of the request row behind it — the id the page keys on, as in
+/// [`FOLLOWERS_PAGE_SQL`]. The text stops where its one placeholder belongs,
+/// because that is where [`page_rows`] pushes its bind and the builder is what
+/// numbers it `$1`; the keyset it then appends runs on the relationship id
+/// `f.id`.
+const PENDING_REQUESTS_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.follower_id
      WHERE f.state = 'pending' AND f.followee_id = ";
 
@@ -407,6 +412,12 @@ pub async fn following_page(
 /// [`Follow::followee_id`] — to answer their follow request, newest request
 /// first and `page`'s `limit` at a time.
 ///
+/// Like [`followers_page`], each entry carries the [`Follow`] row's id next
+/// to the [`User`] (see [`FollowPageEntry`]): the relationship id — not the
+/// requester's — is what the page keysets on (decision 4), so the
+/// follow-request endpoint's `max_id`/`min_id` cursors and `Link` header
+/// carry these ids, as Pleroma's do.
+///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
@@ -415,7 +426,7 @@ pub async fn pending_requests_for(
     pool: &PgPool,
     target_id: Uuid,
     page: PageParams,
-) -> AppResult<Vec<User>> {
+) -> AppResult<Vec<FollowPageEntry>> {
     page_rows(pool, PENDING_REQUESTS_SQL, target_id, &page).await
 }
 
@@ -913,9 +924,11 @@ mod tests {
             "a pending follow is not in the following list"
         );
         assert_eq!(
-            ids(&pending_requests_for(&pool, carol.id, page(""))
-                .await
-                .unwrap()),
+            entry_ids(
+                &pending_requests_for(&pool, carol.id, page(""))
+                    .await
+                    .unwrap()
+            ),
             vec![alice.id],
             "carol has alice's request to answer"
         );
@@ -1499,9 +1512,11 @@ mod tests {
         let newest_first = followers_newest_first(&rows);
 
         assert_eq!(
-            ids(&pending_requests_for(&pool, carol.id, page(""))
-                .await
-                .unwrap()),
+            entry_ids(
+                &pending_requests_for(&pool, carol.id, page(""))
+                    .await
+                    .unwrap()
+            ),
             newest_first,
             "every request waits, newest first"
         );
@@ -1509,19 +1524,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            ids(&first),
+            entry_ids(&first),
             newest_first[..1].to_vec(),
             "one request per page"
         );
-        let cursor = relation(&pool, &first[0], &carol).await;
+        let cursor = relation(&pool, &first[0].user, &carol).await;
         assert_eq!(
-            ids(&pending_requests_for(
-                &pool,
-                carol.id,
-                page(&format!("limit=1&max_id={}", cursor.id))
-            )
-            .await
-            .unwrap()),
+            cursor.id, first[0].follow_id,
+            "the entry carries the request row id the page is keyed on"
+        );
+        assert_eq!(
+            entry_ids(
+                &pending_requests_for(
+                    &pool,
+                    carol.id,
+                    page(&format!("limit=1&max_id={}", cursor.id))
+                )
+                .await
+                .unwrap()
+            ),
             newest_first[1..2].to_vec(),
             "the next page is the next-oldest request"
         );
@@ -1534,15 +1555,17 @@ mod tests {
             "the request that was at the head is answered"
         );
         assert_eq!(
-            ids(&pending_requests_for(&pool, carol.id, page(""))
-                .await
-                .unwrap()),
+            entry_ids(
+                &pending_requests_for(&pool, carol.id, page(""))
+                    .await
+                    .unwrap()
+            ),
             newest_first[1..].to_vec(),
             "and leaves the queue"
         );
         assert_eq!(
             entry_ids(&followers_page(&pool, carol.id, page("")).await.unwrap()),
-            vec![first[0].id],
+            vec![first[0].user.id],
             "into the follower list"
         );
     }
