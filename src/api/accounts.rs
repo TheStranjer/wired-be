@@ -1,6 +1,10 @@
-//! The read endpoints for accounts: `GET /api/v1/accounts/verify_credentials`,
-//! `GET /api/v1/accounts/{id}`, `…/lookup`, `…/relationships` and the
-//! relationship listings `…/{id}/followers` and `…/{id}/following`.
+//! The account endpoints: the single-account reads and listings, the
+//! relationship batch, and the notes write.
+//!
+//! `GET /api/v1/accounts/verify_credentials`, `GET /api/v1/accounts/{id}`,
+//! `…/lookup`, `…/relationships` and the relationship listings
+//! `…/{id}/followers` and `…/{id}/following` are the reads;
+//! `POST /api/v1/accounts/{id}/note` is the write.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
 //! `.relationships`, `.followers` and `.following`
@@ -80,6 +84,19 @@
 //! empty or wholly-unknown `id` is the empty array, never an error
 //! (Pleroma returns `[]` when the parameter is missing). The flags come
 //! from [`Relationship::load_many`], one batched query set per request.
+//!
+//! `POST /api/v1/accounts/{id}/note` is Pleroma's `AccountController.note`
+//! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`) over
+//! `Pleroma.UserNote` (`lib/pleroma/user_note.ex`): [`AuthUser`] plus the
+//! `write:accounts` scope, and the whole answer is the caller's
+//! [`Relationship`] to the account with [`note`](Relationship::note)
+//! carrying what the write left stored. The `comment` parameter is
+//! required, at most 2000 characters (Mastodon's `AccountNote` limit; longer is 422 with Mastodon's changeset wording)
+//! and stored verbatim — but an empty or all-whitespace one *deletes* the
+//! note (the answered `note` is then `""`), which is how Mastodon clears
+//! it too. An unknown, malformed or deactivated account id is the same
+//! 404 as every other route here; noting *yourself* is allowed, unlike
+//! Pleroma's follow-side checks.
 
 use std::collections::HashSet;
 
@@ -87,7 +104,7 @@ use axum::{
     Json, Router,
     extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, Uri},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use url::form_urlencoded;
@@ -101,11 +118,12 @@ use crate::{
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
+    extract::ApiBody,
     models::{
-        follow,
+        account_note, follow,
         user::{self, User},
     },
-    oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS},
+    oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS},
     pagination::{PageParams, link_header, set_link_header},
     state::AppState,
     util::id::parse_id,
@@ -114,6 +132,10 @@ use crate::{
 /// The 400 body message when the `acct` query parameter is absent or blank
 /// (Mastodon's `ParameterMissing` wording).
 const MISSING_ACCT: &str = "Missing parameter: acct";
+
+/// The longest `comment` `POST /api/v1/accounts/{id}/note` accepts
+/// (Mastodon's `AccountNote` limit).
+const MAX_COMMENT_CHARS: usize = 2000;
 
 /// The `Link` header's query parameters carry nothing but the cursor: the
 /// relationship listings have no filter to repeat on either link (the
@@ -128,6 +150,7 @@ pub fn router() -> Router<AppState> {
         .route("/accounts/lookup", get(lookup_account))
         .route("/accounts/{id}/followers", get(list_followers))
         .route("/accounts/{id}/following", get(list_following))
+        .route("/accounts/{id}/note", post(set_note))
         .route("/accounts/{id}", get(show_account))
 }
 
@@ -305,6 +328,61 @@ async fn known_ids(state: &AppState, requested: &[Uuid]) -> AppResult<Vec<Uuid>>
         .copied()
         .filter(|id| known.contains(id))
         .collect())
+}
+
+/// The request parameters of `POST /api/v1/accounts/{id}/note`: Pleroma's
+/// `%{comment: comment}` pattern match — the field is required (an absent
+/// one is the extractor's 422), and the empty string is the documented
+/// delete, so the type carries no default.
+#[derive(Debug, Deserialize)]
+struct NoteParams {
+    /// The note text, verbatim up to [`MAX_COMMENT_CHARS`] characters;
+    /// empty or all whitespace clears the note.
+    comment: String,
+}
+
+/// `POST /api/v1/accounts/{id}/note` — write the caller's private note on
+/// the account and answer their [`Relationship`] to it, with
+/// [`note`](Relationship::note) carrying what the write left stored.
+///
+/// [`account_note::set`] is the write: a non-blank `comment` replaces the
+/// caller's note on the target, a blank one deletes it (Pleroma's
+/// `UserNote.create` stores blanks, this endpoint's ticket deletes on
+/// them; both read back as the same relationship). The account is resolved
+/// by [`account_or_404`], and noting yourself is allowed — unlike
+/// Pleroma's follow-side checks, `note` has no self guard. The
+/// [`Relationship::load_many`] after the write is the render of Pleroma's
+/// `relationship.json`: it reads the row back, so the answer states the
+/// stored fact rather than trusting the request.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check; [`AppError::Unprocessable`] when
+/// `comment` is absent or longer than [`MAX_COMMENT_CHARS`] characters;
+/// [`AppError::NotFound`] for a malformed, unknown or deactivated account
+/// id. Any database failure arrives through `?` as [`AppError::Database`].
+async fn set_note(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiBody(params): ApiBody<NoteParams>,
+) -> AppResult<Json<Relationship>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    // Validation before the lookup, as the list endpoints do: a
+    // too-long comment is the 422 whatever the id names.
+    if params.comment.chars().count() > MAX_COMMENT_CHARS {
+        return Err(AppError::Unprocessable(format!(
+            "Validation failed: Comment is too long (maximum is {MAX_COMMENT_CHARS} characters)"
+        )));
+    }
+    let target = account_or_404(&state, &id).await?;
+    account_note::set(&state.db, auth.0.id, target.id, &params.comment).await?;
+    let loaded = Relationship::load_many(&state.db, auth.0.id, &[target.id]).await?;
+    let relationship = loaded.into_iter().next().ok_or_else(|| {
+        AppError::Internal("the relationship loader skipped its only target".to_owned())
+    })?;
+    Ok(Json(relationship))
 }
 
 /// `GET /api/v1/accounts/{id}/followers` — the accounts that follow `id`

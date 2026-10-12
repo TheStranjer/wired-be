@@ -10,17 +10,18 @@
 //! The `follows` table (owned by [`crate::models::follow`]) supplies the
 //! flags this ticket computes: `following`, `requested` and
 //! `showing_reblogs` / `notifying` from the viewer's own follow rows, and
-//! `followed_by` from the accepted incoming rows. Every other flag of the
-//! entity is a documented default until its own ticket lands; each one
-//! then adds exactly one field to `FlagSources`, one line (one query) to
-//! `flag_sources` and one flag line to `assemble`:
+//! `followed_by` from the accepted incoming rows. The `account_notes`
+//! table (owned by [`crate::models::account_note`]) supplies `note`: the
+//! viewer's stored comment, the empty string where they have none. Every
+//! other flag of the entity is a documented default until its own ticket
+//! lands; each one then adds exactly one field to `FlagSources`, one line
+//! (one query) to `flag_sources` and one flag line to `assemble`:
 //!
 //! - the blocks ticket: `blocking`, `blocked_by` (one query over `blocks`);
 //! - the mutes ticket: `muting`, `muting_notifications` (one query over
 //!   `mutes`);
 //! - the endorsements ticket: `endorsed` (one query);
-//! - the domain-blocks ticket: `domain_blocking` (one query);
-//! - the account-notes ticket: `note` (one query).
+//! - the domain-blocks ticket: `domain_blocking` (one query).
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,7 +31,7 @@ use uuid::Uuid;
 use crate::{
     entities::{account::JsonBool, relationship::Relationship},
     error::AppResult,
-    models::follow::FollowState,
+    models::{account_note, follow::FollowState},
 };
 
 /// [`load_many`](Relationship::load_many)'s outgoing side: the viewer's own
@@ -77,6 +78,10 @@ struct FlagSources {
     /// The targets with an accepted follow of the viewer: decides
     /// `followed_by`. Loaded by [`incoming_follows`] — one query.
     followed_by: HashSet<Uuid>,
+    /// The viewer's stored notes, keyed by target: decides `note`. Loaded
+    /// by [`account_note::get_many`] — one query. Targets without a stored
+    /// note are absent, and [`assemble`] renders them the empty string.
+    notes: HashMap<Uuid, String>,
 }
 
 /// The single inherent implementation of the entity: the constructor that
@@ -155,6 +160,8 @@ async fn flag_sources(
         // The follows table (this ticket): one query per direction.
         outgoing: outgoing_follows(pool, viewer_id, target_ids).await?,
         followed_by: incoming_follows(pool, viewer_id, target_ids).await?,
+        // The account_notes table: one batched read of the viewer's notes.
+        notes: account_note::get_many(pool, viewer_id, target_ids).await?,
     })
 }
 
@@ -189,8 +196,11 @@ async fn incoming_follows(
 }
 
 /// Folds the loaded sources into the entity for one target: the six flags
-/// the follows table answers take their sources' values, every other flag
-/// keeps the default [`Relationship::unconnected`] states.
+/// the follows table answers and the [`note`] the notes table holds take
+/// their sources' values, every other flag keeps the default
+/// [`Relationship::unconnected`] states.
+///
+/// [`note`]: Relationship::note
 fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
     let follow = sources.outgoing.get(&target_id);
     let following = follow.is_some_and(|row| row.state == FollowState::Accepted);
@@ -203,6 +213,7 @@ fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
         notifying: JsonBool(notifying),
         subscribing: JsonBool(notifying),
         showing_reblogs: JsonBool(follow.is_none_or(|row| row.show_reblogs)),
+        note: sources.notes.get(&target_id).cloned().unwrap_or_default(),
         ..Relationship::unconnected(target_id)
     }
 }
@@ -215,7 +226,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            follow,
+            account_note, follow,
             user::{Flag, NewUser, User, insert, local_ap_id},
         },
         util::id::new_id,
@@ -321,7 +332,8 @@ mod tests {
 
     /// Asserts the flags no source has computed (yet) keep their defaults:
     /// the constants the ticket promises until each flag's own ticket
-    /// stores its data.
+    /// stores its data. `note` is computed now, but these fixtures store
+    /// no note, so its source answers the empty default here too.
     fn assert_placeholder_flags(relationship: &Relationship) {
         assert!(!relationship.endorsed.0, "endorsements have no table yet");
         assert!(
@@ -343,7 +355,7 @@ mod tests {
         );
         assert!(
             relationship.note.is_empty(),
-            "account notes have no table yet"
+            "no stored note reads back empty"
         );
     }
 
@@ -521,6 +533,70 @@ mod tests {
             "the rejected row only carries column defaults"
         );
         assert_placeholder_flags(&relationship);
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_stored_note_rides_the_relationship(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        let granted = follow::follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .unwrap();
+        assert_eq!(granted.state, FollowState::Accepted, "the fixture follows");
+        account_note::set(&pool, alice.id, bob.id, "colleague from work")
+            .await
+            .unwrap();
+        account_note::set(&pool, bob.id, alice.id, "who?")
+            .await
+            .unwrap();
+
+        let relationship = one_relationship(&pool, &alice, &bob).await;
+        assert_eq!(
+            relationship.note, "colleague from work",
+            "the viewer's own note on the target loads"
+        );
+        assert!(relationship.following.0, "with the follow flags beside it");
+
+        let loaded = Relationship::load_many(&pool, alice.id, &[bob.id, carol.id])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2, "one answer per requested id");
+        assert_eq!(loaded[0].note, "colleague from work", "noted target");
+        assert!(loaded[1].note.is_empty(), "unnoted target keeps empty");
+
+        let bobs_view = one_relationship(&pool, &bob, &alice).await;
+        assert_eq!(
+            bobs_view.note, "who?",
+            "and bob sees his own note, not alice's"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_cleared_note_leaves_the_relationship(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        account_note::set(&pool, alice.id, bob.id, "here for a while")
+            .await
+            .unwrap();
+        assert_eq!(
+            one_relationship(&pool, &alice, &bob).await.note,
+            "here for a while",
+            "the note loads while it is stored"
+        );
+
+        account_note::set(&pool, alice.id, bob.id, "")
+            .await
+            .unwrap();
+        let relationship = one_relationship(&pool, &alice, &bob).await;
+        assert!(
+            relationship.note.is_empty(),
+            "the empty write deleted the row, and the loader reads the default"
+        );
+        assert!(
+            !relationship.following.0,
+            "and nothing else about the pair changed"
+        );
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
