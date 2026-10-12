@@ -10,18 +10,17 @@
 //! callers say `Relationship::load_many(…)` while the queries
 //! stay in the models layer.
 //!
-//! Only the flags the `follows` table can already answer are computed today:
-//! `following`, `requested`, `followed_by`, `showing_reblogs`, `notifying`
-//! and its Pleroma alias `subscribing`. Every other flag renders `false`
-//! (and [`note`](Relationship::note) the empty string) until its own ticket
-//! stores
+//! The flags the `follows` and `account_notes` tables can answer are
+//! computed: `following`, `requested`, `followed_by`, `showing_reblogs`,
+//! `notifying` and its Pleroma alias `subscribing`, and `note` (the
+//! viewer's stored comment, the empty string where they have none). Every
+//! other flag renders `false` until its own ticket stores
 //! the data behind it and adds one batched query to the loader:
 //!
 //! - `blocking` and `blocked_by`: the blocks ticket.
 //! - `endorsed`: the endorsements ticket.
 //! - `muting` and `muting_notifications`: the mutes ticket.
 //! - `domain_blocking`: the domain-blocks ticket.
-//! - `note`: the account-notes ticket.
 
 use std::collections::HashMap;
 
@@ -84,8 +83,9 @@ pub struct Relationship {
     /// Whether the viewer blocks the target's whole domain: `false` until
     /// the domain-blocks ticket stores domain blocks.
     pub domain_blocking: JsonBool,
-    /// The viewer's private note on the target: the empty string until the
-    /// account-notes ticket stores notes.
+    /// The viewer's private note on the target: the stored comment of
+    /// their `account_notes` row for it, the empty string when they have
+    /// none (see [`crate::models::account_note`]).
     pub note: String,
     /// Pleroma's alias of [`notifying`](Self::notifying): the same value,
     /// named as Pleroma's `subscribing` renders it.
@@ -186,7 +186,7 @@ mod tests {
         );
         assert_eq!(
             value["note"], "",
-            "and so does the note until its ticket stores one"
+            "and a relationship with no stored note keeps the empty string"
         );
         assert_eq!(json_keys(&value), EXPECTED_KEYS, "same key set");
     }
