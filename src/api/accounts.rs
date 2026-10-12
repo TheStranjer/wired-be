@@ -1,12 +1,15 @@
 //! The read endpoints for accounts: `GET /api/v1/accounts/verify_credentials`,
-//! `GET /api/v1/accounts/{id}`, `GET /api/v1/accounts/lookup` and
-//! `GET /api/v1/accounts/relationships`.
+//! `GET /api/v1/accounts/{id}`, `…/lookup`, `…/relationships` and the
+//! relationship listings `…/{id}/followers` and `…/{id}/following`.
 //!
-//! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup` and
-//! `.relationships` (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`)
-//! are the reference. The last three answer the core [`Account`] entity
-//! (decision 3: rendered from the row by [`Account::from_user_for`]); all
-//! three serve local and remote mirrors alike (decision 7) and treat an
+//! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
+//! `.relationships`, `.followers` and `.following`
+//! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`)
+//! are the reference.
+//!
+//! All of these answer the core [`Account`] entity
+//! (decision 3: rendered from the row by [`Account::from_user_for`]); they
+//! serve local and remote mirrors alike (decision 7) and treat an
 //! account that is unknown, unresolvable or deactivated as a 404 "Record
 //! not found" — the answer Pleroma's `visible_for` check renders through
 //! its fallback controller.
@@ -38,6 +41,26 @@
 //! presenting an invalid, expired or deactivated token is answered 401 "The
 //! access token is invalid" instead of being silently treated as anonymous.
 //!
+//! `followers` and `following` are the account's relationship listings,
+//! Pleroma's `.followers` and `.following`: [`MaybeAuthUser`] with the
+//! `read:accounts` scope enforced on a presented user token
+//! ([`require_user_scope`](MaybeAuthUser::require_user_scope)) and
+//! [`PageParams`] keyset pagination (default limit 20, at most
+//! [`MAX_LIMIT`](crate::pagination::MAX_LIMIT)). They answer [`Account`]
+//! entities — the accounts of the *accepted* follows, newest follow first,
+//! local and remote alike — and paginate on the `follows` row: the
+//! [`Link`](crate::pagination::link_header) header's `max_id`/`min_id`
+//! carry [`Follow::id`](crate::models::follow::Follow::id), which is why
+//! [`followers_page`](crate::models::follow::followers_page) returns
+//! [`FollowPageEntry`](crate::models::follow::FollowPageEntry) rather than
+//! bare rows. An authenticated viewer also gets their relationship to
+//! every listed account embedded, one batched
+//! [`Relationship::load_many`] per request. Privacy per Pleroma's
+//! `cond`: an account with `hide_followers` (resp. `hide_follows`) answers
+//! the empty array to everyone but itself — the count-hiding flags alone
+//! never hide the list — while a locked account's lists stay visible,
+//! pending requests excluded, to any viewer.
+//!
 //! `lookup` resolves its `acct` parameter through
 //! [`get_by_acct`](crate::models::user::get_by_acct): a stored nickname,
 //! case-insensitively, with this instance's own domain stripped for local
@@ -59,8 +82,8 @@ use std::collections::HashSet;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::Uri,
+    extract::{OriginalUri, Path, Query, State},
+    http::{HeaderMap, Uri},
     routing::get,
 };
 use serde::Deserialize;
@@ -80,6 +103,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS},
+    pagination::{PageParams, link_header, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -88,12 +112,19 @@ use crate::{
 /// (Mastodon's `ParameterMissing` wording).
 const MISSING_ACCT: &str = "Missing parameter: acct";
 
+/// The `Link` header's query parameters carry nothing but the cursor: the
+/// relationship listings have no filter to repeat on either link (the
+/// scrobbles listing's constant, same rule).
+const NO_EXTRA_QUERY: [(String, String); 0] = [];
+
 /// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/accounts/verify_credentials", get(verify_credentials))
         .route("/accounts/relationships", get(relationships))
         .route("/accounts/lookup", get(lookup_account))
+        .route("/accounts/{id}/followers", get(list_followers))
+        .route("/accounts/{id}/following", get(list_following))
         .route("/accounts/{id}", get(show_account))
 }
 
@@ -138,7 +169,7 @@ async fn verify_credentials(
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn show_account(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer): MaybeAuthUser,
+    MaybeAuthUser(viewer, _): MaybeAuthUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Account>> {
     let found = account_or_404(&state, &id).await?;
@@ -169,7 +200,7 @@ struct LookupQuery {
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn lookup_account(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer): MaybeAuthUser,
+    MaybeAuthUser(viewer, _): MaybeAuthUser,
     Query(query): Query<LookupQuery>,
 ) -> AppResult<Json<Account>> {
     let Some(acct) = query
@@ -252,6 +283,80 @@ async fn known_ids(state: &AppState, requested: &[Uuid]) -> AppResult<Vec<Uuid>>
         .collect())
 }
 
+/// `GET /api/v1/accounts/{id}/followers` — the accounts that follow `id`
+/// with an accepted relationship, newest follow first, one [`PageParams`]
+/// page at a time (limit 20 by default, at most
+/// [`MAX_LIMIT`](crate::pagination::MAX_LIMIT)). Auth is optional; a
+/// presented user token must grant `read:accounts`, as in Pleroma's plug
+/// for this action, and the viewer it names decides whose [`Relationship`]
+/// the entries embed.
+///
+/// Pleroma's `followers` `cond`: an account that hides its followers is
+/// answered the empty array — 200, no `Link` header — unless the viewer is
+/// that account itself; `hide_followers_count` alone does not hide the
+/// list, only the counter the entities carry. A locked account's follower
+/// list is listed as any other's, its unanswered requests left out by the
+/// model's `accepted` filter.
+///
+/// The `Link` header's path is the request's own [`OriginalUri`], not the
+/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// prefix off the latter, and Pleroma links to `conn.request_path`.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] from [`MaybeAuthUser::require_user_scope`] when
+/// the authenticated token lacks `read:accounts`;
+/// [`AppError::Unauthorized`] from the extractor for an invalid token;
+/// [`AppError::NotFound`] for a malformed, unknown or deactivated account
+/// id; [`AppError::BadRequest`] from [`PageParams`] for a malformed
+/// cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+async fn list_followers(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
+    auth.require_user_scope(READ_ACCOUNTS)?;
+    let target = account_or_404(&state, &id).await?;
+    let viewer = auth.0.as_ref();
+    if target.hide_followers.get() && !viewer_is(viewer, &target) {
+        return Ok(empty_page());
+    }
+    let entries = follow::followers_page(&state.db, target.id, page).await?;
+    page_response(&state, viewer, &entries, uri.path()).await
+}
+
+/// `GET /api/v1/accounts/{id}/following` — the accounts `id` follows with
+/// an accepted relationship, newest follow first. The exact counterpart
+/// of [`list_followers`]: the same optional auth and `read:accounts`
+/// gate, the same [`PageParams`] keyset pagination on the `follows` row,
+/// and Pleroma's `following` `cond` hiding the list behind
+/// [`hide_follows`](User::hide_follows) from everyone but the account
+/// itself.
+///
+/// # Errors
+///
+/// Exactly those of [`list_followers`].
+async fn list_following(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
+    auth.require_user_scope(READ_ACCOUNTS)?;
+    let target = account_or_404(&state, &id).await?;
+    let viewer = auth.0.as_ref();
+    if target.hide_follows.get() && !viewer_is(viewer, &target) {
+        return Ok(empty_page());
+    }
+    let entries = follow::following_page(&state.db, target.id, page).await?;
+    page_response(&state, viewer, &entries, uri.path()).await
+}
+
 /// Renders `found` for `viewer` (who may be `None`), preloading the
 /// viewer's relationship to the account when there is one to embed: a
 /// viewer who is not the account itself, answered by a single-target
@@ -286,6 +391,77 @@ async fn preload_relationship(
         Relationship::load_many(&state.db, who.id, std::slice::from_ref(&found.id)).await?;
     let relationship = loaded.into_iter().next();
     Ok(relationship.map(|rel| RelationshipMap::from([(found.id, rel)])))
+}
+
+/// Whether `viewer` is looking at the account `target` itself — Pleroma's
+/// `user.id == for_user.id` check in the `followers`/`following` `cond`,
+/// by primary key. An anonymous request is never the target.
+fn viewer_is(viewer: AccountViewer<'_>, target: &User) -> bool {
+    viewer.is_some_and(|who| who.id == target.id)
+}
+
+/// The answer to a hidden relationship listing: the empty array as a plain
+/// 200 with no `Link` header at all — Pleroma's `[]` branch, where the
+/// page never got a cursor to link from.
+fn empty_page() -> (HeaderMap, Json<Vec<Account>>) {
+    (HeaderMap::new(), Json(Vec::new()))
+}
+
+/// Renders one fetched relationship page for `viewer`: every entry's
+/// [`User`] as an [`Account`] with the viewer's relationship embedded
+/// where one is preloaded (see [`preload_page_relationships`]), under the
+/// `Link` header [`page_link`] derives from the relationship ids.
+async fn page_response(
+    state: &AppState,
+    viewer: AccountViewer<'_>,
+    entries: &[follow::FollowPageEntry],
+    path: &str,
+) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
+    let relationships = preload_page_relationships(state, viewer, entries).await?;
+    let link = page_link(&state.config.base_url, path, entries);
+    let mut headers = HeaderMap::new();
+    set_link_header(&mut headers, link.as_deref())?;
+    let accounts = entries
+        .iter()
+        .map(|entry| {
+            Account::from_user_for(viewer, &entry.user, &state.config, relationships.as_ref())
+        })
+        .collect();
+    Ok((headers, Json(accounts)))
+}
+
+/// The [`RelationshipMap`] for one relationship page: the viewer's
+/// relationship to every listed account in a single batched
+/// [`Relationship::load_many`], keyed by target id (which is how
+/// [`Account::from_user_for`] reads its preload). [`None`] only for an
+/// anonymous viewer, whose entries keep Pleroma's empty
+/// `pleroma.relationship` object and so need no query at all.
+async fn preload_page_relationships(
+    state: &AppState,
+    viewer: AccountViewer<'_>,
+    entries: &[follow::FollowPageEntry],
+) -> AppResult<Option<RelationshipMap>> {
+    let Some(who) = viewer else {
+        return Ok(None);
+    };
+    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
+    let loaded = Relationship::load_many(&state.db, who.id, &targets).await?;
+    let map = loaded
+        .into_iter()
+        .zip(targets)
+        .map(|(relationship, target)| (target, relationship))
+        .collect();
+    Ok(Some(map))
+}
+
+/// The `Link` header value for a fetched relationship page: Pleroma's
+/// `add_link_headers` over the first (newest) and last (oldest) entry's
+/// [`follow::FollowPageEntry::follow_id`] — the cursors key on the
+/// `follows` row, not on the users — and `None` for an empty page.
+fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) -> Option<String> {
+    let newest = entries.first()?.follow_id.to_string();
+    let oldest = entries.last()?.follow_id.to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 #[cfg(test)]

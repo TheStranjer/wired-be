@@ -25,7 +25,7 @@
 //! own `follower_id` and `followee_id` names.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, postgres::PgRow};
 use uuid::Uuid;
 
 use crate::{
@@ -97,17 +97,18 @@ const IS_FOLLOWING_SQL: &str = "SELECT EXISTS (
 )";
 
 /// The incoming side of [`followers_page`]: the users whose follow of the
-/// bound account was accepted. The text stops where its one placeholder
-/// belongs, because that is where [`user_page`] pushes its bind and the
-/// builder is what numbers it `$1`; the keyset it then appends runs on the
-/// relationship id `f.id`.
-const FOLLOWERS_PAGE_SQL: &str = "SELECT u.* FROM follows f
+/// bound account was accepted, each entry led by the `follow_id` of the
+/// relationship row behind it — the id the page keys on. The text stops
+/// where its one placeholder belongs, because that is where [`page_rows`]
+/// pushes its bind and the builder is what numbers it `$1`; the keyset it
+/// then appends runs on the relationship id `f.id`.
+const FOLLOWERS_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.follower_id
      WHERE f.state = 'accepted' AND f.followee_id = ";
 
 /// The outgoing side of [`following_page`]: the users the bound account
 /// follows, same shape as [`FOLLOWERS_PAGE_SQL`].
-const FOLLOWING_PAGE_SQL: &str = "SELECT u.* FROM follows f
+const FOLLOWING_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.followee_id
      WHERE f.state = 'accepted' AND f.follower_id = ";
 
@@ -166,6 +167,22 @@ pub struct Follow {
     pub inserted_at: DateTime<Utc>,
     /// When the row last changed; refreshed by every update here.
     pub updated_at: DateTime<Utc>,
+}
+
+/// One entry of a paged relationship list: the [`User`] on the other end of
+/// the follow plus [`Follow::id`], the id of the row that put them on the
+/// page.
+///
+/// The relationship id — not the user's — is what [`followers_page`]
+/// and [`following_page`] keyset on (decision 4), so the account listings'
+/// `max_id`/`min_id` cursors and `Link` header carry follow row ids.
+#[derive(Debug, sqlx::FromRow)]
+pub struct FollowPageEntry {
+    /// Primary key of the [`Follow`] row behind this entry.
+    pub follow_id: Uuid,
+    /// The user on the other end of the relationship.
+    #[sqlx(flatten)]
+    pub user: User,
 }
 
 /// Records that `follower` follows `target` — the followed account, the
@@ -344,7 +361,8 @@ pub async fn is_following(pool: &PgPool, follower: &User, target: &User) -> AppR
 }
 
 /// The users who follow `user_id`, accepted relationships only, newest
-/// relationship first and `page`'s `limit` at a time.
+/// relationship first and `page`'s `limit` at a time, each entry carrying
+/// the [`Follow`] row's id next to the [`User`] (see [`FollowPageEntry`]).
 ///
 /// # Errors
 ///
@@ -354,12 +372,13 @@ pub async fn followers_page(
     pool: &PgPool,
     user_id: Uuid,
     page: PageParams,
-) -> AppResult<Vec<User>> {
-    user_page(pool, FOLLOWERS_PAGE_SQL, user_id, &page).await
+) -> AppResult<Vec<FollowPageEntry>> {
+    page_rows(pool, FOLLOWERS_PAGE_SQL, user_id, &page).await
 }
 
 /// The users `user_id` follows, accepted relationships only, newest
-/// relationship first and `page`'s `limit` at a time.
+/// relationship first and `page`'s `limit` at a time, each entry carrying
+/// the [`Follow`] row's id next to the [`User`] (see [`FollowPageEntry`]).
 ///
 /// # Errors
 ///
@@ -369,8 +388,8 @@ pub async fn following_page(
     pool: &PgPool,
     user_id: Uuid,
     page: PageParams,
-) -> AppResult<Vec<User>> {
-    user_page(pool, FOLLOWING_PAGE_SQL, user_id, &page).await
+) -> AppResult<Vec<FollowPageEntry>> {
+    page_rows(pool, FOLLOWING_PAGE_SQL, user_id, &page).await
 }
 
 /// The users waiting for `target_id` — the followed account, the row's
@@ -386,7 +405,7 @@ pub async fn pending_requests_for(
     target_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<User>> {
-    user_page(pool, PENDING_REQUESTS_SQL, target_id, &page).await
+    page_rows(pool, PENDING_REQUESTS_SQL, target_id, &page).await
 }
 
 /// How many follow requests are waiting for `user_id` to answer them: the
@@ -554,23 +573,28 @@ fn required(follow: Option<Follow>) -> AppResult<Follow> {
 }
 
 /// Runs one of the paged relationship lists: `sql` is one of the
-/// `SELECT u.* FROM follows f …` prefixes, which stop at the placeholder this
+/// `SELECT … FROM follows f …` prefixes, which stop at the placeholder this
 /// binds `user_id` to, so the cursors [`PageParams::apply_keyset`] appends are
 /// numbered after it; the page comes back newest relationship first
-/// ([`PageParams::finish`] flips a `min_id` fetch).
-async fn user_page(
+/// ([`PageParams::finish`] flips a `min_id` fetch). `T` is the row shape the
+/// statement selects: a bare [`User`] or a [`FollowPageEntry`] with the
+/// relationship id.
+async fn page_rows<T>(
     pool: &PgPool,
     sql: &str,
     user_id: Uuid,
     page: &PageParams,
-) -> AppResult<Vec<User>> {
+) -> AppResult<Vec<T>>
+where
+    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+{
     let mut builder = QueryBuilder::<Postgres>::new(sql);
     // The builder's push methods hand back `&mut Self` for chaining; binding
     // it keeps the statement from having an unused result (decision 14).
     let _bound: &mut _ = builder.push_bind(user_id);
     page.apply_keyset(&mut builder, "f.id");
-    let users = builder.build_query_as::<User>().fetch_all(pool).await?;
-    Ok(page.finish(users))
+    let rows = builder.build_query_as::<T>().fetch_all(pool).await?;
+    Ok(page.finish(rows))
 }
 
 #[cfg(test)]
@@ -690,6 +714,16 @@ mod tests {
     /// The ids of `users`, in the order they came back.
     fn ids(users: &[User]) -> Vec<Uuid> {
         users.iter().map(|user| user.id).collect()
+    }
+
+    /// The ids of the users behind `entries`, in the order they came back.
+    fn entry_ids(entries: &[FollowPageEntry]) -> Vec<Uuid> {
+        entries.iter().map(|entry| entry.user.id).collect()
+    }
+
+    /// The relationship row ids of `entries`, in the order they came back.
+    fn follow_ids(entries: &[FollowPageEntry]) -> Vec<Uuid> {
+        entries.iter().map(|entry| entry.follow_id).collect()
     }
 
     /// The `{TEST_BASE_URL}/activities/{uuid}` id [`follow`] minted for a
@@ -900,12 +934,12 @@ mod tests {
             "the request left the queue"
         );
         assert_eq!(
-            ids(&followers_page(&pool, carol.id, page("")).await.unwrap()),
+            entry_ids(&followers_page(&pool, carol.id, page("")).await.unwrap()),
             vec![alice.id],
             "alice shows up in carol's followers"
         );
         assert_eq!(
-            ids(&following_page(&pool, alice.id, page("")).await.unwrap()),
+            entry_ids(&following_page(&pool, alice.id, page("")).await.unwrap()),
             vec![carol.id],
             "carol shows up in alice's following"
         );
@@ -1318,7 +1352,7 @@ mod tests {
         let oldest_id = by_age(&rows).first().expect("three rows were read back").id;
 
         assert_eq!(
-            ids(&followers_page(&pool, target.id, page("")).await.unwrap()),
+            entry_ids(&followers_page(&pool, target.id, page("")).await.unwrap()),
             newest_first,
             "the whole follower list, newest follow first"
         );
@@ -1326,12 +1360,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            ids(&first_two),
+            entry_ids(&first_two),
             newest_first[..2].to_vec(),
             "the default cap and a limit cut the first page short"
         );
+        let newest_follow_ids: Vec<Uuid> =
+            by_age(&rows).iter().rev().map(|follow| follow.id).collect();
+        assert_eq!(
+            follow_ids(&first_two),
+            newest_follow_ids[..2].to_vec(),
+            "entries carry the relationship id the page is keyed on"
+        );
 
-        let last_on_page = relation(&pool, &first_two[1], &target).await;
+        let last_on_page = relation(&pool, &first_two[1].user, &target).await;
+        assert_eq!(
+            last_on_page.id, first_two[1].follow_id,
+            "the entry's relationship id is the stored row's primary key"
+        );
         let next = followers_page(
             &pool,
             target.id,
@@ -1340,7 +1385,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            ids(&next),
+            entry_ids(&next),
             newest_first[2..].to_vec(),
             "max_id continues where the page ended"
         );
@@ -1352,7 +1397,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            ids(&newer),
+            entry_ids(&newer),
             newest_first[..1].to_vec(),
             "min_id reads the half after the cursor and is still answered newest-first"
         );
@@ -1381,14 +1426,16 @@ mod tests {
         }
         let wanted = followed_newest_first(&outgoing);
         assert_eq!(
-            ids(&following_page(&pool, target.id, page("")).await.unwrap()),
+            entry_ids(&following_page(&pool, target.id, page("")).await.unwrap()),
             wanted,
             "the following list runs the same way"
         );
         assert_eq!(
-            ids(&following_page(&pool, target.id, page("limit=2"))
-                .await
-                .unwrap()),
+            entry_ids(
+                &following_page(&pool, target.id, page("limit=2"))
+                    .await
+                    .unwrap()
+            ),
             wanted[..2].to_vec(),
             "and is paginated on the relationship id too"
         );
@@ -1460,7 +1507,7 @@ mod tests {
             "and leaves the queue"
         );
         assert_eq!(
-            ids(&followers_page(&pool, carol.id, page("")).await.unwrap()),
+            entry_ids(&followers_page(&pool, carol.id, page("")).await.unwrap()),
             vec![first[0].id],
             "into the follower list"
         );
