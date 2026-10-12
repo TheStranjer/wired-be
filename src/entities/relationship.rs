@@ -18,11 +18,14 @@
 //! (see [`crate::models::domain_block`]): true exactly when the target is
 //! a remote account on a domain the viewer blocks. `endorsed` is computed
 //! from the `endorsements` table (see [`crate::models::endorsement`]):
-//! true exactly when the viewer pins the target to their profile. Every
-//! other flag renders `false` until its own ticket stores the data behind
-//! it and adds one batched query to the loader:
+//! true exactly when the viewer pins the target to their profile.
+//! `blocking` and `blocked_by` are computed from the `blocks` table (see
+//! [`crate::models::block`]): the first true exactly when the viewer blocks
+//! the target, the second when the target blocks the viewer — a pair that
+//! blocked each other lights both. Every other flag renders `false` until
+//! its own ticket stores the data behind it and adds one batched query to
+//! the loader:
 //!
-//! - `blocking` and `blocked_by`: the blocks ticket.
 //! - `muting` and `muting_notifications`: the mutes ticket.
 
 use std::collections::HashMap;
@@ -65,11 +68,13 @@ pub struct Relationship {
     /// Whether the target follows the viewer: an accepted
     /// `target → viewer` row.
     pub followed_by: JsonBool,
-    /// Whether the viewer blocks the target: `false` until the blocks
-    /// ticket stores blocks.
+    /// Whether the viewer blocks the target: a `blocks` row of theirs naming
+    /// it (see [`crate::models::block`]); `false` while the viewer blocks
+    /// nothing.
     pub blocking: JsonBool,
-    /// Whether the target blocks the viewer: `false` until the blocks
-    /// ticket stores blocks.
+    /// Whether the target blocks the viewer: a `blocks` row of theirs naming
+    /// the viewer (see [`crate::models::block`]); `false` while no account
+    /// blocks the viewer.
     pub blocked_by: JsonBool,
     /// Whether the viewer mutes the target: `false` until the mutes ticket
     /// stores mutes.

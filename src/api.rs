@@ -33,6 +33,7 @@ pub mod accounts;
 pub mod activitypub;
 pub mod announcements;
 pub mod apps;
+pub mod blocks;
 pub mod chats;
 pub mod custom_emojis;
 pub mod domain_blocks;

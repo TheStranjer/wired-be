@@ -15,6 +15,7 @@
 
 pub mod account_note;
 pub mod announcement;
+pub mod block;
 pub mod chat;
 pub mod custom_emoji;
 pub mod domain_block;
