@@ -20,13 +20,14 @@
 //! [`attachment_media_id`](crate::models::chat::ChatMessageReference::attachment_media_id)
 //! — `None` when the message carries none or its file has since been deleted.
 //!
-//! Three keys are constants here because nothing behind them is implemented:
+//! Two keys are constants here because nothing behind them is implemented:
 //! `emojis`, which Pleroma builds from the shortcodes in the message text and
-//! which stays `[]` until chat messages map emojis; `card`, Pleroma's
-//! rich-media preview, always `null` because this instance collects no cards;
-//! and `idempotency_key`, which Pleroma looks up in a cached id→key map this
-//! schema does not have — the field is `None`, and so the key absent, unless a
-//! caller sets it from the request that just created the message.
+//! which stays `[]` until chat messages map emojis, and `card`, Pleroma's
+//! rich-media preview, always `null` because this instance collects no cards.
+//! `idempotency_key` is the third former constant, retired by the message
+//! posting ticket: the key a client sent is stored on the message row and
+//! renders from there, absent from the JSON only when the message carries no
+//! key.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -126,10 +127,9 @@ pub struct ChatMessage {
     /// Pleroma's rich-media card for the message's links; `null`, because this
     /// instance collects no cards.
     pub card: Option<Value>,
-    /// The `Idempotency-Key` a client sent when creating this message. Pleroma
-    /// echoes it for the messages it has that key cached for and this schema
-    /// caches none, so this is `None` — the key absent from the JSON — unless a
-    /// caller sets it from the request that created the message.
+    /// The `Idempotency-Key` the message was created with, read off the
+    /// message row ([`ChatMessageReference::idempotency_key`]); the key is
+    /// absent from the JSON for a message posted without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }
@@ -154,7 +154,7 @@ impl ChatMessage {
             attachment: attachment.map(MediaAttachment::from_model),
             unread: row.unread,
             card: None,
-            idempotency_key: None,
+            idempotency_key: row.idempotency_key.clone(),
         }
     }
 }
@@ -269,6 +269,7 @@ mod tests {
             raw_text: "hi there".to_owned(),
             attachment_media_id: None,
             ap_id: Some(format!("https://remote.example/chat/{MESSAGE_ID}")),
+            idempotency_key: None,
             message_inserted_at: at(SENT),
         }
     }
@@ -456,16 +457,20 @@ mod tests {
     }
 
     #[test]
-    fn an_idempotency_key_appears_only_when_set() {
-        let mut message = ChatMessage::from_reference(&reference_row(), None);
-        assert!(message.idempotency_key.is_none(), "nothing caches keys");
+    fn an_idempotency_key_appears_only_when_the_row_carries_one() {
+        let plain = ChatMessage::from_reference(&reference_row(), None);
         assert!(
-            !has_key(&render(&message), "idempotency_key"),
+            plain.idempotency_key.is_none(),
+            "a reference of a keyless message has none"
+        );
+        assert!(
+            !has_key(&render(&plain), "idempotency_key"),
             "so it is absent"
         );
 
-        message.idempotency_key = Some("7c9e6679-7425-40de-944b-e07fc1f90ae7".to_owned());
-        let value = render(&message);
+        let mut row = reference_row();
+        row.idempotency_key = Some("7c9e6679-7425-40de-944b-e07fc1f90ae7".to_owned());
+        let value = render(&ChatMessage::from_reference(&row, None));
 
         assert_eq!(
             json_keys(&value).len(),
@@ -474,7 +479,7 @@ mod tests {
         );
         assert_eq!(
             value["idempotency_key"], "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-            "the key the client sent, echoed back"
+            "the key the client sent, echoed back from the row"
         );
     }
 
@@ -550,6 +555,7 @@ mod tests {
             raw_text: "mine".to_owned(),
             attachment_media_id: None,
             ap_id: None,
+            idempotency_key: None,
             deleted_at: None,
             inserted_at: at(WHOLE_SECOND),
         };

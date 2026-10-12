@@ -1,7 +1,8 @@
 //! The chat API over HTTP (`/api/v1/pleroma/chats`, `/api/v2/pleroma/chats`,
-//! WBE-146, and its read-marker and pinning half, WBE-148).
+//! WBE-146; its read-marker and pinning half, WBE-148; and its messages,
+//! WBE-147).
 //!
-//! The tests pin what the two tickets promise. On the write side:
+//! The tests pin what the three tickets promise. On the write side:
 //! `POST …/chats/{id}/read` marks every reference of the caller's chat up to
 //! `last_read_id` read — up to and including, idempotently, leaving anything
 //! newer unread — and answers the `Chat` entity with the new `unread` count;
@@ -12,6 +13,19 @@
 //! another chat is not there. `POST …/pin` and `…/unpin` toggle `pinned` and
 //! move what the lists' `pinned` filter (both mounted below: `GET
 //! /api/v1/pleroma/chats` and `GET /api/v2/pleroma/chats`) sees.
+//!
+//! The message routes (WBE-147) pin their own set: `GET …/messages` answers
+//! `ChatMessage` entities newest first, a 20-default page under `MAX_LIMIT`,
+//! with the `Link` header keyed on reference ids and the keyset cursors
+//! walking them; `POST …/messages` takes `content` and/or `media_id` (the
+//! sender's own unclaimed image/video/audio row, attached to the message),
+//! refusing neither-key bodies, oversize content (against the
+//! `MAX_CHAT_MESSAGE_CHARS` setting, default and lowered) and unattachable
+//! media each with its own 400, honoring `Idempotency-Key` within the hour,
+//! and landing the message unread in the recipient's chat;
+//! `DELETE …/messages/{message_id}` answers the deleted entity and splits as
+//! the model does — the recipient loses their copy, the sender's delete
+//! withdraws the message from both sides.
 //!
 //! On the read side: `POST …/by-account-id/{id}` gets or creates the
 //! caller's chat with that account, 200 and idempotent, and refuses the
@@ -40,6 +54,7 @@ use uuid::Uuid;
 use wired_be::{
     models::{
         chat::{self, ChatFilter, ChatMessageReference, NewChatMessage},
+        status::Visibility,
         user::{Flag, NewUser, User},
     },
     pagination::{MAX_LIMIT, PageParams},
@@ -897,17 +912,119 @@ async fn every_route_demands_write_chats(pool: PgPool) {
 
 /// A media row of `uploader`, for the attachment column to point at.
 async fn insert_attachment(pool: &PgPool, uploader: &User) -> Uuid {
+    insert_media(pool, uploader, "image/png").await
+}
+
+/// A media row of `uploader` with `content_type`, for the posting route's
+/// media gate.
+async fn insert_media(pool: &PgPool, uploader: &User, content_type: &str) -> Uuid {
     let row: (Uuid,) = sqlx::query_as(
         "INSERT INTO media_attachments (id, user_id, url, content_type)
-         VALUES ($1, $2, 'https://test.example/media/x.png', 'image/png')
+         VALUES ($1, $2, 'https://test.example/media/x.png', $3)
          RETURNING id",
     )
     .bind(new_id())
     .bind(uploader.id)
+    .bind(content_type)
     .fetch_one(pool)
     .await
     .unwrap();
     row.0
+}
+
+/// Claims media row `media` for a fresh status of `owner` — the already
+/// posted media the chat gate must not hand out.
+async fn claim_media(pool: &PgPool, media: Uuid, owner: &User) {
+    let posted = common::create_status(pool, owner, "a posted photo", Visibility::Public).await;
+    let _claimed: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE media_attachments SET status_id = $2 WHERE id = $1")
+            .bind(media)
+            .bind(posted.id)
+            .execute(pool)
+            .await
+            .expect("the claim runs");
+}
+
+/// How many rows the `chat_messages` table holds.
+async fn count_messages(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM chat_messages")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+/// The `GET`/`POST` messages path of chat `chat`.
+fn messages_path(chat: &str) -> String {
+    format!("{ROOT}/{chat}/messages")
+}
+
+/// The `DELETE` path of one message of chat `chat`.
+fn message_delete_path(chat: &str, message: &str) -> String {
+    format!("{ROOT}/{chat}/messages/{message}")
+}
+
+/// The `id` strings of a rendered entity array, in order.
+fn entity_ids(list: &Value) -> Vec<String> {
+    list.as_array()
+        .expect("the list is an array")
+        .iter()
+        .map(|entity| {
+            entity["id"]
+                .as_str()
+                .expect("entities carry their id")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// `POST` the message body `body` into chat `chat` as `token`, with the
+/// `Idempotency-Key` header when `key` names one.
+async fn post_message(
+    app: &Router,
+    token: &str,
+    chat: &str,
+    body: Value,
+    key: Option<&str>,
+) -> common::TestResponse {
+    let mut request = common::TestRequest::post(&messages_path(chat))
+        .bearer(token)
+        .json(&body);
+    if let Some(key) = key {
+        request = request.header("idempotency-key", key);
+    }
+    request.send(app).await
+}
+
+/// The id of `user_id`'s most recently active chat, read through the
+/// model's list: the posting fixtures write one chat, this walks it back
+/// out for the other side's token to name.
+async fn own_chat_id(pool: &PgPool, user_id: Uuid) -> Uuid {
+    let rows = chat::page_for_user(pool, user_id, all_page(), ChatFilter::default())
+        .await
+        .expect("the list reads");
+    rows.first().expect("the user has a chat").id
+}
+
+/// A local [`User`] with a token granting both chat scopes — the fixture
+/// that posts and then lists what it posted.
+async fn poster(pool: &PgPool, nickname: &str) -> (User, String) {
+    let created = common::create_local_user(pool, nickname).await;
+    let token = common::create_app_and_token(pool, &created, "read:chats write:chats").await;
+    (created, token)
+}
+
+/// Moves the message behind reference `ref_id` outside the idempotency
+/// replay window.
+async fn expire_message(pool: &PgPool, ref_id: Uuid) {
+    let _moved: sqlx::postgres::PgQueryResult = sqlx::query(
+        "UPDATE chat_messages SET inserted_at = now() - interval '2 hours' \
+         WHERE id = (SELECT message_id FROM chat_message_references WHERE id = $1)",
+    )
+    .bind(ref_id)
+    .execute(pool)
+    .await
+    .expect("the backdate runs");
 }
 
 /// The `POST …/by-account-id/{id}` path for the account `account`.
@@ -1647,5 +1764,1073 @@ async fn creating_a_chat_demands_write_chats(pool: PgPool) {
         broad.json_value()["account"]["id"],
         alice.id.to_string(),
         "and opens erin's own chat with alice"
+    );
+}
+
+/// `DELETE` `path` as `token`.
+async fn delete_as(app: &Router, token: &str, path: &str) -> common::TestResponse {
+    common::TestRequest::delete(path)
+        .bearer(token)
+        .send(app)
+        .await
+}
+
+/// `POST …/chats/{id}/messages` with `content`: 200 with the sender's
+/// [`ChatMessage`] entity — the reference id of the caller's own chat, the
+/// rendered text, `unread: false` because the sender has read what they
+/// wrote — and a urlencoded form body posts just the same.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn posting_a_message_answers_the_senders_entity(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+
+    let posted = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"content": "hello *there* <b>x</b>"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        StatusCode::OK,
+        "posting answers 200: {}",
+        posted.text()
+    );
+    assert_eq!(
+        posted.header("content-type"),
+        Some("application/json"),
+        "the entity is JSON"
+    );
+    let value = posted.json_value();
+    assert_eq!(
+        json_keys(&value),
+        MESSAGE_KEYS,
+        "exactly the ChatMessage keys"
+    );
+    assert_eq!(
+        value["content"], "<p>hello *there* &lt;b&gt;x&lt;/b&gt;</p>",
+        "escaped plain text, linkified, never markdown"
+    );
+    assert_eq!(value["chat_id"], chat, "the caller's own chat");
+    assert_eq!(
+        value["account_id"],
+        alice.id.to_string(),
+        "the sender's account id"
+    );
+    assert_eq!(
+        value["unread"], false,
+        "the sender has read what they wrote"
+    );
+    assert_eq!(value["emojis"], json!([]), "nothing maps chat shortcodes");
+    assert!(
+        value["attachment"].is_null(),
+        "a text message carries nothing"
+    );
+    assert!(value["card"].is_null(), "and no rich-media card");
+    assert!(
+        value["created_at"]
+            .as_str()
+            .is_some_and(|stamp| stamp.ends_with('Z')),
+        "a timestamp in the Mastodon format"
+    );
+    let listed = get_as(&app, &token, &messages_path(&chat))
+        .await
+        .json_value();
+    assert_eq!(
+        entity_ids(&listed),
+        vec![value["id"].as_str().expect("a reference id")],
+        "the entity carries the reference id the list reads back by"
+    );
+
+    let form = common::TestRequest::post(&messages_path(&chat))
+        .bearer(&token)
+        .form(&[("content", "typed")])
+        .send(&app)
+        .await;
+    assert_eq!(form.status, StatusCode::OK, "form bodies post alike");
+    assert_eq!(form.json_value()["content"], "<p>typed</p>");
+}
+
+/// `media_id` attaches the sender's own unclaimed image, video or audio row
+/// to the message — with or without `content`, and a media-only message
+/// keeps both text columns empty — rendered as the full `Attachment`
+/// entity beside it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn posted_media_attaches_to_the_message(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+
+    let image = insert_media(&pool, &alice, "image/png").await;
+    let picture = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"media_id": image.to_string()}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        picture.status,
+        StatusCode::OK,
+        "media alone is a message: {}",
+        picture.text()
+    );
+    let value = picture.json_value();
+    assert_eq!(value["content"], "", "a media-only message stays empty");
+    assert_eq!(
+        value["attachment"]["id"],
+        image.to_string(),
+        "the media row is attached"
+    );
+    assert_eq!(value["attachment"]["type"], "image", "as an Attachment");
+
+    for (mime, want) in [("video/mp4", "video"), ("audio/mpeg", "audio")] {
+        let media = insert_media(&pool, &alice, mime).await;
+        let both = post_message(
+            &app,
+            &token,
+            &chat,
+            json!({"content": format!("watch the {want}"), "media_id": media.to_string()}),
+            None,
+        )
+        .await;
+        assert_eq!(both.status, StatusCode::OK, "{mime} is chat media");
+        let attached = both.json_value();
+        assert_eq!(
+            attached["content"],
+            format!("<p>watch the {want}</p>"),
+            "text and"
+        );
+        assert_eq!(
+            attached["attachment"]["id"],
+            media.to_string(),
+            "media ride together"
+        );
+    }
+    assert_eq!(count_messages(&pool).await, 3, "three messages, no more");
+}
+
+/// A body with neither `content` nor `media_id` is the 400
+/// `{"error":"Cannot send an empty chat message"}` — an empty JSON object,
+/// unrelated keys, explicit nulls and a completely absent body all alike —
+/// and nothing behind a refusal is written.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn posting_refuses_bodies_with_nothing_to_send(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+
+    for body in [
+        json!({}),
+        json!({"other": "x"}),
+        json!({"content": null, "media_id": null}),
+    ] {
+        let response = post_message(&app, &token, &chat, body.clone(), None).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "`{body}` is nothing to send: {}",
+            response.text()
+        );
+        assert_eq!(
+            error_message(&response).as_deref(),
+            Some("Cannot send an empty chat message"),
+            "the ticket's wording"
+        );
+    }
+    let bare = common::TestRequest::post(&messages_path(&chat))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        bare.status,
+        StatusCode::BAD_REQUEST,
+        "an empty body is an empty object"
+    );
+    assert_eq!(
+        error_message(&bare).as_deref(),
+        Some("Cannot send an empty chat message"),
+        "and reads as one"
+    );
+    assert_eq!(count_messages(&pool).await, 0, "the refusals wrote nothing");
+}
+
+/// `media_id` naming no media the poster may attach is the one 400
+/// `{"error":"Media not found"}` whichever way it fails — unknown id,
+/// malformed id text, another user's row, a row a status already claimed,
+/// or a file that is none of image, video or audio — and the refusal says
+/// nothing about which of them the id was.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn unattachable_media_is_media_not_found(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let foreign = insert_media(&pool, &bob, "image/png").await;
+    let claimed = insert_media(&pool, &alice, "image/png").await;
+    claim_media(&pool, claimed, &alice).await;
+    let document = insert_media(&pool, &alice, "application/pdf").await;
+    let app = common::test_app(pool.clone());
+
+    for junk in [
+        new_id().to_string(),
+        "not-a-uuid".to_owned(),
+        foreign.to_string(),
+        claimed.to_string(),
+        document.to_string(),
+    ] {
+        for body in [
+            json!({"media_id": &junk}),
+            json!({"content": "look", "media_id": &junk}),
+        ] {
+            let response = post_message(&app, &token, &chat, body, None).await;
+            assert_eq!(
+                response.status,
+                StatusCode::BAD_REQUEST,
+                "`{junk}` is no chat media for alice: {}",
+                response.text()
+            );
+            assert_eq!(
+                error_message(&response).as_deref(),
+                Some("Media not found"),
+                "one wording on `{junk}`"
+            );
+        }
+    }
+    assert_eq!(count_messages(&pool).await, 0, "and nothing was written");
+}
+
+/// `content` longer than the `MAX_CHAT_MESSAGE_CHARS` setting (default
+/// 5000, counted in characters and not bytes) is the 400
+/// `{"error":"The message is too long"}`; the limit itself posts.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn content_over_the_chat_limit_is_too_long(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+
+    let over = "\u{20ac}".repeat(5_001);
+    let refused = post_message(&app, &token, &chat, json!({"content": over}), None).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "one character over 5000 is refused"
+    );
+    assert_eq!(
+        error_message(&refused).as_deref(),
+        Some("The message is too long"),
+        "the ticket's wording"
+    );
+
+    let exactly = "\u{20ac}".repeat(5_000);
+    let accepted = post_message(&app, &token, &chat, json!({"content": exactly}), None).await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::OK,
+        "the limit itself posts: {}",
+        accepted.text()
+    );
+    assert_eq!(count_messages(&pool).await, 1, "and only that one");
+}
+
+/// A lowered `MAX_CHAT_MESSAGE_CHARS` setting is what the endpoint
+/// measures: six characters over a limit of five are the same 400, five
+/// still post, and a media message's content is bounded the same way.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_chat_length_setting_gates_the_endpoint(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let mut config = common::test_config();
+    config.max_chat_message_chars = 5;
+    let app = common::test_app_with_config(pool.clone(), config);
+
+    let refused = post_message(&app, &token, &chat, json!({"content": "abcdef"}), None).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "six characters over a limit of five: {}",
+        refused.text()
+    );
+    assert_eq!(
+        error_message(&refused).as_deref(),
+        Some("The message is too long"),
+        "the same wording, the operator's number"
+    );
+
+    let media = insert_media(&pool, &alice, "image/png").await;
+    let with_media = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"content": "abcdef", "media_id": media.to_string()}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        with_media.status,
+        StatusCode::BAD_REQUEST,
+        "an attachment does not excuse length"
+    );
+
+    let accepted = post_message(&app, &token, &chat, json!({"content": "abcde"}), None).await;
+    assert_eq!(
+        accepted.status,
+        StatusCode::OK,
+        "five characters fit the lowered setting"
+    );
+}
+
+/// `GET …/chats/{id}/messages` answers `ChatMessage` entities newest first
+/// under the `Link` header keyed on the page's reference ids, walks back
+/// with `max_id`, forward with `since_id`/`min_id`, defaults to a page of
+/// twenty, refuses a malformed cursor, and answers an empty chat with the
+/// bare array and no `Link` header.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_message_list_orders_newest_first_and_pages_by_reference_id(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let posted = post_message(
+            &app,
+            &token,
+            &chat,
+            json!({"content": format!("message {index}")}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            posted.status,
+            StatusCode::OK,
+            "the fixture posts: {}",
+            posted.text()
+        );
+        ids.push(
+            posted.json_value()["id"]
+                .as_str()
+                .expect("a reference id")
+                .to_owned(),
+        );
+    }
+    let path = messages_path(&chat);
+
+    let full = get_as(&app, &token, &path).await;
+    let listed = full.json_value();
+    assert_eq!(
+        entity_ids(&listed),
+        vec![ids[2].clone(), ids[1].clone(), ids[0].clone()],
+        "newest first"
+    );
+    assert_eq!(
+        listed[0]["content"], "<p>message 2</p>",
+        "and it is the text"
+    );
+    let want = expected_link(&path, &ids[2], &ids[0]);
+    assert_eq!(
+        full.header("link"),
+        Some(want.as_str()),
+        "the cursors key on the page's reference ids"
+    );
+
+    let tail = get_as(&app, &token, &format!("{path}?limit=2&max_id={}", ids[1])).await;
+    assert_eq!(
+        entity_ids(&tail.json_value()),
+        vec![ids[0].clone()],
+        "max_id walks back through the chat"
+    );
+    let since = get_as(&app, &token, &format!("{path}?since_id={}", ids[0])).await;
+    assert_eq!(
+        entity_ids(&since.json_value()),
+        vec![ids[2].clone(), ids[1].clone()],
+        "since_id skips the cursor and everything older"
+    );
+    let forward = get_as(&app, &token, &format!("{path}?min_id={}", ids[0])).await;
+    assert_eq!(
+        entity_ids(&forward.json_value()),
+        vec![ids[2].clone(), ids[1].clone()],
+        "min_id answers the page after the cursor, newest first again"
+    );
+
+    let junk = get_as(&app, &token, &format!("{path}?max_id=not-a-uuid")).await;
+    assert_eq!(
+        junk.status,
+        StatusCode::BAD_REQUEST,
+        "a malformed cursor 400s"
+    );
+    assert_eq!(
+        error_message(&junk).as_deref(),
+        Some("Invalid id"),
+        "with the pagination module's wording"
+    );
+
+    let carol = common::create_local_user(&pool, "carol").await;
+    let quiet = open_chat(&pool, &alice, &carol).await.id.to_string();
+    let empty = get_as(&app, &token, &messages_path(&quiet)).await;
+    assert_eq!(
+        empty.json_value(),
+        json!([]),
+        "a chatless chat lists the array"
+    );
+    assert_eq!(empty.header("link"), None, "and sends no Link header");
+}
+
+/// The message page defaults to twenty and takes any `limit` up to
+/// [`MAX_LIMIT`]: twenty-one messages answer twenty unasked and all of them
+/// on a page of twenty-five.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_message_list_defaults_to_twenty(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    for index in 0..21 {
+        let posted = post_message(
+            &app,
+            &token,
+            &chat,
+            json!({"content": format!("m{index}")}),
+            None,
+        )
+        .await;
+        assert_eq!(posted.status, StatusCode::OK, "fixture post {index}");
+    }
+    let path = messages_path(&chat);
+
+    let default = get_as(&app, &token, &path).await.json_value();
+    assert_eq!(entity_ids(&default).len(), 20, "the default page is 20");
+    let asked = get_as(&app, &token, &format!("{path}?limit=25"))
+        .await
+        .json_value();
+    assert_eq!(
+        entity_ids(&asked).len(),
+        21,
+        "and 25 takes everything there is"
+    );
+}
+
+/// What a posted message does to the other side: the recipient gets a
+/// reference of their own chat — a different reference id in a different
+/// chat — flagged unread, and their `Chat` entity counts it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_posted_message_arrives_unread_for_the_recipient(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let (bob, bobs_token) = fixture(&pool, "bob", READ_SCOPE).await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+
+    let posted = post_message(&app, &token, &chat, json!({"content": "ping"}), None).await;
+    assert_eq!(
+        posted.status,
+        StatusCode::OK,
+        "alice posts: {}",
+        posted.text()
+    );
+    let senders_ref = posted.json_value()["id"]
+        .as_str()
+        .expect("a reference id")
+        .to_owned();
+
+    let bobs_chat = own_chat_id(&pool, bob.id).await.to_string();
+    assert_ne!(
+        bobs_chat, chat,
+        "the recipient's side of the conversation is its own chat"
+    );
+    let listed = get_as(&app, &bobs_token, &messages_path(&bobs_chat)).await;
+    assert_eq!(
+        listed.status,
+        StatusCode::OK,
+        "and he may list it: {}",
+        listed.text()
+    );
+    let messages = listed.json_value();
+    assert_eq!(
+        json_keys(&messages[0]),
+        MESSAGE_KEYS,
+        "his own ChatMessage entity"
+    );
+    assert_ne!(
+        messages[0]["id"].as_str().expect("an id"),
+        senders_ref,
+        "each side holds its own reference to one message"
+    );
+    assert_eq!(messages[0]["unread"], true, "unread for him");
+    assert_eq!(messages[0]["content"], "<p>ping</p>", "the same text");
+    assert_eq!(
+        messages[0]["account_id"],
+        alice.id.to_string(),
+        "from alice"
+    );
+    assert_eq!(messages[0]["chat_id"], bobs_chat, "in his chat");
+
+    let shown = get_as(&app, &bobs_token, &format!("{ROOT}/{bobs_chat}")).await;
+    assert_eq!(shown.json_value()["unread"], 1, "his chat counts it unread");
+    assert_eq!(
+        shown.json_value()["last_message"]["unread"],
+        true,
+        "and its last message says so too"
+    );
+}
+
+/// An `Idempotency-Key` stored with a message replays it: the same key from
+/// the same sender answers the message that key created (id and all, body
+/// be damned) and writes nothing; a different key or none posts as usual;
+/// outside the hour the key is fresh again. The entity echoes the key while
+/// it was created with one, and only then.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn an_idempotency_key_replays_its_message_within_the_hour(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    let mut wanted = MESSAGE_KEYS.to_vec();
+    wanted.push("idempotency_key");
+    wanted.sort_unstable();
+
+    let first = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"content": "once"}),
+        Some("key-1"),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "keyed post: {}", first.text());
+    let value = first.json_value();
+    assert_eq!(json_keys(&value), wanted, "the entity adds the key");
+    assert_eq!(value["idempotency_key"], "key-1", "echoed back verbatim");
+    let first_id = value["id"].as_str().expect("a reference id").to_owned();
+
+    let replay = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"content": "twice"}),
+        Some("key-1"),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::OK, "a replay is no error");
+    let again = replay.json_value();
+    assert_eq!(again["id"], first_id, "the key answers its first message");
+    assert_eq!(again["content"], "<p>once</p>", "and not the new body");
+
+    let listed = get_as(&app, &token, &messages_path(&chat))
+        .await
+        .json_value();
+    assert_eq!(
+        entity_ids(&listed),
+        vec![first_id.clone()],
+        "the chat holds it once"
+    );
+    assert_eq!(
+        listed[0]["idempotency_key"], "key-1",
+        "read back with its key"
+    );
+    assert_eq!(count_messages(&pool).await, 1, "the replay wrote nothing");
+
+    let other_key = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"content": "other"}),
+        Some("key-2"),
+    )
+    .await;
+    assert_ne!(
+        other_key.json_value()["id"].as_str().expect("an id"),
+        first_id,
+        "another key is another message"
+    );
+    let no_key = post_message(&app, &token, &chat, json!({"content": "plain"}), None).await;
+    assert!(
+        no_key.json_value().get("idempotency_key").is_none(),
+        "and a keyless message renders no key"
+    );
+
+    expire_message(&pool, parse(&first_id)).await;
+    let late = post_message(
+        &app,
+        &token,
+        &chat,
+        json!({"content": "late"}),
+        Some("key-1"),
+    )
+    .await;
+    assert_eq!(late.status, StatusCode::OK);
+    assert_ne!(
+        late.json_value()["id"].as_str().expect("an id"),
+        first_id,
+        "outside the hour the key posts afresh"
+    );
+    assert_eq!(count_messages(&pool).await, 4, "once, other, plain, late");
+}
+
+/// The key belongs to its sender, not to a chat or an account name: the
+/// same key replayed into another of the sender's chats answers the first
+/// message and touches nothing else, and the same key from another user is
+/// just another message.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn an_idempotency_key_belongs_to_its_sender(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let (bob, bobs_token) = poster(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let with_bob = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let with_carol = open_chat(&pool, &alice, &carol).await.id.to_string();
+    let app = common::test_app(pool.clone());
+
+    let first = post_message(
+        &app,
+        &token,
+        &with_bob,
+        json!({"content": "one message"}),
+        Some("shared"),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let first_id = first.json_value()["id"]
+        .as_str()
+        .expect("a reference id")
+        .to_owned();
+
+    let crossed = post_message(
+        &app,
+        &token,
+        &with_carol,
+        json!({"content": "elsewhere"}),
+        Some("shared"),
+    )
+    .await;
+    let value = crossed.json_value();
+    assert_eq!(
+        value["id"], first_id,
+        "the sender's key replays its message"
+    );
+    assert_eq!(
+        value["chat_id"], with_bob,
+        "in the chat it was first posted into"
+    );
+    let carols_list = get_as(&app, &token, &messages_path(&with_carol)).await;
+    assert_eq!(
+        carols_list.json_value(),
+        json!([]),
+        "and the crossed chat received nothing"
+    );
+
+    let bobs_chat = own_chat_id(&pool, bob.id).await.to_string();
+    let bobs_own = post_message(
+        &app,
+        &bobs_token,
+        &bobs_chat,
+        json!({"content": "mine"}),
+        Some("shared"),
+    )
+    .await;
+    assert_eq!(
+        bobs_own.status,
+        StatusCode::OK,
+        "the same key is bob's to use: {}",
+        bobs_own.text()
+    );
+    assert_ne!(
+        bobs_own.json_value()["id"].as_str().expect("an id"),
+        first_id,
+        "and posts his own message with it"
+    );
+    assert_eq!(count_messages(&pool).await, 2, "alice's one, bob's one");
+}
+
+/// `DELETE …/chats/{id}/messages/{message_id}` as the recipient removes
+/// only his own reference: the answer is his view of the message as it was
+/// (unread and all), the sender keeps a live copy, and a reference is only
+/// deletable through the chat that holds it, once.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_recipient_delete_only_removes_the_recipients_copy(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let (bob, bobs_token) = poster(&pool, "bob").await;
+    let alices_chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    let posted = post_message(
+        &app,
+        &token,
+        &alices_chat,
+        json!({"content": "for both"}),
+        None,
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::OK, "{}", posted.text());
+    let alice_ref = posted.json_value()["id"]
+        .as_str()
+        .expect("a reference id")
+        .to_owned();
+    let bobs_chat = own_chat_id(&pool, bob.id).await.to_string();
+    let his = get_as(&app, &bobs_token, &messages_path(&bobs_chat))
+        .await
+        .json_value();
+    let bob_ref = his[0]["id"].as_str().expect("his reference").to_owned();
+
+    let removed = delete_as(
+        &app,
+        &bobs_token,
+        &message_delete_path(&bobs_chat, &bob_ref),
+    )
+    .await;
+    assert_eq!(
+        removed.status,
+        StatusCode::OK,
+        "the recipient deletes: {}",
+        removed.text()
+    );
+    let value = removed.json_value();
+    assert_eq!(
+        json_keys(&value),
+        MESSAGE_KEYS,
+        "the full entity, as he saw it"
+    );
+    assert_eq!(value["id"], bob_ref, "his reference id");
+    assert_eq!(value["unread"], true, "still unread when it went");
+    assert_eq!(value["content"], "<p>for both</p>", "with the text");
+
+    assert_eq!(
+        get_as(&app, &bobs_token, &messages_path(&bobs_chat))
+            .await
+            .json_value(),
+        json!([]),
+        "his list no longer holds it"
+    );
+    let hers = get_as(&app, &token, &messages_path(&alices_chat))
+        .await
+        .json_value();
+    assert_eq!(
+        entity_ids(&hers),
+        vec![alice_ref.clone()],
+        "alice keeps her copy"
+    );
+    assert_eq!(
+        hers[0]["content"], "<p>for both</p>",
+        "live: hiding somebody's copy is not withdrawing the message"
+    );
+
+    let again = delete_as(
+        &app,
+        &bobs_token,
+        &message_delete_path(&bobs_chat, &bob_ref),
+    )
+    .await;
+    assert_eq!(
+        again.status,
+        StatusCode::NOT_FOUND,
+        "a second delete finds nothing"
+    );
+    assert_eq!(
+        error_message(&again).as_deref(),
+        Some("Record not found"),
+        "the plain 404 wording"
+    );
+    let misplaced = delete_as(
+        &app,
+        &bobs_token,
+        &message_delete_path(&alices_chat, &alice_ref),
+    )
+    .await;
+    assert_eq!(
+        misplaced.status,
+        StatusCode::NOT_FOUND,
+        "alice's chat is not bob's to delete in"
+    );
+    let foreign = delete_as(&app, &token, &message_delete_path(&alices_chat, &bob_ref)).await;
+    assert_eq!(
+        foreign.status,
+        StatusCode::NOT_FOUND,
+        "and bob's reference is not alice's to delete through hers"
+    );
+    assert_eq!(
+        count_messages(&pool).await,
+        1,
+        "the refusals changed nothing"
+    );
+}
+
+/// `DELETE` as the sender withdraws the message from everyone: their own
+/// reference goes, the row becomes a tombstone, and the recipient's
+/// listing hides it even though their reference survives.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_sender_delete_withdraws_the_message_from_both_sides(pool: PgPool) {
+    let (alice, token) = poster(&pool, "alice").await;
+    let (bob, bobs_token) = poster(&pool, "bob").await;
+    let alices_chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    let posted = post_message(
+        &app,
+        &token,
+        &alices_chat,
+        json!({"content": "take it back"}),
+        None,
+    )
+    .await;
+    let alice_ref = posted.json_value()["id"]
+        .as_str()
+        .expect("a reference id")
+        .to_owned();
+    let bobs_chat = own_chat_id(&pool, bob.id).await.to_string();
+
+    let withdrawn = delete_as(&app, &token, &message_delete_path(&alices_chat, &alice_ref)).await;
+    assert_eq!(
+        withdrawn.status,
+        StatusCode::OK,
+        "the sender withdraws: {}",
+        withdrawn.text()
+    );
+    assert_eq!(
+        withdrawn.json_value()["id"],
+        alice_ref,
+        "answering what went"
+    );
+    assert_eq!(
+        get_as(&app, &token, &messages_path(&alices_chat))
+            .await
+            .json_value(),
+        json!([]),
+        "the sender's list is empty"
+    );
+    assert_eq!(
+        get_as(&app, &bobs_token, &messages_path(&bobs_chat))
+            .await
+            .json_value(),
+        json!([]),
+        "and the recipient's no longer shows the tombstone"
+    );
+
+    let again = delete_as(&app, &token, &message_delete_path(&alices_chat, &alice_ref)).await;
+    assert_eq!(
+        again.status,
+        StatusCode::NOT_FOUND,
+        "withdrawing twice finds nothing"
+    );
+    let junk = delete_as(
+        &app,
+        &token,
+        &message_delete_path(&alices_chat, "not-a-uuid"),
+    )
+    .await;
+    assert_eq!(
+        junk.status,
+        StatusCode::NOT_FOUND,
+        "and so does a malformed reference id"
+    );
+}
+
+/// Foreign, unknown and malformed chat ids are one 404 on all three
+/// message routes, and a chat that is the caller's own still answers: the
+/// gate is ownership of the `{id}`, not the message behind it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_message_routes_answer_the_one_chat_404(pool: PgPool) {
+    let (alice, alice_token) = poster(&pool, "alice").await;
+    let (bob, bobs_token) = poster(&pool, "bob").await;
+    let alices_chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    let posted = post_message(
+        &app,
+        &alice_token,
+        &alices_chat,
+        json!({"content": "mine"}),
+        None,
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::OK, "the fixture posts");
+
+    for foreign in [
+        alices_chat.clone(),
+        new_id().to_string(),
+        "not-a-uuid".to_owned(),
+    ] {
+        let listed = get_as(&app, &bobs_token, &messages_path(&foreign)).await;
+        assert_eq!(
+            listed.status,
+            StatusCode::NOT_FOUND,
+            "no listing of {foreign}"
+        );
+        assert_eq!(
+            error_message(&listed).as_deref(),
+            Some("Record not found"),
+            "the plain 404 wording on {foreign}"
+        );
+        let attempted = post_message(
+            &app,
+            &bobs_token,
+            &foreign,
+            json!({"content": "into yours"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            attempted.status,
+            StatusCode::NOT_FOUND,
+            "no posting into {foreign}"
+        );
+        let deleted = delete_as(
+            &app,
+            &bobs_token,
+            &message_delete_path(&foreign, &new_id().to_string()),
+        )
+        .await;
+        assert_eq!(
+            deleted.status,
+            StatusCode::NOT_FOUND,
+            "no deleting through {foreign}"
+        );
+    }
+    assert_eq!(
+        count_messages(&pool).await,
+        1,
+        "every attempt was a 404 before any write"
+    );
+
+    let his_chat = own_chat_id(&pool, bob.id).await.to_string();
+    let mine = get_as(&app, &bobs_token, &messages_path(&his_chat)).await;
+    assert_eq!(
+        mine.status,
+        StatusCode::OK,
+        "bob's own side of the same conversation answers him"
+    );
+    assert_eq!(mine.json_value().as_array().expect("array").len(), 1);
+}
+
+/// The message routes demand their scopes before anything else: the list
+/// wants `read:chats`, the post and the delete want `write:chats`; no token
+/// is the 401 "Invalid credentials", a bad one the 401 naming the token, an
+/// app-only token the 403 demanding a user; the plain `read` and `write`
+/// roots cover the sub-scopes, and a right-scoped stranger still gets the
+/// ownership 404.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_message_routes_demand_their_scopes(pool: PgPool) {
+    let (alice, _) = poster(&pool, "alice").await;
+    let (bob, bob_read) = fixture(&pool, "bob", "read").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let bobs_chat = open_chat(&pool, &bob, &alice).await.id.to_string();
+    let (erin, read_only) = fixture(&pool, "erin", READ_SCOPE).await;
+    let (_, write_only) = fixture(&pool, "dave", SCOPE).await;
+    let (_, unrelated) = fixture(&pool, "grace", "read:accounts").await;
+    let app_only = common::create_app_only_token(&pool, "read:chats write:chats").await;
+    let bob_write = common::create_app_and_token(&pool, &bob, "write").await;
+    let app = common::test_app(pool.clone());
+    let path = messages_path(&chat);
+    let one = format!("{path}/{}", new_id());
+
+    assert_eq!(
+        error_message(&get_as(&app, &write_only, &path).await).as_deref(),
+        Some("Insufficient permissions: read:chats."),
+        "a writer reads no messages"
+    );
+    assert_eq!(
+        error_message(&get_as(&app, &unrelated, &path).await).as_deref(),
+        Some("Insufficient permissions: read:chats."),
+        "and an unrelated scope names what it lacks"
+    );
+    for refused in [
+        get_as(&app, &app_only, &path).await,
+        post_message(&app, &app_only, &chat, json!({"content": "x"}), None).await,
+        delete_as(&app, &app_only, &one).await,
+    ] {
+        assert_eq!(
+            error_message(&refused).as_deref(),
+            Some("This API requires an authenticated user"),
+            "an app-only token is a userless 403"
+        );
+    }
+    for refused in [
+        post_message(&app, &read_only, &chat, json!({"content": "x"}), None).await,
+        delete_as(&app, &read_only, &one).await,
+    ] {
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "a reader posts and deletes nothing"
+        );
+        assert_eq!(
+            error_message(&refused).as_deref(),
+            Some("Insufficient permissions: write:chats."),
+            "naming the scope they lack"
+        );
+    }
+
+    let anonymous = common::TestRequest::get(&path).send(&app).await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::UNAUTHORIZED,
+        "no token is a 401"
+    );
+    assert_eq!(
+        error_message(&anonymous).as_deref(),
+        Some("Invalid credentials"),
+        "the missing-token wording"
+    );
+    assert_eq!(
+        error_message(&get_as(&app, "not-a-real-token", &path).await).as_deref(),
+        Some("The access token is invalid"),
+        "and a bad token says so"
+    );
+    assert_eq!(
+        post_message(
+            &app,
+            "not-a-real-token",
+            &chat,
+            json!({"content": "x"}),
+            None
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED,
+        "on the post too"
+    );
+    assert_eq!(
+        delete_as(&app, "not-a-real-token", &one).await.status,
+        StatusCode::UNAUTHORIZED,
+        "and on the delete"
+    );
+
+    let stranger = get_as(&app, &read_only, &path).await;
+    assert_eq!(
+        stranger.status,
+        StatusCode::NOT_FOUND,
+        "the right scope on the wrong chat is the ownership 404"
+    );
+
+    let erins_chat = open_chat(&pool, &erin, &alice).await.id.to_string();
+    assert_eq!(
+        get_as(&app, &read_only, &messages_path(&erins_chat))
+            .await
+            .status,
+        StatusCode::OK,
+        "`read:chats` lists the caller's own messages"
+    );
+    assert_eq!(
+        get_as(&app, &bob_read, &messages_path(&bobs_chat))
+            .await
+            .status,
+        StatusCode::OK,
+        "the plain `read` root covers `read:chats`"
+    );
+    let posted = post_message(
+        &app,
+        &bob_write,
+        &bobs_chat,
+        json!({"content": "plain write root"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        posted.status,
+        StatusCode::OK,
+        "the plain `write` root posts: {}",
+        posted.text()
     );
 }
