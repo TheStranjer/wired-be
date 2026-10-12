@@ -1,13 +1,34 @@
-//! Chat read markers and pinning over HTTP (`/api/v1/pleroma/chats`,
-//! WBE-148): the four write-side actions of Pleroma's chat API.
+//! The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 list,
+//! WBE-146, with its read-marker and pinning half, WBE-148): Pleroma's chat
+//! endpoints except message posting, which that ticket owns.
 //!
 //! The reference is `Pleroma.Web.PleromaAPI.ChatController`
 //! (`lib/pleroma/web/pleroma_api/controllers/chat_controller.ex`), whose
-//! `mark_as_read`, `mark_message_as_read`, `pin` and `unpin` actions these
-//! routes replicate; the state they change lives in the three chat tables
-//! behind [`crate::models::chat`], and the JSON they answer is the
-//! [`Chat`] and [`ChatMessage`] entities (decision 3).
+//! `create`, `index`, `index2`, `show`, `mark_as_read`,
+//! `mark_message_as_read`, `pin` and `unpin` actions these routes replicate;
+//! the state they change lives in the three chat tables behind
+//! [`crate::models::chat`], and the JSON they answer is the [`Chat`] and
+//! [`ChatMessage`] entities (decision 3).
 //!
+//! - `POST /api/v1/pleroma/chats/by-account-id/{id}` — get or create the
+//!   caller's chat with that account (Pleroma's `create` +
+//!   `Chat.get_or_create`) and answer the [`Chat`] entity with 200. The
+//!   account must exist and be active (one 404, [`account_or_404`]), the
+//!   pair is refused by `chat_refusal` (self, the recipient's chat flag,
+//!   blocks), and the write is idempotent: a second call answers the same
+//!   chat, unmoved in its owner's list.
+//! - `GET /api/v1/pleroma/chats` — the legacy list (Pleroma's `index`,
+//!   whose api spec deprecates it for wanting a page): the caller's chats
+//!   ordered by activity, one [`PageParams`] page of at most 30 under the
+//!   `with_muted` and `pinned` filters, with the `Link` header keyed on the
+//!   chat ids of the returned page.
+//! - `GET /api/v2/pleroma/chats` — Pleroma's `index2`: the same query
+//!   paginated for real; it orders by the chat's last message time, which
+//!   this schema keeps in
+//!   [`updated_at`](crate::models::chat::Chat::updated_at) (messages bump
+//!   it, opening a chat does not), and its cursors are chat ids.
+//! - `GET /api/v1/pleroma/chats/{id}` — Pleroma's `show`: one owned chat as
+//!   the [`Chat`] entity; a malformed, unknown or foreign id is one 404.
 //! - `POST /api/v1/pleroma/chats/{id}/read` — body `last_read_id` (required):
 //!   marks every unread reference of the caller's chat `id` with
 //!   `id <= last_read_id` read (Pleroma's `set_all_seen_for_chat`) and answers
@@ -18,9 +39,10 @@
 //!   `chats.pinned` (Pleroma's `Chat.pin`/`Chat.unpin`) and answer the chat.
 //!
 //! Gates, in Pleroma's order: a user token ([`AuthUser`]) granting
-//! `write:chats` (its `OAuthScopesPlug` pipeline for these four actions), then
-//! the body of the whole-chat read — without `last_read_id` a request is the
-//! 400 `{"error":"Missing parameter: last_read_id"}` of that controller's
+//! `read:chats` on the three reading routes and `write:chats` on the four
+//! writing ones (its `OAuthScopesPlug` pipeline), then the body of the
+//! whole-chat read — without `last_read_id` a request is the 400
+//! `{"error":"Missing parameter: last_read_id"}` of that controller's
 //! fallback clause, checked before anything is looked up; a marker that is
 //! present but not an id is 400 `"Invalid parameter: last_read_id"`,
 //! Pleroma's own uuid cast having no sane answer here. `{id}` (and `{message_id}`)
@@ -36,26 +58,28 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    routing::post,
+    extract::{OriginalUri, Path, State},
+    http::HeaderMap,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
+    api::helpers::account_or_404,
     auth::AuthUser,
     entities::chat::{Chat, ChatMessage},
     error::{AppError, AppResult},
-    extract::ApiBody,
+    extract::{ApiBody, ApiParams, flex},
     models::{
         chat,
-        chat::ChatMessageReference,
+        chat::{ChatFilter, ChatMessageReference},
         media_attachment,
         user::{self, User},
     },
-    oauth::scopes::WRITE_CHATS,
-    pagination::PageParams,
+    oauth::scopes::{READ_CHATS, WRITE_CHATS},
+    pagination::{MAX_LIMIT, PageParams, link_header, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -77,6 +101,27 @@ const NEWEST_PAGE: PageParams = PageParams {
     limit: 1,
     offset: None,
 };
+/// 422 body when the caller names themselves as the chat recipient
+/// (Pleroma's `validate_no_self_chat` changeset error, in the ticket's
+/// spelling).
+const CANT_CHAT_WITH_SELF: &str = "Can't chat with yourself";
+/// 403 body when the recipient's [`accepts_chat_messages`] flag is down
+/// (Pleroma lumps this into its `Chat not allowed` refusal too; the ticket
+/// gives the flag its own wording).
+///
+/// [`accepts_chat_messages`]: crate::models::user::User::accepts_chat_messages
+const RECIPIENT_REJECTS_CHATS: &str = "Recipient doesn't accept chat messages";
+/// 403 body when one side of the pair has blocked the other (Pleroma's
+/// `{:error, :chat_not_allowed}` fallback).
+const CHAT_NOT_ALLOWED: &str = "Chat not allowed";
+/// The `limit` cap of the legacy `GET /api/v1/pleroma/chats` (the ticket's
+/// 20-default, 30-maximum page; [`MAX_LIMIT`] caps the v2 list, like
+/// Pleroma's own `Pagination` module).
+const LEGACY_MAX_LIMIT: i64 = 30;
+/// The `Link` header's query parameters carry nothing but the cursor: the
+/// list's filters are not repeated on either link, as in no other paged
+/// listing of this API.
+const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/pleroma/chats` router, nested into [`crate::api::v1`].
 ///
@@ -85,10 +130,238 @@ const NEWEST_PAGE: PageParams = PageParams {
 /// unmatched paths.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/", get(list_chats))
+        .route("/by-account-id/{id}", post(create_chat))
+        .route("/{id}", get(show_chat))
         .route("/{id}/read", post(mark_chat_read))
         .route("/{id}/messages/{message_id}/read", post(mark_message_read))
         .route("/{id}/pin", post(pin_chat))
         .route("/{id}/unpin", post(unpin_chat))
+}
+
+/// The `/api/v2/pleroma/chats` router, nested into [`crate::api::v2`].
+///
+/// The second version is the paged sibling of [`router`]'s legacy list
+/// (Pleroma's `index` vs `index2`); the per-chat routes live under
+/// `/api/v1` only, which is why this router holds the one route.
+pub fn v2_router() -> Router<AppState> {
+    Router::new().route("/", get(list_chats_v2))
+}
+
+/// `POST /api/v1/pleroma/chats/by-account-id/{id}` — get or create the
+/// caller's chat with that account and answer the [`Chat`] entity (200
+/// whether the chat was made here or already existed: Pleroma's `create`
+/// renders `show.json` either way).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `write:chats` check; [`AppError::NotFound`] when `id` is malformed,
+/// names no account or names a deactivated one ([`account_or_404`]: the
+/// ticket's "unknown account 404" and active-account requirement);
+/// whatever [`chat_refusal`] decides the pair is owed. Any database failure
+/// arrives through `?` as [`AppError::Database`].
+async fn create_chat(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Chat>> {
+    auth.require(WRITE_CHATS)?;
+    let recipient = account_or_404(&state, &id).await?;
+    if let Some(refusal) = chat_refusal(&auth.0, &recipient) {
+        return Err(refusal);
+    }
+    let row = chat::get_or_create(&state.db, &auth.0, &recipient).await?;
+    debug!(
+        chat = %row.id,
+        user = %auth.0.id,
+        recipient = %recipient.id,
+        "chat opened"
+    );
+    chat_json(&state, &row).await
+}
+
+/// The refusal opening `user`'s chat with `recipient` owes the pair, `None`
+/// when they may chat: naming yourself is the 422, a recipient whose
+/// [`accepts_chat_messages`] flag is down — remote mirror or local account
+/// alike — is the 403 that names the flag, and a pair blocked in either
+/// direction is Pleroma's `Chat not allowed` 403, in that order.
+///
+/// [`accepts_chat_messages`]: crate::models::user::User::accepts_chat_messages
+fn chat_refusal(user: &User, recipient: &User) -> Option<AppError> {
+    if user.id == recipient.id {
+        return Some(AppError::Unprocessable(CANT_CHAT_WITH_SELF.to_owned()));
+    }
+    if !recipient.accepts_chat_messages.get() {
+        return Some(AppError::Forbidden(RECIPIENT_REJECTS_CHATS.to_owned()));
+    }
+    if blocked_between(user, recipient) {
+        return Some(AppError::Forbidden(CHAT_NOT_ALLOWED.to_owned()));
+    }
+    None
+}
+
+/// Whether `user` and `recipient` have blocked each other, in either
+/// direction — what makes Pleroma's `ChatController.create` answer the 403
+/// [`CHAT_NOT_ALLOWED`].
+///
+/// No pair is blocked yet: the relationship table that records blocks (and
+/// mutes, which hide a chat from the list but do not refuse opening it)
+/// arrives with the blocks ticket, which wires this hook up the way
+/// [`crate::models::follow`]'s like-named hook waits for the same table.
+const fn blocked_between(_user: &User, _recipient: &User) -> bool {
+    false
+}
+
+/// `GET /api/v1/pleroma/chats` — the caller's chats, newest activity first,
+/// one page of at most [`LEGACY_MAX_LIMIT`] under the [`ChatListParams`]
+/// filters, with the `Link` header keyed on the chat ids of the page.
+///
+/// The `Link` header's path is the request's own [`OriginalUri`], not the
+/// [`Uri`] the nested router hands the handler: axum strips the prefixes,
+/// and Pleroma links to `conn.request_path`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `read:chats` check; [`AppError::BadRequest`] for a malformed
+/// pagination cursor ([`PageParams::from_query`]);
+/// [`AppError::Unprocessable`] for a filter that is not a boolean
+/// ([`ApiParams`]). Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+///
+/// [`Uri`]: axum::http::Uri
+async fn list_chats(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    OriginalUri(uri): OriginalUri,
+    ApiParams(params): ApiParams<ChatListParams>,
+) -> AppResult<(HeaderMap, Json<Vec<Chat>>)> {
+    auth.require(READ_CHATS)?;
+    let page = PageParams::from_query(uri.query(), LEGACY_MAX_LIMIT)?;
+    list_page(&state, auth.0.id, page, params.into_filter(), uri.path()).await
+}
+
+/// `GET /api/v2/pleroma/chats` — the paged counterpart of [`list_chats`]
+/// (Pleroma's `index2`): the same query, the same filters, [`MAX_LIMIT`] as
+/// the page cap instead of the legacy [`LEGACY_MAX_LIMIT`], and the cursors
+/// walking chat ids while the page stays ordered by last message time.
+///
+/// # Errors
+///
+/// Exactly [`list_chats`]'s.
+async fn list_chats_v2(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    OriginalUri(uri): OriginalUri,
+    ApiParams(params): ApiParams<ChatListParams>,
+) -> AppResult<(HeaderMap, Json<Vec<Chat>>)> {
+    auth.require(READ_CHATS)?;
+    let page = PageParams::from_query(uri.query(), MAX_LIMIT)?;
+    list_page(&state, auth.0.id, page, params.into_filter(), uri.path()).await
+}
+
+/// The chats of `user_id` as one listed page: the [`Chat`] entities in
+/// activity order under the `Link` header [`page_link`] derives from their
+/// ids ([`page_for_user`] does the id keyset and the activity sort; opening
+/// a chat never bumps it, a message always does).
+///
+/// [`page_for_user`]: crate::models::chat::page_for_user
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`];
+/// rendering can only 404 through a recipient row that vanished with its
+/// chat's counterpart (see [`chat_entity`]).
+async fn list_page(
+    state: &AppState,
+    user_id: Uuid,
+    page: PageParams,
+    filter: ChatFilter,
+    path: &str,
+) -> AppResult<(HeaderMap, Json<Vec<Chat>>)> {
+    let rows = chat::page_for_user(&state.db, user_id, page, filter).await?;
+    let link = page_link(&state.config.base_url, path, &rows);
+    let mut headers = HeaderMap::new();
+    set_link_header(&mut headers, link.as_deref())?;
+    debug!(
+        count = rows.len(),
+        user = %user_id,
+        "chats listed"
+    );
+    Ok((headers, Json(chat_entities(state, &rows).await?)))
+}
+
+/// The `Link` header value for a fetched chat page: Pleroma's
+/// `add_link_headers` over the first and last row's chat id — the page's
+/// activity order stands, so the cursors name those two rows' ids — and
+/// `None` for an empty page.
+fn page_link(base_url: &str, path: &str, rows: &[chat::Chat]) -> Option<String> {
+    let newest = rows.first()?.id.to_string();
+    let oldest = rows.last()?.id.to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+}
+
+/// The [`Chat`] entities for `rows`, each rendered the way [`chat_json`]
+/// renders one.
+///
+/// # Errors
+///
+/// As [`chat_entity`]'s.
+async fn chat_entities(state: &AppState, rows: &[chat::Chat]) -> AppResult<Vec<Chat>> {
+    let mut entities = Vec::with_capacity(rows.len());
+    for row in rows {
+        entities.push(chat_entity(state, row).await?);
+    }
+    Ok(entities)
+}
+
+/// `GET /api/v1/pleroma/chats/{id}` — one of the caller's chats as the
+/// [`Chat`] entity (Pleroma's `show`).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `read:chats` check; [`AppError::NotFound`] for an id that is
+/// malformed, names no chat or names one of another account (see
+/// [`owned_chat`]). Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn show_chat(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Chat>> {
+    auth.require(READ_CHATS)?;
+    let row = owned_chat(&state, auth.0.id, &id).await?;
+    chat_json(&state, &row).await
+}
+
+/// The `with_muted` and `pinned` query parameters of both chat lists
+/// (Pleroma's `index_query`).
+#[derive(Debug, Deserialize)]
+struct ChatListParams {
+    /// Whether chats with muted accounts are listed (Pleroma's
+    /// `with_muted`); absent means `false`. The exclusion itself waits for
+    /// the mutes table the way [`blocked_between`] waits for the blocks one
+    /// — see [`ChatFilter::with_muted`].
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    with_muted: Option<bool>,
+    /// `Some(true)` lists only pinned chats, `Some(false)` only unpinned
+    /// ones, `None` lists both (Pleroma's `restrict_pinned`).
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    pinned: Option<bool>,
+}
+
+impl ChatListParams {
+    /// These parameters as the model's [`ChatFilter`]: the flag defaults to
+    /// `false` and the filter stays `None` when its key is absent.
+    fn into_filter(self) -> ChatFilter {
+        ChatFilter {
+            pinned: self.pinned,
+            with_muted: self.with_muted.unwrap_or_default(),
+        }
+    }
 }
 
 /// The body of `POST …/chats/{id}/read`: Pleroma's `ChatReadParameter`.
@@ -281,19 +554,28 @@ async fn owned_chat(state: &AppState, user_id: Uuid, id: &str) -> AppResult<chat
 /// [`AppError::NotFound`] if the recipient row is gone (the foreign key makes
 /// that unreachable while the chat exists); database failures arrive through
 /// `?` as [`AppError::Database`].
-async fn chat_json(state: &AppState, row: &chat::Chat) -> AppResult<Json<Chat>> {
+async fn chat_entity(state: &AppState, row: &chat::Chat) -> AppResult<Chat> {
     let recipient = user::get_by_id(&state.db, row.recipient_id)
         .await?
         .ok_or(AppError::NotFound)?;
     let unread = chat::unread_count(&state.db, row.id).await?;
     let last_message = newest_message(state, row.id).await?;
-    Ok(Json(Chat::from_row(
+    Ok(Chat::from_row(
         row,
         &recipient,
         &state.config,
         unread,
         last_message,
-    )))
+    ))
+}
+
+/// The [`Chat`] entity for `row`, answered as JSON.
+///
+/// # Errors
+///
+/// As [`chat_entity`]'s.
+async fn chat_json(state: &AppState, row: &chat::Chat) -> AppResult<Json<Chat>> {
+    Ok(Json(chat_entity(state, row).await?))
 }
 
 /// The chat's newest live message as an entity, `None` when it has none.
@@ -412,5 +694,193 @@ mod tests {
             );
             assert_eq!(err.to_string(), INVALID_LAST_READ_ID, "its wording");
         }
+    }
+
+    /// Inserts a local [`User`] named `nickname` that accepts chats.
+    async fn chatter(pool: &sqlx::PgPool, nickname: &str) -> User {
+        user::insert(
+            pool,
+            &user::NewUser::local(
+                nickname,
+                &user::local_ap_id(crate::config::TEST_BASE_URL, nickname),
+            ),
+        )
+        .await
+        .expect("fixture user inserts")
+    }
+
+    /// Inserts a local [`User`] named `nickname` whose chat flag is down.
+    async fn quiet(pool: &sqlx::PgPool, nickname: &str) -> User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                accepts_chat_messages: user::Flag::new(false),
+                ..user::NewUser::local(
+                    nickname,
+                    &user::local_ap_id(crate::config::TEST_BASE_URL, nickname),
+                )
+            },
+        )
+        .await
+        .expect("fixture user inserts")
+    }
+
+    /// Inserts a remote mirror named `nickname` whose chat flag is down: the
+    /// shape a fetched `Person` that said `acceptsChatMessages: false` has.
+    async fn quiet_remote(pool: &sqlx::PgPool, nickname: &str) -> User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                nickname: format!("{nickname}@remote.example"),
+                ap_id: format!("https://remote.example/users/{nickname}"),
+                domain: Some("remote.example".to_owned()),
+                accepts_chat_messages: user::Flag::new(false),
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("fixture remote user inserts")
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn chatting_with_yourself_is_the_422(pool: sqlx::PgPool) {
+        let alice = chatter(&pool, "alice").await;
+
+        let err = chat_refusal(&alice, &alice).expect("the self-chat is refused");
+
+        assert!(
+            matches!(err, AppError::Unprocessable(_)),
+            "naming yourself is a 422: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            CANT_CHAT_WITH_SELF,
+            "the ticket's spelling"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_recipient_that_does_not_accept_chats_is_named_in_a_403(pool: sqlx::PgPool) {
+        let alice = chatter(&pool, "alice").await;
+
+        for silent in [
+            quiet(&pool, "carol").await,
+            quiet_remote(&pool, "mallory").await,
+        ] {
+            let err = chat_refusal(&alice, &silent)
+                .unwrap_or_else(|| panic!("{} refuses the pair", silent.nickname));
+            assert!(
+                matches!(err, AppError::Forbidden(_)),
+                "the flag is refused with a 403: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                RECIPIENT_REJECTS_CHATS,
+                "its own wording, remote mirror or local account alike"
+            );
+        }
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_ordinary_pair_passes_and_no_pair_is_blocked_yet(pool: sqlx::PgPool) {
+        let alice = chatter(&pool, "alice").await;
+        let bob = chatter(&pool, "bob").await;
+        let mallory = quiet_remote(&pool, "mallory").await;
+
+        assert!(
+            chat_refusal(&alice, &bob).is_none(),
+            "two chatters may chat"
+        );
+        assert!(
+            !blocked_between(&alice, &bob) && !blocked_between(&bob, &alice),
+            "no pair is blocked until the blocks ticket wires the hook up"
+        );
+        // The flag gate stands ahead of the block hook: a silent recipient
+        // is refused by name whatever the block tables will one day say.
+        assert!(
+            chat_refusal(&alice, &mallory).is_some(),
+            "flag down is a refusal"
+        );
+    }
+
+    /// Parses `value` as the lists' query parameters and filters as they ask.
+    fn filter_params(value: serde_json::Value) -> ChatFilter {
+        crate::extract::into_params::<ChatListParams>(value)
+            .expect("the fixture is a parameters object")
+            .into_filter()
+    }
+
+    #[test]
+    fn absent_filters_give_the_plain_list() {
+        assert_eq!(
+            filter_params(json!({})),
+            ChatFilter::default(),
+            "no keys, no restrictions"
+        );
+        assert_eq!(
+            filter_params(json!({"pinned": null, "with_muted": null})),
+            ChatFilter::default(),
+            "an explicit null is still absent"
+        );
+    }
+
+    #[test]
+    fn the_pinned_filter_keeps_its_three_states() {
+        assert_eq!(
+            filter_params(json!({"pinned": true})).pinned,
+            Some(true),
+            "the pinned half"
+        );
+        assert_eq!(
+            filter_params(json!({"pinned": "false"})).pinned,
+            Some(false),
+            "the unpinned half, in a form client's string spelling"
+        );
+        assert_eq!(
+            filter_params(json!({"with_muted": "1"})).pinned,
+            None,
+            "and no filter at all when the key is absent"
+        );
+    }
+
+    #[test]
+    fn with_muted_is_read_in_its_client_spellings() {
+        assert!(
+            filter_params(json!({"with_muted": "true"})).with_muted,
+            "`\"true\"` includes the muted"
+        );
+        assert!(
+            !filter_params(json!({"with_muted": false})).with_muted,
+            "and a plain false excludes them (once the mutes ticket gives them an exclusion)"
+        );
+    }
+
+    #[test]
+    fn a_filter_that_is_not_a_boolean_is_a_parameter_error() {
+        for key in ["with_muted", "pinned"] {
+            let err = crate::extract::into_params::<ChatListParams>(json!({ key: "maybe" }))
+                .expect_err("`maybe` is not a boolean");
+            assert!(
+                err.to_string().contains("expected a boolean"),
+                "and the flex message says so: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_legacy_page_caps_lower_than_the_v2_page() {
+        let legacy = PageParams::from_query(Some("limit=35"), LEGACY_MAX_LIMIT)
+            .expect("a limit above the cap falls to it");
+        assert_eq!(legacy.limit, 30, "the legacy list takes at most 30");
+        assert_eq!(
+            PageParams::from_query(None, LEGACY_MAX_LIMIT)
+                .expect("no query is the default page")
+                .limit,
+            20,
+            "and defaults to 20"
+        );
+        let v2 = PageParams::from_query(Some("limit=35"), MAX_LIMIT)
+            .expect("the v2 page lets 35 through");
+        assert_eq!(v2.limit, 35, "only MAX_LIMIT caps it");
     }
 }
