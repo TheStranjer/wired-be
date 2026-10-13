@@ -4,20 +4,30 @@ pub mod api;
 pub mod config;
 pub mod error;
 pub mod extract;
+pub mod jobs;
 pub mod middleware;
 pub mod models;
 pub mod pagination;
 pub mod state;
 pub mod util;
 
+use std::{error::Error, sync::Arc};
+
 use axum::{
     Router,
     http::{StatusCode, Uri},
     routing::get,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
+use tokio::net::TcpListener;
+use tracing::{error, info};
 
-use crate::{error::AppError, state::AppState};
+use crate::{
+    config::Config,
+    error::AppError,
+    jobs::{JobRegistry, Worker},
+    state::AppState,
+};
 
 /// The migrations embedded from `migrations/`, applied by [`run_migrations`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -30,6 +40,52 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// the migration bookkeeping table cannot be read or written.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     MIGRATOR.run(pool).await
+}
+
+/// Starts the HTTP server and the job worker, and shuts both down on ctrl-c.
+///
+/// Connects to PostgreSQL, applies [`MIGRATOR`], binds
+/// [`config.bind_addr`](Config::bind_addr), and runs [`app`] together with a
+/// [`Worker`] over [`config`](Config::job_queues)
+/// ([`Config::job_concurrency`] slots at once) until the process is
+/// interrupted. Job handlers register themselves in the
+/// [`JobRegistry`] this builds; until they do, the worker only idles and
+/// sweeps.
+///
+/// # Errors
+///
+/// Returns the connection, migration or bind failure that stopped startup.
+pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let db = PgPoolOptions::new().connect(&config.database_url).await?;
+    run_migrations(&db).await?;
+    info!("database migrations applied");
+    let state = AppState {
+        db,
+        config: Arc::new(config),
+    };
+    let listener = TcpListener::bind(state.config.bind_addr).await?;
+    info!(addr = %state.config.bind_addr, "listening");
+    let worker = Worker::new(
+        state.clone(),
+        Arc::new(JobRegistry::new()),
+        state.config.job_queues.clone(),
+        state.config.job_concurrency,
+    );
+    info!(
+        queues = %state.config.job_queues.join(","),
+        concurrency = state.config.job_concurrency,
+        "job worker running"
+    );
+    let server = axum::serve(listener, app(state)).with_graceful_shutdown(wait_for_ctrl_c());
+    let outcome = tokio::join!(server, worker.run(wait_for_ctrl_c())).0;
+    Ok(outcome?)
+}
+
+/// Resolves when the user presses ctrl-c, the process-wide shutdown signal.
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        error!(%err, "cannot listen for ctrl-c; the process must be stopped by signal");
+    }
 }
 
 /// Builds the application router, wrapped in the [`middleware`] stack.

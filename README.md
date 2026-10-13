@@ -23,6 +23,8 @@ All configuration comes from environment variables. For local development, copy 
 | `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status |
 | `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
 | `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
+| `JOB_CONCURRENCY` | no | `10` | Job handlers a single worker runs at the same time |
+| `JOB_QUEUES` | no | `default,federator_incoming,federator_outgoing,mailer,scheduled,background` | Comma-separated job queue names, in claim priority order |
 
 ## Development
 

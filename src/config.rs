@@ -8,6 +8,8 @@ use std::{
 
 use url::Url;
 
+use crate::jobs::DEFAULT_JOB_QUEUES;
+
 /// Environment variable holding the PostgreSQL connection URL.
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 /// Environment variable holding the address to listen on.
@@ -28,6 +30,10 @@ pub const MAX_STATUS_CHARS_VAR: &str = "MAX_STATUS_CHARS";
 pub const MAX_MEDIA_ATTACHMENTS_VAR: &str = "MAX_MEDIA_ATTACHMENTS";
 /// Environment variable holding the maximum options per poll.
 pub const MAX_POLL_OPTIONS_VAR: &str = "MAX_POLL_OPTIONS";
+/// Environment variable holding the job worker's concurrent handler count.
+pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
+/// Environment variable holding the comma-separated job queue names.
+pub const JOB_QUEUES_VAR: &str = "JOB_QUEUES";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -42,6 +48,8 @@ pub const DEFAULT_MAX_STATUS_CHARS: usize = 5000;
 pub const DEFAULT_MAX_MEDIA_ATTACHMENTS: usize = 4;
 /// Poll option limit used when `MAX_POLL_OPTIONS` is unset.
 pub const DEFAULT_MAX_POLL_OPTIONS: usize = 20;
+/// Worker concurrency used when `JOB_CONCURRENCY` is unset.
+pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -75,6 +83,10 @@ pub struct Config {
     pub max_media_attachments: usize,
     /// Maximum number of options per poll.
     pub max_poll_options: usize,
+    /// Job handlers a single worker runs at the same time.
+    pub job_concurrency: usize,
+    /// Job queue names the worker drains, in claim priority order.
+    pub job_queues: Vec<String>,
 }
 
 impl Config {
@@ -125,6 +137,9 @@ impl Config {
             DEFAULT_MAX_MEDIA_ATTACHMENTS,
         )?;
         let max_poll_options = number(&lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?;
+        let job_concurrency = number(&lookup, JOB_CONCURRENCY_VAR, DEFAULT_JOB_CONCURRENCY)?;
+        let job_queues =
+            comma_list(&lookup(JOB_QUEUES_VAR).unwrap_or_else(|| DEFAULT_JOB_QUEUES.to_owned()));
         Ok(Self {
             database_url,
             bind_addr,
@@ -136,6 +151,8 @@ impl Config {
             max_status_chars,
             max_media_attachments,
             max_poll_options,
+            job_concurrency,
+            job_queues,
         })
     }
 
@@ -191,6 +208,8 @@ impl Config {
             max_status_chars: DEFAULT_MAX_STATUS_CHARS,
             max_media_attachments: DEFAULT_MAX_MEDIA_ATTACHMENTS,
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
+            job_concurrency: DEFAULT_JOB_CONCURRENCY,
+            job_queues: comma_list(DEFAULT_JOB_QUEUES),
         }
     }
 }
@@ -261,6 +280,8 @@ impl fmt::Debug for Config {
             .field("max_status_chars", &self.max_status_chars)
             .field("max_media_attachments", &self.max_media_attachments)
             .field("max_poll_options", &self.max_poll_options)
+            .field("job_concurrency", &self.job_concurrency)
+            .field("job_queues", &self.job_queues)
             .finish()
     }
 }
@@ -439,6 +460,19 @@ mod tests {
             "default max_media_attachments"
         );
         assert_eq!(config.max_poll_options, 20, "default max_poll_options");
+        assert_eq!(config.job_concurrency, 10, "default job_concurrency");
+        assert_eq!(
+            config.job_queues,
+            vec![
+                "default".to_owned(),
+                "federator_incoming".to_owned(),
+                "federator_outgoing".to_owned(),
+                "mailer".to_owned(),
+                "scheduled".to_owned(),
+                "background".to_owned(),
+            ],
+            "default job_queues"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -453,6 +487,8 @@ mod tests {
             (MAX_STATUS_CHARS_VAR, "300"),
             (MAX_MEDIA_ATTACHMENTS_VAR, "6"),
             (MAX_POLL_OPTIONS_VAR, "12"),
+            (JOB_CONCURRENCY_VAR, "3"),
+            (JOB_QUEUES_VAR, " default , mailer ,,scheduled"),
         ]);
         assert_eq!(config.instance_name, "Snatter", "custom instance_name");
         assert_eq!(
@@ -475,6 +511,16 @@ mod tests {
             "custom max_media_attachments"
         );
         assert_eq!(config.max_poll_options, 12, "custom max_poll_options");
+        assert_eq!(config.job_concurrency, 3, "custom job_concurrency");
+        assert_eq!(
+            config.job_queues,
+            vec![
+                "default".to_owned(),
+                "mailer".to_owned(),
+                "scheduled".to_owned(),
+            ],
+            "comma list is trimmed, empty entries dropped"
+        );
     }
 
     #[test]
@@ -560,6 +606,7 @@ mod tests {
             MAX_STATUS_CHARS_VAR,
             MAX_MEDIA_ATTACHMENTS_VAR,
             MAX_POLL_OPTIONS_VAR,
+            JOB_CONCURRENCY_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");

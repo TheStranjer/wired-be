@@ -1,12 +1,9 @@
-//! Server entry point: load config, connect to PostgreSQL, migrate, serve.
+//! Server entry point: load config, then hand everything to [`wired_be::serve`].
 
-use std::{error::Error, sync::Arc};
+use std::error::Error;
 
-use sqlx::postgres::PgPoolOptions;
-use tokio::net::TcpListener;
-use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use wired_be::{app, config::Config, run_migrations, state::AppState};
+use wired_be::{config::Config, serve};
 
 /// Installs a `tracing-subscriber` formatter filtered by `RUST_LOG`, defaulting to `info`.
 fn init_tracing() {
@@ -15,7 +12,7 @@ fn init_tracing() {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // A `.env` file is optional; real environment variables take precedence.
     if let Err(err) = dotenvy::dotenv()
         && !err.not_found()
@@ -24,18 +21,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     init_tracing();
     let config = Config::from_env()?;
-    let db = PgPoolOptions::new().connect(&config.database_url).await?;
-    if let Err(err) = run_migrations(&db).await {
-        error!(%err, "database migrations failed");
-        return Err(err.into());
-    }
-    info!("database migrations applied");
-    let listener = TcpListener::bind(config.bind_addr).await?;
-    info!(addr = %config.bind_addr, "listening");
-    let state = AppState {
-        db,
-        config: Arc::new(config),
-    };
-    axum::serve(listener, app(state)).await?;
+    serve(config).await?;
     Ok(())
 }
