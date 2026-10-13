@@ -365,6 +365,7 @@ mod tests {
             last_fetched_at: None,
             inserted_at: at(SENT),
             updated_at: at(SENT),
+            preferred_frontend: None,
         }
     }
 

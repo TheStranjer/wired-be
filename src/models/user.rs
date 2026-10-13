@@ -216,6 +216,10 @@ pub struct User {
     /// backup-code hashes). Holds the TOTP secret; never in `Debug`
     /// output.
     pub mfa_settings: Value,
+    /// The frontend the account picked at `PUT /api/v1/pleroma/preferred_frontend`;
+    /// `None` when it never chose one. The `preferred_frontend` cookie
+    /// mirrors it (Pleroma keeps the choice in the cookie alone).
+    pub preferred_frontend: Option<String>,
 }
 
 /// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
@@ -285,6 +289,7 @@ impl fmt::Debug for User {
             .field("inserted_at", &self.inserted_at)
             .field("updated_at", &self.updated_at)
             .field("mfa_settings", &"<redacted>")
+            .field("preferred_frontend", &self.preferred_frontend)
             .finish()
     }
 }
@@ -417,6 +422,8 @@ pub struct NewUser {
     /// blob by default, matching the column default. Holds the TOTP
     /// secret; never in `Debug` output.
     pub mfa_settings: Value,
+    /// The frontend the account picked; `None` (no choice) by default.
+    pub preferred_frontend: Option<String>,
 }
 
 /// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
@@ -483,6 +490,7 @@ impl fmt::Debug for NewUser {
             .field("last_status_at", &self.last_status_at)
             .field("last_fetched_at", &self.last_fetched_at)
             .field("mfa_settings", &"<redacted>")
+            .field("preferred_frontend", &self.preferred_frontend)
             .finish()
     }
 }
@@ -550,6 +558,7 @@ impl Default for NewUser {
             last_status_at: None,
             last_fetched_at: None,
             mfa_settings: mfa::MfaSettings::default_value(),
+            preferred_frontend: None,
         }
     }
 }
@@ -598,13 +607,14 @@ const INSERT_SQL: &str = "INSERT INTO users (
      tags, settings_store, background_image_url, birthday, show_birthday,
      also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
      approval_pending, last_active_at, followers_count, following_count,
-     statuses_count, last_status_at, last_fetched_at, mfa_settings
+     statuses_count, last_status_at, last_fetched_at, mfa_settings,
+     preferred_frontend
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59
+     $55, $56, $57, $58, $59, $60
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -681,6 +691,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.last_status_at)
         .bind(new_user.last_fetched_at)
         .bind(new_user.mfa_settings.clone())
+        .bind(new_user.preferred_frontend.as_deref())
         .fetch_one(pool)
         .await?;
     Ok(user)
@@ -890,6 +901,57 @@ pub async fn mark_moved(pool: &PgPool, id: Uuid, target_ap_id: &str) -> AppResul
     sqlx::query(MARK_MOVED_SQL)
         .bind(id)
         .bind(target_ap_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_settings_store`]: writes the whole client
+/// settings blob in one statement and refreshes `updated_at`.
+const SET_SETTINGS_STORE_SQL: &str =
+    "UPDATE users SET settings_store = $2, updated_at = now() WHERE id = $1";
+
+/// Stores `store` as user `id`'s `settings_store` column, replacing what
+/// was there.
+///
+/// The settings endpoints keep the merge logic (deep merge, `null`
+/// removal) in the API layer and hand the whole new blob in here, so the
+/// jsonb column is written exactly as computed — the same shape the
+/// account entity round-trips. Unknown ids match no row and change
+/// nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_settings_store(pool: &PgPool, id: Uuid, store: &Value) -> AppResult<()> {
+    sqlx::query(SET_SETTINGS_STORE_SQL)
+        .bind(id)
+        .bind(store.clone())
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_preferred_frontend`]: writes the chosen
+/// frontend and refreshes `updated_at`.
+const SET_PREFERRED_FRONTEND_SQL: &str =
+    "UPDATE users SET preferred_frontend = $2, updated_at = now() WHERE id = $1";
+
+/// Stores `frontend` as user `id`'s `preferred_frontend` column: the
+/// frontend the account picked at `PUT /api/v1/pleroma/preferred_frontend`
+/// (a name the endpoint has validated against the configured list).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> AppResult<()> {
+    sqlx::query(SET_PREFERRED_FRONTEND_SQL)
+        .bind(id)
+        .bind(frontend)
         .execute(pool)
         .await
         .map(drop)?;
@@ -1202,6 +1264,10 @@ mod tests {
             json!({"enabled": false, "totp": {"secret": null, "confirmed": false}, "backup_codes": []}),
             "mfa_settings defaults to the migration's all-off blob"
         );
+        assert!(
+            user.preferred_frontend.is_none(),
+            "an account that never picked a frontend has no preference"
+        );
     }
 
     /// The Pleroma extension columns round trip through [`insert`]: arrays
@@ -1240,6 +1306,7 @@ mod tests {
                 "totp": {"secret": "BASE32SECRET", "confirmed": true},
                 "backup_codes": ["0123456789abcdef"],
             }),
+            preferred_frontend: Some("pleroma-fe".to_owned()),
             ..local_new("dora")
         };
         let user = insert(&pool, &new).await.unwrap();
@@ -1329,6 +1396,11 @@ mod tests {
                 "backup_codes": ["0123456789abcdef"],
             }),
             "the mfa_settings blob round trips through jsonb"
+        );
+        assert_eq!(
+            user.preferred_frontend.as_deref(),
+            Some("pleroma-fe"),
+            "the chosen frontend round trips through the text column"
         );
     }
 
@@ -1753,6 +1825,58 @@ mod tests {
         assert!(
             moved.last_move_at.is_some(),
             "the cooldown stamp is set to the move time"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn set_settings_store_replaces_the_blob(pool: PgPool) {
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert_eq!(alice.settings_store, json!({}), "the fixture starts empty");
+        set_settings_store(&pool, alice.id, &json!({"pleroma_fe": {"theme": "dark"}}))
+            .await
+            .unwrap();
+        let stored = fetch(&pool, alice.id).await;
+        assert_eq!(
+            stored.settings_store,
+            json!({"pleroma_fe": {"theme": "dark"}}),
+            "the written blob is what reads back"
+        );
+
+        set_settings_store(&pool, alice.id, &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch(&pool, alice.id).await.settings_store,
+            json!({}),
+            "an empty object clears what was there"
+        );
+
+        // An unknown id matches no row and is not an error.
+        set_settings_store(&pool, new_id(), &json!({"x": 1}))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn set_preferred_frontend_stores_the_choice(pool: PgPool) {
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert!(alice.preferred_frontend.is_none(), "no choice yet");
+        set_preferred_frontend(&pool, alice.id, "pleroma-fe")
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch(&pool, alice.id).await.preferred_frontend.as_deref(),
+            Some("pleroma-fe"),
+            "the chosen frontend is what reads back"
+        );
+
+        set_preferred_frontend(&pool, alice.id, "mochi-pub")
+            .await
+            .unwrap();
+        assert_eq!(
+            fetch(&pool, alice.id).await.preferred_frontend.as_deref(),
+            Some("mochi-pub"),
+            "a new choice replaces the old one"
         );
     }
 }

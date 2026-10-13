@@ -939,5 +939,29 @@ mod tests {
                 "a state is nobody's child: it outlives no table"
             );
         }
+
+        /// The preferred-frontend migration (WBE-122) adds the one column
+        /// `PUT /api/v1/pleroma/preferred_frontend` stores: a nullable
+        /// `text` `preferred_frontend` on `users` with no default — the
+        /// account that never picked a frontend keeps NULL, and the pick
+        /// itself is validated against `AVAILABLE_FRONTENDS`, not against
+        /// the schema.
+        #[sqlx::test(migrator = "crate::MIGRATOR")]
+        async fn users_preferred_frontend_migration_adds_the_column(pool: PgPool) {
+            let (data_type, is_nullable, default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'users'
+                        AND column_name = 'preferred_frontend'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(data_type, "text", "the frontend name is stored as text");
+            assert_eq!(is_nullable, "YES", "no choice is stored as NULL");
+            assert!(default.is_none(), "and nothing defaults to a frontend");
+        }
     }
 }

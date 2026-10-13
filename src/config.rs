@@ -74,6 +74,9 @@ pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
+/// Environment variable holding the comma-separated list of frontends
+/// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
+pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -159,6 +162,11 @@ pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
 /// login provider is configured, so `GET /oauth/prepare_request` and the
 /// provider endpoints answer their errors for every name.
 pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
+/// Frontend list used when `AVAILABLE_FRONTENDS` is unset: nothing is pickable.
+///
+/// So `GET /api/v1/pleroma/preferred_frontend/available` answers `[]` and
+/// `PUT /api/v1/pleroma/preferred_frontend` refuses every name.
+pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -359,6 +367,11 @@ pub struct Config {
     /// when none is configured. Each one answers the `/oauth` provider
     /// endpoints under its own name (see [`crate::api::oauth_external`]).
     pub oauth_providers: Vec<OauthProvider>,
+    /// The frontends clients may pick, from `AVAILABLE_FRONTENDS` (a
+    /// comma-separated list, empty by default): the answer of
+    /// `GET /api/v1/pleroma/preferred_frontend/available` and the whitelist
+    /// `PUT /api/v1/pleroma/preferred_frontend` validates against.
+    pub available_frontends: Vec<String>,
 }
 
 impl Config {
@@ -432,8 +445,7 @@ impl Config {
         let (accounts_email_optional, min_password_length, oauth_token_ttl_secs, oauth_providers) =
             auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
-        let registrations_open =
-            boolean(&lookup, REGISTRATIONS_OPEN_VAR, DEFAULT_REGISTRATIONS_OPEN)?.into();
+        let (registrations_open, available_frontends) = client_exposure(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -460,6 +472,7 @@ impl Config {
             healthcheck_enabled,
             registrations_open,
             oauth_providers,
+            available_frontends,
         })
     }
 
@@ -546,6 +559,7 @@ impl Config {
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
             oauth_providers: Vec::new(),
+            available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
         }
     }
 }
@@ -659,6 +673,28 @@ where
     ))
 }
 
+/// Reads the two settings that gate what the instance exposes to clients:
+/// whether new registrations are open (`NodeInfo`'s `openRegistrations`)
+/// and the frontends the settings endpoints let a user pick. Grouped
+/// because each is a plain default-or-parse and [`Config::from_lookup`]
+/// has a size budget (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when `REGISTRATIONS_OPEN` holds
+/// a value that is neither spelling.
+fn client_exposure<F>(lookup: &F) -> Result<(Toggle, Vec<String>), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let registrations_open =
+        boolean(lookup, REGISTRATIONS_OPEN_VAR, DEFAULT_REGISTRATIONS_OPEN)?.into();
+    let available_frontends = comma_list(
+        &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
+    );
+    Ok((registrations_open, available_frontends))
+}
+
 /// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login
 /// provider array, [`DEFAULT_OAUTH_PROVIDERS`] when the variable is unset
 /// or blank.
@@ -756,6 +792,7 @@ impl fmt::Debug for Config {
             .field("healthcheck_enabled", &self.healthcheck_enabled)
             .field("registrations_open", &self.registrations_open)
             .field("oauth_providers", &self.oauth_providers)
+            .field("available_frontends", &self.available_frontends)
             .finish()
     }
 }
@@ -1455,6 +1492,34 @@ mod tests {
     fn empty_contact_email_is_none() {
         let config = config_with(&[(CONTACT_EMAIL_VAR, "")]);
         assert_eq!(config.contact_email, None, "empty contact_email");
+    }
+
+    #[test]
+    fn available_frontends_default_to_empty() {
+        let config = config_with(&[]);
+        assert!(
+            config.available_frontends.is_empty(),
+            "no frontend is pickable until the operator names some"
+        );
+    }
+
+    #[test]
+    fn available_frontends_parses_a_comma_list() {
+        let config = config_with(&[(AVAILABLE_FRONTENDS_VAR, " pleroma-fe, mochi-pub ,,x")]);
+        assert_eq!(
+            config.available_frontends,
+            vec![
+                "pleroma-fe".to_owned(),
+                "mochi-pub".to_owned(),
+                "x".to_owned()
+            ],
+            "the list is trimmed and blanks drop, order kept"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains(r#"available_frontends: ["pleroma-fe", "mochi-pub", "x"]"#),
+            "the frontend list is visible in Debug output: {debug}"
+        );
     }
 
     /// The ticket's one-provider `OAUTH_PROVIDERS` document, verbatim.

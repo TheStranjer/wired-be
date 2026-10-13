@@ -563,6 +563,7 @@ mod tests {
             inserted_at: Utc::now(),
             updated_at: Utc::now(),
             mfa_settings: user::mfa::MfaSettings::default_value(),
+            preferred_frontend: None,
         }
     }
 

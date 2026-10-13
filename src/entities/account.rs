@@ -871,6 +871,7 @@ mod tests {
             last_fetched_at: None,
             inserted_at: stamped(),
             updated_at: stamped(),
+            preferred_frontend: None,
         }
     }
 
