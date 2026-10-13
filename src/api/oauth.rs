@@ -1,6 +1,15 @@
-//! `POST /oauth/token`: the OAuth 2.0 `password` and `client_credentials`
-//! grants (Pleroma's `OAuthController.token_exchange`,
+//! `POST /oauth/token`: the OAuth 2.0 `password`, `client_credentials` and
+//! `refresh_token` grants (Pleroma's `OAuthController.token_exchange`,
 //! `lib/pleroma/web/o_auth/o_auth_controller.ex`).
+//!
+//! The `refresh_token` grant rotates a user-bound pair: it authenticates
+//! the application like `/oauth/revoke` does, looks the presented refresh
+//! token up (it must belong to that same application, and its owner to an
+//! active account, else the shared 400 "Invalid credentials"), mints a
+//! fresh pair with the same user and scopes, deletes the old row — so the
+//! old access and refresh tokens stop working — and answers the standard
+//! password-grant JSON. A refresh token does not expire on its own: an
+//! expired access token is still refreshable.
 //!
 //! The `client_credentials` grant authenticates the application the same
 //! way (body fields or HTTP Basic), defaults its `scope` to `read`,
@@ -66,7 +75,7 @@ use crate::{
     models::{
         oauth_app::{self, OauthApp},
         oauth_token::{self, NewToken, OauthToken},
-        user::{User, register},
+        user::{self, User, register},
     },
     oauth::scopes::Scopes,
     state::AppState,
@@ -80,6 +89,9 @@ const GRANT_TYPE_PASSWORD: &str = "password";
 /// The client-credentials grant type: the application authenticates
 /// itself and receives an app-only token.
 const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
+/// The refresh-token grant type: a live refresh token is exchanged for a
+/// fresh pair with the same user and scopes, the old row deleted.
+const GRANT_TYPE_REFRESH_TOKEN: &str = "refresh_token";
 /// 400 body when the request omits `grant_type` entirely.
 const MISSING_GRANT_TYPE: &str = "Missing parameter: grant_type";
 /// 400 body when `grant_type` names a grant this endpoint does not speak.
@@ -87,6 +99,9 @@ const UNSUPPORTED_GRANT_TYPE: &str = "unsupported_grant_type";
 /// 400 body when the revocation request omits the `token` parameter
 /// (Pleroma's `Missing parameter: token`).
 const MISSING_TOKEN: &str = "Missing parameter: token";
+/// 400 body when the refresh-token grant omits the `refresh_token`
+/// parameter.
+const MISSING_REFRESH_TOKEN: &str = "Missing parameter: refresh_token";
 /// 400 body for every credential failure — unknown app, wrong client
 /// secret, unknown user, wrong password — which Pleroma deliberately does
 /// not tell apart (`render_invalid_credentials_error`).
@@ -146,6 +161,9 @@ enum Grant {
     /// `grant_type=client_credentials`: client credentials alone,
     /// answered with an app-only token.
     ClientCredentials,
+    /// `grant_type=refresh_token`: a live refresh token plus client
+    /// credentials, answered with a rotated user-bound token pair.
+    RefreshToken,
 }
 
 /// The token exchange, in order: the grant type, then per grant — the
@@ -160,6 +178,7 @@ async fn exchange(
     match require_grant(&params)? {
         Grant::Password => password_grant(state, headers, &params).await,
         Grant::ClientCredentials => client_credentials_grant(state, headers, &params).await,
+        Grant::RefreshToken => refresh_token_grant(state, headers, &params).await,
     }
 }
 
@@ -192,6 +211,52 @@ async fn client_credentials_grant(
     Ok(Json(TokenResponse::new(token, None)))
 }
 
+/// The `refresh_token` grant: rotate a user-bound pair. The application
+/// authenticates exactly like on `/oauth/revoke` (body fields or HTTP
+/// Basic); the presented refresh token must name a row issued to that
+/// same app, owned by an active account — every failure answers the
+/// shared 400 [`INVALID_CREDENTIALS`]. The replacement carries the same
+/// user and scopes and is minted before the old row goes, so the old
+/// access and refresh tokens stop working at the answer. No expiry is
+/// applied to the old row: refreshing is precisely what a client does
+/// after its access token has lapsed.
+async fn refresh_token_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: &TokenParams,
+) -> AppResult<Json<TokenResponse>> {
+    let Some(refresh_token) = params.refresh_token.as_deref() else {
+        return Err(AppError::BadRequest(MISSING_REFRESH_TOKEN.to_owned()));
+    };
+    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let old = oauth_token::get_by_refresh_token(&state.db, refresh_token)
+        .await?
+        .filter(|found| found.app_id == app.id)
+        .ok_or_else(invalid_credentials)?;
+    let owner = active_owner(&state.db, &old)
+        .await?
+        .ok_or_else(invalid_credentials)?;
+    let fresh = issue_token(state, Some(&owner), &app, Scopes::parse(&old.scopes)).await?;
+    oauth_token::delete_token(&state.db, old.id).await?;
+    Ok(Json(TokenResponse::new(fresh, Some(&owner))))
+}
+
+/// The active user behind `token`: `None` when the row is app-only
+/// (`user_id = NULL`, so it never had a refreshable pair), its user was
+/// deleted out from under it, or the account is deactivated — a
+/// suspended account cannot rotate its tokens.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+async fn active_owner(pool: &PgPool, token: &OauthToken) -> AppResult<Option<User>> {
+    let owner = match token.user_id {
+        Some(user_id) => user::get_by_id(pool, user_id).await?,
+        None => None,
+    };
+    Ok(owner.filter(|user| user.is_active.get()))
+}
+
 /// The request parameters of `POST /oauth/token`.
 ///
 /// Every field is optional at the shape level: Pleroma answers the
@@ -201,8 +266,9 @@ async fn client_credentials_grant(
 /// (see below) because two fields are secret material.
 #[derive(Deserialize)]
 struct TokenParams {
-    /// Which grant to run; [`GRANT_TYPE_PASSWORD`] and
-    /// [`GRANT_TYPE_CLIENT_CREDENTIALS`] are implemented.
+    /// Which grant to run; [`GRANT_TYPE_PASSWORD`],
+    /// [`GRANT_TYPE_CLIENT_CREDENTIALS`] and [`GRANT_TYPE_REFRESH_TOKEN`]
+    /// are implemented.
     #[serde(default)]
     grant_type: Option<String>,
     /// The account's nickname or email. Required by the password grant.
@@ -223,10 +289,15 @@ struct TokenParams {
     /// Never in `Debug` output.
     #[serde(default)]
     client_secret: Option<String>,
+    /// The refresh token to rotate. Required by the `refresh_token`
+    /// grant. Renders as `<redacted>` in `Debug` output.
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
-/// [`password`](Self::password) and [`client_secret`](Self::client_secret)
-/// are secret material and render as `<redacted>`; everything else shows.
+/// [`password`](Self::password), [`client_secret`](Self::client_secret)
+/// and [`refresh_token`](Self::refresh_token) are secret material and
+/// render as `<redacted>`; everything else shows.
 impl fmt::Debug for TokenParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenParams")
@@ -236,6 +307,7 @@ impl fmt::Debug for TokenParams {
             .field("scope", &self.scope)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
             .finish()
     }
 }
@@ -248,15 +320,17 @@ impl TokenParams {
     }
 }
 
-/// Checks the grant type and names the grant to run. The password and
-/// `client_credentials` grants are the ones implemented here; the
-/// refresh-token and authorization-code exchanges join in later tickets.
+/// Checks the grant type and names the grant to run. The password,
+/// `client_credentials` and `refresh_token` grants are the ones
+/// implemented here; the authorization-code exchange joins in a later
+/// ticket.
 ///
 /// # Errors
 ///
 /// 400 [`MISSING_GRANT_TYPE`] when the field is absent, 400
 /// [`UNSUPPORTED_GRANT_TYPE`] for any value other than
-/// [`GRANT_TYPE_PASSWORD`] or [`GRANT_TYPE_CLIENT_CREDENTIALS`].
+/// [`GRANT_TYPE_PASSWORD`], [`GRANT_TYPE_CLIENT_CREDENTIALS`] or
+/// [`GRANT_TYPE_REFRESH_TOKEN`].
 fn require_grant(params: &TokenParams) -> AppResult<Grant> {
     let Some(grant_type) = params.grant_type.as_deref() else {
         return Err(AppError::BadRequest(MISSING_GRANT_TYPE.to_owned()));
@@ -264,6 +338,7 @@ fn require_grant(params: &TokenParams) -> AppResult<Grant> {
     match grant_type {
         GRANT_TYPE_PASSWORD => Ok(Grant::Password),
         GRANT_TYPE_CLIENT_CREDENTIALS => Ok(Grant::ClientCredentials),
+        GRANT_TYPE_REFRESH_TOKEN => Ok(Grant::RefreshToken),
         _ => Err(AppError::BadRequest(UNSUPPORTED_GRANT_TYPE.to_owned())),
     }
 }
@@ -611,6 +686,7 @@ mod tests {
             scope: None,
             client_id: None,
             client_secret: None,
+            refresh_token: None,
         }
     }
 
@@ -665,7 +741,7 @@ mod tests {
             default_scope: DEFAULT_SCOPE.to_owned(),
             tags: Vec::new(),
             settings_store: json!({}),
-            mfa_settings: crate::models::user::mfa::MfaSettings::default_value(),
+            mfa_settings: user::mfa::MfaSettings::default_value(),
             background_image_url: None,
             birthday: None,
             show_birthday: Flag::new(false),
@@ -739,7 +815,11 @@ mod tests {
 
     #[test]
     fn an_unknown_grant_type_is_unsupported() {
-        for grant in ["authorization_code", "refresh_token", "bogus"] {
+        for grant in [
+            "authorization_code",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "bogus",
+        ] {
             let err = require_grant(&params_with_grant(Some(grant))).unwrap_err();
             assert_eq!(
                 message_of(&err),
@@ -764,6 +844,15 @@ mod tests {
             require_grant(&params_with_grant(Some(GRANT_TYPE_CLIENT_CREDENTIALS))).unwrap(),
             Grant::ClientCredentials,
             "client_credentials selects the app-only grant"
+        );
+    }
+
+    #[test]
+    fn the_refresh_token_grant_passes_the_gate() {
+        assert_eq!(
+            require_grant(&params_with_grant(Some(GRANT_TYPE_REFRESH_TOKEN))).unwrap(),
+            Grant::RefreshToken,
+            "refresh_token selects the rotation grant"
         );
     }
 
@@ -931,20 +1020,24 @@ mod tests {
     }
 
     #[test]
-    fn params_debug_redacts_the_password_and_client_secret() {
+    fn params_debug_redacts_the_secret_fields() {
         let mut params = params_with_grant(Some(GRANT_TYPE_PASSWORD));
         params.username = Some("alice".to_owned());
         params.password = Some("correct horse battery staple".to_owned());
         params.client_id = Some("client-id".to_owned());
         params.client_secret = Some("client-secret".to_owned());
+        params.refresh_token = Some("refresh-secret".to_owned());
         let debug = format!("{params:?}");
         assert!(
-            !debug.contains("correct horse battery staple") && !debug.contains("client-secret"),
+            !debug.contains("correct horse battery staple")
+                && !debug.contains("client-secret")
+                && !debug.contains("refresh-secret"),
             "the secrets must not leak: {debug}"
         );
         assert!(
             debug.contains(r#"password: "<redacted>""#)
-                && debug.contains(r#"client_secret: "<redacted>""#),
+                && debug.contains(r#"client_secret: "<redacted>""#)
+                && debug.contains(r#"refresh_token: "<redacted>""#),
             "the markers name their fields: {debug}"
         );
         assert!(
@@ -956,17 +1049,18 @@ mod tests {
     #[test]
     fn json_and_form_shapes_deserialize_to_the_same_params() {
         let full: TokenParams = crate::extract::into_params(json!({
-            "grant_type": "password",
+            "grant_type": "refresh_token",
             "username": "alice",
             "password": "pw",
             "scope": "read write",
             "client_id": "id",
             "client_secret": "secret",
+            "refresh_token": "a-refresh-token",
         }))
         .unwrap();
         assert_eq!(
             full.grant_type.as_deref(),
-            Some(GRANT_TYPE_PASSWORD),
+            Some(GRANT_TYPE_REFRESH_TOKEN),
             "the grant"
         );
         assert_eq!(full.username.as_deref(), Some("alice"), "the username");
@@ -976,6 +1070,11 @@ mod tests {
             "the scope string"
         );
         assert_eq!(full.client_id.as_deref(), Some("id"), "the client id");
+        assert_eq!(
+            full.refresh_token.as_deref(),
+            Some("a-refresh-token"),
+            "the refresh token"
+        );
         let empty: TokenParams = crate::extract::into_params(json!({})).unwrap();
         assert!(
             empty.grant_type.is_none() && empty.username.is_none(),
@@ -1000,6 +1099,25 @@ mod tests {
                 "pragma: no-cache"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_the_refresh_token_parameter_is_refused_by_name() {
+        // The parameter gate runs before the credential check, and the
+        // credential check before any database access, so the lazy pool
+        // of `test_state` is never consulted.
+        let err = refresh_token_grant(
+            &test_state(),
+            &HeaderMap::new(),
+            &params_with_grant(Some(GRANT_TYPE_REFRESH_TOKEN)),
+        )
+        .await
+        .expect_err("no refresh token is no rotation");
+        assert_eq!(
+            message_of(&err),
+            MISSING_REFRESH_TOKEN,
+            "the refusal names the missing parameter even without credentials"
+        );
     }
 
     /// [`RevokeParams`] with the three fields as given.
