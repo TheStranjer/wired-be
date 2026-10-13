@@ -44,6 +44,10 @@ pulldown-cmark = { version = "0.13.4", default-features = false }
 # signing keys carry the SHA-256 DigestInfo prefix. (`base64` above already
 # covers encoding the signatures into HTTP headers.)
 rand = "0.8"
+# Mention/hashtag extraction (`src/util/entities.rs`): the regex engine for
+# the two entity patterns (`\p{L}`/`\p{N}` classes for hashtag words); the
+# crate is automaton-based, so matching is linear time, no backtracking.
+regex = "1.13.1"
 # Outbound HTTP (`src/http_client.rs`): default-features off, rustls only
 # (never native-tls), with `stream` so `get_limited` can cap response bodies.
 # The ticket's `rustls-tls` feature is reqwest 0.13's renamed `rustls`
