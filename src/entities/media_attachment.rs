@@ -68,9 +68,10 @@ pub struct MediaAttachment {
     /// [`url`](Self::url) (Pleroma's `text_url`).
     pub text_url: String,
     /// Metadata from media detection: `original` (dimensions, `WxH` size,
-    /// aspect and, for video and audio, duration), and `focus`
+    /// aspect and, for video and audio, duration), `small` (the generated
+    /// preview's dimensions, which only image uploads carry) and `focus`
     /// (`{"x", "y"}`) — only the parts the row actually knows; `{}` when
-    /// nothing is. A `small` variant appears once thumbnailing stores it.
+    /// nothing is.
     pub meta: Value,
     /// Alt text; `null` when unset or stored empty.
     pub description: Option<String>,
@@ -135,7 +136,9 @@ fn put(map: &mut Map<String, Value>, key: &str, value: Value) {
 }
 
 /// The `meta` object of an attachment: an `original` variant when any of
-/// its parts are known and a `focus` one when both axes are, `{}` when
+/// its parts are known, a `small` one when the stored preview carries
+/// dimensions (only image uploads get generated previews, so videos and
+/// audio are unchanged), and a `focus` one when both axes are — `{}` when
 /// nothing is.
 fn meta_for(row: &AttachmentRow, kind: AttachmentType) -> Value {
     let mut meta = Map::new();
@@ -143,27 +146,26 @@ fn meta_for(row: &AttachmentRow, kind: AttachmentType) -> Value {
     if !original.is_empty() {
         put(&mut meta, "original", Value::Object(original));
     }
+    if let (Some(width), Some(height)) = (row.preview_width, row.preview_height) {
+        put(
+            &mut meta,
+            "small",
+            Value::Object(dimensions_meta(width, height)),
+        );
+    }
     if let (Some(x), Some(y)) = (row.focus_x, row.focus_y) {
         put(&mut meta, "focus", json!({ "x": x, "y": y }));
     }
     Value::Object(meta)
 }
 
-/// The `original` part of [`meta_for`]: width, height, the `WxH` size
-/// string and the aspect when both dimensions are stored (the aspect is
-/// skipped when the height is zero, which would divide by it), plus the
+/// The `original` part of [`meta_for`]: the stored dimensions plus the
 /// duration for the video-like kinds. Unknown parts are simply absent.
 fn original_meta(row: &AttachmentRow, kind: AttachmentType) -> Map<String, Value> {
-    let mut original = Map::new();
-    if let (Some(width), Some(height)) = (row.width, row.height) {
-        put(&mut original, "width", json!(width));
-        put(&mut original, "height", json!(height));
-        put(&mut original, "size", json!(format!("{width}x{height}")));
-        if height != 0 {
-            let aspect = f64::from(width) / f64::from(height);
-            put(&mut original, "aspect", json!(aspect));
-        }
-    }
+    let mut original = match (row.width, row.height) {
+        (Some(width), Some(height)) => dimensions_meta(width, height),
+        _ => Map::new(),
+    };
     if let Some(duration) = row.duration
         && matches!(
             kind,
@@ -173,6 +175,21 @@ fn original_meta(row: &AttachmentRow, kind: AttachmentType) -> Map<String, Value
         put(&mut original, "duration", json!(duration));
     }
     original
+}
+
+/// A dimensions object — `width`, `height`, the `WxH` `size` string and
+/// the `aspect` — shared by `meta`'s `original` and `small` variants. The
+/// aspect is skipped when the height is zero, which would divide by it.
+fn dimensions_meta(width: i32, height: i32) -> Map<String, Value> {
+    let mut dimensions = Map::new();
+    put(&mut dimensions, "width", json!(width));
+    put(&mut dimensions, "height", json!(height));
+    put(&mut dimensions, "size", json!(format!("{width}x{height}")));
+    if height != 0 {
+        let aspect = f64::from(width) / f64::from(height);
+        put(&mut dimensions, "aspect", json!(aspect));
+    }
+    dimensions
 }
 
 #[cfg(test)]
@@ -226,6 +243,8 @@ mod tests {
             blurhash: None,
             width: None,
             height: None,
+            preview_width: None,
+            preview_height: None,
             duration: None,
             focus_x: None,
             focus_y: None,
@@ -262,6 +281,8 @@ mod tests {
         row.blurhash = Some("UBLHZ;9a?wWB%%.8t7Rj".to_owned());
         row.width = Some(1024);
         row.height = Some(512);
+        row.preview_width = Some(400);
+        row.preview_height = Some(200);
         row.focus_x = Some(0.5);
         row.focus_y = Some(-0.25);
         row.file_size = Some(345_678);
@@ -284,6 +305,12 @@ mod tests {
                         "size": "1024x512",
                         "aspect": 2.0,
                     },
+                    "small": {
+                        "width": 400,
+                        "height": 200,
+                        "size": "400x200",
+                        "aspect": 2.0,
+                    },
                     "focus": { "x": 0.5, "y": -0.25 },
                 },
                 "description": "A cat on a mat",
@@ -293,6 +320,22 @@ mod tests {
             "image attachment snapshot"
         );
         assert_eq!(json_keys(&value), EXPECTED_KEYS, "exact key set");
+    }
+
+    #[test]
+    fn a_preview_url_without_stored_dimensions_still_has_no_small_meta() {
+        let mut row = base_row("image/png");
+        row.preview_url = Some(format!("{BASE}/media/9b3c-small.png"));
+        row.width = Some(8);
+        row.height = Some(8);
+
+        assert_eq!(
+            render(&row)["meta"],
+            serde_json::json!({
+                "original": { "width": 8, "height": 8, "size": "8x8", "aspect": 1.0 },
+            }),
+            "the small variant needs both dimensions, not just a preview url"
+        );
     }
 
     #[test]
