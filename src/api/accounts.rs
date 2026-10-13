@@ -1,11 +1,12 @@
 //! The account endpoints: the single-account reads and listings, the
-//! relationship batch, and the notes write.
+//! relationship batch, the notes write, and the profile write.
 //!
 //! `GET /api/v1/accounts/verify_credentials`, `GET /api/v1/accounts/{id}`,
 //! `…/lookup`, `…/relationships` and the relationship listings
 //! `…/{id}/followers` and `…/{id}/following` are the reads;
-//! `POST /api/v1/accounts/{id}/note` and `…/{id}/remove_from_followers` are
-//! the writes.
+//! `PATCH /api/v1/accounts/update_credentials`,
+//! `POST /api/v1/accounts/{id}/note` and `…/{id}/remove_from_followers`
+//! are the writes.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
 //! `.relationships`, `.followers` and `.following`
@@ -34,6 +35,31 @@
 //! block on the viewer being the account itself
 //! (`AccountView.maybe_put_settings`), which is why no other route on this
 //! module carries it.
+//!
+//! `PATCH /api/v1/accounts/update_credentials` (and the `POST` alias older
+//! clients send) is Pleroma's `AccountController.update_credentials`
+//! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`):
+//! [`AuthUser`] with the `write:accounts` scope, and only the fields the
+//! body actually carries are written — [`MultipartForm`] parses JSON,
+//! urlencoded and multipart bodies alike (decision 10) and every parameter
+//! here is optional, a JSON `null` counting as absent as in Pleroma's
+//! `Enum.filter(fn {_, value} -> not is_nil(value) end)`. `display_name`
+//! is length-checked against
+//! [`max_display_name_chars`](Config::max_display_name_chars) (422 with
+//! Mastodon's wording on overflow) and stored through
+//! [`sanitize_display_name`]; an empty one is stored empty, not reset to
+//! the nickname. `note` is length-checked against
+//! [`max_bio_chars`](Config::max_bio_chars), stored verbatim as the row's
+//! `raw_bio` and rendered to `bio` by [`text_to_html`] plus
+//! [`linkify_entities`] — bare-URL links, hashtag links, and mention
+//! links only for mentions naming a local user of this instance (unknown
+//! and remote mentions stay plain text). `locked`, `bot` and
+//! `discoverable` are [`flex::opt_bool`] booleans; an unrecognized
+//! boolean string is the extractor's 422. The answer is a 200
+//! [`Account::for_owner`] render — the owner view with its `source`
+//! block, the same one `verify_credentials` answers — and every
+//! accepted request runs the `after_profile_updated` hook, which the
+//! later ticket that federates the actor's `Update` fills in.
 //!
 //! Authentication on `show` and `lookup` is optional, as in Pleroma's
 //! `OAuthScopesPlug … fallback: :proceed_unauthenticated`: the routes
@@ -118,15 +144,16 @@
 //! federation ticket wires the delivery into this module's
 //! `after_follower_removed` hook.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, Uri},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use serde::Deserialize;
+use sqlx::PgPool;
 use tracing::debug;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -134,21 +161,27 @@ use uuid::Uuid;
 use crate::{
     api::helpers::account_or_404,
     auth::{AuthUser, MaybeAuthUser},
+    config::Config,
     entities::{
-        account::{Account, AccountViewer},
+        account::{Account, AccountViewer, local_url},
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
-    extract::ApiBody,
+    extract::{ApiBody, flex, multipart::MultipartForm},
     models::{
         account_note,
         follow::{self, Follow},
-        user::{self, User},
+        user::{self, Flag, ProfileFields, User},
     },
     oauth::scopes::{FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
     state::AppState,
-    util::id::parse_id,
+    util::{
+        entities::{MentionRef, extract_mentions, linkify_entities},
+        format::text_to_html,
+        id::parse_id,
+        sanitize::sanitize_display_name,
+    },
 };
 
 /// The 400 body message when the `acct` query parameter is absent or blank
@@ -173,6 +206,10 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/accounts/verify_credentials", get(verify_credentials))
+        .route(
+            "/accounts/update_credentials",
+            patch(update_credentials).post(update_credentials),
+        )
         .route("/accounts/relationships", get(relationships))
         .route("/accounts/lookup", get(lookup_account))
         .route("/accounts/{id}/followers", get(list_followers))
@@ -205,10 +242,23 @@ async fn verify_credentials(
     auth: AuthUser,
 ) -> AppResult<Json<Account>> {
     auth.require(READ_ACCOUNTS)?;
-    let owner = &auth.0;
+    owner_view(&state, &auth.0).await
+}
+
+/// The owner render both credentials endpoints answer — the self view of
+/// [`Account::for_owner`] with its [`source`](Account::source) block (the
+/// pending queue counted by
+/// [`pending_count`](crate::models::follow::pending_count) included) and a
+/// stored move target attached as the nested `moved` entity (see
+/// [`with_moved`]).
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn owner_view(state: &AppState, owner: &User) -> AppResult<Json<Account>> {
     let requests = follow::pending_count(&state.db, owner.id).await?;
     let account = Account::for_owner(owner, &state.config, requests);
-    Ok(Json(with_moved(&state, account, owner).await?))
+    Ok(Json(with_moved(state, account, owner).await?))
 }
 
 /// Resolves [`moved_to_ap_id`](User::moved_to_ap_id) for one rendered
@@ -230,6 +280,214 @@ async fn with_moved(state: &AppState, account: Account, user: &User) -> AppResul
         None => account,
     })
 }
+
+/// The request parameters of `PATCH /api/v1/accounts/update_credentials`.
+///
+/// Every field is optional and only the ones present in the body are
+/// written; a JSON `null` reads as absent (Pleroma drops nil-valued
+/// parameters before the changeset). The booleans arrive through
+/// [`flex::opt_bool`], so a form's `"true"`/`"on"`/`"1"` spells the same
+/// as JSON `true`, and an unknown string is the extractor's 422.
+#[derive(Debug, Deserialize)]
+struct ProfileParams {
+    /// The display name to store: at most
+    /// [`max_display_name_chars`](Config::max_display_name_chars)
+    /// characters, then reduced to one line of plain text (see
+    /// [`sanitized_name`]).
+    #[serde(default)]
+    display_name: Option<String>,
+    /// The profile note: source text for `raw_bio`, at most
+    /// [`max_bio_chars`](Config::max_bio_chars) characters, rendered to
+    /// `bio` (see [`render_note`]).
+    #[serde(default)]
+    note: Option<String>,
+    /// Whether follow requests need manual approval.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    locked: Option<bool>,
+    /// Whether the account is flagged as automated.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    bot: Option<bool>,
+    /// Whether the account opts into discovery.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    discoverable: Option<bool>,
+}
+
+/// `PATCH /api/v1/accounts/update_credentials` (and the `POST` alias of
+/// the older clients) — change the caller's own profile, the fields the
+/// body carries and nothing else, answering the updated account as
+/// [`verify_credentials`] answers it.
+///
+/// [`MultipartForm`] takes JSON, urlencoded and multipart bodies alike
+/// (decision 10); file parts (`avatar` and friends) belong to later
+/// tickets and are ignored. [`profile_fields`] validates what is present
+/// and merges it over the token's row,
+/// [`update_profile`](crate::models::user::update_profile) writes the six
+/// columns in one statement, and the fresh row answers through
+/// [`owner_view`] — the write-behind render that states the stored fact
+/// rather than trusting the request. A body that carries none of these
+/// fields is the accepted no-op: 200 with the unchanged entity.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check; [`AppError::Unprocessable`] when
+/// `display_name` or `note` is too long, or from the extractor for an
+/// invalid boolean string. Any database failure arrives through `?` as
+/// [`AppError::Database`], and the [`AppError::Internal`] arm only
+/// documents that the row behind a just-authenticated token is gone.
+async fn update_credentials(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    form: MultipartForm<ProfileParams>,
+) -> AppResult<Json<Account>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    let fields = profile_fields(&state, &auth.0, form.fields).await?;
+    let updated = user::update_profile(&state.db, auth.0.id, &fields)
+        .await?
+        .ok_or_else(|| AppError::Internal("profile update matched no row".to_owned()))?;
+    after_profile_updated(&state, &updated);
+    owner_view(&state, &updated).await
+}
+
+/// Validates the present profile parameters and merges them over the
+/// stored row: the six columns
+/// [`update_profile`](crate::models::user::update_profile) will write,
+/// with fields absent from the request carrying the value they already
+/// hold and fields present-but-blank carrying the blank (an empty
+/// `display_name` is stored as `""`, not reset to the nickname — this
+/// endpoint's ticket pins that against Pleroma's registration-side
+/// fallback). A `note` over [`max_bio_chars`](Config::max_bio_chars)
+/// characters (counted in characters, not bytes) is the 422 mirroring the
+/// name message.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] from [`sanitized_name`] or the note length
+/// check; [`render_note`] adds any database failure as
+/// [`AppError::Database`].
+async fn profile_fields(
+    state: &AppState,
+    current: &User,
+    params: ProfileParams,
+) -> AppResult<ProfileFields> {
+    let name = params
+        .display_name
+        .as_deref()
+        .map(|raw| sanitized_name(raw, state.config.max_display_name_chars))
+        .transpose()?;
+    if params
+        .note
+        .as_deref()
+        .is_some_and(|text| text.chars().count() > state.config.max_bio_chars)
+    {
+        return Err(AppError::Unprocessable(format!(
+            "Bio is too long (maximum is {} characters)",
+            state.config.max_bio_chars
+        )));
+    }
+    let (bio, raw_bio) = match params.note.as_deref() {
+        Some(raw) => (render_note(state, raw).await?, raw.to_owned()),
+        None => (current.bio.clone(), current.raw_bio.clone()),
+    };
+    Ok(ProfileFields {
+        name: name.unwrap_or_else(|| current.name.clone()),
+        bio,
+        raw_bio,
+        locked: params.locked.map_or(current.locked, Flag::from),
+        bot: params.bot.map_or(current.bot, Flag::from),
+        discoverable: params.discoverable.map_or(current.discoverable, Flag::from),
+    })
+}
+
+/// The display name to store: at most `max_chars` characters (in
+/// characters, not bytes) of the submitted text — the limit is checked
+/// before sanitizing, like Pleroma's changeset checks the parameter —
+/// and then [`sanitize_display_name`]'s one line of plain text. An empty
+/// string survives as empty.
+fn sanitized_name(raw: &str, max_chars: usize) -> AppResult<String> {
+    if raw.chars().count() > max_chars {
+        return Err(AppError::Unprocessable(format!(
+            "Name is too long (maximum is {max_chars} characters)"
+        )));
+    }
+    Ok(sanitize_display_name(raw))
+}
+
+/// Renders one submitted note into the `bio` column: [`text_to_html`]
+/// (escape, bare-URL links, paragraphs) and then [`linkify_entities`]
+/// over its output, so hashtags link to `{base_url}/tags/{tag}` and
+/// mentions naming a local user of this instance become their `h-card`
+/// anchors — unknown and remote mentions stay the plain text they were
+/// written as.
+async fn render_note(state: &AppState, raw: &str) -> AppResult<String> {
+    let html = text_to_html(raw);
+    let urls = local_mention_urls(&state.db, &state.config, &html).await?;
+    let resolver = |mention: &MentionRef| urls.get(&mention_key(mention)).cloned();
+    Ok(linkify_entities(&html, &resolver, &state.config.base_url))
+}
+
+/// The profile URLs of every mention [`extract_mentions`] finds in
+/// `text` that names a local user, keyed by [`mention_key`]. Lookups are
+/// citext, so `@ALICE` finds `alice`; the [`local`](User::local) flag is
+/// the guard that keeps a remote mirror out of the table whatever its
+/// stored nickname looks like.
+async fn local_mention_urls(
+    db: &PgPool,
+    config: &Config,
+    text: &str,
+) -> AppResult<HashMap<String, String>> {
+    let mut urls = HashMap::new();
+    for mention in extract_mentions(text) {
+        if !names_own_domain(config, &mention) {
+            continue;
+        }
+        if let Some(found) = user::get_by_nickname(db, &mention.nickname)
+            .await?
+            .filter(|found| found.local.get())
+        {
+            let _seen = urls.insert(mention_key(&mention), local_url(config, &found.nickname));
+        }
+    }
+    Ok(urls)
+}
+
+/// The lookup key of one mention: the account it names, lowercased —
+/// `nick` for a bare one, `nick@domain` when the reference spelled the
+/// domain out (the case-fold
+/// [`mention_html`](crate::util::entities::mention_html) never needs
+/// because it renders the written spelling).
+fn mention_key(mention: &MentionRef) -> String {
+    mention
+        .domain
+        .as_ref()
+        .map_or_else(
+            || mention.nickname.clone(),
+            |domain| format!("{}@{}", mention.nickname, domain),
+        )
+        .to_lowercase()
+}
+
+/// Whether a mention can name a local user at all: a bare `@nick`, or a
+/// `@nick@domain` whose domain is this instance's own
+/// ([`Config::domain`], compared case-insensitively). Any other domain
+/// names a remote account, which this render never links.
+fn names_own_domain(config: &Config, mention: &MentionRef) -> bool {
+    mention
+        .domain
+        .as_deref()
+        .is_none_or(|domain| domain.eq_ignore_ascii_case(config.domain()))
+}
+
+/// Post-update hook of [`update_credentials`], run once per accepted
+/// profile write with the updated row: the federation ticket that answers
+/// a profile change with an `Update` of the actor wires the delivery in
+/// here — the actor is [`User::ap_id`], and the queueing happens through
+/// `state` (decision 11).
+///
+/// Intentionally empty until then, like [`after_follower_removed`]:
+/// Pleroma's `update_credentials` federates through the pipeline inline,
+/// and this server's delivery queue is a later ticket.
+const fn after_profile_updated(_state: &AppState, _user: &User) {}
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or
 /// remote. An id that is not `UUID` text is a 404, not a 400, like every
@@ -750,5 +1008,69 @@ mod tests {
                 "`{query:?}` carries no usable id"
             );
         }
+    }
+
+    /// Builds a `MentionRef` for the key and domain helpers.
+    fn mention(nickname: &str, domain: Option<&str>) -> MentionRef {
+        MentionRef {
+            nickname: nickname.to_owned(),
+            domain: domain.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn display_name_limit_is_counted_in_characters() {
+        assert_eq!(
+            sanitized_name("abcdé", 5).unwrap(),
+            "abcdé",
+            "five characters fit, bytes are not counted"
+        );
+        let err = sanitized_name("abcdeé", 5).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Name is too long (maximum is 5 characters)",
+            "the pinned wording carries the configured limit"
+        );
+    }
+
+    #[test]
+    fn display_name_is_reduced_to_one_line_of_text() {
+        assert_eq!(
+            sanitized_name("  <b>Bob</b><br>the Builder ", 50).unwrap(),
+            "Bob the Builder",
+            "markup and control characters collapse to spaces"
+        );
+        assert_eq!(
+            sanitized_name("", 50).unwrap(),
+            "",
+            "the empty string is stored empty, not reset to the nickname"
+        );
+    }
+
+    #[test]
+    fn mention_keys_fold_case_across_domains() {
+        assert_eq!(mention_key(&mention("Alice", None)), "alice", "a bare nick");
+        assert_eq!(
+            mention_key(&mention("Bob", Some("Remote.Example"))),
+            "bob@remote.example",
+            "the spelled-out domain joins the key, lowercased"
+        );
+    }
+
+    #[test]
+    fn only_bare_or_own_domain_mentions_can_be_local() {
+        let config = Config::for_tests();
+        assert!(
+            names_own_domain(&config, &mention("alice", None)),
+            "a bare nick may name a local user"
+        );
+        assert!(
+            names_own_domain(&config, &mention("alice", Some("TEST.example"))),
+            "and so may one spelled with this instance's own domain"
+        );
+        assert!(
+            !names_own_domain(&config, &mention("bob", Some("elsewhere.example"))),
+            "another domain never names a local user"
+        );
     }
 }
