@@ -16,7 +16,10 @@
 //! (see [`crate::federation::delivery`]). When the shutdown future resolves
 //! the worker stops claiming and waits for its in-flight jobs. Concrete
 //! handlers are registered by [`crate::serve`], which starts with the
-//! federation delivery job kind.
+//! federation delivery job kind. The sibling [`scheduler`] module is the
+//! producer side: it enqueues the recurring, cron-like jobs.
+
+pub mod scheduler;
 
 use std::{
     collections::HashMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
