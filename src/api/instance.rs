@@ -1,43 +1,57 @@
-//! `GET /api/v1/instance`: the public description of this instance —
-//! identity, limits, statistics and rules (`docs/ARCHITECTURE.md`
-//! decision 1).
+//! The public description of this instance and the endpoints hung under
+//! `/instance` (`docs/ARCHITECTURE.md` decision 1).
 //!
-//! The reference is Pleroma's `InstanceController.show` and
-//! `InstanceView.render("show.json", …)`
+//! `GET /api/v1/instance` and `GET /api/v2/instance` serve the document —
+//! identity, limits, statistics and rules — while `peers`, `rules`,
+//! `domain_blocks`, `translation_languages`, `activity` and
+//! `extended_description` each serve one of its sub-resources.
+//!
+//! The reference is Pleroma's `InstanceController` and `InstanceView`
 //! (`lib/pleroma/web/mastodon_api/controllers/instance_controller.ex`,
-//! `lib/pleroma/web/mastodon_api/views/instance_view.ex`). Where the
-//! ticket's shape and Pleroma 2.10.2's defaults meet, the ticket wins;
+//! `lib/pleroma/web/mastodon_api/views/instance_view.ex`), whose `show`,
+//! `show2`, `peers`, `rules`, `domain_blocks` and `translation_languages`
+//! actions these handlers mirror; `activity` and `extended_description`
+//! are Mastodon API completeness endpoints Pleroma does not have. Where
+//! the ticket's shape and Pleroma 2.10.2's defaults meet, the ticket wins;
 //! values Pleroma reads from its runtime config take this instance's
 //! [`Config`] where it has an equivalent setting and Pleroma's shipped
 //! default otherwise — the same rule the `NodeInfo` document follows
 //! ([`crate::api::nodeinfo`]). The `features` and `restrict_unauthenticated`
 //! lists come from [`crate::services::instance_meta`], the builder
 //! `NodeInfo` already shares, so the two endpoints never disagree about
-//! what this instance can do.
+//! what this instance can do — and `peers` asks the same builder whether
+//! unauthenticated callers may see remote instances at all.
 //!
-//! The endpoint needs no authentication — Pleroma's controller `plug`s
-//! `skip_auth` — and takes no parameters. Of its three database reads only
-//! the `stats` block is expensive across large tables, so it is cached
-//! in memory for [`STATS_TTL`] in the [`TimedCache`] on
-//! [`crate::state::AppState`]; rules and the contact account are read
-//! fresh on every request and answer the moment they change.
+//! None of these endpoints needs authentication — Pleroma's controller
+//! `plug`s `skip_auth` — and none takes parameters. Of the `show` reads
+//! only the `stats` block is expensive across large tables, so it is
+//! cached in memory for [`STATS_TTL`] in the [`TimedCache`] on
+//! [`crate::state::AppState`]; rules, the contact account and the peer
+//! list are read fresh on every request and answer the moment they
+//! change.
 //!
 //! [`TimedCache`]: crate::util::cache::TimedCache
 
 use axum::{Json, Router, extract::State, routing::get};
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 use sqlx::PgPool;
 
 use crate::{
     config::{Config, Toggle},
     entities::account::Account,
     error::AppResult,
-    models::{instance_rule, instance_rule::InstanceRule, user::User},
+    models::{
+        instance_policy_domain::{self, InstancePolicyDomain},
+        instance_rule,
+        instance_rule::InstanceRule,
+        user::User,
+    },
     services::instance_meta,
     state::AppState,
-    util::cache::TimedCache,
+    util::{cache::TimedCache, time::mastodon_time},
 };
 
 /// How long the `stats` block may be served from the in-memory cache.
@@ -124,6 +138,21 @@ const POST_FORMATS: [&str; 3] = ["text/plain", "text/html", "text/markdown"];
 const SUPPORTED_MIME_TYPES: [&str; 1] = ["application/octet-stream"];
 /// Monthly active users reported while no activity counter exists.
 const MONTHLY_ACTIVE_USERS: usize = 0;
+/// The public source repository of this server, reported as the v2
+/// document's `source_url` (Pleroma's `Pleroma.Application.repository()`).
+const SOURCE_URL: &str = "https://github.com/TheStranjer/wired-be";
+/// Statuses one account may pin (Mastodon's shipped limit; Pleroma's
+/// config default is `1`, but this block follows Mastodon's numbers the
+/// way [`MAX_FEATURED_TAGS`] already does).
+const MAX_PINNED_STATUSES: usize = 5;
+/// Peer hosts `GET /api/v1/instance/peers` reports at most, the cap the
+/// listing answers with even on a far larger table.
+const PEER_LIMIT: i64 = 1_000;
+/// Whether a translation provider is configured; none is until the
+/// translation ticket lands, so `configuration.translation.enabled` and
+/// `GET /api/v1/instance/translation_languages` report that (Pleroma's
+/// `Pleroma.Language.Translation.configured?()`).
+const TRANSLATION_CONFIGURED: bool = false;
 
 /// The three counters of a Pleroma-compatible instance, read in one
 /// round trip and cached for [`STATS_TTL`].
@@ -169,9 +198,40 @@ const FIRST_ADMIN_SQL: &str = "SELECT * FROM users
      ORDER BY id
         LIMIT 1";
 
-/// The `/api/v1/instance` router, merged into [`crate::api::v1`].
+/// [`list_peers`]: the distinct hosts of the remote actors mirrored here
+/// — local rows carry no `domain` (decision 7), so "not null" is
+/// "remote". Sorted and capped at [`PEER_LIMIT`] rows; Pleroma reads the
+/// same distinct hosts through its `Pleroma.Stats` `GenServer`.
+const PEERS_SQL: &str = "SELECT DISTINCT domain FROM users
+      WHERE domain IS NOT NULL
+  ORDER BY domain
+        LIMIT $1";
+
+/// The `/api/v1/instance` router, merged into [`crate::api::v1`]: the
+/// instance document and the sub-resources hung beside it.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/instance", get(show_instance))
+    Router::new()
+        .route("/instance", get(show_instance))
+        .route("/instance/activity", get(show_activity))
+        .route("/instance/domain_blocks", get(show_domain_blocks))
+        .route(
+            "/instance/extended_description",
+            get(show_extended_description),
+        )
+        .route("/instance/peers", get(show_peers))
+        .route("/instance/rules", get(show_rules))
+        .route(
+            "/instance/translation_languages",
+            get(show_translation_languages),
+        )
+}
+
+/// The `/api/v2/instance` router, merged into [`crate::api::v2`]: the
+/// reshaped document Pleroma's `show2` serves. The `/instance`
+/// sub-resources stay v1-only — Pleroma's router mounts them there and
+/// nowhere else.
+pub fn v2_router() -> Router<AppState> {
+    Router::new().route("/instance", get(show_instance_v2))
 }
 
 /// `GET /api/v1/instance` — the public instance document. No
@@ -223,6 +283,116 @@ async fn read_first_admin(pool: &PgPool) -> AppResult<Option<User>> {
         .fetch_optional(pool)
         .await?;
     Ok(admin)
+}
+
+/// `GET /api/v2/instance` — the public instance document in Mastodon 4's
+/// reshaped form. No authentication.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+async fn show_instance_v2(State(state): State<AppState>) -> AppResult<Json<InstanceV2>> {
+    let rules = instance_rule::list(&state.db).await?;
+    let contact = read_first_admin(&state.db).await?;
+    Ok(Json(InstanceV2::build(
+        &state.config,
+        &rules,
+        contact.as_ref(),
+    )))
+}
+
+/// [`show_peers`]: the peer list — distinct `users.domain`,
+/// alphabetically, at most [`PEER_LIMIT`] hosts — unless the instance
+/// restricts unauthenticated reads, in which case nothing is listed.
+async fn list_peers(pool: &PgPool) -> AppResult<Vec<String>> {
+    let peers = sqlx::query_scalar::<_, String>(PEERS_SQL)
+        .bind(PEER_LIMIT)
+        .fetch_all(pool)
+        .await?;
+    Ok(peers)
+}
+
+/// Whether the [`instance_meta`] access restrictions hide the federated
+/// timeline from anonymous callers — the Akkoma-style gate Pleroma's
+/// `peers` action grows behind it: an instance that will not serve remote
+/// content to strangers publishes no peer list either. wired-be has no
+/// private-instance mode to set, so today this is always `false`.
+fn peers_restricted() -> bool {
+    instance_meta::restrict_unauthenticated()
+        .get("timelines")
+        .and_then(|timelines| timelines.get("federated"))
+        == Some(&Value::Bool(true))
+}
+
+/// `GET /api/v1/instance/peers` — the JSON array of known remote
+/// domains. No authentication.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+async fn show_peers(State(state): State<AppState>) -> AppResult<Json<Vec<String>>> {
+    if peers_restricted() {
+        return Ok(Json(Vec::new()));
+    }
+    Ok(Json(list_peers(&state.db).await?))
+}
+
+/// `GET /api/v1/instance/rules` — the instance rules, the same entries
+/// and order as the v1 document's `rules` block. No authentication.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+async fn show_rules(State(state): State<AppState>) -> AppResult<Json<Vec<Rule>>> {
+    let rules = instance_rule::list(&state.db).await?;
+    Ok(Json(rules.iter().map(Rule::from_model).collect()))
+}
+
+/// `GET /api/v1/instance/domain_blocks` — the domains rejected or
+/// silenced by instance policy, from [`crate::models::instance_policy_domain`].
+/// No authentication.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+async fn show_domain_blocks(State(state): State<AppState>) -> AppResult<Json<Vec<DomainBlock>>> {
+    let policies = instance_policy_domain::list(&state.db).await?;
+    Ok(Json(
+        policies
+            .iter()
+            .filter_map(DomainBlock::from_model)
+            .collect(),
+    ))
+}
+
+/// `GET /api/v1/instance/translation_languages` — the language pairs a
+/// translation provider offers. No provider is configured until the
+/// translation ticket lands, so the document stays the empty object
+/// Pleroma's `translation_languages.json` renders then. No
+/// authentication.
+async fn show_translation_languages() -> Json<Map<String, Value>> {
+    Json(Map::new())
+}
+
+/// `GET /api/v1/instance/activity` — Mastodon's weekly activity stats.
+/// wired-be keeps no activity counters (the same reason the `pleroma`
+/// block's `stats.mau` is zero), so the listing is the empty array
+/// Mastodon answers before its first counted week. No authentication.
+async fn show_activity() -> Json<Vec<Value>> {
+    Json(Vec::new())
+}
+
+/// `GET /api/v1/instance/extended_description` — Mastodon's long-form
+/// instance description. wired-be has one description setting, so the
+/// document is that text wrapped in a paragraph, stamped with the
+/// current time (there is no stored revision to date from). No
+/// authentication.
+async fn show_extended_description(State(state): State<AppState>) -> Json<ExtendedDescription> {
+    Json(ExtendedDescription::build(&state.config, Utc::now()))
 }
 
 /// The `version` string: Mastodon's API level, commented with the Pleroma
@@ -434,27 +604,10 @@ impl Configuration {
     /// The block for the limits `config` configures, with the shipped
     /// constants for what wired-be does not make configurable.
     const fn for_config(config: &Config) -> Self {
-        let upload_limit = config.upload_limits.max_file_bytes;
         Self {
-            statuses: StatusesConfiguration {
-                max_characters: config.max_status_chars,
-                max_media_attachments: config.max_media_attachments,
-                characters_reserved_per_url: CHARACTERS_RESERVED_PER_URL,
-            },
-            media_attachments: MediaAttachmentsConfiguration {
-                supported_mime_types: &SUPPORTED_MIME_TYPES,
-                image_size_limit: upload_limit,
-                video_size_limit: upload_limit,
-                image_matrix_limit: IMAGE_MATRIX_LIMIT,
-                video_matrix_limit: VIDEO_MATRIX_LIMIT,
-                video_frame_rate_limit: VIDEO_FRAME_RATE_LIMIT,
-            },
-            polls: PollsConfiguration {
-                max_options: config.max_poll_options,
-                max_characters_per_option: MAX_POLL_OPTION_CHARS,
-                min_expiration: MIN_POLL_EXPIRATION_SECS,
-                max_expiration: MAX_POLL_EXPIRATION_SECS,
-            },
+            statuses: StatusesConfiguration::for_config(config),
+            media_attachments: MediaAttachmentsConfiguration::for_config(config),
+            polls: PollsConfiguration::for_config(config),
             accounts: AccountsConfiguration {
                 max_featured_tags: MAX_FEATURED_TAGS,
             },
@@ -471,6 +624,18 @@ struct StatusesConfiguration {
     max_media_attachments: usize,
     /// Characters Mastodon subtracts per link before counting.
     characters_reserved_per_url: usize,
+}
+
+impl StatusesConfiguration {
+    /// The status limits `config` configures, beside the fixed
+    /// link reserve.
+    const fn for_config(config: &Config) -> Self {
+        Self {
+            max_characters: config.max_status_chars,
+            max_media_attachments: config.max_media_attachments,
+            characters_reserved_per_url: CHARACTERS_RESERVED_PER_URL,
+        }
+    }
 }
 
 /// The `configuration.media_attachments` group.
@@ -490,6 +655,22 @@ struct MediaAttachmentsConfiguration {
     video_frame_rate_limit: usize,
 }
 
+impl MediaAttachmentsConfiguration {
+    /// The upload limits `config` configures, beside the fixed
+    /// matrix/frame-rate caps.
+    const fn for_config(config: &Config) -> Self {
+        let upload_limit = config.upload_limits.max_file_bytes;
+        Self {
+            supported_mime_types: &SUPPORTED_MIME_TYPES,
+            image_size_limit: upload_limit,
+            video_size_limit: upload_limit,
+            image_matrix_limit: IMAGE_MATRIX_LIMIT,
+            video_matrix_limit: VIDEO_MATRIX_LIMIT,
+            video_frame_rate_limit: VIDEO_FRAME_RATE_LIMIT,
+        }
+    }
+}
+
 /// The `configuration.polls` group — the same four limits as
 /// [`PollLimits`], under Mastodon's own key names.
 #[derive(Debug, Serialize)]
@@ -502,6 +683,19 @@ struct PollsConfiguration {
     min_expiration: usize,
     /// Longest poll duration, in seconds.
     max_expiration: usize,
+}
+
+impl PollsConfiguration {
+    /// The poll limits `config` configures, beside Pleroma's shipped
+    /// option length and duration window.
+    const fn for_config(config: &Config) -> Self {
+        Self {
+            max_options: config.max_poll_options,
+            max_characters_per_option: MAX_POLL_OPTION_CHARS,
+            min_expiration: MIN_POLL_EXPIRATION_SECS,
+            max_expiration: MAX_POLL_EXPIRATION_SECS,
+        }
+    }
 }
 
 /// The `configuration.accounts` group.
@@ -679,6 +873,375 @@ impl Markup {
             tables: Toggle::new(false),
             fonts: Toggle::new(false),
         }
+    }
+}
+
+/// The `GET /api/v2/instance` document, in the shape Pleroma's
+/// `InstanceView.render("show2.json", …)` writes: the same facts as
+/// [`Instance`], regrouped the way Mastodon 4 clients read them —
+/// `domain`/`source_url`/`usage`/`thumbnail`, nested `registrations` and
+/// `contact`, a widened `configuration` — plus Pleroma's own `pleroma`
+/// block, unchanged from v1.
+#[derive(Debug, Serialize)]
+struct InstanceV2 {
+    /// The domain of [`Config::base_url`], without scheme or port default.
+    domain: String,
+    /// Instance display name (`INSTANCE_NAME`).
+    title: String,
+    /// The compatibility version line ([`version_string`]).
+    version: String,
+    /// This server's source repository ([`SOURCE_URL`]).
+    source_url: &'static str,
+    /// Instance description (`INSTANCE_DESCRIPTION`); like the v1
+    /// document, the one setting fills both of Pleroma's description
+    /// keys, and v2 keeps only the long one.
+    description: String,
+    /// The user counters block.
+    usage: Usage,
+    /// The instance thumbnail block.
+    thumbnail: Thumbnail,
+    /// Content language codes (`INSTANCE_LANGUAGES`).
+    languages: Vec<String>,
+    /// The widened client-configuration block.
+    configuration: ConfigurationV2,
+    /// The registration state, nested as Mastodon 4 spells it.
+    registrations: RegistrationsV2,
+    /// The admin contact pair: email and account.
+    contact: Contact,
+    /// The instance rules, lowest priority first ([`Rule::from_model`]).
+    rules: Vec<Rule>,
+    /// Pleroma's extension block, the same [`PleromaBlock`] v1 writes.
+    pleroma: PleromaBlock,
+}
+
+impl InstanceV2 {
+    /// The document for the instance `config` serves, with the stored
+    /// `rules` and `contact` as the account to advertise. The `usage`
+    /// counter needs no database read while no activity counter exists.
+    ///
+    /// Pure (decision 3): every value comes from one of the three inputs
+    /// or a documented constant.
+    fn build(config: &Config, rules: &[InstanceRule], contact: Option<&User>) -> Self {
+        Self {
+            domain: config.domain().to_owned(),
+            title: config.instance_name.clone(),
+            version: version_string(),
+            source_url: SOURCE_URL,
+            description: config.instance_description.clone(),
+            usage: Usage::monthly(),
+            thumbnail: Thumbnail::for_config(config),
+            languages: config.instance_languages.clone(),
+            configuration: ConfigurationV2::for_config(config),
+            registrations: RegistrationsV2::for_config(config),
+            contact: Contact::build(config, contact),
+            rules: rules.iter().map(Rule::from_model).collect(),
+            pleroma: PleromaBlock::pleroma(),
+        }
+    }
+}
+
+/// The `usage` block.
+#[derive(Debug, Serialize)]
+struct Usage {
+    /// The user counters.
+    users: UsageUsers,
+}
+
+impl Usage {
+    /// The usage block of an instance that counts no activity: the same
+    /// zero the `pleroma` block reports as `stats.mau`.
+    const fn monthly() -> Self {
+        Self {
+            users: UsageUsers {
+                active_month: MONTHLY_ACTIVE_USERS,
+            },
+        }
+    }
+}
+
+/// The `usage.users` block.
+#[derive(Debug, Serialize)]
+struct UsageUsers {
+    /// Users active in the last month; wired-be keeps no activity
+    /// counter yet, so a constant zero (the ticket's answer while the
+    /// counters ticket is open).
+    active_month: usize,
+}
+
+/// The `thumbnail` block: Mastodon 4 wraps the URL v1 writes bare.
+#[derive(Debug, Serialize)]
+struct Thumbnail {
+    /// The instance thumbnail URL ([`THUMBNAIL_PATH`] under
+    /// [`Config::base_url`]).
+    url: String,
+}
+
+impl Thumbnail {
+    /// The thumbnail block for `config`'s origin.
+    fn for_config(config: &Config) -> Self {
+        Self {
+            url: format!("{}{THUMBNAIL_PATH}", config.base_url),
+        }
+    }
+}
+
+/// The v2 `configuration` block: the three limit groups v1 already
+/// writes, beside Mastodon 4's own `urls`, `vapid`, `translation` and
+/// the widened `accounts` group.
+#[derive(Debug, Serialize)]
+struct ConfigurationV2 {
+    /// The endpoint group.
+    urls: EndpointUrls,
+    /// The Web Push keys group.
+    vapid: Vapid,
+    /// The account limits group, wider than v1's.
+    accounts: AccountsConfigurationV2,
+    /// The status limits group, as in v1.
+    statuses: StatusesConfiguration,
+    /// The upload limits group, as in v1.
+    media_attachments: MediaAttachmentsConfiguration,
+    /// The poll limits group, as in v1.
+    polls: PollsConfiguration,
+    /// The translation support group.
+    translation: TranslationConfiguration,
+}
+
+impl ConfigurationV2 {
+    /// The block for the limits `config` configures; the shared v1
+    /// groups are reused whole, the Mastodon 4-only groups carry the
+    /// shipped constants.
+    fn for_config(config: &Config) -> Self {
+        Self {
+            urls: EndpointUrls::for_config(config),
+            vapid: Vapid::unsupported(),
+            accounts: AccountsConfigurationV2::shipped(),
+            statuses: StatusesConfiguration::for_config(config),
+            media_attachments: MediaAttachmentsConfiguration::for_config(config),
+            polls: PollsConfiguration::for_config(config),
+            translation: TranslationConfiguration::unconfigured(),
+        }
+    }
+}
+
+/// The v2 `configuration.urls` group.
+#[derive(Debug, Serialize)]
+struct EndpointUrls {
+    /// The websocket address of the streaming API ([`streaming_api_url`],
+    /// under Mastodon 4's own key name).
+    streaming: String,
+    /// The status page URL; wired-be configures none, so JSON `null`
+    /// (Pleroma's `[:instance, :status_page]` default).
+    status: Value,
+}
+
+impl EndpointUrls {
+    /// The endpoint group for `config`'s origin, with no status page.
+    fn for_config(config: &Config) -> Self {
+        Self {
+            streaming: streaming_api_url(config),
+            status: Value::Null,
+        }
+    }
+}
+
+/// The v2 `configuration.vapid` group.
+#[derive(Debug, Serialize)]
+struct Vapid {
+    /// The Web Push public key; no push sender exists, so the empty
+    /// string clients treat as "no push" (Pleroma answers its configured
+    /// key, which ships unset).
+    public_key: String,
+}
+
+impl Vapid {
+    /// The group of an instance with no push sender.
+    const fn unsupported() -> Self {
+        Self {
+            public_key: String::new(),
+        }
+    }
+}
+
+/// The v2 `configuration.accounts` group: the featured-tag limit v1
+/// reports, plus the pinned-status one.
+#[derive(Debug, Serialize)]
+struct AccountsConfigurationV2 {
+    /// Tags one account may feature.
+    max_featured_tags: usize,
+    /// Statuses one account may pin.
+    max_pinned_statuses: usize,
+}
+
+impl AccountsConfigurationV2 {
+    /// The shipped account limits.
+    const fn shipped() -> Self {
+        Self {
+            max_featured_tags: MAX_FEATURED_TAGS,
+            max_pinned_statuses: MAX_PINNED_STATUSES,
+        }
+    }
+}
+
+/// The v2 `configuration.translation` group.
+#[derive(Debug, Serialize)]
+struct TranslationConfiguration {
+    /// Whether a translation provider is configured; none is until the
+    /// translation ticket lands ([`TRANSLATION_CONFIGURED`]).
+    enabled: bool,
+}
+
+impl TranslationConfiguration {
+    /// The group of an instance with no translation provider.
+    const fn unconfigured() -> Self {
+        Self {
+            enabled: TRANSLATION_CONFIGURED,
+        }
+    }
+}
+
+/// The v2 `registrations` block: the flat v1 pair, nested, plus the
+/// invitation fields Mastodon 4 adds (this instance has neither).
+#[derive(Debug, Serialize)]
+struct RegistrationsV2 {
+    /// Whether anyone may register (`REGISTRATIONS_OPEN`).
+    enabled: Toggle,
+    /// Whether registration needs approval; wired-be has no approval
+    /// mode yet, so `false` until the registration-modes ticket updates
+    /// it (Pleroma's `account_approval_required` default).
+    approval_required: bool,
+    /// The text shown on the registration form; `None` renders JSON
+    /// `null`, the answer when the instance writes none.
+    message: Value,
+    /// The external registration URL; wired-be registers in place, so
+    /// JSON `null`.
+    url: Value,
+}
+
+impl RegistrationsV2 {
+    /// The block for `config`'s registration state, with the two
+    /// never-set extras.
+    const fn for_config(config: &Config) -> Self {
+        Self {
+            enabled: config.registrations_open,
+            approval_required: false,
+            message: Value::Null,
+            url: Value::Null,
+        }
+    }
+}
+
+/// The v2 `contact` block: the two flat v1 keys (`email`,
+/// `contact_account`), nested.
+#[derive(Debug, Serialize)]
+struct Contact {
+    /// Admin contact email (`CONTACT_EMAIL`), empty when unconfigured
+    /// (the same answer [`Instance::email`] gives).
+    email: String,
+    /// The account clients should contact the staff through: the first
+    /// local admin, or JSON `null` when there is none.
+    account: Option<Account>,
+}
+
+impl Contact {
+    /// The block for `config`'s email and the `account` to advertise.
+    fn build(config: &Config, account: Option<&User>) -> Self {
+        Self {
+            email: config.contact_email.clone().unwrap_or_default(),
+            account: account.map(|user| Account::from_user(user, config)),
+        }
+    }
+}
+
+/// One entry of `GET /api/v1/instance/domain_blocks`: a domain this
+/// instance's own policy restricts, in the shape Mastodon's domain-block
+/// listing documents.
+///
+/// The `digest` lets a client check the block without learning the
+/// domain (Mastodon hashes it the same way); this instance serves the
+/// domain in the clear anyway, so both are in the entry.
+#[derive(Debug, Serialize)]
+struct DomainBlock {
+    /// The blocked host.
+    domain: String,
+    /// Lowercase hex `SHA-256` of [`domain`](Self::domain).
+    digest: String,
+    /// How the block reads to clients: `suspend` or `silence`
+    /// ([`DomainBlock::severity_of`]).
+    severity: &'static str,
+    /// Why the domain is blocked, empty when the instance gave no
+    /// reason.
+    comment: String,
+}
+
+impl DomainBlock {
+    /// Renders the stored policy `row`, `None` when its action maps to
+    /// no Mastodon severity — Pleroma's renderer likewise drops the
+    /// policy groups without a severity.
+    fn from_model(row: &InstancePolicyDomain) -> Option<Self> {
+        let severity = Self::severity_of(&row.action)?;
+        Some(Self {
+            digest: sha256_hex(&row.domain),
+            domain: row.domain.clone(),
+            severity,
+            comment: row.reason.clone(),
+        })
+    }
+
+    /// The Mastodon severity of a policy `action`: a rejected domain is
+    /// suspended; silenced and media-scrubbed domains both stay visible
+    /// under `silence` (the ticket's mapping; Pleroma likewise folds its
+    /// soft blocks into one severity).
+    fn severity_of(action: &str) -> Option<&'static str> {
+        match action {
+            "reject" => Some("suspend"),
+            "silence" | "media_removal" => Some("silence"),
+            _ => None,
+        }
+    }
+}
+
+/// `GET /api/v1/instance/extended_description`: Mastodon's long-form
+/// description, stored as rich text with a revision date. wired-be has
+/// the one [`Config::instance_description`] and no revisions, so
+/// [`ExtendedDescription::build`] wraps it in a paragraph and stamps it
+/// with the request time.
+#[derive(Debug, Serialize)]
+struct ExtendedDescription {
+    /// When the description last changed ([`ExtendedDescription::build`]).
+    updated_at: String,
+    /// The description as an HTML paragraph.
+    content: String,
+}
+
+impl ExtendedDescription {
+    /// The document for `config`'s description, stamped `now` in
+    /// Mastodon's time format (decision 5).
+    fn build(config: &Config, now: DateTime<Utc>) -> Self {
+        Self {
+            updated_at: mastodon_time(&now),
+            content: format!("<p>{}</p>", config.instance_description),
+        }
+    }
+}
+
+/// The lowercase hex `SHA-256` of `text` — Mastodon's domain-block
+/// digest: Pleroma's renderer writes it as `:crypto.hash(:sha256, host)`
+/// encoded with `Base.encode16(case: :lower)`.
+fn sha256_hex(text: &str) -> String {
+    let mut hex = String::with_capacity(Sha256::output_size() * 2);
+    for &byte in &Sha256::digest(text.as_bytes()) {
+        hex.push(hex_digit(byte >> 4));
+        hex.push(hex_digit(byte & 0x0F));
+    }
+    hex
+}
+
+/// One lowercase hex digit for `nibble` (which must be below `16`).
+fn hex_digit(nibble: u8) -> char {
+    if nibble < 10 {
+        char::from(b'0' + nibble)
+    } else {
+        char::from(b'a' + (nibble - 10))
     }
 }
 
@@ -1077,5 +1640,295 @@ mod tests {
             domains: 0,
         };
         Instance::build(&config, &stats, rules, None)
+    }
+
+    /// The empty-instance v2 document on the test config: zeroed usage,
+    /// no rules, no contact.
+    fn empty_document_v2() -> Value {
+        let config = Config::for_tests();
+        serde_json::to_value(InstanceV2::build(&config, &[], None)).unwrap()
+    }
+
+    #[test]
+    fn the_v2_document_holds_the_ticket_key_sets() {
+        let document = empty_document_v2();
+        assert_eq!(
+            keys_of(&document),
+            vec![
+                "configuration",
+                "contact",
+                "description",
+                "domain",
+                "languages",
+                "pleroma",
+                "registrations",
+                "rules",
+                "source_url",
+                "thumbnail",
+                "title",
+                "usage",
+                "version",
+            ],
+            "the ticket's v2 top-level key set"
+        );
+        assert_eq!(
+            keys_of(&document["configuration"]),
+            vec![
+                "accounts",
+                "media_attachments",
+                "polls",
+                "statuses",
+                "translation",
+                "urls",
+                "vapid",
+            ],
+            "the v2 configuration groups"
+        );
+        assert_eq!(
+            keys_of(&document["registrations"]),
+            vec!["approval_required", "enabled", "message", "url"],
+            "the nested registration block"
+        );
+        assert_eq!(
+            keys_of(&document["contact"]),
+            vec!["account", "email"],
+            "the nested contact block"
+        );
+        assert_eq!(
+            keys_of(&document["usage"]),
+            vec!["users"],
+            "the usage block counts users"
+        );
+        assert_eq!(
+            keys_of(&document["usage"]["users"]),
+            vec!["active_month"],
+            "the monthly-active counter"
+        );
+        assert_eq!(
+            keys_of(&document["thumbnail"]),
+            vec!["url"],
+            "v2 wraps the thumbnail URL"
+        );
+    }
+
+    #[test]
+    fn the_v2_document_holds_the_instance_identity() {
+        let document = empty_document_v2();
+        assert_eq!(document["domain"], "test.example", "the config domain");
+        assert_eq!(document["title"], "Wired", "the config name");
+        assert_eq!(
+            document["description"], "A Pleroma-compatible instance",
+            "the config description"
+        );
+        assert_eq!(
+            document["source_url"], SOURCE_URL,
+            "the shipped repository URL"
+        );
+        assert_eq!(
+            document["source_url"],
+            "https://github.com/TheStranjer/wired-be"
+        );
+        assert_eq!(
+            document["thumbnail"]["url"], "https://test.example/images/thumbnail.jpg",
+            "the wrapped thumbnail URL"
+        );
+        assert_eq!(document["languages"], json!(["en"]), "the config languages");
+        assert_eq!(
+            document["usage"]["users"]["active_month"], 0,
+            "no activity counter exists yet"
+        );
+        assert_eq!(document["rules"], json!([]), "no rules stored");
+    }
+
+    #[test]
+    fn the_v2_configuration_groups_hold_their_defaults() {
+        let document = empty_document_v2();
+        assert_eq!(
+            document["configuration"]["urls"],
+            json!({"streaming": "wss://test.example", "status": null}),
+            "the streaming origin and no status page"
+        );
+        assert_eq!(
+            document["configuration"]["vapid"],
+            json!({"public_key": ""}),
+            "no push sender exists"
+        );
+        assert_eq!(
+            document["configuration"]["accounts"],
+            json!({"max_featured_tags": 10, "max_pinned_statuses": 5}),
+            "Mastodon's shipped account limits"
+        );
+        assert_eq!(
+            document["configuration"]["statuses"],
+            json!({"max_characters": 5000, "max_media_attachments": 4, "characters_reserved_per_url": 23}),
+            "the status limits mirror the config"
+        );
+        assert_eq!(
+            document["configuration"]["translation"],
+            json!({"enabled": false}),
+            "no translation provider is configured"
+        );
+        let v1 = empty_document();
+        for group in ["media_attachments", "polls"] {
+            assert_eq!(
+                document["configuration"][group], v1["configuration"][group],
+                "the {group} group is the shared v1 builder, unchanged"
+            );
+        }
+        assert_eq!(
+            document["registrations"],
+            json!({"enabled": true, "approval_required": false, "message": null, "url": null}),
+            "the config toggle nested with the two never-set extras"
+        );
+        assert_eq!(
+            document["contact"],
+            json!({"email": "", "account": null}),
+            "an unconfigured email is empty, no admin fixture"
+        );
+        assert_eq!(
+            document["pleroma"], v1["pleroma"],
+            "the pleroma block is the shared v1 builder, unchanged"
+        );
+    }
+
+    #[test]
+    fn the_v2_document_follows_the_config() {
+        let mut config = Config::for_tests();
+        config.instance_name = "Snatter".to_owned();
+        config.instance_description = "Where we all chatter".to_owned();
+        config.contact_email = Some("admin@example.org".to_owned());
+        config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
+        config.base_url = "http://snatter.example:4000".to_owned();
+        config.max_status_chars = 300;
+        config.max_media_attachments = 6;
+        config.max_poll_options = 12;
+        config.upload_limits.max_file_bytes = 1_048_576;
+        config.registrations_open = Toggle::new(false);
+        let document = serde_json::to_value(InstanceV2::build(&config, &[], None)).unwrap();
+        assert_eq!(
+            document["domain"], "snatter.example:4000",
+            "the domain with port"
+        );
+        assert_eq!(document["title"], "Snatter");
+        assert_eq!(document["description"], "Where we all chatter");
+        assert_eq!(document["languages"], json!(["en", "de"]));
+        assert_eq!(
+            document["thumbnail"]["url"],
+            "http://snatter.example:4000/images/thumbnail.jpg"
+        );
+        assert_eq!(
+            document["configuration"]["urls"]["streaming"],
+            "ws://snatter.example:4000"
+        );
+        assert_eq!(
+            document["configuration"]["statuses"]["max_characters"], 300,
+            "the shared status group mirrors the config"
+        );
+        assert_eq!(
+            document["configuration"]["media_attachments"]["image_size_limit"], 1_048_576,
+            "the shared media group mirrors the upload limit"
+        );
+        assert_eq!(
+            document["configuration"]["polls"]["max_options"], 12,
+            "the shared poll group mirrors the option count"
+        );
+        assert_eq!(
+            document["registrations"]["enabled"], false,
+            "REGISTRATIONS_OPEN=false is advertised"
+        );
+        assert_eq!(document["contact"]["email"], "admin@example.org");
+    }
+
+    #[test]
+    fn domain_block_severities_follow_the_ticket_mapping() {
+        let policy = |action: &str| InstancePolicyDomain {
+            domain: "blocked.example".to_owned(),
+            action: action.to_owned(),
+            reason: "bots".to_owned(),
+            inserted_at: stamped(),
+        };
+        assert_eq!(
+            DomainBlock::severity_of("reject"),
+            Some("suspend"),
+            "a rejected domain reads as suspended"
+        );
+        assert_eq!(
+            DomainBlock::severity_of("silence"),
+            Some("silence"),
+            "a silenced domain keeps its name"
+        );
+        assert_eq!(
+            DomainBlock::severity_of("media_removal"),
+            Some("silence"),
+            "media scrubbing reads as silence too"
+        );
+        assert_eq!(
+            DomainBlock::severity_of("defederate"),
+            None,
+            "an unmapped action renders no entry"
+        );
+        assert!(
+            DomainBlock::from_model(&policy("defederate")).is_none(),
+            "the renderer drops unmapped rows"
+        );
+    }
+
+    #[test]
+    fn a_domain_block_holds_the_domain_digest_severity_and_comment() {
+        let row = InstancePolicyDomain {
+            domain: "blocked.example".to_owned(),
+            action: "reject".to_owned(),
+            reason: "coordinated abuse".to_owned(),
+            inserted_at: stamped(),
+        };
+        let block = DomainBlock::from_model(&row).expect("reject maps to a severity");
+        let rendered = serde_json::to_value(&block).unwrap();
+        assert_eq!(
+            rendered,
+            json!({
+                "domain": "blocked.example",
+                "digest": sha256_hex("blocked.example"),
+                "severity": "suspend",
+                "comment": "coordinated abuse",
+            }),
+            "the entry shape the ticket documents"
+        );
+        let empty = InstancePolicyDomain {
+            reason: String::new(),
+            ..row
+        };
+        let unnamed = DomainBlock::from_model(&empty).expect("reject maps");
+        assert_eq!(unnamed.comment, "", "an ungiven reason is the empty string");
+    }
+
+    #[test]
+    fn the_sha256_hex_digest_is_lowercase_hex() {
+        // The published SHA-256 of the ASCII string "abc".
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the digest matches the SHA-256 test vector"
+        );
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "even the empty string hashes"
+        );
+    }
+
+    #[test]
+    fn the_extended_description_wraps_the_config_text() {
+        let config = Config::for_tests();
+        let now = stamped();
+        let description = ExtendedDescription::build(&config, now);
+        let rendered = serde_json::to_value(&description).unwrap();
+        assert_eq!(
+            rendered,
+            json!({
+                "updated_at": "2026-10-11T12:00:00.000Z",
+                "content": "<p>A Pleroma-compatible instance</p>",
+            }),
+            "the paragraph-wrapped INSTANCE_DESCRIPTION stamped in Mastodon time"
+        );
     }
 }
