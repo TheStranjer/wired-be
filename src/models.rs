@@ -29,6 +29,7 @@ pub mod job;
 pub mod list;
 pub mod marker;
 pub mod media_attachment;
+pub mod mention;
 pub mod oauth_app;
 pub mod oauth_login_state;
 pub mod oauth_token;

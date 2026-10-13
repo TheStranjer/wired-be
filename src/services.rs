@@ -8,3 +8,4 @@
 pub mod emoji_packs;
 pub mod instance_meta;
 pub mod media_processing;
+pub mod mentions;

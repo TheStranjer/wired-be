@@ -16,7 +16,10 @@
 //! resolves [`conversation_id`](Status::conversation_id) — a reply inherits
 //! its parent's conversation, a root status is its own conversation — and
 //! moves the denormalised counters in the same transaction, so a status and
-//! the counts that describe it are always written together.
+//! the counts that describe it are always written together. It also links
+//! the accounts in [`NewStatus::mentioned_user_ids`] in that transaction
+//! (see [`crate::models::mention`]), so a status and the mentions it
+//! carries appear together or not at all.
 //!
 //! Deletion is soft: [`soft_delete`] keeps the row as a tombstone with its
 //! text cleared and its `uri` reserved (so a deleted remote post is never
@@ -36,7 +39,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::user::User,
+    models::{mention, user::User},
     util::{format::text_to_html, id::new_id},
 };
 
@@ -253,6 +256,10 @@ pub struct NewStatus {
     pub reblog_of_id: Option<Uuid>,
     /// Original being quoted.
     pub quote_of_id: Option<Uuid>,
+    /// Accounts this status @-mentions, in mention order: [`insert`] links
+    /// them to the new row in its transaction (see
+    /// [`crate::models::mention`]); empty in the default.
+    pub mentioned_user_ids: Vec<Uuid>,
     /// Whether this instance owns the post; `false` in the default, as in
     /// [`NewUser`](crate::models::user::NewUser).
     pub local: bool,
@@ -290,6 +297,7 @@ impl Default for NewStatus {
             conversation_id: None,
             reblog_of_id: None,
             quote_of_id: None,
+            mentioned_user_ids: Vec::new(),
             local: false,
             application_name: None,
             application_website: None,
@@ -420,19 +428,23 @@ const SOFT_DELETE_SQL: &str = "UPDATE statuses
 /// back, so importing an old remote post leaves a newer one on the books),
 /// the parent's `replies_count` goes up for a reply and the original's
 /// `reblogs_count` for a reblog — exactly what [`soft_delete`] steps back
-/// down.
+/// down — and every account in [`mentioned_user_ids`](NewStatus::mentioned_user_ids)
+/// is linked to the new row (see [`crate::models::mention`]), so a status
+/// and its mentions appear together or not at all.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError): a missing `uri` for a
-/// remote status, a duplicate `uri`, or an unknown author, parent or original
-/// arrives as the not-null, unique or foreign-key violation the database
-/// reports.
+/// remote status, a duplicate `uri`, an unknown author, parent or original,
+/// or an unknown mentioned account arrives as the not-null, unique or
+/// foreign-key violation the database reports — and the rollback takes the
+/// half-written status with it.
 pub async fn insert(pool: &PgPool, base_url: &str, new_status: &NewStatus) -> AppResult<Status> {
     let mut tx = pool.begin().await?;
     let parent = parent_conversation(&mut tx, new_status.in_reply_to_id).await?;
     let status = write_status(&mut tx, base_url, new_status, parent).await?;
+    mention::link_conn(&mut tx, status.id, &new_status.mentioned_user_ids).await?;
     count_new_post(&mut tx, &status).await?;
     tx.commit().await?;
     Ok(status)
@@ -706,7 +718,10 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         error::AppError,
-        models::user::{self, NewUser, insert as insert_user, local_ap_id},
+        models::{
+            mention,
+            user::{self, NewUser, insert as insert_user, local_ap_id},
+        },
     };
 
     /// The instance origin the fixtures pretend to serve.
@@ -1032,6 +1047,86 @@ mod tests {
             counter(&pool, original.id, Counter::Quotes).await,
             0,
             "insert counts no quote: the quoting ticket bumps it itself"
+        );
+    }
+
+    /// The mentioned ids of `status_id` from the batch read, in order.
+    async fn mentioned(pool: &PgPool, status_id: Uuid) -> Vec<Uuid> {
+        let map = mention::for_statuses(pool, &[status_id])
+            .await
+            .expect("the batch read works");
+        map.get(&status_id)
+            .map(|users| users.iter().map(|user| user.id).collect())
+            .unwrap_or_default()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn insert_links_the_mentioned_accounts_in_order(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+
+        let status = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                mentioned_user_ids: vec![carol.id, bob.id],
+                ..NewStatus::local(&alice, "@carol and @bob")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            mentioned(&pool, status.id).await,
+            vec![carol.id, bob.id],
+            "the links went in in mention order, in the status's transaction"
+        );
+        assert_eq!(
+            fresh_user(&pool, alice.id).await.statuses_count,
+            1,
+            "and the rest of the insert happened as usual"
+        );
+
+        let plain = post(&pool, &alice, "no mentions here").await;
+        assert!(
+            mentioned(&pool, plain.id).await.is_empty(),
+            "a status without mentioned_user_ids links nobody"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_unknown_mention_rolls_the_status_back(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+        let err = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                mentioned_user_ids: vec![new_id()],
+                ..NewStatus::local(&alice, "@ghost")
+            },
+        )
+        .await
+        .expect_err("an unknown mentioned account is the foreign key's to refuse");
+        assert!(
+            matches!(err, AppError::Database(_)),
+            "the failure is the database's: {err}"
+        );
+
+        let left: (i64,) = sqlx::query_as("SELECT count(*) FROM statuses")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left.0, 0, "the half-written status rolled back with it");
+        let links: (i64,) = sqlx::query_as("SELECT count(*) FROM status_mentions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(links.0, 0, "and nothing was linked");
+        assert_eq!(
+            fresh_user(&pool, alice.id).await.statuses_count,
+            0,
+            "the author's count went back too"
         );
     }
 
