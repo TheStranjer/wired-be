@@ -39,8 +39,9 @@ const MENTION_PATTERN: &str = r"(?<lead>^|[\s(\[{])@(?<nick>[A-Za-z0-9_.-]*[A-Za
 const HASHTAG_PATTERN: &str = r"(?<lead>^|[^\p{L}\p{N}])#(?<tag>[\p{L}\p{N}_]+)";
 
 /// The longest hashtag [`extract_hashtags`] and [`linkify_entities`] produce;
-/// a longer word is cut to this many characters.
-const MAX_HASHTAG_LEN: usize = 100;
+/// a longer word is cut to this many characters. Also the ceiling a stored
+/// hashtag name may hold (`src/models/hashtag.rs` ignores longer names).
+pub(crate) const MAX_HASHTAG_LEN: usize = 100;
 
 /// The `http://` scheme text, as bytes, for [`has_http_scheme`].
 const HTTP_SCHEME: &[u8] = b"http://";

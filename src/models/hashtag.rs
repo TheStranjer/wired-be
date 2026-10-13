@@ -1,0 +1,614 @@
+//! The `hashtags` and `status_hashtags` tables: the tags a status carries.
+//!
+//! Reference: Pleroma normalizes tag names and keeps one `hashtags` row per
+//! name behind an object join table (`lib/pleroma/hashtag.ex`). Here the
+//! name is stored lowercase and without the leading `#` (the same shape
+//! [`crate::util::entities::extract_hashtags`] yields), so the unique key is
+//! plain text and the entity renders straight from storage; the reverse
+//! lookup — the newest statuses under one tag — is an index seek on
+//! `(hashtag_id, status_id DESC)`.
+//!
+//! Unlike [`crate::models::mention`] this edge carries no position: the
+//! Status entity's `tags` array orders by name, so
+//! [`for_statuses`] sorts on the column and [`link_to_status`] only has to
+//! keep pairs unique. [`upsert_many`] is the idempotent, case-insensitive
+//! write: re-using a tag points at the row that already holds it, and names
+//! that are blank or, once normalized, longer than the 100-character
+//! extraction bound are ignored rather than stored.
+//!
+//! Nothing here extracts tags from text: [`crate::models::status::insert`]
+//! upserts and links what its caller computed —
+//! [`crate::util::entities::extract_hashtags`] of the raw text for a local
+//! status, the `tag` list of the activity for a remote one — in the
+//! status's own transaction.
+
+use std::collections::{HashMap, HashSet};
+
+use chrono::{DateTime, Utc};
+use sqlx::{PgConnection, PgPool};
+use uuid::Uuid;
+
+use crate::{
+    error::AppResult,
+    util::{entities::MAX_HASHTAG_LEN, id::new_id},
+};
+
+/// The statement behind [`upsert_many`]: one row per given `(id, name)`
+/// pair, and on a name that already exists the no-op update of
+/// `name = EXCLUDED.name` — the shape the ticket prescribes, and what makes
+/// `RETURNING` answer with the stored row (its original `id` and
+/// `inserted_at`) instead of raising the unique violation.
+const UPSERT_SQL: &str = "INSERT INTO hashtags (id, name)
+     SELECT u.id, u.name FROM unnest($1::uuid[], $2::text[]) AS u(id, name)
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+RETURNING id, name, inserted_at";
+
+/// The statement behind [`link_to_status`]: one pair per id, and a pair the
+/// status already has is skipped, so linking twice changes nothing.
+const LINK_SQL: &str = "INSERT INTO status_hashtags (status_id, hashtag_id)
+     SELECT $1::uuid, t.hashtag_id FROM unnest($2::uuid[]) AS t(hashtag_id)
+ON CONFLICT (status_id, hashtag_id) DO NOTHING";
+
+/// The statement behind [`replace_for_status`]: the old set goes first, and
+/// the freshly upserted names are linked after it, in the same transaction.
+const DELETE_FOR_STATUS_SQL: &str = "DELETE FROM status_hashtags WHERE status_id = $1";
+
+/// The leading text of [`for_statuses`]: every tag of the given statuses,
+/// each row led by the status it tags, ordered status first and then by
+/// tag name — the array order the entity renders.
+const FOR_STATUSES_SQL: &str = "SELECT sh.status_id, h.* FROM status_hashtags sh
+      JOIN hashtags h ON h.id = sh.hashtag_id
+     WHERE sh.status_id = ANY($1)
+     ORDER BY sh.status_id, h.name";
+
+/// [`get_by_name`]: one row by its stored (normalized) name.
+const BY_NAME_SQL: &str = "SELECT * FROM hashtags WHERE name = $1";
+
+/// One row of `hashtags`: one tag name, shared by every status that uses it.
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct Hashtag {
+    /// `UUIDv7` primary key, minted by [`upsert_many`] (decision 4).
+    pub id: Uuid,
+    /// The tag name as stored: lowercase, without the leading `#`.
+    pub name: String,
+    /// When this tag was first created.
+    pub inserted_at: DateTime<Utc>,
+}
+
+/// The joined row of [`for_statuses`]: one tag link with the [`Hashtag`] its
+/// `hashtag_id` names, flattened.
+#[derive(Debug, sqlx::FromRow)]
+struct StatusHashtagRow {
+    /// The status this row links, from `status_hashtags.status_id`.
+    status_id: Uuid,
+    /// The tag, from the joined `hashtags` row.
+    #[sqlx(flatten)]
+    hashtag: Hashtag,
+}
+
+/// Upserts every usable name in `names` and returns the rows they name,
+/// ordered by name.
+///
+/// A name is normalized (trimmed, `#`-stripped, lowercased) before it is
+/// looked at, so `#Foo`, `Foo` and `foo` are one tag; a name that
+/// normalizes to nothing or to more than 100 characters (the extraction
+/// bound, [`crate::util::entities::extract_hashtags`]) is ignored.
+/// Idempotent: a name the table already holds answers its stored row, and
+/// repeats within one call are folded to one write.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn upsert_many(pool: &PgPool, names: &[String]) -> AppResult<Vec<Hashtag>> {
+    let mut conn = pool.acquire().await?;
+    upsert_many_conn(&mut conn, names).await
+}
+
+/// [`upsert_many`] on an open connection: the statement runs on the
+/// caller's transaction, which is how [`crate::models::status::insert`]
+/// writes a status and its tags together.
+///
+/// An empty batch short-circuits: no statement, no round trip.
+pub(crate) async fn upsert_many_conn(
+    conn: &mut PgConnection,
+    names: &[String],
+) -> AppResult<Vec<Hashtag>> {
+    let names = normalized_names(names);
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<Uuid> = names.iter().map(|_| new_id()).collect();
+    let mut hashtags = sqlx::query_as::<_, Hashtag>(UPSERT_SQL)
+        .bind(&ids)
+        .bind(&names)
+        .fetch_all(&mut *conn)
+        .await?;
+    // The rows come back in whatever order the statement folded them; the
+    // name order is what callers (and tests) get to rely on.
+    hashtags.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Ok(hashtags)
+}
+
+/// Finds or creates the one tag `name` names.
+///
+/// The single-name face of [`upsert_many`]: `#Foo` finds `foo`, and an
+/// unknown usable name gets a row. A name that normalization rejects
+/// (blank, or longer than the 100-character stored-name bound) is `None` —
+/// there is no tag to find and none to store.
+///
+/// # Errors
+///
+/// Any database failure behind the upsert (connection, encoding) arrives
+/// as [`AppError::Database`](crate::error::AppError).
+pub async fn find_or_create(pool: &PgPool, name: &str) -> AppResult<Option<Hashtag>> {
+    let mut usable: Vec<String> = Vec::new();
+    if let Some(tag) = normalize_name(name) {
+        usable.push(tag);
+    }
+    let mut found = upsert_many(pool, &usable).await?;
+    Ok(found.pop())
+}
+
+/// The stored tag whose name normalizes to `name`'s, `None` when no row
+/// holds it — including when `name` is not a usable tag at all.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_name(pool: &PgPool, name: &str) -> AppResult<Option<Hashtag>> {
+    let Some(tag) = normalize_name(name) else {
+        return Ok(None);
+    };
+    let hashtag = sqlx::query_as::<_, Hashtag>(BY_NAME_SQL)
+        .bind(&tag)
+        .fetch_optional(pool)
+        .await?;
+    Ok(hashtag)
+}
+
+/// Links the tags in `hashtag_ids` to status `status_id`.
+///
+/// Pairs the status already has are skipped, so linking twice changes
+/// nothing, and an id repeated within one call is folded by the key. Order
+/// is not kept: the entity renders [`for_statuses`]' name order.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError); an unknown status or tag
+/// arrives as the foreign-key violation the database reports, unless the
+/// call links nothing at all (an empty `hashtag_ids` touches no row and
+/// checks no key).
+pub async fn link_to_status(pool: &PgPool, status_id: Uuid, hashtag_ids: &[Uuid]) -> AppResult<()> {
+    let mut conn = pool.acquire().await?;
+    link_conn(&mut conn, status_id, hashtag_ids).await
+}
+
+/// [`link_to_status`] on an open connection: the statement runs on the
+/// caller's transaction.
+///
+/// An empty batch short-circuits: no statement, no round trip, and no
+/// foreign-key check either (nothing is written, so an unknown `status_id`
+/// with nothing to link is no error).
+pub(crate) async fn link_conn(
+    conn: &mut PgConnection,
+    status_id: Uuid,
+    hashtag_ids: &[Uuid],
+) -> AppResult<()> {
+    if hashtag_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(LINK_SQL)
+        .bind(status_id)
+        .bind(hashtag_ids)
+        .execute(&mut *conn)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// Upserts `names` and links every tag they name to status `status_id`, on
+/// `conn`: the pair of writes [`crate::models::status::insert`] runs inside
+/// the status's transaction.
+pub(crate) async fn link_names_conn(
+    conn: &mut PgConnection,
+    status_id: Uuid,
+    names: &[String],
+) -> AppResult<()> {
+    let hashtags = upsert_many_conn(conn, names).await?;
+    let ids: Vec<Uuid> = hashtags.iter().map(|hashtag| hashtag.id).collect();
+    link_conn(conn, status_id, &ids).await
+}
+
+/// Replaces the whole tag set of status `status_id` with `names`, in one
+/// transaction.
+///
+/// This is the shape an edit of a post needs: every link the status has is
+/// deleted and the upserted names of `names` are linked in their place.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError); an unknown `status_id`
+/// with at least one usable name is the foreign-key violation the database
+/// reports, and the transaction rolls every part of the replacement back
+/// with it.
+pub async fn replace_for_status(pool: &PgPool, status_id: Uuid, names: &[String]) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(DELETE_FOR_STATUS_SQL)
+        .bind(status_id)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    link_names_conn(&mut tx, status_id, names).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The tags of every status in `ids`, keyed by status id, each entry
+/// ordered by name.
+///
+/// Statuses the caller asked about that carry no tags are absent from the
+/// map, and an empty `ids` answers the empty map; this is the batch read
+/// that renders a page of statuses without one query per row.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn for_statuses(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, Vec<Hashtag>>> {
+    let ids = ids.to_vec();
+    let rows = sqlx::query_as::<_, StatusHashtagRow>(FOR_STATUSES_SQL)
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+    let mut grouped: HashMap<Uuid, Vec<Hashtag>> = HashMap::new();
+    for row in rows {
+        grouped.entry(row.status_id).or_default().push(row.hashtag);
+    }
+    Ok(grouped)
+}
+
+/// The normalized form of one written tag name, or `None` when it is not a
+/// usable tag: trimmed, leading `#`s dropped, lowercased — and non-empty
+/// and at most [`MAX_HASHTAG_LEN`] characters once normalized.
+fn normalize_name(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_start_matches('#').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tag = trimmed.to_lowercase();
+    // The length bound is on the stored tag, so it is checked after the
+    // lowercase (which can change a character count at the margins).
+    if tag.chars().count() > MAX_HASHTAG_LEN {
+        return None;
+    }
+    Some(tag)
+}
+
+/// `names` normalized, unusable names dropped and repeats folded to their
+/// first occurrence, in order: what [`UPSERT_SQL`] inserts, so one call
+/// never offers the same name twice (which `ON CONFLICT DO UPDATE` refuses
+/// to fold inside a single statement).
+fn normalized_names(names: &[String]) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut usable: Vec<String> = Vec::new();
+    for name in names {
+        let Some(tag) = normalize_name(name) else {
+            continue;
+        };
+        if seen.insert(tag.clone()) {
+            usable.push(tag);
+        }
+    }
+    usable
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::{Error as SqlxError, PgPool};
+
+    use super::*;
+    use crate::{
+        config::TEST_BASE_URL,
+        error::AppError,
+        models::{
+            status::{self, NewStatus},
+            user::{NewUser, insert as insert_user, local_ap_id},
+        },
+    };
+
+    /// The instance origin the fixtures pretend to serve.
+    const BASE: &str = TEST_BASE_URL;
+
+    /// The names of `hashtags`, in the order they came back.
+    fn names(hashtags: &[Hashtag]) -> Vec<String> {
+        hashtags
+            .iter()
+            .map(|hashtag| hashtag.name.clone())
+            .collect()
+    }
+
+    /// The stored tag rows as `(name, id)`, ordered by name, read straight
+    /// from storage so assertions do not depend on fixture return values.
+    async fn stored_tags(pool: &PgPool) -> Vec<(String, Uuid)> {
+        sqlx::query_as::<_, (String, Uuid)>("SELECT name, id FROM hashtags ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .expect("the stored tags read")
+    }
+
+    /// The stored links of status `status_id` as tag names, ordered by name.
+    async fn stored_links(pool: &PgPool, status_id: Uuid) -> Vec<String> {
+        sqlx::query_as::<_, (String,)>(
+            "SELECT h.name FROM status_hashtags sh
+               JOIN hashtags h ON h.id = sh.hashtag_id
+              WHERE sh.status_id = $1
+              ORDER BY h.name",
+        )
+        .bind(status_id)
+        .fetch_all(pool)
+        .await
+        .expect("the stored links read")
+        .into_iter()
+        .map(|row| row.0)
+        .collect()
+    }
+
+    /// The SQLSTATE a database failure carries.
+    fn sqlstate_of(err: AppError) -> String {
+        if let AppError::Database(SqlxError::Database(db_err)) = err {
+            return db_err.code().unwrap_or_default().into_owned();
+        }
+        String::new()
+    }
+
+    /// A `Vec<String>` of the given written names, for the &[String] APIs.
+    fn tags(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn upsert_is_idempotent_and_case_insensitive(pool: PgPool) {
+        let first = upsert_many(&pool, &tags(&["Foo"]))
+            .await
+            .expect("the first upsert stores");
+        assert_eq!(names(&first), vec!["foo"], "the name is stored lowercase");
+
+        let again = upsert_many(&pool, &tags(&["foo", "#FOO", " #Foo ", "FOO"]))
+            .await
+            .expect("a repeat upsert runs");
+        assert_eq!(
+            again, first,
+            "every spelling answers the one stored row, folds included"
+        );
+        assert_eq!(
+            stored_tags(&pool).await,
+            vec![("foo".to_owned(), first[0].id)],
+            "and the table still holds exactly one tag"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn upsert_keeps_order_by_name_and_drops_the_unusable(pool: PgPool) {
+        let long = "t".repeat(MAX_HASHTAG_LEN + 1);
+        let stored = upsert_many(
+            &pool,
+            &tags(&["beta", &long, "", "#", "  ", "ALPHA", "beta"]),
+        )
+        .await
+        .expect("a mixed batch runs");
+        assert_eq!(
+            names(&stored),
+            vec!["alpha", "beta"],
+            "results come ordered by name"
+        );
+        assert_eq!(
+            stored_tags(&pool).await.len(),
+            2,
+            "the over-long, blank and hash-only names were ignored"
+        );
+
+        let exactly_max = "x".repeat(MAX_HASHTAG_LEN);
+        let kept = upsert_many(&pool, &tags(&[&exactly_max]))
+            .await
+            .expect("a 100-character name is usable");
+        assert_eq!(
+            names(&kept),
+            vec![exactly_max.as_str()],
+            "the bound itself is kept, only longer is ignored"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn find_or_create_and_get_by_name_agree(pool: PgPool) {
+        assert!(
+            get_by_name(&pool, "rust").await.unwrap().is_none(),
+            "an unknown name is no tag yet"
+        );
+        let created = find_or_create(&pool, "#Rust")
+            .await
+            .expect("creating works")
+            .expect("the name is usable");
+        assert_eq!(created.name, "rust", "the row is the normalized tag");
+
+        let found = find_or_create(&pool, "rust")
+            .await
+            .expect("finding works")
+            .expect("the name is usable");
+        assert_eq!(found, created, "and answers the very same row");
+        assert_eq!(
+            get_by_name(&pool, "RUST")
+                .await
+                .unwrap()
+                .expect("get_by_name normalizes too"),
+            created,
+            "any spelling of the name finds it"
+        );
+        assert!(
+            find_or_create(&pool, "   ").await.unwrap().is_none(),
+            "a blank name is nothing to find or create"
+        );
+        assert!(
+            get_by_name(&pool, &"t".repeat(MAX_HASHTAG_LEN + 1))
+                .await
+                .unwrap()
+                .is_none(),
+            "an over-long name is nothing to find"
+        );
+    }
+
+    /// A local user named `nickname` and one public status of theirs.
+    async fn post(pool: &PgPool, nickname: &str, text: &str) -> status::Status {
+        let author = insert_user(
+            pool,
+            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
+        )
+        .await
+        .expect("fixture user inserts");
+        status::insert(pool, BASE, &NewStatus::local(&author, text))
+            .await
+            .expect("fixture status inserts")
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn link_to_status_is_idempotent(pool: PgPool) {
+        let status = post(&pool, "alice", "hello").await;
+        let foo = find_or_create(&pool, "#foo").await.unwrap().expect("foo");
+        let bar = find_or_create(&pool, "bar").await.unwrap().expect("bar");
+
+        link_to_status(&pool, status.id, &[foo.id, bar.id, foo.id])
+            .await
+            .expect("the first link stores");
+        link_to_status(&pool, status.id, &[bar.id])
+            .await
+            .expect("a repeat link changes nothing");
+        assert_eq!(
+            stored_links(&pool, status.id).await,
+            vec!["bar", "foo"],
+            "one row per pair, the doubled id folded"
+        );
+
+        link_to_status(&pool, status.id, &[])
+            .await
+            .expect("linking nothing is no work");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_unknown_side_of_a_link_is_the_foreign_key(pool: PgPool) {
+        let status = post(&pool, "alice", "hello").await;
+        let err = link_to_status(&pool, status.id, &[Uuid::now_v7()])
+            .await
+            .expect_err("the foreign key refuses an unknown tag");
+        assert_eq!(sqlstate_of(err), "23503", "a missing tag is an FK");
+        assert!(
+            stored_links(&pool, status.id).await.is_empty(),
+            "nothing stored"
+        );
+
+        let status_err = link_to_status(&pool, Uuid::now_v7(), &[status.id])
+            .await
+            .expect_err("and so is an unknown status");
+        assert_eq!(
+            sqlstate_of(status_err),
+            "23503",
+            "the other side is checked too"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn replace_rewrites_the_whole_set(pool: PgPool) {
+        let status = post(&pool, "alice", "#old #shared").await;
+        assert_eq!(
+            stored_links(&pool, status.id).await,
+            vec!["old", "shared"],
+            "the fixture came tagged"
+        );
+
+        replace_for_status(&pool, status.id, &tags(&["new", "SHARED"]))
+            .await
+            .expect("the replacement runs");
+        assert_eq!(
+            stored_links(&pool, status.id).await,
+            vec!["new", "shared"],
+            "the old set is gone, the shared tag kept its row"
+        );
+        assert_eq!(
+            stored_tags(&pool).await.len(),
+            3,
+            "the abandoned `old` tag row itself stays"
+        );
+
+        replace_for_status(&pool, status.id, &[])
+            .await
+            .expect("replacing with nothing runs");
+        assert!(
+            stored_links(&pool, status.id).await.is_empty(),
+            "and an empty replacement clears the status"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn for_statuses_groups_by_status_in_name_order(pool: PgPool) {
+        let tagged = post(&pool, "alice", "#beta #alpha #beta").await;
+        let shared = post(&pool, "bob", "#alpha").await;
+        let quiet = post(&pool, "carol", "no tags").await;
+
+        let map = for_statuses(&pool, &[tagged.id, shared.id, quiet.id, Uuid::now_v7()])
+            .await
+            .expect("the batch read works");
+        assert_eq!(
+            names(map.get(&tagged.id).expect("the tagged status")),
+            vec!["alpha", "beta"],
+            "each entry is ordered by name, repeats folded"
+        );
+        assert_eq!(
+            names(map.get(&shared.id).expect("the shared status")),
+            vec!["alpha"],
+            "and a shared tag is the same row under both statuses"
+        );
+        assert_eq!(
+            map.get(&shared.id).expect("shared")[0].id,
+            map.get(&tagged.id).expect("tagged")[0].id,
+            "one `alpha` for both"
+        );
+        assert!(
+            !map.contains_key(&quiet.id),
+            "a status without tags is absent, not an empty entry"
+        );
+        assert_eq!(map.len(), 2, "and an unknown id is absent as well");
+        assert!(
+            for_statuses(&pool, &[]).await.unwrap().is_empty(),
+            "asking about nothing answers nothing"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn deleting_a_status_cascades_its_links(pool: PgPool) {
+        let one = post(&pool, "alice", "#shared #mine").await;
+        let two = post(&pool, "bob", "#shared").await;
+
+        let gone = sqlx::query("DELETE FROM statuses WHERE id = $1")
+            .bind(one.id)
+            .execute(&pool)
+            .await
+            .expect("the fixture status hard-deletes");
+        assert_eq!(gone.rows_affected(), 1, "one status went");
+        assert!(
+            stored_links(&pool, one.id).await.is_empty(),
+            "its links cascaded with it"
+        );
+        assert_eq!(
+            stored_links(&pool, two.id).await,
+            vec!["shared"],
+            "the other status keeps its link"
+        );
+        assert_eq!(
+            stored_tags(&pool).await.len(),
+            2,
+            "and the tag rows stay for reuse"
+        );
+    }
+}

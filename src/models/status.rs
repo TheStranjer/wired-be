@@ -19,7 +19,8 @@
 //! the counts that describe it are always written together. It also links
 //! the accounts in [`NewStatus::mentioned_user_ids`] in that transaction
 //! (see [`crate::models::mention`]), so a status and the mentions it
-//! carries appear together or not at all.
+//! carries appear together or not at all, and the same for the tags in
+//! [`NewStatus::hashtags`] (see [`crate::models::hashtag`]).
 //!
 //! Deletion is soft: [`soft_delete`] keeps the row as a tombstone with its
 //! text cleared and its `uri` reserved (so a deleted remote post is never
@@ -39,8 +40,8 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::{mention, user::User},
-    util::{format::text_to_html, id::new_id},
+    models::{hashtag, mention, user::User},
+    util::{entities::extract_hashtags, format::text_to_html, id::new_id},
 };
 
 /// The `text/plain` value of [`content_type`](NewStatus::content_type), which
@@ -260,6 +261,13 @@ pub struct NewStatus {
     /// them to the new row in its transaction (see
     /// [`crate::models::mention`]); empty in the default.
     pub mentioned_user_ids: Vec<Uuid>,
+    /// Hashtags this status carries, as written: [`insert`] upserts the
+    /// usable ones by name and links them to the new row in its
+    /// transaction (see [`crate::models::hashtag`]); empty in the default.
+    /// A local post's [`NewStatus::local`] fills them with
+    /// [`extract_hashtags`] of the text; a remote status's caller fills
+    /// them from the activity's `tag` list.
+    pub hashtags: Vec<String>,
     /// Whether this instance owns the post; `false` in the default, as in
     /// [`NewUser`](crate::models::user::NewUser).
     pub local: bool,
@@ -298,6 +306,7 @@ impl Default for NewStatus {
             reblog_of_id: None,
             quote_of_id: None,
             mentioned_user_ids: Vec::new(),
+            hashtags: Vec::new(),
             local: false,
             application_name: None,
             application_website: None,
@@ -313,7 +322,8 @@ impl NewStatus {
     /// `docs/ARCHITECTURE.md` decision 6 stores it: [`local`](Self::local)
     /// set, [`user_id`](Self::user_id) from `user`, [`text_to_html`] in
     /// [`content`](Self::content) with `text` kept in
-    /// [`raw_text`](Self::raw_text) as [`DEFAULT_CONTENT_TYPE`], and
+    /// [`raw_text`](Self::raw_text) as [`DEFAULT_CONTENT_TYPE`],
+    /// [`extract_hashtags`] of `text` in [`hashtags`](Self::hashtags), and
     /// [`Visibility::Public`].
     ///
     /// The columns that depend on the primary key — `uri`
@@ -328,6 +338,7 @@ impl NewStatus {
             raw_text: text.to_owned(),
             content_type: DEFAULT_CONTENT_TYPE.to_owned(),
             visibility: Visibility::Public,
+            hashtags: extract_hashtags(text),
             local: true,
             ..Self::default()
         }
@@ -429,8 +440,10 @@ const SOFT_DELETE_SQL: &str = "UPDATE statuses
 /// the parent's `replies_count` goes up for a reply and the original's
 /// `reblogs_count` for a reblog — exactly what [`soft_delete`] steps back
 /// down — and every account in [`mentioned_user_ids`](NewStatus::mentioned_user_ids)
-/// is linked to the new row (see [`crate::models::mention`]), so a status
-/// and its mentions appear together or not at all.
+/// is linked to the new row (see [`crate::models::mention`]) and every
+/// usable tag in [`hashtags`](NewStatus::hashtags) is upserted and linked
+/// (see [`crate::models::hashtag`]), so a status and its mentions and tags
+/// appear together or not at all.
 ///
 /// # Errors
 ///
@@ -445,6 +458,7 @@ pub async fn insert(pool: &PgPool, base_url: &str, new_status: &NewStatus) -> Ap
     let parent = parent_conversation(&mut tx, new_status.in_reply_to_id).await?;
     let status = write_status(&mut tx, base_url, new_status, parent).await?;
     mention::link_conn(&mut tx, status.id, &new_status.mentioned_user_ids).await?;
+    hashtag::link_names_conn(&mut tx, status.id, &new_status.hashtags).await?;
     count_new_post(&mut tx, &status).await?;
     tx.commit().await?;
     Ok(status)
@@ -1103,7 +1117,8 @@ mod tests {
             BASE,
             &NewStatus {
                 mentioned_user_ids: vec![new_id()],
-                ..NewStatus::local(&alice, "@ghost")
+                hashtags: vec!["doomed".to_owned()],
+                ..NewStatus::local(&alice, "@ghost #doomed")
             },
         )
         .await
@@ -1123,10 +1138,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(links.0, 0, "and nothing was linked");
+        let tags: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM hashtags h
+               JOIN status_hashtags sh ON sh.hashtag_id = h.id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tags.0, 0, "and the hashtag's link rolled back with it");
         assert_eq!(
             fresh_user(&pool, alice.id).await.statuses_count,
             0,
             "the author's count went back too"
+        );
+    }
+
+    /// The names of the batch read's entry for `status_id`, in order.
+    async fn tag_names(pool: &PgPool, status_id: Uuid) -> Vec<String> {
+        let map = hashtag::for_statuses(pool, &[status_id])
+            .await
+            .expect("the batch read works");
+        map.get(&status_id)
+            .map(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn insert_links_the_hashtags_extracted_from_local_text(pool: PgPool) {
+        let alice = user(&pool, "alice").await;
+
+        let status = post(&pool, &alice, "hello #World #foo #FOO").await;
+        assert_eq!(
+            tag_names(&pool, status.id).await,
+            vec!["foo", "world"],
+            "the local post's tags were extracted on insert, in name order, \
+             case folded"
+        );
+
+        let twin = post(&pool, &alice, "#foo again").await;
+        let shared = post(&pool, &alice, "#bar").await;
+        assert_eq!(
+            tag_names(&pool, twin.id).await,
+            vec!["foo"],
+            "a second post with the same tag links the same tag"
+        );
+        let ids: (i64,) = sqlx::query_as("SELECT count(*) FROM hashtags")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids.0, 3, "foo, world and bar — one row per name");
+        let foos: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM status_hashtags sh
+               JOIN hashtags h ON h.id = sh.hashtag_id
+              WHERE h.name = 'foo'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(foos.0, 2, "and two statuses point at the one foo row");
+        assert_eq!(
+            tag_names(&pool, shared.id).await,
+            vec!["bar"],
+            "an untouched tag keeps its own status"
+        );
+
+        let plain = post(&pool, &alice, "no tags here").await;
+        assert!(
+            tag_names(&pool, plain.id).await.is_empty(),
+            "a status without hashtags links none"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn insert_links_the_explicit_hashtags_of_a_remote_post(pool: PgPool) {
+        let mallory = remote_user(&pool, "mallory").await;
+        let status = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                hashtags: vec![
+                    "FromAP".to_owned(),
+                    "#dup".to_owned(),
+                    "  ".to_owned(),
+                    "dup".to_owned(),
+                ],
+                ..mirrored(&mallory, "https://remote.example/posts/tags")
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tag_names(&pool, status.id).await,
+            vec!["dup", "fromap"],
+            "the caller's tag list is normalized, folded and linked \
+             name-first, and the blank name was ignored"
         );
     }
 
