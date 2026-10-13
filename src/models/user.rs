@@ -958,6 +958,71 @@ pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> 
     Ok(())
 }
 
+/// The whole `PATCH /api/v1/accounts/update_credentials` write: the six
+/// profile columns the endpoint owns.
+///
+/// Every one of them arrives already merged with the stored row by the
+/// caller, so fields absent from the request are rewritten with the value
+/// they already hold and change nothing.
+#[derive(Debug)]
+pub struct ProfileFields {
+    /// The display name to store, sanitized by the caller.
+    pub name: String,
+    /// The profile note as rendered HTML for the `bio` column.
+    pub bio: String,
+    /// The profile note as its source text for the `raw_bio` column.
+    pub raw_bio: String,
+    /// Whether follow requests need manual approval.
+    pub locked: Flag,
+    /// Whether the account is flagged as automated.
+    pub bot: Flag,
+    /// Whether the account opted into discovery.
+    pub discoverable: Flag,
+}
+
+/// The `UPDATE` behind [`update_profile`]: writes the six profile columns
+/// in one statement, refreshes `updated_at` and returns the stored row.
+const UPDATE_PROFILE_SQL: &str = "UPDATE users
+      SET name = $2,
+          bio = $3,
+          raw_bio = $4,
+          locked = $5,
+          bot = $6,
+          discoverable = $7,
+          updated_at = now()
+     WHERE id = $1
+  RETURNING *";
+
+/// Stores `fields` as user `id`'s profile columns and returns the updated
+/// row.
+///
+/// `None` when `id` names no row (the caller authenticated it moments
+/// earlier, so that only happens if the account was deleted mid-request).
+/// The endpoint layer computes the merged values — this function writes
+/// exactly what it is handed, the same split the alias and
+/// settings-store writers use.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn update_profile(
+    pool: &PgPool,
+    id: Uuid,
+    fields: &ProfileFields,
+) -> AppResult<Option<User>> {
+    Ok(sqlx::query_as::<_, User>(UPDATE_PROFILE_SQL)
+        .bind(id)
+        .bind(&fields.name)
+        .bind(&fields.bio)
+        .bind(&fields.raw_bio)
+        .bind(fields.locked)
+        .bind(fields.bot)
+        .bind(fields.discoverable)
+        .fetch_optional(pool)
+        .await?)
+}
+
 /// The `ActivityPub` actor id of the local account `nickname` on the
 /// instance served at `base_url`: `{base_url}/users/{nickname}`.
 #[must_use]
@@ -1877,6 +1942,52 @@ mod tests {
             fetch(&pool, alice.id).await.preferred_frontend.as_deref(),
             Some("mochi-pub"),
             "a new choice replaces the old one"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn update_profile_writes_the_six_columns_and_returns_them(pool: PgPool) {
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert_eq!(alice.name, "", "the fixture has no display name");
+        assert!(
+            !alice.locked.get() && !alice.bot.get() && !alice.discoverable.get(),
+            "the option flags default off"
+        );
+        let fields = ProfileFields {
+            name: "Alice Adams".to_owned(),
+            bio: "<p>hi</p>".to_owned(),
+            raw_bio: "hi".to_owned(),
+            locked: Flag::new(true),
+            bot: Flag::new(false),
+            discoverable: Flag::new(true),
+        };
+        let updated = update_profile(&pool, alice.id, &fields)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert_eq!(updated.name, "Alice Adams", "the returned row is updated");
+        assert_eq!(updated.bio, "<p>hi</p>", "the html note");
+        assert_eq!(updated.raw_bio, "hi", "the source note");
+        assert!(updated.locked.get(), "locked set");
+        assert!(!updated.bot.get(), "bot left off");
+        assert!(updated.discoverable.get(), "discoverable set");
+        assert!(
+            updated.updated_at > alice.updated_at,
+            "the write refreshes updated_at"
+        );
+
+        let stored = fetch(&pool, alice.id).await;
+        assert_eq!(stored.name, updated.name, "the row is what reads back");
+        assert_eq!(stored.bio, updated.bio, "stored bio");
+        assert_eq!(stored.raw_bio, updated.raw_bio, "stored raw bio");
+
+        // An unknown id matches no row and is not an error.
+        assert!(
+            update_profile(&pool, new_id(), &fields)
+                .await
+                .unwrap()
+                .is_none(),
+            "no row, no update"
         );
     }
 }

@@ -37,6 +37,12 @@ pub const MAX_CHAT_MESSAGE_CHARS_VAR: &str = "MAX_CHAT_MESSAGE_CHARS";
 /// Environment variable holding the maximum media description length in
 /// characters.
 pub const MAX_MEDIA_DESCRIPTION_VAR: &str = "MAX_MEDIA_DESCRIPTION";
+/// Environment variable holding the maximum display-name length in
+/// characters.
+pub const MAX_DISPLAY_NAME_CHARS_VAR: &str = "MAX_DISPLAY_NAME_CHARS";
+/// Environment variable holding the maximum profile note (bio) length in
+/// characters.
+pub const MAX_BIO_CHARS_VAR: &str = "MAX_BIO_CHARS";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -110,6 +116,18 @@ pub const DEFAULT_MAX_CHAT_MESSAGE_CHARS: usize = 5_000;
 /// (`MAX_ALTERNATIVE_TEXT_SIZE` in `config/settings.yml`);
 /// `PUT /api/v1/media/{id}` refuses a longer `description`.
 pub const DEFAULT_MAX_MEDIA_DESCRIPTION: usize = 1_500;
+/// Display-name length used when `MAX_DISPLAY_NAME_CHARS` is unset.
+///
+/// Mastodon caps `display_name` at 50 characters
+/// (`Account#display_name`); `PATCH /api/v1/accounts/update_credentials`
+/// refuses a longer one with 422.
+pub const DEFAULT_MAX_DISPLAY_NAME_CHARS: usize = 50;
+/// Bio length used when `MAX_BIO_CHARS` is unset.
+///
+/// The 5000 characters of Pleroma's `[:limiter, :user_bio_length]`;
+/// `PATCH /api/v1/accounts/update_credentials` refuses a longer `note`
+/// with 422.
+pub const DEFAULT_MAX_BIO_CHARS: usize = 5_000;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -335,6 +353,14 @@ pub struct Config {
     /// characters, from `MAX_MEDIA_DESCRIPTION`; `PUT /api/v1/media/{id}`
     /// refuses longer values.
     pub max_media_description: usize,
+    /// Maximum length of an account's `display_name` in characters, from
+    /// `MAX_DISPLAY_NAME_CHARS`; `PATCH /api/v1/accounts/update_credentials`
+    /// refuses longer values with 422.
+    pub max_display_name_chars: usize,
+    /// Maximum length of a profile note (bio) in characters, from
+    /// `MAX_BIO_CHARS`; `PATCH /api/v1/accounts/update_credentials` refuses
+    /// a longer `note` with 422.
+    pub max_bio_chars: usize,
     /// Maximum pixel count (width times height) of an uploaded image, from
     /// `MAX_IMAGE_PIXELS`; the media upload endpoints reject an image that
     /// decodes larger with 422 "Image too large" (see
@@ -445,11 +471,8 @@ impl Config {
             MAX_CHAT_MESSAGE_CHARS_VAR,
             DEFAULT_MAX_CHAT_MESSAGE_CHARS,
         )?;
-        let max_media_description = number(
-            &lookup,
-            MAX_MEDIA_DESCRIPTION_VAR,
-            DEFAULT_MAX_MEDIA_DESCRIPTION,
-        )?;
+        let (max_media_description, max_display_name_chars, max_bio_chars) =
+            text_length_limits(&lookup)?;
         let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
         let upload_limits = UploadLimits {
             max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
@@ -479,6 +502,8 @@ impl Config {
             max_poll_options,
             max_chat_message_chars,
             max_media_description,
+            max_display_name_chars,
+            max_bio_chars,
             max_image_pixels,
             upload_limits,
             uploads_dir,
@@ -566,6 +591,8 @@ impl Config {
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
             max_chat_message_chars: DEFAULT_MAX_CHAT_MESSAGE_CHARS,
             max_media_description: DEFAULT_MAX_MEDIA_DESCRIPTION,
+            max_display_name_chars: DEFAULT_MAX_DISPLAY_NAME_CHARS,
+            max_bio_chars: DEFAULT_MAX_BIO_CHARS,
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
@@ -744,6 +771,36 @@ where
     ))
 }
 
+/// Reads the three per-field character limits that live beside the status
+/// ones: the media attachment description (`MAX_MEDIA_DESCRIPTION`), the
+/// display name (`MAX_DISPLAY_NAME_CHARS`) and the profile bio
+/// (`MAX_BIO_CHARS`). Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
+/// back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when any of the three variables
+/// holds a value that is not a whole number.
+fn text_length_limits<F>(lookup: &F) -> Result<(usize, usize, usize), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        number(
+            lookup,
+            MAX_MEDIA_DESCRIPTION_VAR,
+            DEFAULT_MAX_MEDIA_DESCRIPTION,
+        )?,
+        number(
+            lookup,
+            MAX_DISPLAY_NAME_CHARS_VAR,
+            DEFAULT_MAX_DISPLAY_NAME_CHARS,
+        )?,
+        number(lookup, MAX_BIO_CHARS_VAR, DEFAULT_MAX_BIO_CHARS)?,
+    ))
+}
+
 /// Reads the two settings that gate what the instance exposes to clients:
 /// whether new registrations are open (`NodeInfo`'s `openRegistrations`)
 /// and the frontends the settings endpoints let a user pick. Grouped
@@ -850,6 +907,8 @@ impl fmt::Debug for Config {
             .field("max_poll_options", &self.max_poll_options)
             .field("max_chat_message_chars", &self.max_chat_message_chars)
             .field("max_media_description", &self.max_media_description)
+            .field("max_display_name_chars", &self.max_display_name_chars)
+            .field("max_bio_chars", &self.max_bio_chars)
             .field("max_image_pixels", &self.max_image_pixels)
             .field("upload_limits", &self.upload_limits)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
@@ -1270,6 +1329,35 @@ mod tests {
         assert!(
             debug.contains("max_media_description: 100"),
             "the description limit is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn reads_custom_profile_length_limits() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.max_display_name_chars, 50,
+            "default MAX_DISPLAY_NAME_CHARS"
+        );
+        assert_eq!(defaults.max_bio_chars, 5_000, "default MAX_BIO_CHARS");
+
+        let config = config_with(&[
+            (MAX_DISPLAY_NAME_CHARS_VAR, "30"),
+            (MAX_BIO_CHARS_VAR, "200"),
+        ]);
+        assert_eq!(
+            config.max_display_name_chars, 30,
+            "custom MAX_DISPLAY_NAME_CHARS"
+        );
+        assert_eq!(config.max_bio_chars, 200, "custom MAX_BIO_CHARS");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_display_name_chars: 30"),
+            "the display-name limit is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_bio_chars: 200"),
+            "the bio limit is visible in Debug output: {debug}"
         );
     }
 
@@ -1855,6 +1943,9 @@ mod tests {
             MAX_MEDIA_ATTACHMENTS_VAR,
             MAX_POLL_OPTIONS_VAR,
             MAX_CHAT_MESSAGE_CHARS_VAR,
+            MAX_MEDIA_DESCRIPTION_VAR,
+            MAX_DISPLAY_NAME_CHARS_VAR,
+            MAX_BIO_CHARS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
