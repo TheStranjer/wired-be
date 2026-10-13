@@ -17,8 +17,12 @@
 //! verifies with and without it).
 //!
 //! [`sign_request`] produces all four headers for a sender;
-//! [`signing_string`] is the same text builder split out so the inbound
-//! verifier ticket can reuse it.
+//! [`signing_string`] is the same text builder split out (it writes one
+//! `name: value` line per signed header, in the order it is given) so the
+//! inbound verifier in [`verify`] can rebuild the exact text from a
+//! received request.
+
+pub mod verify;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
@@ -114,26 +118,18 @@ fn host_of(url: &Url) -> String {
 
 /// Assembles the exact text that gets signed from the signed header values.
 ///
-/// One `name: value` line per header in `(request-target) host date
-/// [digest]` order, joined with `\n` and without a trailing newline.
-/// Split out of [`sign_request`] so the inbound verifier can rebuild the
-/// same text from a received request.
+/// One `name: value` line per `(name, value)` pair, in the given order,
+/// joined with `\n` and without a trailing newline. [`sign_request`] passes
+/// the fediverse-canonical `(request-target) host date [digest]`; the
+/// inbound verifier ([`verify`]) passes the order the peer named in its
+/// `headers` parameter, so both build the same text from the same lines.
 #[must_use]
-pub fn signing_string(
-    request_target: &str,
-    host: &str,
-    date: &str,
-    digest: Option<&str>,
-) -> String {
-    let mut lines = vec![
-        format!("(request-target): {request_target}"),
-        format!("host: {host}"),
-        format!("date: {date}"),
-    ];
-    if let Some(digest_value) = digest {
-        lines.push(format!("digest: {digest_value}"));
-    }
-    lines.join("\n")
+pub fn signing_string(lines: &[(&str, &str)]) -> String {
+    lines
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 /// Signs an outbound federation request with `key`'s private key.
@@ -168,7 +164,15 @@ pub fn sign_request(
     let host = host_of(&parsed);
     let date = date_header(now);
     let digest = body.map(digest_header);
-    let to_sign = signing_string(&target, &host, &date, digest.as_deref());
+    let mut signed_lines = vec![
+        ("(request-target)", target.as_str()),
+        ("host", host.as_str()),
+        ("date", date.as_str()),
+    ];
+    if let Some(digest_value) = digest.as_deref() {
+        signed_lines.push(("digest", digest_value));
+    }
+    let to_sign = signing_string(&signed_lines);
     let raw_signature = sign_sha256(key.private_pem, to_sign.as_bytes())?;
     let signature = format!(
         r#"keyId="{}",algorithm="{ALGORITHM}",headers="{}",signature="{}""#,
@@ -235,6 +239,25 @@ mod tests {
         parse_time(NOW_RFC3339).unwrap()
     }
 
+    /// The canonical `(request-target) host date [digest]` signing text,
+    /// built through the slice-based [`signing_string`].
+    fn canonical_text(
+        request_target: &str,
+        host: &str,
+        date: &str,
+        digest: Option<&str>,
+    ) -> String {
+        let mut lines = vec![
+            ("(request-target)", request_target),
+            ("host", host),
+            ("date", date),
+        ];
+        if let Some(value) = digest {
+            lines.push(("digest", value));
+        }
+        signing_string(&lines)
+    }
+
     /// The raw signature bytes out of a well-formed `Signature` header,
     /// also checking the `keyId`, `algorithm` and `headers` parameters
     /// equal [`KEY_ID`], `rsa-sha256` and `headers_param`.
@@ -270,7 +293,11 @@ mod tests {
     #[test]
     fn signing_string_lists_the_signed_headers_in_order_for_a_get() {
         assert_eq!(
-            signing_string("get /users/alice", "wired.example", NOW_FIXDATE, None),
+            signing_string(&[
+                ("(request-target)", "get /users/alice"),
+                ("host", "wired.example"),
+                ("date", NOW_FIXDATE),
+            ]),
             "(request-target): get /users/alice\n\
              host: wired.example\n\
              date: Tue, 07 Jun 2022 20:51:35 GMT",
@@ -279,19 +306,19 @@ mod tests {
     }
 
     #[test]
-    fn signing_string_appends_the_digest_line_for_a_post() {
+    fn signing_string_writes_the_lines_it_is_given_in_that_order() {
         assert_eq!(
-            signing_string(
-                "post /inbox",
-                "peer.example:4436",
-                NOW_FIXDATE,
-                Some(HELLO_DIGEST),
-            ),
-            "(request-target): post /inbox\n\
-             host: peer.example:4436\n\
-             date: Tue, 07 Jun 2022 20:51:35 GMT\n\
-             digest: SHA-256=LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
-            "the digest is the fourth line"
+            signing_string(&[
+                ("date", NOW_FIXDATE),
+                ("(request-target)", "post /inbox"),
+                ("digest", HELLO_DIGEST),
+                ("host", "peer.example:4436"),
+            ]),
+            "date: Tue, 07 Jun 2022 20:51:35 GMT\n\
+             (request-target): post /inbox\n\
+             digest: SHA-256=LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=\n\
+             host: peer.example:4436",
+            "any order of any headers is written verbatim, the digest where given"
         );
     }
 
@@ -312,7 +339,7 @@ mod tests {
         assert!(
             verify_sha256(
                 &keys().public_pem,
-                signing_string("get /users/alice", "peer.example", NOW_FIXDATE, None).as_bytes(),
+                canonical_text("get /users/alice", "peer.example", NOW_FIXDATE, None).as_bytes(),
                 &signature,
             ),
             "the signature verifies over the GET signing string"
@@ -338,7 +365,7 @@ mod tests {
         assert!(
             verify_sha256(
                 &keys().public_pem,
-                signing_string(
+                canonical_text(
                     "post /users/bob/inbox",
                     "peer.example",
                     NOW_FIXDATE,
@@ -349,7 +376,7 @@ mod tests {
             ),
             "the signature verifies over the four-line POST signing string"
         );
-        let tampered = signing_string(
+        let tampered = canonical_text(
             "post /users/bob/inbox",
             "peer.example",
             NOW_FIXDATE,
@@ -376,7 +403,7 @@ mod tests {
         assert!(
             verify_sha256(
                 &keys().public_pem,
-                signing_string("get /users/alice", "peer.example:4436", NOW_FIXDATE, None,)
+                canonical_text("get /users/alice", "peer.example:4436", NOW_FIXDATE, None,)
                     .as_bytes(),
                 &signature,
             ),
@@ -410,7 +437,7 @@ mod tests {
         assert!(
             verify_sha256(
                 &keys().public_pem,
-                signing_string(
+                canonical_text(
                     "get /users/alice?page=2&x=1",
                     "peer.example",
                     NOW_FIXDATE,
@@ -424,7 +451,7 @@ mod tests {
         assert!(
             !verify_sha256(
                 &keys().public_pem,
-                signing_string("get /users/alice", "peer.example", NOW_FIXDATE, None).as_bytes(),
+                canonical_text("get /users/alice", "peer.example", NOW_FIXDATE, None).as_bytes(),
                 &signature,
             ),
             "and the path-only spelling does not verify"
@@ -445,7 +472,7 @@ mod tests {
         assert!(
             verify_sha256(
                 &keys().public_pem,
-                signing_string(
+                canonical_text(
                     "post /inbox",
                     "peer.example",
                     NOW_FIXDATE,
@@ -536,7 +563,7 @@ mod tests {
         assert!(
             verify_sha256(
                 &keys().public_pem,
-                signing_string("get /x", "peer.example", NOW_FIXDATE, None).as_bytes(),
+                canonical_text("get /x", "peer.example", NOW_FIXDATE, None).as_bytes(),
                 &signature,
             ),
             "a PKCS#1 PEM is accepted and signs verifiably"

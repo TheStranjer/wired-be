@@ -1096,12 +1096,15 @@ mod tests {
     /// The four lines a peer can rebuild for us, as the text the signature
     /// must verify over.
     fn peer_signing_string(seen: &Value) -> String {
-        signing_string(
-            seen["request-target"].as_str().unwrap(),
-            seen["host"].as_str().unwrap(),
-            seen["date"].as_str().unwrap(),
-            seen.get("digest").and_then(Value::as_str),
-        )
+        let mut lines = vec![
+            ("(request-target)", seen["request-target"].as_str().unwrap()),
+            ("host", seen["host"].as_str().unwrap()),
+            ("date", seen["date"].as_str().unwrap()),
+        ];
+        if let Some(digest) = seen.get("digest").and_then(Value::as_str) {
+            lines.push(("digest", digest));
+        }
+        signing_string(&lines)
     }
 
     #[tokio::test]
