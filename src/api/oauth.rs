@@ -684,6 +684,7 @@ mod tests {
             last_fetched_at: None,
             inserted_at: now,
             updated_at: now,
+            preferred_frontend: None,
         }
     }
 

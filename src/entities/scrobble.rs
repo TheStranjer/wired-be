@@ -200,6 +200,7 @@ mod tests {
             last_fetched_at: None,
             inserted_at: at(STAMPED),
             updated_at: at(STAMPED),
+            preferred_frontend: None,
         }
     }
 

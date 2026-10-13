@@ -8,7 +8,7 @@ use crate::{
     api::{
         accounts, announcements, apps, blocks, chats, custom_emojis, domain_blocks, emoji_packs,
         endorsements, filters, follow_requests, instance, lists, markers, media, misc,
-        oauth_tokens, pleroma_accounts, scrobbles,
+        oauth_tokens, pleroma_accounts, pleroma_settings, scrobbles,
     },
     config::Config,
     state::AppState,
@@ -23,10 +23,10 @@ use crate::{
 /// Pleroma's `api_not_implemented`, and merging two routers that each set
 /// a fallback panics.
 ///
-/// `config` reaches [`media::router`], the one merged router that needs it:
-/// the upload route carries its own body limit (see
-/// [`crate::extract::multipart::upload_body_limit`]), which axum's multipart
-/// extractor cannot read from the state on its own.
+/// `config` reaches [`media::router`] and [`pleroma_settings::router`],
+/// the merged routers that need it: their upload routes carry their own
+/// body limit (see [`crate::extract::multipart::upload_body_limit`]),
+/// which axum's multipart extractor cannot read from the state on its own.
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .merge(accounts::router())
@@ -44,6 +44,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(markers::router())
         .merge(media::router(config))
         .merge(pleroma_accounts::router())
+        .merge(pleroma_settings::router(config))
         .merge(scrobbles::router())
         .nest("/pleroma", misc::util_router())
         .nest("/pleroma/apps", oauth_tokens::apps_router())
