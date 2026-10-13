@@ -9,7 +9,7 @@ use std::{
 
 use url::Url;
 
-use crate::extract::multipart::UploadLimits;
+use crate::{extract::multipart::UploadLimits, jobs::DEFAULT_JOB_QUEUES};
 
 /// Environment variable holding the PostgreSQL connection URL.
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
@@ -77,6 +77,10 @@ pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
 /// Environment variable holding the comma-separated list of frontends
 /// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
 pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
+/// Environment variable holding the job worker's concurrent handler count.
+pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
+/// Environment variable holding the comma-separated job queue names.
+pub const JOB_QUEUES_VAR: &str = "JOB_QUEUES";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -167,6 +171,8 @@ pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
 /// So `GET /api/v1/pleroma/preferred_frontend/available` answers `[]` and
 /// `PUT /api/v1/pleroma/preferred_frontend` refuses every name.
 pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
+/// Worker concurrency used when `JOB_CONCURRENCY` is unset.
+pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -372,6 +378,10 @@ pub struct Config {
     /// `GET /api/v1/pleroma/preferred_frontend/available` and the whitelist
     /// `PUT /api/v1/pleroma/preferred_frontend` validates against.
     pub available_frontends: Vec<String>,
+    /// Job handlers a single worker runs at the same time.
+    pub job_concurrency: usize,
+    /// Job queue names the worker drains, in claim priority order.
+    pub job_queues: Vec<String>,
 }
 
 impl Config {
@@ -406,15 +416,8 @@ impl Config {
             .filter(|url| !url.is_empty())
             .ok_or(ConfigError::Missing(BASE_URL_VAR))?;
         let base_url = normalize_base_url(&base_url_raw)?;
-        let instance_name =
-            lookup(INSTANCE_NAME_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_owned());
-        let instance_description = lookup(INSTANCE_DESCRIPTION_VAR)
-            .unwrap_or_else(|| DEFAULT_INSTANCE_DESCRIPTION.to_owned());
-        let contact_email = lookup(CONTACT_EMAIL_VAR).filter(|email| !email.is_empty());
-        let instance_languages = comma_list(
-            &lookup(INSTANCE_LANGUAGES_VAR)
-                .unwrap_or_else(|| DEFAULT_INSTANCE_LANGUAGES.to_owned()),
-        );
+        let (instance_name, instance_description, contact_email, instance_languages) =
+            instance_profile(&lookup);
         let max_status_chars = number(&lookup, MAX_STATUS_CHARS_VAR, DEFAULT_MAX_STATUS_CHARS)?;
         let max_media_attachments = number(
             &lookup,
@@ -446,6 +449,7 @@ impl Config {
             auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (registrations_open, available_frontends) = client_exposure(&lookup)?;
+        let (job_concurrency, job_queues) = job_worker(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -473,6 +477,8 @@ impl Config {
             registrations_open,
             oauth_providers,
             available_frontends,
+            job_concurrency,
+            job_queues,
         })
     }
 
@@ -560,6 +566,8 @@ impl Config {
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
             oauth_providers: Vec::new(),
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
+            job_concurrency: DEFAULT_JOB_CONCURRENCY,
+            job_queues: comma_list(DEFAULT_JOB_QUEUES),
         }
     }
 }
@@ -588,6 +596,51 @@ fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
         .port()
         .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
     Ok(format!("{}://{domain}", url.scheme()))
+}
+
+/// What [`instance_profile`] reads, in [`Config`] field order: the display
+/// name, the short description, the admin contact email and the content
+/// language codes. Grouped because each is a plain default-or-list and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
+/// back in field order.
+fn instance_profile<F>(lookup: &F) -> (String, String, Option<String>, Vec<String>)
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let instance_name =
+        lookup(INSTANCE_NAME_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_owned());
+    let instance_description =
+        lookup(INSTANCE_DESCRIPTION_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_DESCRIPTION.to_owned());
+    let contact_email = lookup(CONTACT_EMAIL_VAR).filter(|email| !email.is_empty());
+    let instance_languages = comma_list(
+        &lookup(INSTANCE_LANGUAGES_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_LANGUAGES.to_owned()),
+    );
+    (
+        instance_name,
+        instance_description,
+        contact_email,
+        instance_languages,
+    )
+}
+
+/// Reads the two settings that shape the job worker: how many handlers a
+/// single worker runs at the same time, and the queue names it drains, in
+/// claim priority order. Grouped because each is a plain default-or-parse
+/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
+/// comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when `JOB_CONCURRENCY` holds a
+/// value that is not a whole number.
+fn job_worker<F>(lookup: &F) -> Result<(usize, Vec<String>), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let job_concurrency = number(lookup, JOB_CONCURRENCY_VAR, DEFAULT_JOB_CONCURRENCY)?;
+    let job_queues =
+        comma_list(&lookup(JOB_QUEUES_VAR).unwrap_or_else(|| DEFAULT_JOB_QUEUES.to_owned()));
+    Ok((job_concurrency, job_queues))
 }
 
 /// What [`auth_settings`] reads, in [`Config`] field order: the email
@@ -793,6 +846,8 @@ impl fmt::Debug for Config {
             .field("registrations_open", &self.registrations_open)
             .field("oauth_providers", &self.oauth_providers)
             .field("available_frontends", &self.available_frontends)
+            .field("job_concurrency", &self.job_concurrency)
+            .field("job_queues", &self.job_queues)
             .finish()
     }
 }
@@ -1132,6 +1187,42 @@ mod tests {
         assert!(
             config.healthcheck_enabled.get(),
             "custom HEALTHCHECK_ENABLED"
+        );
+    }
+
+    #[test]
+    fn job_worker_settings_default() {
+        let config = config_with(&[]);
+        assert_eq!(config.job_concurrency, 10, "default job_concurrency");
+        assert_eq!(
+            config.job_queues,
+            vec![
+                "default".to_owned(),
+                "federator_incoming".to_owned(),
+                "federator_outgoing".to_owned(),
+                "mailer".to_owned(),
+                "scheduled".to_owned(),
+                "background".to_owned(),
+            ],
+            "default job_queues"
+        );
+    }
+
+    #[test]
+    fn reads_custom_job_worker_settings() {
+        let config = config_with(&[
+            (JOB_CONCURRENCY_VAR, "3"),
+            (JOB_QUEUES_VAR, " default , mailer ,,scheduled"),
+        ]);
+        assert_eq!(config.job_concurrency, 3, "custom job_concurrency");
+        assert_eq!(
+            config.job_queues,
+            vec![
+                "default".to_owned(),
+                "mailer".to_owned(),
+                "scheduled".to_owned(),
+            ],
+            "comma list is trimmed, empty entries dropped"
         );
     }
 
@@ -1727,6 +1818,7 @@ mod tests {
             UPLOAD_MAX_FILES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
+            JOB_CONCURRENCY_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");
