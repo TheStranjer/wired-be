@@ -781,18 +781,23 @@ mod tests {
         let raw = BASE64
             .decode(signature_param(signature, "signature"))
             .unwrap();
-        let signing_text = signing_string(
-            "get /users/alice",
-            captured
-                .get("host")
-                .and_then(|value| value.to_str().ok())
-                .unwrap(),
-            captured
-                .get("date")
-                .and_then(|value| value.to_str().ok())
-                .unwrap(),
-            None,
-        );
+        let signing_text = signing_string(&[
+            ("(request-target)", "get /users/alice"),
+            (
+                "host",
+                captured
+                    .get("host")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap(),
+            ),
+            (
+                "date",
+                captured
+                    .get("date")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap(),
+            ),
+        ]);
         assert!(
             verify_sha256(FIXTURE_PUBLIC_PKCS1_PEM, signing_text.as_bytes(), &raw),
             "the signature verifies over exactly what the peer saw"

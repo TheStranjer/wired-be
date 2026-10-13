@@ -60,9 +60,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// [`config.bind_addr`](Config::bind_addr), and runs [`app`] together with a
 /// [`Worker`] over [`config`](Config::job_queues)
 /// ([`Config::job_concurrency`] slots at once) until the process is
-/// interrupted. Job handlers register themselves in the
-/// [`JobRegistry`] this builds; until they do, the worker only idles and
-/// sweeps.
+/// interrupted. Job handlers are bound in the [`JobRegistry`] this builds:
+/// today the federation delivery job
+/// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)), so the
+/// worker idles, sweeps and delivers.
 ///
 /// # Errors
 ///
@@ -87,7 +88,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(addr = %state.config.bind_addr, "listening");
     let worker = Worker::new(
         state.clone(),
-        Arc::new(JobRegistry::new()),
+        Arc::new(job_registry()),
         state.config.job_queues.clone(),
         state.config.job_concurrency,
     );
@@ -99,6 +100,17 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let server = axum::serve(listener, app(state)).with_graceful_shutdown(wait_for_ctrl_c());
     let outcome = tokio::join!(server, worker.run(wait_for_ctrl_c())).0;
     Ok(outcome?)
+}
+
+/// The [`JobRegistry`] the [`serve`] worker runs: every job kind this
+/// instance handles, bound to its handler.
+fn job_registry() -> JobRegistry {
+    let mut registry = JobRegistry::new();
+    registry.register(
+        federation::delivery::KIND_DELIVER,
+        federation::delivery::handle,
+    );
+    registry
 }
 
 /// Resolves when the user presses ctrl-c, the process-wide shutdown signal.

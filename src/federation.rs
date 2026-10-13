@@ -11,10 +11,13 @@
 //! [`signature::sign_request`] signs outbound requests, [`signature::verify`]
 //! authenticates inbound ones.
 //! [`json`] holds the shared JSON-LD shape normalizers those readers use.
-//! Activity documents, inboxes and outboxes arrive in later tickets and get
-//! their modules beside them.
+//! [`delivery`] is the way back out: the `federator.deliver` job that signs
+//! an activity as its actor and POSTs it to a remote inbox, retrying the
+//! answers that may yet succeed. Activity documents, inboxes and outboxes
+//! arrive in later tickets and get their modules beside them.
 
 pub mod actor;
+pub mod delivery;
 pub mod fetch_actor;
 pub mod json;
 pub mod remote_actor;

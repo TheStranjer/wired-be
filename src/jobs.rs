@@ -7,12 +7,16 @@
 //! async handler by [`JobRegistry`]; [`Worker`] polls the configured queues,
 //! runs at most `concurrency` handlers at a time (bounded by a semaphore), and
 //! moves every attempt to its terminal state: `complete` on success,
-//! retryable with [`backoff`] delay on [`JobError::Retry`] — including handler
-//! panics, which run on their own task — and `discarded` on
-//! [`JobError::Discard`] or an unknown kind. When the shutdown future resolves
+//! retryable with [`backoff`] delay on [`JobError::Retry`] — or with the
+//! handler's own delay on [`JobError::RetryAfter`], which is how a peer's
+//! `Retry-After` is honoured — including handler panics, which run on their
+//! own task — and `discarded` on [`JobError::Discard`] or an unknown kind.
+//! Handlers are told which attempt they are running
+//! ([`AttemptInfo`]), because some failures only deserve a second chance once
+//! (see [`crate::federation::delivery`]). When the shutdown future resolves
 //! the worker stops claiming and waits for its in-flight jobs. Concrete
-//! handlers arrive with the later federation tickets; [`crate::serve`] runs
-//! the worker with an empty registry until then.
+//! handlers are registered by [`crate::serve`], which starts with the
+//! federation delivery job kind.
 
 use std::{
     collections::HashMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
@@ -68,6 +72,12 @@ pub enum JobError {
     /// Transient failure: retry the job with [`backoff`] delay (until the
     /// attempt budget is spent).
     Retry(String),
+    /// Transient failure whose delay the peer set: retry the job after
+    /// exactly the given [`Duration`] instead of [`backoff`], until the
+    /// attempt budget is spent. The string states what failed, as in
+    /// [`Self::Retry`]; a peer's `Retry-After` on an inbox delivery is the
+    /// case this exists for.
+    RetryAfter(Duration, String),
     /// Permanent failure: discard the job, never retry.
     Discard(String),
 }
@@ -76,6 +86,11 @@ impl fmt::Display for JobError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Retry(detail) => write!(f, "retryable job failure: {detail}"),
+            Self::RetryAfter(delay, detail) => write!(
+                f,
+                "retryable job failure: {detail} (after {}s)",
+                delay.as_secs()
+            ),
             Self::Discard(detail) => write!(f, "fatal job failure: {detail}"),
         }
     }
@@ -83,11 +98,28 @@ impl fmt::Display for JobError {
 
 impl Error for JobError {}
 
+/// What a handler is told about the claim it is running, beside the job's
+/// arguments.
+///
+/// A failure whose right treatment depends on how many times it has already
+/// happened — a delivery refused `401`, retried once for a key refresh and
+/// discarded after that — reads [`attempts`](Self::attempts) here; the
+/// worker's own retry budget still decides when the job runs out of attempts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttemptInfo {
+    /// Claims made so far, this one included: `1` on the first attempt.
+    pub attempts: i32,
+    /// The attempt budget of the job: [`attempts`](Self::attempts) at or above
+    /// it means this is the last chance.
+    pub max_attempts: i32,
+}
+
 /// The boxed future an async job handler returns.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>>;
 
-/// An async job handler: takes the shared application state and the job's
-/// JSON arguments, and reports its outcome as a [`HandlerFuture`].
+/// An async job handler: takes the shared application state, the
+/// [`AttemptInfo`] of the claim it is running, and the job's JSON arguments,
+/// and reports its outcome as a [`HandlerFuture`].
 ///
 /// Implementations are plain `fn`s (not capturing closures) so they can live
 /// in a static registry; whatever they need is already in
@@ -95,15 +127,15 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Sen
 ///
 /// ```
 /// use serde_json::Value;
-/// use wired_be::jobs::HandlerFuture;
+/// use wired_be::jobs::{AttemptInfo, HandlerFuture};
 /// use wired_be::state::AppState;
 ///
 /// /// Handler shape: do the work, then report success or a failure.
-/// fn hello(_state: AppState, _args: Value) -> HandlerFuture {
+/// fn hello(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
 ///     Box::pin(async { Ok(()) })
 /// }
 /// ```
-pub type HandlerFn = fn(AppState, Value) -> HandlerFuture;
+pub type HandlerFn = fn(AppState, AttemptInfo, Value) -> HandlerFuture;
 
 /// Maps job kinds to their handlers.
 #[derive(Debug, Default)]
@@ -287,7 +319,11 @@ async fn dispatch_handler(
             job.kind
         )));
     };
-    let handle = tokio::spawn(handler(state.clone(), job.args.clone()));
+    let attempt = AttemptInfo {
+        attempts: job.attempts,
+        max_attempts: job.max_attempts,
+    };
+    let handle = tokio::spawn(handler(state.clone(), attempt, job.args.clone()));
     match handle.await {
         Ok(outcome) => outcome,
         Err(join_err) => Err(JobError::Retry(format!(
@@ -298,13 +334,15 @@ async fn dispatch_handler(
 }
 
 /// Moves a finished attempt to its terminal state: `completed` on success,
-/// retryable with [`backoff`] delay on a retryable failure, discarded on a
-/// fatal failure. Whether the attempt budget allows the retry is decided by
-/// [`fail`] (the models layer), atomically with the write.
+/// retryable with [`backoff`] delay (or the handler's own) on a retryable
+/// failure, discarded on a fatal failure. Whether the attempt budget allows
+/// the retry is decided by [`fail`] (the models layer), atomically with the
+/// write.
 async fn record_outcome(db: &PgPool, id: Uuid, attempts: i32, outcome: Result<(), JobError>) {
     let stored = match outcome {
         Ok(()) => complete(db, id).await,
         Err(JobError::Retry(detail)) => fail(db, id, &detail, Some(backoff(attempts))).await,
+        Err(JobError::RetryAfter(delay, detail)) => fail(db, id, &detail, Some(delay)).await,
         Err(JobError::Discard(detail)) => fail(db, id, &detail, None).await,
     };
     if let Err(err) = stored {
@@ -327,7 +365,10 @@ async fn sweep_stuck(state: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use chrono::{TimeDelta, Utc};
     use serde_json::json;
@@ -346,6 +387,8 @@ mod tests {
     static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
     /// Set once by [`slow_handler`] before it pauses.
     static HANDLER_STARTED: AtomicBool = AtomicBool::new(false);
+    /// What [`reporting_handler`] was told about its attempt.
+    static LAST_ATTEMPT: Mutex<Option<AttemptInfo>> = Mutex::new(None);
 
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
@@ -435,30 +478,51 @@ mod tests {
     }
 
     /// A handler that always succeeds.
-    fn ok_handler(_state: AppState, _args: Value) -> HandlerFuture {
+    fn ok_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
         Box::pin(async { Ok(()) })
     }
 
     /// A handler that records that it ran, then succeeds.
-    fn marking_handler(_state: AppState, _args: Value) -> HandlerFuture {
+    fn marking_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
         Box::pin(async {
             HANDLER_RAN.store(true, Ordering::SeqCst);
             Ok(())
         })
     }
 
+    /// A handler that reports its [`AttemptInfo`] and succeeds, so a test can
+    /// read what the dispatch handed it.
+    fn reporting_handler(_state: AppState, attempt: AttemptInfo, _args: Value) -> HandlerFuture {
+        Box::pin(async move {
+            let _previous = LAST_ATTEMPT.lock().unwrap().replace(attempt);
+            Ok(())
+        })
+    }
+
     /// A handler that reports a transient failure.
-    fn retry_handler(_state: AppState, _args: Value) -> HandlerFuture {
+    fn retry_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
         Box::pin(async { Err(JobError::Retry("temporarily broken".to_owned())) })
     }
 
+    /// A handler that reports a transient failure with the peer's own delay:
+    /// half a minute, long enough that the retry cannot fire while a test is
+    /// still watching the job's first terminal write.
+    fn retry_after_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
+        Box::pin(async {
+            Err(JobError::RetryAfter(
+                Duration::from_secs(30),
+                "peer asked to wait".to_owned(),
+            ))
+        })
+    }
+
     /// A handler that reports a permanent failure.
-    fn discard_handler(_state: AppState, _args: Value) -> HandlerFuture {
+    fn discard_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
         Box::pin(async { Err(JobError::Discard("bad arguments".to_owned())) })
     }
 
     /// A handler that crashes its task mid-flight.
-    fn panicking_handler(_state: AppState, _args: Value) -> HandlerFuture {
+    fn panicking_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
         Box::pin(async {
             let _boom = "not-a-number".parse::<u64>().unwrap();
             Ok(())
@@ -466,7 +530,7 @@ mod tests {
     }
 
     /// A handler that announces its start and then runs for a moment.
-    fn slow_handler(_state: AppState, _args: Value) -> HandlerFuture {
+    fn slow_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
         Box::pin(async {
             HANDLER_STARTED.store(true, Ordering::SeqCst);
             sleep(Duration::from_millis(400)).await;
@@ -627,6 +691,82 @@ mod tests {
         assert!(
             done.run_at > Utc::now() + TimeDelta::seconds(5),
             "the job is due again only after the 15 s backoff"
+        );
+    }
+
+    #[test]
+    fn job_error_display_states_the_outcome_and_the_wait() {
+        assert_eq!(
+            JobError::Retry("later".to_owned()).to_string(),
+            "retryable job failure: later",
+            "a plain retry states its detail"
+        );
+        assert_eq!(
+            JobError::RetryAfter(Duration::from_mins(4), "peer throttled us".to_owned())
+                .to_string(),
+            "retryable job failure: peer throttled us (after 240s)",
+            "a delayed retry states its detail and the delay"
+        );
+        assert_eq!(
+            JobError::Discard("never".to_owned()).to_string(),
+            "fatal job failure: never",
+            "a discard says the failure is fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_tells_the_handler_which_attempt_it_is() {
+        let config = Arc::new(Config::for_tests());
+        let state = AppState {
+            db: lazy_pool(),
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+        };
+        let mut registry = JobRegistry::new();
+        registry.register("greet", reporting_handler);
+        let job = Job {
+            attempts: 3,
+            max_attempts: 7,
+            ..job_row("greet")
+        };
+
+        let _drop = dispatch_handler(&registry, &state, &job).await;
+
+        let seen = *LAST_ATTEMPT.lock().unwrap();
+        assert_eq!(
+            seen,
+            Some(AttemptInfo {
+                attempts: 3,
+                max_attempts: 7,
+            }),
+            "the claimed row's attempt budget reaches the handler"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn retry_after_error_schedules_the_peers_delay(pool: PgPool) {
+        let job = enqueue(&pool, test_job("throttled"))
+            .await
+            .unwrap()
+            .expect("the job inserts");
+        let mut registry = JobRegistry::new();
+        registry.register("throttled", retry_after_handler);
+
+        let done =
+            run_until_state(worker_for(&pool, registry, 1), &pool, job.id, "retryable").await;
+        assert_eq!(
+            done.last_error.as_deref(),
+            Some("peer asked to wait"),
+            "the retry message is stored"
+        );
+        assert_eq!(done.attempts, 1, "the failed attempt is counted");
+        assert!(
+            done.run_at > Utc::now() + TimeDelta::seconds(20)
+                && done.run_at < Utc::now() + TimeDelta::seconds(50),
+            "the job is due at the peer's 30 s, not the 15 s backoff: {}",
+            done.run_at
         );
     }
 
