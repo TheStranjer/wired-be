@@ -334,19 +334,18 @@ mod tests {
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn run_ticks_the_periodic_schedule_under_a_paused_clock(pool: PgPool) {
+        // Drive the paused clock by hand. A running blocking task inhibits
+        // tokio's auto-advance, so the virtual clock moves only where this
+        // test calls `advance`: every real Postgres round trip lands while
+        // the clock stands still. That replaces the old free-running 1 ms
+        // ticker, whose hundred-fold virtual speed could burn sqlx's 30 s
+        // acquire timeout (and its 1 s idle timeout) before a lazily opened
+        // connection's handshake finished — the `PoolTimedOut` flakes a
+        // loaded suite produced.
         tokio::time::pause();
-        // Auto-advance steps the virtual clock to the next armed timer on
-        // every park. Left alone that step is the scheduler's own 10 s
-        // interval, so the clock races ahead of real Postgres round trips
-        // and sqlx's 30 s acquire timeout fires long before a fresh
-        // connection's handshake lands in wall-clock time. A 1 ms ticker
-        // task keeps every step at one millisecond of virtual time — tens
-        // of thousands of steps per real second: real IO always wins its
-        // race, and periods still turn over quickly.
-        let ticker = tokio::spawn(async move {
-            for _step in 0..100_000_u32 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let inhibitor = tokio::task::spawn_blocking(move || {
+            let _held = hold_rx.recv();
         });
         let jobs = vec![PeriodicJob {
             kind: "heartbeat",
@@ -354,16 +353,34 @@ mod tests {
             every: Duration::from_secs(1),
         }];
 
-        // The first tick fires at once; the 10 s tick interval spans ten
-        // one-second periods, but the dedupe key caps each period at one
-        // row, so exactly two rows exist once a new period has been
-        // enqueued and the shutdown future resolves.
+        // The first tick fires at once; the next lands only 10 s of virtual
+        // time later. Stepping 20 ms at a time wakes the shutdown future's
+        // poll on that rhythm — and the poll's own round trip is what hands
+        // the scheduler's inserts real time to land — while 900 steps still
+        // stop short of a third tick, so the finished scheduler holds
+        // exactly the two periods the keys below are asserted on.
         let watched = pool.clone();
-        run(pool.clone(), jobs, async move {
+        let scheduler = tokio::spawn(run(pool.clone(), jobs, async move {
             wait_for_count(&watched, "heartbeat", 2).await;
-        })
-        .await;
-        ticker.abort();
+        }));
+        let started = std::time::Instant::now();
+        let mut steps = 0_u32;
+        while !scheduler.is_finished() {
+            assert!(
+                steps < 900,
+                "the schedule never turned over a period: {steps} steps"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the scheduler wedged in real time"
+            );
+            steps += 1;
+            tokio::time::advance(Duration::from_millis(20)).await;
+            let _rows = count_jobs(&pool, "heartbeat").await;
+        }
+        scheduler
+            .await
+            .expect("the scheduler task ran to completion");
 
         let keys = keys_for(&pool, "heartbeat").await;
         assert_eq!(
@@ -378,21 +395,35 @@ mod tests {
         );
         assert_ne!(keys[0], keys[1], "the two rows come from different buckets");
 
-        // `run` returned when the shutdown future resolved; a long virtual
-        // wait afterwards proves nothing keeps ticking behind it.
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        // `run` returned when the shutdown future resolved; 60 more seconds
+        // of virtual time (six tick periods) prove nothing keeps ticking
+        // behind it.
+        tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(
             count_jobs(&pool, "heartbeat").await,
             2,
             "the scheduler stopped with its shutdown"
         );
+
+        drop(hold_tx);
+        inhibitor
+            .await
+            .expect("the clock inhibitor exits with its channel");
+
+        // Hand the wall clock back before returning: sqlx closes the pool
+        // and drops the temporary database after the test body, and that
+        // cleanup opens a fresh master connection. Left frozen, the
+        // auto-advancing paused clock would burn that connection's real-
+        // time handshake against sqlx's virtual 30 s acquire timeout, the
+        // cleanup would time out, and the test database would leak.
+        tokio::time::resume();
     }
 
     /// Resolves once `kind` has at least `want` rows.
     ///
-    /// The polls park on short sleeps so the auto-advancing paused clock
-    /// keeps moving; the deadline is a real-time guard, which is what
-    /// watches a paused runtime for a scheduler that never ticks.
+    /// The polls park on short virtual sleeps, which the driving test steps
+    /// forward; the deadline is a real-time guard, which is what watches a
+    /// paused runtime for a scheduler that never ticks.
     async fn wait_for_count(pool: &PgPool, kind: &str, want: i64) {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while count_jobs(pool, kind).await < want {

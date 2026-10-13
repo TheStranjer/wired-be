@@ -15,7 +15,8 @@
 //! [`chat`] the
 //! Pleroma chat `Chat` and `ChatMessage` entities, [`marker`] the
 //! Mastodon v1 `Marker` entity, [`mention`] the Mastodon `Mention` entity,
-//! [`scrobble`] the Pleroma `Scrobble` entity
+//! [`scrobble`] the Pleroma `Scrobble` entity, [`tag`] the Mastodon
+//! `Tag` entity
 //! and [`relationship`]
 //! the Mastodon `Relationship` entity (with Pleroma's `subscribing`
 //! alias), which [`models::relationship`](crate::models::relationship)
@@ -33,3 +34,4 @@ pub mod media_attachment;
 pub mod mention;
 pub mod relationship;
 pub mod scrobble;
+pub mod tag;
