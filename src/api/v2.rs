@@ -4,7 +4,7 @@
 use axum::Router;
 
 use crate::{
-    api::{chats, media},
+    api::{chats, instance, media},
     config::Config,
     state::AppState,
 };
@@ -14,7 +14,9 @@ use crate::{
 /// Area routers live as `src/api/<area>.rs` and are merged here; the first
 /// one is [`media`], whose two upload endpoints share the `/api/v1` handler,
 /// and [`chats::v2_router`] is nested at `/pleroma/chats`, the paged
-/// counterpart of that area's legacy `/api/v1` list. Do not call
+/// counterpart of that area's legacy `/api/v1` list. [`instance::v2_router`]
+/// contributes `GET /api/v2/instance`, the reshaped instance document; its
+/// `/instance` sub-resources stay v1-only. Do not call
 /// [`Router::fallback`] here (or on anything merged here): unmatched paths
 /// must reach the app-wide JSON fallback in [`crate::app`], which answers
 /// them with Pleroma's `api_not_implemented`, and merging two routers that
@@ -25,6 +27,7 @@ use crate::{
 /// configured upload limits.
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
+        .merge(instance::v2_router())
         .merge(media::router(config))
         .nest("/pleroma/chats", chats::v2_router())
 }

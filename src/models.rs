@@ -22,6 +22,7 @@ pub mod domain_block;
 pub mod endorsement;
 pub mod filter;
 pub mod follow;
+pub mod instance_policy_domain;
 pub mod instance_rule;
 pub mod instance_setting;
 pub mod job;

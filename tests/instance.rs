@@ -1,12 +1,17 @@
-//! Tests for `GET /api/v1/instance` (`src/api/instance.rs`).
+//! Tests for the public instance endpoints (`src/api/instance.rs`):
+//! `GET /api/v1/instance`, `GET /api/v2/instance`, and the
+//! `/api/v1/instance` sub-resources `peers`, `rules`, `domain_blocks`,
+//! `translation_languages`, `activity` and `extended_description`.
 //!
-//! The endpoint is public (Pleroma's `skip_auth`) and takes no
+//! These endpoints are public (Pleroma's `skip_auth`) and take no
 //! parameters, so there is no auth failure, 404 or validation arm to
 //! cover: what these tests own is the exact key set and value types of
-//! the document, the three cached counters against local/remote
+//! the documents, the three cached counters against local/remote
 //! fixtures, the priority-ordered rules, the contact account (present
-//! and absent), the config mirroring through non-default settings, and
-//! the 60-second stats cache window. The cache helper's own expiry
+//! and absent), the config mirroring through non-default settings, the
+//! 60-second stats cache window, the distinct-and-capped peer list, the
+//! policy domains' digest and severity mapping, and the empty answers
+//! of the completeness endpoints. The cache helper's own expiry
 //! arithmetic is unit-tested where it lives, in `src/util/cache.rs`.
 
 #![cfg(test)]
@@ -611,4 +616,458 @@ async fn the_route_lives_at_api_v1_instance(pool: PgPool) {
         "Pleroma's api_not_implemented fallback"
     );
     let _document = get_instance(&app).await;
+}
+
+/// The sorted top-level keys of the v2 document — the ticket's key set.
+const V2_TOP_KEYS: [&str; 13] = [
+    "configuration",
+    "contact",
+    "description",
+    "domain",
+    "languages",
+    "pleroma",
+    "registrations",
+    "rules",
+    "source_url",
+    "thumbnail",
+    "title",
+    "usage",
+    "version",
+];
+
+/// The `configuration` block of the empty [`common::test_config`] v2
+/// document: the three groups v1 shares, spelled via
+/// [`expected_configuration`] to prove they are identical, beside
+/// Mastodon 4's own groups.
+fn expected_v2_configuration() -> Value {
+    let v1 = expected_configuration();
+    json!({
+        "urls": { "streaming": "wss://test.example", "status": null },
+        "vapid": { "public_key": "" },
+        "accounts": { "max_featured_tags": 10, "max_pinned_statuses": 5 },
+        "statuses": v1["statuses"].clone(),
+        "media_attachments": v1["media_attachments"].clone(),
+        "polls": v1["polls"].clone(),
+        "translation": { "enabled": false },
+    })
+}
+
+/// The complete v2 document an empty instance built on
+/// [`common::test_config`] serves.
+fn expected_v2_document() -> Value {
+    json!({
+        "domain": "test.example",
+        "title": "Wired",
+        "version": instance_version(),
+        "source_url": "https://github.com/TheStranjer/wired-be",
+        "description": "A Pleroma-compatible instance",
+        "usage": { "users": { "active_month": 0 } },
+        "thumbnail": { "url": format!("{BASE}/images/thumbnail.jpg") },
+        "languages": ["en"],
+        "configuration": expected_v2_configuration(),
+        "registrations": {
+            "enabled": true,
+            "approval_required": false,
+            "message": null,
+            "url": null,
+        },
+        "contact": { "email": "", "account": null },
+        "rules": [],
+        "pleroma": expected_pleroma(),
+    })
+}
+
+/// `GET /api/v2/instance` answers the ticket's reshaped document — the
+/// v1 `media_attachments`, `polls` and `pleroma` blocks reused whole —
+/// without consulting credentials; a wrong method is the plain 405.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_v2_document_is_public_and_complete(pool: PgPool) {
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/api/v2/instance")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the v2 document is served");
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/json"),
+        "the document is JSON"
+    );
+    let document = response.json_value();
+    assert_eq!(keys_of(&document), V2_TOP_KEYS, "the ticket's v2 key set");
+    assert_eq!(document, expected_v2_document(), "the whole document");
+    assert_eq!(
+        document["pleroma"]["metadata"]["features"],
+        json!(instance_meta::features()),
+        "the pleroma block is the shared builder, not a restatement"
+    );
+    let posted = common::TestRequest::post("/api/v2/instance")
+        .send(&app)
+        .await;
+    assert_eq!(
+        posted.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the endpoint is read-only"
+    );
+}
+
+/// The v2 document mirrors the config (domain, streaming scheme,
+/// thumbnail, limits, registration state, contact email) and the
+/// fixtures (rules in display order, the first local admin as the full
+/// `Account` entity nested in `contact`).
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_v2_document_follows_the_config_and_fixtures(pool: PgPool) {
+    let rule = instance_rule::create(&pool, "Be nice", "say hi", 0)
+        .await
+        .expect("the rule inserts");
+    let root = common::create_local_user_with(&pool, "root", |user| NewUser {
+        is_admin: true.into(),
+        ..user
+    })
+    .await;
+    let config = other_config();
+    let app = common::test_app_with_config(pool, config.clone());
+    let document = common::TestRequest::get("/api/v2/instance")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(document["domain"], "snatter.example:4000", "the domain");
+    assert_eq!(document["title"], "Snatter", "INSTANCE_NAME");
+    assert_eq!(
+        document["description"], "Where we all chatter",
+        "INSTANCE_DESCRIPTION"
+    );
+    assert_eq!(
+        document["source_url"], "https://github.com/TheStranjer/wired-be",
+        "the shipped repository URL"
+    );
+    assert_eq!(
+        document["thumbnail"]["url"], "http://snatter.example:4000/images/thumbnail.jpg",
+        "the wrapped thumbnail follows BASE_URL"
+    );
+    assert_eq!(
+        document["configuration"]["urls"]["streaming"], "ws://snatter.example:4000",
+        "an http origin gets the plain ws scheme"
+    );
+    assert_eq!(
+        document["configuration"]["statuses"],
+        json!({"max_characters": 300, "max_media_attachments": 6, "characters_reserved_per_url": 23}),
+        "MAX_STATUS_CHARS and MAX_MEDIA_ATTACHMENTS mirror the config"
+    );
+    assert_eq!(
+        document["configuration"]["polls"]["max_options"], 12,
+        "MAX_POLL_OPTIONS mirrors the config"
+    );
+    assert_eq!(
+        document["registrations"]["enabled"], false,
+        "REGISTRATIONS_OPEN=false is advertised"
+    );
+    assert_eq!(
+        document["contact"]["email"], "admin@example.org",
+        "CONTACT_EMAIL"
+    );
+    assert_eq!(
+        document["contact"]["account"],
+        serde_json::to_value(Account::from_user(&root, &config)).unwrap(),
+        "the first local admin renders as the full Account entity"
+    );
+    assert_eq!(
+        document["rules"],
+        json!([{"id": rule.id.to_string(), "text": "Be nice", "hint": "say hi"}]),
+        "the rules block matches the v1 rendering"
+    );
+}
+
+/// Inserts `domain`'s mirror so the peer listing has hosts to read.
+async fn mirror_remote(pool: &PgPool, host: &str) {
+    let _user = common::create_remote_user(pool, "someone", host).await;
+}
+
+/// `GET /api/v1/instance/peers` answers the distinct remote hosts,
+/// alphabetically, local users (whose `domain` is null) never among
+/// them; a garbage bearer is not consulted, and an instance mirroring
+/// nobody answers the empty array.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn peers_lists_distinct_remote_domains(pool: PgPool) {
+    let app = common::test_app(pool.clone());
+    let empty = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&app)
+        .await;
+    assert_eq!(empty.status, StatusCode::OK, "peers are served");
+    assert_eq!(
+        empty.json_value(),
+        json!([]),
+        "an instance that mirrors nobody lists no peers"
+    );
+
+    let _alice = common::create_local_user(&pool, "alice").await;
+    mirror_remote(&pool, "remote.example").await;
+    let _gap = common::create_remote_user(&pool, "gap", "remote.example").await;
+    mirror_remote(&pool, "other.example").await;
+
+    let response = common::TestRequest::get("/api/v1/instance/peers")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "credentials are ignored");
+    assert_eq!(
+        response.json_value(),
+        json!(["other.example", "remote.example"]),
+        "each host once, sorted, locals excluded"
+    );
+
+    let posted = common::TestRequest::post("/api/v1/instance/peers")
+        .send(&app)
+        .await;
+    assert_eq!(
+        posted.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the endpoint is read-only"
+    );
+}
+
+/// The listing is capped at the thousand hosts the endpoint documents,
+/// keeping the alphabetically first thousand of a larger table.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn peers_are_capped_at_one_thousand(pool: PgPool) {
+    // 1001 distinct hosts in one set-based write; the ids are test
+    // fixtures, so the database-generated ones are fine here.
+    let inserted = sqlx::query(
+        "INSERT INTO users (id, nickname, ap_id, local, domain)
+         SELECT gen_random_uuid(),
+                'peeruser' || g || '@peer' || g || '.example',
+                'https://peer' || g || '.example/users/peeruser' || g,
+                false,
+                'peer' || g || '.example'
+           FROM generate_series(1, 1001) AS g",
+    )
+    .execute(&pool)
+    .await
+    .expect("the peer fixtures insert");
+    assert_eq!(inserted.rows_affected(), 1001, "the table holds 1001 hosts");
+
+    let app = common::test_app(pool);
+    let peers: Vec<String> = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&app)
+        .await
+        .json();
+    assert_eq!(peers.len(), 1000, "the listing stops at the documented cap");
+    let mut sorted = peers.clone();
+    sorted.sort();
+    assert_eq!(sorted, peers, "the answer stays alphabetical");
+    assert!(
+        !peers.iter().any(|domain| domain == "peer999.example"),
+        "the alphabetically last host is the one cut off"
+    );
+    assert!(
+        peers.iter().any(|domain| domain == "peer1.example"),
+        "the listing starts at the top"
+    );
+}
+
+/// `GET /api/v1/instance/rules` answers the same entries, in the same
+/// priority-then-id order, as the v1 document's `rules` block — and the
+/// empty array while no rule is written. No authentication.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_rules_endpoint_serves_the_instance_rules(pool: PgPool) {
+    let app = common::test_app(pool.clone());
+    let empty = common::TestRequest::get("/api/v1/instance/rules")
+        .send(&app)
+        .await;
+    assert_eq!(empty.status, StatusCode::OK, "the listing is served");
+    assert_eq!(empty.json_value(), json!([]), "no rules written yet");
+
+    let first = instance_rule::create(&pool, "Be nice", "", 0)
+        .await
+        .expect("the first rule inserts");
+    let second = instance_rule::create(&pool, "No spam", "we delete it", 5)
+        .await
+        .expect("the second rule inserts");
+
+    let response = common::TestRequest::get("/api/v1/instance/rules")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "credentials are ignored");
+    assert_eq!(
+        response.json_value(),
+        json!([
+            {"id": first.id.to_string(), "text": "Be nice", "hint": ""},
+            {"id": second.id.to_string(), "text": "No spam", "hint": "we delete it"},
+        ]),
+        "id, text and hint, priority-ordered like the document block"
+    );
+}
+
+/// Inserts one policy row directly: the table has no writer yet (the
+/// admin tickets add one), so the endpoint is tested by hand.
+async fn insert_policy(pool: &PgPool, domain: &str, action: &str, reason: &str) {
+    let inserted = sqlx::query(
+        "INSERT INTO instance_policy_domains (domain, action, reason) VALUES ($1, $2, $3)",
+    )
+    .bind(domain)
+    .bind(action)
+    .bind(reason)
+    .execute(pool)
+    .await
+    .expect("the policy row inserts");
+    assert_eq!(inserted.rows_affected(), 1, "the row is there");
+}
+
+/// `GET /api/v1/instance/domain_blocks` answers the instance-policy
+/// domains with their lowercase-hex `SHA-256` digest and the severity
+/// their action maps to (reject is `suspend`, `silence` and
+/// `media_removal` both fold into `silence`) — and the empty array
+/// while no policy is recorded. No authentication.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_domain_blocks_endpoint_maps_policy_to_severities(pool: PgPool) {
+    let app = common::test_app(pool.clone());
+    let empty = common::TestRequest::get("/api/v1/instance/domain_blocks")
+        .send(&app)
+        .await;
+    assert_eq!(empty.status, StatusCode::OK, "the listing is served");
+    assert_eq!(empty.json_value(), json!([]), "no policy recorded yet");
+
+    insert_policy(&pool, "blocked.example", "reject", "coordinated abuse").await;
+    insert_policy(&pool, "lewd.example", "media_removal", "no nsfw").await;
+    insert_policy(&pool, "silenced.example", "silence", "").await;
+
+    let response = common::TestRequest::get("/api/v1/instance/domain_blocks")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "credentials are ignored");
+    assert_eq!(
+        response.json_value(),
+        json!([
+            {
+                "domain": "blocked.example",
+                "digest": "1f30273176bf43428242811a3bd5e04653804cff849e2ac73a14aa6e00c66a48",
+                "severity": "suspend",
+                "comment": "coordinated abuse",
+            },
+            {
+                "domain": "lewd.example",
+                "digest": "f50aaa39cbb6aefb278cf66e0ad8c74e1ce67b4707c0a9f1a0c8fbf33e02a126",
+                "severity": "silence",
+                "comment": "no nsfw",
+            },
+            {
+                "domain": "silenced.example",
+                "digest": "a31604814f94139582162dedb2ac91d8008fb44562daa4b35e834e4429d6c873",
+                "severity": "silence",
+                "comment": "",
+            },
+        ]),
+        "each entry carries the domain, its sha256 digest, the mapped \
+         severity and the reason (empty when ungiven), by host"
+    );
+}
+
+/// `GET /api/v1/instance/translation_languages` answers the empty
+/// object: no translation provider is configured until the translation
+/// ticket lands. No authentication.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn translation_languages_is_the_empty_object(pool: PgPool) {
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/api/v1/instance/translation_languages")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the document is served");
+    assert_eq!(
+        response.json_value(),
+        json!({}),
+        "an unconfigured provider has no language matrix"
+    );
+}
+
+/// `GET /api/v1/instance/activity` answers the empty array: wired-be
+/// keeps no weekly activity counters. No authentication.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn activity_is_the_empty_array(pool: PgPool) {
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/api/v1/instance/activity")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the listing is served");
+    assert_eq!(
+        response.json_value(),
+        json!([]),
+        "no counted week exists yet"
+    );
+}
+
+/// `GET /api/v1/instance/extended_description` wraps the configured
+/// description in a paragraph and stamps it with the current time in
+/// Mastodon's format. No authentication.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_extended_description_wraps_the_instance_description(pool: PgPool) {
+    let app = common::test_app(pool.clone());
+    let response = common::TestRequest::get("/api/v1/instance/extended_description")
+        .bearer("not-a-real-token")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the document is served");
+    let document = response.json_value();
+    assert_eq!(
+        keys_of(&document),
+        vec!["content", "updated_at"],
+        "the ticket's two keys"
+    );
+    assert_eq!(
+        document["content"], "<p>A Pleroma-compatible instance</p>",
+        "the INSTANCE_DESCRIPTION paragraph"
+    );
+    let stamp = document["updated_at"]
+        .as_str()
+        .expect("the update time is a string");
+    assert_eq!(stamp.len(), 24, "exactly the Mastodon timestamp shape");
+    let when = wired_be::util::time::parse_time(stamp).expect("a parseable stamp");
+    let age = chrono::Utc::now().signed_duration_since(when).num_seconds();
+    assert!((-5..=60).contains(&age), "the stamp is the request time");
+
+    let other = common::test_app_with_config(pool, other_config());
+    let rewritten = common::TestRequest::get("/api/v1/instance/extended_description")
+        .send(&other)
+        .await
+        .json_value();
+    assert_eq!(
+        rewritten["content"], "<p>Where we all chatter</p>",
+        "the content follows INSTANCE_DESCRIPTION"
+    );
+}
+
+/// The `/instance` sub-resources are mounted under `/api/v1` only —
+/// Pleroma's router offers no v2 spelling — while `/api/v2/instance`
+/// itself answers: the v2 mount does not shadow or extend the v1 list.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_sub_resources_are_v1_only(pool: PgPool) {
+    let app = common::test_app(pool);
+    for path in [
+        "/api/v2/instance/peers",
+        "/api/v2/instance/rules",
+        "/api/v2/instance/domain_blocks",
+    ] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "{path} is not a second mount"
+        );
+        assert_eq!(
+            response.json_value(),
+            json!({"error": "Not implemented"}),
+            "Pleroma's api_not_implemented fallback"
+        );
+    }
+    let document = common::TestRequest::get("/api/v2/instance")
+        .send(&app)
+        .await;
+    assert_eq!(
+        document.status,
+        StatusCode::OK,
+        "the v2 document itself stays served"
+    );
 }
