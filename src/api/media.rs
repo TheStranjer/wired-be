@@ -31,10 +31,18 @@
 //!   `NULL`); a later `POST /api/v1/statuses` claims it through
 //!   [`crate::models::media_attachment::attach_to_status`].
 //!
-//! Dimensions and `blurhash` belong to later tickets, so nothing fills the
-//! detection columns and the entity's `meta` carries only the focal point
-//! until something detects an `original`. A `thumbnail` parameter is
-//! accepted and ignored on upload for the same reason.
+//! An `image/*` upload is analysed through [`crate::services::media_processing`]
+//! on the blocking pool before anything is stored: its header must decode
+//! (an undecodable one is a 422 "Invalid image") and its pixel count must
+//! stay within `MAX_IMAGE_PIXELS` (over it is a 422 "Image too large").
+//! The decoded dimensions are recorded on the row, and the endpoint then
+//! generates the attachment's preview — the same key's stem with a
+//! `_small.jpg` / `_small.png` suffix, encoded JPEG for an opaque image,
+//! PNG when it has transparency to keep — and a `Blurhash` string. Those
+//! two extras are best-effort: a thumbnail or hash that fails is logged
+//! and the upload answers without it. A `thumbnail` parameter or file part
+//! on upload is still accepted and ignored: the preview is generated, not
+//! supplied.
 //!
 //! `GET /media/{id}` answers the [`MediaAttachment`] entity of an
 //! UNATTACHED upload owned by the viewer — Mastodon's semantics: once a
@@ -51,27 +59,28 @@
 //! characters, a longer one a 422 "Description too long"), `focus`
 //! (`"x,y"`, two floats in `[-1.0, 1.0]`, anything else a 422 "Invalid
 //! focus") and the `thumbnail` file part, present-only: fields the body
-//! does not carry keep their stored values. No image-analysis or
-//! thumbnailing service exists yet, so a thumbnail's bytes are stored
-//! as-sent and only `preview_url` points at them. Neither route deletes
-//! anything: there is no `DELETE /media/{id}`.
+//! does not carry keep their stored values. A supplied thumbnail's bytes
+//! are stored as-sent (the analysis and thumbnailing services run on
+//! upload, not on every edit), and only `preview_url` points at them.
+//! Neither route deletes anything: there is no `DELETE /media/{id}`.
 //!
 //! The rejections are those of decision 8: 401 / 403 from [`AuthUser`] and
 //! the scope check, 404 "Record not found" on the `{id}` routes for anything
 //! that is not the caller's own unattached media, 413 for a file over
 //! `UPLOAD_LIMIT_BYTES` — enforced by [`crate::extract::multipart`], which
 //! [`upload_body_limit`] must free from axum's 2 MiB extractor default first
-//! — and 422 for a missing or empty `file` part, an undetectable type, a
-//! `focus` that is not two floats in `[-1.0, 1.0]`, or an update
-//! `description` over `MAX_MEDIA_DESCRIPTION`.
+//! — and 422 for a missing or empty `file` part, an undetectable type, an
+//! undecodable or oversized image, a `focus` that is not two floats in
+//! `[-1.0, 1.0]`, or an update `description` over `MAX_MEDIA_DESCRIPTION`.
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     routing::{get, post},
 };
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -82,6 +91,7 @@ use crate::{
     extract::multipart::{MultipartForm, UploadedFile, UploadedFiles as _, upload_body_limit},
     models::media_attachment::{self, MediaMetadata, NewMediaAttachment},
     oauth::scopes::{READ_STATUSES, WRITE_MEDIA},
+    services::media_processing::{self, ImageInfo, Thumbnail},
     state::AppState,
     uploads::{self, UploaderBackend},
     util::id::parse_id,
@@ -115,6 +125,9 @@ const DESCRIPTION_TOO_LONG: &str = "Description too long";
 /// likewise — the update endpoint's own wording, not [`FOCUS_INVALID`]'s
 /// changeset phrase.
 const UPDATE_FOCUS_INVALID: &str = "Invalid focus";
+/// Edge bound of the generated preview image, in pixels (the ticket's 400):
+/// the longest edge of a thumbnail is scaled down to this, never up.
+const THUMBNAIL_MAX_EDGE: u32 = 400;
 
 /// The `/media` router, merged into both [`crate::api::v1`] and
 /// [`crate::api::v2`]: the two upload paths and the `{id}` metadata routes
@@ -136,14 +149,22 @@ pub fn router(config: &Config) -> Router<AppState> {
 /// `POST /api/v1/media` and `POST /api/v2/media` — store the uploaded file,
 /// record it as the caller's unattached media and answer its entity.
 ///
+/// An `image/*` upload is analysed first, before anything is written: an
+/// undecodable or oversized image is rejected and stores nothing. The
+/// analysis's own extras — the generated preview and the `Blurhash` string
+/// — are best-effort: whichever of them fails is logged and left off the
+/// row, and the upload answers without it.
+///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:media` check; [`AppError::PayloadTooLarge`] from the multipart
 /// extractor for a file over `UPLOAD_LIMIT_BYTES`;
 /// [`AppError::Unprocessable`] from [`Upload::from_form`] for a missing or
-/// empty file, an undetectable type or a malformed `focus`; storage and
-/// database failures arrive through `?` as
+/// empty file, an undetectable type or a malformed `focus`, and from
+/// [`media_processing::analyze_image`] for an image no decoder can read
+/// ("Invalid image") or whose pixel count passes `MAX_IMAGE_PIXELS`
+/// ("Image too large"); storage and database failures arrive through `?` as
 /// [`AppError::Internal`] / [`AppError::Database`].
 async fn upload_media(
     State(state): State<AppState>,
@@ -152,6 +173,7 @@ async fn upload_media(
 ) -> AppResult<Json<MediaAttachment>> {
     auth.require(WRITE_MEDIA)?;
     let upload = Upload::from_form(form)?;
+    let analyzed = analyze_upload(&state, &upload).await?;
     let key = uploads::media_key(
         auth.0.id,
         upload.file.filename.as_deref(),
@@ -161,7 +183,11 @@ async fn upload_media(
         .uploader
         .put(&key, upload.file.bytes.clone(), upload.content_type)
         .await?;
-    let new = upload.new_attachment(auth.0.id, &state.uploader, &key)?;
+    let detection = match analyzed {
+        Some(analyzed) => Some(detect_stored(&state, &key, analyzed).await),
+        None => None,
+    };
+    let new = upload.new_attachment(auth.0.id, &state.uploader, &key, detection.as_ref())?;
     let row = media_attachment::insert(&state.db, &new).await?;
     debug!(
         media = %row.id,
@@ -172,12 +198,171 @@ async fn upload_media(
     Ok(Json(MediaAttachment::from_model(&row)))
 }
 
+/// What one blocking pass over an image upload's bytes found out: the
+/// dimensions are required, the preview and the `Blurhash` are the extras
+/// whose failure must not cost the upload.
+#[derive(Debug)]
+struct Analyzed {
+    /// Dimensions read from the file's header.
+    info: ImageInfo,
+    /// The rendered preview, or why rendering it failed.
+    thumbnail: AppResult<Thumbnail>,
+    /// `Blurhash` string; `None` when the image cannot be hashed.
+    blurhash: Option<String>,
+}
+
+/// The image analysis an upload records on its row, after the generated
+/// preview did (or did not) reach storage.
+#[derive(Debug)]
+struct Detection {
+    /// Dimensions of the original file.
+    info: ImageInfo,
+    /// `Blurhash` string of the original, if one was computed.
+    blurhash: Option<String>,
+    /// Stored preview of the original, if one was generated and stored.
+    preview: Option<StoredPreview>,
+}
+
+/// A generated preview that made it into storage.
+#[derive(Debug)]
+struct StoredPreview {
+    /// Public URL of the stored preview file.
+    url: String,
+    /// Preview width in pixels.
+    width: u32,
+    /// Preview height in pixels.
+    height: u32,
+}
+
+impl Detection {
+    /// Write what the analysis found onto `new`: the original's dimensions,
+    /// the `Blurhash` and the preview's URL and dimensions — the columns
+    /// behind the entity's `meta.original`, `meta.small` and `blurhash`.
+    fn record(&self, new: &mut NewMediaAttachment) {
+        new.width = column_dimension(self.info.width);
+        new.height = column_dimension(self.info.height);
+        new.blurhash.clone_from(&self.blurhash);
+        if let Some(preview) = &self.preview {
+            new.preview_url = Some(preview.url.clone());
+            new.preview_width = column_dimension(preview.width);
+            new.preview_height = column_dimension(preview.height);
+        }
+    }
+}
+
+/// A detected pixel count as the `integer` column value it needs. `None`
+/// (with a log line) for an edge over `i32::MAX`, which the enforced
+/// `MAX_IMAGE_PIXELS` rules out unless an operator raised the limit past
+/// the column's range — the row then simply keeps that part unknown.
+fn column_dimension(pixels: u32) -> Option<i32> {
+    match i32::try_from(pixels) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warn!(pixels, %err, "detected dimension does not fit an integer column");
+            None
+        }
+    }
+}
+
+/// Read the upload's image dimensions and, for an `image/*` type, render
+/// its preview and compute its `Blurhash` — all the CPU work in one
+/// [`tokio::task::spawn_blocking`] pass, so decoders never run on the
+/// async runtime. A non-image upload analyzes to `None`: there is nothing
+/// on the row for it to fill.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] from [`media_processing::analyze_image`] for
+/// an undecodable image ("Invalid image") or one over
+/// `MAX_IMAGE_PIXELS` ("Image too large"); [`AppError::Internal`] when the
+/// blocking task itself is gone. Thumbnail and `Blurhash` failures are not
+/// errors here — they ride along inside [`Analyzed`], because losing an
+/// extra must not fail the upload.
+async fn analyze_upload(state: &AppState, upload: &Upload) -> AppResult<Option<Analyzed>> {
+    if !upload.content_type.starts_with("image/") {
+        return Ok(None);
+    }
+    let bytes = upload.file.bytes.clone();
+    let max_pixels = u64::try_from(state.config.max_image_pixels).unwrap_or(u64::MAX);
+    let analyzed = tokio::task::spawn_blocking(move || -> AppResult<Analyzed> {
+        let info = media_processing::analyze_image(&bytes, max_pixels)?;
+        let thumbnail = media_processing::make_thumbnail(&bytes, THUMBNAIL_MAX_EDGE);
+        let blurhash = media_processing::compute_blurhash(&bytes);
+        Ok(Analyzed {
+            info,
+            thumbnail,
+            blurhash,
+        })
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("image analysis task did not finish: {err}")))??;
+    Ok(Some(analyzed))
+}
+
+/// Fold [`Analyzed`] into the [`Detection`] the row records: store the
+/// generated preview under `key`'s stem with a `_small` suffix, logging and
+/// dropping either failure — an upload never answers 500 over a preview it
+/// could not make.
+async fn detect_stored(state: &AppState, key: &str, analyzed: Analyzed) -> Detection {
+    let Analyzed {
+        info,
+        thumbnail,
+        blurhash,
+    } = analyzed;
+    let preview = match thumbnail {
+        Ok(thumbnail) => store_generated_preview(state, key, &thumbnail).await,
+        Err(err) => {
+            warn!(%err, %key, "thumbnail generation failed, storing no preview");
+            None
+        }
+    };
+    Detection {
+        info,
+        blurhash,
+        preview,
+    }
+}
+
+/// Store `thumbnail` as the preview of the file kept at `key`: the same
+/// stem, a `_small` suffix and the encoded format's extension
+/// (`<stem>_small.jpg` / `<stem>_small.png`). A storage failure is logged
+/// and answers `None`, leaving the upload without a preview.
+async fn store_generated_preview(
+    state: &AppState,
+    key: &str,
+    thumbnail: &Thumbnail,
+) -> Option<StoredPreview> {
+    let preview_key = preview_key(key, thumbnail.extension());
+    let body = Bytes::copy_from_slice(&thumbnail.bytes);
+    if let Err(err) = state
+        .uploader
+        .put(&preview_key, body, thumbnail.content_type)
+        .await
+    {
+        warn!(%err, preview_key = %preview_key, "storing the thumbnail failed, serving the file without a preview");
+        return None;
+    }
+    Some(StoredPreview {
+        url: state.uploader.public_url(&preview_key),
+        width: thumbnail.width,
+        height: thumbnail.height,
+    })
+}
+
+/// The key of the preview generated for the file stored at `key`: the same
+/// stem up to the extension, a `_small` suffix and `extension`.
+fn preview_key(key: &str, extension: &str) -> String {
+    let (stem, _) = key.rsplit_once('.').unwrap_or((key, ""));
+    format!("{stem}_small.{extension}")
+}
+
 /// The text parameters of a media upload: everything beside the file.
 ///
 /// A `thumbnail` part is not a field of this struct on purpose: serde
 /// ignores unknown keys, so the parameter (and a file part of that name,
-/// which never reaches `fields`) is accepted and dropped until thumbnailing
-/// exists.
+/// which never reaches `fields`) is accepted and dropped — the upload
+/// endpoint's preview is generated by [`media_processing`], not supplied
+/// by the client.
 #[derive(Debug, Deserialize)]
 struct UploadParams {
     /// Alt text describing the media for accessibility.
@@ -250,6 +435,8 @@ impl Upload {
 
     /// The row this upload inserts: the caller's media, stored at `key` and
     /// served at the uploader's public URL for it, attached to no status.
+    /// `detection` — set when the upload was an analysed image — fills the
+    /// dimension, `Blurhash` and preview columns ([`Detection::record`]).
     ///
     /// # Errors
     ///
@@ -260,12 +447,13 @@ impl Upload {
         user_id: Uuid,
         uploader: &UploaderBackend,
         key: &str,
+        detection: Option<&Detection>,
     ) -> AppResult<NewMediaAttachment> {
         let file_size = i64::try_from(self.file.bytes.len()).map_err(|err| {
             AppError::Internal(format!("uploaded file size is unrecordable: {err}"))
         })?;
         let (focus_x, focus_y) = self.focus.unzip();
-        Ok(NewMediaAttachment {
+        let mut new = NewMediaAttachment {
             user_id: Some(user_id),
             status_id: None,
             storage_key: Some(key.to_owned()),
@@ -276,7 +464,11 @@ impl Upload {
             focus_y,
             file_size: Some(file_size),
             ..NewMediaAttachment::default()
-        })
+        };
+        if let Some(detection) = detection {
+            detection.record(&mut new);
+        }
+        Ok(new)
     }
 }
 
@@ -451,11 +643,13 @@ fn updated_focus(
 }
 
 /// Store `file` as the attachment's preview image, answering its public
-/// URL. No image-analysis or thumbnailing service exists yet, so the bytes
-/// are stored as they arrived; the [`detect_media_type`] gate and the
-/// detected type's extension in [`uploads::media_key`] are shared with the
-/// upload endpoint, so a preview is only ever a file the media route will
-/// serve as the type its bytes carry.
+/// URL. A client-supplied preview is stored as it arrived — the analysis
+/// and thumbnailing services run on upload, not on every edit — but the
+/// [`detect_media_type`] gate and the detected type's extension in
+/// [`uploads::media_key`] are shared with the upload endpoint, so a preview
+/// is only ever a file the media route will serve as the type its bytes
+/// carry. The row's stored preview dimensions keep describing the generated
+/// preview; re-detecting a replaced one belongs to a later ticket.
 ///
 /// # Errors
 ///
@@ -635,7 +829,7 @@ mod tests {
         ))
         .expect("the fixture is a valid upload");
         upload
-            .new_attachment(Uuid::now_v7(), &uploader(), "u/9b3c1d0e4f5a6b7c.png")
+            .new_attachment(Uuid::now_v7(), &uploader(), "u/9b3c1d0e4f5a6b7c.png", None)
             .expect("the fixture size is recordable")
     }
 
@@ -751,7 +945,10 @@ mod tests {
             Some(i64::try_from(PNG.len()).expect("the fixture size is recordable")),
             "the byte count of the stored file"
         );
-        assert!(new.preview_url.is_none(), "thumbnailing is later");
+        assert!(
+            new.preview_url.is_none(),
+            "the row only gains a preview when detection produced one"
+        );
         assert!(new.remote_url.is_none(), "a local upload has no origin");
     }
 
@@ -820,6 +1017,8 @@ mod tests {
             blurhash: None,
             width: None,
             height: None,
+            preview_width: None,
+            preview_height: None,
             duration: None,
             focus_x: Some(0.25),
             focus_y: Some(-0.5),
@@ -1012,5 +1211,105 @@ mod tests {
                 "`{focus}` is not a focal point, and the update says so its own way"
             );
         }
+    }
+
+    #[test]
+    fn the_preview_key_shares_its_originals_stem() {
+        assert_eq!(
+            preview_key("u/9b3c1d0e4f5a6b7c.png", "jpg"),
+            "u/9b3c1d0e4f5a6b7c_small.jpg",
+            "same stem, _small, the encoded extension"
+        );
+        assert_eq!(
+            preview_key("u/9b3c1d0e4f5a6b7c.gif", "png"),
+            "u/9b3c1d0e4f5a6b7c_small.png",
+            "a GIF previews as a PNG beside the same stem"
+        );
+        assert_eq!(
+            preview_key("u/9b3c1d0e4f5a6b7c", "jpg"),
+            "u/9b3c1d0e4f5a6b7c_small.jpg",
+            "a key without an extension is still a stem"
+        );
+    }
+
+    #[test]
+    fn detection_records_the_analysis_columns() {
+        let detection = Detection {
+            info: ImageInfo {
+                width: 1024,
+                height: 512,
+            },
+            blurhash: Some("UBLHZ;9a?wWB%%.8t7Rj".to_owned()),
+            preview: Some(StoredPreview {
+                url: "https://test.example/media/u/9b3c_small.jpg".to_owned(),
+                width: 400,
+                height: 200,
+            }),
+        };
+        let upload = Upload {
+            file: file_part("cat.png", "image/png", PNG),
+            description: None,
+            focus: None,
+            content_type: "image/png",
+        };
+        let new = upload
+            .new_attachment(
+                Uuid::now_v7(),
+                &uploader(),
+                "u/9b3c1d0e4f5a6b7c.png",
+                Some(&detection),
+            )
+            .expect("the fixture size is recordable");
+        assert_eq!(new.width, Some(1024), "the original width is recorded");
+        assert_eq!(new.height, Some(512), "and its height");
+        assert_eq!(
+            new.blurhash.as_deref(),
+            Some("UBLHZ;9a?wWB%%.8t7Rj"),
+            "the blurhash is recorded"
+        );
+        assert_eq!(
+            new.preview_url.as_deref(),
+            Some("https://test.example/media/u/9b3c_small.jpg"),
+            "the preview url is recorded"
+        );
+        assert_eq!(new.preview_width, Some(400), "and the preview dimensions");
+        assert_eq!(new.preview_height, Some(200), "both of them");
+
+        let without_preview = Detection {
+            info: detection.info,
+            blurhash: None,
+            preview: None,
+        };
+        let lost = upload
+            .new_attachment(
+                Uuid::now_v7(),
+                &uploader(),
+                "u/9b3c.png",
+                Some(&without_preview),
+            )
+            .expect("the fixture size is recordable");
+        assert!(
+            lost.preview_url.is_none() && lost.preview_width.is_none(),
+            "a failed thumbnail leaves the preview columns unset"
+        );
+        assert_eq!(
+            lost.width,
+            Some(1024),
+            "but the dimensions are still stored"
+        );
+        assert!(
+            lost.blurhash.is_none(),
+            "and a failed hash leaves blurhash unset"
+        );
+    }
+
+    #[test]
+    fn an_unrecordable_dimension_is_dropped_with_a_log() {
+        assert_eq!(column_dimension(400), Some(400), "a normal edge fits");
+        assert_eq!(
+            column_dimension(u32::MAX),
+            None,
+            "an edge past i32::MAX is left unknown rather than wrapped"
+        );
     }
 }

@@ -39,6 +39,9 @@ pub const MAX_CHAT_MESSAGE_CHARS_VAR: &str = "MAX_CHAT_MESSAGE_CHARS";
 pub const MAX_MEDIA_DESCRIPTION_VAR: &str = "MAX_MEDIA_DESCRIPTION";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
+/// Environment variable holding the maximum pixel count of an uploaded
+/// image.
+pub const MAX_IMAGE_PIXELS_VAR: &str = "MAX_IMAGE_PIXELS";
 /// Environment variable holding the maximum number of files per request.
 pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
 /// Environment variable holding whether outbound HTTP may reach private
@@ -114,6 +117,13 @@ pub const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 16_000_000;
 /// Upload file count used when `UPLOAD_MAX_FILES` is unset: Pleroma's
 /// `:upload, max_number_of_files`.
 pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
+/// Image pixel count used when `MAX_IMAGE_PIXELS` is unset.
+///
+/// The 40 megapixels the media ticket fixes. `POST /api/v1/media` and
+/// `POST /api/v2/media` reject an image whose decoded dimensions multiply
+/// past it with 422 `{"error":"Image too large"}` (see
+/// [`crate::services::media_processing::analyze_image`]).
+pub const DEFAULT_MAX_IMAGE_PIXELS: usize = 40_000_000;
 /// Whether the outbound SSRF guard is disabled when
 /// `HTTP_ALLOW_PRIVATE_HOSTS` is unset: it is on by default, so private
 /// and loopback targets are blocked.
@@ -325,6 +335,11 @@ pub struct Config {
     /// characters, from `MAX_MEDIA_DESCRIPTION`; `PUT /api/v1/media/{id}`
     /// refuses longer values.
     pub max_media_description: usize,
+    /// Maximum pixel count (width times height) of an uploaded image, from
+    /// `MAX_IMAGE_PIXELS`; the media upload endpoints reject an image that
+    /// decodes larger with 422 "Image too large" (see
+    /// [`crate::services::media_processing::analyze_image`]).
+    pub max_image_pixels: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -435,6 +450,7 @@ impl Config {
             MAX_MEDIA_DESCRIPTION_VAR,
             DEFAULT_MAX_MEDIA_DESCRIPTION,
         )?;
+        let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
         let upload_limits = UploadLimits {
             max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
             max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
@@ -463,6 +479,7 @@ impl Config {
             max_poll_options,
             max_chat_message_chars,
             max_media_description,
+            max_image_pixels,
             upload_limits,
             uploads_dir,
             emoji_dir,
@@ -549,6 +566,7 @@ impl Config {
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
             max_chat_message_chars: DEFAULT_MAX_CHAT_MESSAGE_CHARS,
             max_media_description: DEFAULT_MAX_MEDIA_DESCRIPTION,
+            max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
@@ -832,6 +850,7 @@ impl fmt::Debug for Config {
             .field("max_poll_options", &self.max_poll_options)
             .field("max_chat_message_chars", &self.max_chat_message_chars)
             .field("max_media_description", &self.max_media_description)
+            .field("max_image_pixels", &self.max_image_pixels)
             .field("upload_limits", &self.upload_limits)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
@@ -1252,6 +1271,28 @@ mod tests {
             debug.contains("max_media_description: 100"),
             "the description limit is visible in Debug output: {debug}"
         );
+    }
+
+    #[test]
+    fn max_image_pixels_defaults_to_forty_megapixels() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.max_image_pixels, 40_000_000,
+            "default max_image_pixels"
+        );
+    }
+
+    #[test]
+    fn reads_custom_max_image_pixels() {
+        let config = config_with(&[(MAX_IMAGE_PIXELS_VAR, "1000")]);
+        assert_eq!(config.max_image_pixels, 1_000, "custom MAX_IMAGE_PIXELS");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_image_pixels: 1000"),
+            "the pixel limit is visible in Debug output: {debug}"
+        );
+        let err = try_config_with(&[(MAX_IMAGE_PIXELS_VAR, "many")]).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidNumber(MAX_IMAGE_PIXELS_VAR));
     }
 
     #[test]

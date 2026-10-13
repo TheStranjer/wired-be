@@ -59,6 +59,11 @@ pub struct MediaAttachment {
     pub width: Option<i32>,
     /// Height of the original media in pixels.
     pub height: Option<i32>,
+    /// Width of the stored preview (the `_small` thumbnail) in pixels;
+    /// `None` when the attachment has no generated preview (yet).
+    pub preview_width: Option<i32>,
+    /// Height of the stored preview (the `_small` thumbnail) in pixels.
+    pub preview_height: Option<i32>,
     /// Length of audio and video in seconds.
     pub duration: Option<f64>,
     /// Horizontal focal point for cropping, in `[-1.0, 1.0]`.
@@ -107,6 +112,10 @@ pub struct NewMediaAttachment {
     pub width: Option<i32>,
     /// Height in pixels.
     pub height: Option<i32>,
+    /// Width of the stored preview in pixels.
+    pub preview_width: Option<i32>,
+    /// Height of the stored preview in pixels.
+    pub preview_height: Option<i32>,
     /// Duration in seconds (audio and video).
     pub duration: Option<f64>,
     /// Horizontal focal point.
@@ -125,10 +134,11 @@ pub struct NewMediaAttachment {
 const INSERT_SQL: &str = "INSERT INTO media_attachments (
      id, user_id, status_id, position, storage_key, remote_url, url,
      preview_url, content_type, description, blurhash, width, height,
-     duration, focus_x, focus_y, file_size, sensitive_hint
+     preview_width, preview_height, duration, focus_x, focus_y, file_size,
+     sensitive_hint
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18
+     $16, $17, $18, $19, $20
 ) RETURNING *";
 
 /// Inserts one media attachment and returns the stored row.
@@ -159,6 +169,8 @@ pub async fn insert(
         .bind(new_attachment.blurhash.as_deref())
         .bind(new_attachment.width)
         .bind(new_attachment.height)
+        .bind(new_attachment.preview_width)
+        .bind(new_attachment.preview_height)
         .bind(new_attachment.duration)
         .bind(new_attachment.focus_x)
         .bind(new_attachment.focus_y)
@@ -489,6 +501,8 @@ mod tests {
                 blurhash: Some("UBLHZ;9a?wWB%%.8t7Rj".to_owned()),
                 width: Some(1024),
                 height: Some(512),
+                preview_width: Some(400),
+                preview_height: Some(200),
                 duration: None,
                 focus_x: Some(0.5),
                 focus_y: Some(-0.25),
@@ -521,6 +535,12 @@ mod tests {
         );
         assert_eq!(stored.width, Some(1024), "width round trips");
         assert_eq!(stored.height, Some(512), "height round trips");
+        assert_eq!(stored.preview_width, Some(400), "preview width round trips");
+        assert_eq!(
+            stored.preview_height,
+            Some(200),
+            "preview height round trips"
+        );
         assert_eq!(stored.duration, None, "an image has no duration");
         assert_eq!(stored.focus_x, Some(0.5), "focal point x round trips");
         assert_eq!(stored.focus_y, Some(-0.25), "focal point y round trips");
@@ -566,6 +586,8 @@ mod tests {
         assert!(
             stored.width.is_none()
                 && stored.height.is_none()
+                && stored.preview_width.is_none()
+                && stored.preview_height.is_none()
                 && stored.duration.is_none()
                 && stored.focus_x.is_none()
                 && stored.focus_y.is_none()

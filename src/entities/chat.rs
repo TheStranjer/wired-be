@@ -290,6 +290,8 @@ mod tests {
             blurhash: None,
             width: None,
             height: None,
+            preview_width: None,
+            preview_height: None,
             duration: None,
             focus_x: None,
             focus_y: None,

@@ -29,6 +29,11 @@ axum = { version = "0.8.9", features = ["multipart"] }
 base32 = "0.5.1"
 base64 = "0.23.1"
 bcrypt = "0.19.3"
+# `Blurhash` placeholder strings for uploaded images
+# (`src/services/media_processing.rs`): the encoder over an RGBA buffer is
+# all the upload path needs, so the optional `image`/`gdk-pixbuf`
+# integrations stay off (the conversion is done with `image` directly).
+blurhash = "0.2.3"
 # Byte buffers (`src/http_client.rs`): buffered response bodies and the
 # incremental read buffer. `reqwest` re-exports it, but the wrapper names
 # the types directly.
@@ -38,6 +43,12 @@ dotenvy = "0.15.7"
 # HMAC (`src/util/totp.rs`): RFC 6238/4226 TOTP is HMAC-SHA1 over the time
 # step; `sha1` below supplies the hash, `subtle` the constant-time compare.
 hmac = "0.13.0"
+# Image analysis for media uploads (`src/services/media_processing.rs`):
+# dimensions, `_small` previews and the pixel data behind the `Blurhash`
+# string. Only the four formats the ticket names are compiled in, and the
+# `png`/`jpeg`/`gif` features carry the encoders the thumbnails need;
+# `webp` is decoder-side only, which is all the upload path asks of it.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 # Magic-byte media detection for uploads (`src/api/media.rs`): an upload's type
 # is what its bytes say, not what the client's part header claimed. The default
 # matchers (image, video and audio among them) are all the endpoint needs.
