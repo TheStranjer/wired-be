@@ -6,8 +6,9 @@
 //! (`lib/pleroma/web/mastodon_api/views/instance_view.ex`); here each
 //! blocked domain is a row, which is what lets the (later) admin tickets
 //! edit the list without rewriting a config blob.
-//! [`crate::api::instance`] serves [`list`] as that endpoint, and only
-//! that endpoint reads this table for now.
+//! [`crate::api::instance`] serves [`list`] as that endpoint, and
+//! outbound federation consults [`is_rejected`] before delivering to a
+//! host the instance has declared it does not talk to.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -18,6 +19,11 @@ use crate::error::AppResult;
 /// an unchanged table answer the same array. The primary key's index
 /// already serves this order.
 const LIST_SQL: &str = "SELECT * FROM instance_policy_domains ORDER BY domain";
+
+/// [`is_rejected`]: the one fact, asked as an existence check, so a domain
+/// that is not on the list costs a `false` and not a scanned table.
+const REJECT_EXISTS_SQL: &str = "SELECT EXISTS (SELECT 1 FROM instance_policy_domains \
+                                 WHERE domain = $1 AND action = 'reject')";
 
 /// One row of `instance_policy_domains`: a domain the instance's own
 /// policy restricts.
@@ -45,6 +51,27 @@ pub async fn list(pool: &PgPool) -> AppResult<Vec<InstancePolicyDomain>> {
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// Whether instance policy rejects `domain` outright: a row for it whose
+/// action is `reject`.
+///
+/// `domain` is compared exactly, so callers pass the canonical spelling the
+/// rows hold: lowercase, no scheme, no port (a URL's host already is that —
+/// see [`crate::federation::delivery`]). Softer actions (`silence`,
+/// `media_removal`) are not rejections: they restrict what is done with a
+/// domain's content, not whether this instance talks to it.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn is_rejected(pool: &PgPool, domain: &str) -> AppResult<bool> {
+    let rejected = sqlx::query_scalar::<_, bool>(REJECT_EXISTS_SQL)
+        .bind(domain)
+        .fetch_one(pool)
+        .await?;
+    Ok(rejected)
 }
 
 #[cfg(test)]
@@ -105,6 +132,31 @@ mod tests {
             silence.inserted_at <= Utc::now(),
             "the row carries its database stamp"
         );
+    }
+
+    /// `is_rejected` answers only for a `reject` row on the exact host.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn only_a_reject_row_makes_a_domain_rejected(pool: PgPool) {
+        insert(&pool, "spam.example", "reject", "").await;
+        insert(&pool, "quiet.example", "silence", "").await;
+        insert(&pool, "naked.example", "media_removal", "").await;
+
+        assert!(
+            is_rejected(&pool, "spam.example").await.unwrap(),
+            "the rejected domain answers true"
+        );
+        for domain in ["quiet.example", "naked.example"] {
+            assert!(
+                !is_rejected(&pool, domain).await.unwrap(),
+                "`{domain}` is restricted, not rejected"
+            );
+        }
+        for domain in ["SPAM.example", "sub.spam.example", "unknown.example", ""] {
+            assert!(
+                !is_rejected(&pool, domain).await.unwrap(),
+                "`{domain}` names no reject row"
+            );
+        }
     }
 
     /// The primary key keeps one policy per domain, and the `action`
