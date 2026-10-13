@@ -34,7 +34,7 @@ use crate::{
     config::Config,
     error::AppError,
     http_client::HttpClient,
-    jobs::{JobRegistry, Worker},
+    jobs::{JobRegistry, Worker, scheduler},
     services::emoji_packs,
     state::AppState,
     uploads::UploaderBackend,
@@ -53,7 +53,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     MIGRATOR.run(pool).await
 }
 
-/// Starts the HTTP server and the job worker, and shuts both down on ctrl-c.
+/// Starts the HTTP server, the job worker and the periodic scheduler, and
+/// shuts everything down on ctrl-c.
 ///
 /// Connects to PostgreSQL, applies [`MIGRATOR`], syncs the emoji packs
 /// (see [`crate::services::emoji_packs`]), binds
@@ -63,7 +64,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// interrupted. Job handlers are bound in the [`JobRegistry`] this builds:
 /// today the federation delivery job
 /// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)), so the
-/// worker idles, sweeps and delivers.
+/// worker idles, sweeps and delivers. Alongside it, a spawned
+/// [`scheduler::run`] task enqueues the [`scheduler::periodic_jobs`]
+/// recurring jobs, honoring the same ctrl-c shutdown as the other tasks.
 ///
 /// # Errors
 ///
@@ -97,8 +100,13 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         concurrency = state.config.job_concurrency,
         "job worker running"
     );
+    let scheduler_task = tokio::spawn(scheduler::run(
+        state.db.clone(),
+        scheduler::periodic_jobs(),
+        wait_for_ctrl_c(),
+    ));
     let server = axum::serve(listener, app(state)).with_graceful_shutdown(wait_for_ctrl_c());
-    let outcome = tokio::join!(server, worker.run(wait_for_ctrl_c())).0;
+    let outcome = tokio::join!(server, worker.run(wait_for_ctrl_c()), scheduler_task).0;
     Ok(outcome?)
 }
 
