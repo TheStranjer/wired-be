@@ -79,7 +79,7 @@ impl MentionRef {
     /// The full account this reference names: `nick`, or `nick@domain` for a
     /// remote one.
     #[must_use]
-    fn acct(&self) -> String {
+    pub fn acct(&self) -> String {
         let nickname = &self.nickname;
         self.domain
             .as_ref()

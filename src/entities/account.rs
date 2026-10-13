@@ -614,7 +614,7 @@ pub fn local_url(config: &Config, nickname: &str) -> String {
 
 /// The part of `nickname` before the first `@` — Pleroma's
 /// `username_from_nickname`.
-fn nickname_part(nickname: &str) -> &str {
+pub(crate) fn nickname_part(nickname: &str) -> &str {
     nickname
         .split_once('@')
         .map_or(nickname, |(nick, _domain)| nick)
