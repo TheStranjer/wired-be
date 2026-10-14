@@ -1,22 +1,31 @@
 //! Integration tests for `PATCH /api/v1/accounts/update_credentials`
 //! (WBE-67, the profile-text-fields ticket, extended by WBE-69, the
-//! profile-metadata ticket, and by this ticket's profile images): the
-//! fields this slice of the endpoint owns — `display_name` (length-capped
-//! against `MAX_DISPLAY_NAME_CHARS`, sanitized, empty stored as empty),
+//! profile-metadata ticket, by the profile-images ticket, and by this
+//! ticket's posting defaults and Pleroma settings): the fields this slice
+//! of the endpoint owns — `display_name` (length-capped against
+//! `MAX_DISPLAY_NAME_CHARS`, sanitized, empty stored as empty),
 //! `note` (length-capped against `MAX_BIO_CHARS`, stored raw in `raw_bio`
 //! and rendered to `bio` with URL, hashtag and local-mention links), the
 //! `locked` / `bot` / `discoverable` booleans, `fields_attributes` (the
 //! profile metadata: every body shape, the `MAX_PROFILE_FIELDS` count cap,
 //! the per-entry name and value character caps, both-empty entries dropped,
-//! empty clearing, raw values kept beside the rendered HTML) and the three
+//! empty clearing, raw values kept beside the rendered HTML), the three
 //! profile images — `avatar`, `header` and `pleroma_background_image` file
 //! parts stored through the uploader and served over `/media`, replaced
 //! images whose file goes away, the empty-string and JSON-`null` clears,
 //! the `AVATAR_LIMIT_BYTES` / `BANNER_LIMIT_BYTES` caps and the
-//! `png`/`jpeg`/`gif`/`webp` allowlist, both 422s — each updated
-//! individually through JSON, form and multipart bodies, with absent fields
-//! left untouched, invalid boolean strings and over-long texts answered
-//! 422, the 200 answer the owner entity with its `source` block (the
+//! `png`/`jpeg`/`gif`/`webp` allowlist, both 422s — and, from this ticket,
+//! the posting defaults of the `source` block (`source[privacy]` as the
+//! nested object or Pleroma's flat `default_scope`, `source[sensitive]`,
+//! `source[language]` with its length cap and its clearing empty string),
+//! the eleven Pleroma preference flags, `birthday` (set, cleared, and both
+//! 422s), `pleroma_settings_store` (the shallow key-by-key merge, the
+//! JSON-text spelling of a form body, the non-object and over-1-MiB
+//! refusals) and `actor_type` (the `Person`/`Service` pair that keeps `bot`
+//! in step) — each updated individually through JSON, form and multipart
+//! bodies, with absent fields left untouched, invalid boolean strings and
+//! over-long texts answered 422, the 200 answer the owner entity with its
+//! `source` block and its `pleroma` block reflecting the new values (the
 //! `verify_credentials` render), the route behind `AuthUser` and
 //! `write:accounts` (401 unauthenticated, 403 for the wrong credential),
 //! and the `POST` alias serving the old clients.
@@ -29,6 +38,7 @@
 pub mod common;
 
 use axum::{Router, body::Bytes, http::StatusCode};
+use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
@@ -491,8 +501,10 @@ async fn invalid_boolean_strings_are_422(pool: PgPool) {
 }
 
 /// Fields absent from the body keep their stored values — the flags, the
-/// note and the name each survive an update of the others, and a body
-/// that carries none of the five changes nothing (and is not an error).
+/// note, the name, the posting defaults, the Pleroma preferences, the
+/// birthday and the settings store each survive an update of the others,
+/// and a body that carries none of them changes nothing (and is not an
+/// error).
 #[sqlx::test(migrator = "wired_be::MIGRATOR")]
 async fn absent_fields_stay_untouched(pool: PgPool) {
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
@@ -502,6 +514,14 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
         new.locked = Flag::new(true);
         new.bot = Flag::new(true);
         new.discoverable = Flag::new(true);
+        new.default_scope = "unlisted".to_owned();
+        new.sensitive_default = Flag::new(true);
+        new.language = Some("pt-BR".to_owned());
+        new.hide_follows = Flag::new(true);
+        new.no_rich_text = Flag::new(true);
+        new.show_birthday = Flag::new(true);
+        new.birthday = NaiveDate::from_ymd_opt(1990, 1, 31);
+        new.settings_store = json!({"theme": "dark"});
         new
     })
     .await;
@@ -515,6 +535,35 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
     assert_eq!(flipped["display_name"], "Ada", "the name stays");
     assert_eq!(flipped["note"], "<p>old bio</p>", "the note stays");
     assert_eq!(source_of(&flipped)["note"], "old bio", "raw stays too");
+    assert_eq!(
+        source_of(&flipped)["privacy"],
+        "unlisted",
+        "the posting default the body never named stays"
+    );
+    assert_eq!(
+        source_of(&flipped)["sensitive"],
+        true,
+        "and so does the sensitive default"
+    );
+    assert_eq!(source_of(&flipped)["language"], "pt-BR", "and the language");
+    assert_eq!(
+        source_of(&flipped)["pleroma"]["no_rich_text"],
+        true,
+        "and the pleroma flags"
+    );
+    assert_eq!(
+        flipped["pleroma"]["hide_follows"], true,
+        "the follow-list flag included"
+    );
+    assert_eq!(
+        flipped["pleroma"]["birthday"], "1990-01-31",
+        "the birthday survives a flag write"
+    );
+    assert_eq!(
+        flipped["pleroma"]["settings_store"],
+        json!({"theme": "dark"}),
+        "and the stored client settings"
+    );
 
     let renamed = ok_body(&patch_json(&app, &token, &json!({"display_name": "Grace"})).await);
     assert_eq!(renamed["display_name"], "Grace", "the name updated");
@@ -523,12 +572,26 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
         renamed["note"], "<p>old bio</p>",
         "the note survives a name change"
     );
+    assert_eq!(
+        renamed["pleroma"]["show_birthday"], true,
+        "the preference flags survive a name change"
+    );
 
     let nulled = ok_body(
         &patch_json(
             &app,
             &token,
-            &json!({"display_name": null, "note": null, "locked": null}),
+            &json!({
+                "display_name": null,
+                "note": null,
+                "locked": null,
+                "source": null,
+                "birthday": null,
+                "pleroma_settings_store": null,
+                "actor_type": null,
+                "hide_followers": null,
+                "default_scope": null,
+            }),
         )
         .await,
     );
@@ -537,6 +600,24 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
         "a JSON null reads as absent, Pleroma's nil filter"
     );
     assert_eq!(nulled["locked"], true, "and so for the booleans");
+    assert_eq!(
+        nulled["pleroma"]["birthday"], "1990-01-31",
+        "a null birthday clears nothing"
+    );
+    assert_eq!(
+        nulled["pleroma"]["settings_store"],
+        json!({"theme": "dark"}),
+        "and a null settings store merges nothing"
+    );
+    assert_eq!(
+        nulled["pleroma"]["hide_followers"], false,
+        "and a null flag writes nothing"
+    );
+    assert_eq!(
+        source_of(&nulled)["pleroma"]["actor_type"],
+        "Person",
+        "and a null actor type keeps the stored kind"
+    );
 
     let empty = common::TestRequest::patch(ROUTE)
         .bearer(&token)
@@ -606,7 +687,13 @@ async fn auth_and_scope_gate_the_write(pool: PgPool) {
     let app = common::test_app(pool.clone());
 
     let no_token = common::TestRequest::patch(ROUTE)
-        .json(&json!({"display_name": "Nobody"}))
+        .json(&json!({
+            "display_name": "Nobody",
+            "source": {"privacy": "private", "language": "de"},
+            "birthday": "1990-01-31",
+            "pleroma_settings_store": {"theme": "light"},
+            "hide_followers": true,
+        }))
         .send(&app)
         .await;
     assert_eq!(no_token.status, StatusCode::UNAUTHORIZED, "no token");
@@ -640,6 +727,16 @@ async fn auth_and_scope_gate_the_write(pool: PgPool) {
 
     let row = stored(&pool, alice.id).await;
     assert_eq!(row.name, "", "no rejection wrote anything");
+    assert_eq!(
+        row.default_scope, "public",
+        "and none of the new columns either"
+    );
+    assert!(row.birthday.is_none(), "no birthday");
+    assert_eq!(
+        row.settings_store,
+        json!({}),
+        "no settings store from the unauthenticated body"
+    );
 }
 
 /// Old clients `POST` the same body to the same path and get the same
@@ -1710,5 +1807,738 @@ async fn a_text_update_leaves_a_stored_image_alone(pool: PgPool) {
         stored(&pool, alice.id).await.avatar_url.as_deref(),
         Some(avatar.as_str()),
         "stored through the unrelated write"
+    );
+}
+
+/// The `pleroma` block of an answered owner entity.
+fn pleroma_of(body: &Value) -> Value {
+    body.get("pleroma")
+        .cloned()
+        .expect("update_credentials renders the pleroma block")
+}
+
+/// The eleven Pleroma preference flags `update_credentials` writes, in the
+/// order the entity renders them.
+const PREF_FLAGS: [&str; 11] = [
+    "hide_followers",
+    "hide_follows",
+    "hide_followers_count",
+    "hide_follows_count",
+    "hide_favorites",
+    "skip_thread_containment",
+    "allow_following_move",
+    "accepts_chat_messages",
+    "show_birthday",
+    "show_role",
+    "no_rich_text",
+];
+
+/// The two of [`PREF_FLAGS`] Pleroma renders inside `source.pleroma` rather
+/// than the top-level `pleroma` block.
+const SOURCE_FLAGS: [&str; 2] = ["show_role", "no_rich_text"];
+
+/// The value the owner entity answers for one preference flag, wherever that
+/// key lives.
+fn flag_of(body: &Value, field: &str) -> Value {
+    if SOURCE_FLAGS.contains(&field) {
+        return source_of(body)["pleroma"][field].clone();
+    }
+    pleroma_of(body)[field].clone()
+}
+
+/// The stored column behind one preference flag, for the assertions that
+/// read the row rather than the answer.
+fn stored_flag(row: &User, field: &str) -> bool {
+    match field {
+        "hide_followers" => row.hide_followers.get(),
+        "hide_follows" => row.hide_follows.get(),
+        "hide_followers_count" => row.hide_followers_count.get(),
+        "hide_follows_count" => row.hide_follows_count.get(),
+        "hide_favorites" => row.hide_favorites.get(),
+        "skip_thread_containment" => row.skip_thread_containment.get(),
+        "allow_following_move" => row.allow_following_move.get(),
+        "accepts_chat_messages" => row.accepts_chat_messages.get(),
+        "show_birthday" => row.show_birthday.get(),
+        "show_role" => row.show_role.get(),
+        "no_rich_text" => row.no_rich_text.get(),
+        other => panic!("`{other}` is not one of the eleven preference flags"),
+    }
+}
+
+/// `source[privacy]` sets the posting default, in all three spellings the
+/// endpoint takes it in — the nested JSON object, the bracketed form key and
+/// Pleroma's flat `default_scope` — with the block winning over the flat
+/// name, as `AccountController.update_credentials` applies them.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn source_privacy_updates_the_posting_default(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let via_json =
+        ok_body(&patch_json(&app, &token, &json!({"source": {"privacy": "private"}})).await);
+    assert_eq!(
+        source_of(&via_json)["privacy"],
+        "private",
+        "the nested JSON object answers the new default"
+    );
+
+    let via_form = ok_body(&patch_form(&app, &token, &[("source[privacy]", "unlisted")]).await);
+    assert_eq!(
+        source_of(&via_form)["privacy"],
+        "unlisted",
+        "the bracketed form key is the same parameter"
+    );
+
+    let via_flat = ok_body(&patch_form(&app, &token, &[("default_scope", "direct")]).await);
+    assert_eq!(
+        source_of(&via_flat)["privacy"],
+        "direct",
+        "and so is Pleroma's flat name"
+    );
+
+    let both = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"default_scope": "public", "source": {"privacy": "private"}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        source_of(&both)["privacy"],
+        "private",
+        "the block wins over the flat name"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.default_scope, "private",
+        "the column is the answered privacy"
+    );
+}
+
+/// A privacy outside the four visibilities is the 422, in either spelling,
+/// and the refused body writes nothing at all.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn an_unknown_privacy_is_422(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    for body in [
+        json!({"source": {"privacy": "internal"}}),
+        json!({"default_scope": "protected"}),
+        json!({"source": {"privacy": ""}}),
+        json!({"source": {"privacy": "PUBLIC"}}),
+    ] {
+        let response = patch_json(&app, &token, &body).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`{body}` names no visibility"
+        );
+        assert_eq!(
+            response.text(),
+            r#"{"error":"privacy: is not included in the list"}"#,
+            "the 422 names the parameter"
+        );
+    }
+    let mixed = patch_json(
+        &app,
+        &token,
+        &json!({"display_name": "Ada", "source": {"privacy": "internal"}}),
+    )
+    .await;
+    assert_eq!(
+        mixed.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a good field riding with a bad privacy is refused whole"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.default_scope, "public", "nothing was written");
+    assert_eq!(row.name, "", "and neither was the name");
+}
+
+/// `source[sensitive]` writes the sensitive posting default through every
+/// body type, flex booleans and all, and never moves its sibling.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn source_sensitive_updates_the_sensitive_default(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let via_json =
+        ok_body(&patch_json(&app, &token, &json!({"source": {"sensitive": true}})).await);
+    assert_eq!(
+        source_of(&via_json)["sensitive"],
+        true,
+        "the JSON boolean answers the new default"
+    );
+
+    let via_form = ok_body(&patch_form(&app, &token, &[("source[sensitive]", "on")]).await);
+    assert_eq!(
+        source_of(&via_form)["sensitive"],
+        true,
+        "a form `on` is the same true"
+    );
+
+    let via_multipart =
+        ok_body(&patch_multipart(&app, &token, &[part("source[sensitive]", "0")]).await);
+    assert_eq!(
+        source_of(&via_multipart)["sensitive"],
+        false,
+        "and a multipart `0` is a false"
+    );
+    assert_eq!(
+        source_of(&via_multipart)["privacy"],
+        "public",
+        "the privacy the body never named stayed"
+    );
+
+    let bad = patch_form(&app, &token, &[("source[sensitive]", "maybe")]).await;
+    assert_eq!(
+        bad.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unknown boolean string is the extractor's 422"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert!(
+        !row.sensitive_default.get(),
+        "the stored flag is the answered one"
+    );
+    assert_eq!(
+        row.default_scope, "public",
+        "and the refusals wrote nothing"
+    );
+}
+
+/// `source[language]` writes the language posting default, the empty string
+/// clears it back to `null`, and a tag over the ten-character cap is the 422.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn source_language_is_capped_and_the_empty_tag_clears(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let via_json =
+        ok_body(&patch_json(&app, &token, &json!({"source": {"language": "pt-BR"}})).await);
+    assert_eq!(
+        source_of(&via_json)["language"],
+        "pt-BR",
+        "the JSON object answers the tag"
+    );
+
+    let via_form = ok_body(&patch_form(&app, &token, &[("source[language]", "de")]).await);
+    assert_eq!(
+        source_of(&via_form)["language"],
+        "de",
+        "the bracketed form key is the same parameter"
+    );
+
+    let at_cap = "é".repeat(10);
+    let capped = ok_body(&patch_form(&app, &token, &[("source[language]", &at_cap)]).await);
+    assert_eq!(
+        source_of(&capped)["language"],
+        at_cap,
+        "ten characters fit, counted as characters, not bytes"
+    );
+
+    let over = patch_json(
+        &app,
+        &token,
+        &json!({"source": {"language": "0123456789a"}}),
+    )
+    .await;
+    assert_eq!(
+        over.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "eleven characters are over the cap"
+    );
+    assert_eq!(
+        over.text(),
+        r#"{"error":"Language is too long (maximum is 10 characters)"}"#,
+        "the length message names the cap"
+    );
+
+    let cleared = ok_body(&patch_form(&app, &token, &[("source[language]", "")]).await);
+    assert_eq!(
+        source_of(&cleared)["language"],
+        Value::Null,
+        "the empty string clears the preference"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.language, None, "the column is NULL again");
+    assert_eq!(
+        row.default_scope, "public",
+        "the language write left the privacy alone"
+    );
+}
+
+/// Each of the eleven preference flags updates on its own, through JSON,
+/// form and multipart bodies, reaching the entity wherever Pleroma renders
+/// that key and never moving any of the other ten.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn each_pleroma_flag_updates_on_its_own(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let initial = ok_body(&patch_json(&app, &token, &json!({"display_name": "Ada"})).await);
+    let mut expect = json!({});
+    for field in PREF_FLAGS {
+        expect[field] = flag_of(&initial, field);
+    }
+
+    for field in PREF_FLAGS {
+        expect[field] = json!(true);
+        let via_json = ok_body(&patch_json(&app, &token, &one_flag(field, true)).await);
+        assert_pref_flags(&via_json, &expect, &format!("a JSON true for {field}"));
+
+        expect[field] = json!(false);
+        let via_form = ok_body(&patch_form(&app, &token, &[(field, "false")]).await);
+        assert_pref_flags(&via_form, &expect, &format!("a form false for {field}"));
+
+        expect[field] = json!(true);
+        let via_multipart = ok_body(
+            &patch_multipart(
+                &app,
+                &token,
+                &[part(field, "yes"), part("source[privacy]", "direct")],
+            )
+            .await,
+        );
+        assert_pref_flags(
+            &via_multipart,
+            &expect,
+            &format!("a multipart yes for {field}"),
+        );
+        assert_eq!(
+            source_of(&via_multipart)["privacy"],
+            "direct",
+            "the privacy rode along with the flag"
+        );
+    }
+
+    let row = stored(&pool, alice.id).await;
+    for field in PREF_FLAGS {
+        assert!(
+            stored_flag(&row, field),
+            "{field} is the stored true the answer stated"
+        );
+    }
+    assert_eq!(row.default_scope, "direct", "the stored privacy too");
+}
+
+/// Assert every preference flag of the answer against `expect` — the running
+/// stored state, so each round also proves the ten flags it did not send
+/// stayed where they were.
+fn assert_pref_flags(body: &Value, expect: &Value, why: &str) {
+    for field in PREF_FLAGS {
+        assert_eq!(flag_of(body, field), expect[field], "{why}: {field}");
+    }
+}
+
+/// `birthday` is stored from a JSON body and a form alike, the empty string
+/// clears the column, and the answer renders the date back in the owner's
+/// `pleroma` block.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn birthday_updates_and_the_empty_string_clears_it(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let via_json = ok_body(&patch_json(&app, &token, &json!({"birthday": "1990-01-31"})).await);
+    assert_eq!(
+        pleroma_of(&via_json)["birthday"],
+        "1990-01-31",
+        "the owner view answers the stored date"
+    );
+
+    let via_form = ok_body(&patch_form(&app, &token, &[("birthday", "2000-02-29")]).await);
+    assert_eq!(
+        pleroma_of(&via_form)["birthday"],
+        "2000-02-29",
+        "a form body is the same parameter"
+    );
+    assert_eq!(
+        stored(&pool, alice.id).await.birthday,
+        NaiveDate::from_ymd_opt(2000, 2, 29),
+        "the leap day is what the row holds"
+    );
+
+    let shown = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"show_birthday": true, "birthday": "1990-01-31"}),
+        )
+        .await,
+    );
+    assert_eq!(
+        pleroma_of(&shown)["show_birthday"],
+        true,
+        "the flag a client sets beside the date sticks"
+    );
+
+    let cleared = ok_body(&patch_form(&app, &token, &[("birthday", "")]).await);
+    assert_eq!(
+        pleroma_of(&cleared)["birthday"],
+        Value::Null,
+        "the empty string clears the date"
+    );
+    assert_eq!(
+        stored(&pool, alice.id).await.birthday,
+        None,
+        "and stores NULL behind it"
+    );
+}
+
+/// A birthday that is not `YYYY-MM-DD` text or one after today is the 422,
+/// and neither writes anything.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn an_invalid_or_future_birthday_is_422(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let stored_date = ok_body(&patch_json(&app, &token, &json!({"birthday": "1990-01-31"})).await);
+    assert_eq!(
+        pleroma_of(&stored_date)["birthday"],
+        "1990-01-31",
+        "the fixture date is stored"
+    );
+
+    for text in [
+        "31-01-1990",
+        "1990-1-31",
+        "1990-13-01",
+        "yesterday",
+        "1990-01-31T00:00:00Z",
+    ] {
+        let response = patch_json(&app, &token, &json!({"birthday": text})).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`{text}` is no `YYYY-MM-DD` date"
+        );
+        assert_eq!(
+            response.text(),
+            r#"{"error":"birthday: is not a valid date"}"#,
+            "the parse 422 names the parameter"
+        );
+    }
+
+    let tomorrow = Utc::now()
+        .date_naive()
+        .succ_opt()
+        .expect("tomorrow exists")
+        .format("%Y-%m-%d")
+        .to_string();
+    let future = patch_form(&app, &token, &[("birthday", &tomorrow)]).await;
+    assert_eq!(
+        future.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "`{tomorrow}` is in the future"
+    );
+    assert_eq!(
+        future.text(),
+        r#"{"error":"birthday: must not be in the future"}"#,
+        "the future 422 names the parameter"
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.birthday,
+        NaiveDate::from_ymd_opt(1990, 1, 31),
+        "no refusal moved the stored date"
+    );
+}
+
+/// `pleroma_settings_store` merges into the stored blob key by key: a
+/// submitted key wins, an untouched key stays, a nested object is replaced
+/// whole, and the owner's `pleroma.settings_store` answers the result.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_settings_store_merges_key_by_key(pool: PgPool) {
+    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+        new.settings_store = json!({"theme": "dark", "locale": "pt", "fe": {"a": 1, "b": 2}});
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    let app = common::test_app(pool.clone());
+
+    let merged = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"pleroma_settings_store": {"locale": "de", "custom": {"nested": true}}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        pleroma_of(&merged)["settings_store"],
+        json!({"theme": "dark", "locale": "de", "fe": {"a": 1, "b": 2}, "custom": {"nested": true}}),
+        "the submitted keys win, the stored ones stay"
+    );
+
+    let replaced = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"pleroma_settings_store": {"fe": {"c": 3}}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        pleroma_of(&replaced)["settings_store"],
+        json!({"theme": "dark", "locale": "de", "custom": {"nested": true}, "fe": {"c": 3}}),
+        "a nested object replaces the stored one: the merge is shallow, key by key"
+    );
+
+    let nulled = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"pleroma_settings_store": {"theme": null}}),
+        )
+        .await,
+    );
+    assert_eq!(
+        pleroma_of(&nulled)["settings_store"]["theme"],
+        Value::Null,
+        "unlike the settings endpoint's deep merge, a null is a stored null"
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.settings_store,
+        json!({"custom": {"nested": true}, "fe": {"c": 3}, "locale": "de", "theme": null}),
+        "the row is what the answer stated"
+    );
+    assert_eq!(row.name, "", "the settings write left the profile alone");
+}
+
+/// A form body carries `pleroma_settings_store` as JSON *text*; so does a
+/// multipart text part. Both parse into the object they name and merge like
+/// the JSON spelling.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_form_settings_store_arrives_as_json_text(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let patch = r#"{"theme": "light", "fe": {"v": 1}}"#;
+
+    let via_form = ok_body(&patch_form(&app, &token, &[("pleroma_settings_store", patch)]).await);
+    assert_eq!(
+        pleroma_of(&via_form)["settings_store"],
+        json!({"theme": "light", "fe": {"v": 1}}),
+        "the form's JSON text parses"
+    );
+
+    let via_multipart = ok_body(
+        &patch_multipart(
+            &app,
+            &token,
+            &[
+                part("pleroma_settings_store", "{\"bookmarks\": false}"),
+                part("display_name", "Ada"),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        pleroma_of(&via_multipart)["settings_store"],
+        json!({"theme": "light", "fe": {"v": 1}, "bookmarks": false}),
+        "a multipart text part merges over what the form left"
+    );
+    assert_eq!(
+        via_multipart["display_name"], "Ada",
+        "and the text field rode along"
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.settings_store,
+        json!({"theme": "light", "fe": {"v": 1}, "bookmarks": false}),
+        "stored as answered"
+    );
+}
+
+/// A settings store that is no object, and a merged blob past 1 MiB, are both
+/// the 422 with nothing written.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_bad_or_oversize_settings_store_is_422(pool: PgPool) {
+    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+        new.settings_store = json!({"theme": "dark"});
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    let app = common::test_app(pool.clone());
+
+    for patch in [json!([1, 2]), json!(5), json!("plain text")] {
+        let response = patch_json(&app, &token, &json!({"pleroma_settings_store": patch})).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`{patch}` has no keys to merge"
+        );
+        assert_eq!(
+            response.text(),
+            r#"{"error":"pleroma_settings_store: expected a JSON object"}"#,
+            "the shape 422 names the parameter"
+        );
+    }
+
+    let blob = "x".repeat(1024 * 1024 + 1);
+    let too_large = patch_json(
+        &app,
+        &token,
+        &json!({"pleroma_settings_store": {"blob": blob}}),
+    )
+    .await;
+    assert_eq!(
+        too_large.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a merged store past one mebibyte is refused"
+    );
+    assert_eq!(
+        too_large.text(),
+        r#"{"error":"settings_store: too large"}"#,
+        "the same wording the settings endpoint uses"
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.settings_store,
+        json!({"theme": "dark"}),
+        "and every refusal left the stored blob alone"
+    );
+}
+
+/// `actor_type` and `bot` are one pair: the stated kind decides the flag, the
+/// flag picks the kind when no kind is stated, and a kind outside `Person`
+/// and `Service` is the 422.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn actor_type_and_bot_are_written_as_one_pair(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let service = ok_body(&patch_json(&app, &token, &json!({"actor_type": "Service"})).await);
+    assert_eq!(
+        source_of(&service)["pleroma"]["actor_type"],
+        "Service",
+        "the stated kind is the stored kind"
+    );
+    assert_eq!(service["bot"], true, "and a Service is a bot");
+
+    let human = ok_body(&patch_form(&app, &token, &[("actor_type", "Person")]).await);
+    assert_eq!(
+        source_of(&human)["pleroma"]["actor_type"],
+        "Person",
+        "a form body states it the same way"
+    );
+    assert_eq!(human["bot"], false, "and a Person is not a bot");
+
+    let automated = ok_body(&patch_json(&app, &token, &json!({"bot": true})).await);
+    assert_eq!(
+        source_of(&automated)["pleroma"]["actor_type"],
+        "Service",
+        "the bot flag alone picks the actor kind, as Pleroma does"
+    );
+    assert_eq!(automated["bot"], true, "and stays set");
+
+    let both = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"bot": false, "actor_type": "Service"}),
+        )
+        .await,
+    );
+    assert_eq!(
+        source_of(&both)["pleroma"]["actor_type"],
+        "Service",
+        "an explicit kind wins over the flag"
+    );
+    assert_eq!(
+        both["bot"], true,
+        "and the answered flag reads back from the kind"
+    );
+
+    for kind in ["Group", "Application", "person", ""] {
+        let response = patch_json(&app, &token, &json!({"actor_type": kind})).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`{kind}` is no kind this endpoint sets"
+        );
+        assert_eq!(
+            response.text(),
+            r#"{"error":"actor_type: is not included in the list"}"#,
+            "the 422 names the parameter"
+        );
+    }
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.actor_type, "Service", "the refusals wrote nothing");
+    assert!(row.bot.get(), "and so for the bot flag");
+}
+
+/// The new parameters are the owner's own settings: the answer carries them
+/// in the `source` block and the `pleroma` block, and a stranger's `show`
+/// view keeps Pleroma's restricted render of the same row.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_response_reflects_every_new_value(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let body = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({
+                "source": {"privacy": "private", "sensitive": true, "language": "eo"},
+                "birthday": "1990-01-31",
+                "show_birthday": true,
+                "hide_followers": true,
+                "no_rich_text": true,
+                "pleroma_settings_store": {"theme": "dark"},
+                "actor_type": "Service",
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        source_of(&body),
+        json!({
+            "privacy": "private",
+            "sensitive": true,
+            "language": "eo",
+            "note": "",
+            "fields": [],
+            "follow_requests_count": 0,
+            "pleroma": {
+                "show_role": true,
+                "no_rich_text": true,
+                "discoverable": false,
+                "actor_type": "Service",
+            },
+        }),
+        "the source block carries the posting defaults and the pleroma settings"
+    );
+    assert_eq!(body["bot"], true, "the answered bot flag follows the kind");
+    let pleroma = pleroma_of(&body);
+    assert_eq!(pleroma["birthday"], "1990-01-31", "the owner sees the date");
+    assert_eq!(pleroma["show_birthday"], true, "and the flag");
+    assert_eq!(pleroma["hide_followers"], true, "and the hidden list");
+    assert_eq!(
+        pleroma["settings_store"],
+        json!({"theme": "dark"}),
+        "and the client settings"
+    );
+
+    let other = common::create_local_user(&pool, "bob").await;
+    let viewer = common::create_app_and_token(&pool, &other, "read:accounts").await;
+    let shown = common::TestRequest::get(&format!("/api/v1/accounts/{}", alice.id))
+        .bearer(&viewer)
+        .send(&app)
+        .await;
+    let shown_body = shown.json_value();
+    assert_eq!(
+        shown_body.get("source"),
+        None,
+        "a stranger gets no source block"
+    );
+    assert_eq!(
+        shown_body["pleroma"]["birthday"], "1990-01-31",
+        "and sees the birthday the account chose to show"
+    );
+    assert_eq!(
+        shown_body["pleroma"]["hide_followers"], true,
+        "the privacy flags are public information"
+    );
+    assert_eq!(
+        shown_body["pleroma"].get("settings_store"),
+        None,
+        "but the client settings are not"
     );
 }

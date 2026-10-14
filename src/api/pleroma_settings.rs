@@ -77,15 +77,17 @@ use crate::{
 };
 
 /// The whole settings store may not exceed one mebibyte of JSON text.
-const MAX_SETTINGS_STORE_BYTES: usize = 1024 * 1024;
+pub const MAX_SETTINGS_STORE_BYTES: usize = 1024 * 1024;
 /// Longest accepted `{app}` path segment.
 const MAX_APP_NAME_CHARS: usize = 64;
 /// 422 body for a `{app}` segment outside [`MAX_APP_NAME_CHARS`] characters
 /// of `[A-Za-z0-9_.:-]`.
 const INVALID_APP: &str = "Invalid app";
 /// 422 body for a merged settings store past [`MAX_SETTINGS_STORE_BYTES`],
-/// the message the ticket fixes.
-const STORE_TOO_LARGE: &str = "settings_store: too large";
+/// the message the ticket fixes. Shared with
+/// [`update_credentials`](crate::api::accounts), which writes the same
+/// column through `pleroma_settings_store`.
+pub const STORE_TOO_LARGE: &str = "settings_store: too large";
 /// 415 body for mascot bytes that are not an image (Pleroma's
 /// `MascotController` wording).
 const MASCOTS_IMAGES_ONLY: &str = "mascots can only be images";
@@ -395,18 +397,39 @@ fn store_value_with(store: &Value, key: &str, value: &Value) -> Value {
 /// exceed [`MAX_SETTINGS_STORE_BYTES`] (the check runs before the write,
 /// so a refusal leaves the stored blob untouched).
 ///
+/// Shared with [`update_credentials`](crate::api::accounts), which merges a
+/// submitted `pleroma_settings_store` into the same column.
+///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with [`STORE_TOO_LARGE`] over the limit, or
 /// [`AppError::Internal`] for a store that will not serialize (which only
 /// a non-finite number could do, and the request parsers never make one).
-fn check_store_size(store: &Value) -> AppResult<()> {
+pub fn check_store_size(store: &Value) -> AppResult<()> {
     let encoded = serde_json::to_vec(store)
         .map_err(|err| AppError::Internal(format!("the settings store did not encode: {err}")))?;
     if encoded.len() > MAX_SETTINGS_STORE_BYTES {
         return Err(AppError::Unprocessable(STORE_TOO_LARGE.to_owned()));
     }
     Ok(())
+}
+
+/// `patch` shallow-merged over `base`: Pleroma's `Map.merge`, key by key.
+///
+/// Every key of `patch` replaces the stored entry under the same name and
+/// every other entry of `base` is kept. Unlike this module's `deep_merge`
+/// (the one `PATCH /api/v1/pleroma/settings/{app}` runs) this merges top
+/// level entries only, and a `null` value is a stored `null` rather than a
+/// removal — the whole blob is what `pleroma_settings_store` writes
+/// (`User.update_changeset`'s `Map.merge`).
+#[must_use]
+pub fn shallow_merge(base: &Value, patch: &Map<String, Value>) -> Value {
+    let mut merged = object_of(base);
+    for (key, value) in patch {
+        let previous: Option<Value> = merged.insert(key.clone(), value.clone());
+        drop(previous);
+    }
+    Value::Object(merged)
 }
 
 /// The size gate, then the write: [`check_store_size`] decides, and only a
@@ -599,6 +622,33 @@ mod tests {
             merged(&json!({}), &json!({"ghost": null})),
             json!({}),
             "deleting a key that is not there changes nothing"
+        );
+    }
+
+    #[test]
+    fn shallow_merge_replaces_top_level_keys_only() {
+        assert_eq!(
+            shallow_merge(
+                &json!({"theme": "dark", "fe": {"a": 1, "b": 2}}),
+                &object(r#"{"fe": {"c": 3}, "locale": "de"}"#)
+            ),
+            json!({"theme": "dark", "fe": {"c": 3}, "locale": "de"}),
+            "a submitted key wins whole, an untouched one stays, new keys arrive"
+        );
+        assert_eq!(
+            shallow_merge(&json!({"a": 1}), &object(r#"{"a": null}"#)),
+            json!({"a": null}),
+            "unlike the deep merge, a null is a stored null, not a deletion"
+        );
+        assert_eq!(
+            shallow_merge(&json!({"a": 1}), &Map::new()),
+            json!({"a": 1}),
+            "an empty patch is the stored blob"
+        );
+        assert_eq!(
+            shallow_merge(&json!("not an object"), &object(r#"{"a": 1}"#)),
+            json!({"a": 1}),
+            "a stored blob that is no object starts empty (Pleroma's ensure_object)"
         );
     }
 
