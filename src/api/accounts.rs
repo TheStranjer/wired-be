@@ -90,6 +90,36 @@
 //! one bad one changes nothing; the file a replacement or a clear left
 //! behind is removed best-effort once the row stopped naming it.
 //! `avatar_description` and `header_description` are accepted and ignored.
+//!
+//! The posting defaults arrive in Mastodon's `source` block —
+//! `source[privacy]`, `source[sensitive]` and `source[language]` as form keys
+//! or as the nested JSON object of the same shape — and Pleroma's flat
+//! `default_scope` is the other spelling of the privacy one, losing to
+//! `source[privacy]` when a body carries both, as in
+//! `AccountController.update_credentials`. `privacy` must be one of the four
+//! visibilities in `SCOPES` (any other text is the 422 `PRIVACY_INVALID`
+//! wording), `sensitive` is a [`flex`] boolean, and `language` is a tag of
+//! at most `MAX_LANGUAGE_CHARS` characters whose empty string clears the
+//! column.
+//! The eleven Pleroma preference flags — `hide_followers`, `hide_follows`,
+//! `hide_followers_count`, `hide_follows_count`, `hide_favorites`,
+//! `show_role`, `skip_thread_containment`, `allow_following_move`,
+//! `accepts_chat_messages`, `no_rich_text` and `show_birthday` — are
+//! [`flex::opt_bool`] booleans like the three Mastodon ones. `birthday` is
+//! `YYYY-MM-DD` text (the empty string clears it, anything else that is not a
+//! date is 422, and a date after today is 422 as Pleroma's age check refuses
+//! it). `pleroma_settings_store` is a JSON object — the JSON *text* of one
+//! from a form body — merged key by key into the stored `settings_store` and
+//! refused with the 422 of
+//! [`STORE_TOO_LARGE`](crate::api::pleroma_settings::STORE_TOO_LARGE) when
+//! the merged blob passes 1 MiB, the cap
+//! `PATCH /api/v1/pleroma/settings/{app}` measures with (see
+//! [`check_store_size`]). `actor_type` is `Person` or `Service` (anything
+//! else, `Group` included, is 422); it picks the actor kind and the `bot`
+//! flag follows it, while `bot` alone picks the kind Pleroma's controller
+//! does — `true` a `Service`, `false` a `Person` — so the two columns never
+//! disagree.
+//!
 //! The answer
 //! is a 200 [`Account::for_owner`] render — the owner view with its
 //! `source` block, the same one `verify_credentials` answers — and every
@@ -188,15 +218,19 @@ use axum::{
     routing::{get, patch, post},
 };
 use bytes::Bytes;
+use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tracing::{debug, warn};
 use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::{
+        helpers::account_or_404,
+        pleroma_settings::{check_store_size, shallow_merge},
+    },
     auth::{AuthUser, MaybeAuthUser},
     config::Config,
     entities::{
@@ -211,7 +245,7 @@ use crate::{
     models::{
         account_note,
         follow::{self, Follow},
-        user::{self, Flag, ProfileFields, User},
+        user::{self, DEFAULT_ACTOR_TYPE, Flag, PleromaPrefs, ProfileFields, User},
     },
     oauth::scopes::{FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
@@ -249,6 +283,49 @@ const MAX_PROFILE_FIELD_VALUE_CHARS: usize = 2047;
 /// [`max_profile_fields`](Config::max_profile_fields); this endpoint's
 /// ticket pins the wording.
 const TOO_MANY_FIELDS: &str = "Too many fields";
+
+/// The four `default_scope` values `source[privacy]` accepts: the
+/// visibilities new statuses may default to (the same list a scrobble's
+/// `visibility` picks from).
+const SCOPES: [&str; 4] = ["public", "unlisted", "private", "direct"];
+
+/// The 422 body for a `source[privacy]` (or the flat `default_scope` of the
+/// same parameter) outside [`SCOPES`], in the wording the scrobble endpoint
+/// uses for its visibility.
+const PRIVACY_INVALID: &str = "privacy: is not included in the list";
+
+/// The longest `source[language]` tag accepted, in characters; longer is the
+/// 422 in [`merged_language`]'s wording.
+const MAX_LANGUAGE_CHARS: usize = 10;
+
+/// The two `actor_type` values `update_credentials` accepts: a human actor
+/// and an automated one (`Service` is what Pleroma stores for `bot=true`).
+const ACTOR_TYPES: [&str; 2] = [PERSON_ACTOR_TYPE, SERVICE_ACTOR_TYPE];
+
+/// The [`ACTOR_TYPES`] entry of a human actor: the column default, which is
+/// what `bot=false` stores.
+const PERSON_ACTOR_TYPE: &str = DEFAULT_ACTOR_TYPE;
+
+/// The [`ACTOR_TYPES`] entry of an automated account.
+const SERVICE_ACTOR_TYPE: &str = "Service";
+
+/// The 422 body for an `actor_type` outside [`ACTOR_TYPES`].
+const ACTOR_TYPE_INVALID: &str = "actor_type: is not included in the list";
+
+/// The 422 body for a `pleroma_settings_store` that is neither a JSON object
+/// nor the JSON text of one.
+const STORE_NOT_OBJECT: &str = "pleroma_settings_store: expected a JSON object";
+
+/// The 422 body for a `birthday` that is not `YYYY-MM-DD` text.
+const BIRTHDAY_INVALID: &str = "birthday: is not a valid date";
+
+/// The 422 body for a `birthday` after today: Pleroma's `validate_min_age`
+/// reduced to the one rule this ticket states.
+const BIRTHDAY_FUTURE: &str = "birthday: must not be in the future";
+
+/// The format of a `birthday` parameter: an ISO 8601 calendar date, the
+/// `YYYY-MM-DD` text this ticket fixes.
+const BIRTHDAY_FORMAT: &str = "%Y-%m-%d";
 
 /// The 422 message `POST /api/v1/accounts/{id}/remove_from_followers`
 /// answers when the path names the caller: this endpoint's ticket pins the
@@ -383,7 +460,18 @@ async fn with_moved(state: &AppState, account: Account, user: &User) -> AppResul
 /// written; a JSON `null` reads as absent (Pleroma drops nil-valued
 /// parameters before the changeset). The booleans arrive through
 /// [`flex::opt_bool`], so a form's `"true"`/`"on"`/`"1"` spells the same
-/// as JSON `true`, and an unknown string is the extractor's 422.
+/// as JSON `true`, and an unknown string is the extractor's 422. That
+/// covers the eleven Pleroma preference flags and `source[sensitive]` as
+/// well as the three Mastodon booleans.
+///
+/// The `source` block is [`SourceParams`], read from the form's
+/// `source[privacy]=…` keys or the JSON object of the same shape;
+/// `default_scope` is Pleroma's flat spelling of `source[privacy]` and
+/// loses to it when a body carries both. `birthday` is `YYYY-MM-DD` text
+/// ([`merged_birthday`]), `pleroma_settings_store` the JSON object — or,
+/// from a form, the JSON *text* of one — that merges into the stored
+/// settings blob ([`merged_store`]), and `actor_type` the actor kind
+/// [`merged_actor`] pairs with `bot`.
 ///
 /// The three profile images are the exception to the `null` rule, and so are
 /// read through [`kept_value`] as raw [`Value`]s: Pleroma's
@@ -408,12 +496,67 @@ struct ProfileParams {
     /// Whether follow requests need manual approval.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     locked: Option<bool>,
-    /// Whether the account is flagged as automated.
+    /// Whether the account is flagged as automated; the other half of the
+    /// pair [`merged_actor`] writes.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     bot: Option<bool>,
     /// Whether the account opts into discovery.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     discoverable: Option<bool>,
+    /// The `source` block of Mastodon's account entity, sent as
+    /// `source[privacy]`/`source[sensitive]`/`source[language]` form keys or
+    /// as the nested JSON object of the same shape (see [`SourceParams`]).
+    #[serde(default)]
+    source: Option<SourceParams>,
+    /// Pleroma's flat spelling of `source[privacy]`: the visibility new
+    /// statuses default to, checked against [`SCOPES`].
+    #[serde(default)]
+    default_scope: Option<String>,
+    /// Pleroma's `pleroma_settings_store`: a JSON object (or its JSON text,
+    /// from a form) merged key by key into the stored settings blob.
+    #[serde(default)]
+    pleroma_settings_store: Option<Value>,
+    /// The `ActivityPub` actor kind, one of [`ACTOR_TYPES`]; wins over
+    /// [`bot`](Self::bot) and decides it (see [`merged_actor`]).
+    #[serde(default)]
+    actor_type: Option<String>,
+    /// The account's birthday as `YYYY-MM-DD` text, or the empty string to
+    /// clear it (see [`merged_birthday`]).
+    #[serde(default)]
+    birthday: Option<String>,
+    /// Whether the follower collection is hidden from other accounts.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    hide_followers: Option<bool>,
+    /// Whether the follow collection is hidden from other accounts.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    hide_follows: Option<bool>,
+    /// Whether the follower count renders as zero for others.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    hide_followers_count: Option<bool>,
+    /// Whether the follow count renders as zero for others.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    hide_follows_count: Option<bool>,
+    /// Whether the favourites list is private to the account.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    hide_favorites: Option<bool>,
+    /// Whether the admin/moderator flags may be shown to others.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    show_role: Option<bool>,
+    /// Whether this account's statuses skip thread containment.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    skip_thread_containment: Option<bool>,
+    /// Whether a `Move` of the account may take the following list with it.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    allow_following_move: Option<bool>,
+    /// Whether the account accepts chat messages.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    accepts_chat_messages: Option<bool>,
+    /// Whether clients should render this account's content as plain text.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    no_rich_text: Option<bool>,
+    /// Whether strangers may see the stored birthday.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    show_birthday: Option<bool>,
     /// The profile metadata: Mastodon's `fields_attributes`, a JSON array
     /// of `{name, value}` objects, an object keyed by index or the
     /// `fields_attributes[0][name]=…` spelling of form and multipart
@@ -432,6 +575,28 @@ struct ProfileParams {
     /// The profile background image, Pleroma's own extension.
     #[serde(default, deserialize_with = "kept_value")]
     pleroma_background_image: Option<Value>,
+}
+
+/// The `source` object of an `update_credentials` body: Mastodon's editing
+/// half of the account entity, which Pleroma reads back into the posting
+/// defaults. A form carries its keys as `source[privacy]=…`, which the
+/// body parser nests into exactly this shape; a JSON body carries the object
+/// itself.
+#[derive(Debug, Deserialize)]
+struct SourceParams {
+    /// The visibility new statuses default to, checked against [`SCOPES`]
+    /// (the `users.default_scope` column).
+    #[serde(default)]
+    privacy: Option<String>,
+    /// Whether new statuses are flagged sensitive by default (the
+    /// `users.sensitive_default` column).
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    sensitive: Option<bool>,
+    /// The BCP 47 tag new statuses default to, at most
+    /// [`MAX_LANGUAGE_CHARS`] characters and cleared by the empty string
+    /// (the `users.language` column).
+    #[serde(default)]
+    language: Option<String>,
 }
 
 /// Serde field helper for a parameter that must tell an absent key from a
@@ -463,11 +628,12 @@ where
 /// (decision 10), its file parts arriving beside the text parameters: the
 /// three profile images are the file parts this endpoint reads
 /// ([`resolve_images`]), every other file part is ignored.
-/// [`profile_fields`] validates what the body carries of the text side and
-/// merges it over the token's row, the image writes land in the same merged
-/// struct after [`ImageWrites::apply`] stored their files, and
-/// [`update_profile`](crate::models::user::update_profile) writes the eleven
-/// columns in one statement. The fresh row answers through [`owner_view`] —
+/// [`profile_fields`] validates what the body carries and merges it over the
+/// token's row, the image writes land in the same merged struct after
+/// [`ImageWrites::apply`] stored their files, and
+/// [`update_profile`](crate::models::user::update_profile) writes every
+/// profile column in one statement. The fresh row answers through
+/// [`owner_view`] —
 /// the write-behind render that states the stored fact rather than trusting
 /// the request — and only after it does [`delete_replaced_files`] remove the
 /// files the write replaced. A body that carries none of these fields is the
@@ -478,7 +644,12 @@ where
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
 /// and the `write:accounts` check; [`AppError::Unprocessable`] when
 /// `display_name` or `note` is too long, when `fields_attributes` breaks
-/// one of its limits, when a profile image is not a `png`, `jpeg`, `gif` or
+/// one of its limits, when `source[privacy]` (or the flat `default_scope`)
+/// names no visibility, when `source[language]` is over
+/// [`MAX_LANGUAGE_CHARS`] characters, when `actor_type` is neither `Person`
+/// nor `Service`, when `birthday` is no `YYYY-MM-DD` date or a future one,
+/// when `pleroma_settings_store` is no JSON object or the merged store passes
+/// the 1 MiB cap, when a profile image is not a `png`, `jpeg`, `gif` or
 /// `webp` file or when one passes its configured byte limit, and from the
 /// extractor for an invalid boolean string or a file over
 /// `UPLOAD_LIMIT_BYTES` (413). Storage failures arrive as
@@ -507,24 +678,30 @@ async fn update_credentials(
 }
 
 /// Validates the present profile parameters and merges them over the
-/// stored row: the eight text columns
-/// [`update_profile`](crate::models::user::update_profile) will write,
-/// with fields absent from the request carrying the value they already
-/// hold and fields present-but-blank carrying the blank (an empty
-/// `display_name` is stored as `""`, not reset to the nickname — this
-/// endpoint's ticket pins that against Pleroma's registration-side
-/// fallback). A `note` over [`max_bio_chars`](Config::max_bio_chars)
-/// characters (counted in characters, not bytes) is the 422 mirroring the
-/// name message; a submitted `fields_attributes` is validated and
-/// rendered by [`stored_fields`]. The three image columns start from the
-/// stored row here and are overwritten by [`ImageWrites::apply`], which is
-/// the only writer that can store a file.
+/// stored row: every column
+/// [`update_profile`](crate::models::user::update_profile) will write, with
+/// fields absent from the request carrying the value they already hold and
+/// fields present-but-blank carrying the blank (an empty `display_name` is
+/// stored as `""`, not reset to the nickname — this endpoint's ticket pins
+/// that against Pleroma's registration-side fallback). A `note` over
+/// [`max_bio_chars`](Config::max_bio_chars) characters (counted in
+/// characters, not bytes) is the 422 mirroring the name message; a submitted
+/// `fields_attributes` is validated and rendered by [`stored_fields`]. The
+/// Pleroma side of the body merges through the `merged_*` helpers below:
+/// [`merged_scope`] and [`merged_language`] for two of the three posting
+/// defaults (`source[sensitive]` is a plain [`flex`] boolean),
+/// [`merged_prefs`] for the eleven preference flags, [`merged_birthday`],
+/// [`merged_store`] and [`merged_actor`] for the date, the client settings
+/// blob and the actor kind. The three image columns start from the stored
+/// row here and are overwritten by [`ImageWrites::apply`], which is the only
+/// writer that can store a file.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] from [`sanitized_name`], the note length
-/// check or [`stored_fields`]; [`render_note`] adds any database failure
-/// as [`AppError::Database`].
+/// check, [`stored_fields`], [`merged_scope`], [`merged_language`],
+/// [`merged_actor`], [`merged_birthday`] or [`merged_store`];
+/// [`render_note`] adds any database failure as [`AppError::Database`].
 async fn profile_fields(
     state: &AppState,
     current: &User,
@@ -549,23 +726,241 @@ async fn profile_fields(
         Some(raw) => (render_note(state, raw).await?, raw.to_owned()),
         None => (current.bio.clone(), current.raw_bio.clone()),
     };
-    let (fields, raw_fields) = match params.fields_attributes {
-        Some(submitted) => stored_fields(submitted, state.config.max_profile_fields)?,
+    let (fields, raw_fields) = match params.fields_attributes.as_ref() {
+        Some(submitted) => stored_fields(submitted.clone(), state.config.max_profile_fields)?,
         None => (current.fields.clone(), current.raw_fields.clone()),
     };
+    let privacy = params
+        .source
+        .as_ref()
+        .and_then(|nested| nested.privacy.as_deref())
+        .or(params.default_scope.as_deref());
+    let language = params
+        .source
+        .as_ref()
+        .and_then(|nested| nested.language.as_deref());
+    let sensitive = params.source.as_ref().and_then(|nested| nested.sensitive);
+    let (actor_type, bot) = merged_actor(&params, current)?;
     Ok(ProfileFields {
         name: name.unwrap_or_else(|| current.name.clone()),
         bio,
         raw_bio,
         locked: params.locked.map_or(current.locked, Flag::from),
-        bot: params.bot.map_or(current.bot, Flag::from),
+        bot,
         discoverable: params.discoverable.map_or(current.discoverable, Flag::from),
         fields,
         raw_fields,
         avatar_url: current.avatar_url.clone(),
         banner_url: current.banner_url.clone(),
         background_image_url: current.background_image_url.clone(),
+        default_scope: merged_scope(privacy, &current.default_scope)?,
+        sensitive_default: sensitive.map_or(current.sensitive_default, Flag::from),
+        language: merged_language(language, current.language.as_deref())?,
+        pleroma: merged_prefs(&params, current),
+        birthday: merged_birthday(
+            params.birthday.as_deref(),
+            current.birthday,
+            Utc::now().date_naive(),
+        )?,
+        settings_store: merged_store(
+            params.pleroma_settings_store.as_ref(),
+            &current.settings_store,
+        )?,
+        actor_type,
     })
+}
+
+/// The `default_scope` to store: `submitted` — the body's
+/// `source[privacy]`, which wins over Pleroma's flat `default_scope` because
+/// that is the order `update_credentials` applies them — checked against
+/// [`SCOPES`]; `None` (neither parameter, or a JSON `null`) keeps the stored
+/// visibility.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`PRIVACY_INVALID`] for any other text.
+fn merged_scope(submitted: Option<&str>, stored: &str) -> AppResult<String> {
+    match submitted {
+        Some(text) if SCOPES.contains(&text) => Ok(text.to_owned()),
+        Some(_) => Err(AppError::Unprocessable(PRIVACY_INVALID.to_owned())),
+        None => Ok(stored.to_owned()),
+    }
+}
+
+/// The `language` to store: `submitted` — the body's `source[language]`, at
+/// most [`MAX_LANGUAGE_CHARS`] characters counted in characters, not bytes —
+/// with the empty string clearing the preference to `None`; `None` (no
+/// parameter) keeps the stored tag.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] in [`sanitized_name`]'s wording for an
+/// over-long tag.
+fn merged_language(submitted: Option<&str>, stored: Option<&str>) -> AppResult<Option<String>> {
+    let Some(raw) = submitted else {
+        return Ok(stored.map(str::to_owned));
+    };
+    if raw.chars().count() > MAX_LANGUAGE_CHARS {
+        return Err(AppError::Unprocessable(format!(
+            "Language is too long (maximum is {MAX_LANGUAGE_CHARS} characters)"
+        )));
+    }
+    Ok((!raw.is_empty()).then(|| raw.to_owned()))
+}
+
+/// The eleven `pleroma` preference flags after this body: every one of them
+/// the submitted [`flex`] boolean or, absent, the flag the row holds. No
+/// validation beyond the coercion itself: these are plain booleans.
+fn merged_prefs(params: &ProfileParams, current: &User) -> PleromaPrefs {
+    PleromaPrefs {
+        hide_followers: params
+            .hide_followers
+            .map_or(current.hide_followers, Flag::from),
+        hide_follows: params.hide_follows.map_or(current.hide_follows, Flag::from),
+        hide_followers_count: params
+            .hide_followers_count
+            .map_or(current.hide_followers_count, Flag::from),
+        hide_follows_count: params
+            .hide_follows_count
+            .map_or(current.hide_follows_count, Flag::from),
+        hide_favorites: params
+            .hide_favorites
+            .map_or(current.hide_favorites, Flag::from),
+        show_role: params.show_role.map_or(current.show_role, Flag::from),
+        skip_thread_containment: params
+            .skip_thread_containment
+            .map_or(current.skip_thread_containment, Flag::from),
+        allow_following_move: params
+            .allow_following_move
+            .map_or(current.allow_following_move, Flag::from),
+        accepts_chat_messages: params
+            .accepts_chat_messages
+            .map_or(current.accepts_chat_messages, Flag::from),
+        no_rich_text: params.no_rich_text.map_or(current.no_rich_text, Flag::from),
+        show_birthday: params
+            .show_birthday
+            .map_or(current.show_birthday, Flag::from),
+    }
+}
+
+/// The `birthday` to store: the parsed `submitted` date, the empty string
+/// clearing the column and `None` (no parameter) keeping the stored one.
+/// Text that is not the `YYYY-MM-DD` spelling is [`BIRTHDAY_INVALID`] —
+/// chrono's parser also takes `1990-1-3`, so the parsed date has to print
+/// back exactly what was sent — and a date after `today` is
+/// [`BIRTHDAY_FUTURE`], Pleroma's `validate_min_age` kept to the one rule
+/// this ticket states.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with those two messages.
+fn merged_birthday(
+    submitted: Option<&str>,
+    stored: Option<NaiveDate>,
+    today: NaiveDate,
+) -> AppResult<Option<NaiveDate>> {
+    let Some(raw) = submitted else {
+        return Ok(stored);
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let parsed = NaiveDate::parse_from_str(raw, BIRTHDAY_FORMAT)
+        .map_err(|_err| AppError::Unprocessable(BIRTHDAY_INVALID.to_owned()))?;
+    if parsed.format(BIRTHDAY_FORMAT).to_string() != raw {
+        return Err(AppError::Unprocessable(BIRTHDAY_INVALID.to_owned()));
+    }
+    if parsed > today {
+        return Err(AppError::Unprocessable(BIRTHDAY_FUTURE.to_owned()));
+    }
+    Ok(Some(parsed))
+}
+
+/// The `settings_store` to write: the stored blob with the submitted
+/// `pleroma_settings_store` merged into it key by key ([`shallow_merge`],
+/// Pleroma's `Map.merge` in `User.update_changeset` — a submitted key wins,
+/// every other stored entry stays) and then measured by
+/// [`check_store_size`]. No parameter keeps the stored blob; a merged blob
+/// over the cap is refused here, before the write, so nothing changes.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`STORE_NOT_OBJECT`] for a value that is
+/// neither a JSON object nor the JSON text of one, or with
+/// [`STORE_TOO_LARGE`](crate::api::pleroma_settings::STORE_TOO_LARGE) for a
+/// store over the limit.
+fn merged_store(submitted: Option<&Value>, stored: &Value) -> AppResult<Value> {
+    let Some(patch) = submitted else {
+        return Ok(stored.clone());
+    };
+    let merged = shallow_merge(stored, &store_object(patch)?);
+    check_store_size(&merged)?;
+    Ok(merged)
+}
+
+/// The object a submitted `pleroma_settings_store` names: a JSON body
+/// carries the object itself, a form or multipart body carries its JSON
+/// *text*, which is parsed here; anything else — an array, a scalar, text
+/// that is no JSON — has no keys to merge and is the 422.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`STORE_NOT_OBJECT`].
+fn store_object(submitted: &Value) -> AppResult<Map<String, Value>> {
+    let decoded = match submitted {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .map_err(|_err| AppError::Unprocessable(STORE_NOT_OBJECT.to_owned())),
+        Value::Object(map) => Ok(Value::Object(map.clone())),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => {
+            Err(AppError::Unprocessable(STORE_NOT_OBJECT.to_owned()))
+        }
+    }?;
+    let Value::Object(map) = decoded else {
+        return Err(AppError::Unprocessable(STORE_NOT_OBJECT.to_owned()));
+    };
+    Ok(map)
+}
+
+/// The `actor_type` and `bot` pair after this body, in Pleroma's order: the
+/// `bot` parameter picks the actor kind ([`actor_type_for_bot`]) and an
+/// explicit `actor_type` wins over it and re-decides `bot` from the kind, so
+/// the two columns never disagree. A body carrying neither leaves both
+/// stored values as they are.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`ACTOR_TYPE_INVALID`] for a kind
+/// outside [`ACTOR_TYPES`] (`Group` and every other actor type is not
+/// settable through this endpoint).
+fn merged_actor(params: &ProfileParams, current: &User) -> AppResult<(String, Flag)> {
+    match params.actor_type.as_deref() {
+        Some(kind) if ACTOR_TYPES.contains(&kind) => {
+            Ok((kind.to_owned(), Flag::from(kind == SERVICE_ACTOR_TYPE)))
+        }
+        Some(_) => Err(AppError::Unprocessable(ACTOR_TYPE_INVALID.to_owned())),
+        None => Ok(params.bot.map_or_else(
+            || (current.actor_type.clone(), current.bot),
+            |automated| {
+                (
+                    actor_type_for_bot(automated).to_owned(),
+                    Flag::new(automated),
+                )
+            },
+        )),
+    }
+}
+
+/// The `actor_type` Pleroma stores for an account flagged as a bot (or not):
+/// an automated account is a `Service`, a human one a [`Person`].
+///
+/// [`Person`]: crate::models::user::DEFAULT_ACTOR_TYPE
+#[must_use]
+const fn actor_type_for_bot(automated: bool) -> &'static str {
+    if automated {
+        SERVICE_ACTOR_TYPE
+    } else {
+        PERSON_ACTOR_TYPE
+    }
 }
 
 /// What one profile-image parameter of an `update_credentials` body asks
@@ -1899,6 +2294,332 @@ mod tests {
             own_media_key(&config, "https://test.example/media/"),
             None,
             "an empty remainder is no key either"
+        );
+    }
+
+    /// The same day every `merged_birthday` test measures "the future"
+    /// against, so the assertions do not drift with the clock.
+    const TODAY: &str = "2026-02-28";
+
+    /// `TODAY` as the date [`merged_birthday`] compares against.
+    fn today() -> NaiveDate {
+        NaiveDate::parse_from_str(TODAY, BIRTHDAY_FORMAT).expect("the fixture date is valid")
+    }
+
+    /// The stored row the merge helpers are tested against: the column
+    /// defaults, with a few values set apart — `private`, a tag, a
+    /// two-key settings blob, one date, and two on-by-default flags — so a
+    /// merge that ignored the stored state cannot pass by accident.
+    fn stored_user() -> User {
+        User {
+            id: Uuid::now_v7(),
+            nickname: "alice".to_owned(),
+            ap_id: "https://test.example/users/alice".to_owned(),
+            local: Flag::new(true),
+            domain: None,
+            actor_type: DEFAULT_ACTOR_TYPE.to_owned(),
+            email: None,
+            password_hash: None,
+            name: String::new(),
+            bio: String::new(),
+            raw_bio: String::new(),
+            avatar_url: None,
+            banner_url: None,
+            profile_url: None,
+            locked: Flag::new(false),
+            bot: Flag::new(false),
+            discoverable: Flag::new(false),
+            fields: json!([]),
+            raw_fields: json!([]),
+            inbox: None,
+            shared_inbox: None,
+            outbox: None,
+            followers_url: None,
+            following_url: None,
+            featured_url: None,
+            public_key: None,
+            private_key: None,
+            is_admin: Flag::new(false),
+            is_moderator: Flag::new(false),
+            is_active: Flag::new(true),
+            hide_followers: Flag::new(true),
+            hide_follows: Flag::new(false),
+            hide_followers_count: Flag::new(false),
+            hide_follows_count: Flag::new(false),
+            hide_favorites: Flag::new(true),
+            allow_following_move: Flag::new(true),
+            skip_thread_containment: Flag::new(false),
+            accepts_chat_messages: Flag::new(true),
+            show_role: Flag::new(true),
+            no_rich_text: Flag::new(false),
+            default_scope: "private".to_owned(),
+            sensitive_default: Flag::new(false),
+            language: Some("pt-BR".to_owned()),
+            tags: Vec::new(),
+            settings_store: json!({"theme": "dark", "locale": "pt"}),
+            background_image_url: None,
+            birthday: Some(NaiveDate::from_ymd_opt(1990, 1, 31).expect("a real day")),
+            show_birthday: Flag::new(false),
+            also_known_as: Vec::new(),
+            moved_to_ap_id: None,
+            last_move_at: None,
+            email_confirmed: Flag::new(true),
+            approval_pending: Flag::new(false),
+            last_active_at: None,
+            followers_count: 0,
+            following_count: 0,
+            statuses_count: 0,
+            last_status_at: None,
+            last_fetched_at: None,
+            inserted_at: Utc::now(),
+            updated_at: Utc::now(),
+            mfa_settings: json!({}),
+            preferred_frontend: None,
+        }
+    }
+
+    /// The `source` block of a body, `unwrap`ing the parse.
+    fn source_params(text: &str) -> ProfileParams {
+        params(&format!(r#"{{"source": {text}}}"#))
+    }
+
+    #[test]
+    fn the_source_block_reads_both_spellings() {
+        let json_body = source_params(r#"{"privacy": "unlisted", "sensitive": "1"}"#);
+        let nested = json_body
+            .source
+            .as_ref()
+            .expect("the JSON object is the block");
+        assert_eq!(nested.privacy.as_deref(), Some("unlisted"), "privacy");
+        assert_eq!(nested.sensitive, Some(true), "the string spelling coerces");
+        assert_eq!(nested.language, None, "an absent key is no parameter");
+
+        let form = crate::extract::parse_pairs([
+            ("source[privacy]", "direct"),
+            ("source[sensitive]", "off"),
+            ("source[language]", "de"),
+        ]);
+        let from_form: ProfileParams =
+            serde_json::from_value(form).expect("the form nests into the same shape");
+        let block = from_form
+            .source
+            .as_ref()
+            .expect("`source[privacy]` is the block");
+        assert_eq!(block.privacy.as_deref(), Some("direct"), "the form privacy");
+        assert_eq!(block.sensitive, Some(false), "the form sensitive");
+        assert_eq!(block.language.as_deref(), Some("de"), "the form language");
+    }
+
+    #[test]
+    fn privacy_is_a_scope_or_the_422() {
+        assert_eq!(
+            merged_scope(Some("direct"), "public").unwrap(),
+            "direct",
+            "a stated scope wins over the stored one"
+        );
+        assert_eq!(
+            merged_scope(None, "private").unwrap(),
+            "private",
+            "no parameter keeps the stored scope"
+        );
+        for text in ["internal", "", "PUBLIC", "unlisted "] {
+            let err = merged_scope(Some(text), "public").expect_err("a scope outside the list");
+            assert_eq!(err.to_string(), PRIVACY_INVALID, "the pinned wording");
+        }
+    }
+
+    #[test]
+    fn a_language_tag_is_capped_and_the_empty_one_clears() {
+        assert_eq!(
+            merged_language(Some("pt-BR"), Some("de"))
+                .unwrap()
+                .as_deref(),
+            Some("pt-BR"),
+            "a submitted tag replaces the stored one"
+        );
+        assert_eq!(
+            merged_language(Some(""), Some("pt-BR")).unwrap(),
+            None,
+            "the empty string clears the preference"
+        );
+        assert_eq!(
+            merged_language(None, Some("pt-BR")).unwrap().as_deref(),
+            Some("pt-BR"),
+            "and no parameter keeps it"
+        );
+        assert_eq!(
+            merged_language(None, None).unwrap(),
+            None,
+            "nothing stated is nothing stored"
+        );
+        let at_cap = "é".repeat(MAX_LANGUAGE_CHARS);
+        assert_eq!(
+            merged_language(Some(at_cap.as_str()), None)
+                .unwrap()
+                .as_deref(),
+            Some(at_cap.as_str()),
+            "exactly the cap fits, counted in characters, not bytes"
+        );
+        let err = merged_language(Some("0123456789a"), None).expect_err("eleven is over the cap");
+        assert_eq!(
+            err.to_string(),
+            "Language is too long (maximum is 10 characters)",
+            "the length message names the cap"
+        );
+    }
+
+    #[test]
+    fn a_birthday_is_a_past_date_or_the_clear_or_the_422() {
+        let stored = today().pred_opt().expect("yesterday exists");
+        assert_eq!(
+            merged_birthday(Some(TODAY), Some(stored), today()).unwrap(),
+            Some(today()),
+            "today is not in the future"
+        );
+        assert_eq!(
+            merged_birthday(Some("1990-01-31"), Some(stored), today()).unwrap(),
+            NaiveDate::from_ymd_opt(1990, 1, 31),
+            "a submitted date replaces the stored one"
+        );
+        assert_eq!(
+            merged_birthday(None, Some(stored), today()).unwrap(),
+            Some(stored),
+            "no parameter keeps the stored date"
+        );
+        assert_eq!(
+            merged_birthday(Some(""), Some(stored), today()).unwrap(),
+            None,
+            "the empty string clears it"
+        );
+        for text in ["1990-1-31", "31-01-1990", "1990-13-01", "yesterday"] {
+            let err = merged_birthday(Some(text), None, today()).expect_err("not a birthday");
+            assert_eq!(err.to_string(), BIRTHDAY_INVALID, "the parse message");
+        }
+        for text in ["2026-03-01", "2099-01-01"] {
+            let err = merged_birthday(Some(text), None, today()).expect_err("a future birthday");
+            assert_eq!(err.to_string(), BIRTHDAY_FUTURE, "the future message");
+        }
+    }
+
+    #[test]
+    fn the_settings_store_merges_key_by_key() {
+        let stored = stored_user();
+        let merged = merged_store(
+            Some(&json!({"locale": "de", "theme": null})),
+            &stored.settings_store,
+        )
+        .expect("a small object fits");
+        assert_eq!(
+            merged,
+            json!({"locale": "de", "theme": Value::Null}),
+            "submitted keys replace, a null is stored as null, and only the merged keys change"
+        );
+        assert_eq!(
+            merged_store(None, &stored.settings_store).unwrap(),
+            stored.settings_store,
+            "no parameter keeps the stored blob"
+        );
+        let from_text = merged_store(
+            Some(&json!(r#"{"custom": {"nested": 1}}"#)),
+            &stored.settings_store,
+        )
+        .expect("a form carries the JSON text of the object");
+        assert_eq!(
+            from_text["custom"],
+            json!({"nested": 1}),
+            "the text parses to the object it names"
+        );
+    }
+
+    #[test]
+    fn a_settings_store_submission_is_an_object_within_the_cap() {
+        use crate::api::pleroma_settings::{MAX_SETTINGS_STORE_BYTES, STORE_TOO_LARGE};
+
+        let stored = stored_user().settings_store;
+        for patch in [json!(5), json!("plain text"), json!([1, 2]), json!(true)] {
+            let err = merged_store(Some(&patch), &stored).expect_err("a value with no keys");
+            assert_eq!(err.to_string(), STORE_NOT_OBJECT, "the object message");
+        }
+        let blob = "x".repeat(MAX_SETTINGS_STORE_BYTES + 1);
+        let err = merged_store(Some(&json!({"blob": blob})), &stored)
+            .expect_err("over one mebibyte does not fit");
+        assert_eq!(err.to_string(), STORE_TOO_LARGE, "the size message");
+        assert!(
+            matches!(err, AppError::Unprocessable(_)),
+            "both store refusals are 422s"
+        );
+    }
+
+    /// `merged_actor` over the stored fixture row, as the `(actor_type,
+    /// bot)` pair the body leaves.
+    fn actor_pair(body: &str) -> (String, bool) {
+        let (kind, bot) =
+            merged_actor(&params(body), &stored_user()).expect("the fixture body is accepted");
+        (kind, bot.get())
+    }
+
+    #[test]
+    fn actor_type_and_bot_are_written_as_one_pair() {
+        assert_eq!(
+            actor_pair(r#"{"actor_type": "Service"}"#),
+            ("Service".to_owned(), true),
+            "the stated kind is stored and `bot` follows it"
+        );
+        assert_eq!(
+            actor_pair(r#"{"actor_type": "Person"}"#),
+            ("Person".to_owned(), false),
+            "and so the other way round"
+        );
+        assert_eq!(
+            actor_pair(r#"{"bot": true}"#),
+            ("Service".to_owned(), true),
+            "`bot=true` picks the actor kind Pleroma stores for a bot"
+        );
+        assert_eq!(
+            actor_pair(r#"{"bot": false}"#),
+            ("Person".to_owned(), false),
+            "and `bot=false` picks `Person`"
+        );
+        assert_eq!(
+            actor_pair(r#"{"bot": false, "actor_type": "Service"}"#),
+            ("Service".to_owned(), true),
+            "an explicit `actor_type` wins, and `bot` reads back from the kind"
+        );
+        assert_eq!(
+            actor_pair("{}"),
+            (DEFAULT_ACTOR_TYPE.to_owned(), false),
+            "a body with neither parameter keeps both stored columns"
+        );
+        for text in ["Group", "person", ""] {
+            let body = params(&format!(r#"{{"actor_type": "{text}"}}"#));
+            let err = merged_actor(&body, &stored_user()).expect_err("no such actor kind");
+            assert_eq!(err.to_string(), ACTOR_TYPE_INVALID, "the kind message");
+        }
+    }
+
+    #[test]
+    fn each_pleroma_flag_merges_on_its_own() {
+        let current = stored_user();
+        let body = params(r#"{"hide_follows": "on", "no_rich_text": false}"#);
+        let prefs = merged_prefs(&body, &current);
+        assert!(prefs.hide_follows.get(), "the submitted flag is set");
+        assert!(!prefs.no_rich_text.get(), "and so is the submitted false");
+        assert!(
+            prefs.hide_followers.get() && prefs.hide_favorites.get(),
+            "flags the body never carried keep what the row held"
+        );
+        assert!(
+            prefs.show_role.get()
+                && prefs.allow_following_move.get()
+                && prefs.accepts_chat_messages.get(),
+            "the on-by-default flags survive an unrelated write"
+        );
+        assert!(
+            !prefs.show_birthday.get()
+                && !prefs.skip_thread_containment.get()
+                && !prefs.hide_followers_count.get()
+                && !prefs.hide_follows_count.get(),
+            "and so do the off-by-default ones"
         );
     }
 }
