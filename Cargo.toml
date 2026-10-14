@@ -43,6 +43,11 @@ dotenvy = "0.15.7"
 # HMAC (`src/util/totp.rs`): RFC 6238/4226 TOTP is HMAC-SHA1 over the time
 # step; `sha1` below supplies the hash, `subtle` the constant-time compare.
 hmac = "0.13.0"
+# Bounded request-body reads (`src/federation/inbox_auth.rs`): `Limited`
+# enforces the inbox's `INBOX_MAX_BYTES` cap while the body streams in, and
+# `BodyExt::collect` buffers the capped frames. The default features are all
+# this needs.
+http-body-util = "0.1.5"
 # Image analysis for media uploads (`src/services/media_processing.rs`):
 # dimensions, `_small` previews and the pixel data behind the `Blurhash`
 # string. Only the four formats the ticket names are compiled in, and the
@@ -103,7 +108,6 @@ uuid = { version = "1.28.0", features = ["v7", "serde"] }
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-http-body-util = "0.1.5"
 # Throwaway directories for the upload tests (`src/uploads.rs`,
 # `tests/media.rs`): `TempDir` makes one per test and removes it on drop, so
 # no test writes into the repository.

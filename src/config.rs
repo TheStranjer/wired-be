@@ -50,6 +50,9 @@ pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 pub const MAX_IMAGE_PIXELS_VAR: &str = "MAX_IMAGE_PIXELS";
 /// Environment variable holding the maximum number of files per request.
 pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
+/// Environment variable holding the maximum size of one inbound
+/// `ActivityPub` inbox request body, in bytes.
+pub const INBOX_MAX_BYTES_VAR: &str = "INBOX_MAX_BYTES";
 /// Environment variable holding whether outbound HTTP may reach private
 /// hosts (disabling the SSRF guard).
 pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
@@ -135,6 +138,10 @@ pub const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 16_000_000;
 /// Upload file count used when `UPLOAD_MAX_FILES` is unset: Pleroma's
 /// `:upload, max_number_of_files`.
 pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
+/// Inbox body size used when `INBOX_MAX_BYTES` is unset: the 1 MiB the
+/// inbox authentication extractor caps one inbound `ActivityPub` `POST`
+/// body at (see [`crate::federation::inbox_auth`]).
+pub const DEFAULT_INBOX_MAX_BYTES: usize = 1_048_576;
 /// Image pixel count used when `MAX_IMAGE_PIXELS` is unset.
 ///
 /// The 40 megapixels the media ticket fixes. `POST /api/v1/media` and
@@ -369,6 +376,10 @@ pub struct Config {
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
+    /// Hard cap on one inbound `ActivityPub` inbox request body, in bytes,
+    /// from `INBOX_MAX_BYTES`; the `SignedActivity` extractor answers a
+    /// larger body 413 (see [`crate::federation::inbox_auth`]).
+    pub inbox_max_bytes: usize,
     /// Directory uploaded files are stored in, from `UPLOADS_DIR`.
     pub uploads_dir: PathBuf,
     /// Directory emoji packs are stored in, from `EMOJI_DIR`: one
@@ -478,6 +489,7 @@ impl Config {
             max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
             max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
         };
+        let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
         let http_allow_private_hosts = boolean(
             &lookup,
             HTTP_ALLOW_PRIVATE_HOSTS_VAR,
@@ -506,6 +518,7 @@ impl Config {
             max_bio_chars,
             max_image_pixels,
             upload_limits,
+            inbox_max_bytes,
             uploads_dir,
             emoji_dir,
             media_base_url,
@@ -598,6 +611,7 @@ impl Config {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
             },
+            inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
             uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
             emoji_dir: PathBuf::from(DEFAULT_EMOJI_DIR),
             media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
@@ -911,6 +925,7 @@ impl fmt::Debug for Config {
             .field("max_bio_chars", &self.max_bio_chars)
             .field("max_image_pixels", &self.max_image_pixels)
             .field("upload_limits", &self.upload_limits)
+            .field("inbox_max_bytes", &self.inbox_max_bytes)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
             .field("emoji_dir", &self.emoji_dir)
@@ -1381,6 +1396,26 @@ mod tests {
         );
         let err = try_config_with(&[(MAX_IMAGE_PIXELS_VAR, "many")]).unwrap_err();
         assert_eq!(err, ConfigError::InvalidNumber(MAX_IMAGE_PIXELS_VAR));
+    }
+
+    #[test]
+    fn inbox_max_bytes_defaults_to_one_mebibyte() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.inbox_max_bytes, 1_048_576,
+            "default INBOX_MAX_BYTES is 1 MiB"
+        );
+    }
+
+    #[test]
+    fn reads_custom_inbox_max_bytes() {
+        let config = config_with(&[(INBOX_MAX_BYTES_VAR, "1024")]);
+        assert_eq!(config.inbox_max_bytes, 1_024, "custom INBOX_MAX_BYTES");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("inbox_max_bytes: 1024"),
+            "the inbox body cap is visible in Debug output: {debug}"
+        );
     }
 
     #[test]
@@ -1948,6 +1983,7 @@ mod tests {
             MAX_BIO_CHARS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
+            INBOX_MAX_BYTES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
             JOB_CONCURRENCY_VAR,

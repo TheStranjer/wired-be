@@ -13,12 +13,16 @@
 //! [`json`] holds the shared JSON-LD shape normalizers those readers use.
 //! [`delivery`] is the way back out: the `federator.deliver` job that signs
 //! an activity as its actor and POSTs it to a remote inbox, retrying the
-//! answers that may yet succeed. Activity documents, inboxes and outboxes
-//! arrive in later tickets and get their modules beside them.
+//! answers that may yet succeed. [`inbox_auth`] is its inbound counterpart:
+//! the `SignedActivity` extractor that authenticates a peer's inbox `POST`
+//! against its actor's key before any handler sees the activity. Activity
+//! documents, inboxes and outboxes arrive in later tickets and get their
+//! modules beside them.
 
 pub mod actor;
 pub mod delivery;
 pub mod fetch_actor;
+pub mod inbox_auth;
 pub mod json;
 pub mod remote_actor;
 pub mod signature;
