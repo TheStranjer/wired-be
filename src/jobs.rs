@@ -19,6 +19,7 @@
 //! federation delivery job kind. The sibling [`scheduler`] module is the
 //! producer side: it enqueues the recurring, cron-like jobs.
 
+pub mod mutes;
 pub mod scheduler;
 
 use std::{

@@ -1,11 +1,15 @@
-//! Batch loading of the [`Relationship`] entity from the `follows` table.
+//! Batch loading of the [`Relationship`] entity from the tables that answer
+//! its flags.
 //!
 //! [`Relationship::load_many`] answers the relationship flags of one viewer
 //! to many targets in a fixed, bounded set of queries: every source of flags
-//! is exactly one `WHERE … = ANY(…)` statement, executed once per call
-//! whatever the number of targets, so there is no N+1 anywhere in this
-//! module. The `FlagSources` struct mirrors that contract — one field per
-//! source query — and `flag_sources` is the single place the set runs.
+//! is one statement, executed once per call whatever the number of targets —
+//! either a `WHERE … = ANY(…)` batch over the requested ids or, for a source
+//! whose whole set is smaller than the question (the endorsements and the
+//! mutes), one read of the viewer's own set, of which membership then answers
+//! every target — so there is no N+1 anywhere in this module. The
+//! `FlagSources` struct mirrors that contract — one field per source — and
+//! `flag_sources` is the single place the set runs.
 //!
 //! The `follows` table (owned by [`crate::models::follow`]) supplies the
 //! flags this ticket computes: `following`, `requested` and
@@ -22,12 +26,15 @@
 //! [`crate::models::block`]) supplies `blocking` and `blocked_by`: one
 //! statement over both directions of the pair, so a target the viewer
 //! blocked lights the first flag and a target who blocked the viewer the
-//! second. Every other flag of the entity is a documented default until its
-//! own ticket lands; each one then adds exactly one field to `FlagSources`,
-//! one line (one query) to `flag_sources` and one flag line to `assemble`:
-//!
-//! - the mutes ticket: `muting`, `muting_notifications` (one query over
-//!   `mutes`).
+//! second. The `mutes` table (owned by [`crate::models::mute`]) supplies
+//! `muting` and `muting_notifications`: the muter's two flat sets, read
+//! through the model that owns them, so a target the viewer mutes lights the
+//! first flag and one whose notifications are hidden as well the second —
+//! and a mute whose duration has run out is in neither set, which is how
+//! every read of that table treats it. Every other flag of the entity is a
+//! documented default until its own ticket lands; each one then adds exactly
+//! one field to `FlagSources`, one line (one query) to `flag_sources` and one
+//! flag line to `assemble`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -37,7 +44,7 @@ use uuid::Uuid;
 use crate::{
     entities::{account::JsonBool, relationship::Relationship},
     error::AppResult,
-    models::{account_note, endorsement, follow::FollowState},
+    models::{account_note, endorsement, follow::FollowState, mute},
 };
 
 /// [`load_many`](Relationship::load_many)'s outgoing side: the viewer's own
@@ -127,6 +134,30 @@ struct FlagSources {
     /// are absent from both sets, and [`assemble`] renders them the flags'
     /// `false` defaults.
     blocks: BlockFlags,
+    /// The accounts the viewer mutes, and the muted ones whose notifications
+    /// they hide: decides `muting` and `muting_notifications`. Loaded by
+    /// [`mute_flags`] — the `mutes` table's two flat sets, read through
+    /// [`crate::models::mute`], which filters expired mutes out of both.
+    /// Targets the viewer does not mute are absent from both sets, and
+    /// [`assemble`] renders them the flags' `false` defaults.
+    mutes: MuteFlags,
+}
+
+/// Both flags one viewer's mutes answer, as the two [`FlagSources`] fields of
+/// the same name: the muter's muted set and its notification-hidden subset.
+///
+/// The subset relation is the table's own: an account whose mute hides only
+/// the timeline is in [`muting`](Self::muting) and not in
+/// [`muting_notifications`](Self::muting_notifications), which is exactly how
+/// the two Mastodon flags differ. An expired mute is in neither, because both
+/// sets come from reads that treat it as absent.
+#[derive(Debug)]
+struct MuteFlags {
+    /// The targets the viewer mutes: the `muting` flag.
+    muting: HashSet<Uuid>,
+    /// The muted targets whose notifications the viewer also hides: the
+    /// `muting_notifications` flag.
+    muting_notifications: HashSet<Uuid>,
 }
 
 /// Both directions of one viewer's blocks among the targets of a batch, read
@@ -221,9 +252,10 @@ impl Relationship {
 }
 
 /// Runs the fixed query set behind [`Relationship::load_many`] and keeps
-/// the results together. Every flag source is exactly one batched query
-/// awaited once here; the tickets listed in the [module docs](self) add
-/// their one line (and their one [`FlagSources`] field) to this list.
+/// the results together. Every flag source is awaited exactly once here, and
+/// is one statement except for the mutes, whose two sets are one statement
+/// each; the tickets listed in the [module docs](self) add their one line
+/// (and their one [`FlagSources`] field) to this list.
 async fn flag_sources(
     pool: &PgPool,
     viewer_id: Uuid,
@@ -247,6 +279,9 @@ async fn flag_sources(
         // The blocks table: one statement over both directions of the
         // pair; membership answers each of the two flags.
         blocks: block_flags(pool, viewer_id, target_ids).await?,
+        // The mutes table: the muter's two flat sets, one read each;
+        // membership answers `muting` and `muting_notifications`.
+        mutes: mute_flags(pool, viewer_id).await?,
     })
 }
 
@@ -321,12 +356,33 @@ async fn block_flags(pool: &PgPool, viewer_id: Uuid, target_ids: &[Uuid]) -> App
     })
 }
 
+/// `viewer_id`'s mutes, in the two sets the entity's flags key on: who they
+/// mute, and who they mute with their notifications hidden. Both come from
+/// [`crate::models::mute`], the table's owner, which leaves an expired mute
+/// out of either; the batch's targets need no narrowing, because membership
+/// in the muter's own set is the whole question (the same shape the
+/// `endorsed` flag reads its set from).
+async fn mute_flags(pool: &PgPool, viewer_id: Uuid) -> AppResult<MuteFlags> {
+    let muting = mute::muted_ids(pool, viewer_id)
+        .await?
+        .into_iter()
+        .collect();
+    let muting_notifications = mute::notification_muted_ids(pool, viewer_id)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(MuteFlags {
+        muting,
+        muting_notifications,
+    })
+}
+
 /// Folds the loaded sources into the entity for one target: the six flags
 /// the follows table answers, the [`note`] the notes table holds, the
 /// `domain_blocking` the domain-block join decided, the `endorsed` the
-/// viewer's endorsement set contains and the two directions of the blocks
-/// table take their sources' values, every other flag keeps the default
-/// [`Relationship::unconnected`] states.
+/// viewer's endorsement set contains, the two directions of the blocks table
+/// and the two sets of the mutes table take their sources' values, every
+/// other flag keeps the default [`Relationship::unconnected`] states.
 ///
 /// [`note`]: Relationship::note
 fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
@@ -345,6 +401,8 @@ fn assemble(target_id: Uuid, sources: &FlagSources) -> Relationship {
         endorsed: JsonBool(sources.endorsed.contains(&target_id)),
         blocking: JsonBool(sources.blocks.blocking.contains(&target_id)),
         blocked_by: JsonBool(sources.blocks.blocked_by.contains(&target_id)),
+        muting: JsonBool(sources.mutes.muting.contains(&target_id)),
+        muting_notifications: JsonBool(sources.mutes.muting_notifications.contains(&target_id)),
         note: sources.notes.get(&target_id).cloned().unwrap_or_default(),
         ..Relationship::unconnected(target_id)
     }
@@ -491,15 +549,17 @@ mod tests {
     /// endorsement, so the flag keeps its default; `blocking` and
     /// `blocked_by` are computed as well, and their dedicated fixture
     /// below tests them — these tests record no block, so both flags keep
-    /// their defaults.
+    /// their defaults; `muting` and `muting_notifications` are computed as
+    /// well, and their dedicated fixture below tests them — these tests
+    /// record no mute, so both flags keep their defaults.
     fn assert_placeholder_flags(relationship: &Relationship) {
         assert!(!relationship.endorsed.0, "no endorsement recorded");
         assert!(!relationship.blocking.0, "no block recorded, outgoing");
         assert!(!relationship.blocked_by.0, "no block recorded, incoming");
-        assert!(!relationship.muting.0, "mutes have no table yet");
+        assert!(!relationship.muting.0, "no mute recorded");
         assert!(
             !relationship.muting_notifications.0,
-            "notification mutes have no table yet"
+            "no notification mute recorded"
         );
         assert!(
             relationship.note.is_empty(),
@@ -983,5 +1043,114 @@ mod tests {
             "and the whole batch reads clean"
         );
         assert_placeholder_flags(&cleared);
+    }
+
+    /// The `(muting, muting_notifications)` pair [`Relationship::load_many`]
+    /// answers for `viewer` over `targets`, in the order requested.
+    async fn mutes_of(pool: &PgPool, viewer: &User, targets: &[&User]) -> Vec<(bool, bool)> {
+        let ids: Vec<Uuid> = targets.iter().map(|target| target.id).collect();
+        Relationship::load_many(pool, viewer.id, &ids)
+            .await
+            .expect("the batch reads")
+            .iter()
+            .map(|row| (row.muting.0, row.muting_notifications.0))
+            .collect()
+    }
+
+    /// Mutes `target` for `muter` through the model that owns the table — the
+    /// fixture this loader only ever reads.
+    async fn mute_pair(pool: &PgPool, muter: &User, target: &User) {
+        let stored = mute::mute(pool, muter, target, mute::MuteOptions::default())
+            .await
+            .expect("the fixture mute stores");
+        assert_eq!(
+            stored.muted_id, target.id,
+            "the row is the pair that was asked for"
+        );
+    }
+
+    /// Mutes `target` for `muter` with the notifications left visible:
+    /// Mastodon's `notifications: false`, the one mute that tells the two
+    /// flags apart.
+    async fn mute_timeline_only(pool: &PgPool, muter: &User, target: &User) {
+        let options = mute::MuteOptions {
+            notifications: false,
+            expires_in: None,
+        };
+        let stored = mute::mute(pool, muter, target, options)
+            .await
+            .expect("the fixture mute stores");
+        assert!(
+            !stored.hide_notifications,
+            "and the option is stored as the caller set it"
+        );
+    }
+
+    /// Writes `target` into `muter`'s mute list with `expires_at` in the past:
+    /// the lapsed row of a mute whose duration ran out, which the sweep has not
+    /// deleted yet and every read must still treat as absent.
+    async fn mute_lapsed(pool: &PgPool, muter: &User, target: &User) {
+        let sql = "INSERT INTO mutes (id, muter_id, muted_id, expires_at)
+                    VALUES ($1, $2, $3, now() - make_interval(secs => 60))";
+        let written = sqlx::query(sql)
+            .bind(new_id())
+            .bind(muter.id)
+            .bind(target.id)
+            .execute(pool)
+            .await
+            .expect("the lapsed fixture row inserts");
+        assert_eq!(written.rows_affected(), 1, "one row was written");
+    }
+
+    /// Lifts `muter`'s mute on `target`, reporting whether one was there.
+    async fn unmute_pair(pool: &PgPool, muter: &User, target: &User) -> bool {
+        let removed = mute::unmute(pool, muter, target)
+            .await
+            .expect("the fixture unmute runs");
+        removed.is_some()
+    }
+
+    /// Both mutes flags ride the same batch: the viewer's mute of a target
+    /// lights `muting`, the same mute with notifications hidden lights both, a
+    /// lapsed mute lights neither, and a target nobody muted keeps both
+    /// defaults — as does every account once its mute is lifted.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn mutes_light_muting_and_muting_notifications(pool: PgPool) {
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        let dave = local_user(&pool, "dave").await;
+        mute_timeline_only(&pool, &alice, &bob).await;
+        mute_pair(&pool, &alice, &carol).await;
+        mute_lapsed(&pool, &alice, &dave).await;
+
+        assert_eq!(
+            mutes_of(&pool, &alice, &[&bob, &carol, &dave]).await,
+            vec![(true, false), (true, true), (false, false)],
+            "alice mutes bob's timeline only, mutes carol outright, and is
+             past her lapsed mute of dave"
+        );
+        assert_eq!(
+            mutes_of(&pool, &bob, &[&alice]).await,
+            vec![(false, false)],
+            "being muted does not mute anybody back"
+        );
+
+        let lifted = unmute_pair(&pool, &alice, &carol).await;
+        assert!(lifted, "carol's mute was there to lift");
+        let cleared = one_relationship(&pool, &alice, &carol).await;
+        assert!(
+            !cleared.muting.0 && !cleared.muting_notifications.0,
+            "with nothing muted the pair falls back to the defaults"
+        );
+        assert_eq!(
+            mutes_of(&pool, &alice, &[&bob, &carol, &dave]).await,
+            vec![(true, false), (false, false), (false, false)],
+            "and the rest of the batch is untouched by the lift"
+        );
+        assert!(
+            !cleared.following.0 && cleared.showing_reblogs.0,
+            "a mute says nothing about the follow flags"
+        );
     }
 }

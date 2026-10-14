@@ -51,6 +51,7 @@ pub mod media;
 pub mod media_files;
 pub mod mfa;
 pub mod misc;
+pub mod mutes;
 pub mod nodeinfo;
 pub mod oauth;
 pub mod oauth_external;
