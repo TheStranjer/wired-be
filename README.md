@@ -39,6 +39,8 @@ All configuration comes from environment variables. For local development, copy 
 | `AVAILABLE_FRONTENDS` | no | | Comma-separated frontends clients may pick at `PUT /api/v1/pleroma/preferred_frontend`; while empty, the available list is `[]` and every pick is refused with 422 |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
+| `AVATAR_LIMIT_BYTES` | no | `2000000` | Maximum size of the `avatar` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
+| `BANNER_LIMIT_BYTES` | no | `4000000` | Maximum size of the `header` or `pleroma_background_image` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
 | `INBOX_MAX_BYTES` | no | `1048576` | Hard cap on one inbound ActivityPub inbox request body, in bytes; a larger body is answered 413 `{"error":"Payload too large"}` |
 | `MAX_IMAGE_PIXELS` | no | `40000000` | Maximum pixel count (width times height) of an uploaded image; the media upload endpoints reject a larger image with 422 `{"error":"Image too large"}` and an undecodable one with 422 `{"error":"Invalid image"}` |
 | `HTTP_ALLOW_PRIVATE_HOSTS` | no | `false` | Disable the outbound SSRF guard so the instance may fetch private/loopback addresses (`true`/`false`, or `1`/`0`); development and test only |

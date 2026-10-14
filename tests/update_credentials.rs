@@ -1,20 +1,25 @@
 //! Integration tests for `PATCH /api/v1/accounts/update_credentials`
 //! (WBE-67, the profile-text-fields ticket, extended by WBE-69, the
-//! profile-metadata ticket): the fields this slice of the endpoint owns —
-//! `display_name` (length-capped against `MAX_DISPLAY_NAME_CHARS`,
-//! sanitized, empty stored as empty), `note` (length-capped against
-//! `MAX_BIO_CHARS`, stored raw in `raw_bio` and rendered to `bio` with
-//! URL, hashtag and local-mention links), the `locked` / `bot` /
-//! `discoverable` booleans, and `fields_attributes` (the profile
-//! metadata: every body shape, the `MAX_PROFILE_FIELDS` count cap, the
-//! per-entry name and value character caps, both-empty entries dropped,
-//! empty clearing, raw values kept beside the rendered HTML) — each
-//! updated individually through JSON, form and multipart bodies, with
-//! absent fields left untouched, invalid boolean strings and over-long
-//! texts answered 422, the 200 answer the owner entity with its `source`
-//! block (the `verify_credentials` render), the route behind `AuthUser`
-//! and `write:accounts` (401 unauthenticated, 403 for the wrong
-//! credential), and the `POST` alias serving the old clients.
+//! profile-metadata ticket, and by this ticket's profile images): the
+//! fields this slice of the endpoint owns — `display_name` (length-capped
+//! against `MAX_DISPLAY_NAME_CHARS`, sanitized, empty stored as empty),
+//! `note` (length-capped against `MAX_BIO_CHARS`, stored raw in `raw_bio`
+//! and rendered to `bio` with URL, hashtag and local-mention links), the
+//! `locked` / `bot` / `discoverable` booleans, `fields_attributes` (the
+//! profile metadata: every body shape, the `MAX_PROFILE_FIELDS` count cap,
+//! the per-entry name and value character caps, both-empty entries dropped,
+//! empty clearing, raw values kept beside the rendered HTML) and the three
+//! profile images — `avatar`, `header` and `pleroma_background_image` file
+//! parts stored through the uploader and served over `/media`, replaced
+//! images whose file goes away, the empty-string and JSON-`null` clears,
+//! the `AVATAR_LIMIT_BYTES` / `BANNER_LIMIT_BYTES` caps and the
+//! `png`/`jpeg`/`gif`/`webp` allowlist, both 422s — each updated
+//! individually through JSON, form and multipart bodies, with absent fields
+//! left untouched, invalid boolean strings and over-long texts answered
+//! 422, the 200 answer the owner entity with its `source` block (the
+//! `verify_credentials` render), the route behind `AuthUser` and
+//! `write:accounts` (401 unauthenticated, 403 for the wrong credential),
+//! and the `POST` alias serving the old clients.
 
 #![cfg(test)]
 
@@ -26,6 +31,8 @@ pub mod common;
 use axum::{Router, body::Bytes, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
@@ -39,6 +46,12 @@ const ROUTE: &str = "/api/v1/accounts/update_credentials";
 const BOUNDARY: &str = "wired-update-credentials-boundary";
 /// The instance origin the fixtures live on (`Config::for_tests`).
 const BASE: &str = TEST_BASE_URL;
+/// Where the test instance serves stored files from.
+const MEDIA: &str = "https://test.example/media";
+/// The entity's default avatar, `Config::for_tests`' instance asset.
+const DEFAULT_AVATAR: &str = "https://test.example/images/avi.png";
+/// The entity's default banner, likewise.
+const DEFAULT_HEADER: &str = "https://test.example/images/banner.png";
 /// The 401 body `AuthUser` renders when no token was presented at all.
 const NO_TOKEN: &str = r#"{"error":"Invalid credentials"}"#;
 /// The 401 body for a token that does not resolve.
@@ -47,6 +60,26 @@ const INVALID_TOKEN: &str = r#"{"error":"The access token is invalid"}"#;
 const USER_REQUIRED: &str = r#"{"error":"This API requires an authenticated user"}"#;
 /// The 403 body for a token without the endpoint's scope.
 const NO_SCOPE: &str = r#"{"error":"Insufficient permissions: write:accounts."}"#;
+/// A `PNG`: the signature the detector matches on. A profile image is never
+/// decoded, so the header is the whole fixture (20 bytes).
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
+/// A `JPEG`: the `SOI` and `APP0` markers the detector matches on (16 bytes).
+const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01";
+/// A `GIF`: the versioned header `GIF89a` (14 bytes).
+const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00";
+/// The bare 8-byte `PNG` signature: the smallest file the detector still
+/// names a `png`, which the size-cap tests measure against a cap.
+const SMALL_PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// A `WebP`: the `RIFF` container, its size and the `WEBP`/`VP8` tags
+/// (16 bytes).
+const WEBP: &[u8] = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+/// A `BMP`: an image the detector names, and one the endpoint still
+/// refuses.
+const BMP: &[u8] = b"BM\x36\x00\x00\x00\x00\x00\x36\x00\x00\x00";
+/// A `PDF`: bytes with a type that is no image.
+const PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n";
+/// Text: bytes no matcher can name at all.
+const TEXT: &[u8] = b"a plain text file, definitely not an image\n";
 
 /// `PATCH` the endpoint with `body` as JSON.
 async fn patch_json(app: &Router, token: &str, body: &Value) -> common::TestResponse {
@@ -639,12 +672,63 @@ async fn post_alias_updates_the_same_fields(pool: PgPool) {
     );
 }
 
-/// File parts ride along unexamined for now: an `avatar` upload in the
-/// same multipart body does not disturb the text fields (the media side
-/// of this endpoint is a later ticket).
+/// A profile image and the text fields ride along in one multipart body:
+/// the upload writes its column and the name beside it, and nothing else
+/// moves. The earlier slice of this endpoint ignored file parts altogether;
+/// the image ticket took them over, and this is the test that pinned that
+/// behaviour, rewritten to the one that holds now.
 #[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn multipart_file_parts_are_ignored_by_the_text_slice(pool: PgPool) {
-    let (app, token, _) = authed_app(&pool, "alice").await;
+async fn an_avatar_upload_rides_along_with_the_text_fields(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let body = ok_body(
+        &patch_multipart(
+            &app,
+            &token,
+            &[
+                part("display_name", "Ada"),
+                file_part("avatar", PNG),
+                part("avatar_description", "alt text the endpoint ignores"),
+                part("header_description", "and so this one"),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(body["display_name"], "Ada", "the text field applied");
+    assert_eq!(body["note"], "", "the note stayed as it was");
+    let avatar = url_of(&body["avatar"]);
+    assert!(
+        avatar.starts_with(&format!("{MEDIA}/{}/", alice.id)),
+        "the avatar is the caller's own stored file: {avatar}"
+    );
+    assert!(
+        extension_of(&avatar) == "png",
+        "stored as the png it is: {avatar}"
+    );
+    assert_eq!(
+        body["header"], DEFAULT_HEADER,
+        "the banner the body did not send stays the default"
+    );
+    assert_eq!(
+        body["pleroma"]["background_image"],
+        Value::Null,
+        "and so does the background"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.avatar_url.as_deref(), Some(avatar.as_str()), "stored");
+    assert_eq!(
+        served(&dir, &avatar),
+        Some(PNG.to_vec()),
+        "the announced URL serves the uploaded bytes"
+    );
+}
+
+/// A file part under a field this endpoint does not read is still ignored,
+/// and stores nothing.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_file_part_under_another_name_is_ignored(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, _) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let body = ok_body(
         &patch_multipart(
             &app,
@@ -652,10 +736,10 @@ async fn multipart_file_parts_are_ignored_by_the_text_slice(pool: PgPool) {
             &[
                 part("display_name", "Ada"),
                 common::MultipartPart::file(
-                    "avatar",
+                    "file",
                     "cat.png",
                     "image/png",
-                    Bytes::from_static(b"not really a png"),
+                    Bytes::from_static(PNG),
                 ),
             ],
         )
@@ -663,10 +747,10 @@ async fn multipart_file_parts_are_ignored_by_the_text_slice(pool: PgPool) {
     );
     assert_eq!(body["display_name"], "Ada", "the text field applied");
     assert_eq!(
-        body["avatar"],
-        format!("{BASE}/images/avi.png"),
+        body["avatar"], DEFAULT_AVATAR,
         "the avatar stays the instance default"
     );
+    assert_eq!(stored_files(&dir), 0, "and nothing was stored");
 }
 
 /// One profile metadata entry as the entity answers it.
@@ -1151,4 +1235,480 @@ fn source_of(body: &Value) -> Value {
     body.get("source")
         .cloned()
         .expect("update_credentials renders the source block")
+}
+
+/// A throwaway uploads directory, removed when the returned guard drops:
+/// profile-image tests store real files and must not write into the
+/// repository's own `./uploads`.
+fn uploads_dir() -> TempDir {
+    TempDir::new().expect("temp dir for uploads")
+}
+
+/// A user bound `write:accounts` token, the app that serves it out of
+/// `dir`, and the fixture user whose row the updates change.
+async fn authed_app_with_uploads(
+    pool: &PgPool,
+    nickname: &str,
+    dir: &TempDir,
+) -> (Router, String, User) {
+    let alice = common::create_local_user(pool, nickname).await;
+    let token = common::create_app_and_token(pool, &alice, "write:accounts").await;
+    (
+        common::test_app_with_uploads_dir(pool.clone(), dir.path()),
+        token,
+        alice,
+    )
+}
+
+/// An image file part uploaded under `field`. The client always claims
+/// `image/png` and names the part `picture.png`: what is stored comes from
+/// the bytes, so a test that wants to prove that (and one that wants to see
+/// the claim refused) can reuse this one builder.
+fn file_part(field: &'static str, bytes: &[u8]) -> common::MultipartPart {
+    common::MultipartPart::file(
+        field,
+        "picture.png",
+        "image/png",
+        Bytes::copy_from_slice(bytes),
+    )
+}
+
+/// A `PATCH` multipart body of one image part and nothing else.
+async fn upload(
+    app: &Router,
+    token: &str,
+    field: &'static str,
+    bytes: &[u8],
+) -> common::TestResponse {
+    patch_multipart(app, token, &[file_part(field, bytes)]).await
+}
+
+/// The URL of a string value, for comparing against what the row stored.
+///
+/// # Panics
+///
+/// If the value is not a string (an entity that carried no URL at all).
+fn url_of(value: &Value) -> String {
+    value
+        .as_str()
+        .unwrap_or_else(|| panic!("{value} is not a URL string"))
+        .to_owned()
+}
+
+/// The uploads key a media URL names: the part below [`MEDIA`].
+///
+/// # Panics
+///
+/// If the URL is not served from [`MEDIA`].
+fn key_of(url: &str) -> String {
+    url.strip_prefix(&format!("{MEDIA}/"))
+        .unwrap_or_else(|| panic!("{url} is not served from {MEDIA}"))
+        .to_owned()
+}
+
+/// Where the file behind a media URL lives inside `dir`.
+fn path_of(dir: &TempDir, url: &str) -> PathBuf {
+    dir.path().join(key_of(url))
+}
+
+/// The bytes the uploads directory holds behind a media URL, or `None` when
+/// no file is there (anymore).
+fn served(dir: &TempDir, url: &str) -> Option<Vec<u8>> {
+    std::fs::read(path_of(dir, url)).ok()
+}
+
+/// Every file under `dir`, counted: zero is an empty uploads directory, and
+/// a profile-image write that stored one file moves it by one.
+fn stored_files(dir: &TempDir) -> usize {
+    count_files(dir.path())
+}
+
+/// The files under `path`, recursively (the uploader namespaces them by
+/// user id, so they are never directly in the root).
+fn count_files(path: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let child = entry.path();
+            if child.is_dir() {
+                count_files(&child)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// Assert a 422 with the exact error body, and name it for the caller.
+fn assert_422(response: &common::TestResponse, message: &str, why: &str) {
+    assert_eq!(
+        response.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{why}: {}",
+        response.text()
+    );
+    assert_eq!(
+        response.text(),
+        format!(r#"{{"error":"{message}"}}"#),
+        "{why}"
+    );
+}
+
+/// The three profile images upload through one multipart body: each column
+/// holds the public URL of its own stored file, the entity renders them in
+/// `avatar`, `header` and `pleroma.background_image`, and `/media` serves
+/// every one of them with the bytes as sent.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn the_three_profile_images_upload_and_are_served(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let body = ok_body(
+        &patch_multipart(
+            &app,
+            &token,
+            &[
+                file_part("avatar", PNG),
+                file_part("header", JPEG),
+                file_part("pleroma_background_image", GIF),
+            ],
+        )
+        .await,
+    );
+    let avatar = url_of(&body["avatar"]);
+    let header = url_of(&body["header"]);
+    let background = url_of(&body["pleroma"]["background_image"]);
+    assert_eq!(body["avatar_static"], body["avatar"], "the static pair");
+    assert_eq!(body["header_static"], body["header"], "is the same URL");
+    assert_ne!(avatar, header, "and each slot got its own file");
+
+    let stored_rows = [
+        ("avatar", &avatar, "png", PNG, "image/png"),
+        ("header", &header, "jpg", JPEG, "image/jpeg"),
+        ("background", &background, "gif", GIF, "image/gif"),
+    ];
+    for (name, url, extension, bytes, mime) in stored_rows {
+        assert!(
+            url.starts_with(&format!("{MEDIA}/{}/", alice.id)),
+            "{name} is namespaced to the uploader: {url}"
+        );
+        assert_eq!(extension_of(url), extension, "{name} keeps its type");
+        assert_eq!(
+            served(&dir, url).as_deref(),
+            Some(bytes),
+            "{name} is on disk under its key"
+        );
+        let response = common::TestRequest::get(&format!("/media/{}", key_of(url)))
+            .send(&app)
+            .await;
+        assert_eq!(response.status, StatusCode::OK, "{name} is served");
+        assert_eq!(
+            response.header("content-type"),
+            Some(mime),
+            "{name} serves as the type its bytes are"
+        );
+        assert_eq!(response.body.as_ref(), bytes, "the served {name} bytes");
+    }
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.avatar_url.as_deref(), Some(avatar.as_str()), "stored");
+    assert_eq!(row.banner_url.as_deref(), Some(header.as_str()), "stored");
+    assert_eq!(
+        row.background_image_url.as_deref(),
+        Some(background.as_str()),
+        "stored"
+    );
+}
+
+/// `webp` is the fourth accepted image type, and the endpoint accepts it for
+/// the avatar: the stored key carries the extension the detected type gives.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_webp_avatar_uploads_like_the_others(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let body = ok_body(&upload(&app, &token, "avatar", WEBP).await);
+    let avatar = url_of(&body["avatar"]);
+    assert_eq!(extension_of(&avatar), "webp", "stored as a webp");
+    assert_eq!(served(&dir, &avatar).as_deref(), Some(WEBP), "the bytes");
+    assert_eq!(
+        stored(&pool, alice.id).await.banner_url,
+        None,
+        "the slot the body did not send stays empty"
+    );
+}
+
+/// A replacement stores a new key and removes the file the column named
+/// before it; the other two images are untouched, file and all.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn replacing_an_image_deletes_the_previous_file(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let first = url_of(&ok_body(&upload(&app, &token, "avatar", PNG).await)["avatar"]);
+    let header = url_of(&ok_body(&upload(&app, &token, "header", JPEG).await)["header"]);
+    assert_eq!(stored_files(&dir), 2, "avatar and banner on disk");
+
+    let second = url_of(&ok_body(&upload(&app, &token, "avatar", WEBP).await)["avatar"]);
+    assert_ne!(first, second, "a replacement mints a fresh key");
+    assert_eq!(served(&dir, &second).as_deref(), Some(WEBP), "the new file");
+    assert_eq!(served(&dir, &first), None, "the replaced file is gone");
+    assert_eq!(
+        served(&dir, &header).as_deref(),
+        Some(JPEG),
+        "and the image nobody touched stays where it was"
+    );
+    assert_eq!(stored_files(&dir), 2, "one in, one out");
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.avatar_url.as_deref(), Some(second.as_str()), "stored");
+    assert_eq!(row.banner_url.as_deref(), Some(header.as_str()), "stored");
+}
+
+/// Both spellings of the reset clear their column, answer the instance
+/// default again, and remove the file the column had named: the empty
+/// string through a form and a multipart text part, the `null` through
+/// JSON.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn clearing_an_image_resets_the_entity_and_deletes_the_file(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let avatar = url_of(&ok_body(&upload(&app, &token, "avatar", PNG).await)["avatar"]);
+    let header = url_of(&ok_body(&upload(&app, &token, "header", JPEG).await)["header"]);
+    let background = url_of(
+        &ok_body(&upload(&app, &token, "pleroma_background_image", GIF).await)["pleroma"]["background_image"],
+    );
+    assert_eq!(stored_files(&dir), 3, "all three images on disk");
+
+    let cleared = ok_body(&patch_form(&app, &token, &[("avatar", "")]).await);
+    assert_eq!(
+        cleared["avatar"], DEFAULT_AVATAR,
+        "the empty form string resets the entity"
+    );
+    assert_eq!(served(&dir, &avatar), None, "and its file goes with it");
+
+    let nulled = ok_body(&patch_json(&app, &token, &json!({"header": null})).await);
+    assert_eq!(
+        nulled["header"], DEFAULT_HEADER,
+        "a JSON null resets the banner"
+    );
+    assert_eq!(served(&dir, &header), None, "and deletes its file");
+
+    let text_part =
+        ok_body(&patch_multipart(&app, &token, &[part("pleroma_background_image", "")]).await);
+    assert_eq!(
+        text_part["pleroma"]["background_image"],
+        Value::Null,
+        "an empty multipart text part clears the background too"
+    );
+    assert_eq!(served(&dir, &background), None, "and deletes that file");
+
+    assert_eq!(stored_files(&dir), 0, "every replaced file is gone");
+    let row = stored(&pool, alice.id).await;
+    assert!(
+        row.avatar_url.is_none() && row.banner_url.is_none() && row.background_image_url.is_none(),
+        "all three columns are NULL again: {row:?}"
+    );
+
+    // And the slot can be filled once more after the clear.
+    let again = url_of(&ok_body(&upload(&app, &token, "avatar", GIF).await)["avatar"]);
+    assert_eq!(
+        served(&dir, &again).as_deref(),
+        Some(GIF),
+        "a new upload works"
+    );
+}
+
+/// Clearing an image that was never set is the accepted no-op, not an
+/// error, and it leaves a stored image of another slot alone.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn clearing_an_unset_image_changes_nothing(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, _) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let header = url_of(&ok_body(&upload(&app, &token, "header", JPEG).await)["header"]);
+    let body = ok_body(&patch_json(&app, &token, &json!({"avatar": null})).await);
+    assert_eq!(body["avatar"], DEFAULT_AVATAR, "the avatar stays unset");
+    assert_eq!(
+        body["header"], header,
+        "an absent slot keeps the stored image"
+    );
+    assert_eq!(stored_files(&dir), 1, "and no file was deleted");
+}
+
+/// The two byte caps: the avatar is measured by `AVATAR_LIMIT_BYTES`, the
+/// banner and the background by `BANNER_LIMIT_BYTES`, and passing either is
+/// the 422 "File is too large" that stores nothing.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn an_oversize_profile_image_is_the_422(pool: PgPool) {
+    let dir = uploads_dir();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    // The fixtures are 12 to 20 bytes, so the caps below are within reach of
+    // every one of them and the general `UPLOAD_LIMIT_BYTES` never fires.
+    let mut config = common::test_config_with_uploads_dir(dir.path());
+    config.avatar_limit_bytes = 16;
+    config.banner_limit_bytes = 14;
+    let app = common::test_app_with_config(pool.clone(), config);
+
+    // [`PNG`] is 20 bytes, over both caps; [`GIF`] is 14, within the banner's.
+    for field in ["avatar", "header", "pleroma_background_image"] {
+        let response = upload(&app, &token, field, PNG).await;
+        assert_422(
+            &response,
+            "File is too large",
+            &format!("{field} is over its cap"),
+        );
+    }
+    assert_eq!(stored_files(&dir), 0, "a refused upload stores nothing");
+    let row = stored(&pool, alice.id).await;
+    assert!(
+        row.avatar_url.is_none() && row.banner_url.is_none() && row.background_image_url.is_none(),
+        "and writes nothing: {row:?}"
+    );
+
+    let banner = ok_body(&upload(&app, &token, "header", GIF).await);
+    assert_eq!(
+        extension_of(&url_of(&banner["header"])),
+        "gif",
+        "BANNER_LIMIT_BYTES is exactly what measures the banner"
+    );
+
+    // The avatar's own cap is the other number: the 14-byte [`GIF`] the
+    // banner above accepted is over an 8-byte avatar cap, while the 8-byte
+    // PNG signature fits it exactly.
+    let mut strict = common::test_config_with_uploads_dir(dir.path());
+    strict.avatar_limit_bytes = SMALL_PNG.len();
+    let strict_app = common::test_app_with_config(pool.clone(), strict);
+    let response = upload(&strict_app, &token, "avatar", GIF).await;
+    assert_422(
+        &response,
+        "File is too large",
+        "AVATAR_LIMIT_BYTES caps the avatar on its own number",
+    );
+    let avatar = ok_body(&upload(&strict_app, &token, "avatar", SMALL_PNG).await);
+    assert_eq!(
+        extension_of(&url_of(&avatar["avatar"])),
+        "png",
+        "a file exactly at the cap is accepted"
+    );
+}
+
+/// The type allowlist: a `BMP` and a `PDF` are both bytes a matcher names and
+/// neither is a profile image, so both are the 422 "Unsupported file type"
+/// that stores nothing.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_wrong_image_type_is_the_422(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    for bytes in [BMP, PDF] {
+        for field in ["avatar", "header", "pleroma_background_image"] {
+            let response = upload(&app, &token, field, bytes).await;
+            assert_422(
+                &response,
+                "Unsupported file type",
+                &format!("{field} cannot be {}", hex_head(bytes)),
+            );
+        }
+    }
+    assert_eq!(stored_files(&dir), 0, "a refused upload stores nothing");
+    assert!(
+        stored(&pool, alice.id).await.avatar_url.is_none(),
+        "and writes nothing"
+    );
+}
+
+/// The extension of a stored media URL's key: the part after the last dot of
+/// its name.
+///
+/// # Panics
+///
+/// If the key has no dot, which a generated key always has.
+fn extension_of(url: &str) -> String {
+    let key = key_of(url);
+    let (_, extension) = key
+        .rsplit_once('.')
+        .unwrap_or_else(|| panic!("{url} is not a named key"));
+    extension.to_owned()
+}
+
+/// The first bytes of a fixture, spelled out for a failure message.
+fn hex_head(bytes: &[u8]) -> String {
+    let head: Vec<String> = bytes
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02X}"))
+        .collect();
+    format!("{}-byte fixture ({})", bytes.len(), head.join(" "))
+}
+
+/// Non-image bytes under an `image/png` part header: the claim is what the
+/// client says, the answer is what the bytes are, so this is the same 422 as
+/// any other non-image — and an empty part with it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn non_image_bytes_with_an_image_content_type_are_the_422(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, _) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    for bytes in [TEXT, PDF, b""] {
+        // Every fixture from [`file_part`] arrives as `image/png`, named
+        // `.png`: neither the claim nor the name carries the decision.
+        let response = upload(&app, &token, "avatar", bytes).await;
+        assert_422(
+            &response,
+            "Unsupported file type",
+            &format!("{} bytes claimed image/png", bytes.len()),
+        );
+    }
+    assert_eq!(stored_files(&dir), 0, "nothing reached storage");
+    let response = upload(&app, &token, "header", TEXT).await;
+    assert_422(&response, "Unsupported file type", "the banner checks too");
+}
+
+/// One bad image in a body with a good one refuses the whole request: every
+/// slot is checked before any file is stored, so the good avatar never
+/// reaches disk and the row never moves.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_body_with_one_bad_image_stores_nothing(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let response = patch_multipart(
+        &app,
+        &token,
+        &[
+            part("display_name", "Ada"),
+            file_part("avatar", PNG),
+            file_part("header", PDF),
+        ],
+    )
+    .await;
+    assert_422(
+        &response,
+        "Unsupported file type",
+        "the bad header sinks the body",
+    );
+    assert_eq!(
+        stored_files(&dir),
+        0,
+        "and the good avatar was never stored"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.name, "", "no column of the same body was written");
+    assert!(row.avatar_url.is_none(), "and no image either");
+}
+
+/// The image slots are absent from a text-only body, so an account with a
+/// stored avatar keeps it (and its file) through a name or note update.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn a_text_update_leaves_a_stored_image_alone(pool: PgPool) {
+    let dir = uploads_dir();
+    let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
+    let avatar = url_of(&ok_body(&upload(&app, &token, "avatar", PNG).await)["avatar"]);
+    let body = ok_body(&patch_json(&app, &token, &json!({"display_name": "Grace"})).await);
+    assert_eq!(
+        body["avatar"], avatar,
+        "an absent avatar parameter keeps the stored image"
+    );
+    assert_eq!(served(&dir, &avatar).as_deref(), Some(PNG), "and its file");
+    assert_eq!(
+        stored(&pool, alice.id).await.avatar_url.as_deref(),
+        Some(avatar.as_str()),
+        "stored through the unrelated write"
+    );
 }

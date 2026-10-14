@@ -970,7 +970,7 @@ pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> 
     Ok(())
 }
 
-/// The whole `PATCH /api/v1/accounts/update_credentials` write: the eight
+/// The whole `PATCH /api/v1/accounts/update_credentials` write: the eleven
 /// profile columns the endpoint owns.
 ///
 /// Every one of them arrives already merged with the stored row by the
@@ -997,9 +997,20 @@ pub struct ProfileFields {
     /// column: the same entries as [`fields`](Self::fields), with the
     /// values and names exactly as typed.
     pub raw_fields: Value,
+    /// The avatar URL for the `avatar_url` column: the stored one when the
+    /// body carried no `avatar` parameter, the public URL of a newly stored
+    /// upload when it carried a file, `None` when it cleared the image.
+    pub avatar_url: Option<String>,
+    /// The banner URL for the `banner_url` column, the three states of
+    /// [`avatar_url`](Self::avatar_url) read from the body's `header`.
+    pub banner_url: Option<String>,
+    /// The background URL for the `background_image_url` column, the three
+    /// states of [`avatar_url`](Self::avatar_url) read from the body's
+    /// `pleroma_background_image`.
+    pub background_image_url: Option<String>,
 }
 
-/// The `UPDATE` behind [`update_profile`]: writes the eight profile columns
+/// The `UPDATE` behind [`update_profile`]: writes the eleven profile columns
 /// in one statement, refreshes `updated_at` and returns the stored row.
 const UPDATE_PROFILE_SQL: &str = "UPDATE users
       SET name = $2,
@@ -1010,6 +1021,9 @@ const UPDATE_PROFILE_SQL: &str = "UPDATE users
           discoverable = $7,
           fields = $8,
           raw_fields = $9,
+          avatar_url = $10,
+          banner_url = $11,
+          background_image_url = $12,
           updated_at = now()
      WHERE id = $1
   RETURNING *";
@@ -1042,6 +1056,9 @@ pub async fn update_profile(
         .bind(fields.discoverable)
         .bind(fields.fields.clone())
         .bind(fields.raw_fields.clone())
+        .bind(fields.avatar_url.as_deref())
+        .bind(fields.banner_url.as_deref())
+        .bind(fields.background_image_url.as_deref())
         .fetch_optional(pool)
         .await?)
 }
@@ -1976,12 +1993,18 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_profile_writes_the_eight_columns_and_returns_them(pool: PgPool) {
+    async fn update_profile_writes_the_eleven_columns_and_returns_them(pool: PgPool) {
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         assert_eq!(alice.name, "", "the fixture has no display name");
         assert!(
             !alice.locked.get() && !alice.bot.get() && !alice.discoverable.get(),
             "the option flags default off"
+        );
+        assert!(
+            alice.avatar_url.is_none()
+                && alice.banner_url.is_none()
+                && alice.background_image_url.is_none(),
+            "the fixture has no profile images"
         );
         let fields = ProfileFields {
             name: "Alice Adams".to_owned(),
@@ -1992,6 +2015,9 @@ mod tests {
             discoverable: Flag::new(true),
             fields: json!([{"name": "site", "value": "<p><a href=\"https://alice.example\" rel=\"ugc nofollow noopener noreferrer\">alice.example</a></p>"}]),
             raw_fields: json!([{"name": "site", "value": "https://alice.example"}]),
+            avatar_url: Some(format!("{BASE}/media/alice/avatar.png")),
+            banner_url: Some(format!("{BASE}/media/alice/banner.png")),
+            background_image_url: Some(format!("{BASE}/media/alice/bg.png")),
         };
         let updated = update_profile(&pool, alice.id, &fields)
             .await
@@ -2013,6 +2039,21 @@ mod tests {
             json!([{"name": "site", "value": "https://alice.example"}]),
             "the raw fields are written beside them"
         );
+        assert_eq!(
+            updated.avatar_url.as_deref(),
+            Some("https://test.example/media/alice/avatar.png"),
+            "the avatar URL is written"
+        );
+        assert_eq!(
+            updated.banner_url.as_deref(),
+            Some("https://test.example/media/alice/banner.png"),
+            "the banner URL is written"
+        );
+        assert_eq!(
+            updated.background_image_url.as_deref(),
+            Some("https://test.example/media/alice/bg.png"),
+            "the background URL is written"
+        );
         assert!(
             updated.updated_at > alice.updated_at,
             "the write refreshes updated_at"
@@ -2024,6 +2065,7 @@ mod tests {
         assert_eq!(stored.raw_bio, updated.raw_bio, "stored raw bio");
         assert_eq!(stored.fields, updated.fields, "stored fields");
         assert_eq!(stored.raw_fields, updated.raw_fields, "stored raw fields");
+        assert_eq!(stored.avatar_url, updated.avatar_url, "stored avatar url");
 
         // An unknown id matches no row and is not an error.
         assert!(
@@ -2032,6 +2074,27 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "no row, no update"
+        );
+
+        // The columns are plain nullable text: the merged value the caller
+        // hands in is what stands, so `None` clears one image while the
+        // other two keep what the caller merged over the row.
+        let cleared = ProfileFields {
+            avatar_url: None,
+            ..fields
+        };
+        let after = update_profile(&pool, alice.id, &cleared)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert!(after.avatar_url.is_none(), "the avatar column is cleared");
+        assert_eq!(
+            after.banner_url, stored.banner_url,
+            "and the untouched ones keep their value"
+        );
+        assert_eq!(
+            after.background_image_url, stored.background_image_url,
+            "the background keeps its value"
         );
     }
 }

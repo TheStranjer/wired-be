@@ -43,7 +43,12 @@
 //! body actually carries are written — [`MultipartForm`] parses JSON,
 //! urlencoded and multipart bodies alike (decision 10) and every parameter
 //! here is optional, a JSON `null` counting as absent as in Pleroma's
-//! `Enum.filter(fn {_, value} -> not is_nil(value) end)`. `display_name`
+//! `Enum.filter(fn {_, value} -> not is_nil(value) end)`. The three
+//! profile-image parameters are the exception to that rule: Pleroma's
+//! `user_image_value` reads their empty string as "reset", so an empty
+//! string or a JSON `null` *clears* `avatar`, `header` or
+//! `pleroma_background_image` while an absent one keeps the stored image.
+//! `display_name`
 //! is length-checked against
 //! [`max_display_name_chars`](Config::max_display_name_chars) (422 with
 //! Mastodon's wording on overflow) and stored through
@@ -68,7 +73,24 @@
 //! jsonb columns store the pair: `raw_fields` keeps the entries as
 //! typed, `fields` the names reduced to plain text and the values
 //! rendered by [`text_to_html`] — so a bare URL becomes a link with the
-//! standard `rel`. An empty submission clears the metadata. The answer
+//! standard `rel`. An empty submission clears the metadata. The three
+//! profile images — the `avatar`, `header` and `pleroma_background_image`
+//! file parts, `users.avatar_url`, `banner_url` and `background_image_url`
+//! on this side — are stored through [`crate::uploads`] under a
+//! [`media_key`](uploads::media_key) of the caller's id, and their columns
+//! hold the [`public_url`](uploads::UploaderBackend::public_url) of what
+//! was stored, the address [`crate::api::media_files`] serves the bytes
+//! from. What a part's bytes name decides everything: only `png`, `jpeg`,
+//! `gif` and `webp` are profile images (any other bytes, and any other
+//! type the client's part header claimed, are the 422 "Unsupported file
+//! type"), and a part over [`avatar_limit_bytes`](Config::avatar_limit_bytes)
+//! for the avatar or [`banner_limit_bytes`](Config::banner_limit_bytes) for
+//! the banner and the background is the 422 "File is too large". Every slot
+//! is checked before any file is stored, so a body with one good image and
+//! one bad one changes nothing; the file a replacement or a clear left
+//! behind is removed best-effort once the row stopped naming it.
+//! `avatar_description` and `header_description` are accepted and ignored.
+//! The answer
 //! is a 200 [`Account::for_owner`] render — the owner view with its
 //! `source` block, the same one `verify_credentials` answers — and every
 //! accepted request runs the `after_profile_updated` hook, which the
@@ -165,10 +187,11 @@ use axum::{
     http::{HeaderMap, Uri},
     routing::{get, patch, post},
 };
-use serde::Deserialize;
+use bytes::Bytes;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -181,7 +204,10 @@ use crate::{
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
-    extract::{ApiBody, flex, index_map_to_vec, multipart::MultipartForm},
+    extract::{
+        ApiBody, flex, index_map_to_vec,
+        multipart::{MultipartForm, UploadedFile, UploadedFiles as _, upload_body_limit},
+    },
     models::{
         account_note,
         follow::{self, Follow},
@@ -190,6 +216,7 @@ use crate::{
     oauth::scopes::{FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
     state::AppState,
+    uploads,
     util::{
         entities::{MentionRef, extract_mentions, linkify_entities},
         format::text_to_html,
@@ -228,13 +255,50 @@ const TOO_MANY_FIELDS: &str = "Too many fields";
 /// wording for the action.
 const SELF_REMOVE: &str = "Can not remove yourself from followers";
 
+/// The form field `PATCH /api/v1/accounts/update_credentials` reads the
+/// avatar image from (Mastodon's and Pleroma's `avatar`).
+const AVATAR_FIELD: &str = "avatar";
+
+/// The field the profile banner arrives under: Mastodon calls it `header`,
+/// Pleroma stores it in the `banner` column.
+const HEADER_FIELD: &str = "header";
+
+/// The field Pleroma's profile background image arrives under.
+const BACKGROUND_FIELD: &str = "pleroma_background_image";
+
+/// The 422 body for a profile-image part whose bytes are none of
+/// [`ACCEPTED_IMAGE_TYPES`] — the same wording the media upload uses for
+/// bytes it cannot name an accepted type for.
+const UNSUPPORTED_FILE_TYPE: &str = "Unsupported file type";
+
+/// The 422 body for a profile-image part over its configured byte limit
+/// ([`avatar_limit_bytes`](Config::avatar_limit_bytes) for the avatar,
+/// [`banner_limit_bytes`](Config::banner_limit_bytes) for the banner and the
+/// background); Pleroma's `update_credentials` wording, which this
+/// endpoint's ticket pins to 422 rather than its 413.
+const FILE_TOO_LARGE: &str = "File is too large";
+
+/// The media types a profile image may be, as the MIME types [`infer`]
+/// reads from the bytes: the four the ticket names (Pleroma accepts these
+/// and nothing else for `avatar`, `header` and `pleroma_background_image`).
+const ACCEPTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
 /// The `Link` header's query parameters carry nothing but the cursor: the
 /// relationship listings have no filter to repeat on either link (the
 /// scrobbles listing's constant, same rule).
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
-pub fn router() -> Router<AppState> {
+///
+/// `config` is what [`upload_body_limit`] sizes the routes' body limit from:
+/// `update_credentials` takes the three profile images as multipart file
+/// parts, and axum's multipart extractor refuses a body over its 2 MiB
+/// default unless the route raises that — which for an avatar capped at
+/// [`DEFAULT_AVATAR_LIMIT_BYTES`] it must, or a legal upload would never
+/// reach the handler.
+///
+/// [`DEFAULT_AVATAR_LIMIT_BYTES`]: crate::config::DEFAULT_AVATAR_LIMIT_BYTES
+pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/accounts/verify_credentials", get(verify_credentials))
         .route(
@@ -251,6 +315,7 @@ pub fn router() -> Router<AppState> {
             post(remove_from_followers),
         )
         .route("/accounts/{id}", get(show_account))
+        .layer(upload_body_limit(config))
 }
 
 /// `GET /api/v1/accounts/verify_credentials` — the caller's own account,
@@ -319,6 +384,14 @@ async fn with_moved(state: &AppState, account: Account, user: &User) -> AppResul
 /// parameters before the changeset). The booleans arrive through
 /// [`flex::opt_bool`], so a form's `"true"`/`"on"`/`"1"` spells the same
 /// as JSON `true`, and an unknown string is the extractor's 422.
+///
+/// The three profile images are the exception to the `null` rule, and so are
+/// read through [`kept_value`] as raw [`Value`]s: Pleroma's
+/// `user_image_value` treats their empty string as the reset, so an
+/// *absent* parameter keeps the stored image while `null` or `""` clears it
+/// (see [`resolve_images`]). `avatar_description` and `header_description`
+/// are not fields of this shape on purpose: serde drops unknown keys, so
+/// both are accepted and ignored, as this endpoint's ticket asks.
 #[derive(Debug, Deserialize)]
 struct ProfileParams {
     /// The display name to store: at most
@@ -348,6 +421,37 @@ struct ProfileParams {
     /// extractor and [`stored_fields`] folds them into one list.
     #[serde(default)]
     fields_attributes: Option<Value>,
+    /// The avatar: a `multipart/form-data` file part named `avatar`, or the
+    /// text/JSON spelling that clears the stored one.
+    #[serde(default, deserialize_with = "kept_value")]
+    avatar: Option<Value>,
+    /// The profile banner, Mastodon's name for what Pleroma stores in
+    /// `banner_url`.
+    #[serde(default, deserialize_with = "kept_value")]
+    header: Option<Value>,
+    /// The profile background image, Pleroma's own extension.
+    #[serde(default, deserialize_with = "kept_value")]
+    pleroma_background_image: Option<Value>,
+}
+
+/// Serde field helper for a parameter that must tell an absent key from a
+/// JSON `null`: `deserialize_with` runs only when the key is there, and
+/// [`Value`] keeps `null` as [`Value::Null`] instead of folding it into
+/// absence the way `Option<T>` does. Paired with `#[serde(default)]` the
+/// field is `None` for a key the body never carried and
+/// `Some(Value::Null)` for one it carried as `null` — the difference the
+/// profile-image clears depend on.
+///
+/// # Errors
+///
+/// Whatever the underlying [`Value`] deserializer reports (which, for the
+/// JSON and form bodies the extractors hand over, is nothing: any value
+/// becomes a [`Value`]).
+fn kept_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// `PATCH /api/v1/accounts/update_credentials` (and the `POST` alias of
@@ -356,40 +460,54 @@ struct ProfileParams {
 /// [`verify_credentials`] answers it.
 ///
 /// [`MultipartForm`] takes JSON, urlencoded and multipart bodies alike
-/// (decision 10); file parts (`avatar` and friends) belong to later
-/// tickets and are ignored. [`profile_fields`] validates what is present
-/// and merges it over the token's row,
-/// [`update_profile`](crate::models::user::update_profile) writes the
-/// eight columns in one statement, and the fresh row answers through
-/// [`owner_view`] — the write-behind render that states the stored fact
-/// rather than trusting the request. A body that carries none of these
-/// fields is the accepted no-op: 200 with the unchanged entity.
+/// (decision 10), its file parts arriving beside the text parameters: the
+/// three profile images are the file parts this endpoint reads
+/// ([`resolve_images`]), every other file part is ignored.
+/// [`profile_fields`] validates what the body carries of the text side and
+/// merges it over the token's row, the image writes land in the same merged
+/// struct after [`ImageWrites::apply`] stored their files, and
+/// [`update_profile`](crate::models::user::update_profile) writes the eleven
+/// columns in one statement. The fresh row answers through [`owner_view`] —
+/// the write-behind render that states the stored fact rather than trusting
+/// the request — and only after it does [`delete_replaced_files`] remove the
+/// files the write replaced. A body that carries none of these fields is the
+/// accepted no-op: 200 with the unchanged entity.
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
 /// and the `write:accounts` check; [`AppError::Unprocessable`] when
 /// `display_name` or `note` is too long, when `fields_attributes` breaks
-/// one of its limits, or from the extractor for an invalid boolean
-/// string. Any database failure arrives through `?` as
-/// [`AppError::Database`], and the [`AppError::Internal`] arm only
-/// documents that the row behind a just-authenticated token is gone.
+/// one of its limits, when a profile image is not a `png`, `jpeg`, `gif` or
+/// `webp` file or when one passes its configured byte limit, and from the
+/// extractor for an invalid boolean string or a file over
+/// `UPLOAD_LIMIT_BYTES` (413). Storage failures arrive as
+/// [`AppError::Internal`], any database failure through `?` as
+/// [`AppError::Database`], and the [`AppError::Internal`] arm of the write
+/// only documents that the row behind a just-authenticated token is gone.
 async fn update_credentials(
     State(state): State<AppState>,
     auth: AuthUser,
     form: MultipartForm<ProfileParams>,
 ) -> AppResult<Json<Account>> {
     auth.require(WRITE_ACCOUNTS)?;
-    let fields = profile_fields(&state, &auth.0, form.fields).await?;
-    let updated = user::update_profile(&state.db, auth.0.id, &fields)
+    let MultipartForm { fields, mut files } = form;
+    let images = resolve_images(&state.config, &mut files, &fields)?;
+    let mut profile = profile_fields(&state, &auth.0, fields).await?;
+    let applied = images.apply(&state, auth.0.id, &auth.0).await?;
+    profile.avatar_url = applied.avatar_url;
+    profile.banner_url = applied.banner_url;
+    profile.background_image_url = applied.background_image_url;
+    let updated = user::update_profile(&state.db, auth.0.id, &profile)
         .await?
         .ok_or_else(|| AppError::Internal("profile update matched no row".to_owned()))?;
+    delete_replaced_files(&state, applied.replaced).await;
     after_profile_updated(&state, &updated);
     owner_view(&state, &updated).await
 }
 
 /// Validates the present profile parameters and merges them over the
-/// stored row: the eight columns
+/// stored row: the eight text columns
 /// [`update_profile`](crate::models::user::update_profile) will write,
 /// with fields absent from the request carrying the value they already
 /// hold and fields present-but-blank carrying the blank (an empty
@@ -398,7 +516,9 @@ async fn update_credentials(
 /// fallback). A `note` over [`max_bio_chars`](Config::max_bio_chars)
 /// characters (counted in characters, not bytes) is the 422 mirroring the
 /// name message; a submitted `fields_attributes` is validated and
-/// rendered by [`stored_fields`].
+/// rendered by [`stored_fields`]. The three image columns start from the
+/// stored row here and are overwritten by [`ImageWrites::apply`], which is
+/// the only writer that can store a file.
 ///
 /// # Errors
 ///
@@ -442,7 +562,308 @@ async fn profile_fields(
         discoverable: params.discoverable.map_or(current.discoverable, Flag::from),
         fields,
         raw_fields,
+        avatar_url: current.avatar_url.clone(),
+        banner_url: current.banner_url.clone(),
+        background_image_url: current.background_image_url.clone(),
     })
+}
+
+/// What one profile-image parameter of an `update_credentials` body asks
+/// for, after its bytes passed the checks and before anything was stored.
+#[derive(Debug)]
+enum ImageWrite {
+    /// The parameter is absent: the column keeps its stored value.
+    Unchanged,
+    /// The empty string (the form and multipart spelling) or JSON `null`:
+    /// the column is cleared, Pleroma's `user_image_value` reset.
+    Clear,
+    /// A file part whose bytes named an accepted image type and stayed
+    /// within the column's byte limit.
+    Store {
+        /// The image's bytes.
+        bytes: Bytes,
+        /// The client's file name, used only for the key's extension
+        /// fallback (the type comes from the bytes).
+        filename: Option<String>,
+        /// The media type the magic bytes named.
+        content_type: &'static str,
+    },
+}
+
+/// The three profile-image writes of one body, resolved together so that a
+/// body with one good image and one bad one stores nothing at all.
+#[derive(Debug)]
+struct ImageWrites {
+    /// The write for `users.avatar_url`, from the `avatar` parameter.
+    avatar: ImageWrite,
+    /// The write for `users.banner_url`, from the `header` parameter.
+    banner: ImageWrite,
+    /// The write for `users.background_image_url`, from Pleroma's
+    /// `pleroma_background_image` parameter.
+    background: ImageWrite,
+}
+
+/// One profile-image column after its write was applied: the value the row
+/// will hold, and the URL the write replaced.
+type MergedImage = (Option<String>, Option<String>);
+
+impl ImageWrites {
+    /// Stores every upload of `writes` through the uploader and answers the
+    /// three merged column values beside the list of URLs the writes
+    /// replaced: [`ImageWrite::Unchanged`] leaves the `current` row's value
+    /// in place, [`ImageWrite::Clear`] replaces it with `None` and
+    /// [`ImageWrite::Store`] with the new file's public URL. Whatever the
+    /// column held before and no longer holds is the file
+    /// [`delete_replaced_files`] removes, once the row stopped naming it.
+    ///
+    /// # Errors
+    ///
+    /// Storage failures arrive from [`store_image`] as
+    /// [`AppError::Internal`] / [`AppError::BadRequest`].
+    async fn apply(self, state: &AppState, user_id: Uuid, current: &User) -> AppResult<Applied> {
+        let (avatar_url, avatar_replaced) = self
+            .avatar
+            .merged(state, user_id, current.avatar_url.as_deref())
+            .await?;
+        let (banner_url, banner_replaced) = self
+            .banner
+            .merged(state, user_id, current.banner_url.as_deref())
+            .await?;
+        let (background_image_url, background_replaced) = self
+            .background
+            .merged(state, user_id, current.background_image_url.as_deref())
+            .await?;
+        Ok(Applied {
+            avatar_url,
+            banner_url,
+            background_image_url,
+            replaced: [avatar_replaced, banner_replaced, background_replaced]
+                .into_iter()
+                .flatten()
+                .collect(),
+        })
+    }
+}
+
+/// The three merged profile-image columns and the files that replaced them
+/// (see [`ImageWrites::apply`]).
+#[derive(Debug)]
+struct Applied {
+    /// The value for `users.avatar_url`.
+    avatar_url: Option<String>,
+    /// The value for `users.banner_url`.
+    banner_url: Option<String>,
+    /// The value for `users.background_image_url`.
+    background_image_url: Option<String>,
+    /// The URLs the writes replaced, in column order: empty for a slot that
+    /// was untouched, or cleared while already empty.
+    replaced: Vec<String>,
+}
+
+impl ImageWrite {
+    /// The value this write leaves in its column and the URL it replaced:
+    /// see [`ImageWrites::apply`] for the three cases. `current` is what the
+    /// row holds now, so an untouched slot round-trips it.
+    ///
+    /// # Errors
+    ///
+    /// As [`store_image`]'s for a [`ImageWrite::Store`].
+    async fn merged(
+        self,
+        state: &AppState,
+        user_id: Uuid,
+        current: Option<&str>,
+    ) -> AppResult<MergedImage> {
+        let value = match self {
+            Self::Unchanged => current.map(str::to_owned),
+            Self::Clear => None,
+            Self::Store {
+                bytes,
+                filename,
+                content_type,
+            } => Some(store_image(state, user_id, bytes, filename.as_deref(), content_type).await?),
+        };
+        Ok((value.clone(), replaced_url(current, value.as_deref())))
+    }
+}
+
+/// The URL a write leaves behind: `Some` only when the column held one and
+/// the write stores a different value — a replacement, or a clear. Re-sending
+/// the URL already stored replaces nothing (and a body cannot send one
+/// anyway, since this endpoint only ever writes URLs it minted itself).
+fn replaced_url(before: Option<&str>, after: Option<&str>) -> Option<String> {
+    before
+        .filter(|held| Some(*held) != after)
+        .map(str::to_owned)
+}
+
+/// Resolves the three profile-image parameters of one body against the file
+/// parts that rode along, each against its own configured cap: the avatar
+/// against [`avatar_limit_bytes`](Config::avatar_limit_bytes), the banner and
+/// the background against [`banner_limit_bytes`](Config::banner_limit_bytes),
+/// Pleroma's one number for both. A file part wins over a text or JSON
+/// spelling of the same parameter — that is what a browser's `FormData`
+/// sends — and every slot is resolved before any file is stored, so a body
+/// with one good image and one bad one writes nothing.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`FILE_TOO_LARGE`] or
+/// [`UNSUPPORTED_FILE_TYPE`] from [`resolve_image`].
+fn resolve_images(
+    config: &Config,
+    files: &mut Vec<UploadedFile>,
+    params: &ProfileParams,
+) -> AppResult<ImageWrites> {
+    Ok(ImageWrites {
+        avatar: resolve_image(
+            files,
+            AVATAR_FIELD,
+            params.avatar.as_ref(),
+            config.avatar_limit_bytes,
+        )?,
+        banner: resolve_image(
+            files,
+            HEADER_FIELD,
+            params.header.as_ref(),
+            config.banner_limit_bytes,
+        )?,
+        background: resolve_image(
+            files,
+            BACKGROUND_FIELD,
+            params.pleroma_background_image.as_ref(),
+            config.banner_limit_bytes,
+        )?,
+    })
+}
+
+/// Resolves one profile-image slot: the file part uploaded under `field`
+/// when the body carried one, else the parameter's text or JSON `value` —
+/// absent keeps the column, `null` and the empty string clear it, and
+/// anything else is a value this endpoint has no way to store, answered with
+/// the same 422 as bytes it cannot name an image for.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`FILE_TOO_LARGE`] or
+/// [`UNSUPPORTED_FILE_TYPE`].
+fn resolve_image(
+    files: &mut Vec<UploadedFile>,
+    field: &str,
+    value: Option<&Value>,
+    max_bytes: usize,
+) -> AppResult<ImageWrite> {
+    if let Some(file) = files.take(field) {
+        return validated_write(file, max_bytes);
+    }
+    match value {
+        None => Ok(ImageWrite::Unchanged),
+        Some(Value::Null) => Ok(ImageWrite::Clear),
+        Some(Value::String(text)) if text.is_empty() => Ok(ImageWrite::Clear),
+        Some(_) => Err(AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned())),
+    }
+}
+
+/// The write for one image file part: its size checked against `max_bytes`
+/// and its bytes against [`ACCEPTED_IMAGE_TYPES`], before anything reached
+/// storage.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`FILE_TOO_LARGE`] over the cap or
+/// [`UNSUPPORTED_FILE_TYPE`] from [`detect_image_type`].
+fn validated_write(file: UploadedFile, max_bytes: usize) -> AppResult<ImageWrite> {
+    if file.bytes.len() > max_bytes {
+        return Err(AppError::Unprocessable(FILE_TOO_LARGE.to_owned()));
+    }
+    let content_type = detect_image_type(&file.bytes)?;
+    Ok(ImageWrite::Store {
+        bytes: file.bytes,
+        filename: file.filename,
+        content_type,
+    })
+}
+
+/// The media type of profile-image bytes, from the bytes themselves and not
+/// from the `content-type` the part was sent with: the `infer` match when its
+/// type is one of [`ACCEPTED_IMAGE_TYPES`].
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`UNSUPPORTED_FILE_TYPE`] for bytes no
+/// matcher names, and for the media types a profile image may not be.
+fn detect_image_type(bytes: &[u8]) -> AppResult<&'static str> {
+    let Some(mime) = infer::get(bytes)
+        .map(|kind| kind.mime_type())
+        .filter(|mime| ACCEPTED_IMAGE_TYPES.contains(mime))
+    else {
+        return Err(AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned()));
+    };
+    Ok(mime)
+}
+
+/// Stores one profile image: a fresh [`media_key`](uploads::media_key) under
+/// the uploader's id, the bytes at that key, and the key's public URL as the
+/// value the column holds — the address [`crate::api::media_files`] serves
+/// the file from.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] when the filesystem rejects the write and
+/// [`AppError::BadRequest`] from the key guard (unreachable for a generated
+/// key), both from [`UploaderBackend::put`](uploads::UploaderBackend::put).
+async fn store_image(
+    state: &AppState,
+    user_id: Uuid,
+    bytes: Bytes,
+    filename: Option<&str>,
+    content_type: &str,
+) -> AppResult<String> {
+    let key = uploads::media_key(user_id, filename, content_type);
+    state.uploader.put(&key, bytes, content_type).await?;
+    debug!(
+        user = %user_id,
+        %key,
+        %content_type,
+        "stored profile image"
+    );
+    Ok(state.uploader.public_url(&key))
+}
+
+/// Removes the files the profile-image writes replaced, run after the row
+/// stopped naming them: see [`delete_replaced_file`] for one URL.
+async fn delete_replaced_files(state: &AppState, replaced: Vec<String>) {
+    for stored_url in replaced {
+        delete_replaced_file(state, &stored_url).await;
+    }
+}
+
+/// Best-effort removal of one replaced profile image. Only a URL under this
+/// instance's own media prefix names a file we hold; a foreign or hand-set
+/// URL is left alone, and a removal that fails is logged, not an error — the
+/// profile update it follows already succeeded.
+async fn delete_replaced_file(state: &AppState, stored_url: &str) {
+    let Some(key) = own_media_key(&state.config, stored_url) else {
+        debug!(
+            stored_url,
+            "keeping a replaced profile image we do not store"
+        );
+        return;
+    };
+    if let Err(err) = state.uploader.delete(&key).await {
+        warn!(%err, %key, "could not delete the replaced profile image");
+    }
+}
+
+/// The uploads key `stored_url` names when it is one of this instance's own
+/// media addresses — `{MEDIA_BASE_URL}/{key}` with a `key`
+/// [`check_key`](uploads::check_key) accepts — and `None` for no URL, for a
+/// file on another host, and for a remainder that is not a usable key.
+#[must_use]
+fn own_media_key(config: &Config, stored_url: &str) -> Option<String> {
+    let prefix = format!("{}/", config.media_base_url);
+    let key = stored_url.strip_prefix(prefix.as_str())?;
+    uploads::check_key(key).is_ok().then(|| key.to_owned())
 }
 
 /// The `fields` and `raw_fields` jsonb a submitted `fields_attributes`
@@ -1187,6 +1608,297 @@ mod tests {
         assert!(
             !names_own_domain(&config, &mention("bob", Some("elsewhere.example"))),
             "another domain never names a local user"
+        );
+    }
+
+    /// Magic-byte fixtures for the image slots: a header is all [`infer`]
+    /// reads, and the endpoint never decodes a profile image.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
+    /// A `JPEG`: the `SOI` marker `infer` matches on.
+    const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01";
+    /// A `GIF`: the versioned header, `GIF89a`.
+    const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00";
+    /// A `WebP`: the `RIFF` container with the `WEBP` and `VP8` tags.
+    const WEBP: &[u8] = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+    /// A `BMP`: an image, just not one of the four the endpoint accepts.
+    const BMP: &[u8] = b"BM\x36\x00\x00\x00\x00\x00\x36\x00\x00\x00";
+    /// A `PDF`: bytes with a type that is not an image at all.
+    const PDF: &[u8] = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n";
+    /// Text: bytes no matcher can name.
+    const TEXT: &[u8] = b"a plain text file, definitely not an image\n";
+
+    /// A file part named `field` holding `bytes`, as the multipart extractor
+    /// hands one to the endpoint. The client's claimed `content_type` is
+    /// `None` where the test does not care: what is stored never comes from
+    /// it.
+    fn part(field: &str, bytes: &[u8]) -> UploadedFile {
+        UploadedFile {
+            field: field.to_owned(),
+            filename: Some("picture.bmp".to_owned()),
+            content_type: Some("image/png".to_owned()),
+            bytes: Bytes::copy_from_slice(bytes),
+        }
+    }
+
+    /// The parameters of a body, parsed the way the extractor hands them
+    /// over: `json!` text for the JSON spellings, a map of strings for the
+    /// form and multipart ones.
+    fn params(text: &str) -> ProfileParams {
+        serde_json::from_str(text).expect("the fixture body parses")
+    }
+
+    /// The empty body, for the tests that only pass a file part.
+    fn no_params() -> ProfileParams {
+        params("{}")
+    }
+
+    /// Resolves `value` as the `avatar` slot with no file part, `unwrap`ing
+    /// the success or naming the rejection the test asserts on.
+    fn avatar_slot(value: Option<&str>) -> Result<ImageWrite, AppError> {
+        let parsed: Option<Value> =
+            value.map(|text| serde_json::from_str(text).expect("the fixture value parses"));
+        let mut files = Vec::new();
+        resolve_image(
+            &mut files,
+            AVATAR_FIELD,
+            parsed.as_ref(),
+            Config::for_tests().avatar_limit_bytes,
+        )
+    }
+
+    #[test]
+    fn an_absent_image_parameter_keeps_the_stored_column() {
+        assert!(
+            matches!(avatar_slot(None).unwrap(), ImageWrite::Unchanged),
+            "no key in the body is no write"
+        );
+    }
+
+    #[test]
+    fn null_and_empty_image_parameters_clear_the_column() {
+        // The two spellings of Pleroma's reset: JSON `null` and the empty
+        // string a form or multipart text part carries.
+        for value in [Some("null"), Some(r#""""#)] {
+            assert!(
+                matches!(avatar_slot(value).unwrap(), ImageWrite::Clear),
+                "`{value:?}` clears"
+            );
+        }
+        let body = params(r#"{"avatar": "", "header": null}"#);
+        let mut files = Vec::new();
+        let writes = resolve_images(&Config::for_tests(), &mut files, &body).unwrap();
+        assert!(
+            matches!(writes.avatar, ImageWrite::Clear)
+                && matches!(writes.banner, ImageWrite::Clear)
+                && matches!(writes.background, ImageWrite::Unchanged),
+            "the two sent slots clear, the third stays"
+        );
+    }
+
+    #[test]
+    fn a_url_string_is_not_an_image_the_endpoint_can_store() {
+        for value in [Some(r#""https://elsewhere.example/a.png""#), Some("[1,2]")] {
+            let err = avatar_slot(value).expect_err("a string is no upload");
+            assert_eq!(
+                err.to_string(),
+                UNSUPPORTED_FILE_TYPE,
+                "`{value:?}` is refused with the type message"
+            );
+        }
+    }
+
+    #[test]
+    fn kept_value_tells_absent_from_null() {
+        let absent = no_params();
+        assert_eq!(absent.avatar, None, "an absent key is no parameter");
+        let nulled = params(r#"{"avatar": null}"#);
+        assert_eq!(nulled.avatar, Some(Value::Null), "a JSON null is one");
+        let blank = params(r#"{"avatar": ""}"#);
+        assert_eq!(
+            blank.avatar,
+            Some(Value::String(String::new())),
+            "and so is the form spelling"
+        );
+    }
+
+    #[test]
+    fn a_file_part_wins_over_the_text_spelling_of_its_field() {
+        let mut files = vec![part(AVATAR_FIELD, PNG)];
+        let writes = resolve_images(
+            &Config::for_tests(),
+            &mut files,
+            &params(r#"{"avatar": ""}"#),
+        )
+        .unwrap();
+        assert!(
+            matches!(writes.avatar, ImageWrite::Store { .. }),
+            "the uploaded file is what the slot reads"
+        );
+        assert!(
+            files.is_empty(),
+            "and the part is taken out of the body's files"
+        );
+    }
+
+    #[test]
+    fn the_four_accepted_image_types_are_read_from_the_bytes() {
+        for (bytes, mime) in [
+            (PNG, "image/png"),
+            (JPEG, "image/jpeg"),
+            (GIF, "image/gif"),
+            (WEBP, "image/webp"),
+        ] {
+            assert_eq!(
+                detect_image_type(bytes).unwrap(),
+                mime,
+                "the magic bytes name {mime}"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_else_is_the_unsupported_file_type() {
+        // `BMP` proves the allowlist, not merely the "is it an image"
+        // question: `infer` names it, and the endpoint still refuses it.
+        for bytes in [BMP, PDF, TEXT, b""] {
+            let err = detect_image_type(bytes).expect_err("no profile image");
+            assert_eq!(
+                err.to_string(),
+                UNSUPPORTED_FILE_TYPE,
+                "bytes {bytes:?} are refused with the type message"
+            );
+        }
+    }
+
+    #[test]
+    fn the_part_content_type_claim_is_ignored() {
+        // The extractor's `content_type` says `image/png` for every fixture
+        // part; what decides is the bytes, so a text body under an image
+        // claim is still the 422.
+        let mut files = vec![part(AVATAR_FIELD, TEXT)];
+        let err = resolve_images(&Config::for_tests(), &mut files, &no_params())
+            .expect_err("a text file is no avatar");
+        assert_eq!(err.to_string(), UNSUPPORTED_FILE_TYPE);
+    }
+
+    #[test]
+    fn each_slot_is_measured_against_its_own_limit() {
+        // [`PNG`] is 20 bytes: over the 8-byte avatar cap the fixture sets,
+        // under the 32-byte banner one — which is also what measures the
+        // background image.
+        let config = Config {
+            avatar_limit_bytes: 8,
+            banner_limit_bytes: 32,
+            ..Config::for_tests()
+        };
+        let err = resolve_one(&config, AVATAR_FIELD).expect_err("the avatar cap is 8 bytes");
+        assert_eq!(
+            err.to_string(),
+            FILE_TOO_LARGE,
+            "the avatar is over its own cap"
+        );
+        for field in [HEADER_FIELD, BACKGROUND_FIELD] {
+            assert!(
+                matches!(
+                    resolve_one(&config, field).unwrap(),
+                    ImageWrite::Store { .. }
+                ),
+                "{field} fits the banner cap"
+            );
+        }
+    }
+
+    /// Resolves `field` as the whole of a body: one [`PNG`] part under that
+    /// name, no text parameters, measured by `config`'s limits.
+    fn resolve_one(config: &Config, field: &str) -> AppResult<ImageWrite> {
+        let mut files = vec![part(field, PNG)];
+        resolve_images(config, &mut files, &no_params()).map(|writes| write_for(writes, field))
+    }
+
+    /// The slot of `writes` that arrived under `field`, for the tests that
+    /// resolve one field at a time.
+    fn write_for(writes: ImageWrites, field: &str) -> ImageWrite {
+        if field == AVATAR_FIELD {
+            writes.avatar
+        } else if field == HEADER_FIELD {
+            writes.banner
+        } else {
+            writes.background
+        }
+    }
+
+    #[test]
+    fn an_unrelated_file_part_is_ignored_and_no_file_is_stored() {
+        let mut files = vec![part("file", PNG)];
+        let writes = resolve_images(&Config::for_tests(), &mut files, &no_params()).unwrap();
+        assert!(
+            matches!(
+                (writes.avatar, writes.banner, writes.background),
+                (
+                    ImageWrite::Unchanged,
+                    ImageWrite::Unchanged,
+                    ImageWrite::Unchanged
+                )
+            ),
+            "a file under another field name writes no column"
+        );
+        assert_eq!(files.len(), 1, "and the part is left where it was");
+    }
+
+    #[test]
+    fn replaced_urls_are_only_named_by_writes_that_overwrote_one() {
+        let old = "https://test.example/media/alice/a.png";
+        let new = "https://test.example/media/alice/b.png";
+        assert_eq!(
+            replaced_url(None, None),
+            None,
+            "nothing stored, nothing gone"
+        );
+        assert_eq!(
+            replaced_url(Some(old), Some(old)),
+            None,
+            "the same URL still uses its file"
+        );
+        let replaced = replaced_url(Some(old), Some(new));
+        assert_eq!(
+            replaced.as_deref(),
+            Some(old),
+            "a replacement names the old"
+        );
+        let cleared = replaced_url(Some(old), None);
+        assert_eq!(
+            cleared.as_deref(),
+            Some(old),
+            "a clear names the stored one"
+        );
+    }
+
+    #[test]
+    fn only_this_instances_own_media_urls_name_a_file_we_hold() {
+        let config = Config::for_tests();
+        assert_eq!(
+            own_media_key(&config, "https://test.example/media/alice/a.png").as_deref(),
+            Some("alice/a.png"),
+            "our own media URL is a key"
+        );
+        for stored_url in [
+            "",
+            "https://elsewhere.example/media/alice/a.png",
+            "https://test.example/media",
+            "https://test.example/mediazonk/a.png",
+            "https://test.example/media/../escape.png",
+            "https://test.example/media/alice//a.png",
+        ] {
+            assert_eq!(
+                own_media_key(&config, stored_url),
+                None,
+                "`{stored_url}` names no file of ours",
+            );
+        }
+        assert_eq!(
+            own_media_key(&config, "https://test.example/media/"),
+            None,
+            "an empty remainder is no key either"
         );
     }
 }

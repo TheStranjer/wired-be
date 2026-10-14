@@ -29,7 +29,7 @@ use crate::{
 /// which axum's multipart extractor cannot read from the state on its own.
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
-        .merge(accounts::router())
+        .merge(accounts::router(config))
         .merge(announcements::router())
         .merge(apps::router())
         .merge(blocks::router())

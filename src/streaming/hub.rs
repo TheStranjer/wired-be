@@ -514,6 +514,11 @@ mod tests {
     /// How long a hub must stay quiet to prove it did not echo an event
     /// back; the round trip the assertions wait on takes milliseconds.
     const QUIET_WAIT: Duration = Duration::from_secs(2);
+    /// How long one warm-up round waits for its payload before publishing
+    /// the next one: a round trip takes milliseconds and a lost `NOTIFY`
+    /// never answers at all, so a short wait tells the two apart without
+    /// costing the test anything.
+    const WARM_UP_ROUND: Duration = Duration::from_millis(200);
 
     /// A lazy, never-connected pool, for tests that never reach Postgres.
     fn lazy_pool() -> PgPool {
@@ -580,9 +585,75 @@ mod tests {
         }
     }
 
-    /// Drops everything `rx` holds right now, without waiting.
+    /// Bridges `payload` from `source` to `target`, republishing until one
+    /// copy crosses: the listener's first `LISTEN` races the test's first
+    /// publish, and a `NOTIFY` that reaches Postgres before its listener
+    /// subscribed is dropped on the floor (the bridge is at-most-once), so
+    /// one-shot warm-up publish is no barrier at all. When this returns the
+    /// `source` to `target` direction is live and the test's real
+    /// assertions may depend on it.
+    async fn warm_up(
+        source: &Hub,
+        target: &mut broadcast::Receiver<Arc<StreamEvent>>,
+        payload: &str,
+    ) {
+        let deadline = Instant::now() + BRIDGE_WAIT;
+        loop {
+            source.publish(update_event(payload));
+            if arrived_within(target, payload, WARM_UP_ROUND).await {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the bridge never carried {payload:?} within {BRIDGE_WAIT:?}"
+            );
+        }
+    }
+
+    /// Whether `rx` yields the event whose payload is `payload` inside
+    /// `within`, skipping the other payloads and lag reports a retried
+    /// warm-up leaves in its way; `false` is the round simply having run out
+    /// of time.
+    async fn arrived_within(
+        rx: &mut broadcast::Receiver<Arc<StreamEvent>>,
+        payload: &str,
+        within: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Ok(event)) if event.payload.as_deref() == Some(payload) => return true,
+                Ok(Ok(_other)) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(closed)) => panic!("the bus closed while warming up: {closed:?}"),
+                Err(_elapsed) => return false,
+            }
+        }
+    }
+
+    /// Drains everything `rx` holds right now, without waiting.
     fn drain(rx: &mut broadcast::Receiver<Arc<StreamEvent>>) {
         while rx.try_recv().is_ok() {}
+    }
+
+    /// Empties `rx` and then waits until it has stayed quiet for
+    /// [`QUIET_WAIT`], so nothing of the warm-up is still on its way. One
+    /// publish bridges on its own spawned task, so retried warm-up copies
+    /// can commit in any order and a late one would otherwise be the first
+    /// thing the real assertion reads.
+    async fn settle(rx: &mut broadcast::Receiver<Arc<StreamEvent>>) {
+        loop {
+            drain(rx);
+            match timeout(QUIET_WAIT, rx.recv()).await {
+                Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                Ok(_delivered) => {}
+                Err(_quiet) => return,
+            }
+        }
     }
 
     /// Asserts `rx` already holds `want` and then goes quiet: the hub
@@ -915,13 +986,14 @@ mod tests {
         let mut rx_b = hub_b.subscribe();
 
         // Warm up both directions first, so the real assertions do not
-        // race the listeners' initial connect-and-LISTEN.
-        hub_a.publish(update_event("\"warm-a\""));
-        await_payload(&mut rx_b, "\"warm-a\"").await;
-        hub_b.publish(update_event("\"warm-b\""));
-        await_payload(&mut rx_a, "\"warm-b\"").await;
-        drain(&mut rx_a);
-        drain(&mut rx_b);
+        // race the listeners' initial connect-and-LISTEN: the barrier
+        // republishes until a copy actually crosses (a `NOTIFY` that beats
+        // its listener's `LISTEN` is lost) and then waits for the bus to go
+        // quiet, so what follows is the only event in flight.
+        warm_up(&hub_a, &mut rx_b, "\"warm-a\"").await;
+        warm_up(&hub_b, &mut rx_a, "\"warm-b\"").await;
+        settle(&mut rx_a).await;
+        settle(&mut rx_b).await;
 
         hub_a.publish(update_event("\"final\""));
 
@@ -954,12 +1026,10 @@ mod tests {
         let (stop_b, task_b) = spawn_listener(&pool, &hub_b);
         let mut rx_a = hub_a.subscribe();
         let mut rx_b = hub_b.subscribe();
-        hub_a.publish(update_event("\"warm-a\""));
-        await_payload(&mut rx_b, "\"warm-a\"").await;
-        hub_b.publish(update_event("\"warm-b\""));
-        await_payload(&mut rx_a, "\"warm-b\"").await;
-        drain(&mut rx_a);
-        drain(&mut rx_b);
+        warm_up(&hub_a, &mut rx_b, "\"warm-a\"").await;
+        warm_up(&hub_b, &mut rx_a, "\"warm-b\"").await;
+        settle(&mut rx_a).await;
+        settle(&mut rx_b).await;
 
         let big = format!(r#"{{"content":"{}"}}"#, "x".repeat(2 * MAX_NOTIFY_BYTES));
         hub_a.publish(update_event(&big));
