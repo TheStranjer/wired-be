@@ -508,8 +508,10 @@ mod tests {
     /// SSRF guard is off, so it may reach the loopback mocks.
     fn test_state(pool: PgPool) -> AppState {
         let config = Arc::new(Config::for_tests());
+        let hub = crate::streaming::hub::Hub::new(&pool);
         AppState {
             db: pool,
+            hub,
             config: Arc::clone(&config),
             http_client: HttpClient::new_for_tests(TEST_UA),
             uploader: UploaderBackend::from(config.as_ref()),

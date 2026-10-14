@@ -638,6 +638,7 @@ mod tests {
         let config = Arc::new(config);
         AppState {
             db: pool.clone(),
+            hub: crate::streaming::hub::Hub::new(pool),
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),

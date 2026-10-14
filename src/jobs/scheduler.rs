@@ -2,8 +2,9 @@
 //!
 //! `docs/ARCHITECTURE.md` decision 11 keeps background work in Postgres rows;
 //! this module is the producer of the rows that fire on a schedule. The
-//! [`periodic_jobs`] registry lists every recurring job (empty today; later
-//! tickets append one line per entry), and [`run`] ticks every ten seconds,
+//! [`periodic_jobs`] registry lists every recurring job (today the
+//! streaming hub's reference-table sweep; later tickets append one line
+//! per entry), and [`run`] ticks every ten seconds,
 //! enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
@@ -50,9 +51,18 @@ pub struct PeriodicJob {
 ///
 /// The registry is a plain list: a later ticket adds a job by appending one
 /// line here (decision 15), and the [`run`] loop starts enqueueing it.
+/// Today it holds the streaming hub's sweep of expired reference payloads
+/// ([`KIND_CLEANUP`](crate::streaming::hub::KIND_CLEANUP)), run on
+/// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND) once a minute so no
+/// spill-over row outlives its [`PAYLOAD_TTL`](crate::streaming::hub::PAYLOAD_TTL)
+/// by more than a tick.
 #[must_use]
-pub const fn periodic_jobs() -> Vec<PeriodicJob> {
-    Vec::new()
+pub fn periodic_jobs() -> Vec<PeriodicJob> {
+    vec![PeriodicJob {
+        kind: crate::streaming::hub::KIND_CLEANUP,
+        queue: super::QUEUE_BACKGROUND,
+        every: Duration::from_secs(60),
+    }]
 }
 
 /// The period index of `now` for a job that runs every `every`:

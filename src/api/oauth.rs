@@ -1230,8 +1230,11 @@ mod tests {
     /// fail first).
     fn test_state() -> AppState {
         let config = Arc::new(Config::for_tests());
+        let db = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        let hub = crate::streaming::hub::Hub::new(&db);
         AppState {
-            db: PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
+            db,
+            hub,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),

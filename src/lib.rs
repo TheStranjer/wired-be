@@ -15,6 +15,7 @@ pub mod oauth;
 pub mod pagination;
 pub mod services;
 pub mod state;
+pub mod streaming;
 pub mod uploads;
 pub mod util;
 
@@ -37,6 +38,7 @@ use crate::{
     jobs::{JobRegistry, Worker, scheduler},
     services::emoji_packs,
     state::AppState,
+    streaming::hub::Hub,
     uploads::UploaderBackend,
 };
 
@@ -53,8 +55,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     MIGRATOR.run(pool).await
 }
 
-/// Starts the HTTP server, the job worker and the periodic scheduler, and
-/// shuts everything down on ctrl-c.
+/// Starts the HTTP server, the job worker, the periodic scheduler and the
+/// streaming listener, and shuts everything down on ctrl-c.
 ///
 /// Connects to PostgreSQL, applies [`MIGRATOR`], syncs the emoji packs
 /// (see [`crate::services::emoji_packs`]), binds
@@ -63,10 +65,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// ([`Config::job_concurrency`] slots at once) until the process is
 /// interrupted. Job handlers are bound in the [`JobRegistry`] this builds:
 /// today the federation delivery job
-/// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)), so the
-/// worker idles, sweeps and delivers. Alongside it, a spawned
-/// [`scheduler::run`] task enqueues the [`scheduler::periodic_jobs`]
-/// recurring jobs, honoring the same ctrl-c shutdown as the other tasks.
+/// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)) and
+/// the streaming reference-table sweep
+/// ([`KIND_CLEANUP`](streaming::hub::KIND_CLEANUP)), so the worker idles,
+/// sweeps and delivers. Alongside it, a spawned [`scheduler::run`] task
+/// enqueues the [`scheduler::periodic_jobs`] recurring jobs, and a spawned
+/// [`run_pg_listener`](streaming::hub::run_pg_listener) task mirrors the
+/// other instances' [`Hub`] events onto this process' streaming bus,
+/// honoring the same ctrl-c shutdown as the other tasks.
 ///
 /// # Errors
 ///
@@ -80,8 +86,10 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let emoji_count =
         emoji_packs::sync_custom_emojis(&db, &config.base_url, &config.emoji_dir).await?;
     info!(emoji_count, "emoji packs synced into custom_emojis");
+    let hub = Hub::new(&db);
     let state = AppState {
         db,
+        hub,
         config: Arc::clone(&config),
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
@@ -105,8 +113,19 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         scheduler::periodic_jobs(),
         wait_for_ctrl_c(),
     ));
+    let listener_task = tokio::spawn(streaming::hub::run_pg_listener(
+        state.db.clone(),
+        state.hub.clone(),
+        wait_for_ctrl_c(),
+    ));
     let server = axum::serve(listener, app(state)).with_graceful_shutdown(wait_for_ctrl_c());
-    let outcome = tokio::join!(server, worker.run(wait_for_ctrl_c()), scheduler_task).0;
+    let outcome = tokio::join!(
+        server,
+        worker.run(wait_for_ctrl_c()),
+        scheduler_task,
+        listener_task
+    )
+    .0;
     Ok(outcome?)
 }
 
@@ -118,6 +137,7 @@ fn job_registry() -> JobRegistry {
         federation::delivery::KIND_DELIVER,
         federation::delivery::handle,
     );
+    registry.register(streaming::hub::KIND_CLEANUP, streaming::hub::handle_cleanup);
     registry
 }
 
@@ -193,7 +213,9 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt as _;
 
-    use crate::{config::Config, http_client::HttpClient, uploads::UploaderBackend};
+    use crate::{
+        config::Config, http_client::HttpClient, streaming::hub::Hub, uploads::UploaderBackend,
+    };
 
     /// A config with only the required variables set, for tests that don't
     /// exercise config.
@@ -208,6 +230,7 @@ mod tests {
             .unwrap();
         let config = Arc::new(test_config());
         app(AppState {
+            hub: Hub::new(&db),
             db,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
