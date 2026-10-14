@@ -53,6 +53,12 @@ pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 pub const MAX_IMAGE_PIXELS_VAR: &str = "MAX_IMAGE_PIXELS";
 /// Environment variable holding the maximum number of files per request.
 pub const UPLOAD_MAX_FILES_VAR: &str = "UPLOAD_MAX_FILES";
+/// Environment variable holding the maximum size of a profile avatar image,
+/// in bytes.
+pub const AVATAR_LIMIT_BYTES_VAR: &str = "AVATAR_LIMIT_BYTES";
+/// Environment variable holding the maximum size of a profile banner (or
+/// background) image, in bytes.
+pub const BANNER_LIMIT_BYTES_VAR: &str = "BANNER_LIMIT_BYTES";
 /// Environment variable holding the maximum size of one inbound
 /// `ActivityPub` inbox request body, in bytes.
 pub const INBOX_MAX_BYTES_VAR: &str = "INBOX_MAX_BYTES";
@@ -148,6 +154,19 @@ pub const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 16_000_000;
 /// Upload file count used when `UPLOAD_MAX_FILES` is unset: Pleroma's
 /// `:upload, max_number_of_files`.
 pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
+/// Avatar image size used when `AVATAR_LIMIT_BYTES` is unset.
+///
+/// Pleroma's `[:avatar, :limit]` `[size: 2_000_000]`:
+/// `PATCH /api/v1/accounts/update_credentials` refuses a larger `avatar`
+/// file with 422 `{"error":"File is too large"}`.
+pub const DEFAULT_AVATAR_LIMIT_BYTES: usize = 2_000_000;
+/// Banner image size used when `BANNER_LIMIT_BYTES` is unset.
+///
+/// Pleroma's `[:banner, :limit]` (and `[:background, :limit]`)
+/// `[size: 4_000_000]`, the one number this server caps both the `header`
+/// and the `pleroma_background_image` file at with 422
+/// `{"error":"File is too large"}`.
+pub const DEFAULT_BANNER_LIMIT_BYTES: usize = 4_000_000;
 /// Inbox body size used when `INBOX_MAX_BYTES` is unset: the 1 MiB the
 /// inbox authentication extractor caps one inbound `ActivityPub` `POST`
 /// body at (see [`crate::federation::inbox_auth`]).
@@ -391,6 +410,14 @@ pub struct Config {
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
+    /// Maximum size of a profile avatar image in bytes, from
+    /// `AVATAR_LIMIT_BYTES`; `PATCH /api/v1/accounts/update_credentials`
+    /// refuses a larger `avatar` file with 422 `{"error":"File is too large"}`.
+    pub avatar_limit_bytes: usize,
+    /// Maximum size of a profile banner or background image in bytes, from
+    /// `BANNER_LIMIT_BYTES`; the same endpoint refuses a larger `header` or
+    /// `pleroma_background_image` file with 422 `{"error":"File is too large"}`.
+    pub banner_limit_bytes: usize,
     /// Hard cap on one inbound `ActivityPub` inbox request body, in bytes,
     /// from `INBOX_MAX_BYTES`; the `SignedActivity` extractor answers a
     /// larger body 413 (see [`crate::federation::inbox_auth`]).
@@ -500,10 +527,7 @@ impl Config {
         let (max_media_description, max_display_name_chars, max_bio_chars, max_profile_fields) =
             text_length_limits(&lookup)?;
         let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
-        let upload_limits = UploadLimits {
-            max_file_bytes: number(&lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
-            max_files: number(&lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
-        };
+        let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
         let http_allow_private_hosts = boolean(
             &lookup,
@@ -534,6 +558,8 @@ impl Config {
             max_profile_fields,
             max_image_pixels,
             upload_limits,
+            avatar_limit_bytes,
+            banner_limit_bytes,
             inbox_max_bytes,
             uploads_dir,
             emoji_dir,
@@ -628,6 +654,8 @@ impl Config {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
             },
+            avatar_limit_bytes: DEFAULT_AVATAR_LIMIT_BYTES,
+            banner_limit_bytes: DEFAULT_BANNER_LIMIT_BYTES,
             inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
             uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
             emoji_dir: PathBuf::from(DEFAULT_EMOJI_DIR),
@@ -840,6 +868,37 @@ where
     ))
 }
 
+/// The shape [`upload_settings`] answers: the per-request multipart limits
+/// and the two profile-image byte caps, in [`Config`] field order; factored
+/// out because a mixed tuple of a struct and two numbers reads better by
+/// name.
+type UploadSettings = (UploadLimits, usize, usize);
+
+/// Reads the settings that bound uploads: the per-request multipart limits
+/// (`UPLOAD_LIMIT_BYTES` and `UPLOAD_MAX_FILES`) and the two profile-image
+/// byte caps (`AVATAR_LIMIT_BYTES` for the avatar, `BANNER_LIMIT_BYTES` for
+/// the banner and the background image alike). Grouped because each is a
+/// plain default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when any of the four variables
+/// holds a value that is not a whole number.
+fn upload_settings<F>(lookup: &F) -> Result<UploadSettings, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        UploadLimits {
+            max_file_bytes: number(lookup, UPLOAD_LIMIT_BYTES_VAR, DEFAULT_UPLOAD_LIMIT_BYTES)?,
+            max_files: number(lookup, UPLOAD_MAX_FILES_VAR, DEFAULT_UPLOAD_MAX_FILES)?,
+        },
+        number(lookup, AVATAR_LIMIT_BYTES_VAR, DEFAULT_AVATAR_LIMIT_BYTES)?,
+        number(lookup, BANNER_LIMIT_BYTES_VAR, DEFAULT_BANNER_LIMIT_BYTES)?,
+    ))
+}
+
 /// Reads the two settings that gate what the instance exposes to clients:
 /// whether new registrations are open (`NodeInfo`'s `openRegistrations`)
 /// and the frontends the settings endpoints let a user pick. Grouped
@@ -951,6 +1010,8 @@ impl fmt::Debug for Config {
             .field("max_profile_fields", &self.max_profile_fields)
             .field("max_image_pixels", &self.max_image_pixels)
             .field("upload_limits", &self.upload_limits)
+            .field("avatar_limit_bytes", &self.avatar_limit_bytes)
+            .field("banner_limit_bytes", &self.banner_limit_bytes)
             .field("inbox_max_bytes", &self.inbox_max_bytes)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
@@ -1413,6 +1474,43 @@ mod tests {
         assert!(
             debug.contains("max_profile_fields: 2"),
             "the field-count limit is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The two profile-image byte caps: Pleroma's avatar/banner defaults,
+    /// the environment overriding each, and `Debug` showing both.
+    #[test]
+    fn reads_custom_profile_image_limits() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.avatar_limit_bytes, 2_000_000,
+            "default AVATAR_LIMIT_BYTES"
+        );
+        assert_eq!(
+            defaults.banner_limit_bytes, 4_000_000,
+            "default BANNER_LIMIT_BYTES"
+        );
+
+        let config = config_with(&[
+            (AVATAR_LIMIT_BYTES_VAR, "1024"),
+            (BANNER_LIMIT_BYTES_VAR, "2048"),
+        ]);
+        assert_eq!(
+            config.avatar_limit_bytes, 1_024,
+            "custom AVATAR_LIMIT_BYTES"
+        );
+        assert_eq!(
+            config.banner_limit_bytes, 2_048,
+            "custom BANNER_LIMIT_BYTES"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("avatar_limit_bytes: 1024"),
+            "the avatar cap is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("banner_limit_bytes: 2048"),
+            "the banner cap is visible in Debug output: {debug}"
         );
     }
 
@@ -2024,6 +2122,8 @@ mod tests {
             MAX_PROFILE_FIELDS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
+            AVATAR_LIMIT_BYTES_VAR,
+            BANNER_LIMIT_BYTES_VAR,
             INBOX_MAX_BYTES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
