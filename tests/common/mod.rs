@@ -117,6 +117,27 @@ pub fn test_app_with_upload_limits(
     test_app_with_config(pool, config)
 }
 
+/// The shared [`AppState`] every test router is built on, and every job
+/// handler is handed: `pool` plus `config`, with the hub, HTTP client,
+/// uploader and stats cache the app needs.
+///
+/// A test that runs a background job rather than a request takes this
+/// directly — handlers receive an [`AppState`], not a router — while
+/// [`test_app_with_config`] wraps the very same state into the router.
+#[must_use]
+pub fn test_app_state(pool: PgPool, config: Config) -> AppState {
+    let config = Arc::new(config);
+    let hub = wired_be::streaming::hub::Hub::new(&pool);
+    AppState {
+        db: pool,
+        hub,
+        config: Arc::clone(&config),
+        http_client: HttpClient::from(config.as_ref()),
+        uploader: UploaderBackend::from(config.as_ref()),
+        instance_stats_cache: Arc::default(),
+    }
+}
+
 /// The real application router from [`wired_be::app`] over `pool` and
 /// `config`.
 ///
@@ -124,16 +145,7 @@ pub fn test_app_with_upload_limits(
 /// values through here: build a [`test_config`], set the fields, and
 /// mount the router.
 pub fn test_app_with_config(pool: PgPool, config: Config) -> Router {
-    let config = Arc::new(config);
-    let hub = wired_be::streaming::hub::Hub::new(&pool);
-    wired_be::app(AppState {
-        db: pool,
-        hub,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-    })
+    wired_be::app(test_app_state(pool, config))
 }
 
 /// Inserts a local [`User`] named `nickname` straight through

@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config, entities::relationship::RelationshipMap, models::user::User,
-    util::sanitize::strip_html,
+    util::sanitize::strip_html, util::time::mastodon_time,
 };
 
 /// The `actor_type` value that makes the entity's `group` flag true.
@@ -161,6 +161,33 @@ impl AccountSource {
 /// Mastodon's `AccountViewer`. `None` is an anonymous viewer, who sees
 /// nothing of another account that the account itself hides.
 pub type AccountViewer<'a> = Option<&'a User>;
+
+/// The value of an [`Account`]'s `mute_expires_at` key (decision 5's Mastodon
+/// time format for the instant, JSON `null` for a mute that never expires).
+///
+/// `GET /api/v1/mutes` sends the key on every entry, timed mutes and
+/// indefinite ones alike, so the listing's render has to tell "no expiry"
+/// (present, `null`) apart from "this is not the mutes listing" (absent) —
+/// one `Option` cannot carry both answers, which is why presence lives on
+/// [`Account::mute_expires_at`] and the value here. `#[serde(transparent)]`
+/// writes the inner `Option<String>` out as it is: its text or `null`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+pub struct MuteExpiresAt(
+    /// The mute's expiry as Mastodon time text, `None` for an indefinite mute
+    /// (which renders JSON `null`).
+    pub Option<String>,
+);
+
+impl MuteExpiresAt {
+    /// The key of an entry whose mute expires at `expires_at`: the instant in
+    /// the Mastodon time format, and JSON `null` when the mute has no expiry
+    /// — either way the key itself is present, as the mutes listing sends it.
+    #[must_use]
+    pub fn from_expiry(expires_at: Option<DateTime<Utc>>) -> Self {
+        Self(expires_at.map(|at| mastodon_time(&at)))
+    }
+}
 
 /// The `pleroma` extension object of an [`Account`]: the Pleroma-specific
 /// keys of Pleroma's `show.json` renderer
@@ -332,6 +359,17 @@ pub struct Account {
     /// other viewer serde omits the key entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub also_known_as: Option<Vec<String>>,
+    /// Mastodon's `mute_expires_at`: the expiry of the viewer's mute of this
+    /// account, present as a top-level key only on the entries
+    /// [`Account::with_mute_expires_at`] built for `GET /api/v1/mutes` and
+    /// omitted by every other render. Its value is the mute's
+    /// [`expires_at`](crate::models::mute::Mute::expires_at) in the Mastodon
+    /// time format (decision 5), or JSON `null` for an indefinite mute —
+    /// which is why the key is a [`MuteExpiresAt`] and not a bare
+    /// `Option<String>`: the listing has to render "no expiry" as `null`, and
+    /// an ordinary render has to render nothing at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mute_expires_at: Option<MuteExpiresAt>,
     /// Whether the account is deactivated: `is_active` inverted.
     pub suspended: JsonBool,
     /// Whether the account is rate-limited by moderation; nothing limits
@@ -430,6 +468,7 @@ impl Account {
             fields: fields_from_json(&user.fields),
             moved: None,
             also_known_as: None,
+            mute_expires_at: None,
             suspended: JsonBool(!user.is_active.get()),
             limited: JsonBool(false),
             source: None,
@@ -477,6 +516,21 @@ impl Account {
     #[must_use]
     pub fn with_moved(mut self, target: &User, config: &Config) -> Self {
         self.moved = serde_json::to_value(Self::from_user(target, config)).ok();
+        self
+    }
+
+    /// Attaches the mutes listing's [`mute_expires_at`](Self::mute_expires_at)
+    /// key: `Some` renders the instant in the Mastodon time format, `None`
+    /// (an indefinite mute) renders JSON `null`, and either way the key is
+    /// there — which is what makes this the only place an ordinary [`Account`]
+    /// render gains it, and why [`Account::from_user_for`] leaves the field
+    /// absent. Called by `GET /api/v1/mutes` for every entry, whose [`Mute`]
+    /// row the listing paged over carries the expiry.
+    ///
+    /// [`Mute`]: crate::models::mute::Mute
+    #[must_use]
+    pub fn with_mute_expires_at(mut self, expires_at: Option<DateTime<Utc>>) -> Self {
+        self.mute_expires_at = Some(MuteExpiresAt::from_expiry(expires_at));
         self
     }
 }
@@ -1875,6 +1929,53 @@ mod tests {
         assert_eq!(
             own["id"], self_view["id"],
             "and the core entity is the same account either way"
+        );
+    }
+
+    /// The mutes listing's extra key: absent from an ordinary render (so every
+    /// other endpoint's shape is untouched, key set included), and present on
+    /// an entry the listing built — `null` for an indefinite mute, the Mastodon
+    /// time for a timed one.
+    #[test]
+    fn mute_expires_at_appears_only_on_the_listing_render() {
+        let config = Config::for_tests();
+        let alice = base_user("alice", &format!("{BASE}/users/alice"));
+
+        let plain = serde_json::to_value(Account::from_user(&alice, &config)).unwrap();
+        assert!(
+            plain.get("mute_expires_at").is_none(),
+            "a plain render does not carry the key at all"
+        );
+        assert_eq!(
+            json_keys(&plain),
+            EXPECTED_KEYS,
+            "which is why every account's key set is unchanged"
+        );
+
+        let indefinite =
+            serde_json::to_value(Account::from_user(&alice, &config).with_mute_expires_at(None))
+                .unwrap();
+        assert_eq!(
+            indefinite["mute_expires_at"],
+            Value::Null,
+            "an indefinite mute sends the key as null"
+        );
+        let mut with_key = json_keys(&plain);
+        with_key.push("mute_expires_at");
+        with_key.sort_unstable();
+        assert_eq!(
+            json_keys(&indefinite),
+            with_key,
+            "and is otherwise the same entity"
+        );
+
+        let timed = serde_json::to_value(
+            Account::from_user(&alice, &config).with_mute_expires_at(Some(stamped())),
+        )
+        .unwrap();
+        assert_eq!(
+            timed["mute_expires_at"], "2024-01-31T12:34:56.789Z",
+            "a timed mute sends the expiry in the Mastodon format"
         );
     }
 }

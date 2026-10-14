@@ -22,11 +22,14 @@
 //! `blocking` and `blocked_by` are computed from the `blocks` table (see
 //! [`crate::models::block`]): the first true exactly when the viewer blocks
 //! the target, the second when the target blocks the viewer — a pair that
-//! blocked each other lights both. Every other flag renders `false` until
-//! its own ticket stores the data behind it and adds one batched query to
-//! the loader:
-//!
-//! - `muting` and `muting_notifications`: the mutes ticket.
+//! blocked each other lights both. `muting` and `muting_notifications` are
+//! computed from the `mutes` table (see [`crate::models::mute`]): the first
+//! true exactly when the viewer mutes the target, the second when that mute
+//! also hides the target's notifications (`notifications: false` lights
+//! `muting` alone) — and a mute whose duration has run out lights neither,
+//! the same way every read of that table treats it. Every other flag renders
+//! its documented default until its own ticket stores the data behind it and
+//! adds one batched query to the loader.
 
 use std::collections::HashMap;
 
@@ -76,11 +79,15 @@ pub struct Relationship {
     /// the viewer (see [`crate::models::block`]); `false` while no account
     /// blocks the viewer.
     pub blocked_by: JsonBool,
-    /// Whether the viewer mutes the target: `false` until the mutes ticket
-    /// stores mutes.
+    /// Whether the viewer mutes the target: a still-active `mutes` row of
+    /// theirs naming it (see [`crate::models::mute`]); `false` while the
+    /// viewer mutes nothing, and while the mute's duration has run out.
     pub muting: JsonBool,
-    /// Whether the viewer mutes only the target's notifications: `false`
-    /// until the mutes ticket stores notification mutes.
+    /// Whether the viewer's mute of the target also hides its notifications:
+    /// a `mutes` row of theirs naming it with `hide_notifications` (Mastodon's
+    /// `notifications` parameter left at its `true` default, see
+    /// [`crate::models::mute`]); `false` for a timeline-only mute and for no
+    /// mute at all.
     pub muting_notifications: JsonBool,
     /// Whether the viewer wants notifications for every target post: the
     /// `notify` toggle of the `viewer → target` follow row, `false` with no row.

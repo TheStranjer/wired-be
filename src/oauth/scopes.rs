@@ -53,6 +53,15 @@ pub const READ_BLOCKS: &str = "read:blocks";
 /// remaining actions, with the `follow` root as an accepted alternative).
 pub const WRITE_BLOCKS: &str = "write:blocks";
 
+/// The read side of mutes: `GET /api/v1/mutes`, the list a client shows its
+/// user (Mastodon's `read:mutes`, Pleroma's `read:mutes` on the
+/// `AccountController` `mutes` action, there aliased by `follow`).
+pub const READ_MUTES: &str = "read:mutes";
+/// The write side of mutes: `POST /api/v1/accounts/{id}/mute` and
+/// `…/unmute` (Mastodon's `write:mutes`, Pleroma's grant for those two
+/// actions, with the `follow` root as an accepted alternative).
+pub const WRITE_MUTES: &str = "write:mutes";
+
 /// The read side of chats, listing and looking.
 ///
 /// The `/api/v1` and `/api/v2` chat lists, `GET /api/v1/pleroma/chats/{id}`

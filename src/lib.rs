@@ -138,6 +138,7 @@ fn job_registry() -> JobRegistry {
         federation::delivery::handle,
     );
     registry.register(streaming::hub::KIND_CLEANUP, streaming::hub::handle_cleanup);
+    registry.register(jobs::mutes::KIND_EXPIRE, jobs::mutes::handle_expire);
     registry
 }
 
