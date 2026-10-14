@@ -125,8 +125,10 @@ pub fn test_app_with_upload_limits(
 /// mount the router.
 pub fn test_app_with_config(pool: PgPool, config: Config) -> Router {
     let config = Arc::new(config);
+    let hub = wired_be::streaming::hub::Hub::new(&pool);
     wired_be::app(AppState {
         db: pool,
+        hub,
         config: Arc::clone(&config),
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),

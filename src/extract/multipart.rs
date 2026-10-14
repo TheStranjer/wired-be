@@ -313,10 +313,13 @@ mod tests {
     /// never connects (these handlers do not touch the database).
     fn state_with_limits(max_file_bytes: usize, max_files: usize) -> AppState {
         let config = Arc::new(config_with_limits(max_file_bytes, max_files));
+        let db = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        let hub = crate::streaming::hub::Hub::new(&db);
         AppState {
-            db: PgPoolOptions::new()
-                .connect_lazy("postgres://localhost/unused")
-                .unwrap(),
+            db,
+            hub,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),

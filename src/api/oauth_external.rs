@@ -652,9 +652,12 @@ mod tests {
         let mut config = Config::for_tests();
         config.oauth_providers = names.iter().map(|name| provider(name)).collect();
         let config = Arc::new(config);
+        let db = sqlx::PgPool::connect_lazy("postgres://localhost/unused")
+            .expect("a lazy pool needs no server");
+        let hub = crate::streaming::hub::Hub::new(&db);
         AppState {
-            db: sqlx::PgPool::connect_lazy("postgres://localhost/unused")
-                .expect("a lazy pool needs no server"),
+            db,
+            hub,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),

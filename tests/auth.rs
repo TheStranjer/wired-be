@@ -33,8 +33,10 @@ const TEST_CLIENT: &str = "Test Client";
 /// `/scope/…` routes, one scope guard) and reports what it resolved.
 fn auth_test_app(pool: PgPool) -> Router {
     let config = Arc::new(common::test_config());
+    let hub = wired_be::streaming::hub::Hub::new(&pool);
     let state = AppState {
         db: pool,
+        hub,
         config: Arc::clone(&config),
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),

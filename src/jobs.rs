@@ -398,6 +398,7 @@ mod tests {
         let config = Arc::new(Config::for_tests());
         AppState {
             db: pool.clone(),
+            hub: crate::streaming::hub::Hub::new(pool),
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
@@ -611,8 +612,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_runs_the_registered_handler() {
         let config = Arc::new(Config::for_tests());
+        let db = lazy_pool();
         let state = AppState {
-            db: lazy_pool(),
+            hub: crate::streaming::hub::Hub::new(&db),
+            db,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
@@ -631,8 +634,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_discards_unknown_kinds() {
         let config = Arc::new(Config::for_tests());
+        let db = lazy_pool();
         let state = AppState {
-            db: lazy_pool(),
+            hub: crate::streaming::hub::Hub::new(&db),
+            db,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
@@ -720,8 +725,10 @@ mod tests {
     #[tokio::test]
     async fn dispatch_tells_the_handler_which_attempt_it_is() {
         let config = Arc::new(Config::for_tests());
+        let db = lazy_pool();
         let state = AppState {
-            db: lazy_pool(),
+            hub: crate::streaming::hub::Hub::new(&db),
+            db,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),

@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use crate::{
     api::instance::InstanceStatsCache, config::Config, http_client::HttpClient,
-    uploads::UploaderBackend,
+    streaming::hub::Hub, uploads::UploaderBackend,
 };
 
 /// State shared across all requests. Cheap to clone.
@@ -14,6 +14,11 @@ use crate::{
 pub struct AppState {
     /// PostgreSQL connection pool.
     pub db: PgPool,
+    /// The streaming event hub (see [`crate::streaming::hub`]): every
+    /// [`StreamEvent`](crate::streaming::hub::StreamEvent) published by
+    /// this process fans out to the local subscribers here and is
+    /// bridged to the other instances over Postgres `NOTIFY`.
+    pub hub: Hub,
     /// Runtime configuration.
     pub config: Arc<Config>,
     /// Outbound HTTP client for calls to other instances; cheap to clone,

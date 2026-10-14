@@ -684,8 +684,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
     /// needs a small `inbox_max_bytes`).
     fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
         let config = Arc::new(config);
+        let hub = crate::streaming::hub::Hub::new(&pool);
         AppState {
             db: pool,
+            hub,
             config: Arc::clone(&config),
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
