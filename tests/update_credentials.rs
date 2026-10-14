@@ -1,16 +1,20 @@
 //! Integration tests for `PATCH /api/v1/accounts/update_credentials`
-//! (WBE-67, the profile-text-fields ticket): the five fields this slice of
-//! the endpoint owns — `display_name` (length-capped against
-//! `MAX_DISPLAY_NAME_CHARS`, sanitized, empty stored as empty), `note`
-//! (length-capped against `MAX_BIO_CHARS`, stored raw in `raw_bio` and
-//! rendered to `bio` with URL, hashtag and local-mention links), and the
-//! `locked` / `bot` / `discoverable` booleans — each updated individually
-//! through JSON, form and multipart bodies, with absent fields left
-//! untouched, invalid boolean strings and over-long texts answered 422,
-//! the 200 answer the owner entity with its `source` block (the
-//! `verify_credentials` render), the route behind `AuthUser` and
-//! `write:accounts` (401 unauthenticated, 403 for the wrong credential),
-//! and the `POST` alias serving the old clients.
+//! (WBE-67, the profile-text-fields ticket, extended by WBE-69, the
+//! profile-metadata ticket): the fields this slice of the endpoint owns —
+//! `display_name` (length-capped against `MAX_DISPLAY_NAME_CHARS`,
+//! sanitized, empty stored as empty), `note` (length-capped against
+//! `MAX_BIO_CHARS`, stored raw in `raw_bio` and rendered to `bio` with
+//! URL, hashtag and local-mention links), the `locked` / `bot` /
+//! `discoverable` booleans, and `fields_attributes` (the profile
+//! metadata: every body shape, the `MAX_PROFILE_FIELDS` count cap, the
+//! per-entry name and value character caps, both-empty entries dropped,
+//! empty clearing, raw values kept beside the rendered HTML) — each
+//! updated individually through JSON, form and multipart bodies, with
+//! absent fields left untouched, invalid boolean strings and over-long
+//! texts answered 422, the 200 answer the owner entity with its `source`
+//! block (the `verify_credentials` render), the route behind `AuthUser`
+//! and `write:accounts` (401 unauthenticated, 403 for the wrong
+//! credential), and the `POST` alias serving the old clients.
 
 #![cfg(test)]
 
@@ -663,6 +667,482 @@ async fn multipart_file_parts_are_ignored_by_the_text_slice(pool: PgPool) {
         format!("{BASE}/images/avi.png"),
         "the avatar stays the instance default"
     );
+}
+
+/// One profile metadata entry as the entity answers it.
+fn field(name: &str, value: &str) -> Value {
+    json!({"name": name, "value": value, "verified_at": null})
+}
+
+/// `fields_attributes` updates through every body shape: the JSON array,
+/// the JSON object keyed by index, and the `fields_attributes[0][name]`
+/// spelling of form and multipart bodies. Each round answers the top-level
+/// `fields` with the rendered HTML and `source.fields` with the raw text,
+/// and stores the pair of jsonb columns.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn fields_attributes_update_through_every_body_shape(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let via_json = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [
+                {"name": "Site", "value": "https://example.com/a"},
+                {"name": "Motto", "value": "beep boop"},
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        via_json["fields"],
+        json!([
+            field(
+                "Site",
+                "<p><a href=\"https://example.com/a\" rel=\"ugc nofollow noopener noreferrer\">example.com/a</a></p>"
+            ),
+            field("Motto", "<p>beep boop</p>"),
+        ]),
+        "the JSON array renders: bare URL linked with the standard rel, plain text paragraphed"
+    );
+    assert_eq!(
+        source_of(&via_json)["fields"],
+        json!([
+            field("Site", "https://example.com/a"),
+            field("Motto", "beep boop"),
+        ]),
+        "the source block hands back exactly what was typed"
+    );
+
+    let via_index_map = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": {
+                "1": {"name": "second", "value": "two"},
+                "0": {"name": "first", "value": "one"},
+            }}),
+        )
+        .await,
+    );
+    assert_eq!(
+        via_index_map["fields"],
+        json!([field("first", "<p>one</p>"), field("second", "<p>two</p>")]),
+        "the index-object shape orders by the index as a number"
+    );
+
+    let via_form = ok_body(
+        &patch_form(
+            &app,
+            &token,
+            &[
+                ("fields_attributes[0][name]", "Form"),
+                ("fields_attributes[0][value]", "https://form.example/x"),
+                ("fields_attributes[1][name]", "Bare"),
+                ("fields_attributes[1][value]", "just words"),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        via_form["fields"],
+        json!([
+            field(
+                "Form",
+                "<p><a href=\"https://form.example/x\" rel=\"ugc nofollow noopener noreferrer\">form.example/x</a></p>"
+            ),
+            field("Bare", "<p>just words</p>"),
+        ]),
+        "the form's bracketed index keys fold into the same list"
+    );
+    assert_eq!(
+        source_of(&via_form)["fields"],
+        json!([
+            field("Form", "https://form.example/x"),
+            field("Bare", "just words")
+        ]),
+        "and the raw text round-trips the same"
+    );
+
+    let via_multipart = ok_body(
+        &patch_multipart(
+            &app,
+            &token,
+            &[
+                part("fields_attributes[0][name]", "Multi"),
+                part("fields_attributes[0][value]", "hello"),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        via_multipart["fields"],
+        json!([field("Multi", "<p>hello</p>")]),
+        "multipart text parts structure like urlencoded ones"
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.fields,
+        json!([{"name": "Multi", "value": "<p>hello</p>"}]),
+        "the `fields` column holds the rendered pair"
+    );
+    assert_eq!(
+        row.raw_fields,
+        json!([{"name": "Multi", "value": "hello"}]),
+        "the `raw_fields` column holds the typed pair"
+    );
+}
+
+/// A submitted field name is stored as plain text — markup is stripped —
+/// while `raw_fields` keeps the spelling as typed, and `source.fields`
+/// round-trips that raw spelling so the client's textarea sees what it
+/// wrote.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn field_names_are_stored_as_plain_text(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let body = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [{"name": "<b>Site</b>", "value": "https://example.com"}]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        body["fields"][0]["name"], "Site",
+        "the rendered name is stripped to text"
+    );
+    assert_eq!(
+        source_of(&body)["fields"][0]["name"],
+        "<b>Site</b>",
+        "the source keeps the name as typed"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.raw_fields,
+        json!([{"name": "<b>Site</b>", "value": "https://example.com"}]),
+        "raw_fields round-trips both halves verbatim"
+    );
+}
+
+/// At most `MAX_PROFILE_FIELDS` entries are stored: the fourth fits, the
+/// fifth is the 422 "Too many fields" that writes nothing, entries dropped
+/// as empty do not count toward the cap, and the cap moves with the
+/// configuration.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn too_many_fields_is_422(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let fourth = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [
+                {"name": "a", "value": "1"},
+                {"name": "b", "value": "2"},
+                {"name": "c", "value": "3"},
+                {"name": "d", "value": "4"},
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        fourth["fields"].as_array().map(Vec::len),
+        Some(4),
+        "four entries fit the default cap"
+    );
+
+    let fifth = patch_json(
+        &app,
+        &token,
+        &json!({"fields_attributes": [
+            {"name": "a", "value": "1"},
+            {"name": "b", "value": "2"},
+            {"name": "c", "value": "3"},
+            {"name": "d", "value": "4"},
+            {"name": "e", "value": "5"},
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        fifth.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "five is over the default cap"
+    );
+    assert_eq!(
+        fifth.text(),
+        r#"{"error":"Too many fields"}"#,
+        "the pinned wording"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.fields,
+        json!([
+            {"name": "a", "value": "<p>1</p>"},
+            {"name": "b", "value": "<p>2</p>"},
+            {"name": "c", "value": "<p>3</p>"},
+            {"name": "d", "value": "<p>4</p>"},
+        ]),
+        "the refused write changed nothing"
+    );
+
+    let with_empties = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [
+                {"name": "a", "value": "1"},
+                {"name": "", "value": ""},
+                {},
+                {"name": "b", "value": "2"},
+                {"name": "c", "value": "3"},
+                {"name": "d", "value": "4"},
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        with_empties["fields"].as_array().map(Vec::len),
+        Some(4),
+        "dropped empties do not count toward the cap"
+    );
+
+    let mut config = common::test_config();
+    config.max_profile_fields = 2;
+    let ada = common::create_local_user(&pool, "ada").await;
+    let small_token = common::create_app_and_token(&pool, &ada, "write:accounts").await;
+    let small_app = common::test_app_with_config(pool.clone(), config);
+    let third = patch_json(
+        &small_app,
+        &small_token,
+        &json!({"fields_attributes": [
+            {"name": "a", "value": "1"},
+            {"name": "b", "value": "2"},
+            {"name": "c", "value": "3"},
+        ]}),
+    )
+    .await;
+    assert_eq!(
+        third.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "MAX_PROFILE_FIELDS moves the cap"
+    );
+    assert_eq!(
+        third.text(),
+        r#"{"error":"Too many fields"}"#,
+        "same wording"
+    );
+}
+
+/// A field name over 255 characters and a field value over 2047 are the
+/// 422s, counted in characters not bytes; exactly the maxima fit, and a
+/// refused body writes nothing.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn field_name_and_value_length_limits_are_422(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let long_name = patch_json(
+        &app,
+        &token,
+        &json!({"fields_attributes": [{"name": "x".repeat(256), "value": "ok"}]}),
+    )
+    .await;
+    assert_eq!(
+        long_name.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "256 characters is over the name cap"
+    );
+    assert_eq!(
+        long_name.text(),
+        r#"{"error":"Field name is too long (maximum is 255 characters)"}"#,
+        "the message mirrors the profile wording"
+    );
+
+    let long_value = patch_json(
+        &app,
+        &token,
+        &json!({"fields_attributes": [{"name": "ok", "value": "é".repeat(2048)}]}),
+    )
+    .await;
+    assert_eq!(
+        long_value.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "2048 characters is over the value cap, in characters not bytes"
+    );
+    assert_eq!(
+        long_value.text(),
+        r#"{"error":"Field value is too long (maximum is 2047 characters)"}"#,
+        "the value message spells the cap out"
+    );
+
+    let at_max = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [{"name": "x".repeat(255), "value": "y".repeat(2047)}]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        at_max["fields"].as_array().map(Vec::len),
+        Some(1),
+        "the maxima themselves fit"
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.fields,
+        json!([{"name": "x".repeat(255), "value": format!("<p>{}</p>", "y".repeat(2047))}]),
+        "only the accepted write is stored"
+    );
+    assert_eq!(
+        row.raw_fields[0]["value"],
+        "y".repeat(2047),
+        "raw kept as typed"
+    );
+}
+
+/// An empty `fields_attributes` — the JSON array and the form index map
+/// alike — clears every stored field from both columns and both renders;
+/// its absence leaves them alone.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn empty_fields_attributes_clears_the_metadata(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let filled = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [{"name": "Site", "value": "https://example.com"}]}),
+        )
+        .await,
+    );
+    assert_eq!(filled["fields"].as_array().map(Vec::len), Some(1));
+
+    let cleared = ok_body(&patch_json(&app, &token, &json!({"fields_attributes": []})).await);
+    assert_eq!(cleared["fields"], json!([]), "the entity answers none");
+    assert_eq!(
+        source_of(&cleared)["fields"],
+        json!([]),
+        "and neither does the source block"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.fields, json!([]), "the rendered column is empty");
+    assert_eq!(row.raw_fields, json!([]), "and the raw column");
+
+    let refilled = ok_body(
+        &patch_form(
+            &app,
+            &token,
+            &[
+                ("fields_attributes[0][name]", "Back"),
+                ("fields_attributes[0][value]", "again"),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        refilled["fields"],
+        json!([field("Back", "<p>again</p>")]),
+        "the metadata can be written again after clearing"
+    );
+    let empty_map = ok_body(&patch_json(&app, &token, &json!({"fields_attributes": {}})).await);
+    assert_eq!(
+        empty_map["fields"],
+        json!([]),
+        "the empty index-object clears like the empty array"
+    );
+
+    let untouched = ok_body(&patch_json(&app, &token, &json!({"display_name": "Ada"})).await);
+    assert_eq!(
+        untouched["fields"],
+        json!([]),
+        "a body without fields_attributes leaves the (now empty) metadata alone"
+    );
+}
+
+/// An entry whose name and value are both empty is dropped rather than
+/// stored; one with only a name or only a value is kept, so a form that
+/// half-fills a row still writes it.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn entries_with_both_empty_name_and_value_are_dropped(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let body = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [
+                {"name": "", "value": ""},
+                {},
+                "not even an object",
+                {"name": "NameOnly", "value": ""},
+                {"value": "value only"},
+                {"name": "Kept", "value": "x"},
+            ]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        body["fields"],
+        json!([
+            field("NameOnly", ""),
+            field("", "<p>value only</p>"),
+            field("Kept", "<p>x</p>"),
+        ]),
+        "both-empty entries (and non-objects, which read as empty) go, half-entries stay in order"
+    );
+    assert_eq!(
+        source_of(&body)["fields"],
+        json!([
+            field("NameOnly", ""),
+            field("", "value only"),
+            field("Kept", "x"),
+        ]),
+        "the source block sees the same list raw"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(
+        row.raw_fields,
+        json!([
+            {"name": "NameOnly", "value": ""},
+            {"name": "", "value": "value only"},
+            {"name": "Kept", "value": "x"},
+        ]),
+        "and it is exactly what the two columns store"
+    );
+}
+
+/// An all-empty submission drops to nothing, which is the clear: the
+/// stored metadata is replaced by the empty pair, not left behind.
+#[sqlx::test(migrator = "wired_be::MIGRATOR")]
+async fn an_all_empty_submission_clears_like_the_empty_array(pool: PgPool) {
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+    let filled = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [{"name": "Site", "value": "https://example.com"}]}),
+        )
+        .await,
+    );
+    assert_eq!(filled["fields"].as_array().map(Vec::len), Some(1));
+
+    let cleared = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"fields_attributes": [{"name": "", "value": ""}, {}]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        cleared["fields"],
+        json!([]),
+        "every entry dropped leaves the empty list"
+    );
+    let row = stored(&pool, alice.id).await;
+    assert_eq!(row.fields, json!([]), "stored rendered");
+    assert_eq!(row.raw_fields, json!([]), "stored raw");
 }
 
 /// The `source` object of a rendered account, present or panicked over:

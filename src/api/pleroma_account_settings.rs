@@ -520,6 +520,7 @@ mod tests {
             bot: user::Flag::new(false),
             discoverable: user::Flag::new(false),
             fields: json!([]),
+            raw_fields: json!([]),
             inbox: None,
             shared_inbox: None,
             outbox: None,

@@ -110,8 +110,13 @@ pub struct User {
     pub bot: Flag,
     /// Whether the account opted into discovery.
     pub discoverable: Flag,
-    /// Profile metadata: JSON array of `{name, value}` objects.
+    /// Profile metadata: JSON array of `{name, value}` objects whose value
+    /// is the rendered HTML (see [`raw_fields`](Self::raw_fields) for the
+    /// editing text behind it).
     pub fields: Value,
+    /// Profile metadata as its source text: JSON array of `{name, value}`
+    /// objects, the same entries [`fields`](Self::fields) renders.
+    pub raw_fields: Value,
     /// `ActivityPub` inbox endpoint, if known.
     pub inbox: Option<String>,
     /// Shared inbox endpoint, if known.
@@ -246,6 +251,7 @@ impl fmt::Debug for User {
             .field("bot", &self.bot)
             .field("discoverable", &self.discoverable)
             .field("fields", &self.fields)
+            .field("raw_fields", &self.raw_fields)
             .field("inbox", &self.inbox)
             .field("shared_inbox", &self.shared_inbox)
             .field("outbox", &self.outbox)
@@ -335,6 +341,9 @@ pub struct NewUser {
     pub discoverable: Flag,
     /// Profile metadata; the empty JSON array by default.
     pub fields: Value,
+    /// Profile metadata as its source text; the empty JSON array by
+    /// default.
+    pub raw_fields: Value,
     /// `ActivityPub` inbox endpoint.
     pub inbox: Option<String>,
     /// Shared inbox endpoint.
@@ -449,6 +458,7 @@ impl fmt::Debug for NewUser {
             .field("bot", &self.bot)
             .field("discoverable", &self.discoverable)
             .field("fields", &self.fields)
+            .field("raw_fields", &self.raw_fields)
             .field("inbox", &self.inbox)
             .field("shared_inbox", &self.shared_inbox)
             .field("outbox", &self.outbox)
@@ -517,6 +527,7 @@ impl Default for NewUser {
             bot: Flag::new(false),
             discoverable: Flag::new(false),
             fields: json!([]),
+            raw_fields: json!([]),
             inbox: None,
             shared_inbox: None,
             outbox: None,
@@ -608,13 +619,13 @@ const INSERT_SQL: &str = "INSERT INTO users (
      also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
-     preferred_frontend
+     preferred_frontend, raw_fields
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60
+     $55, $56, $57, $58, $59, $60, $61
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -692,6 +703,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.last_fetched_at)
         .bind(new_user.mfa_settings.clone())
         .bind(new_user.preferred_frontend.as_deref())
+        .bind(new_user.raw_fields.clone())
         .fetch_one(pool)
         .await?;
     Ok(user)
@@ -958,7 +970,7 @@ pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> 
     Ok(())
 }
 
-/// The whole `PATCH /api/v1/accounts/update_credentials` write: the six
+/// The whole `PATCH /api/v1/accounts/update_credentials` write: the eight
 /// profile columns the endpoint owns.
 ///
 /// Every one of them arrives already merged with the stored row by the
@@ -978,9 +990,16 @@ pub struct ProfileFields {
     pub bot: Flag,
     /// Whether the account opted into discovery.
     pub discoverable: Flag,
+    /// The profile metadata as rendered HTML entries for the `fields`
+    /// column: a JSON array of `{name, value}` objects.
+    pub fields: Value,
+    /// The profile metadata as its source text for the `raw_fields`
+    /// column: the same entries as [`fields`](Self::fields), with the
+    /// values and names exactly as typed.
+    pub raw_fields: Value,
 }
 
-/// The `UPDATE` behind [`update_profile`]: writes the six profile columns
+/// The `UPDATE` behind [`update_profile`]: writes the eight profile columns
 /// in one statement, refreshes `updated_at` and returns the stored row.
 const UPDATE_PROFILE_SQL: &str = "UPDATE users
       SET name = $2,
@@ -989,6 +1008,8 @@ const UPDATE_PROFILE_SQL: &str = "UPDATE users
           locked = $5,
           bot = $6,
           discoverable = $7,
+          fields = $8,
+          raw_fields = $9,
           updated_at = now()
      WHERE id = $1
   RETURNING *";
@@ -1019,6 +1040,8 @@ pub async fn update_profile(
         .bind(fields.locked)
         .bind(fields.bot)
         .bind(fields.discoverable)
+        .bind(fields.fields.clone())
+        .bind(fields.raw_fields.clone())
         .fetch_optional(pool)
         .await?)
 }
@@ -1100,7 +1123,8 @@ mod tests {
             avatar_url: Some(format!("{BASE}/avatar.png")),
             banner_url: Some(format!("{BASE}/banner.png")),
             profile_url: Some(local_ap_id(BASE, "alice")),
-            fields: json!([{"name": "site", "value": "https://alice.example"}]),
+            fields: json!([{"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"}]),
+            raw_fields: json!([{"name": "site", "value": "https://alice.example"}]),
             inbox: Some(inbox(&local_ap_id(BASE, "alice"))),
             public_key: Some("PUBLIC-PEM".to_owned()),
             private_key: Some(SECRET_KEY.to_owned()),
@@ -1148,8 +1172,13 @@ mod tests {
         );
         assert_eq!(
             user.fields,
-            json!([{"name": "site", "value": "https://alice.example"}]),
+            json!([{"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"}]),
             "fields round trip through jsonb"
+        );
+        assert_eq!(
+            user.raw_fields,
+            json!([{"name": "site", "value": "https://alice.example"}]),
+            "raw fields round trip through jsonb"
         );
         assert_eq!(
             user.inbox.as_deref(),
@@ -1791,6 +1820,7 @@ mod tests {
         assert_eq!(new.bio, "", "empty note");
         assert_eq!(new.raw_bio, "", "empty source note");
         assert_eq!(new.fields, json!([]), "empty field array");
+        assert_eq!(new.raw_fields, json!([]), "empty raw field array");
         assert!(
             !new.locked.get() && !new.bot.get() && !new.discoverable.get(),
             "profile flags default to false"
@@ -1946,7 +1976,7 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_profile_writes_the_six_columns_and_returns_them(pool: PgPool) {
+    async fn update_profile_writes_the_eight_columns_and_returns_them(pool: PgPool) {
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         assert_eq!(alice.name, "", "the fixture has no display name");
         assert!(
@@ -1960,6 +1990,8 @@ mod tests {
             locked: Flag::new(true),
             bot: Flag::new(false),
             discoverable: Flag::new(true),
+            fields: json!([{"name": "site", "value": "<p><a href=\"https://alice.example\" rel=\"ugc nofollow noopener noreferrer\">alice.example</a></p>"}]),
+            raw_fields: json!([{"name": "site", "value": "https://alice.example"}]),
         };
         let updated = update_profile(&pool, alice.id, &fields)
             .await
@@ -1971,6 +2003,16 @@ mod tests {
         assert!(updated.locked.get(), "locked set");
         assert!(!updated.bot.get(), "bot left off");
         assert!(updated.discoverable.get(), "discoverable set");
+        assert_eq!(
+            updated.fields,
+            json!([{"name": "site", "value": "<p><a href=\"https://alice.example\" rel=\"ugc nofollow noopener noreferrer\">alice.example</a></p>"}]),
+            "the rendered fields are written"
+        );
+        assert_eq!(
+            updated.raw_fields,
+            json!([{"name": "site", "value": "https://alice.example"}]),
+            "the raw fields are written beside them"
+        );
         assert!(
             updated.updated_at > alice.updated_at,
             "the write refreshes updated_at"
@@ -1980,6 +2022,8 @@ mod tests {
         assert_eq!(stored.name, updated.name, "the row is what reads back");
         assert_eq!(stored.bio, updated.bio, "stored bio");
         assert_eq!(stored.raw_bio, updated.raw_bio, "stored raw bio");
+        assert_eq!(stored.fields, updated.fields, "stored fields");
+        assert_eq!(stored.raw_fields, updated.raw_fields, "stored raw fields");
 
         // An unknown id matches no row and is not an error.
         assert!(

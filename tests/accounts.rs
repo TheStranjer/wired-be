@@ -213,14 +213,18 @@ async fn verify_credentials_source_defaults_are_the_column_defaults(pool: PgPool
 }
 
 /// The `source` fields are the text an owner edits, not the markup a
-/// stranger reads: a field stored only as HTML is reduced to its text, and
-/// one stored with a raw value round-trips that value.
+/// stranger reads: the entity renders the `fields` jsonb as stored and the
+/// source block round-trips the `raw_fields` jsonb beside it.
 #[sqlx::test(migrator = "wired_be::MIGRATOR")]
 async fn verify_credentials_source_fields_are_the_raw_text(pool: PgPool) {
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.fields = json!([
-            {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"},
-            {"name": "motto", "value": "<b>beep</b>", "value_plaintext": "**beep**"},
+            {"name": "site", "value": "<p><a href=\"https://alice.example\" rel=\"ugc nofollow noopener noreferrer\">alice.example</a></p>"},
+            {"name": "motto", "value": "<p><b>beep</b></p>"},
+        ]);
+        new.raw_fields = json!([
+            {"name": "site", "value": "https://alice.example"},
+            {"name": "motto", "value": "<b>beep</b>"},
         ]);
         new
     })
@@ -231,19 +235,18 @@ async fn verify_credentials_source_fields_are_the_raw_text(pool: PgPool) {
     assert_eq!(
         body["fields"],
         json!([
-            {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>", "verified_at": null},
-            {"name": "motto", "value": "<b>beep</b>", "verified_at": null},
+            {"name": "site", "value": "<p><a href=\"https://alice.example\" rel=\"ugc nofollow noopener noreferrer\">alice.example</a></p>", "verified_at": null},
+            {"name": "motto", "value": "<p><b>beep</b></p>", "verified_at": null},
         ]),
         "the public entity keeps rendering the stored markup"
     );
     assert_eq!(
         source_of(&body)["fields"],
         json!([
-            {"name": "site", "value": "alice.example", "verified_at": null},
-            {"name": "motto", "value": "**beep**", "verified_at": null},
+            {"name": "site", "value": "https://alice.example", "verified_at": null},
+            {"name": "motto", "value": "<b>beep</b>", "verified_at": null},
         ]),
-        "the source block hands back what the account typed: stripped where \
-         only HTML was stored, verbatim where a raw value was"
+        "the source block hands back the raw text stored beside the markup"
     );
 }
 

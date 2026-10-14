@@ -27,6 +27,7 @@ All configuration comes from environment variables. For local development, copy 
 | `MAX_MEDIA_DESCRIPTION` | no | `1500` | Maximum characters in a media attachment's description (alt text); `PUT /api/v1/media/{id}` refuses longer values with 422 |
 | `MAX_DISPLAY_NAME_CHARS` | no | `50` | Maximum characters in an account display name; `PATCH /api/v1/accounts/update_credentials` refuses a longer `display_name` with 422 |
 | `MAX_BIO_CHARS` | no | `5000` | Maximum characters in a profile note (bio); `PATCH /api/v1/accounts/update_credentials` refuses a longer `note` with 422 |
+| `MAX_PROFILE_FIELDS` | no | `4` | Maximum number of profile metadata entries (`fields_attributes`) per account; `PATCH /api/v1/accounts/update_credentials` refuses more with 422 `{"error":"Too many fields"}` |
 | `ACCOUNTS_EMAIL_OPTIONAL` | no | `false` | Allow registering local accounts without an email address (`true`/`false`, or `1`/`0`) |
 | `MIN_PASSWORD_LENGTH` | no | `8` | Minimum length of a registration password, in characters |
 | `OAUTH_TOKEN_TTL_SECS` | no | `2592000` | Lifetime granted to newly issued OAuth access tokens, in seconds (default: 30 days) |
