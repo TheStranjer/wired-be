@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config, entities::relationship::RelationshipMap, models::user::User,
-    util::sanitize::strip_html, util::time::mastodon_time,
+    util::time::mastodon_time,
 };
 
 /// The `actor_type` value that makes the entity's `group` flag true.
@@ -62,12 +62,13 @@ const DATE_FORMAT: &str = "%Y-%m-%d";
 #[derive(Clone, Debug, Serialize)]
 pub struct JsonBool(pub bool);
 
-/// One profile metadata line, as Mastodon renders it: the stored
-/// `{name, value}` pair of the `fields` jsonb plus a verification time.
+/// One profile metadata line, as Mastodon renders it: a `{name, value}`
+/// pair of the stored jsonb plus a verification time.
 ///
 /// The same shape serves both renderings: the top-level
-/// [`fields`](Account::fields) carry the stored value as sanitized HTML,
-/// while [`AccountSource::fields`] hands the owner the raw text to edit.
+/// [`fields`](Account::fields) carry the `fields` jsonb's sanitized-HTML
+/// value, while [`AccountSource::fields`] hands the owner the `raw_fields`
+/// jsonb's editing text.
 #[derive(Debug, Serialize)]
 pub struct Field {
     /// The field label, as the user typed it.
@@ -145,7 +146,7 @@ impl AccountSource {
             sensitive: JsonBool(user.sensitive_default.get()),
             language: user.language.clone(),
             note: user.raw_bio.clone(),
-            fields: raw_fields_from_json(&user.fields),
+            fields: fields_from_json(&user.raw_fields),
             follow_requests_count,
             pleroma: SourcePleroma {
                 show_role: JsonBool(user.show_role.get()),
@@ -688,11 +689,13 @@ pub(crate) fn full_nickname(user: &User, config: &Config) -> String {
     }
 }
 
-/// Maps the `fields` jsonb — an array of `{name, value}` objects whose
-/// value is sanitized HTML — into entity [`Field`]s. Entries without a
-/// string `name` and `value` are skipped, and stored jsonb of any other
-/// shape renders as the empty list, so malformed storage never fails a
-/// response.
+/// Maps a stored profile-metadata jsonb — an array of `{name, value}`
+/// objects — into entity [`Field`]s, used for both columns: the `fields`
+/// jsonb whose values are sanitized HTML renders the top-level entity, and
+/// the `raw_fields` jsonb whose values are the editing text renders
+/// [`AccountSource::fields`]. Entries without a string `name` and `value`
+/// are skipped, and stored jsonb of any other shape renders as the empty
+/// list, so malformed storage never fails a response.
 fn fields_from_json(stored: &Value) -> Vec<Field> {
     stored
         .as_array()
@@ -705,45 +708,6 @@ fn fields_from_json(stored: &Value) -> Vec<Field> {
                     Some(Field {
                         name: name.to_owned(),
                         value: value.to_owned(),
-                        verified_at: None,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The key a stored field's raw text value would sit under: Pleroma keeps
-/// the editing spelling beside the rendered one (its `raw_fields`, whose
-/// entries `put_fields` derives `fields` from), so a field stored with one
-/// round-trips verbatim instead of being re-derived from its markup.
-const FIELD_RAW_KEY: &str = "value_plaintext";
-
-/// Maps the `fields` jsonb into the [`AccountSource::fields`] an owner
-/// edits: the same entries as [`fields_from_json`], with the value as
-/// plain text rather than as markup. A field that stores a raw value under
-/// [`FIELD_RAW_KEY`] round-trips it verbatim; one that only stores the
-/// sanitized HTML (every field this instance has today) is reduced to its
-/// text by [`strip_html`], so what a client puts in a textarea is what the
-/// account wrote, not the markup around it.
-fn raw_fields_from_json(stored: &Value) -> Vec<Field> {
-    stored
-        .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| {
-                    let name = entry.get("name").and_then(Value::as_str)?;
-                    let raw = entry.get(FIELD_RAW_KEY).and_then(Value::as_str);
-                    let html = entry.get("value").and_then(Value::as_str);
-                    let value = match (raw, html) {
-                        (Some(raw), _) => raw.to_owned(),
-                        (None, Some(html)) => strip_html(html),
-                        (None, None) => return None,
-                    };
-                    Some(Field {
-                        name: name.to_owned(),
-                        value,
                         verified_at: None,
                     })
                 })
@@ -882,6 +846,7 @@ mod tests {
             bot: Flag::new(false),
             discoverable: Flag::new(false),
             fields: serde_json::json!([]),
+            raw_fields: serde_json::json!([]),
             inbox: None,
             shared_inbox: None,
             outbox: None,
@@ -1877,29 +1842,42 @@ mod tests {
     }
 
     #[test]
-    fn source_fields_are_the_raw_text_of_the_stored_ones() {
+    fn source_fields_are_the_raw_text_stored_beside_the_rendered_ones() {
         let config = Config::for_tests();
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
         alice.fields = json!([
             {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"},
-            {"name": "raw", "value": "<b>kept as stored</b>", "value_plaintext": "**kept as stored**"},
+            {"name": "motto", "value": "<b>beep</b>"},
+        ]);
+        alice.raw_fields = json!([
+            {"name": "site", "value": "https://alice.example"},
+            {"name": "motto", "value": "<b>beep</b>"},
             {"name": "no value"},
             {"name": 3, "value": "four"},
             "not an object",
         ]);
-        let fields = source_of(&render_for_owner(&alice, &config, 0))["fields"].clone();
+        let value = render_for_owner(&alice, &config, 0);
+        assert_eq!(
+            value["fields"],
+            json!([
+                {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>", "verified_at": null},
+                {"name": "motto", "value": "<b>beep</b>", "verified_at": null},
+            ]),
+            "the public entity renders the `fields` jsonb exactly as stored"
+        );
+        let fields = source_of(&value)["fields"].clone();
         assert_eq!(
             fields,
             json!([
-                {"name": "site", "value": "alice.example", "verified_at": null},
-                {"name": "raw", "value": "**kept as stored**", "verified_at": null},
+                {"name": "site", "value": "https://alice.example", "verified_at": null},
+                {"name": "motto", "value": "<b>beep</b>", "verified_at": null},
             ]),
-            "an HTML-only field is reduced to its text, one stored with a \
-             plaintext value round-trips it verbatim, and malformed \
-             entries are skipped like the top-level render skips them"
+            "the source block round-trips the `raw_fields` jsonb verbatim, \
+             and malformed entries are skipped like the top-level render \
+             skips them"
         );
 
-        alice.fields = json!({"not": "an array"});
+        alice.raw_fields = json!({"not": "an array"});
         assert_eq!(
             source_of(&render_for_owner(&alice, &config, 0))["fields"],
             json!([]),

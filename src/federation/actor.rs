@@ -278,6 +278,7 @@ mod tests {
             bot: Flag::new(false),
             discoverable: Flag::new(false),
             fields: json!([]),
+            raw_fields: json!([]),
             inbox: None,
             shared_inbox: None,
             outbox: None,

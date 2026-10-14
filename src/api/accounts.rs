@@ -55,9 +55,22 @@
 //! links only for mentions naming a local user of this instance (unknown
 //! and remote mentions stay plain text). `locked`, `bot` and
 //! `discoverable` are [`flex::opt_bool`] booleans; an unrecognized
-//! boolean string is the extractor's 422. The answer is a 200
-//! [`Account::for_owner`] render — the owner view with its `source`
-//! block, the same one `verify_credentials` answers — and every
+//! boolean string is the extractor's 422. `fields_attributes` is the
+//! profile metadata: a JSON array of `{name, value}` objects, an index
+//! map (`{"0": {…}}`) or the form spelling
+//! `fields_attributes[0][name]=…` alike — [`index_map_to_vec`] folds all
+//! three shapes into the submitted list (see `stored_fields`). An
+//! entry whose name and value are both empty is dropped; more than
+//! [`max_profile_fields`](Config::max_profile_fields) remaining entries
+//! are the 422 "Too many fields", and a name over
+//! `MAX_PROFILE_FIELD_NAME_CHARS` or a value over
+//! `MAX_PROFILE_FIELD_VALUE_CHARS` characters is a length 422. Two
+//! jsonb columns store the pair: `raw_fields` keeps the entries as
+//! typed, `fields` the names reduced to plain text and the values
+//! rendered by [`text_to_html`] — so a bare URL becomes a link with the
+//! standard `rel`. An empty submission clears the metadata. The answer
+//! is a 200 [`Account::for_owner`] render — the owner view with its
+//! `source` block, the same one `verify_credentials` answers — and every
 //! accepted request runs the `after_profile_updated` hook, which the
 //! later ticket that federates the actor's `Update` fills in.
 //!
@@ -153,6 +166,7 @@ use axum::{
     routing::{get, patch, post},
 };
 use serde::Deserialize;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tracing::debug;
 use url::form_urlencoded;
@@ -167,7 +181,7 @@ use crate::{
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
-    extract::{ApiBody, flex, multipart::MultipartForm},
+    extract::{ApiBody, flex, index_map_to_vec, multipart::MultipartForm},
     models::{
         account_note,
         follow::{self, Follow},
@@ -180,7 +194,7 @@ use crate::{
         entities::{MentionRef, extract_mentions, linkify_entities},
         format::text_to_html,
         id::parse_id,
-        sanitize::sanitize_display_name,
+        sanitize::{sanitize_display_name, strip_html},
     },
 };
 
@@ -191,6 +205,23 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 /// The longest `comment` `POST /api/v1/accounts/{id}/note` accepts
 /// (Mastodon's `AccountNote` limit).
 const MAX_COMMENT_CHARS: usize = 2000;
+
+/// The longest `fields_attributes` name accepted, in characters
+/// (Pleroma's `[:instance, :account_field_name_length]` default, the
+/// same cap Mastodon stores); longer is the 422 in [`check_field_len`]'s
+/// wording.
+const MAX_PROFILE_FIELD_NAME_CHARS: usize = 255;
+
+/// The longest `fields_attributes` value accepted, in characters
+/// (Mastodon's `account_field_value_length`); longer is the 422 in
+/// [`check_field_len`]'s wording.
+const MAX_PROFILE_FIELD_VALUE_CHARS: usize = 2047;
+
+/// The 422 body `PATCH /api/v1/accounts/update_credentials` answers when
+/// `fields_attributes` carries more entries than
+/// [`max_profile_fields`](Config::max_profile_fields); this endpoint's
+/// ticket pins the wording.
+const TOO_MANY_FIELDS: &str = "Too many fields";
 
 /// The 422 message `POST /api/v1/accounts/{id}/remove_from_followers`
 /// answers when the path names the caller: this endpoint's ticket pins the
@@ -310,6 +341,13 @@ struct ProfileParams {
     /// Whether the account opts into discovery.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     discoverable: Option<bool>,
+    /// The profile metadata: Mastodon's `fields_attributes`, a JSON array
+    /// of `{name, value}` objects, an object keyed by index or the
+    /// `fields_attributes[0][name]=…` spelling of form and multipart
+    /// bodies alike — read as `Value` so every shape survives the
+    /// extractor and [`stored_fields`] folds them into one list.
+    #[serde(default)]
+    fields_attributes: Option<Value>,
 }
 
 /// `PATCH /api/v1/accounts/update_credentials` (and the `POST` alias of
@@ -321,8 +359,8 @@ struct ProfileParams {
 /// (decision 10); file parts (`avatar` and friends) belong to later
 /// tickets and are ignored. [`profile_fields`] validates what is present
 /// and merges it over the token's row,
-/// [`update_profile`](crate::models::user::update_profile) writes the six
-/// columns in one statement, and the fresh row answers through
+/// [`update_profile`](crate::models::user::update_profile) writes the
+/// eight columns in one statement, and the fresh row answers through
 /// [`owner_view`] — the write-behind render that states the stored fact
 /// rather than trusting the request. A body that carries none of these
 /// fields is the accepted no-op: 200 with the unchanged entity.
@@ -331,8 +369,9 @@ struct ProfileParams {
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
 /// and the `write:accounts` check; [`AppError::Unprocessable`] when
-/// `display_name` or `note` is too long, or from the extractor for an
-/// invalid boolean string. Any database failure arrives through `?` as
+/// `display_name` or `note` is too long, when `fields_attributes` breaks
+/// one of its limits, or from the extractor for an invalid boolean
+/// string. Any database failure arrives through `?` as
 /// [`AppError::Database`], and the [`AppError::Internal`] arm only
 /// documents that the row behind a just-authenticated token is gone.
 async fn update_credentials(
@@ -350,7 +389,7 @@ async fn update_credentials(
 }
 
 /// Validates the present profile parameters and merges them over the
-/// stored row: the six columns
+/// stored row: the eight columns
 /// [`update_profile`](crate::models::user::update_profile) will write,
 /// with fields absent from the request carrying the value they already
 /// hold and fields present-but-blank carrying the blank (an empty
@@ -358,13 +397,14 @@ async fn update_credentials(
 /// endpoint's ticket pins that against Pleroma's registration-side
 /// fallback). A `note` over [`max_bio_chars`](Config::max_bio_chars)
 /// characters (counted in characters, not bytes) is the 422 mirroring the
-/// name message.
+/// name message; a submitted `fields_attributes` is validated and
+/// rendered by [`stored_fields`].
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] from [`sanitized_name`] or the note length
-/// check; [`render_note`] adds any database failure as
-/// [`AppError::Database`].
+/// [`AppError::Unprocessable`] from [`sanitized_name`], the note length
+/// check or [`stored_fields`]; [`render_note`] adds any database failure
+/// as [`AppError::Database`].
 async fn profile_fields(
     state: &AppState,
     current: &User,
@@ -389,6 +429,10 @@ async fn profile_fields(
         Some(raw) => (render_note(state, raw).await?, raw.to_owned()),
         None => (current.bio.clone(), current.raw_bio.clone()),
     };
+    let (fields, raw_fields) = match params.fields_attributes {
+        Some(submitted) => stored_fields(submitted, state.config.max_profile_fields)?,
+        None => (current.fields.clone(), current.raw_fields.clone()),
+    };
     Ok(ProfileFields {
         name: name.unwrap_or_else(|| current.name.clone()),
         bio,
@@ -396,7 +440,79 @@ async fn profile_fields(
         locked: params.locked.map_or(current.locked, Flag::from),
         bot: params.bot.map_or(current.bot, Flag::from),
         discoverable: params.discoverable.map_or(current.discoverable, Flag::from),
+        fields,
+        raw_fields,
     })
+}
+
+/// The `fields` and `raw_fields` jsonb a submitted `fields_attributes`
+/// stores: [`index_map_to_vec`] folds the JSON array, index-object and
+/// form-spelled bodies into one list of `{name, value}` entries (a key
+/// neither holds reads as the empty string, so entries that are not
+/// objects are empty ones), and an entry with both name and value empty
+/// is dropped — Pleroma's `put_fields` filtering, widened to the whole
+/// entry. What survives must be at most `max_fields` entries (the 422
+/// [`TOO_MANY_FIELDS`]) with each name within
+/// [`MAX_PROFILE_FIELD_NAME_CHARS`] and each value within
+/// [`MAX_PROFILE_FIELD_VALUE_CHARS`] characters, counted on the raw text
+/// like Pleroma's `valid_field?`. The stored pair is the raw entry in
+/// `raw_fields` and, in `fields`, the name reduced to plain text by
+/// [`strip_html`] and the value rendered by [`text_to_html`] — bare URLs
+/// become links carrying the standard `rel`. An empty submission is an
+/// empty pair: the metadata, cleared.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] for the count and both length limits.
+fn stored_fields(submitted: Value, max_fields: usize) -> AppResult<(Value, Value)> {
+    let mut entries = Vec::new();
+    for entry in index_map_to_vec(submitted) {
+        let name = field_text(&entry, "name");
+        let value = field_text(&entry, "value");
+        if name.is_empty() && value.is_empty() {
+            continue;
+        }
+        entries.push((name, value));
+    }
+    if entries.len() > max_fields {
+        return Err(AppError::Unprocessable(TOO_MANY_FIELDS.to_owned()));
+    }
+    let mut rendered = Vec::with_capacity(entries.len());
+    let mut raw = Vec::with_capacity(entries.len());
+    for (name, value) in entries {
+        check_field_len("Field name", &name, MAX_PROFILE_FIELD_NAME_CHARS)?;
+        check_field_len("Field value", &value, MAX_PROFILE_FIELD_VALUE_CHARS)?;
+        rendered.push(json!({
+            "name": strip_html(&name),
+            "value": text_to_html(&value),
+        }));
+        raw.push(json!({"name": name, "value": value}));
+    }
+    Ok((Value::Array(rendered), Value::Array(raw)))
+}
+
+/// The string one submitted `fields_attributes` entry holds under `key`:
+/// a missing key or a non-string value is the empty string, which is how
+/// a form that spelled only `fields_attributes[1][name]` leaves the
+/// value.
+fn field_text(entry: &Value, key: &str) -> String {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The 422 mirroring the name and bio messages when one profile field's
+/// `text` is longer than `max_chars` characters (counted in characters,
+/// not bytes).
+fn check_field_len(what: &str, text: &str, max_chars: usize) -> AppResult<()> {
+    if text.chars().count() > max_chars {
+        return Err(AppError::Unprocessable(format!(
+            "{what} is too long (maximum is {max_chars} characters)"
+        )));
+    }
+    Ok(())
 }
 
 /// The display name to store: at most `max_chars` characters (in

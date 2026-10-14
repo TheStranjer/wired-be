@@ -43,6 +43,9 @@ pub const MAX_DISPLAY_NAME_CHARS_VAR: &str = "MAX_DISPLAY_NAME_CHARS";
 /// Environment variable holding the maximum profile note (bio) length in
 /// characters.
 pub const MAX_BIO_CHARS_VAR: &str = "MAX_BIO_CHARS";
+/// Environment variable holding the maximum number of profile metadata
+/// fields (`fields_attributes`).
+pub const MAX_PROFILE_FIELDS_VAR: &str = "MAX_PROFILE_FIELDS";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -131,6 +134,13 @@ pub const DEFAULT_MAX_DISPLAY_NAME_CHARS: usize = 50;
 /// `PATCH /api/v1/accounts/update_credentials` refuses a longer `note`
 /// with 422.
 pub const DEFAULT_MAX_BIO_CHARS: usize = 5_000;
+/// Profile metadata field count used when `MAX_PROFILE_FIELDS` is unset.
+///
+/// Mastodon caps `fields_attributes` at 4 entries per account
+/// (`account_fields` in `config/settings.yml`);
+/// `PATCH /api/v1/accounts/update_credentials` refuses more with 422
+/// `{"error":"Too many fields"}`.
+pub const DEFAULT_MAX_PROFILE_FIELDS: usize = 4;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -368,6 +378,11 @@ pub struct Config {
     /// `MAX_BIO_CHARS`; `PATCH /api/v1/accounts/update_credentials` refuses
     /// a longer `note` with 422.
     pub max_bio_chars: usize,
+    /// Maximum number of profile metadata entries (`fields_attributes`) an
+    /// account may store, from `MAX_PROFILE_FIELDS`;
+    /// `PATCH /api/v1/accounts/update_credentials` refuses more with 422
+    /// `{"error":"Too many fields"}`.
+    pub max_profile_fields: usize,
     /// Maximum pixel count (width times height) of an uploaded image, from
     /// `MAX_IMAGE_PIXELS`; the media upload endpoints reject an image that
     /// decodes larger with 422 "Image too large" (see
@@ -482,7 +497,7 @@ impl Config {
             MAX_CHAT_MESSAGE_CHARS_VAR,
             DEFAULT_MAX_CHAT_MESSAGE_CHARS,
         )?;
-        let (max_media_description, max_display_name_chars, max_bio_chars) =
+        let (max_media_description, max_display_name_chars, max_bio_chars, max_profile_fields) =
             text_length_limits(&lookup)?;
         let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
         let upload_limits = UploadLimits {
@@ -516,6 +531,7 @@ impl Config {
             max_media_description,
             max_display_name_chars,
             max_bio_chars,
+            max_profile_fields,
             max_image_pixels,
             upload_limits,
             inbox_max_bytes,
@@ -606,6 +622,7 @@ impl Config {
             max_media_description: DEFAULT_MAX_MEDIA_DESCRIPTION,
             max_display_name_chars: DEFAULT_MAX_DISPLAY_NAME_CHARS,
             max_bio_chars: DEFAULT_MAX_BIO_CHARS,
+            max_profile_fields: DEFAULT_MAX_PROFILE_FIELDS,
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
@@ -785,18 +802,25 @@ where
     ))
 }
 
-/// Reads the three per-field character limits that live beside the status
+/// The shape [`text_length_limits`] answers: the four default-or-parse
+/// profile limits in field order (media description, display name, bio,
+/// profile-field count); factored out because a bare fourfold tuple is
+/// Clippy's `type_complexity` fodder.
+type TextLengthLimits = (usize, usize, usize, usize);
+
+/// Reads the four per-field profile limits that live beside the status
 /// ones: the media attachment description (`MAX_MEDIA_DESCRIPTION`), the
-/// display name (`MAX_DISPLAY_NAME_CHARS`) and the profile bio
-/// (`MAX_BIO_CHARS`). Grouped because each is a plain default-or-parse and
-/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
-/// back in field order.
+/// display name (`MAX_DISPLAY_NAME_CHARS`), the profile bio
+/// (`MAX_BIO_CHARS`) and the profile metadata field count
+/// (`MAX_PROFILE_FIELDS`). Grouped because each is a plain default-or-parse
+/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
+/// comes back in field order.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidNumber`] when any of the three variables
+/// Returns [`ConfigError::InvalidNumber`] when any of the four variables
 /// holds a value that is not a whole number.
-fn text_length_limits<F>(lookup: &F) -> Result<(usize, usize, usize), ConfigError>
+fn text_length_limits<F>(lookup: &F) -> Result<TextLengthLimits, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -812,6 +836,7 @@ where
             DEFAULT_MAX_DISPLAY_NAME_CHARS,
         )?,
         number(lookup, MAX_BIO_CHARS_VAR, DEFAULT_MAX_BIO_CHARS)?,
+        number(lookup, MAX_PROFILE_FIELDS_VAR, DEFAULT_MAX_PROFILE_FIELDS)?,
     ))
 }
 
@@ -923,6 +948,7 @@ impl fmt::Debug for Config {
             .field("max_media_description", &self.max_media_description)
             .field("max_display_name_chars", &self.max_display_name_chars)
             .field("max_bio_chars", &self.max_bio_chars)
+            .field("max_profile_fields", &self.max_profile_fields)
             .field("max_image_pixels", &self.max_image_pixels)
             .field("upload_limits", &self.upload_limits)
             .field("inbox_max_bytes", &self.inbox_max_bytes)
@@ -1373,6 +1399,20 @@ mod tests {
         assert!(
             debug.contains("max_bio_chars: 200"),
             "the bio limit is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn reads_custom_max_profile_fields() {
+        let defaults = config_with(&[]);
+        assert_eq!(defaults.max_profile_fields, 4, "default MAX_PROFILE_FIELDS");
+
+        let config = config_with(&[(MAX_PROFILE_FIELDS_VAR, "2")]);
+        assert_eq!(config.max_profile_fields, 2, "custom MAX_PROFILE_FIELDS");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_profile_fields: 2"),
+            "the field-count limit is visible in Debug output: {debug}"
         );
     }
 
@@ -1981,6 +2021,7 @@ mod tests {
             MAX_MEDIA_DESCRIPTION_VAR,
             MAX_DISPLAY_NAME_CHARS_VAR,
             MAX_BIO_CHARS_VAR,
+            MAX_PROFILE_FIELDS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             INBOX_MAX_BYTES_VAR,
