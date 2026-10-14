@@ -13,8 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
-      # Used by `#[sqlx::test]`, which creates throwaway databases from this
-      # connection at runtime; never a real secret.
+      # Reduce artifact size
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      # Use mold linker (more stable + faster under runner memory limits)
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # Used by `#[sqlx::test]`
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     services:
       postgres:
@@ -30,12 +35,25 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+
       - uses: actions/checkout@v4
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
       - uses: Swatinem/rust-cache@v2
+
       - name: Run CI suite (scripts/ci.sh)
         run: scripts/ci.sh
-
-
