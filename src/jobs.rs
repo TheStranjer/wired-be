@@ -658,8 +658,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn worker_runs_handler_to_completion(pool: PgPool) {
+    #[tokio::test]
+    async fn worker_runs_handler_to_completion() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         HANDLER_RAN.store(false, Ordering::SeqCst);
         let job = enqueue(&pool, test_job("greet"))
             .await
@@ -679,8 +681,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn retry_error_makes_the_job_retryable_later(pool: PgPool) {
+    #[tokio::test]
+    async fn retry_error_makes_the_job_retryable_later() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(&pool, test_job("flaky"))
             .await
             .unwrap()
@@ -698,7 +702,7 @@ mod tests {
         assert_eq!(done.attempts, 1, "the failed attempt is counted");
         assert!(done.locked_at.is_none(), "failing releases the lock");
         assert!(
-            done.run_at > Utc::now() + TimeDelta::seconds(5),
+            done.run_at > done.updated_at + TimeDelta::seconds(5),
             "the job is due again only after the 15 s backoff"
         );
     }
@@ -756,8 +760,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn retry_after_error_schedules_the_peers_delay(pool: PgPool) {
+    #[tokio::test]
+    async fn retry_after_error_schedules_the_peers_delay() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(&pool, test_job("throttled"))
             .await
             .unwrap()
@@ -774,15 +780,17 @@ mod tests {
         );
         assert_eq!(done.attempts, 1, "the failed attempt is counted");
         assert!(
-            done.run_at > Utc::now() + TimeDelta::seconds(20)
-                && done.run_at < Utc::now() + TimeDelta::seconds(50),
+            done.run_at > done.updated_at + TimeDelta::seconds(20)
+                && done.run_at < done.updated_at + TimeDelta::seconds(50),
             "the job is due at the peer's 30 s, not the 15 s backoff: {}",
             done.run_at
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn discard_error_ends_the_job(pool: PgPool) {
+    #[tokio::test]
+    async fn discard_error_ends_the_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(&pool, test_job("doomed"))
             .await
             .unwrap()
@@ -803,8 +811,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unknown_kind_is_discarded_with_a_message(pool: PgPool) {
+    #[tokio::test]
+    async fn unknown_kind_is_discarded_with_a_message() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(&pool, test_job("mystery"))
             .await
             .unwrap()
@@ -820,8 +830,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn panicking_handler_retries_and_the_worker_keeps_going(pool: PgPool) {
+    #[tokio::test]
+    async fn panicking_handler_retries_and_the_worker_keeps_going() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let boom = enqueue(&pool, test_job("boom"))
             .await
             .unwrap()
@@ -859,13 +871,15 @@ mod tests {
             "the error names the kind and the crash: {message}"
         );
         assert!(
-            crashed.run_at > Utc::now() + TimeDelta::seconds(5),
+            crashed.run_at > crashed.updated_at + TimeDelta::seconds(5),
             "the retry waits out the backoff"
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn shutdown_waits_for_in_flight_jobs(pool: PgPool) {
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_jobs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         HANDLER_STARTED.store(false, Ordering::SeqCst);
         let job = enqueue(&pool, test_job("slow"))
             .await
@@ -899,8 +913,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn worker_uses_the_queues_and_concurrency_from_config(pool: PgPool) {
+    #[tokio::test]
+    async fn worker_uses_the_queues_and_concurrency_from_config() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = app_state(&pool);
         let job = enqueue(
             &pool,
@@ -929,8 +945,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn sweep_leaves_fresh_locks_alone(pool: PgPool) {
+    #[tokio::test]
+    async fn sweep_leaves_fresh_locks_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(&pool, test_job("held"))
             .await
             .unwrap()

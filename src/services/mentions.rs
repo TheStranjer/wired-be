@@ -164,8 +164,10 @@ mod tests {
             .collect()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_bare_nickname_resolves_its_local_account(pool: PgPool) {
+    #[tokio::test]
+    async fn a_bare_nickname_resolves_its_local_account() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         assert_eq!(
             resolved(&pool, "hello @alice, how are you?").await,
@@ -174,8 +176,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_locally_written_mention_matches_case_insensitively(pool: PgPool) {
+    #[tokio::test]
+    async fn a_locally_written_mention_matches_case_insensitively() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         assert_eq!(
             resolved(&pool, "@ALICE!").await,
@@ -184,8 +188,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_own_domain_qualifier_resolves_the_local_account(pool: PgPool) {
+    #[tokio::test]
+    async fn an_own_domain_qualifier_resolves_the_local_account() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         assert_eq!(
             resolved(&pool, "@alice@test.example @ALICE@Test.Example").await,
@@ -199,8 +205,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_stored_remote_account_resolves_by_its_full_acct(pool: PgPool) {
+    #[tokio::test]
+    async fn a_stored_remote_account_resolves_by_its_full_acct() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let bob = remote_user(&pool, "bob").await;
         assert_eq!(
             resolved(&pool, "@bob@remote.example").await,
@@ -209,8 +217,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unknown_mentions_are_skipped(pool: PgPool) {
+    #[tokio::test]
+    async fn unknown_mentions_are_skipped() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         assert!(
             resolved(&pool, "@nobody says hi").await.is_empty(),
@@ -227,8 +237,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn resolution_keeps_text_order_and_dedupe(pool: PgPool) {
+    #[tokio::test]
+    async fn resolution_keeps_text_order_and_dedupe() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         assert_eq!(
@@ -241,8 +253,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_bare_name_never_resolves_to_a_remote_mirror(pool: PgPool) {
+    #[tokio::test]
+    async fn a_bare_name_never_resolves_to_a_remote_mirror() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let _carol = remote_user(&pool, "carol").await;
         assert!(
             resolved(&pool, "@carol @carol@test.example")
@@ -253,8 +267,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn plain_text_resolves_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn plain_text_resolves_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             resolved(
                 &pool,
@@ -268,8 +284,10 @@ mod tests {
         assert!(resolved(&pool, "").await.is_empty(), "empty text");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_remote_hook_resolves_nothing_until_federation_lands(pool: PgPool) {
+    #[tokio::test]
+    async fn the_remote_hook_resolves_nothing_until_federation_lands() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mention = MentionRef {
             nickname: "whoever".to_owned(),
             domain: Some("nowhere.example".to_owned()),

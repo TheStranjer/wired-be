@@ -238,8 +238,10 @@ mod tests {
             .expect("counting scrobbles succeeds")
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = insert(
             &pool,
@@ -286,8 +288,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_optional_columns_stay_null_and_visibility_defaults(pool: PgPool) {
+    #[tokio::test]
+    async fn the_optional_columns_stay_null_and_visibility_defaults() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = insert(&pool, alice.id, &titled("only a title"))
             .await
@@ -304,8 +308,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_column_check_refuses_a_status_only_visibility(pool: PgPool) {
+    #[tokio::test]
+    async fn the_column_check_refuses_a_status_only_visibility() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let err = insert(&pool, alice.id, &visible("nope", Visibility::Local))
             .await
@@ -317,8 +323,10 @@ mod tests {
         assert_eq!(count_scrobbles(&pool).await, 0, "and no row went in");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn page_for_user_is_newest_first_and_the_owners_own(pool: PgPool) {
+    #[tokio::test]
+    async fn page_for_user_is_newest_first_and_the_owners_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let first = seed(&pool, &alice, "first").await;
@@ -356,8 +364,10 @@ mod tests {
         assert!(nobody.is_empty(), "and it has no scrobbles");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn private_scrobbles_reach_their_owner_only(pool: PgPool) {
+    #[tokio::test]
+    async fn private_scrobbles_reach_their_owner_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         seed_visible(&pool, &alice, "public one", Visibility::Public).await;
@@ -388,8 +398,10 @@ mod tests {
         assert_eq!(titles(&anonymous), titles(&stranger), "and so does nobody");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_page_walks_by_id_cursors(pool: PgPool) {
+    #[tokio::test]
+    async fn the_page_walks_by_id_cursors() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let mut ids: Vec<Uuid> = Vec::new();
         for n in 0..5 {
@@ -440,8 +452,10 @@ mod tests {
         assert_eq!(titles(&unseen), ["track 4"], "since_id gives the new ones");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_user_takes_their_scrobbles(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_user_takes_their_scrobbles() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let _hers: Scrobble = seed(&pool, &alice, "hers").await;

@@ -111,8 +111,10 @@ fn names_of(body: &Value) -> Vec<&str> {
 
 /// `GET /api/oauth_tokens` — only the caller's own, unexpired tokens,
 /// newest first, under exactly the three pinned keys.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn token_list_shows_the_callers_valid_tokens_newest_first(pool: PgPool) {
+#[tokio::test]
+async fn token_list_shows_the_callers_valid_tokens_newest_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = session(&pool, "alice").await;
     let bob = session(&pool, "bob").await;
     let app_x = common::create_app_named(&pool, "App X", None).await;
@@ -159,8 +161,10 @@ async fn token_list_shows_the_callers_valid_tokens_newest_first(pool: PgPool) {
 /// `DELETE /api/oauth_tokens/{id}` — the owner revokes their token:
 /// 200 with `{}`, the row gone from database and listing alike, and a
 /// second attempt on the dead id is the plain 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoke_removes_the_owners_token_and_answers_empty_object(pool: PgPool) {
+#[tokio::test]
+async fn revoke_removes_the_owners_token_and_answers_empty_object() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = session(&pool, "alice").await;
     let app = common::create_app_named(&pool, "Revoke Me", Some(&alice.user)).await;
     let doomed = common::create_token(&pool, &alice.user, &app, "read").await;
@@ -203,8 +207,10 @@ async fn revoke_removes_the_owners_token_and_answers_empty_object(pool: PgPool) 
 
 /// A foreign, unknown or malformed revocation id is one and the same
 /// 404, and the foreign row survives the attempt.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoke_of_foreign_unknown_or_malformed_is_404(pool: PgPool) {
+#[tokio::test]
+async fn revoke_of_foreign_unknown_or_malformed_is_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = session(&pool, "alice").await;
     let bob = session(&pool, "bob").await;
     let app = common::create_app_named(&pool, "Bobs", Some(&bob.user)).await;
@@ -237,8 +243,10 @@ async fn revoke_of_foreign_unknown_or_malformed_is_404(pool: PgPool) {
 /// for, deduplicated (the session app is both, the tokened app has two
 /// tokens), newest first, under exactly the seven pinned keys; foreign
 /// and untouched apps stay out.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first(pool: PgPool) {
+#[tokio::test]
+async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = session(&pool, "alice").await;
     let owned = common::create_app_named(&pool, "Owned", Some(&alice.user)).await;
     let tokened = common::create_app_named(&pool, "Tokened", None).await;
@@ -298,8 +306,10 @@ async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first(pool: PgPool) {
 }
 
 /// Every route answers the no-token 401 of the `AuthUser` pipeline.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_route_demands_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn every_route_demands_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let requests = [
         common::TestRequest::get(TOKENS),

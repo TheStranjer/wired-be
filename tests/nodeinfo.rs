@@ -22,7 +22,6 @@ pub mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use wired_be::{
     config::Toggle,
     models::{
@@ -204,8 +203,10 @@ async fn get_document(app: &axum::Router, path: &str) -> Value {
 
 /// `GET /.well-known/nodeinfo` links both schema documents at their
 /// `.json`-suffixed addresses under `BASE_URL`, and both hrefs resolve.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn discovery_links_both_schema_documents(pool: PgPool) {
+#[tokio::test]
+async fn discovery_links_both_schema_documents() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/.well-known/nodeinfo")
         .send(&app)
@@ -241,8 +242,10 @@ async fn discovery_links_both_schema_documents(pool: PgPool) {
 
 /// The 2.0 document, key by key: the ticket's key sets and Pleroma 2.10.2's
 /// default metadata on a fresh instance.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn nodeinfo_20_is_the_full_pleroma_document(pool: PgPool) {
+#[tokio::test]
+async fn nodeinfo_20_is_the_full_pleroma_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let document = get_document(&app, "/nodeinfo/2.0").await;
     assert_eq!(document, expected_document("2.0"), "the whole document");
@@ -265,8 +268,10 @@ async fn nodeinfo_20_is_the_full_pleroma_document(pool: PgPool) {
 
 /// The 2.1 document repeats 2.0's key sets under its own `version`, with
 /// the software links the 2.0 schema has no keys for.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn nodeinfo_21_adds_the_software_links(pool: PgPool) {
+#[tokio::test]
+async fn nodeinfo_21_adds_the_software_links() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let bare = get_document(&app, "/nodeinfo/2.1").await;
     let suffixed = get_document(&app, "/nodeinfo/2.1.json").await;
@@ -293,8 +298,10 @@ async fn nodeinfo_21_adds_the_software_links(pool: PgPool) {
 
 /// Every document path — four mounts, two schemas — answers with the
 /// schema's URI as the `profile` content-type parameter.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn each_document_carries_its_schema_profile(pool: PgPool) {
+#[tokio::test]
+async fn each_document_carries_its_schema_profile() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for (path, schema) in [
         ("/nodeinfo/2.0", SCHEMA_20),
@@ -315,8 +322,10 @@ async fn each_document_carries_its_schema_profile(pool: PgPool) {
 
 /// A version this server does not document is Pleroma's 404; the bare
 /// `/nodeinfo` path is no document at all and takes the router fallback.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unserved_versions_are_404(pool: PgPool) {
+#[tokio::test]
+async fn unserved_versions_are_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for path in [
         "/nodeinfo/2.2",
@@ -353,8 +362,10 @@ fn days_ago(days: i64) -> DateTime<Utc> {
 /// The usage counters count local active users, the 30- and 180-day
 /// activity windows (`last_active_at`, falling back to the newest post),
 /// and live non-reblog posts of this instance only.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn usage_counts_local_users_and_posts(pool: PgPool) {
+#[tokio::test]
+async fn usage_counts_local_users_and_posts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |user| NewUser {
         last_active_at: Some(days_ago(1)),
         ..user
@@ -432,8 +443,10 @@ async fn usage_counts_local_users_and_posts(pool: PgPool) {
 
 /// The staff list holds the actor ids of the local admin and moderator
 /// accounts — and only theirs, ordered by id.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn staff_accounts_lists_admins_and_moderators(pool: PgPool) {
+#[tokio::test]
+async fn staff_accounts_lists_admins_and_moderators() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _zed = common::create_local_user_with(&pool, "zed", |user| NewUser {
         is_moderator: true.into(),
         ..user
@@ -474,8 +487,10 @@ async fn staff_accounts_lists_admins_and_moderators(pool: PgPool) {
 /// `openRegistrations` follows `REGISTRATIONS_OPEN`, and the feature and
 /// access-restriction blocks are the ones the shared instance-metadata
 /// builders produce.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn registrations_toggle_and_shared_metadata_follow_the_builders(pool: PgPool) {
+#[tokio::test]
+async fn registrations_toggle_and_shared_metadata_follow_the_builders() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let mut config = common::test_config();
     config.registrations_open = Toggle::new(false);
     let app = common::test_app_with_config(pool, config);

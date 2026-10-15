@@ -1096,8 +1096,10 @@ mod tests {
             .collect()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn following_an_open_local_user_is_accepted_and_counted(pool: PgPool) {
+    #[tokio::test]
+    async fn following_an_open_local_user_is_accepted_and_counted() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let follow = follow(&pool, TEST_BASE_URL, &alice, &bob).await.unwrap();
@@ -1157,8 +1159,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn following_a_locked_user_waits_and_moves_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn following_a_locked_user_waits_and_moves_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let carol = locked_user(&pool, "carol").await;
         let follow = follow(&pool, TEST_BASE_URL, &alice, &carol).await.unwrap();
@@ -1209,8 +1213,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn accepting_grants_a_pending_request_once(pool: PgPool) {
+    #[tokio::test]
+    async fn accepting_grants_a_pending_request_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let carol = locked_user(&pool, "carol").await;
         let requested = follow(&pool, TEST_BASE_URL, &alice, &carol).await.unwrap();
@@ -1269,8 +1275,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn rejecting_a_pending_request_removes_it(pool: PgPool) {
+    #[tokio::test]
+    async fn rejecting_a_pending_request_removes_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let carol = locked_user(&pool, "carol").await;
         let requested = follow(&pool, TEST_BASE_URL, &alice, &carol).await.unwrap();
@@ -1304,8 +1312,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn rejecting_an_accepted_relationship_uncounts_it(pool: PgPool) {
+    #[tokio::test]
+    async fn rejecting_an_accepted_relationship_uncounts_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let accepted = follow(&pool, TEST_BASE_URL, &alice, &bob).await.unwrap();
@@ -1332,8 +1342,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unfollowing_reports_what_it_removed(pool: PgPool) {
+    #[tokio::test]
+    async fn unfollowing_reports_what_it_removed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -1393,8 +1405,10 @@ mod tests {
     /// endorsement together with the relationship — granted follows and
     /// withdrawn requests alike — while the reverse pin and another
     /// account's pin on the same target stay exactly where they were.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unfollowing_removes_the_endorsement(pool: PgPool) {
+    #[tokio::test]
+    async fn unfollowing_removes_the_endorsement() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -1465,8 +1479,10 @@ mod tests {
 
     /// The cleanup rides the removal: an [`unfollow`] that found nothing to
     /// remove (here a `rejected` row) leaves an existing endorsement alone.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unfollow_that_removed_nothing_keeps_the_endorsement(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unfollow_that_removed_nothing_keeps_the_endorsement() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dave = local_user(&pool, "dave").await;
         let carol = locked_user(&pool, "carol").await;
         let _rejected = rejected_relation(&pool, &dave, &carol).await;
@@ -1503,8 +1519,10 @@ mod tests {
     /// unfollowing account's own lists — an accepted relationship and a
     /// withdrawn request alike — while another owner's membership of the same
     /// account is not theirs to prune.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unfollowing_takes_the_target_out_of_the_followers_lists(pool: PgPool) {
+    #[tokio::test]
+    async fn unfollowing_takes_the_target_out_of_the_followers_lists() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -1551,8 +1569,10 @@ mod tests {
 
     /// The cleanup rides the removal: an [`unfollow`] that found nothing to
     /// remove leaves the memberships exactly where they were, too.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unfollow_that_removed_nothing_keeps_the_memberships(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unfollow_that_removed_nothing_keeps_the_memberships() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dave = local_user(&pool, "dave").await;
         let carol = locked_user(&pool, "carol").await;
         let _rejected = rejected_relation(&pool, &dave, &carol).await;
@@ -1573,8 +1593,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn remove_follower_takes_an_accepted_follower_and_uncounts_it(pool: PgPool) {
+    #[tokio::test]
+    async fn remove_follower_takes_an_accepted_follower_and_uncounts_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let accepted = follow(&pool, TEST_BASE_URL, &alice, &bob).await.unwrap();
@@ -1610,8 +1632,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn remove_follower_leaves_everything_but_a_follower_alone(pool: PgPool) {
+    #[tokio::test]
+    async fn remove_follower_leaves_everything_but_a_follower_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -1687,8 +1711,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn following_twice_is_the_same_relationship(pool: PgPool) {
+    #[tokio::test]
+    async fn following_twice_is_the_same_relationship() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -1725,8 +1751,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn following_again_reopens_a_rejected_request(pool: PgPool) {
+    #[tokio::test]
+    async fn following_again_reopens_a_rejected_request() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -1782,8 +1810,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn following_yourself_is_refused(pool: PgPool) {
+    #[tokio::test]
+    async fn following_yourself_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let err = follow(&pool, TEST_BASE_URL, &alice, &alice)
             .await
@@ -1801,8 +1831,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_remote_followee_is_answered_by_its_own_instance(pool: PgPool) {
+    #[tokio::test]
+    async fn a_remote_followee_is_answered_by_its_own_instance() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let bob = local_user(&pool, "bob").await;
         let carol = remote_user(&pool, "carol").await;
         let follow = follow(&pool, TEST_BASE_URL, &bob, &carol).await.unwrap();
@@ -1828,8 +1860,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_remote_follower_keeps_its_own_activity_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_remote_follower_keeps_its_own_activity_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mallory = remote_user(&pool, "mallory").await;
         let bob = local_user(&pool, "bob").await;
         let follow = follow(&pool, TEST_BASE_URL, &mallory, &bob).await.unwrap();
@@ -1855,8 +1889,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn accept_or_reject_of_an_unknown_id_is_not_found(pool: PgPool) {
+    #[tokio::test]
+    async fn accept_or_reject_of_an_unknown_id_is_not_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let missing = new_id();
         let accept_err = accept(&pool, missing).await.expect_err("nothing to accept");
         assert!(
@@ -1885,8 +1921,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn following_ids_lists_accepted_follows_oldest_first(pool: PgPool) {
+    #[tokio::test]
+    async fn following_ids_lists_accepted_follows_oldest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -1928,14 +1966,16 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn follower_lists_are_paged_newest_relationship_first(pool: PgPool) {
-        let target = local_user(&pool, "target").await;
-        let one = local_user(&pool, "one").await;
-        let two = local_user(&pool, "two").await;
-        let three = local_user(&pool, "three").await;
-        for follower in [&one, &two, &three] {
-            let granted = follow(&pool, TEST_BASE_URL, follower, &target)
+    /// Three accounts that each follow `target`, accepted at once, and the
+    /// stored rows of those three relationships.
+    async fn three_followers(pool: &PgPool, target: &User) -> (Vec<User>, Vec<Follow>) {
+        let mut followers = Vec::new();
+        for nickname in ["one", "two", "three"] {
+            followers.push(local_user(pool, nickname).await);
+        }
+        let mut rows = Vec::new();
+        for follower in &followers {
+            let granted = follow(pool, TEST_BASE_URL, follower, target)
                 .await
                 .expect("an open account answers every request");
             assert_eq!(
@@ -1943,25 +1983,39 @@ mod tests {
                 FollowState::Accepted,
                 "each of these is granted at once"
             );
+            rows.push(relation(pool, follower, target).await);
         }
-        let rows = vec![
-            relation(&pool, &one, &target).await,
-            relation(&pool, &two, &target).await,
-            relation(&pool, &three, &target).await,
-        ];
+        (followers, rows)
+    }
+
+    /// One page of `owner`'s followers, unwrapped.
+    async fn followers_of(pool: &PgPool, owner: &User, query: &str) -> Vec<FollowPageEntry> {
+        followers_page(pool, owner.id, page(query)).await.unwrap()
+    }
+
+    /// One page of `owner`'s following list, unwrapped.
+    async fn following_of(pool: &PgPool, owner: &User, query: &str) -> Vec<FollowPageEntry> {
+        following_page(pool, owner.id, page(query)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn follower_lists_are_paged_newest_relationship_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let target = local_user(&pool, "target").await;
+        let (followers, rows) = three_followers(&pool, &target).await;
         // Which of the three rows is "newest" is decided by their ids, not by
         // the order they were written in: UUIDv7 is only millisecond precise.
         let newest_first = followers_newest_first(&rows);
         let oldest_id = by_age(&rows).first().expect("three rows were read back").id;
 
+        let whole = followers_of(&pool, &target, "").await;
         assert_eq!(
-            entry_ids(&followers_page(&pool, target.id, page("")).await.unwrap()),
+            entry_ids(&whole),
             newest_first,
             "the whole follower list, newest follow first"
         );
-        let first_two = followers_page(&pool, target.id, page("limit=2"))
-            .await
-            .unwrap();
+        let first_two = followers_of(&pool, &target, "limit=2").await;
         assert_eq!(
             entry_ids(&first_two),
             newest_first[..2].to_vec(),
@@ -1980,47 +2034,36 @@ mod tests {
             last_on_page.id, first_two[1].follow_id,
             "the entry's relationship id is the stored row's primary key"
         );
-        let next = followers_page(
+        let next = followers_of(
             &pool,
-            target.id,
-            page(&format!("limit=2&max_id={}", last_on_page.id)),
+            &target,
+            &format!("limit=2&max_id={}", last_on_page.id),
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(
             entry_ids(&next),
             newest_first[2..].to_vec(),
             "max_id continues where the page ended"
         );
-        let newer = followers_page(
-            &pool,
-            target.id,
-            page(&format!("min_id={}", last_on_page.id)),
-        )
-        .await
-        .unwrap();
+        let newer = followers_of(&pool, &target, &format!("min_id={}", last_on_page.id)).await;
         assert_eq!(
             entry_ids(&newer),
             newest_first[..1].to_vec(),
             "min_id reads the half after the cursor and is still answered newest-first"
         );
         assert!(
-            followers_page(&pool, target.id, page(&format!("max_id={oldest_id}")))
+            followers_of(&pool, &target, &format!("max_id={oldest_id}"))
                 .await
-                .unwrap()
                 .is_empty(),
             "walking past the oldest row yields nothing"
         );
         assert!(
-            followers_page(&pool, one.id, page(""))
-                .await
-                .unwrap()
-                .is_empty(),
+            followers_of(&pool, &followers[0], "").await.is_empty(),
             "a follower of the list is not followed by anyone"
         );
 
         let mut outgoing = Vec::new();
-        for followed in [&one, &two, &three] {
+        for followed in &followers {
             outgoing.push(
                 follow(&pool, TEST_BASE_URL, &target, followed)
                     .await
@@ -2029,23 +2072,21 @@ mod tests {
         }
         let wanted = followed_newest_first(&outgoing);
         assert_eq!(
-            entry_ids(&following_page(&pool, target.id, page("")).await.unwrap()),
+            entry_ids(&following_of(&pool, &target, "").await),
             wanted,
             "the following list runs the same way"
         );
         assert_eq!(
-            entry_ids(
-                &following_page(&pool, target.id, page("limit=2"))
-                    .await
-                    .unwrap()
-            ),
+            entry_ids(&following_of(&pool, &target, "limit=2").await),
             wanted[..2].to_vec(),
             "and is paginated on the relationship id too"
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn pending_requests_are_paged_and_answered_away(pool: PgPool) {
+    #[tokio::test]
+    async fn pending_requests_are_paged_and_answered_away() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let carol = locked_user(&pool, "carol").await;
         let one = local_user(&pool, "one").await;
         let two = local_user(&pool, "two").await;
@@ -2126,8 +2167,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn pending_counts_the_requests_one_account_has_to_answer(pool: PgPool) {
+    #[tokio::test]
+    async fn pending_counts_the_requests_one_account_has_to_answer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let carol = locked_user(&pool, "carol").await;
         let dave = local_user(&pool, "dave").await;
         let erin = local_user(&pool, "erin").await;
@@ -2199,8 +2242,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_table_constraints_are_the_ones_the_model_relies_on(pool: PgPool) {
+    #[tokio::test]
+    async fn the_table_constraints_are_the_ones_the_model_relies_on() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let recorded = follow(&pool, TEST_BASE_URL, &alice, &bob)
@@ -2265,8 +2310,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn helpers_classify_the_target_and_mint_activity_ids(pool: PgPool) {
+    #[tokio::test]
+    async fn helpers_classify_the_target_and_mint_activity_ids() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let carol = locked_user(&pool, "carol").await;
         let bob = remote_user(&pool, "bob").await;
@@ -2303,8 +2350,10 @@ mod tests {
     /// [`follow`] refuses a pair with a block between them in either
     /// direction, with the 403 and the wording this ticket pins, and every
     /// other pair's follows are untouched by it.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_blocked_pair_cannot_follow(pool: PgPool) {
+    #[tokio::test]
+    async fn a_blocked_pair_cannot_follow() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -2372,8 +2421,10 @@ mod tests {
     /// [`blocked_error`] names the target's block when a pair blocked each
     /// other both ways: the answer the blocked follower gets is the one about
     /// the account that holds the block over them.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_mutually_blocked_pair_hears_the_incoming_block_first(pool: PgPool) {
+    #[tokio::test]
+    async fn a_mutually_blocked_pair_hears_the_incoming_block_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         block_pair(&pool, &alice, &bob).await;
@@ -2421,8 +2472,10 @@ mod tests {
     /// carry: local, with an accepted follow of the moving account, and
     /// still allowing their following list to move. Remote mirrors,
     /// rejected relationships and opted-out followers stay out of the set.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn move_followers_of_selects_local_accepted_permitters(pool: PgPool) {
+    #[tokio::test]
+    async fn move_followers_of_selects_local_accepted_permitters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mover = local_user(&pool, "mover").await;
         let carried = local_user(&pool, "carried").await;
         let opted_out = insert(
@@ -2464,8 +2517,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_notify_writes_only_an_accepted_relationship(pool: PgPool) {
+    #[tokio::test]
+    async fn set_notify_writes_only_an_accepted_relationship() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -2543,8 +2598,17 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn outgoing_requests_are_the_callers_own_asks(pool: PgPool) {
+    /// `owner`'s own outgoing follow requests, one page, unwrapped.
+    async fn asks_from(pool: &PgPool, owner: &User, query: &str) -> Vec<FollowPageEntry> {
+        outgoing_requests_from(pool, owner.id, page(query))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn outgoing_requests_are_the_callers_own_asks() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -2574,18 +2638,12 @@ mod tests {
         let newest_ids: Vec<Uuid> = by_age(&rows).iter().rev().map(|row| row.id).collect();
 
         assert_eq!(
-            entry_ids(
-                &outgoing_requests_from(&pool, alice.id, page(""))
-                    .await
-                    .unwrap()
-            ),
+            entry_ids(&asks_from(&pool, &alice, "").await),
             newest_first,
             "both of alice's asks, newest row first; the granted follow and \
              the incoming request stay out"
         );
-        let first = outgoing_requests_from(&pool, alice.id, page("limit=1"))
-            .await
-            .unwrap();
+        let first = asks_from(&pool, &alice, "limit=1").await;
         assert_eq!(
             entry_ids(&first),
             newest_first[..1].to_vec(),
@@ -2597,30 +2655,16 @@ mod tests {
             "the entry carries the request row id the page keys on"
         );
         assert_eq!(
-            entry_ids(
-                &outgoing_requests_from(
-                    &pool,
-                    alice.id,
-                    page(&format!("max_id={}", newest_ids[0]))
-                )
-                .await
-                .unwrap()
-            ),
+            entry_ids(&asks_from(&pool, &alice, &format!("max_id={}", newest_ids[0])).await),
             newest_first[1..].to_vec(),
             "max_id continues where the page ended"
         );
         assert!(
-            outgoing_requests_from(&pool, bob.id, page(""))
-                .await
-                .unwrap()
-                .is_empty(),
+            asks_from(&pool, &bob, "").await.is_empty(),
             "an account that asked nobody has an empty list"
         );
         assert!(
-            outgoing_requests_from(&pool, dave.id, page(""))
-                .await
-                .unwrap()
-                .is_empty(),
+            asks_from(&pool, &dave, "").await.is_empty(),
             "requests made to an account are not its own outgoing asks"
         );
 
@@ -2632,11 +2676,7 @@ mod tests {
             FollowState::Accepted,
             "and the answer grants it"
         );
-        let rest: Vec<Uuid> = entry_ids(
-            &outgoing_requests_from(&pool, alice.id, page(""))
-                .await
-                .unwrap(),
-        );
+        let rest: Vec<Uuid> = entry_ids(&asks_from(&pool, &alice, "").await);
         assert_eq!(
             rest,
             newest_first[..1].to_vec(),

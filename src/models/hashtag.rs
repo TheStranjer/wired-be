@@ -370,8 +370,10 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_is_idempotent_and_case_insensitive(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_is_idempotent_and_case_insensitive() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let first = upsert_many(&pool, &tags(&["Foo"]))
             .await
             .expect("the first upsert stores");
@@ -391,8 +393,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_keeps_order_by_name_and_drops_the_unusable(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_keeps_order_by_name_and_drops_the_unusable() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let long = "t".repeat(MAX_HASHTAG_LEN + 1);
         let stored = upsert_many(
             &pool,
@@ -422,8 +426,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn find_or_create_and_get_by_name_agree(pool: PgPool) {
+    #[tokio::test]
+    async fn find_or_create_and_get_by_name_agree() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             get_by_name(&pool, "rust").await.unwrap().is_none(),
             "an unknown name is no tag yet"
@@ -473,8 +479,10 @@ mod tests {
             .expect("fixture status inserts")
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn link_to_status_is_idempotent(pool: PgPool) {
+    #[tokio::test]
+    async fn link_to_status_is_idempotent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let status = post(&pool, "alice", "hello").await;
         let foo = find_or_create(&pool, "#foo").await.unwrap().expect("foo");
         let bar = find_or_create(&pool, "bar").await.unwrap().expect("bar");
@@ -496,8 +504,10 @@ mod tests {
             .expect("linking nothing is no work");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unknown_side_of_a_link_is_the_foreign_key(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unknown_side_of_a_link_is_the_foreign_key() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let status = post(&pool, "alice", "hello").await;
         let err = link_to_status(&pool, status.id, &[Uuid::now_v7()])
             .await
@@ -518,8 +528,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn replace_rewrites_the_whole_set(pool: PgPool) {
+    #[tokio::test]
+    async fn replace_rewrites_the_whole_set() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let status = post(&pool, "alice", "#old #shared").await;
         assert_eq!(
             stored_links(&pool, status.id).await,
@@ -550,8 +562,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn for_statuses_groups_by_status_in_name_order(pool: PgPool) {
+    #[tokio::test]
+    async fn for_statuses_groups_by_status_in_name_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let tagged = post(&pool, "alice", "#beta #alpha #beta").await;
         let shared = post(&pool, "bob", "#alpha").await;
         let quiet = post(&pool, "carol", "no tags").await;
@@ -585,8 +599,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_status_cascades_its_links(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_status_cascades_its_links() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let one = post(&pool, "alice", "#shared #mine").await;
         let two = post(&pool, "bob", "#shared").await;
 

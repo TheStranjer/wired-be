@@ -113,8 +113,10 @@ fn key_set(object: &Value) -> Vec<&str> {
 
 /// The JSON answer to an `acct:` lookup: subject, aliases and the three
 /// links, with nothing else — exact key sets included.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn acct_resource_resolves_the_local_user(pool: PgPool) {
+#[tokio::test]
+async fn acct_resource_resolves_the_local_user() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     let response = webfinger(&pool, ALICE_ACCT).await;
     assert_eq!(response.status, StatusCode::OK, "live local user");
@@ -150,8 +152,10 @@ async fn acct_resource_resolves_the_local_user(pool: PgPool) {
 /// A bare actor URL as `resource` resolves the same document (Pleroma's
 /// actor-id fallback lookup), and so does the `acct:` form without its
 /// prefix.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn actor_url_and_bare_acct_resolve_the_same_user(pool: PgPool) {
+#[tokio::test]
+async fn actor_url_and_bare_acct_resolve_the_same_user() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     for resource in [ALICE_URL, "alice%40test.example"] {
         let response = webfinger(&pool, resource).await;
@@ -166,8 +170,10 @@ async fn actor_url_and_bare_acct_resolve_the_same_user(pool: PgPool) {
 
 /// Domain and nickname are matched case-insensitively; the subject uses
 /// the stored spelling either way.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_lookup_is_case_insensitive(pool: PgPool) {
+#[tokio::test]
+async fn the_lookup_is_case_insensitive() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     for resource in [
         "acct:alice@TEST.EXAMPLE",
@@ -190,8 +196,10 @@ async fn the_lookup_is_case_insensitive(pool: PgPool) {
 
 /// A user with a profile URL aliases it and points the profile-page link
 /// at it; a profile URL that is just the actor id again adds no alias.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_profile_url_joins_the_aliases_and_the_profile_link(pool: PgPool) {
+#[tokio::test]
+async fn a_profile_url_joins_the_aliases_and_the_profile_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         profile_url: Some(format!("{BASE}/@alice")),
         ..new
@@ -230,8 +238,10 @@ async fn a_profile_url_joins_the_aliases_and_the_profile_link(pool: PgPool) {
 
 /// A wrong domain, an unknown nickname, an empty resource and a foreign
 /// actor URL are all 404s with the standard JSON error body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn resources_that_name_no_local_user_are_not_found(pool: PgPool) {
+#[tokio::test]
+async fn resources_that_name_no_local_user_are_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     for resource in [
         "acct:alice@other.example",
@@ -261,8 +271,10 @@ async fn resources_that_name_no_local_user_are_not_found(pool: PgPool) {
 
 /// Remote mirrors and deactivated local accounts are not served: both the
 /// `acct:` and the actor-URL form answer 404 for them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn remote_and_deactivated_users_are_not_found(pool: PgPool) {
+#[tokio::test]
+async fn remote_and_deactivated_users_are_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
     let erin = common::create_local_user_with(&pool, "erin", |new| NewUser {
         is_active: Flag::new(false),
@@ -293,8 +305,10 @@ async fn remote_and_deactivated_users_are_not_found(pool: PgPool) {
 
 /// `Accept: application/xrd+xml` gets the same data as XRD XML, element
 /// for element; an `Accept` naming JRD (or nothing usable) keeps the JSON.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn accept_xrd_xml_switches_to_the_xml_representation(pool: PgPool) {
+#[tokio::test]
+async fn accept_xrd_xml_switches_to_the_xml_representation() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     for accept in [XRD_XML, "text/html, application/xrd+xml;q=0.9"] {
         let response = webfinger_with_accept(&pool, ALICE_ACCT, accept).await;
@@ -319,8 +333,10 @@ async fn accept_xrd_xml_switches_to_the_xml_representation(pool: PgPool) {
 /// The `format=xml` query parameter is the explicit override Pleroma's
 /// `SetFormatPlug` honors: it wins over an `Accept`, and `.xml` is the
 /// same request.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn format_param_switches_to_the_xml_representation(pool: PgPool) {
+#[tokio::test]
+async fn format_param_switches_to_the_xml_representation() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool.clone());
     for format in ["xml", ".xml"] {
@@ -348,8 +364,10 @@ async fn format_param_switches_to_the_xml_representation(pool: PgPool) {
 
 /// A request without the `resource` parameter is the ticket's 400 with
 /// the `Missing resource` JSON body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn missing_resource_is_a_bad_request(pool: PgPool) {
+#[tokio::test]
+async fn missing_resource_is_a_bad_request() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/.well-known/webfinger")
         .send(&app)
@@ -373,8 +391,10 @@ async fn missing_resource_is_a_bad_request(pool: PgPool) {
 
 /// `GET /.well-known/host-meta` is the static lrdd descriptor pointing at
 /// `WebFinger`, as XRD XML.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn host_meta_advertises_the_webfinger_template(pool: PgPool) {
+#[tokio::test]
+async fn host_meta_advertises_the_webfinger_template() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/.well-known/host-meta")
         .send(&app)
@@ -397,8 +417,10 @@ async fn host_meta_advertises_the_webfinger_template(pool: PgPool) {
 /// Values from the database cannot break out of the XML: every special
 /// character of a stored profile URL arrives escaped in the XRD document
 /// and raw in the JRD one.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn stored_urls_are_escaped_in_xml_and_raw_in_json(pool: PgPool) {
+#[tokio::test]
+async fn stored_urls_are_escaped_in_xml_and_raw_in_json() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let evil = r#"https://test.example/&<>a"b'c"#;
     let _alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         profile_url: Some(evil.to_owned()),

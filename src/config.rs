@@ -238,8 +238,8 @@ pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
 /// Worker concurrency used when `JOB_CONCURRENCY` is unset.
 pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
-/// points at nothing; integration tests get their real pool from
-/// `#[sqlx::test]`.
+/// points at nothing; integration tests get their real pool from the fixture
+/// in [`crate::test_db`].
 #[cfg(any(test, feature = "integration-tests"))]
 pub const TEST_DATABASE_URL: &str = "postgres://localhost/wired_test";
 /// `BASE_URL` used by [`Config::for_tests`].
@@ -608,8 +608,8 @@ impl Config {
     /// `HTTP_ALLOW_PRIVATE_HOSTS` is `true` (the suites talk to local
     /// mini-servers), every other setting is at its default, and
     /// `DATABASE_URL` is an inert placeholder (tests get their real pool
-    /// from `#[sqlx::test]`). Reads no environment variables, so it is
-    /// safe in parallel tests.
+    /// from the fixture in [`crate::test_db`]). Reads no environment
+    /// variables, so it is safe in parallel tests.
     ///
     /// Available to unit tests through `cfg(test)` and to the integration
     /// tests through the `integration-tests` feature.

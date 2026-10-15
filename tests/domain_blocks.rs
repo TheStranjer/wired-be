@@ -186,8 +186,10 @@ fn listed_domains(response: &common::TestResponse) -> Vec<String> {
 /// Add over HTTP (JSON and form bodies alike), list the array of domain
 /// strings, remove one over the query, and see the empty listing carry no
 /// `Link` header at all.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn add_list_and_remove(pool: PgPool) {
+#[tokio::test]
+async fn add_list_and_remove() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
@@ -236,8 +238,10 @@ async fn add_list_and_remove(pool: PgPool) {
 
 /// `DELETE` reads its `domain` from the query string, a form body or a
 /// JSON body alike.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn delete_accepts_query_form_and_json_bodies(pool: PgPool) {
+#[tokio::test]
+async fn delete_accepts_query_form_and_json_bodies() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
@@ -276,8 +280,10 @@ async fn delete_accepts_query_form_and_json_bodies(pool: PgPool) {
 
 /// The domain normalisation the store keeps: lowercase, no leading `@`,
 /// no scheme, no trailing slash.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_domain_is_stored_canonical(pool: PgPool) {
+#[tokio::test]
+async fn the_domain_is_stored_canonical() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
@@ -311,8 +317,10 @@ async fn the_domain_is_stored_canonical(pool: PgPool) {
 /// Blocking what the same account already blocked — in any spelling that
 /// normalises alike — stays one row that keeps its id, and deleting it is
 /// idempotent too: repeats answer `{}` and change nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn duplicate_blocks_are_idempotent(pool: PgPool) {
+#[tokio::test]
+async fn duplicate_blocks_are_idempotent() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
@@ -351,8 +359,10 @@ async fn duplicate_blocks_are_idempotent(pool: PgPool) {
 /// A write that names no domain — absent, empty, or blank — is the 400
 /// `Missing parameter: domain`; a domain that normalises to no dotted
 /// host is the 422 `Invalid domain`. Both on `POST` and on `DELETE`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn missing_domain_is_400_and_invalid_domain_is_422(pool: PgPool) {
+#[tokio::test]
+async fn missing_domain_is_400_and_invalid_domain_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
@@ -403,8 +413,10 @@ async fn missing_domain_is_400_and_invalid_domain_is_422(pool: PgPool) {
 /// The page walks by `user_domain_blocks` row id: the `Link` header's
 /// cursors, the `max_id` continuation, the `min_id` page (answered
 /// newest-first again), and the ends of the walk, which carry no header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_pages_key_on_block_row_ids_and_link(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_pages_key_on_block_row_ids_and_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
@@ -476,8 +488,10 @@ async fn the_listing_pages_key_on_block_row_ids_and_link(pool: PgPool) {
 
 /// All three routes demand a user token: no token is the 401, an invalid
 /// one the 401, and an app-only credential the 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_requires_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_requires_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app_only = common::create_app_only_token(&pool, "read write follow").await;
     let app = common::test_app(pool);
 
@@ -512,8 +526,10 @@ async fn the_listing_requires_a_user_token(pool: PgPool) {
 /// the scope itself pass; `follow` — Pleroma's write-side alias, not the
 /// ticket's read side — and unrelated grants answer the
 /// insufficient-permissions 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_requires_the_read_blocks_scope(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_requires_the_read_blocks_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
 
@@ -542,8 +558,10 @@ async fn the_listing_requires_the_read_blocks_scope(pool: PgPool) {
 /// The writes' gate is `write:blocks | follow`: broad `write`, the scope
 /// itself and the `follow` root all block and unblock; anything else is
 /// the alternatives-joined 403, on both `POST` and `DELETE`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_writes_take_write_blocks_or_follow(pool: PgPool) {
+#[tokio::test]
+async fn the_writes_take_write_blocks_or_follow() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
 
@@ -590,8 +608,10 @@ async fn the_writes_take_write_blocks_or_follow(pool: PgPool) {
 /// spelling the block was written in), false for a remote account on
 /// another domain, and false for local accounts — even when the local
 /// instance's own domain is on the block list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_carry_the_domain_blocking_flag(pool: PgPool) {
+#[tokio::test]
+async fn relationships_carry_the_domain_blocking_flag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let spammer = common::create_remote_user(&pool, "bob", "spam.example").await;

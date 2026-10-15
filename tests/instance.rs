@@ -243,8 +243,10 @@ fn keys_of(value: &Value) -> Vec<&str> {
 /// type and default at once — without any authentication: a garbage
 /// bearer token is not even looked at, and a wrong method is the plain
 /// 405 axum gives for a known path.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_document_is_public_and_complete(pool: PgPool) {
+#[tokio::test]
+async fn the_document_is_public_and_complete() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let document = get_instance(&app).await;
     assert_eq!(
@@ -286,8 +288,10 @@ async fn the_document_is_public_and_complete(pool: PgPool) {
 /// instance owns, and the distinct hosts of the mirrored remote actors:
 /// deactivated locals, reblogs, tombstones, remote posts and duplicate
 /// domains each drop out exactly as the ticket defines them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn stats_count_local_users_local_posts_and_remote_domains(pool: PgPool) {
+#[tokio::test]
+async fn stats_count_local_users_local_posts_and_remote_domains() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let carol = common::create_local_user(&pool, "carol").await;
     let _erin = common::create_local_user_with(&pool, "erin", |user| NewUser {
@@ -337,8 +341,10 @@ async fn stats_count_local_users_local_posts_and_remote_domains(pool: PgPool) {
 /// The rules arrive in display order: lowest priority first, and within
 /// one priority oldest first on the id (decision 4), each rendered with
 /// its string id, its text and its hint.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn rules_are_ordered_by_priority_then_id(pool: PgPool) {
+#[tokio::test]
+async fn rules_are_ordered_by_priority_then_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let first = instance_rule::create(&pool, "Be nice", "", 0)
         .await
         .expect("the first rule inserts");
@@ -370,8 +376,10 @@ async fn rules_are_ordered_by_priority_then_id(pool: PgPool) {
 /// active local admin as a full `Account` entity: moderators, remote
 /// admins and deactivated admins never take the slot, and retiring the
 /// first admin hands it to the second.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn contact_account_is_the_first_active_local_admin(pool: PgPool) {
+#[tokio::test]
+async fn contact_account_is_the_first_active_local_admin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _mod = common::create_local_user_with(&pool, "mod", |user| NewUser {
         is_moderator: true.into(),
         ..user
@@ -448,8 +456,10 @@ fn other_config() -> Config {
 
 /// The identity, description, email, languages, scheme and registration
 /// state all come from the configuration.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn identity_fields_mirror_the_config(pool: PgPool) {
+#[tokio::test]
+async fn identity_fields_mirror_the_config() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app_with_config(pool, other_config());
     let document = get_instance(&app).await;
     assert_eq!(document["uri"], "snatter.example:4000", "the domain");
@@ -490,8 +500,10 @@ async fn identity_fields_mirror_the_config(pool: PgPool) {
 /// The status, attachment, poll and upload limits mirror the configured
 /// numbers everywhere they appear, while the per-purpose upload limits
 /// and metadata constants keep their shipped values.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn limits_mirror_the_config(pool: PgPool) {
+#[tokio::test]
+async fn limits_mirror_the_config() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app_with_config(pool, other_config());
     let document = get_instance(&app).await;
     assert_eq!(document["max_toot_chars"], 300, "MAX_STATUS_CHARS");
@@ -560,8 +572,10 @@ async fn limits_mirror_the_config(pool: PgPool) {
 /// The window arithmetic itself is unit-tested with an injected clock in
 /// `src/util/cache.rs`; what this test owns is that the endpoint routes
 /// its counters through that cache and nothing else.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn stats_are_cached_while_their_window_is_open(pool: PgPool) {
+#[tokio::test]
+async fn stats_are_cached_while_their_window_is_open() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool.clone());
 
@@ -599,8 +613,10 @@ async fn stats_are_cached_while_their_window_is_open(pool: PgPool) {
 
 /// The endpoint is merged under `/api/v1`, and the trailing-slash
 /// spelling is no second mount: it takes the app-wide API fallback.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_route_lives_at_api_v1_instance(pool: PgPool) {
+#[tokio::test]
+async fn the_route_lives_at_api_v1_instance() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/instance/")
         .send(&app)
@@ -680,8 +696,10 @@ fn expected_v2_document() -> Value {
 /// `GET /api/v2/instance` answers the ticket's reshaped document — the
 /// v1 `media_attachments`, `polls` and `pleroma` blocks reused whole —
 /// without consulting credentials; a wrong method is the plain 405.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_v2_document_is_public_and_complete(pool: PgPool) {
+#[tokio::test]
+async fn the_v2_document_is_public_and_complete() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v2/instance")
         .bearer("not-a-real-token")
@@ -715,8 +733,10 @@ async fn the_v2_document_is_public_and_complete(pool: PgPool) {
 /// thumbnail, limits, registration state, contact email) and the
 /// fixtures (rules in display order, the first local admin as the full
 /// `Account` entity nested in `contact`).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_v2_document_follows_the_config_and_fixtures(pool: PgPool) {
+#[tokio::test]
+async fn the_v2_document_follows_the_config_and_fixtures() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let rule = instance_rule::create(&pool, "Be nice", "say hi", 0)
         .await
         .expect("the rule inserts");
@@ -787,8 +807,10 @@ async fn mirror_remote(pool: &PgPool, host: &str) {
 /// alphabetically, local users (whose `domain` is null) never among
 /// them; a garbage bearer is not consulted, and an instance mirroring
 /// nobody answers the empty array.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn peers_lists_distinct_remote_domains(pool: PgPool) {
+#[tokio::test]
+async fn peers_lists_distinct_remote_domains() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let empty = common::TestRequest::get("/api/v1/instance/peers")
         .send(&app)
@@ -828,8 +850,10 @@ async fn peers_lists_distinct_remote_domains(pool: PgPool) {
 
 /// The listing is capped at the thousand hosts the endpoint documents,
 /// keeping the alphabetically first thousand of a larger table.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn peers_are_capped_at_one_thousand(pool: PgPool) {
+#[tokio::test]
+async fn peers_are_capped_at_one_thousand() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     // 1001 distinct hosts in one set-based write; the ids are test
     // fixtures, so the database-generated ones are fine here.
     let inserted = sqlx::query(
@@ -868,8 +892,10 @@ async fn peers_are_capped_at_one_thousand(pool: PgPool) {
 /// `GET /api/v1/instance/rules` answers the same entries, in the same
 /// priority-then-id order, as the v1 document's `rules` block — and the
 /// empty array while no rule is written. No authentication.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_rules_endpoint_serves_the_instance_rules(pool: PgPool) {
+#[tokio::test]
+async fn the_rules_endpoint_serves_the_instance_rules() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let empty = common::TestRequest::get("/api/v1/instance/rules")
         .send(&app)
@@ -919,8 +945,10 @@ async fn insert_policy(pool: &PgPool, domain: &str, action: &str, reason: &str) 
 /// their action maps to (reject is `suspend`, `silence` and
 /// `media_removal` both fold into `silence`) — and the empty array
 /// while no policy is recorded. No authentication.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_domain_blocks_endpoint_maps_policy_to_severities(pool: PgPool) {
+#[tokio::test]
+async fn the_domain_blocks_endpoint_maps_policy_to_severities() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let empty = common::TestRequest::get("/api/v1/instance/domain_blocks")
         .send(&app)
@@ -967,8 +995,10 @@ async fn the_domain_blocks_endpoint_maps_policy_to_severities(pool: PgPool) {
 /// `GET /api/v1/instance/translation_languages` answers the empty
 /// object: no translation provider is configured until the translation
 /// ticket lands. No authentication.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn translation_languages_is_the_empty_object(pool: PgPool) {
+#[tokio::test]
+async fn translation_languages_is_the_empty_object() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/instance/translation_languages")
         .bearer("not-a-real-token")
@@ -984,8 +1014,10 @@ async fn translation_languages_is_the_empty_object(pool: PgPool) {
 
 /// `GET /api/v1/instance/activity` answers the empty array: wired-be
 /// keeps no weekly activity counters. No authentication.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn activity_is_the_empty_array(pool: PgPool) {
+#[tokio::test]
+async fn activity_is_the_empty_array() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/instance/activity")
         .bearer("not-a-real-token")
@@ -1002,8 +1034,10 @@ async fn activity_is_the_empty_array(pool: PgPool) {
 /// `GET /api/v1/instance/extended_description` wraps the configured
 /// description in a paragraph and stamps it with the current time in
 /// Mastodon's format. No authentication.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_extended_description_wraps_the_instance_description(pool: PgPool) {
+#[tokio::test]
+async fn the_extended_description_wraps_the_instance_description() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let response = common::TestRequest::get("/api/v1/instance/extended_description")
         .bearer("not-a-real-token")
@@ -1042,8 +1076,10 @@ async fn the_extended_description_wraps_the_instance_description(pool: PgPool) {
 /// The `/instance` sub-resources are mounted under `/api/v1` only —
 /// Pleroma's router offers no v2 spelling — while `/api/v2/instance`
 /// itself answers: the v2 mount does not shadow or extend the v1 list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_sub_resources_are_v1_only(pool: PgPool) {
+#[tokio::test]
+async fn the_sub_resources_are_v1_only() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for path in [
         "/api/v2/instance/peers",

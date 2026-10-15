@@ -737,8 +737,10 @@ mod tests {
     /// One synced row as `(shortcode, image_url, first tag, category)`.
     type RowFacts<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn sync_stores_every_pack_file_as_a_local_emoji(pool: PgPool) {
+    #[tokio::test]
+    async fn sync_stores_every_pack_file_as_a_local_emoji() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dir = temp_dir();
         seed_pack(dir.path(), "cats", &[("cat", "cat.png")]).await;
         save_pack(
@@ -784,8 +786,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn sync_is_idempotent_and_keeps_row_ids(pool: PgPool) {
+    #[tokio::test]
+    async fn sync_is_idempotent_and_keeps_row_ids() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dir = temp_dir();
         seed_pack(dir.path(), "cats", &[("cat", "cat.png")]).await;
         let first = sync_custom_emojis(&pool, BASE, dir.path()).await.unwrap();
@@ -799,8 +803,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn sync_forgets_pack_files_that_are_gone(pool: PgPool) {
+    #[tokio::test]
+    async fn sync_forgets_pack_files_that_are_gone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dir = temp_dir();
         seed_pack(
             dir.path(),
@@ -851,8 +857,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn sync_of_an_empty_or_missing_root_stores_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn sync_of_an_empty_or_missing_root_stores_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dir = temp_dir();
         assert_eq!(
             sync_custom_emojis(&pool, BASE, &dir.path().join("nowhere"))

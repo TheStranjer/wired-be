@@ -95,16 +95,20 @@ mod tests {
     }
 
     /// [`list`] on a fresh table answers the empty list.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_of_an_empty_table_is_empty(pool: PgPool) {
+    #[tokio::test]
+    async fn list_of_an_empty_table_is_empty() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let rows = list(&pool).await.expect("the list query runs");
         assert!(rows.is_empty(), "a fresh table holds no policy");
     }
 
     /// [`list`] returns every row with its columns intact, alphabetically
     /// by domain.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_returns_every_row_by_domain(pool: PgPool) {
+    #[tokio::test]
+    async fn list_returns_every_row_by_domain() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         insert(&pool, "spam.example", "reject", "bots").await;
         insert(&pool, "angry.example", "silence", "").await;
         insert(&pool, "lewd.example", "media_removal", "nsfw").await;
@@ -135,8 +139,10 @@ mod tests {
     }
 
     /// `is_rejected` answers only for a `reject` row on the exact host.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn only_a_reject_row_makes_a_domain_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn only_a_reject_row_makes_a_domain_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         insert(&pool, "spam.example", "reject", "").await;
         insert(&pool, "quiet.example", "silence", "").await;
         insert(&pool, "naked.example", "media_removal", "").await;
@@ -161,8 +167,10 @@ mod tests {
 
     /// The primary key keeps one policy per domain, and the `action`
     /// `CHECK` refuses anything outside the three documented values.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_columns_guard_against_duplicate_and_unknown_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn the_columns_guard_against_duplicate_and_unknown_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         insert(&pool, "spam.example", "reject", "").await;
         let clash =
             sqlx::query("INSERT INTO instance_policy_domains (domain, action) VALUES ($1, $2)")

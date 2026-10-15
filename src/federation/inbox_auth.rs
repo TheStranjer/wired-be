@@ -1135,8 +1135,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// An unknown actor, fetched on the fly, authenticates its delivery —
     /// and the mirror answers the next one without a second fetch.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_valid_signature_authenticates_the_signer(pool: PgPool) {
+    #[tokio::test]
+    async fn a_valid_signature_authenticates_the_signer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1184,8 +1186,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// A `Signature` header moved into `Authorization: Signature …`
     /// authenticates exactly the same.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_authorization_signature_header_authenticates(pool: PgPool) {
+    #[tokio::test]
+    async fn an_authorization_signature_header_authenticates() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1216,8 +1220,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// A body that changed after signing fails the digest check before
     /// any key is fetched, and so does a `Digest` header that simply lies.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_tampered_body_or_digest_is_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn a_tampered_body_or_digest_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1261,8 +1267,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// Every request-header failure answers before any fetch: unsigned,
     /// mislabelled and unparsable bodies all get their ticket status.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unsigned_mislabelled_and_unparsable_requests_are_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn unsigned_mislabelled_and_unparsable_requests_are_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1321,8 +1329,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
     }
 
     /// A `keyId` that names no actor — and no key object — is unknown.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unknown_key_is_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unknown_key_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let peer = peer(base.clone(), FIXTURE_PUBLIC_PKCS1_PEM.to_owned());
@@ -1349,8 +1359,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// A `keyId` whose URL is a standalone key object resolves through
     /// its `owner` to the actor document.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_standalone_key_object_follows_its_owner(pool: PgPool) {
+    #[tokio::test]
+    async fn a_standalone_key_object_follows_its_owner() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1388,8 +1400,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
     /// A rotated key: the stored public key rejects the signature, the
     /// one forced refetch replaces it, and the retry succeeds. The next
     /// delivery answers from the refreshed mirror with no new fetch.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_rotated_key_succeeds_after_one_refetch(pool: PgPool) {
+    #[tokio::test]
+    async fn a_rotated_key_succeeds_after_one_refetch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1430,8 +1444,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
     /// A signature no key can answer: the first delivery spends the
     /// actor's one refetch of the window, the second fails without
     /// touching the network again.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_key_refetch_is_rate_limited_to_once_per_window(pool: PgPool) {
+    #[tokio::test]
+    async fn the_key_refetch_is_rate_limited_to_once_per_window() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1470,8 +1486,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// A signature that authenticates alice cannot post as anyone else:
     /// `LD`-signature forwarding is not supported yet.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_activity_by_another_actor_is_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn an_activity_by_another_actor_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1523,8 +1541,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// The `Delete` of an actor that answers `410 Gone` is accepted and
     /// dropped when it deletes itself — and only then.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_gone_actors_self_delete_is_dropped_with_202(pool: PgPool) {
+    #[tokio::test]
+    async fn a_gone_actors_self_delete_is_dropped_with_202() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let gone = format!("{base}/gone");
@@ -1578,8 +1598,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
 
     /// A signer from a domain on the instance-policy reject list is
     /// refused — signature and containment valid, the 403 is the gate.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_rejected_instance_is_refused(pool: PgPool) {
+    #[tokio::test]
+    async fn a_rejected_instance_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");

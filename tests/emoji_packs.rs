@@ -21,7 +21,6 @@ use std::{
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use wired_be::{
     config::TEST_BASE_URL,
     models::custom_emoji::{self, NewCustomEmoji},
@@ -102,8 +101,10 @@ fn pack_names(body: &Value) -> Vec<&str> {
 /// the total count, serializes each as Pleroma's `pack`/`files`/
 /// `files_count` triple, skips entries that are not packs, and answers
 /// without any credentials.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lists_packs_with_their_total_count(pool: PgPool) {
+#[tokio::test]
+async fn lists_packs_with_their_total_count() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     seed_pack(dir.path(), "bb", &pack(true, &[("b", "b.png")])).await;
     seed_pack(
@@ -143,8 +144,10 @@ async fn lists_packs_with_their_total_count(pool: PgPool) {
 /// `/packs` pages by name: full, partial and past-the-end windows of the
 /// ordered pack list, with `count` fixed at the total; a huge `page_size`
 /// is clamped to the 100-item cap instead of failing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn pack_listing_pages_by_name(pool: PgPool) {
+#[tokio::test]
+async fn pack_listing_pages_by_name() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     for name in ["aa", "bb", "cc"] {
         seed_pack(dir.path(), name, &pack(true, &[("x", "x.png")])).await;
@@ -188,8 +191,10 @@ async fn pack_listing_pages_by_name(pool: PgPool) {
 /// `/pack` serves one pack with its files paginated by shortcode
 /// (`files_count` still counts the whole pack), and answers 404 for an
 /// unknown pack, a name that could traverse, and 400 for a missing one.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn shows_one_pack_with_files_paginated(pool: PgPool) {
+#[tokio::test]
+async fn shows_one_pack_with_files_paginated() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     seed_pack(
         dir.path(),
@@ -237,8 +242,10 @@ async fn shows_one_pack_with_files_paginated(pool: PgPool) {
 /// The archive download: shared packs come back as a zip holding
 /// `pack.json` and every file with the download headers; a pack that does
 /// not share is a 403, an unknown pack a 404 and a missing name a 400.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn archives_a_shared_pack_as_a_zip_download(pool: PgPool) {
+#[tokio::test]
+async fn archives_a_shared_pack_as_a_zip_download() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     seed_pack(dir.path(), "cats", &cats_pack()).await;
     seed_pack(dir.path(), "dogs", &pack(false, &[("dog", "dog.png")])).await;
@@ -316,8 +323,10 @@ async fn archives_a_shared_pack_as_a_zip_download(pool: PgPool) {
 /// `custom_emojis` table: every local enabled emoji keyed by shortcode with
 /// its image url and tags; disabled and remote rows stay out, and a row
 /// that no pack owns still shows up.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_util_map_covers_every_local_custom_emoji(pool: PgPool) {
+#[tokio::test]
+async fn the_util_map_covers_every_local_custom_emoji() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     seed_pack(dir.path(), "cats", &cats_pack()).await;
     seed_pack(dir.path(), "dogs", &pack(false, &[("dog", "dog.png")])).await;
@@ -387,8 +396,10 @@ async fn the_util_map_covers_every_local_custom_emoji(pool: PgPool) {
 }
 
 /// With nothing synced the map is the empty object, JSON-typed, no auth.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_util_map_is_empty_without_emojis(pool: PgPool) {
+#[tokio::test]
+async fn the_util_map_is_empty_without_emojis() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/pleroma/emoji")
         .send(&app)
@@ -401,8 +412,10 @@ async fn the_util_map_is_empty_without_emojis(pool: PgPool) {
 /// nothing else: manifests, web files and unknown or unsafe names all get
 /// the same 404 as an absent file, so the route cannot probe the pack
 /// directory.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn static_route_serves_only_pack_images(pool: PgPool) {
+#[tokio::test]
+async fn static_route_serves_only_pack_images() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     seed_pack(dir.path(), "cats", &cats_pack()).await;
     std::fs::write(dir.path().join("cats").join("icon.svg"), b"<svg/>").unwrap();
@@ -467,8 +480,10 @@ async fn static_route_serves_only_pack_images(pool: PgPool) {
 
 /// The endpoints are GET-only; other verbs keep axum's 405 on the routed
 /// paths (there is nothing to auth-fail: all four are public).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn other_methods_are_not_routed(pool: PgPool) {
+#[tokio::test]
+async fn other_methods_are_not_routed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for path in [
         "/api/v1/pleroma/emoji",

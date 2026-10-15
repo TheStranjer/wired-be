@@ -217,8 +217,10 @@ mod tests {
         entries.iter().map(|entry| entry.endorsement_id).collect()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_endorsement_is_written_and_read_back(pool: PgPool) {
+    #[tokio::test]
+    async fn an_endorsement_is_written_and_read_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         endorse(&pool, alice.id, bob.id)
@@ -233,8 +235,10 @@ mod tests {
         assert_eq!(stored_ids(&pool).await.len(), 1, "and it is one row");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn endorsing_twice_is_one_row_and_keeps_its_id(pool: PgPool) {
+    #[tokio::test]
+    async fn endorsing_twice_is_one_row_and_keeps_its_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         endorse(&pool, alice.id, bob.id).await.unwrap();
@@ -255,8 +259,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn withdrawing_removes_the_endorsement_and_repeating_is_fine(pool: PgPool) {
+    #[tokio::test]
+    async fn withdrawing_removes_the_endorsement_and_repeating_is_fine() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         endorse(&pool, alice.id, bob.id).await.unwrap();
@@ -275,8 +281,10 @@ mod tests {
         assert_eq!(stored_ids(&pool).await.len(), 0, "and deletes nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn endorsements_are_each_account_s_own(pool: PgPool) {
+    #[tokio::test]
+    async fn endorsements_are_each_account_s_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -300,8 +308,10 @@ mod tests {
         assert_eq!(stored_ids(&pool).await.len(), 2, "one row per endorser");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn endorsed_ids_keeps_oldest_first(pool: PgPool) {
+    #[tokio::test]
+    async fn endorsed_ids_keeps_oldest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         for nickname in ["bob", "carol", "dave"] {
             let target = user(&pool, nickname).await;
@@ -323,8 +333,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_page_newest_first_walks_by_row_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_page_newest_first_walks_by_row_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -373,8 +385,10 @@ mod tests {
         assert!(tail.is_empty(), "and answers nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_endorser_with_nothing_endorsed_pages_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn an_endorser_with_nothing_endorsed_pages_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         assert!(
             page_for(&pool, alice.id, page(""))
@@ -389,8 +403,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_either_side_takes_the_endorsement(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_either_side_takes_the_endorsement() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -423,8 +439,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_endorsement_for_no_stored_account_fails(pool: PgPool) {
+    #[tokio::test]
+    async fn an_endorsement_for_no_stored_account_fails() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         // The foreign key is the model's only guard: the endpoint hands
         // ids that name live users, and a fabricated one is a database
         // error, never a silently stored orphan.

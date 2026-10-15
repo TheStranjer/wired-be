@@ -275,8 +275,10 @@ async fn relationship_of(app: &Router, token: &str, target: &Uuid) -> Value {
 /// `muting_notifications` both true (Mastodon's default for the
 /// `notifications` parameter), stores the pair as one indefinite row with
 /// `hide_notifications` set, and says nothing about the other end of the pair.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn muting_lights_both_flags_from_the_caller_s_end(pool: PgPool) {
+#[tokio::test]
+async fn muting_lights_both_flags_from_the_caller_s_end() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let (bob, bob_token) = fixture(&pool, "bob", "read").await;
     let app = common::test_app(pool.clone());
@@ -322,8 +324,10 @@ async fn muting_lights_both_flags_from_the_caller_s_end(pool: PgPool) {
 /// `muting_notifications` is false, and the row stores the flag as the caller
 /// set it. The parameter arrives in a JSON body, a form body and the query
 /// string alike (decision 10).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_notifications_parameter_says_which_flags_light(pool: PgPool) {
+#[tokio::test]
+async fn the_notifications_parameter_says_which_flags_light() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:mutes").await;
     let app = common::test_app(pool.clone());
 
@@ -373,8 +377,10 @@ async fn notification_ids(pool: &PgPool, muter: Uuid) -> Vec<Uuid> {
 
 /// `duration` becomes an `expires_at` that many seconds ahead, and `duration=0`
 /// is Mastodon's spelling of an indefinite mute.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_duration_parameter_stores_an_expiry(pool: PgPool) {
+#[tokio::test]
+async fn the_duration_parameter_stores_an_expiry() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "follow").await;
     let timed = common::create_local_user(&pool, "timed").await;
     let forever = common::create_local_user(&pool, "forever").await;
@@ -429,8 +435,10 @@ async fn the_duration_parameter_stores_an_expiry(pool: PgPool) {
 /// A mute whose `expires_at` lies in the past is treated as absent: the flags
 /// fall back to their defaults and the listing drops the entry, while the row
 /// is still on the books for the sweep to take.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_lapsed_mute_is_absent_from_flags_and_listing(pool: PgPool) {
+#[tokio::test]
+async fn a_lapsed_mute_is_absent_from_flags_and_listing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write:mutes").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -470,8 +478,10 @@ async fn a_lapsed_mute_is_absent_from_flags_and_listing(pool: PgPool) {
 /// Re-muting a pair is one row whose options the second write rewrote: the same
 /// id (so the listing's cursor does not move), the new `notifications` flag and
 /// a duration counted from the latest write.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn remuting_replaces_the_options_of_the_same_row(pool: PgPool) {
+#[tokio::test]
+async fn remuting_replaces_the_options_of_the_same_row() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let app = common::test_app(pool.clone());
@@ -532,8 +542,10 @@ async fn remuting_replaces_the_options_of_the_same_row(pool: PgPool) {
 
 /// Unmuting answers the relationship back at its defaults, is idempotent, and
 /// takes the row with it; the pair's follows are nobody's business here.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unmuting_lifts_the_mute_without_asking_for_one(pool: PgPool) {
+#[tokio::test]
+async fn unmuting_lifts_the_mute_without_asking_for_one() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_, token) = fixture(&pool, "alice", "read follow").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let app = common::test_app(pool.clone());
@@ -563,14 +575,20 @@ async fn unmuting_lifts_the_mute_without_asking_for_one(pool: PgPool) {
     );
     assert_eq!(mute_count(&pool).await, 0, "writes nothing");
 
-    let listed = get(&app, Some(&token), MUTES).await;
-    assert_eq!(listed.json_value(), json!([]), "and the listing is empty");
+    let after_unmute = get(&app, Some(&token), MUTES).await;
+    assert_eq!(
+        after_unmute.json_value(),
+        json!([]),
+        "and the listing is empty"
+    );
 }
 
 /// Muting yourself is the 422 the ticket pins, `unmute` is not a path to it,
 /// and an unknown or malformed id is the shared 404 on both writes.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_self_mute_is_422_and_any_other_miss_is_404(pool: PgPool) {
+#[tokio::test]
+async fn a_self_mute_is_422_and_any_other_miss_is_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:mutes").await;
     let app = common::test_app(pool.clone());
 
@@ -609,8 +627,10 @@ async fn a_self_mute_is_422_and_any_other_miss_is_404(pool: PgPool) {
 
 /// A parameter that is not the value the endpoint asks for is the extractor's
 /// 422 (decision 10), on either of the two optional keys.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_malformed_parameter_is_422(pool: PgPool) {
+#[tokio::test]
+async fn a_malformed_parameter_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let token = common::create_app_and_token(&pool, &alice, "write:mutes").await;
@@ -636,14 +656,36 @@ async fn a_malformed_parameter_is_422(pool: PgPool) {
     }
 }
 
-/// `GET /api/v1/mutes` answers the caller's muted accounts as `Account`
+/// One entry of the mute listing: the `Account` entity under the muted
+/// account's id, with `mute_expires_at` beside it — the row's own expiry, or
+/// `null` for an indefinite mute.
+fn assert_muted_entry(entry: &Value, account_id: &str, expires: Option<String>) {
+    assert_eq!(
+        entry["id"],
+        json!(account_id),
+        "an entry is a rendered `Account`, keyed on the muted account's id"
+    );
+    assert!(
+        entry["username"].is_string(),
+        "with the account's own fields beside it"
+    );
+    assert_eq!(
+        entry["mute_expires_at"],
+        expires.map_or(Value::Null, |text| json!(text)),
+        "the expiry the row carries, or null for an indefinite mute"
+    );
+}
+
+/// The listing answers every mute of the caller with the muted account's
 /// entities, newest mute first, each embedding the caller's relationship and
 /// carrying `mute_expires_at` — the mute's expiry as a Mastodon time, `null`
 /// for an indefinite one — under a `Link` header keyed on the mute row ids; an
 /// account with nothing muted gets the empty array and no header, and another
 /// account's mutes are nobody else's list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_answers_accounts_with_their_expiry(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_answers_accounts_with_their_expiry() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -682,50 +724,19 @@ async fn the_listing_answers_accounts_with_their_expiry(pool: PgPool) {
         "the Link cursors are the mute row ids, not the accounts"
     );
 
-    let timed = &listed.json_value()[0];
+    let body = listed.json_value();
+    assert_muted_entry(&body[0], &stored[0].1, stored[0].2.clone());
     assert_eq!(
-        timed["id"],
-        json!(stored[0].1),
-        "an entry is a rendered `Account`, keyed on the muted account's id"
-    );
-    assert!(
-        timed["username"].is_string(),
-        "with the account's own fields beside it"
-    );
-    assert_eq!(
-        timed["mute_expires_at"],
-        json!(
-            stored[0]
-                .2
-                .clone()
-                .expect("the timed fixture has an expiry")
-        ),
-        "and the extra key carries the mute's expiry"
-    );
-    assert_eq!(
-        timed["pleroma"]["relationship"]["muting"],
+        body[0]["pleroma"]["relationship"]["muting"],
         json!(true),
         "each entry embeds the caller's relationship"
     );
     assert_eq!(
-        timed["pleroma"]["relationship"]["muting_notifications"],
+        body[0]["pleroma"]["relationship"]["muting_notifications"],
         json!(false),
         "including the option the write set"
     );
-
-    let indefinite = &listed.json_value()[1];
-    assert!(
-        indefinite
-            .as_object()
-            .expect("an object")
-            .contains_key("mute_expires_at"),
-        "the key is on every entry of this listing"
-    );
-    assert_eq!(
-        indefinite["mute_expires_at"],
-        Value::Null,
-        "and an indefinite mute sends it as null"
-    );
+    assert_muted_entry(&body[1], &stored[1].1, None);
 
     let (_, erin_token) = fixture(&pool, "erin", "read").await;
     let theirs = get(&app, Some(&erin_token), MUTES).await;
@@ -739,8 +750,10 @@ async fn the_listing_answers_accounts_with_their_expiry(pool: PgPool) {
 /// The listing's page walk: `limit` at a time, `max_id` continuing where a page
 /// ended, `min_id` answered newest-first again, the ends of the walk carrying no
 /// header, and a malformed cursor the extractor's 400.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_pages_by_mute_row_id(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_pages_by_mute_row_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write:mutes").await;
     let app = common::test_app(pool.clone());
     for nickname in ["bob", "carol", "dave", "erin"] {
@@ -825,8 +838,10 @@ async fn the_listing_pages_by_mute_row_id(pool: PgPool) {
 /// The listing's cap is Mastodon's 80, not the global 40: a page of 41 mutes
 /// comes back whole, while Pleroma's 20 stays the default when no `limit` is
 /// asked for.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_pages_up_to_eighty_rows(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_pages_up_to_eighty_rows() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     for n in 0..41 {
         let muted = common::create_local_user(&pool, &format!("muted{n}")).await;
@@ -859,8 +874,10 @@ async fn the_listing_pages_up_to_eighty_rows(pool: PgPool) {
 
 /// All three routes demand a user token: no token is the 401, an invalid one
 /// the 401, and an app-only credential the 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_routes_require_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn the_routes_require_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let app_only = common::create_app_only_token(&pool, "read write follow").await;
     let app = common::test_app(pool);
@@ -899,8 +916,10 @@ async fn the_routes_require_a_user_token(pool: PgPool) {
 /// The listing's scope gate is exactly `read:mutes`: broad `read` and the scope
 /// itself list; `follow` (the writes' alternative, not this read side), `write`
 /// and an unrelated sub-scope answer the insufficient-permissions 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_requires_the_read_mutes_scope(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_requires_the_read_mutes_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
 
@@ -929,8 +948,10 @@ async fn the_listing_requires_the_read_mutes_scope(pool: PgPool) {
 /// Both writes' gate is `write:mutes | follow`: broad `write`, the scope itself
 /// and the `follow` root all mute and unmute; anything else is the
 /// alternatives-joined 403, on both actions.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_writes_take_write_mutes_or_follow(pool: PgPool) {
+#[tokio::test]
+async fn the_writes_take_write_mutes_or_follow() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
@@ -991,8 +1012,10 @@ async fn the_writes_take_write_mutes_or_follow(pool: PgPool) {
 /// The `mutes.expire` job's pass deletes the lapsed rows the reads already
 /// ignore and leaves every live mute alone, so the table cannot grow and the
 /// listing does not change.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_expire_job_removes_the_lapsed_rows(pool: PgPool) {
+#[tokio::test]
+async fn the_expire_job_removes_the_lapsed_rows() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:mutes write:mutes").await;
     let lapsed = common::create_local_user(&pool, "lapsed").await;
     let running = common::create_local_user(&pool, "running").await;

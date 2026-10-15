@@ -580,8 +580,10 @@ mod tests {
         entries.iter().map(|(row, _)| row.id).collect()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_block_is_written_and_read_back(pool: PgPool) {
+    #[tokio::test]
+    async fn a_block_is_written_and_read_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let row = block(&pool, TEST_BASE_URL, &alice, &bob)
@@ -657,8 +659,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_remote_blocker_mints_no_activity_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_remote_blocker_mints_no_activity_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let carol = remote_user(&pool, "carol").await;
         let alice = local_user(&pool, "alice").await;
 
@@ -679,8 +683,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocking_twice_is_one_row_that_keeps_its_id(pool: PgPool) {
+    #[tokio::test]
+    async fn blocking_twice_is_one_row_that_keeps_its_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let first = block(&pool, TEST_BASE_URL, &alice, &bob)
@@ -706,8 +712,10 @@ mod tests {
     /// The severing [`block`] owes the pair: both directions' accepted follows
     /// are gone and their counters stepped down, while another account's
     /// follow of the blocker and the blocker's own unrelated follow stand.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_block_severs_both_follows_and_fixes_the_counts(pool: PgPool) {
+    #[tokio::test]
+    async fn a_block_severs_both_follows_and_fixes_the_counts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -757,8 +765,10 @@ mod tests {
 
     /// Both directions' *pending* requests go with the block too, and a
     /// request never counted, so no counter moves for it.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_block_withdraws_pending_requests_both_ways(pool: PgPool) {
+    #[tokio::test]
+    async fn a_block_withdraws_pending_requests_both_ways() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = locked_user(&pool, "alice").await;
         let carol = locked_user(&pool, "carol").await;
         let from_alice = follow::follow(&pool, TEST_BASE_URL, &alice, &carol)
@@ -801,8 +811,10 @@ mod tests {
 
     /// A mirrored `rejected` row is nobody's active relationship: the block
     /// leaves it in place, exactly as [`follow::unfollow`] does.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_block_leaves_a_rejected_row_alone(pool: PgPool) {
+    #[tokio::test]
+    async fn a_block_leaves_a_rejected_row_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dave = local_user(&pool, "dave").await;
         let carol = local_user(&pool, "carol").await;
         let rejected = sqlx::query_as::<_, follow::Follow>(
@@ -826,8 +838,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unblocking_reports_the_row_it_removed(pool: PgPool) {
+    #[tokio::test]
+    async fn unblocking_reports_the_row_it_removed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -874,8 +888,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocking_yourself_is_refused(pool: PgPool) {
+    #[tokio::test]
+    async fn blocking_yourself_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
 
         let err = block(&pool, TEST_BASE_URL, &alice, &alice)
@@ -893,8 +909,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocking_an_unknown_account_fails(pool: PgPool) {
+    #[tokio::test]
+    async fn blocking_an_unknown_account_fails() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         // The endpoint hands the model rows it just resolved; this is the row
@@ -920,8 +938,10 @@ mod tests {
 
     /// The pair key and the unique activity id: the facts the model builds
     /// on, checked against the table that stores them.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_table_constraints_are_the_ones_the_model_relies_on(pool: PgPool) {
+    #[tokio::test]
+    async fn the_table_constraints_are_the_ones_the_model_relies_on() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let row = block(&pool, TEST_BASE_URL, &alice, &bob)
@@ -961,8 +981,10 @@ mod tests {
 
     /// Deleting either account takes the block through the foreign key's
     /// cascade, from both ends of the pair.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_either_side_takes_the_block(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_either_side_takes_the_block() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -994,8 +1016,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocks_are_each_account_s_own(pool: PgPool) {
+    #[tokio::test]
+    async fn blocks_are_each_account_s_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -1029,8 +1053,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_page_of_blocks_newest_first_walks_by_row_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_page_of_blocks_newest_first_walks_by_row_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let erin = local_user(&pool, "erin").await;
         for nickname in ["bob", "carol", "dave"] {

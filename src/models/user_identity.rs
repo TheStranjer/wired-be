@@ -147,8 +147,10 @@ mod tests {
     }
 
     /// A fresh table answers `None`: nothing is linked to anything.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn find_user_of_an_unknown_pair_is_none(pool: PgPool) {
+    #[tokio::test]
+    async fn find_user_of_an_unknown_pair_is_none() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             find_user(&pool, PROVIDER, UID)
                 .await
@@ -160,8 +162,10 @@ mod tests {
 
     /// [`link`] then [`find_user`] round-trips: the stored row carries the
     /// pair it was made from, the lookup answers that user's row.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn link_and_find_user_round_trip(pool: PgPool) {
+    #[tokio::test]
+    async fn link_and_find_user_round_trip() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let identity = link(&pool, alice.id, PROVIDER, UID)
             .await
@@ -196,8 +200,10 @@ mod tests {
 
     /// One pair is one row: the `UNIQUE (provider, uid)` constraint refuses a
     /// second link, so a provider account cannot move between users here.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_linked_pair_cannot_be_linked_again(pool: PgPool) {
+    #[tokio::test]
+    async fn a_linked_pair_cannot_be_linked_again() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let bob = create_user(&pool, "bob").await;
         let first = link(&pool, alice.id, PROVIDER, UID)
@@ -220,8 +226,10 @@ mod tests {
 
     /// Deleting the user takes the link with it (the cascade), which is how
     /// a closed account stops being reachable by a provider login.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_user_unlinks_their_identities(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_user_unlinks_their_identities() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let made = link(&pool, alice.id, PROVIDER, UID)
             .await
@@ -252,8 +260,10 @@ mod tests {
     /// local accounts only, which is the pair of facts the callback's
     /// "matches a local active user" gate asks for (activity is
     /// `check_account_ready`'s half).
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_link_to_a_remote_actor_is_not_a_login(pool: PgPool) {
+    #[tokio::test]
+    async fn a_link_to_a_remote_actor_is_not_a_login() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let remote = create_remote_user(&pool, "octocat").await;
         let made = link(&pool, remote.id, PROVIDER, UID)
             .await

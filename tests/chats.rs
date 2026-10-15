@@ -293,8 +293,10 @@ async fn read_chat(app: &Router, token: &str, chat: &str, last_read_id: Uuid) ->
 /// count, its newest message and the other participant's account, and stays
 /// idempotent on a repeat; a newest-marker read empties the chat; a message
 /// that arrives afterwards keeps its flag against the old marker.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn chat_read_marks_up_to_the_marker_and_counts_what_remains(pool: PgPool) {
+#[tokio::test]
+async fn chat_read_marks_up_to_the_marker_and_counts_what_remains() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -370,8 +372,10 @@ async fn chat_read_marks_up_to_the_marker_and_counts_what_remains(pool: PgPool) 
 
 /// A form body carries the marker just as well: Mastodon clients post
 /// urlencoded, and Pleroma reads the parameter from the body either way.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_form_body_marks_the_chat_read(pool: PgPool) {
+#[tokio::test]
+async fn a_form_body_marks_the_chat_read() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -390,8 +394,10 @@ async fn a_form_body_marks_the_chat_read(pool: PgPool) {
 /// An empty chat answers the read with `last_message: null`, and a marker
 /// naming no reference of it is still a legal up-to point: the comparison,
 /// not a lookup, decides.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_empty_chat_reads_to_null_messages(pool: PgPool) {
+#[tokio::test]
+async fn an_empty_chat_reads_to_null_messages() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (bob, token) = fixture(&pool, "bob", SCOPE).await;
     let carol = common::create_local_user(&pool, "carol").await;
     let opened = chat::get_or_create(&pool, &bob, &carol)
@@ -409,8 +415,10 @@ async fn an_empty_chat_reads_to_null_messages(pool: PgPool) {
 /// Without `last_read_id` the whole-chat read is Pleroma's fallback 400 —
 /// and it is that 400 even when the chat is unknown: the body clause is
 /// matched before any lookup. An empty body counts as no parameter.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_read_without_the_marker_is_a_400(pool: PgPool) {
+#[tokio::test]
+async fn a_read_without_the_marker_is_a_400() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -447,8 +455,10 @@ async fn a_read_without_the_marker_is_a_400(pool: PgPool) {
 /// A `last_read_id` that is present but not id text is refused once the chat
 /// itself checks out: Pleroma's uuid cast has no answer for it either, so
 /// this endpoint names the parameter in a 400.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_malformed_marker_is_a_400(pool: PgPool) {
+#[tokio::test]
+async fn a_malformed_marker_is_a_400() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -482,8 +492,10 @@ async fn a_malformed_marker_is_a_400(pool: PgPool) {
 /// `POST …/chats/{id}/messages/{message_id}/read` marks exactly one
 /// reference — the up-to sweep leaves the others alone — and answers it as
 /// the full `ChatMessage` entity, idempotently.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn marking_one_message_read_returns_it(pool: PgPool) {
+#[tokio::test]
+async fn marking_one_message_read_returns_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -545,23 +557,15 @@ async fn marking_one_message_read_returns_it(pool: PgPool) {
     assert_eq!(again.json_value()["unread"], false, "and changes nothing");
     assert_eq!(stored_unread(&pool, own).await, 2);
 
-    let unknown = post_empty(
-        &app,
-        &started.token,
-        &message_read_path(&chat, &new_id().to_string()),
-    )
-    .await;
+    let missing = message_read_path(&chat, &new_id().to_string());
+    let unknown = post_empty(&app, &started.token, &missing).await;
     assert_eq!(
         unknown.status,
         StatusCode::NOT_FOUND,
         "an unknown reference is 404"
     );
-    let malformed = post_empty(
-        &app,
-        &started.token,
-        &message_read_path(&chat, "not-a-uuid"),
-    )
-    .await;
+    let junk = message_read_path(&chat, "not-a-uuid");
+    let malformed = post_empty(&app, &started.token, &junk).await;
     assert_eq!(
         malformed.status,
         StatusCode::NOT_FOUND,
@@ -571,8 +575,10 @@ async fn marking_one_message_read_returns_it(pool: PgPool) {
 
 /// A message's attachment rides along in the entity the read answers with,
 /// on both routes that render one.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_marked_message_carries_its_attachment(pool: PgPool) {
+#[tokio::test]
+async fn a_marked_message_carries_its_attachment() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, _) = fixture(&pool, "alice", "read").await;
     let (bob, token) = fixture(&pool, "bob", SCOPE).await;
     let media_id = insert_attachment(&pool, &alice).await;
@@ -625,8 +631,10 @@ async fn a_marked_message_carries_its_attachment(pool: PgPool) {
 
 /// One reference is only markable through the chat that holds it: bob naming
 /// carol's reference inside his own chat is a 404, and nobody's flags move.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_message_of_another_chat_is_not_there(pool: PgPool) {
+#[tokio::test]
+async fn a_message_of_another_chat_is_not_there() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let carol = common::create_local_user(&pool, "carol").await;
     let (_, _, carol_ref) = send(&pool, &started.alice, &carol, "not yours").await;
@@ -666,8 +674,10 @@ async fn a_message_of_another_chat_is_not_there(pool: PgPool) {
 /// Foreign, unknown and malformed chat ids are one 404 on every route, and
 /// nothing behind them moves: the other participant's side of the same
 /// conversation is a different id that their token cannot use.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn chats_are_only_their_owners_to_read_and_pin(pool: PgPool) {
+#[tokio::test]
+async fn chats_are_only_their_owners_to_read_and_pin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     // alice's own side of the same conversation.
     let page = chat::page_for_user(&pool, started.alice.id, all_page(), ChatFilter::default())
@@ -728,8 +738,10 @@ async fn chats_are_only_their_owners_to_read_and_pin(pool: PgPool) {
 /// chat entity with it, and move what the list's `pinned` filter sees; the
 /// other side of the conversation keeps its own flag, and an already-pinned
 /// chat stays pinned under a second pin.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn pin_and_unpin_toggle_the_flag_and_the_list_filter(pool: PgPool) {
+#[tokio::test]
+async fn pin_and_unpin_toggle_the_flag_and_the_list_filter() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -803,11 +815,54 @@ async fn pin_and_unpin_toggle_the_flag_and_the_list_filter(pool: PgPool) {
 }
 
 /// All four routes demand a user token granting `write:chats`: no token is
-/// the 401 "Invalid credentials", a bad one the 401 "The access token is
+/// `POST`s `path` with `body` (when it has one) as `token`, or with no
+/// credential at all when `token` is `None`.
+async fn post_as(
+    app: &Router,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&Value>,
+) -> common::TestResponse {
+    let mut request = common::TestRequest::post(path);
+    if let Some(secret) = token {
+        request = request.bearer(secret);
+    }
+    if let Some(value) = body {
+        request = request.json(value);
+    }
+    request.send(app).await
+}
+
+/// The refusal a route answers for `who`: `status`, and `message` as the
+/// body's `error`.
+fn assert_refused(
+    response: &common::TestResponse,
+    who: &str,
+    path: &str,
+    status: StatusCode,
+    message: &str,
+) {
+    assert_eq!(
+        response.status,
+        status,
+        "{who} is refused on {path}: {}",
+        response.text()
+    );
+    assert_eq!(
+        error_message(response).as_deref(),
+        Some(message),
+        "the refusal wording for {who} on {path}"
+    );
+}
+
+/// Every `write:chats` route refuses what it must: no token at all the
+/// 401 "Invalid credentials", a bad one the 401 "The access token is
 /// invalid", an app-only token and a `read:chats` user token the 403 — and a
 /// plain `write` token covers the sub-scope through the Mastodon hierarchy.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_route_demands_write_chats(pool: PgPool) {
+#[tokio::test]
+async fn every_route_demands_write_chats() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let app = common::test_app(pool.clone());
     let chat = started.chat_id();
@@ -821,69 +876,33 @@ async fn every_route_demands_write_chats(pool: PgPool) {
     let app_only = common::create_app_only_token(&pool, SCOPE).await;
 
     for (path, body) in routes {
-        let anonymous = match body.clone() {
-            Some(value) => post_json(&app, "not-a-real-token", &path, value).await,
-            None => post_empty(&app, "not-a-real-token", &path).await,
-        };
-        assert_eq!(
-            anonymous.status,
+        assert_refused(
+            &post_as(&app, &path, Some("not-a-real-token"), body.as_ref()).await,
+            "a bogus token",
+            &path,
             StatusCode::UNAUTHORIZED,
-            "an invalid token is a 401 on {path}"
+            "The access token is invalid",
         );
-        assert_eq!(
-            error_message(&anonymous).as_deref(),
-            Some("The access token is invalid"),
-            "the token refusal wording on {path}"
-        );
-
-        let no_token = match body.clone() {
-            Some(value) => {
-                common::TestRequest::post(&path)
-                    .json(&value)
-                    .send(&app)
-                    .await
-            }
-            None => common::TestRequest::post(&path).send(&app).await,
-        };
-        assert_eq!(
-            no_token.status,
+        assert_refused(
+            &post_as(&app, &path, None, body.as_ref()).await,
+            "no token at all",
+            &path,
             StatusCode::UNAUTHORIZED,
-            "no token at all is a 401 on {path}"
+            "Invalid credentials",
         );
-        assert_eq!(
-            error_message(&no_token).as_deref(),
-            Some("Invalid credentials"),
-            "the missing-token wording on {path}"
-        );
-
-        let wrong_kind = match body.clone() {
-            Some(value) => post_json(&app, &app_only, &path, value).await,
-            None => post_empty(&app, &app_only, &path).await,
-        };
-        assert_eq!(
-            wrong_kind.status,
+        assert_refused(
+            &post_as(&app, &path, Some(&app_only), body.as_ref()).await,
+            "an app-only token",
+            &path,
             StatusCode::FORBIDDEN,
-            "an app-only token is a 403 on {path}"
+            "This API requires an authenticated user",
         );
-        assert_eq!(
-            error_message(&wrong_kind).as_deref(),
-            Some("This API requires an authenticated user"),
-            "the user refusal wording on {path}"
-        );
-
-        let wrong_scope = match body.clone() {
-            Some(value) => post_json(&app, &narrow, &path, value).await,
-            None => post_empty(&app, &narrow, &path).await,
-        };
-        assert_eq!(
-            wrong_scope.status,
+        assert_refused(
+            &post_as(&app, &path, Some(&narrow), body.as_ref()).await,
+            "`read:chats`",
+            &path,
             StatusCode::FORBIDDEN,
-            "`read:chats` is not enough on {path}"
-        );
-        assert_eq!(
-            error_message(&wrong_scope).as_deref(),
-            Some("Insufficient permissions: write:chats."),
-            "the scope refusal wording on {path}"
+            "Insufficient permissions: write:chats.",
         );
     }
 
@@ -976,6 +995,135 @@ fn entity_ids(list: &Value) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// The status `response` answers, with its body for the message.
+fn assert_answer(response: &common::TestResponse, status: StatusCode, who: &str) {
+    assert_eq!(response.status, status, "{who}: {}", response.text());
+}
+
+/// The `error` body `response` carries.
+fn assert_says(response: &common::TestResponse, message: &str, who: &str) {
+    assert_eq!(
+        error_message(response).as_deref(),
+        Some(message),
+        "the refusal wording for {who}"
+    );
+}
+
+/// The status every response in `refused` answers, for `who`.
+fn assert_all_answer(refused: &[common::TestResponse], status: StatusCode, who: &str) {
+    for response in refused {
+        assert_answer(response, status, who);
+    }
+}
+
+/// The `error` body every response in `refused` carries, for `who`.
+fn assert_all_say(refused: &[common::TestResponse], message: &str, who: &str) {
+    for response in refused {
+        assert_says(response, message, who);
+    }
+}
+
+/// The 404 a delete of `reference` in chat `chat` answers — `who` is what the
+/// assertion names, and the wording is the shared "Record not found".
+async fn assert_delete_404(app: &Router, token: &str, chat: &str, reference: &str, who: &str) {
+    let refused = delete_as(app, token, &message_delete_path(chat, reference)).await;
+    assert_eq!(
+        refused.status,
+        StatusCode::NOT_FOUND,
+        "{who}: {}",
+        refused.text()
+    );
+    assert_eq!(
+        error_message(&refused).as_deref(),
+        Some("Record not found"),
+        "the plain 404 wording for {who}"
+    );
+}
+
+/// Three messages posted into chat `chat` as `token`, oldest first, and
+/// their reference ids in that order.
+async fn post_three(app: &Router, token: &str, chat: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let posted = post_text(app, token, chat, &format!("message {index}"), None).await;
+        assert_eq!(
+            posted.status,
+            StatusCode::OK,
+            "the fixture posts: {}",
+            posted.text()
+        );
+        ids.push(
+            posted.json_value()["id"]
+                .as_str()
+                .expect("a reference id")
+                .to_owned(),
+        );
+    }
+    ids
+}
+
+/// Alice's three chats: one hour old, two hours old and brand new, in that
+/// order, as `opened` is indexed by the assertions below.
+async fn three_chats(pool: &PgPool, alice: &User) -> Vec<chat::Chat> {
+    let mut opened = Vec::new();
+    for (nickname, hours) in [("bob", 1_i64), ("carol", 2), ("dave", 0)] {
+        let partner = common::create_local_user(pool, nickname).await;
+        let chat = open_chat(pool, alice, &partner).await;
+        if hours > 0 {
+            backdate_chat(pool, chat.id, hours).await;
+        }
+        opened.push(chat);
+    }
+    opened
+}
+
+/// The chat ids a `limit=1` `max_id` walk over `ROOT` visits, in the order it
+/// visits them: strictly descending, and ending where the list runs out.
+async fn walk_chats(app: &Router, token: &str) -> Vec<Uuid> {
+    let mut walked = Vec::new();
+    let mut cursor: Option<Uuid> = None;
+    loop {
+        let path = cursor.map_or_else(
+            || format!("{ROOT}?limit=1"),
+            |oldest| format!("{ROOT}?limit=1&max_id={oldest}"),
+        );
+        let page = get_as(app, token, &path).await;
+        assert_eq!(
+            page.status,
+            StatusCode::OK,
+            "the walk keeps answering: {}",
+            page.text()
+        );
+        let Some(first) = listed_ids(&page.json_value()).first().cloned() else {
+            break;
+        };
+        let id = parse(&first);
+        if let Some(older) = cursor {
+            assert!(id < older, "pages walk strictly down the chat ids");
+        }
+        walked.push(id);
+        cursor = Some(id);
+    }
+    walked
+}
+
+/// `GET`s `path` with no credential at all.
+async fn get_anonymous(app: &Router, path: &str) -> common::TestResponse {
+    common::TestRequest::get(path).send(app).await
+}
+
+/// `POST`s a chat message with `content` (and `key`, when the client sent
+/// one) as `token`: the endpoint's usual JSON body, spelled as text.
+async fn post_text(
+    app: &Router,
+    token: &str,
+    chat: &str,
+    content: &str,
+    key: Option<&str>,
+) -> common::TestResponse {
+    post_message(app, token, chat, json!({"content": content}), key).await
 }
 
 /// `POST` the message body `body` into chat `chat` as `token`, with the
@@ -1095,8 +1243,10 @@ async fn count_chats(pool: &PgPool) -> i64 {
 /// opening never bumps the list), and the other participant's side is the
 /// other row with the other id — which is what their own list and `show`
 /// then answer.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn creating_a_chat_gets_the_same_row_every_time(pool: PgPool) {
+#[tokio::test]
+async fn creating_a_chat_gets_the_same_row_every_time() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", SCOPE).await;
     let (bob, bobs_token) = fixture(&pool, "bob", SCOPE).await;
     let alice_read = common::create_app_and_token(&pool, &alice, READ_SCOPE).await;
@@ -1164,8 +1314,10 @@ async fn creating_a_chat_gets_the_same_row_every_time(pool: PgPool) {
 /// see the `blocked_between` hook's unit tests for its wiring.)
 ///
 /// [`account_or_404`]: wired_be::api::helpers::account_or_404
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_chat_gates_refuse_self_a_silent_recipient_and_nobody(pool: PgPool) {
+#[tokio::test]
+async fn the_chat_gates_refuse_self_a_silent_recipient_and_nobody() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", SCOPE).await;
     let carol = common::create_local_user_with(&pool, "carol", |new| NewUser {
         accepts_chat_messages: Flag::new(false),
@@ -1250,8 +1402,10 @@ async fn the_chat_gates_refuse_self_a_silent_recipient_and_nobody(pool: PgPool) 
 /// owner's unread count and newest message included — and one 404 to
 /// everyone else: the other participant's row of the same conversation, an
 /// unknown id and a malformed id are indistinguishable.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_answers_the_chat_to_its_owner_alone(pool: PgPool) {
+#[tokio::test]
+async fn show_answers_the_chat_to_its_owner_alone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, alice_token) = fixture(&pool, "alice", READ_SCOPE).await;
     let (bob, token) = fixture(&pool, "bob", READ_SCOPE).await;
     let (_, alice_ref, bob_ref) = send(&pool, &alice, &bob, "look").await;
@@ -1314,18 +1468,12 @@ async fn show_answers_the_chat_to_its_owner_alone(pool: PgPool) {
 /// on the page's first and last chat ids, and the `max_id`/`min_id`/
 /// `since_id` cursors walk the chat ids themselves: a `limit=1` walk visits
 /// every chat exactly once, descending.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_v1_list_orders_by_activity_and_pages_by_id(pool: PgPool) {
+#[tokio::test]
+async fn the_v1_list_orders_by_activity_and_pages_by_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", READ_SCOPE).await;
-    let mut opened = Vec::new();
-    for (nickname, hours) in [("bob", 1_i64), ("carol", 2), ("dave", 0)] {
-        let partner = common::create_local_user(&pool, nickname).await;
-        let chat = open_chat(&pool, &alice, &partner).await;
-        if hours > 0 {
-            backdate_chat(&pool, chat.id, hours).await;
-        }
-        opened.push(chat);
-    }
+    let opened = three_chats(&pool, &alice).await;
     let app = common::test_app(pool.clone());
 
     let response = get_as(&app, &token, ROOT).await;
@@ -1360,30 +1508,7 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id(pool: PgPool) {
         "the cursors key on the page's own chat ids"
     );
 
-    let mut walked = Vec::new();
-    let mut cursor: Option<Uuid> = None;
-    loop {
-        let path = cursor.map_or_else(
-            || format!("{ROOT}?limit=1"),
-            |oldest| format!("{ROOT}?limit=1&max_id={oldest}"),
-        );
-        let page = get_as(&app, &token, &path).await;
-        assert_eq!(
-            page.status,
-            StatusCode::OK,
-            "the walk keeps answering: {}",
-            page.text()
-        );
-        let Some(first) = listed_ids(&page.json_value()).first().cloned() else {
-            break;
-        };
-        let id = parse(&first);
-        if let Some(older) = cursor {
-            assert!(id < older, "pages walk strictly down the chat ids");
-        }
-        walked.push(id);
-        cursor = Some(id);
-    }
+    let walked = walk_chats(&app, &token).await;
     assert_eq!(walked.len(), 3, "the limit-one walk visits every chat");
     let mut own: Vec<Uuid> = opened.iter().map(|chat| chat.id).collect();
     let mut seen = walked.clone();
@@ -1423,8 +1548,10 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id(pool: PgPool) {
 /// accepted and hides nothing while the mutes table waits for its ticket, a
 /// non-boolean filter fails validation, and a chatless account gets the bare
 /// empty array with no `Link` header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_lists_filter_by_pinned_and_tolerate_with_muted(pool: PgPool) {
+#[tokio::test]
+async fn the_lists_filter_by_pinned_and_tolerate_with_muted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", READ_SCOPE).await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -1498,8 +1625,10 @@ async fn the_lists_filter_by_pinned_and_tolerate_with_muted(pool: PgPool) {
 /// `GET /api/v2/pleroma/chats` is Pleroma's `index2`: the chat whose last
 /// message is newest leads the page (a message bumps it, opening never
 /// does), the `Link` header rides along, and the cursors walk chat ids.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_v2_list_orders_by_the_last_message_and_pages_by_id(pool: PgPool) {
+#[tokio::test]
+async fn the_v2_list_orders_by_the_last_message_and_pages_by_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, _) = fixture(&pool, "alice", READ_SCOPE).await;
     let (bob, token) = fixture(&pool, "bob", READ_SCOPE).await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -1567,8 +1696,10 @@ async fn the_v2_list_orders_by_the_last_message_and_pages_by_id(pool: PgPool) {
 
 /// Both lists default to a page of 20; the legacy one caps at 30 while the
 /// v2 page goes on to [`MAX_LIMIT`], and every full page links onward.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_lists_default_to_twenty_and_v1_caps_at_thirty(pool: PgPool) {
+#[tokio::test]
+async fn the_lists_default_to_twenty_and_v1_caps_at_thirty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", READ_SCOPE).await;
     for index in 0..32 {
         let partner = common::create_local_user(&pool, &format!("partner{index}")).await;
@@ -1610,8 +1741,10 @@ async fn the_lists_default_to_twenty_and_v1_caps_at_thirty(pool: PgPool) {
 /// one the 401 "The access token is invalid", an app-only token the 403
 /// demanding a user, and a `write:chats` or `read:accounts` token the 403
 /// naming the missing scope; the plain `read` root covers the sub-scope.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_reading_route_demands_read_chats(pool: PgPool) {
+#[tokio::test]
+async fn every_reading_route_demands_read_chats() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let started = thread(&pool).await;
     let read_token = common::create_app_and_token(&pool, &started.bob, READ_SCOPE).await;
     let broad_token = common::create_app_and_token(&pool, &started.bob, "read").await;
@@ -1625,52 +1758,33 @@ async fn every_reading_route_demands_read_chats(pool: PgPool) {
     ];
 
     for path in paths {
-        let anonymous = common::TestRequest::get(&path).send(&app).await;
-        assert_eq!(
-            anonymous.status,
+        assert_refused(
+            &get_anonymous(&app, &path).await,
+            "no token at all",
+            &path,
             StatusCode::UNAUTHORIZED,
-            "no token at all is a 401 on {path}"
+            "Invalid credentials",
         );
-        assert_eq!(
-            error_message(&anonymous).as_deref(),
-            Some("Invalid credentials"),
-            "the missing-token wording on {path}"
-        );
-
-        let invalid = get_as(&app, "not-a-real-token", &path).await;
-        assert_eq!(
-            invalid.status,
+        assert_refused(
+            &get_as(&app, "not-a-real-token", &path).await,
+            "a bogus token",
+            &path,
             StatusCode::UNAUTHORIZED,
-            "an invalid token is a 401 on {path}"
+            "The access token is invalid",
         );
-        assert_eq!(
-            error_message(&invalid).as_deref(),
-            Some("The access token is invalid"),
-            "the token refusal wording on {path}"
-        );
-
-        let wrong_kind = get_as(&app, &app_only, &path).await;
-        assert_eq!(
-            wrong_kind.status,
+        assert_refused(
+            &get_as(&app, &app_only, &path).await,
+            "an app-only token",
+            &path,
             StatusCode::FORBIDDEN,
-            "an app-only token is a 403 on {path}"
+            "This API requires an authenticated user",
         );
-        assert_eq!(
-            error_message(&wrong_kind).as_deref(),
-            Some("This API requires an authenticated user"),
-            "the user refusal wording on {path}"
-        );
-
-        let wrong_scope = get_as(&app, &narrow, &path).await;
-        assert_eq!(
-            wrong_scope.status,
+        assert_refused(
+            &get_as(&app, &narrow, &path).await,
+            "`read:accounts`",
+            &path,
             StatusCode::FORBIDDEN,
-            "`read:accounts` is not enough on {path}"
-        );
-        assert_eq!(
-            error_message(&wrong_scope).as_deref(),
-            Some("Insufficient permissions: read:chats."),
-            "the scope refusal wording on {path}"
+            "Insufficient permissions: read:chats.",
         );
 
         let write_only = get_as(&app, &started.token, &path).await;
@@ -1707,8 +1821,10 @@ async fn every_reading_route_demands_read_chats(pool: PgPool) {
 /// `POST …/by-account-id/{id}` demands `write:chats` the same way — the
 /// read scopes cannot open chats — and the plain `write` root covers the
 /// sub-scope on the token's own chats.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn creating_a_chat_demands_write_chats(pool: PgPool) {
+#[tokio::test]
+async fn creating_a_chat_demands_write_chats() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, read_token) = fixture(&pool, "alice", READ_SCOPE).await;
     let (erin, _) = fixture(&pool, "erin", "read").await;
     let erin_write = common::create_app_and_token(&pool, &erin, "write").await;
@@ -1779,8 +1895,10 @@ async fn delete_as(app: &Router, token: &str, path: &str) -> common::TestRespons
 /// [`ChatMessage`] entity — the reference id of the caller's own chat, the
 /// rendered text, `unread: false` because the sender has read what they
 /// wrote — and a urlencoded form body posts just the same.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn posting_a_message_answers_the_senders_entity(pool: PgPool) {
+#[tokio::test]
+async fn posting_a_message_answers_the_senders_entity() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -1859,8 +1977,10 @@ async fn posting_a_message_answers_the_senders_entity(pool: PgPool) {
 /// to the message — with or without `content`, and a media-only message
 /// keeps both text columns empty — rendered as the full `Attachment`
 /// entity beside it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn posted_media_attaches_to_the_message(pool: PgPool) {
+#[tokio::test]
+async fn posted_media_attaches_to_the_message() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -1920,8 +2040,10 @@ async fn posted_media_attaches_to_the_message(pool: PgPool) {
 /// `{"error":"Cannot send an empty chat message"}` — an empty JSON object,
 /// unrelated keys, explicit nulls and a completely absent body all alike —
 /// and nothing behind a refusal is written.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn posting_refuses_bodies_with_nothing_to_send(pool: PgPool) {
+#[tokio::test]
+async fn posting_refuses_bodies_with_nothing_to_send() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -1967,8 +2089,10 @@ async fn posting_refuses_bodies_with_nothing_to_send(pool: PgPool) {
 /// malformed id text, another user's row, a row a status already claimed,
 /// or a file that is none of image, video or audio — and the refusal says
 /// nothing about which of them the id was.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unattachable_media_is_media_not_found(pool: PgPool) {
+#[tokio::test]
+async fn unattachable_media_is_media_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2009,8 +2133,10 @@ async fn unattachable_media_is_media_not_found(pool: PgPool) {
 /// `content` longer than the `MAX_CHAT_MESSAGE_CHARS` setting (default
 /// 5000, counted in characters and not bytes) is the 400
 /// `{"error":"The message is too long"}`; the limit itself posts.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn content_over_the_chat_limit_is_too_long(pool: PgPool) {
+#[tokio::test]
+async fn content_over_the_chat_limit_is_too_long() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2043,8 +2169,10 @@ async fn content_over_the_chat_limit_is_too_long(pool: PgPool) {
 /// A lowered `MAX_CHAT_MESSAGE_CHARS` setting is what the endpoint
 /// measures: six characters over a limit of five are the same 400, five
 /// still post, and a media message's content is bounded the same way.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_chat_length_setting_gates_the_endpoint(pool: PgPool) {
+#[tokio::test]
+async fn the_chat_length_setting_gates_the_endpoint() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2093,35 +2221,15 @@ async fn the_chat_length_setting_gates_the_endpoint(pool: PgPool) {
 /// with `max_id`, forward with `since_id`/`min_id`, defaults to a page of
 /// twenty, refuses a malformed cursor, and answers an empty chat with the
 /// bare array and no `Link` header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_message_list_orders_newest_first_and_pages_by_reference_id(pool: PgPool) {
+#[tokio::test]
+async fn the_message_list_orders_newest_first_and_pages_by_reference_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
     let app = common::test_app(pool.clone());
-    let mut ids = Vec::new();
-    for index in 0..3 {
-        let posted = post_message(
-            &app,
-            &token,
-            &chat,
-            json!({"content": format!("message {index}")}),
-            None,
-        )
-        .await;
-        assert_eq!(
-            posted.status,
-            StatusCode::OK,
-            "the fixture posts: {}",
-            posted.text()
-        );
-        ids.push(
-            posted.json_value()["id"]
-                .as_str()
-                .expect("a reference id")
-                .to_owned(),
-        );
-    }
+    let ids = post_three(&app, &token, &chat).await;
     let path = messages_path(&chat);
 
     let full = get_as(&app, &token, &path).await;
@@ -2187,8 +2295,10 @@ async fn the_message_list_orders_newest_first_and_pages_by_reference_id(pool: Pg
 /// The message page defaults to twenty and takes any `limit` up to
 /// [`MAX_LIMIT`]: twenty-one messages answer twenty unasked and all of them
 /// on a page of twenty-five.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_message_list_defaults_to_twenty(pool: PgPool) {
+#[tokio::test]
+async fn the_message_list_defaults_to_twenty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2221,8 +2331,10 @@ async fn the_message_list_defaults_to_twenty(pool: PgPool) {
 /// What a posted message does to the other side: the recipient gets a
 /// reference of their own chat — a different reference id in a different
 /// chat — flagged unread, and their `Chat` entity counts it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_posted_message_arrives_unread_for_the_recipient(pool: PgPool) {
+#[tokio::test]
+async fn a_posted_message_arrives_unread_for_the_recipient() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let (bob, bobs_token) = fixture(&pool, "bob", READ_SCOPE).await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2286,8 +2398,10 @@ async fn a_posted_message_arrives_unread_for_the_recipient(pool: PgPool) {
 /// be damned) and writes nothing; a different key or none posts as usual;
 /// outside the hour the key is fresh again. The entity echoes the key while
 /// it was created with one, and only then.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_idempotency_key_replays_its_message_within_the_hour(pool: PgPool) {
+#[tokio::test]
+async fn an_idempotency_key_replays_its_message_within_the_hour() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2296,28 +2410,14 @@ async fn an_idempotency_key_replays_its_message_within_the_hour(pool: PgPool) {
     wanted.push("idempotency_key");
     wanted.sort_unstable();
 
-    let first = post_message(
-        &app,
-        &token,
-        &chat,
-        json!({"content": "once"}),
-        Some("key-1"),
-    )
-    .await;
+    let first = post_text(&app, &token, &chat, "once", Some("key-1")).await;
     assert_eq!(first.status, StatusCode::OK, "keyed post: {}", first.text());
     let value = first.json_value();
     assert_eq!(json_keys(&value), wanted, "the entity adds the key");
     assert_eq!(value["idempotency_key"], "key-1", "echoed back verbatim");
     let first_id = value["id"].as_str().expect("a reference id").to_owned();
 
-    let replay = post_message(
-        &app,
-        &token,
-        &chat,
-        json!({"content": "twice"}),
-        Some("key-1"),
-    )
-    .await;
+    let replay = post_text(&app, &token, &chat, "twice", Some("key-1")).await;
     assert_eq!(replay.status, StatusCode::OK, "a replay is no error");
     let again = replay.json_value();
     assert_eq!(again["id"], first_id, "the key answers its first message");
@@ -2337,34 +2437,20 @@ async fn an_idempotency_key_replays_its_message_within_the_hour(pool: PgPool) {
     );
     assert_eq!(count_messages(&pool).await, 1, "the replay wrote nothing");
 
-    let other_key = post_message(
-        &app,
-        &token,
-        &chat,
-        json!({"content": "other"}),
-        Some("key-2"),
-    )
-    .await;
+    let other_key = post_text(&app, &token, &chat, "other", Some("key-2")).await;
     assert_ne!(
         other_key.json_value()["id"].as_str().expect("an id"),
         first_id,
         "another key is another message"
     );
-    let no_key = post_message(&app, &token, &chat, json!({"content": "plain"}), None).await;
+    let no_key = post_text(&app, &token, &chat, "plain", None).await;
     assert!(
         no_key.json_value().get("idempotency_key").is_none(),
         "and a keyless message renders no key"
     );
 
     expire_message(&pool, parse(&first_id)).await;
-    let late = post_message(
-        &app,
-        &token,
-        &chat,
-        json!({"content": "late"}),
-        Some("key-1"),
-    )
-    .await;
+    let late = post_text(&app, &token, &chat, "late", Some("key-1")).await;
     assert_eq!(late.status, StatusCode::OK);
     assert_ne!(
         late.json_value()["id"].as_str().expect("an id"),
@@ -2378,8 +2464,10 @@ async fn an_idempotency_key_replays_its_message_within_the_hour(pool: PgPool) {
 /// same key replayed into another of the sender's chats answers the first
 /// message and touches nothing else, and the same key from another user is
 /// just another message.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_idempotency_key_belongs_to_its_sender(pool: PgPool) {
+#[tokio::test]
+async fn an_idempotency_key_belongs_to_its_sender() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let (bob, bobs_token) = poster(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -2452,20 +2540,15 @@ async fn an_idempotency_key_belongs_to_its_sender(pool: PgPool) {
 /// only his own reference: the answer is his view of the message as it was
 /// (unread and all), the sender keeps a live copy, and a reference is only
 /// deletable through the chat that holds it, once.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_recipient_delete_only_removes_the_recipients_copy(pool: PgPool) {
+#[tokio::test]
+async fn a_recipient_delete_only_removes_the_recipients_copy() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let (bob, bobs_token) = poster(&pool, "bob").await;
     let alices_chat = open_chat(&pool, &alice, &bob).await.id.to_string();
     let app = common::test_app(pool.clone());
-    let posted = post_message(
-        &app,
-        &token,
-        &alices_chat,
-        json!({"content": "for both"}),
-        None,
-    )
-    .await;
+    let posted = post_text(&app, &token, &alices_chat, "for both", None).await;
     assert_eq!(posted.status, StatusCode::OK, "{}", posted.text());
     let alice_ref = posted.json_value()["id"]
         .as_str()
@@ -2519,39 +2602,23 @@ async fn a_recipient_delete_only_removes_the_recipients_copy(pool: PgPool) {
         "live: hiding somebody's copy is not withdrawing the message"
     );
 
-    let again = delete_as(
+    assert_delete_404(&app, &bobs_token, &bobs_chat, &bob_ref, "a second delete").await;
+    assert_delete_404(
         &app,
         &bobs_token,
-        &message_delete_path(&bobs_chat, &bob_ref),
+        &alices_chat,
+        &alice_ref,
+        "alice's chat is not bob's to delete in",
     )
     .await;
-    assert_eq!(
-        again.status,
-        StatusCode::NOT_FOUND,
-        "a second delete finds nothing"
-    );
-    assert_eq!(
-        error_message(&again).as_deref(),
-        Some("Record not found"),
-        "the plain 404 wording"
-    );
-    let misplaced = delete_as(
+    assert_delete_404(
         &app,
-        &bobs_token,
-        &message_delete_path(&alices_chat, &alice_ref),
+        &token,
+        &alices_chat,
+        &bob_ref,
+        "bob's reference is not alice's to delete through hers",
     )
     .await;
-    assert_eq!(
-        misplaced.status,
-        StatusCode::NOT_FOUND,
-        "alice's chat is not bob's to delete in"
-    );
-    let foreign = delete_as(&app, &token, &message_delete_path(&alices_chat, &bob_ref)).await;
-    assert_eq!(
-        foreign.status,
-        StatusCode::NOT_FOUND,
-        "and bob's reference is not alice's to delete through hers"
-    );
     assert_eq!(
         count_messages(&pool).await,
         1,
@@ -2562,8 +2629,10 @@ async fn a_recipient_delete_only_removes_the_recipients_copy(pool: PgPool) {
 /// `DELETE` as the sender withdraws the message from everyone: their own
 /// reference goes, the row becomes a tombstone, and the recipient's
 /// listing hides it even though their reference survives.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_sender_delete_withdraws_the_message_from_both_sides(pool: PgPool) {
+#[tokio::test]
+async fn a_sender_delete_withdraws_the_message_from_both_sides() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = poster(&pool, "alice").await;
     let (bob, bobs_token) = poster(&pool, "bob").await;
     let alices_chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2631,8 +2700,10 @@ async fn a_sender_delete_withdraws_the_message_from_both_sides(pool: PgPool) {
 /// Foreign, unknown and malformed chat ids are one 404 on all three
 /// message routes, and a chat that is the caller's own still answers: the
 /// gate is ownership of the `{id}`, not the message behind it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_message_routes_answer_the_one_chat_404(pool: PgPool) {
+#[tokio::test]
+async fn the_message_routes_answer_the_one_chat_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, alice_token) = poster(&pool, "alice").await;
     let (bob, bobs_token) = poster(&pool, "bob").await;
     let alices_chat = open_chat(&pool, &alice, &bob).await.id.to_string();
@@ -2710,127 +2781,109 @@ async fn the_message_routes_answer_the_one_chat_404(pool: PgPool) {
 /// app-only token the 403 demanding a user; the plain `read` and `write`
 /// roots cover the sub-scopes, and a right-scoped stranger still gets the
 /// ownership 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_message_routes_demand_their_scopes(pool: PgPool) {
+#[tokio::test]
+async fn the_message_routes_demand_their_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, _) = poster(&pool, "alice").await;
-    let (bob, bob_read) = fixture(&pool, "bob", "read").await;
+    let (bob, _) = fixture(&pool, "bob", "read").await;
     let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
-    let bobs_chat = open_chat(&pool, &bob, &alice).await.id.to_string();
-    let (erin, read_only) = fixture(&pool, "erin", READ_SCOPE).await;
+    let (_, read_only) = fixture(&pool, "erin", READ_SCOPE).await;
     let (_, write_only) = fixture(&pool, "dave", SCOPE).await;
     let (_, unrelated) = fixture(&pool, "grace", "read:accounts").await;
     let app_only = common::create_app_only_token(&pool, "read:chats write:chats").await;
-    let bob_write = common::create_app_and_token(&pool, &bob, "write").await;
     let app = common::test_app(pool.clone());
     let path = messages_path(&chat);
     let one = format!("{path}/{}", new_id());
 
-    assert_eq!(
-        error_message(&get_as(&app, &write_only, &path).await).as_deref(),
-        Some("Insufficient permissions: read:chats."),
-        "a writer reads no messages"
+    assert_all_say(
+        &[
+            get_as(&app, &write_only, &path).await,
+            get_as(&app, &unrelated, &path).await,
+        ],
+        "Insufficient permissions: read:chats.",
+        "a writer and an unrelated scope read no messages",
     );
-    assert_eq!(
-        error_message(&get_as(&app, &unrelated, &path).await).as_deref(),
-        Some("Insufficient permissions: read:chats."),
-        "and an unrelated scope names what it lacks"
+    assert_all_say(
+        &[
+            get_as(&app, &app_only, &path).await,
+            post_text(&app, &app_only, &chat, "x", None).await,
+            delete_as(&app, &app_only, &one).await,
+        ],
+        "This API requires an authenticated user",
+        "an app-only token is a userless 403 on every route",
     );
-    for refused in [
-        get_as(&app, &app_only, &path).await,
-        post_message(&app, &app_only, &chat, json!({"content": "x"}), None).await,
-        delete_as(&app, &app_only, &one).await,
-    ] {
-        assert_eq!(
-            error_message(&refused).as_deref(),
-            Some("This API requires an authenticated user"),
-            "an app-only token is a userless 403"
-        );
-    }
-    for refused in [
-        post_message(&app, &read_only, &chat, json!({"content": "x"}), None).await,
+    let reader_writes = [
+        post_text(&app, &read_only, &chat, "x", None).await,
         delete_as(&app, &read_only, &one).await,
-    ] {
-        assert_eq!(
-            refused.status,
-            StatusCode::FORBIDDEN,
-            "a reader posts and deletes nothing"
-        );
-        assert_eq!(
-            error_message(&refused).as_deref(),
-            Some("Insufficient permissions: write:chats."),
-            "naming the scope they lack"
-        );
-    }
-
-    let anonymous = common::TestRequest::get(&path).send(&app).await;
-    assert_eq!(
-        anonymous.status,
+    ];
+    assert_all_answer(
+        &reader_writes,
+        StatusCode::FORBIDDEN,
+        "a reader posts and deletes nothing",
+    );
+    assert_all_say(
+        &reader_writes,
+        "Insufficient permissions: write:chats.",
+        "the reader denial names the scope it lacks",
+    );
+    let anonymous = get_anonymous(&app, &path).await;
+    assert_answer(
+        &anonymous,
         StatusCode::UNAUTHORIZED,
-        "no token is a 401"
+        "no token at all is a 401",
     );
-    assert_eq!(
-        error_message(&anonymous).as_deref(),
-        Some("Invalid credentials"),
-        "the missing-token wording"
+    assert_says(
+        &anonymous,
+        "Invalid credentials",
+        "the missing-token wording",
     );
-    assert_eq!(
-        error_message(&get_as(&app, "not-a-real-token", &path).await).as_deref(),
-        Some("The access token is invalid"),
-        "and a bad token says so"
-    );
-    assert_eq!(
-        post_message(
-            &app,
-            "not-a-real-token",
-            &chat,
-            json!({"content": "x"}),
-            None
-        )
-        .await
-        .status,
-        StatusCode::UNAUTHORIZED,
-        "on the post too"
-    );
-    assert_eq!(
-        delete_as(&app, "not-a-real-token", &one).await.status,
-        StatusCode::UNAUTHORIZED,
-        "and on the delete"
+    let bogus = [
+        get_as(&app, "not-a-real-token", &path).await,
+        post_text(&app, "not-a-real-token", &chat, "x", None).await,
+        delete_as(&app, "not-a-real-token", &one).await,
+    ];
+    assert_all_answer(&bogus, StatusCode::UNAUTHORIZED, "a bogus token is a 401");
+    assert_all_say(
+        &bogus,
+        "The access token is invalid",
+        "and it names the token as the problem",
     );
 
     let stranger = get_as(&app, &read_only, &path).await;
-    assert_eq!(
-        stranger.status,
+    assert_answer(
+        &stranger,
         StatusCode::NOT_FOUND,
-        "the right scope on the wrong chat is the ownership 404"
+        "the right scope on the wrong chat is the ownership 404",
     );
+}
+
+/// The other half of the same hierarchy: the narrow sub-scope on its own
+/// account, and the broad `read` and `write` roots that cover it.
+#[tokio::test]
+async fn the_broad_scope_roots_grant_the_message_routes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, _) = poster(&pool, "alice").await;
+    let (bob, bob_read) = fixture(&pool, "bob", "read").await;
+    let bobs_chat = open_chat(&pool, &bob, &alice).await.id.to_string();
+    let (erin, read_only) = fixture(&pool, "erin", READ_SCOPE).await;
+    let bob_write = common::create_app_and_token(&pool, &bob, "write").await;
+    let app = common::test_app(pool.clone());
 
     let erins_chat = open_chat(&pool, &erin, &alice).await.id.to_string();
-    assert_eq!(
-        get_as(&app, &read_only, &messages_path(&erins_chat))
-            .await
-            .status,
+    let own = get_as(&app, &read_only, &messages_path(&erins_chat)).await;
+    assert_answer(
+        &own,
         StatusCode::OK,
-        "`read:chats` lists the caller's own messages"
+        "`read:chats` lists the caller's own messages",
     );
-    assert_eq!(
-        get_as(&app, &bob_read, &messages_path(&bobs_chat))
-            .await
-            .status,
+    let broad_read = get_as(&app, &bob_read, &messages_path(&bobs_chat)).await;
+    assert_answer(
+        &broad_read,
         StatusCode::OK,
-        "the plain `read` root covers `read:chats`"
+        "the plain `read` root covers `read:chats`",
     );
-    let posted = post_message(
-        &app,
-        &bob_write,
-        &bobs_chat,
-        json!({"content": "plain write root"}),
-        None,
-    )
-    .await;
-    assert_eq!(
-        posted.status,
-        StatusCode::OK,
-        "the plain `write` root posts: {}",
-        posted.text()
-    );
+    let broad_write = post_text(&app, &bob_write, &bobs_chat, "plain write root", None).await;
+    assert_answer(&broad_write, StatusCode::OK, "the plain `write` root posts");
 }

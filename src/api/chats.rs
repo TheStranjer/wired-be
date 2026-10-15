@@ -1115,8 +1115,10 @@ mod tests {
         .expect("fixture remote user inserts")
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn chatting_with_yourself_is_the_422(pool: sqlx::PgPool) {
+    #[tokio::test]
+    async fn chatting_with_yourself_is_the_422() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = chatter(&pool, "alice").await;
 
         let err = chat_refusal(&alice, &alice).expect("the self-chat is refused");
@@ -1132,8 +1134,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_recipient_that_does_not_accept_chats_is_named_in_a_403(pool: sqlx::PgPool) {
+    #[tokio::test]
+    async fn a_recipient_that_does_not_accept_chats_is_named_in_a_403() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = chatter(&pool, "alice").await;
 
         for silent in [
@@ -1154,8 +1158,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_ordinary_pair_passes_and_no_pair_is_blocked_yet(pool: sqlx::PgPool) {
+    #[tokio::test]
+    async fn an_ordinary_pair_passes_and_no_pair_is_blocked_yet() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = chatter(&pool, "alice").await;
         let bob = chatter(&pool, "bob").await;
         let mallory = quiet_remote(&pool, "mallory").await;

@@ -248,8 +248,10 @@ async fn follows_between(pool: &PgPool, first: &User, second: &User) -> bool {
 /// counters down, answers the caller's relationship with `blocking: true` and
 /// no follow flags, and lights `blocked_by` from the blocked account's own
 /// view.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn blocking_severs_the_pair_and_lights_both_flags(pool: PgPool) {
+#[tokio::test]
+async fn blocking_severs_the_pair_and_lights_both_flags() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let (bob, bob_token) = fixture(&pool, "bob", "read").await;
     follow_pair(&pool, &alice, &bob).await;
@@ -317,8 +319,10 @@ async fn blocking_severs_the_pair_and_lights_both_flags(pool: PgPool) {
 /// Unblocking answers the relationship with both flags back at their default,
 /// is idempotent, and does not restore what the block severed; the lifted
 /// guard lets the pair start over.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unblocking_lifts_the_block_without_rewinding(pool: PgPool) {
+#[tokio::test]
+async fn unblocking_lifts_the_block_without_rewinding() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_pair(&pool, &alice, &bob).await;
@@ -369,8 +373,10 @@ async fn unblocking_lifts_the_block_without_rewinding(pool: PgPool) {
 /// A blocked follow attempt is refused from both ends with the two exact
 /// messages this ticket pins, as a 403 on the model the follow endpoints run
 /// through.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_blocked_pair_cannot_follow(pool: PgPool) {
+#[tokio::test]
+async fn a_blocked_pair_cannot_follow() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let row = block::block(&pool, TEST_BASE_URL, &bob, &alice)
@@ -398,8 +404,10 @@ async fn a_blocked_pair_cannot_follow(pool: PgPool) {
 
 /// Blocking yourself is the 422 the ticket pins, and an unknown or malformed
 /// id is the shared 404 on both writes.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_self_block_is_422_and_any_other_miss_is_404(pool: PgPool) {
+#[tokio::test]
+async fn a_self_block_is_422_and_any_other_miss_is_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:blocks").await;
     let app = common::test_app(pool.clone());
 
@@ -439,8 +447,10 @@ async fn a_self_block_is_422_and_any_other_miss_is_404(pool: PgPool) {
 /// under a `Link` header keyed on the block row ids; an account with nothing
 /// blocked gets the empty array and no header, and another account's blocks
 /// are nobody else's list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_answers_accounts_newest_first(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_answers_accounts_newest_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -502,8 +512,10 @@ async fn the_listing_answers_accounts_newest_first(pool: PgPool) {
 /// The listing's page walk: `limit` at a time, `max_id` continuing where a
 /// page ended, `min_id` answered newest-first again, the ends of the walk
 /// carrying no header, and a malformed cursor the extractor's 400.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_pages_by_block_row_id(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_pages_by_block_row_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app(pool.clone());
     for nickname in ["bob", "carol", "dave", "erin"] {
@@ -587,8 +599,10 @@ async fn the_listing_pages_by_block_row_id(pool: PgPool) {
 /// The listing's cap is Mastodon's 80, not the global 40: a page of 41 blocks
 /// comes back whole, while Pleroma's 20 stays the default when no `limit` is
 /// asked for.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_pages_up_to_eighty_rows(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_pages_up_to_eighty_rows() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let mut seeded: Vec<Block> = Vec::new();
     for n in 0..41 {
@@ -627,8 +641,10 @@ async fn the_listing_pages_up_to_eighty_rows(pool: PgPool) {
 
 /// All three routes demand a user token: no token is the 401, an invalid one
 /// the 401, and an app-only credential the 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_routes_require_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn the_routes_require_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let app_only = common::create_app_only_token(&pool, "read write follow").await;
     let app = common::test_app(pool);
@@ -667,8 +683,10 @@ async fn the_routes_require_a_user_token(pool: PgPool) {
 /// The listing's scope gate is exactly `read:blocks`: broad `read` and the
 /// scope itself list; `follow` (the writes' alternative, not this read side),
 /// `write` and an unrelated sub-scope answer the insufficient-permissions 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_requires_the_read_blocks_scope(pool: PgPool) {
+#[tokio::test]
+async fn the_listing_requires_the_read_blocks_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
 
@@ -697,8 +715,10 @@ async fn the_listing_requires_the_read_blocks_scope(pool: PgPool) {
 /// Both writes' gate is `write:blocks | follow`: broad `write`, the scope
 /// itself and the `follow` root all block and unblock; anything else is the
 /// alternatives-joined 403, on both actions.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_writes_take_write_blocks_or_follow(pool: PgPool) {
+#[tokio::test]
+async fn the_writes_take_write_blocks_or_follow() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;

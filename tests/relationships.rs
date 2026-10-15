@@ -116,8 +116,10 @@ async fn flip_toggles(pool: &PgPool, follower: &Uuid, target: &Uuid) {
 
 /// Every computed flag in each follow state — accepted with flipped
 /// toggles, pending, incoming-only, mutual — as one batched request.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_answer_every_follow_state(pool: PgPool) {
+#[tokio::test]
+async fn relationships_answer_every_follow_state() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user_with(&pool, "carol", |mut new| {
@@ -191,8 +193,10 @@ async fn relationships_answer_every_follow_state(pool: PgPool) {
 
 /// The requested order is kept, unknown and invalid ids are skipped, and a
 /// repeated id is answered twice.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_keep_the_order_and_skip_unknown_and_invalid_ids(pool: PgPool) {
+#[tokio::test]
+async fn relationships_keep_the_order_and_skip_unknown_and_invalid_ids() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -236,8 +240,10 @@ async fn relationships_keep_the_order_and_skip_unknown_and_invalid_ids(pool: PgP
 }
 
 /// The single `id=` form — Pleroma's `List.wrap` — answers the one row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_accept_the_single_id_form(pool: PgPool) {
+#[tokio::test]
+async fn relationships_accept_the_single_id_form() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_as(&pool, &alice, &bob, FollowState::Accepted).await;
@@ -255,8 +261,10 @@ async fn relationships_accept_the_single_id_form(pool: PgPool) {
 
 /// No `id`, an empty `id`, only-garbage ids and an empty array parameter
 /// are all the empty array, never an error (Pleroma's `json(conn, [])`).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_without_usable_ids_answer_the_empty_array(pool: PgPool) {
+#[tokio::test]
+async fn relationships_without_usable_ids_answer_the_empty_array() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read:follows").await;
     let app = common::test_app(pool);
@@ -274,8 +282,10 @@ async fn relationships_without_usable_ids_answer_the_empty_array(pool: PgPool) {
 
 /// The endpoint demands a user token: no token is the 401, an invalid one
 /// the 401, and an app-only credential the 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_require_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn relationships_require_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app_only = common::create_app_only_token(&pool, "read:follows").await;
     let app = common::test_app(pool);
 
@@ -315,8 +325,10 @@ async fn relationships_require_a_user_token(pool: PgPool) {
 /// The scope gate is Pleroma's `read:follows`: broader `read`, the `follow`
 /// root and the exact scope pass; anything else fails with the
 /// insufficient-permissions 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationships_require_the_read_follows_scope(pool: PgPool) {
+#[tokio::test]
+async fn relationships_require_the_read_follows_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let mut passing = Vec::new();
     for scopes in ["read", "follow", "read:follows"] {
@@ -349,8 +361,10 @@ async fn relationships_require_the_read_follows_scope(pool: PgPool) {
 
 /// The account entity embeds the viewer's relationship in
 /// `pleroma.relationship` when the viewer is looking at someone else.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_embeds_the_relationship_for_a_stranger_viewer(pool: PgPool) {
+#[tokio::test]
+async fn show_embeds_the_relationship_for_a_stranger_viewer() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_as(&pool, &alice, &bob, FollowState::Accepted).await;
@@ -377,8 +391,10 @@ async fn show_embeds_the_relationship_for_a_stranger_viewer(pool: PgPool) {
 /// The same row seen anonymously and seen by its own user keeps the empty
 /// object Pleroma renders without a reading user — and the owner has no
 /// self-relationship to see either.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_keeps_the_empty_relationship_without_a_stranger(pool: PgPool) {
+#[tokio::test]
+async fn show_keeps_the_empty_relationship_without_a_stranger() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_as(&pool, &alice, &bob, FollowState::Accepted).await;
@@ -407,8 +423,10 @@ async fn show_keeps_the_empty_relationship_without_a_stranger(pool: PgPool) {
 
 /// `lookup` renders for its viewer exactly as `show` does, so it embeds
 /// the relationship through the same path.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_embeds_the_relationship(pool: PgPool) {
+#[tokio::test]
+async fn lookup_embeds_the_relationship() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_as(&pool, &alice, &bob, FollowState::Accepted).await;

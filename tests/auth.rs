@@ -127,8 +127,10 @@ fn error_of(response: &common::TestResponse) -> String {
         .to_owned()
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_user_accepts_a_valid_bearer_token(pool: PgPool) {
+#[tokio::test]
+async fn auth_user_accepts_a_valid_bearer_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read").await;
     let app = auth_test_app(pool);
@@ -148,8 +150,10 @@ async fn auth_user_accepts_a_valid_bearer_token(pool: PgPool) {
     assert_eq!(body["token_scopes"], "read", "with the token beside it");
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn bearer_scheme_is_matched_case_insensitively(pool: PgPool) {
+#[tokio::test]
+async fn bearer_scheme_is_matched_case_insensitively() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let token = common::create_app_and_token(&pool, &bob, "read").await;
     let app = auth_test_app(pool);
@@ -167,8 +171,10 @@ async fn bearer_scheme_is_matched_case_insensitively(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn access_token_query_parameter_is_accepted(pool: PgPool) {
+#[tokio::test]
+async fn access_token_query_parameter_is_accepted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user(&pool, "carol").await;
     let token = common::create_app_and_token(&pool, &carol, "read").await;
     let app = auth_test_app(pool);
@@ -185,8 +191,10 @@ async fn access_token_query_parameter_is_accepted(pool: PgPool) {
     assert_eq!(body["user_id"], carol.id.to_string(), "same user");
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn header_wins_over_the_query_parameter(pool: PgPool) {
+#[tokio::test]
+async fn header_wins_over_the_query_parameter() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dave = common::create_local_user(&pool, "dave").await;
     let token = common::create_app_and_token(&pool, &dave, "read").await;
     let app = auth_test_app(pool);
@@ -217,8 +225,10 @@ async fn header_wins_over_the_query_parameter(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_user_without_any_token_is_unauthorized(pool: PgPool) {
+#[tokio::test]
+async fn auth_user_without_any_token_is_unauthorized() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = auth_test_app(pool);
 
     let response = TestRequest::get("/auth-user").send(&app).await;
@@ -235,8 +245,10 @@ async fn auth_user_without_any_token_is_unauthorized(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_user_rejects_an_unknown_token(pool: PgPool) {
+#[tokio::test]
+async fn auth_user_rejects_an_unknown_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = auth_test_app(pool);
 
     let response = TestRequest::get("/auth-user")
@@ -251,8 +263,10 @@ async fn auth_user_rejects_an_unknown_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_user_rejects_an_expired_token(pool: PgPool) {
+#[tokio::test]
+async fn auth_user_rejects_an_expired_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let erin = common::create_local_user(&pool, "erin").await;
     let token = common::create_app_and_token(&pool, &erin, "read").await;
     expire_token(&pool, &token).await;
@@ -270,8 +284,10 @@ async fn auth_user_rejects_an_expired_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_user_rejects_a_deactivated_users_token(pool: PgPool) {
+#[tokio::test]
+async fn auth_user_rejects_a_deactivated_users_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let frank = common::create_local_user_with(&pool, "frank", |new| NewUser {
         is_active: Flag::new(false),
         ..new
@@ -292,8 +308,10 @@ async fn auth_user_rejects_a_deactivated_users_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_user_rejects_an_app_only_token(pool: PgPool) {
+#[tokio::test]
+async fn auth_user_rejects_an_app_only_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let token = common::create_app_only_token(&pool, "read write").await;
     let app = auth_test_app(pool);
 
@@ -309,8 +327,10 @@ async fn auth_user_rejects_an_app_only_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn maybe_auth_user_without_a_token_is_none(pool: PgPool) {
+#[tokio::test]
+async fn maybe_auth_user_without_a_token_is_none() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = auth_test_app(pool);
 
     let response = TestRequest::get("/maybe-auth-user").send(&app).await;
@@ -329,8 +349,10 @@ async fn maybe_auth_user_without_a_token_is_none(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn maybe_auth_user_resolves_a_valid_user_token(pool: PgPool) {
+#[tokio::test]
+async fn maybe_auth_user_resolves_a_valid_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let grace = common::create_local_user(&pool, "grace").await;
     let token = common::create_app_and_token(&pool, &grace, "read").await;
     let app = auth_test_app(pool);
@@ -352,8 +374,10 @@ async fn maybe_auth_user_resolves_a_valid_user_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn maybe_auth_user_rejects_an_invalid_token(pool: PgPool) {
+#[tokio::test]
+async fn maybe_auth_user_rejects_an_invalid_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = auth_test_app(pool);
 
     let response = TestRequest::get("/maybe-auth-user")
@@ -372,8 +396,10 @@ async fn maybe_auth_user_rejects_an_invalid_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn maybe_auth_user_rejects_a_deactivated_users_token(pool: PgPool) {
+#[tokio::test]
+async fn maybe_auth_user_rejects_a_deactivated_users_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let henry = common::create_local_user_with(&pool, "henry", |new| NewUser {
         is_active: Flag::new(false),
         ..new
@@ -398,8 +424,10 @@ async fn maybe_auth_user_rejects_a_deactivated_users_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn maybe_auth_user_treats_an_app_only_token_as_none(pool: PgPool) {
+#[tokio::test]
+async fn maybe_auth_user_treats_an_app_only_token_as_none() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let token = common::create_app_only_token(&pool, "read").await;
     let app = auth_test_app(pool);
 
@@ -419,8 +447,10 @@ async fn maybe_auth_user_treats_an_app_only_token_as_none(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn app_auth_accepts_any_valid_token(pool: PgPool) {
+#[tokio::test]
+async fn app_auth_accepts_any_valid_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let ivan = common::create_local_user(&pool, "ivan").await;
     let user_token = common::create_app_and_token(&pool, &ivan, "read").await;
     let app_only_token = common::create_app_only_token(&pool, "read").await;
@@ -454,8 +484,10 @@ async fn app_auth_accepts_any_valid_token(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn app_auth_rejects_missing_invalid_and_deactivated_tokens(pool: PgPool) {
+#[tokio::test]
+async fn app_auth_rejects_missing_invalid_and_deactivated_tokens() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let judy = common::create_local_user_with(&pool, "judy", |new| NewUser {
         is_active: Flag::new(false),
         ..new
@@ -495,8 +527,10 @@ async fn app_auth_rejects_missing_invalid_and_deactivated_tokens(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_context_carries_token_user_and_app(pool: PgPool) {
+#[tokio::test]
+async fn auth_context_carries_token_user_and_app() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let ken = common::create_local_user(&pool, "ken").await;
     let user_token = common::create_app_and_token(&pool, &ken, "read write").await;
     let app_only_token = common::create_app_only_token(&pool, "read").await;
@@ -530,8 +564,10 @@ async fn auth_context_carries_token_user_and_app(pool: PgPool) {
     assert_eq!(error_of(&denied), "The access token is invalid", "…");
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn scope_guard_grants_through_the_hierarchy(pool: PgPool) {
+#[tokio::test]
+async fn scope_guard_grants_through_the_hierarchy() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let leo = common::create_local_user(&pool, "leo").await;
     let broad = common::create_app_and_token(&pool, &leo, "read").await;
     let exact = common::create_app_and_token(&pool, &leo, "read:statuses").await;
@@ -566,8 +602,10 @@ async fn scope_guard_grants_through_the_hierarchy(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn scope_guard_denies_a_narrower_token_a_broader_scope(pool: PgPool) {
+#[tokio::test]
+async fn scope_guard_denies_a_narrower_token_a_broader_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let mia = common::create_local_user(&pool, "mia").await;
     let narrow = common::create_app_and_token(&pool, &mia, "read:accounts").await;
     let app = auth_test_app(pool);
@@ -584,8 +622,10 @@ async fn scope_guard_denies_a_narrower_token_a_broader_scope(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn require_any_passes_on_one_granted_alternative(pool: PgPool) {
+#[tokio::test]
+async fn require_any_passes_on_one_granted_alternative() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let nora = common::create_local_user(&pool, "nora").await;
     let narrow = common::create_app_and_token(&pool, &nora, "read:accounts").await;
     let broad = common::create_app_and_token(&pool, &nora, "read").await;
@@ -616,8 +656,10 @@ async fn require_any_passes_on_one_granted_alternative(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_user_check_precedes_the_scope_check(pool: PgPool) {
+#[tokio::test]
+async fn the_user_check_precedes_the_scope_check() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let token = common::create_app_only_token(&pool, "read").await;
     let app = auth_test_app(pool);
 

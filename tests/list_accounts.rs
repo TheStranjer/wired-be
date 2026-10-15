@@ -306,8 +306,10 @@ fn cursor(link: &str, rel: &str, key: &str) -> String {
 
 /// A list with nobody on it answers the empty array, with no `Link` header:
 /// there is no membership to key a page on.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_empty_list_answers_the_empty_array(pool: PgPool) {
+#[tokio::test]
+async fn an_empty_list_answers_the_empty_array() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let app = common::test_app(pool);
 
@@ -317,11 +319,76 @@ async fn an_empty_list_answers_the_empty_array(pool: PgPool) {
     assert_eq!(response.header("link"), None, "and nothing to link to");
 }
 
+/// The `Account` entity keys a member entry must render.
+const ACCOUNT_KEYS: [&str; 6] = [
+    "url",
+    "acct",
+    "display_name",
+    "created_at",
+    "followers_count",
+    "pleroma",
+];
+
+/// One member entry is a rendered `Account`: every key of the entity there.
+fn assert_account_keys(first: &Value) {
+    for key in ACCOUNT_KEYS {
+        assert!(
+            first.get(key).is_some(),
+            "and every `Account` entity key `{key}` is rendered"
+        );
+    }
+}
+
+/// The cursor semantics over the same list: `max_id` walks to the older
+/// membership, `min_id` and `since_id` walk back from there, newest first.
+async fn assert_cursor_walk(app: &Router, token: &str, list: Uuid, next: &str) {
+    let older = members(app, token, list, &format!("limit=2&max_id={next}")).await;
+    assert_eq!(
+        accts(&older.json::<Vec<Value>>()),
+        ["bob"],
+        "max_id walks to the membership added before the cursor"
+    );
+    let back = cursor(
+        older
+            .header("link")
+            .expect("one row is a page, and a page links"),
+        "prev",
+        "min_id",
+    );
+    let back_again = listed(app, token, list, &format!("limit=2&min_id={back}")).await;
+    assert_eq!(
+        accts(&back_again),
+        ["dave", "carol"],
+        "min_id walks back from the older page, still newest first"
+    );
+    let forward = listed(app, token, list, &format!("limit=2&since_id={back}")).await;
+    assert_eq!(
+        accts(&forward),
+        ["dave", "carol"],
+        "and since_id reads everything newer than the cursor it polls with"
+    );
+}
+
+/// The `Link` header a members page carries: Pleroma's `add_link_headers`
+/// over the position ordinals of the page, on the request's own `path`, with
+/// nothing else in the query.
+fn assert_members_link(link: &str, path: &str, next: &str, newest: &str) {
+    let expected = format!(
+        "<{BASE}{path}?max_id={next}>; rel=\"next\", <{BASE}{path}?min_id={newest}>; rel=\"prev\""
+    );
+    assert_eq!(
+        link, expected,
+        "the Link header is the two cursors and nothing else"
+    );
+}
+
 /// The page walk: newest membership first, `max_id` older, `min_id` newer,
 /// `since_id` forward, the `Link` header keyed on the position ordinals of the
 /// page it describes, and `limit=0` every member of the list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn members_are_answered_newest_membership_first(pool: PgPool) {
+#[tokio::test]
+async fn members_are_answered_newest_membership_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let app = common::test_app(pool.clone());
     added(&app, &scene.token, scene.list.id, &scene.ids()).await;
@@ -342,20 +409,7 @@ async fn members_are_answered_newest_membership_first(pool: PgPool) {
         ],
         "the entities carry the members' own ids"
     );
-    let first = every.first().expect("three members are on the page");
-    for key in [
-        "url",
-        "acct",
-        "display_name",
-        "created_at",
-        "followers_count",
-        "pleroma",
-    ] {
-        assert!(
-            first.get(key).is_some(),
-            "and every `Account` entity key `{key}` is rendered"
-        );
-    }
+    assert_account_keys(every.first().expect("three members are on the page"));
     assert_eq!(
         listed(&app, &scene.token, scene.list.id, "").await.len(),
         3,
@@ -369,91 +423,39 @@ async fn members_are_answered_newest_membership_first(pool: PgPool) {
         ["dave", "carol"],
         "the two newest memberships"
     );
+    let path = members_path(scene.list.id);
     let link = page
         .header("link")
         .expect("a page that leaves a member out links to the rest")
         .to_owned();
-    let path = members_path(scene.list.id);
     let next = cursor(&link, "next", "max_id");
     let newest = cursor(&link, "prev", "min_id");
-    assert_eq!(
-        link,
-        format!(
-            "<{BASE}{path}?max_id={next}>; rel=\"next\", \
-             <{BASE}{path}?min_id={newest}>; rel=\"prev\""
-        ),
-        "Pleroma's `add_link_headers` over the position ordinals, the \
-         request's own path, and nothing else in the query"
-    );
+    assert_members_link(&link, &path, &next, &newest);
 
-    let older = members(
-        &app,
-        &scene.token,
-        scene.list.id,
-        &format!("limit=2&max_id={next}"),
-    )
-    .await;
+    assert_cursor_walk(&app, &scene.token, scene.list.id, &next).await;
+    let empty = [
+        members(
+            &app,
+            &scene.token,
+            scene.list.id,
+            &format!("since_id={newest}"),
+        )
+        .await,
+        members(&app, &scene.token, scene.list.id, "limit=2&max_id=0").await,
+    ];
+    for past_end in &empty {
+        common::assert_answer(
+            past_end,
+            StatusCode::OK,
+            "a page past the newest membership",
+        );
+        assert_eq!(past_end.text(), "[]", "is the empty array");
+    }
     assert_eq!(
-        accts(&older.json::<Vec<Value>>()),
-        ["bob"],
-        "max_id walks to the membership added before the cursor"
+        empty[0].header("link"),
+        None,
+        "and an empty page sends no Link header at all"
     );
-    let back = cursor(
-        older
-            .header("link")
-            .expect("one row is a page, and a page links"),
-        "prev",
-        "min_id",
-    );
-    assert_eq!(
-        accts(
-            &listed(
-                &app,
-                &scene.token,
-                scene.list.id,
-                &format!("limit=2&min_id={back}")
-            )
-            .await
-        ),
-        ["dave", "carol"],
-        "min_id walks back from the older page, still newest first"
-    );
-    assert_eq!(
-        accts(
-            &listed(
-                &app,
-                &scene.token,
-                scene.list.id,
-                &format!("limit=2&since_id={back}")
-            )
-            .await
-        ),
-        ["dave", "carol"],
-        "and since_id reads everything newer than the cursor it polls with"
-    );
-
-    let ahead = members(
-        &app,
-        &scene.token,
-        scene.list.id,
-        &format!("since_id={newest}"),
-    )
-    .await;
-    assert_eq!(
-        ahead.status,
-        StatusCode::OK,
-        "nothing is newer than the newest membership"
-    );
-    assert_eq!(ahead.text(), "[]", "the empty array,");
-    assert_eq!(ahead.header("link"), None, "and no Link header at all");
-
-    let past = members(&app, &scene.token, scene.list.id, "limit=2&max_id=0").await;
-    assert_eq!(
-        past.status,
-        StatusCode::OK,
-        "and a cursor before every membership reads the empty page"
-    );
-    assert_eq!(past.text(), "[]", "the same empty answer");
 
     let second_list = seed(&pool, &scene.alice, "Work").await;
     assert!(
@@ -466,8 +468,10 @@ async fn members_are_answered_newest_membership_first(pool: PgPool) {
 
 /// The default page is 20 members, an explicit `limit` above the cap falls to
 /// the cap, and `limit=0` answers all of them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_default_page_is_twenty_members(pool: PgPool) {
+#[tokio::test]
+async fn the_default_page_is_twenty_members() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     assert_eq!(
         CAP,
         usize::try_from(MAX_LIMIT).expect("the cap is a page size"),
@@ -507,8 +511,10 @@ async fn the_default_page_is_twenty_members(pool: PgPool) {
 /// Both body spellings add; a member who is already there keeps the place they
 /// hold instead of moving to the end; an empty batch is accepted and changes
 /// nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn adding_is_idempotent_in_either_body_spelling(pool: PgPool) {
+#[tokio::test]
+async fn adding_is_idempotent_in_either_body_spelling() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let app = common::test_app(pool);
 
@@ -563,8 +569,10 @@ async fn adding_is_idempotent_in_either_body_spelling(pool: PgPool) {
 /// one whose request is still waiting, are the ticket's 422 — and a batch that
 /// mixes the two writes nothing at all. Accepting the request is what lets the
 /// same account in.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn only_followed_accounts_can_be_added(pool: PgPool) {
+#[tokio::test]
+async fn only_followed_accounts_can_be_added() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let erin = user(&pool, "erin").await;
     let frank = locked_user(&pool, "frank").await;
@@ -621,8 +629,10 @@ async fn only_followed_accounts_can_be_added(pool: PgPool) {
 /// outranks the follow rule: the phantom in a mixed batch is answered before
 /// the followed one is ever considered. A body without `account_ids` anywhere
 /// is the parameter 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_account_ids_answer_404(pool: PgPool) {
+#[tokio::test]
+async fn unknown_account_ids_answer_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let phantom = Uuid::now_v7();
     let app = common::test_app(pool);
@@ -680,48 +690,49 @@ async fn unknown_account_ids_answer_404(pool: PgPool) {
     );
 }
 
+/// `DELETE`s the members of `scene`'s list, naming `ids`, through the JSON
+/// body.
+async fn removed(app: &Router, scene: &Scene, ids: &[Uuid]) -> common::TestResponse {
+    let texts: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    remove_json(
+        app,
+        &scene.token,
+        scene.list.id,
+        json!({"account_ids": texts}),
+    )
+    .await
+}
+
+/// The members `scene`'s list still holds, by nickname, in page order.
+async fn assert_members(app: &Router, scene: &Scene, want: &[&str], why: &str) {
+    let listed = listed(app, &scene.token, scene.list.id, "limit=0").await;
+    assert_eq!(accts(&listed), want.to_vec(), "{why}");
+}
+
 /// `DELETE` answers `{}` for every batch: a member goes, a non-member is
 /// ignored, the ids arrive in the body or in the query, and neither an unknown
 /// account nor a malformed id is an error here.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn removing_members_answers_the_empty_object(pool: PgPool) {
+#[tokio::test]
+async fn removing_members_answers_the_empty_object() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let erin = user(&pool, "erin").await;
     let app = common::test_app(pool);
     added(&app, &scene.token, scene.list.id, &scene.ids()).await;
 
-    let gone = remove_json(
-        &app,
-        &scene.token,
-        scene.list.id,
-        account_ids(&[scene.bob.id]),
-    )
-    .await;
-    assert_eq!(gone.status, StatusCode::OK, "a body removes a member");
+    let gone = removed(&app, &scene, &[scene.bob.id]).await;
+    common::assert_answer(&gone, StatusCode::OK, "a body removes a member");
     assert_eq!(gone.json_value(), json!({}), "and answers the empty object");
-    assert_eq!(
-        accts(&listed(&app, &scene.token, scene.list.id, "limit=0").await),
-        ["dave", "carol"],
-        "one membership went"
-    );
+    assert_members(&app, &scene, &["dave", "carol"], "one membership went").await;
 
-    let twice = remove_json(
-        &app,
-        &scene.token,
-        scene.list.id,
-        account_ids(&[scene.bob.id]),
-    )
-    .await;
-    assert_eq!(
-        twice.status,
+    let twice = removed(&app, &scene, &[scene.bob.id]).await;
+    common::assert_answer(
+        &twice,
         StatusCode::OK,
-        "removing a non-member is not an error"
+        "removing a non-member is not an error",
     );
-    assert_eq!(
-        accts(&listed(&app, &scene.token, scene.list.id, "limit=0").await),
-        ["dave", "carol"],
-        "and it changed nothing"
-    );
+    assert_members(&app, &scene, &["dave", "carol"], "and it changed nothing").await;
 
     let by_query = remove_query(
         &app,
@@ -730,21 +741,13 @@ async fn removing_members_answers_the_empty_object(pool: PgPool) {
         &format!("account_ids[]={}", scene.dave.id),
     )
     .await;
-    assert_eq!(
-        by_query.status,
-        StatusCode::OK,
-        "the query spelling removes"
-    );
+    common::assert_answer(&by_query, StatusCode::OK, "the query spelling removes");
     assert_eq!(
         by_query.json_value(),
         json!({}),
         "and answers the empty object"
     );
-    assert_eq!(
-        accts(&listed(&app, &scene.token, scene.list.id, "limit=0").await),
-        ["carol"],
-        "dave is gone"
-    );
+    assert_members(&app, &scene, &["carol"], "dave is gone").await;
 
     let texts: Vec<String> = vec![
         erin.id.to_string(),
@@ -758,17 +761,18 @@ async fn removing_members_answers_the_empty_object(pool: PgPool) {
         json!({"account_ids": texts}),
     )
     .await;
-    assert_eq!(
-        mixed.status,
+    common::assert_answer(
+        &mixed,
         StatusCode::OK,
-        "an account that is on nobody's list and a malformed id ride along"
+        "an account on nobody's list and a malformed id ride along",
     );
-    assert!(
-        listed(&app, &scene.token, scene.list.id, "limit=0")
-            .await
-            .is_empty(),
-        "the real member went and the rest was ignored"
-    );
+    assert_members(
+        &app,
+        &scene,
+        &[],
+        "the real member went and the rest was ignored",
+    )
+    .await;
 
     let nothing = common::TestRequest::delete(&members_path(scene.list.id))
         .bearer(&scene.token)
@@ -784,8 +788,10 @@ async fn removing_members_answers_the_empty_object(pool: PgPool) {
 /// Unfollowing an account takes it out of every list of the account that
 /// stopped following it, while another owner's membership of the same account
 /// is not hers to prune.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unfollowing_prunes_the_followers_lists(pool: PgPool) {
+#[tokio::test]
+async fn unfollowing_prunes_the_followers_lists() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let carol_token = token(&pool, &scene.carol, "read:lists").await;
     let carols = seed(&pool, &scene.carol, "carol's own").await;
@@ -831,8 +837,10 @@ async fn unfollowing_prunes_the_followers_lists(pool: PgPool) {
 /// A list that is malformed, unknown or another account's is one and the same
 /// 404 on all three member routes — for a stranger and for an account that is
 /// a member of it — and the owner's rows survive every attempt.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_list_that_is_not_the_callers_is_404(pool: PgPool) {
+#[tokio::test]
+async fn a_list_that_is_not_the_callers_is_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let (erin, erin_token) = user_and_token(&pool, "erin", "read:lists write:lists").await;
     let bob_token = token(&pool, &scene.bob, "read:lists write:lists").await;
@@ -900,8 +908,10 @@ async fn a_list_that_is_not_the_callers_is_404(pool: PgPool) {
 
 /// A page cursor that is not a position is the pagination 400: the members
 /// page keys on ordinals, so an account id is no cursor here.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_cursor_that_is_not_a_position_is_a_bad_request(pool: PgPool) {
+#[tokio::test]
+async fn a_cursor_that_is_not_a_position_is_a_bad_request() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
     let app = common::test_app(pool.clone());
     added(&app, &scene.token, scene.list.id, &[scene.bob.id]).await;
@@ -930,38 +940,25 @@ async fn a_cursor_that_is_not_a_position_is_a_bad_request(pool: PgPool) {
 /// user, and after that `read:lists` to read and `write:lists` to change, with
 /// the broad `read`/`write` trees passing on both sides and an unrelated
 /// sub-scope refused on all three.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_scope_pipeline_guards_the_member_routes(pool: PgPool) {
+#[tokio::test]
+async fn the_scope_pipeline_guards_the_member_routes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let scene = Scene::new(&pool).await;
-    let (reader, reader_token) = user_and_token(&pool, "reader", "read:lists").await;
-    let readers_own = seed(&pool, &reader, "reader's own").await;
-    let (mutator, mutator_token) = user_and_token(&pool, "mutator", "write:lists").await;
+    let (_reader, reader_token) = user_and_token(&pool, "reader", "read:lists").await;
+    let (_mutator, mutator_token) = user_and_token(&pool, "mutator", "write:lists").await;
     let (_narrow, wrong_scope) =
         user_and_token(&pool, "narrow", "read:statuses write:statuses").await;
-    let (broad_reader, broad_read) = user_and_token(&pool, "broad_r", "read").await;
-    let broads_own = seed(&pool, &broad_reader, "broad read's own").await;
-    let (_broad_write, broad_write) = user_and_token(&pool, "broad_w", "write").await;
+    let (_broad_reader, broad_read) = user_and_token(&pool, "broad_r", "read").await;
     let app_only = common::create_app_only_token(&pool, "read write").await;
-    let app = common::test_app(pool.clone());
-
-    // Mutator may write lists but has followed nobody: give her a list of her
-    // own and someone she follows to put on it.
-    let theirs = seed(&pool, &mutator, "mutator's own").await;
-    follow_user(&pool, &mutator, &scene.bob).await;
+    let app = common::test_app(pool);
 
     let anonymous = common::TestRequest::get(&members_path(scene.list.id))
         .send(&app)
         .await;
-    assert_eq!(
-        anonymous.status,
-        StatusCode::UNAUTHORIZED,
-        "no token is a 401"
-    );
-    assert_eq!(
-        anonymous.json_value()["error"],
-        "Invalid credentials",
-        "Pleroma's wording for an absent token"
-    );
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "no token is a 401");
+    common::assert_error(&anonymous, "Invalid credentials", "the absent token");
+
     let bogus = add_json(
         &app,
         "not-a-real-token",
@@ -969,26 +966,22 @@ async fn the_scope_pipeline_guards_the_member_routes(pool: PgPool) {
         json!({"account_ids": []}),
     )
     .await;
-    assert_eq!(
-        bogus.status,
-        StatusCode::UNAUTHORIZED,
-        "a bogus token is a 401"
-    );
-    assert_eq!(
-        bogus.json_value()["error"],
+    common::assert_answer(&bogus, StatusCode::UNAUTHORIZED, "a bogus token is a 401");
+    common::assert_error(
+        &bogus,
         "The access token is invalid",
-        "naming the token as the problem"
+        "the token-naming wording",
     );
-    let as_app = members(&app, &app_only, scene.list.id, "").await;
-    assert_eq!(
-        as_app.status,
+
+    let userless = [
+        members(&app, &app_only, scene.list.id, "").await,
+        add_json(&app, &app_only, scene.list.id, account_ids(&[])).await,
+    ];
+    common::assert_all_refused(
+        &userless,
         StatusCode::FORBIDDEN,
-        "an app token is a 403"
-    );
-    assert_eq!(
-        as_app.json_value()["error"],
         "This API requires an authenticated user",
-        "naming what is missing"
+        "an app-only token",
     );
 
     for (who, bearer) in [
@@ -996,15 +989,15 @@ async fn the_scope_pipeline_guards_the_member_routes(pool: PgPool) {
         ("`write:lists`", &mutator_token),
     ] {
         let read = members(&app, bearer, scene.list.id, "").await;
-        assert_eq!(
-            read.status,
+        common::assert_answer(
+            &read,
             StatusCode::FORBIDDEN,
-            "{who} may not read members"
+            &format!("{who} may not read members"),
         );
-        assert_eq!(
-            read.json_value()["error"],
+        common::assert_error(
+            &read,
             "Insufficient permissions: read:lists.",
-            "the denial names the missing scope for {who}"
+            &format!("the read denial for {who}"),
         );
     }
 
@@ -1013,43 +1006,53 @@ async fn the_scope_pipeline_guards_the_member_routes(pool: PgPool) {
         ("`read:lists`", &reader_token),
         ("the broad `read`", &broad_read),
     ] {
-        let add = add_json(&app, bearer, scene.list.id, account_ids(&[scene.bob.id])).await;
-        assert_eq!(
-            add.status,
+        let refused = [
+            add_json(&app, bearer, scene.list.id, account_ids(&[scene.bob.id])).await,
+            remove_json(&app, bearer, scene.list.id, account_ids(&[scene.bob.id])).await,
+        ];
+        common::assert_all_refused(
+            &refused,
             StatusCode::FORBIDDEN,
-            "{who} may not add members"
-        );
-        assert_eq!(
-            add.json_value()["error"],
             "Insufficient permissions: write:lists.",
-            "the denial names the missing scope for {who}"
-        );
-        let remove = remove_json(&app, bearer, scene.list.id, account_ids(&[scene.bob.id])).await;
-        assert_eq!(
-            remove.status,
-            StatusCode::FORBIDDEN,
-            "{who} may not remove members"
-        );
-        assert_eq!(
-            remove.json_value()["error"],
-            "Insufficient permissions: write:lists.",
-            "and says the same thing for {who}"
+            &format!("{who} may not change members"),
         );
     }
+}
+
+/// The granted side of the same pipeline: `read:lists` and the broad `read`
+/// read the members of a list of their own (and still 404 on somebody else's,
+/// because the scope check runs first), `write:lists` adds to her own list,
+/// and the broad `write` may not reach into another account's.
+#[tokio::test]
+async fn the_granted_scopes_reach_only_their_own_lists() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let scene = Scene::new(&pool).await;
+    let (reader, reader_token) = user_and_token(&pool, "reader", "read:lists").await;
+    let readers_own = seed(&pool, &reader, "reader's own").await;
+    let (mutator, mutator_token) = user_and_token(&pool, "mutator", "write:lists").await;
+    let (broad_reader, broad_read) = user_and_token(&pool, "broad_r", "read").await;
+    let broads_own = seed(&pool, &broad_reader, "broad read's own").await;
+    let (_broad_write, broad_write) = user_and_token(&pool, "broad_w", "write").await;
+    let app = common::test_app(pool.clone());
+    let theirs = seed(&pool, &mutator, "mutator's own").await;
+    follow_user(&pool, &mutator, &scene.bob).await;
 
     for (who, bearer, own) in [
         ("`read:lists`", &reader_token, readers_own.id),
         ("the broad `read`", &broad_read, broads_own.id),
     ] {
-        assert_eq!(
-            members(&app, bearer, own, "").await.status,
+        let own_list = members(&app, bearer, own, "").await;
+        common::assert_answer(
+            &own_list,
             StatusCode::OK,
-            "{who} reads the members of a list of her own"
+            &format!("{who} reads her own members"),
         );
-        assert_eq!(
-            members(&app, bearer, scene.list.id, "").await.status,
+        let foreign = members(&app, bearer, scene.list.id, "").await;
+        common::assert_answer(
+            &foreign,
             StatusCode::NOT_FOUND,
-            "...and the 404 on alice's, which is the scope check passing first"
+            &format!("{who} gets the 404 on alice's list: the scope check passes first"),
         );
     }
     added(&app, &mutator_token, theirs.id, &[scene.bob.id]).await;

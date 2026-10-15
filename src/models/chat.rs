@@ -1044,8 +1044,10 @@ mod tests {
         String::new()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_or_create_is_idempotent_and_per_direction(pool: PgPool) {
+    #[tokio::test]
+    async fn get_or_create_is_idempotent_and_per_direction() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
 
@@ -1091,8 +1093,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_chat_is_only_its_owner_s(pool: PgPool) {
+    #[tokio::test]
+    async fn a_chat_is_only_its_owner_s() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let alice_chat = get_or_create(&pool, &alice, &bob).await.unwrap();
@@ -1131,8 +1135,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn pinning_is_per_participant_and_orders_the_list(pool: PgPool) {
+    #[tokio::test]
+    async fn pinning_is_per_participant_and_orders_the_list() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let carol = local(&pool, "carol").await;
@@ -1206,8 +1212,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn add_message_writes_both_sides_with_their_read_flags(pool: PgPool) {
+    #[tokio::test]
+    async fn add_message_writes_both_sides_with_their_read_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
 
@@ -1275,8 +1283,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_message_bumps_both_sides_of_the_conversation(pool: PgPool) {
+    #[tokio::test]
+    async fn a_message_bumps_both_sides_of_the_conversation() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let carol = local(&pool, "carol").await;
@@ -1324,8 +1334,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_remote_recipient_gets_no_chat_and_no_reference(pool: PgPool) {
+    #[tokio::test]
+    async fn a_remote_recipient_gets_no_chat_and_no_reference() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let mallory = remote(&pool, "mallory").await;
 
@@ -1371,8 +1383,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_overlong_message_is_refused_before_anything_is_written(pool: PgPool) {
+    #[tokio::test]
+    async fn an_overlong_message_is_refused_before_anything_is_written() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let too_long = "x".repeat(MAX_CHAT_MESSAGE_CHARS + 1);
@@ -1412,8 +1426,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn message_pages_walk_by_reference_id(pool: PgPool) {
+    #[tokio::test]
+    async fn message_pages_walk_by_reference_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let mut sent = Vec::new();
@@ -1493,8 +1509,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn chat_pages_walk_by_activity_and_id(pool: PgPool) {
+    #[tokio::test]
+    async fn chat_pages_walk_by_activity_and_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let mut opened = Vec::new();
         for nickname in ["bob", "carol", "dave"] {
@@ -1571,12 +1589,14 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn removing_a_reference_hides_a_message_from_one_side_only(pool: PgPool) {
+    #[tokio::test]
+    async fn removing_a_reference_hides_a_message_from_one_side_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
-        let (message, alice_ref, bob_ref) = send(&pool, &alice, &bob, "alice says").await;
-        let bobs_ref = bob_ref.expect("bob is local");
+        let (message, alice_ref, recipient_ref) = send(&pool, &alice, &bob, "alice says").await;
+        let bobs_ref = recipient_ref.expect("bob is local");
 
         assert!(
             !delete_message_for(&pool, alice.id, bobs_ref.id)
@@ -1631,12 +1651,14 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_sender_withdrawing_a_message_takes_it_from_everyone(pool: PgPool) {
+    #[tokio::test]
+    async fn a_sender_withdrawing_a_message_takes_it_from_everyone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
-        let (message, alice_ref, bob_ref) = send(&pool, &alice, &bob, "take it back").await;
-        let bobs_ref = bob_ref.expect("bob is local");
+        let (message, alice_ref, recipient_ref) = send(&pool, &alice, &bob, "take it back").await;
+        let bobs_ref = recipient_ref.expect("bob is local");
 
         assert!(
             delete_message_for(&pool, alice.id, alice_ref.id)
@@ -1679,8 +1701,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn marking_a_chat_read_walks_the_unread_flags(pool: PgPool) {
+    #[tokio::test]
+    async fn marking_a_chat_read_walks_the_unread_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let mut references = Vec::new();
@@ -1756,8 +1780,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn marking_one_message_read_returns_it(pool: PgPool) {
+    #[tokio::test]
+    async fn marking_one_message_read_returns_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let (message, alice_ref, recipient_ref) = send(&pool, &alice, &bob, "read me").await;
@@ -1835,8 +1861,10 @@ mod tests {
         .expect("the backdate runs");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_idempotency_key_rides_the_row_and_replays_once(pool: PgPool) {
+    #[tokio::test]
+    async fn an_idempotency_key_rides_the_row_and_replays_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
 
@@ -1912,10 +1940,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_withdrawn_message_is_not_replayed_and_a_dropped_reference_goes_with_it(
-        pool: PgPool,
-    ) {
+    #[tokio::test]
+    async fn a_withdrawn_message_is_not_replayed_and_a_dropped_reference_goes_with_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let (message, alice_ref, _) = send_with(
@@ -1957,8 +1985,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_reference_is_only_its_own_chats(pool: PgPool) {
+    #[tokio::test]
+    async fn a_reference_is_only_its_own_chats() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let (message, alice_ref, bob_ref) = send(&pool, &alice, &bob, "pair").await;
@@ -2041,8 +2071,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_message_can_carry_an_attachment_and_an_ap_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_message_can_carry_an_attachment_and_an_ap_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let attachment = insert_attachment(&pool, &alice).await;
@@ -2086,8 +2118,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_empty_message_is_storable(pool: PgPool) {
+    #[tokio::test]
+    async fn an_empty_message_is_storable() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let mut conn = pool.begin().await.unwrap();
@@ -2125,8 +2159,10 @@ mod tests {
         row.0
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_reused_message_id_is_refused(pool: PgPool) {
+    #[tokio::test]
+    async fn a_reused_message_id_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let ap_id = format!("{TEST_BASE_URL}/objects/{}", new_id());
@@ -2167,8 +2203,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn media_that_is_not_a_row_cannot_be_attached(pool: PgPool) {
+    #[tokio::test]
+    async fn media_that_is_not_a_row_cannot_be_attached() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
 
@@ -2192,8 +2230,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn chats_key_their_owners_and_their_pairs(pool: PgPool) {
+    #[tokio::test]
+    async fn chats_key_their_owners_and_their_pairs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
 
@@ -2231,8 +2271,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_sender_takes_their_chats_and_messages(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_sender_takes_their_chats_and_messages() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let (message, _, bobs_ref) = send(&pool, &alice, &bob, "bye").await;
@@ -2268,8 +2310,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_an_attachment_leaves_the_message_standing(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_an_attachment_leaves_the_message_standing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let attachment = insert_attachment(&pool, &alice).await;

@@ -261,8 +261,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn ticks_inside_one_period_enqueue_exactly_one_job(pool: PgPool) {
+    #[tokio::test]
+    async fn ticks_inside_one_period_enqueue_exactly_one_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let jobs = vec![PeriodicJob {
             kind: "purge",
             queue: "scheduled",
@@ -294,8 +296,10 @@ mod tests {
         assert_eq!(row.args, json!({}), "periodic jobs run with empty args");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_new_period_enqueues_another_row(pool: PgPool) {
+    #[tokio::test]
+    async fn a_new_period_enqueues_another_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let jobs = vec![PeriodicJob {
             kind: "purge",
             queue: "scheduled",
@@ -312,8 +316,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn one_tick_enqueues_every_registry_job(pool: PgPool) {
+    #[tokio::test]
+    async fn one_tick_enqueues_every_registry_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let jobs = vec![
             PeriodicJob {
                 kind: "purge",
@@ -352,8 +358,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn run_ticks_the_periodic_schedule_under_a_paused_clock(pool: PgPool) {
+    #[tokio::test]
+    async fn run_ticks_the_periodic_schedule_under_a_paused_clock() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         // Drive the paused clock by hand. A running blocking task inhibits
         // tokio's auto-advance, so the virtual clock moves only where this
         // test calls `advance`: every real Postgres round trip lands while

@@ -67,8 +67,10 @@ fn shortcodes(body: &Value) -> Vec<&str> {
 
 /// An empty table answers 200 with the empty list, JSON content type and
 /// no auth required.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn empty_database_returns_an_empty_json_list(pool: PgPool) {
+#[tokio::test]
+async fn empty_database_returns_an_empty_json_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = get_emojis(&app).await;
     assert_eq!(response.status, StatusCode::OK, "200 without auth");
@@ -87,8 +89,10 @@ async fn empty_database_returns_an_empty_json_list(pool: PgPool) {
 /// Local enabled emojis come back ordered by category then shortcode
 /// (ungrouped last), with exact keys and values; disabled and remote
 /// rows are absent, and a bearer token changes nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lists_local_enabled_emojis_ordered_by_category_then_shortcode(pool: PgPool) {
+#[tokio::test]
+async fn lists_local_enabled_emojis_ordered_by_category_then_shortcode() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     seed_local(&pool, "uncategorised", None).await;
     seed_local(&pool, "zebra", Some("animals")).await;
     seed_local(&pool, "aardvark", Some("animals")).await;
@@ -158,8 +162,10 @@ async fn lists_local_enabled_emojis_ordered_by_category_then_shortcode(pool: PgP
 /// `visible_in_picker` is data the client honours, not a filter: an
 /// invisible-but-enabled emoji is listed with the flag false, and a row
 /// with no still url or pack serves those keys as `null`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn picker_visibility_and_absent_fields_pass_through(pool: PgPool) {
+#[tokio::test]
+async fn picker_visibility_and_absent_fields_pass_through() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _secret: custom_emoji::CustomEmoji = custom_emoji::upsert(
         &pool,
         &NewCustomEmoji {
@@ -190,8 +196,10 @@ async fn picker_visibility_and_absent_fields_pass_through(pool: PgPool) {
 
 /// `POST` to the collection is not routed: the endpoint is a read-only
 /// list (Pleroma's controller exposes `index` only).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn other_methods_are_not_routed(pool: PgPool) {
+#[tokio::test]
+async fn other_methods_are_not_routed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::post("/api/v1/custom_emojis")
         .json(&json!({"shortcode": "cat"}))

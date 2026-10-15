@@ -160,8 +160,10 @@ mod tests {
         (id, same_stamp)
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_first_note_is_written_and_read_back(pool: PgPool) {
+    #[tokio::test]
+    async fn a_first_note_is_written_and_read_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         set(&pool, alice.id, bob.id, "met at a conference")
@@ -176,8 +178,10 @@ mod tests {
         assert_eq!(row_count(&pool).await, 1, "and it is one row");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_second_note_replaces_the_first_in_the_same_row(pool: PgPool) {
+    #[tokio::test]
+    async fn a_second_note_replaces_the_first_in_the_same_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         set(&pool, alice.id, bob.id, "first").await.unwrap();
@@ -197,8 +201,10 @@ mod tests {
         assert_eq!(row_count(&pool).await, 1, "still exactly one note");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_empty_comment_deletes_the_note(pool: PgPool) {
+    #[tokio::test]
+    async fn an_empty_comment_deletes_the_note() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         set(&pool, alice.id, bob.id, "keep this").await.unwrap();
@@ -215,8 +221,10 @@ mod tests {
         assert_eq!(row_count(&pool).await, 0, "nothing came back");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_whitespace_comment_is_an_empty_comment(pool: PgPool) {
+    #[tokio::test]
+    async fn a_whitespace_comment_is_an_empty_comment() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         set(&pool, alice.id, bob.id, "keep this").await.unwrap();
@@ -236,8 +244,10 @@ mod tests {
         assert_eq!(row_count(&pool).await, 0, "and nothing was stored");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn notes_are_each_viewer_s_own(pool: PgPool) {
+    #[tokio::test]
+    async fn notes_are_each_viewer_s_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -259,8 +269,10 @@ mod tests {
         assert_eq!(row_count(&pool).await, 2, "one row per viewer");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_account_can_note_itself(pool: PgPool) {
+    #[tokio::test]
+    async fn an_account_can_note_itself() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         set(&pool, alice.id, alice.id, "self-reminder")
             .await
@@ -272,8 +284,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_many_batches_targets_and_skips_the_unnoted(pool: PgPool) {
+    #[tokio::test]
+    async fn get_many_batches_targets_and_skips_the_unnoted() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -300,8 +314,10 @@ mod tests {
         assert!(nothing.is_empty(), "and answers nothing at all");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_either_side_takes_the_note(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_either_side_takes_the_note() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         set(&pool, alice.id, bob.id, "doomed").await.unwrap();
@@ -330,8 +346,10 @@ mod tests {
         assert_eq!(row_count(&pool).await, 0, "the author's notes cascaded too");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_long_comment_is_stored_verbatim(pool: PgPool) {
+    #[tokio::test]
+    async fn a_long_comment_is_stored_verbatim() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         // The endpoint caps at 2000 characters; the table is text and the

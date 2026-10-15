@@ -44,10 +44,44 @@ fn error_text(response: &common::TestResponse) -> String {
 /// The secret fields only the registration response carries.
 const SECRET_FIELDS: [&str; 3] = ["client_id", "client_secret", "client_secret_expires_at"];
 
+/// The row a registration stored, read back by its own `client_id`: every
+/// column says what the response said.
+async fn assert_stored_row(pool: &PgPool, client_id: &str, id: Uuid, body: &Value) {
+    let stored = oauth_app::get_by_client_id(pool, client_id)
+        .await
+        .expect("the lookup reaches the database")
+        .expect("the registration stored a row");
+    assert_eq!(stored.id, id, "the response id is the stored primary key");
+    assert_eq!(stored.client_name, "My Client", "the stored name");
+    assert_eq!(
+        stored.redirect_uris,
+        body["redirect_uri"].as_str().expect("a string"),
+        "the stored redirect_uris is exactly the response's redirect_uri"
+    );
+    assert_eq!(
+        stored.scopes, "read write",
+        "the stored scopes is the space-joined list"
+    );
+    assert_eq!(
+        stored.website.as_deref(),
+        Some("https://client.example"),
+        "the stored website"
+    );
+    assert_eq!(
+        stored.client_secret,
+        body["client_secret"].as_str().expect("a secret"),
+        "the stored secret is the response's secret"
+    );
+    assert!(!stored.trusted, "registrations start untrusted");
+    assert!(stored.user_id.is_none(), "no owner without authentication");
+}
+
 /// A full JSON registration: every documented field echoes back, the
 /// credentials have Pleroma's shape, and the stored row is the response.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn json_registration_returns_the_application_entity(pool: PgPool) {
+#[tokio::test]
+async fn json_registration_returns_the_application_entity() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let response = post_json(
         &app,
@@ -103,39 +137,16 @@ async fn json_registration_returns_the_application_entity(pool: PgPool) {
     );
     assert_eq!(body["scopes"], json!(["read", "write"]), "a scope list");
 
-    let stored = oauth_app::get_by_client_id(&pool, client_id)
-        .await
-        .expect("the lookup reaches the database")
-        .expect("the registration stored a row");
-    assert_eq!(stored.id, id, "the response id is the stored primary key");
-    assert_eq!(stored.client_name, "My Client", "the stored name");
-    assert_eq!(
-        stored.redirect_uris,
-        body["redirect_uri"].as_str().expect("a string"),
-        "the stored redirect_uris is exactly the response's redirect_uri"
-    );
-    assert_eq!(
-        stored.scopes, "read write",
-        "the stored scopes is the space-joined list"
-    );
-    assert_eq!(
-        stored.website.as_deref(),
-        Some("https://client.example"),
-        "the stored website"
-    );
-    assert_eq!(
-        stored.client_secret, client_secret,
-        "the stored secret is the response's secret"
-    );
-    assert!(!stored.trusted, "registrations start untrusted");
-    assert!(stored.user_id.is_none(), "no owner without authentication");
+    assert_stored_row(&pool, client_id, id, &body).await;
 }
 
 /// Form bodies register the same way: `redirect_uris[]` keys become the
 /// joined storage string, a lone value is stored verbatim, and `+`
 /// separated scopes parse.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn form_registration_stores_and_echoes_the_same_values(pool: PgPool) {
+#[tokio::test]
+async fn form_registration_stores_and_echoes_the_same_values() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let list = common::TestRequest::post("/api/v1/apps")
         .form(&[
@@ -203,8 +214,10 @@ async fn form_registration_stores_and_echoes_the_same_values(pool: PgPool) {
 
 /// A minimal body (just the two required fields) gets the documented
 /// defaults.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn defaults_apply_for_a_minimal_registration(pool: PgPool) {
+#[tokio::test]
+async fn defaults_apply_for_a_minimal_registration() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let response = post_json(
         &app,
@@ -234,8 +247,10 @@ async fn defaults_apply_for_a_minimal_registration(pool: PgPool) {
 }
 
 /// A body without `client_name` is a 422 that names the field.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn missing_client_name_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn missing_client_name_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = post_json(&app, &json!({"redirect_uris": "https://x.example/cb"})).await;
     assert_eq!(
@@ -256,8 +271,10 @@ async fn missing_client_name_is_unprocessable(pool: PgPool) {
 
 /// `redirect_uris` must be present and carry something: absent, an empty
 /// string, an empty list and an all-blank list are all 422s.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn missing_or_empty_redirect_uris_are_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn missing_or_empty_redirect_uris_are_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     for body in [
         json!({"client_name": "C"}),
@@ -281,8 +298,10 @@ async fn missing_or_empty_redirect_uris_are_unprocessable(pool: PgPool) {
 }
 
 /// An unknown scope is a 422 naming the offender, and nothing is stored.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unknown_scope_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn an_unknown_scope_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let response = post_json(
         &app,
@@ -311,8 +330,10 @@ async fn an_unknown_scope_is_unprocessable(pool: PgPool) {
 
 /// Two registrations of the same client name get distinct ids and
 /// distinct credential pairs.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn two_registrations_get_distinct_credentials(pool: PgPool) {
+#[tokio::test]
+async fn two_registrations_get_distinct_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let first = post_json(
         &app,
@@ -336,8 +357,10 @@ async fn two_registrations_get_distinct_credentials(pool: PgPool) {
 
 /// A user-bound bearer token reaches `verify_credentials`: 200 with the
 /// application the token was issued for, and none of the secrets.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_accepts_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_accepts_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool.clone());
     let user = common::create_local_user(&pool, "appverifier").await;
     let app_row = common::create_app(&pool, "read write").await;
@@ -382,8 +405,10 @@ async fn verify_credentials_accepts_a_user_token(pool: PgPool) {
 /// An app-only (`client_credentials`-shaped) token — minted straight
 /// through the token model with no user — satisfies `verify_credentials`
 /// too.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_accepts_an_app_only_token(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_accepts_an_app_only_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool.clone());
     let app_row = common::create_app(&pool, "read").await;
     let token = oauth_token::create_token(
@@ -411,8 +436,10 @@ async fn verify_credentials_accepts_an_app_only_token(pool: PgPool) {
 /// The `verify_credentials` entity is exactly the registration entity
 /// with the credential fields removed: register over HTTP, mint a token
 /// for the registered app, and compare the two bodies key by key.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_is_the_registration_response_minus_the_secrets(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_is_the_registration_response_minus_the_secrets() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool.clone());
     let registration = post_json(
         &router,
@@ -471,8 +498,10 @@ async fn verify_credentials_is_the_registration_response_minus_the_secrets(pool:
 /// No token at all is a 401 with Pleroma's anonymous-challenge wording
 /// ("Invalid credentials", `EnsureAuthenticatedPlug`), still carrying the
 /// bearer challenge header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_without_a_token_is_unauthorized(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_without_a_token_is_unauthorized() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/apps/verify_credentials")
         .send(&router)
@@ -491,8 +520,10 @@ async fn verify_credentials_without_a_token_is_unauthorized(pool: PgPool) {
 }
 
 /// An unknown token and one past its expiry are the same 401.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_rejects_unknown_and_expired_tokens(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_rejects_unknown_and_expired_tokens() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool.clone());
     let app_row = common::create_app(&pool, "read").await;
     let lapsed = oauth_token::create_token(
@@ -537,8 +568,10 @@ async fn verify_credentials_rejects_unknown_and_expired_tokens(pool: PgPool) {
 
 /// A token whose owner's account is deactivated is refused too, matching
 /// the extractors' rules.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_rejects_a_deactivated_owners_token(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_rejects_a_deactivated_owners_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool.clone());
     let user = common::create_deactivated_user_with_password(&pool, "gone", "pw12345!").await;
     let app_row = common::create_app(&pool, "read").await;
@@ -572,8 +605,10 @@ async fn verify_credentials_rejects_a_deactivated_owners_token(pool: PgPool) {
 
 /// The fixture app is also reachable through the [`create_app_and_token`]
 /// helper: a user-bound token minted with the app in one step.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_accepts_the_combined_fixture_token(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_accepts_the_combined_fixture_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let router = common::test_app(pool.clone());
     let user = common::create_local_user(&pool, "combined").await;
     let raw = common::create_app_and_token(&pool, &user, "read").await;

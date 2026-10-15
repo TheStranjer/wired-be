@@ -139,7 +139,6 @@ pub async fn set_pending(pool: &PgPool, state: &str, pending: &Value) -> AppResu
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use sqlx::PgPool;
 
     use super::*;
 
@@ -154,8 +153,10 @@ mod tests {
     }
 
     /// [`get_valid`] answers `None` for a state that was never issued.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unissued_state_is_absent(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unissued_state_is_absent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             get_valid(&pool, "no-such-state", "github")
                 .await
@@ -167,8 +168,10 @@ mod tests {
 
     /// [`create`] issues the state, stamps the expiry and round-trips the
     /// parameters verbatim.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_stores_the_row_and_get_valid_reads_it(pool: PgPool) {
+    #[tokio::test]
+    async fn create_stores_the_row_and_get_valid_reads_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let issued = create(&pool, "github", &params())
             .await
             .expect("the insert runs");
@@ -192,8 +195,10 @@ mod tests {
     }
 
     /// Two issues are two states: the token is random, so nothing collides.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn each_issue_is_its_own_state(pool: PgPool) {
+    #[tokio::test]
+    async fn each_issue_is_its_own_state() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let first = create(&pool, "github", &params())
             .await
             .expect("the first issue runs");
@@ -205,8 +210,10 @@ mod tests {
 
     /// A state is only readable for the provider it was issued to: that is
     /// the endpoint's "Invalid state" refusal.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_state_is_only_valid_for_its_provider(pool: PgPool) {
+    #[tokio::test]
+    async fn a_state_is_only_valid_for_its_provider() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let issued = create(&pool, "github", &params())
             .await
             .expect("the insert runs");
@@ -220,8 +227,10 @@ mod tests {
     }
 
     /// An expired row is unreadable, and a live one beside it is not.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_expired_state_is_unreadable(pool: PgPool) {
+    #[tokio::test]
+    async fn an_expired_state_is_unreadable() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let expired = create(&pool, "github", &params())
             .await
             .expect("the first insert runs");
@@ -253,8 +262,10 @@ mod tests {
 
     /// [`set_pending`] adds the `pending` key and leaves the stored
     /// parameters beside it; it answers whether a live row took the write.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_pending_merges_into_the_stored_params(pool: PgPool) {
+    #[tokio::test]
+    async fn set_pending_merges_into_the_stored_params() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let issued = create(&pool, "github", &params())
             .await
             .expect("the insert runs");
@@ -290,8 +301,10 @@ mod tests {
     }
 
     /// An expired state takes no pending write either.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_pending_skips_an_expired_state(pool: PgPool) {
+    #[tokio::test]
+    async fn set_pending_skips_an_expired_state() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let issued = create(&pool, "github", &params())
             .await
             .expect("the insert runs");

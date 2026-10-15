@@ -307,26 +307,12 @@ fn entries_in(dir: &TempDir) -> usize {
         .count()
 }
 
-/// An uploaded `PNG` answers the `Attachment` entity with its dimensions,
-/// generated preview and `Blurhash`, records an unattached row for the
-/// uploader, and both files come back over the announced URLs.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
-    let dir = uploads_dir();
-    let (user, token) = uploader(&pool, "alice", SCOPE).await;
-    let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
-    let fixture = png(640, 480);
-
-    let entity = upload_file(
-        &app,
-        V1,
-        &token,
-        file_part("cat.png", "image/png", fixture.clone()),
-    )
-    .await;
-    let id = entity_id(&entity);
+/// The rendered `Attachment` entity of a fresh `PNG` upload: its type, the
+/// fields a local unattached upload leaves empty, the blurhash and both
+/// dimension variants of `meta`.
+fn assert_attachment_entity(entity: &Value, id: &str) {
     assert!(
-        Uuid::parse_str(&id).is_ok(),
+        Uuid::parse_str(id).is_ok(),
         "the id is a hyphenated UUID: {id}"
     );
     assert_eq!(entity["type"], "image", "a png is an image attachment");
@@ -355,9 +341,12 @@ async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
         entity.get("file_size").is_none(),
         "the entity is Mastodon's shape, which has no file size"
     );
+}
 
-    let row = stored_row(&pool, &id).await;
-    assert_eq!(row.user_id, Some(user.id), "the uploader owns the media");
+/// The row a `PNG` upload stored: the uploader's own, attached to nothing,
+/// with the analyzed dimensions and byte count of the file.
+fn assert_stored_png(row: &media_attachment::MediaAttachment, owner: &User, bytes: usize) {
+    assert_eq!(row.user_id, Some(owner.id), "the uploader owns the media");
     assert!(
         row.status_id.is_none(),
         "fresh media is attached to nothing"
@@ -366,20 +355,29 @@ async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
     assert_eq!(row.content_type, "image/png", "the stored type");
     assert_eq!(
         row.file_size,
-        Some(i64::try_from(fixture.len()).expect("a fixture size fits an i64")),
+        Some(i64::try_from(bytes).expect("a fixture size fits an i64")),
         "the byte count of the stored file"
     );
     assert_eq!(row.width, Some(640), "the analyzed width is stored");
     assert_eq!(row.height, Some(480), "and the analyzed height");
     assert!(row.blurhash.is_some(), "and the blurhash");
     assert!(!row.sensitive_hint, "the upload sends no sensitive flag");
+}
 
+/// The two keys the upload wrote — the original and its `_small` preview —
+/// plus the announcement of both: the uploader's namespace, the detected
+/// extension and the public URL for each key.
+fn assert_stored_keys(
+    entity: &Value,
+    row: &media_attachment::MediaAttachment,
+    owner: &User,
+) -> (String, String) {
     let key = row
         .storage_key
         .clone()
         .expect("a local upload has a storage key");
     assert!(
-        key.starts_with(&format!("{}/", user.id)),
+        key.starts_with(&format!("{}/", owner.id)),
         "the key is namespaced by the uploader: {key}"
     );
     assert_eq!(
@@ -388,7 +386,7 @@ async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
         "the key carries the detected type"
     );
     assert_eq!(
-        url_of(&entity),
+        url_of(entity),
         format!("{MEDIA_BASE_URL}/{key}"),
         "the announced url is the uploader's public url for the key"
     );
@@ -415,14 +413,19 @@ async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
     );
     assert_eq!(row.preview_width, Some(400), "the preview width is stored");
     assert_eq!(row.preview_height, Some(300), "and its height");
+    (key, preview_key)
+}
 
+/// Both files the upload wrote come back over the URLs it announced, as the
+/// bytes and the types they were detected as.
+async fn assert_both_files_serve(app: &Router, key: &str, preview_key: &str, bytes: Vec<u8>) {
     let served = common::TestRequest::get(&format!("/media/{key}"))
-        .send(&app)
+        .send(app)
         .await;
-    assert_eq!(served.status, StatusCode::OK, "the announced url serves");
+    common::assert_answer(&served, StatusCode::OK, "the announced url serves");
     assert_eq!(
         served.body,
-        Bytes::from(fixture),
+        Bytes::from(bytes),
         "the original is stored as uploaded, byte for byte"
     );
     assert_eq!(
@@ -431,9 +434,9 @@ async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
         "as the type that was detected"
     );
     let preview = common::TestRequest::get(&format!("/media/{preview_key}"))
-        .send(&app)
+        .send(app)
         .await;
-    assert_eq!(preview.status, StatusCode::OK, "the preview url serves");
+    common::assert_answer(&preview, StatusCode::OK, "the preview url serves");
     assert_eq!(
         preview.header("content-type"),
         Some("image/jpeg"),
@@ -441,10 +444,41 @@ async fn png_upload_answers_the_entity_and_serves_the_file(pool: PgPool) {
     );
 }
 
+/// An uploaded `PNG` answers the `Attachment` entity with its dimensions,
+/// generated preview and `Blurhash`, records an unattached row for the
+/// uploader, and both files come back over the announced URLs.
+#[tokio::test]
+async fn png_upload_answers_the_entity_and_serves_the_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (user, token) = uploader(&pool, "alice", SCOPE).await;
+    let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
+    let fixture = png(640, 480);
+
+    let entity = upload_file(
+        &app,
+        V1,
+        &token,
+        file_part("cat.png", "image/png", fixture.clone()),
+    )
+    .await;
+    let id = entity_id(&entity);
+    assert_attachment_entity(&entity, &id);
+
+    let row = stored_row(&pool, &id).await;
+    assert_stored_png(&row, &user, fixture.len());
+
+    let (key, preview_key) = assert_stored_keys(&entity, &row, &user);
+    assert_both_files_serve(&app, &key, &preview_key, fixture).await;
+}
+
 /// An upload whose bytes claim a `PNG` but do not decode is rejected with the
 /// ticket's 422 — before any file is written and without a row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_undecodable_image_is_rejected(pool: PgPool) {
+#[tokio::test]
+async fn an_undecodable_image_is_rejected() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "vicky", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -480,8 +514,10 @@ async fn an_undecodable_image_is_rejected(pool: PgPool) {
 
 /// An image over `MAX_IMAGE_PIXELS` is the ticket's 422: the header check
 /// rejects it before the upload is stored, without a full decode.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_over_pixel_image_is_rejected(pool: PgPool) {
+#[tokio::test]
+async fn an_over_pixel_image_is_rejected() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "wendy", SCOPE).await;
     let mut config = common::test_config_with_uploads_dir(dir.path());
@@ -511,8 +547,10 @@ async fn an_over_pixel_image_is_rejected(pool: PgPool) {
 
 /// A transparent PNG previews as a PNG: the generated file keeps the alpha
 /// instead of flattening it into a JPEG.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_transparent_png_previews_as_png(pool: PgPool) {
+#[tokio::test]
+async fn a_transparent_png_previews_as_png() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "xenia", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -559,8 +597,10 @@ async fn a_transparent_png_previews_as_png(pool: PgPool) {
 
 /// An animated GIF uploads like a still: the dimensions come from the
 /// header's (first frame's) canvas and the preview is that first frame.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_animated_gif_stores_first_frame_dimensions(pool: PgPool) {
+#[tokio::test]
+async fn an_animated_gif_stores_first_frame_dimensions() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (_user, token) = uploader(&pool, "yves", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -585,8 +625,10 @@ async fn an_animated_gif_stores_first_frame_dimensions(pool: PgPool) {
 
 /// Video and audio uploads are not analyzed: no preview, no `Blurhash`, no
 /// dimensions — the detection columns stay as empty as they were.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn video_and_audio_keep_no_detection(pool: PgPool) {
+#[tokio::test]
+async fn video_and_audio_keep_no_detection() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (_user, token) = uploader(&pool, "zoe", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -620,8 +662,10 @@ async fn video_and_audio_keep_no_detection(pool: PgPool) {
 
 /// Every accepted kind uploads as the type its bytes carry, and the entity's
 /// `type` follows it: `image`, `video` or `audio`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn each_media_kind_keeps_the_type_its_bytes_carry(pool: PgPool) {
+#[tokio::test]
+async fn each_media_kind_keeps_the_type_its_bytes_carry() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (_user, token) = uploader(&pool, "carol", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -662,8 +706,10 @@ async fn each_media_kind_keeps_the_type_its_bytes_carry(pool: PgPool) {
 
 /// `description` and `focus` reach the row and the entity reports them
 /// beside the detected dimensions.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn description_and_focus_are_stored(pool: PgPool) {
+#[tokio::test]
+async fn description_and_focus_are_stored() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "dave", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -714,8 +760,10 @@ async fn description_and_focus_are_stored(pool: PgPool) {
 
 /// A `focus` that is not two floats in `[-1.0, 1.0]` is a 422, and nothing is
 /// stored for it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_invalid_focus_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn an_invalid_focus_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "erin", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -757,8 +805,10 @@ async fn an_invalid_focus_is_unprocessable(pool: PgPool) {
 
 /// An absent `focus`, and one sent empty, store no focal point instead of
 /// failing: clearing the value is not a validation error.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_empty_focus_stores_nothing(pool: PgPool) {
+#[tokio::test]
+async fn an_empty_focus_stores_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "fred", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -799,8 +849,10 @@ async fn an_empty_focus_stores_nothing(pool: PgPool) {
 }
 
 /// No `file` part at all is the ticket's 422, whatever else the body holds.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_body_without_a_file_is_a_missing_parameter(pool: PgPool) {
+#[tokio::test]
+async fn a_body_without_a_file_is_a_missing_parameter() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "gina", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -866,8 +918,10 @@ async fn a_body_without_a_file_is_a_missing_parameter(pool: PgPool) {
 
 /// A `file` part that carries no bytes is rejected as blank: an empty file has
 /// no magic bytes to detect and would store nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_empty_file_is_rejected(pool: PgPool) {
+#[tokio::test]
+async fn an_empty_file_is_rejected() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "heidi", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -901,8 +955,10 @@ async fn an_empty_file_is_rejected(pool: PgPool) {
 
 /// Bytes that are not image, video or audio never enter the store, whether the
 /// detector names their type or not.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_file_that_is_not_media_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn a_file_that_is_not_media_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "ivan", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -930,8 +986,10 @@ async fn a_file_that_is_not_media_is_unprocessable(pool: PgPool) {
 
 /// The bytes decide the type, never the part header: a `PNG` sent as HTML is
 /// stored, named and served as the image it is.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_client_header_never_decides_the_type(pool: PgPool) {
+#[tokio::test]
+async fn the_client_header_never_decides_the_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (_user, token) = uploader(&pool, "judy", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -968,8 +1026,10 @@ async fn the_client_header_never_decides_the_type(pool: PgPool) {
 }
 
 /// A file over `UPLOAD_LIMIT_BYTES` is a 413 naming the limit it passed.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_oversize_file_is_payload_too_large(pool: PgPool) {
+#[tokio::test]
+async fn an_oversize_file_is_payload_too_large() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "ken", SCOPE).await;
     let app = common::test_app_with_upload_limits(pool.clone(), dir.path(), 64);
@@ -1011,8 +1071,10 @@ async fn an_oversize_file_is_payload_too_large(pool: PgPool) {
 /// `upload_body_limit`, which is what makes the configured limit the one that
 /// applies. A video stands in here: its bytes only need the magic header the
 /// detector reads, since nothing decodes them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_file_over_the_extractor_default_uploads(pool: PgPool) {
+#[tokio::test]
+async fn a_file_over_the_extractor_default_uploads() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (_user, token) = uploader(&pool, "lana", SCOPE).await;
     let app = common::test_app_with_upload_limits(pool.clone(), dir.path(), 4_000_000);
@@ -1041,8 +1103,10 @@ async fn a_file_over_the_extractor_default_uploads(pool: PgPool) {
 }
 
 /// Without a token the endpoint answers 401 and the body is never stored.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_anonymous_upload_is_unauthorized(pool: PgPool) {
+#[tokio::test]
+async fn an_anonymous_upload_is_unauthorized() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
 
@@ -1072,8 +1136,10 @@ async fn an_anonymous_upload_is_unauthorized(pool: PgPool) {
 
 /// A token that does not grant `write:media` is a 403 naming the scope, and an
 /// app-only token cannot upload at all.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_token_without_the_scope_is_forbidden(pool: PgPool) {
+#[tokio::test]
+async fn a_token_without_the_scope_is_forbidden() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, read_media) = uploader(&pool, "mona", "read:media").await;
     let (_other, write_statuses) = uploader(&pool, "nora", "write:statuses").await;
@@ -1128,8 +1194,10 @@ async fn a_token_without_the_scope_is_forbidden(pool: PgPool) {
 
 /// The broader `write` scope uploads too: `write:media` is satisfied by its
 /// top-level scope as well as by itself.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_broader_write_scope_uploads_too(pool: PgPool) {
+#[tokio::test]
+async fn the_broader_write_scope_uploads_too() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (_user, token) = uploader(&pool, "peggy", "write").await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -1153,8 +1221,10 @@ async fn the_broader_write_scope_uploads_too(pool: PgPool) {
 
 /// The two versions are one endpoint: same status, same entity keys, same
 /// fields, and two separate uploads.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn v1_and_v2_answer_the_same(pool: PgPool) {
+#[tokio::test]
+async fn v1_and_v2_answer_the_same() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "quinn", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -1231,8 +1301,10 @@ async fn v1_and_v2_answer_the_same(pool: PgPool) {
 /// A client-sent `thumbnail` part is accepted and ignored, whether sent as a
 /// file part or as a text field: the preview the row records is the generated
 /// one, keyed off the `file` part's stem, not the posted thumbnail's bytes.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_client_thumbnail_is_ignored_for_the_generated_preview(pool: PgPool) {
+#[tokio::test]
+async fn a_client_thumbnail_is_ignored_for_the_generated_preview() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "rosa", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -1290,8 +1362,10 @@ async fn a_client_thumbnail_is_ignored_for_the_generated_preview(pool: PgPool) {
 
 /// Rejected uploads leave nothing behind, and repeated uploads of the same
 /// bytes never share a key.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn repeated_uploads_do_not_share_a_key(pool: PgPool) {
+#[tokio::test]
+async fn repeated_uploads_do_not_share_a_key() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (user, token) = uploader(&pool, "sue", SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -1336,8 +1410,10 @@ async fn repeated_uploads_do_not_share_a_key(pool: PgPool) {
 
 /// The upload routes are `POST`-only: a `GET` there is a method mismatch, not
 /// a path the fallback swallows.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn only_post_uploads(pool: PgPool) {
+#[tokio::test]
+async fn only_post_uploads() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
 

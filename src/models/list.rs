@@ -476,8 +476,10 @@ mod tests {
             .expect("counting memberships succeeds")
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn create_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = create(
             &pool,
@@ -505,8 +507,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_defaults_match_the_column_defaults(pool: PgPool) {
+    #[tokio::test]
+    async fn create_defaults_match_the_column_defaults() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = create(&pool, alice.id, &titled("x"))
             .await
@@ -528,8 +532,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_owned_reads_the_owners_row_and_nobody_elses(pool: PgPool) {
+    #[tokio::test]
+    async fn get_owned_reads_the_owners_row_and_nobody_elses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = create(&pool, alice.id, &titled("mine"))
@@ -552,8 +558,10 @@ mod tests {
         assert!(missing.is_none(), "an unknown id reads the same way");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn for_user_is_oldest_first_and_the_owners_own(pool: PgPool) {
+    #[tokio::test]
+    async fn for_user_is_oldest_first_and_the_owners_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let first: List = seed(&pool, &alice, "first").await;
@@ -571,8 +579,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_changes_only_the_present_columns(pool: PgPool) {
+    #[tokio::test]
+    async fn update_changes_only_the_present_columns() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = create(
             &pool,
@@ -618,8 +628,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_replaces_every_named_column(pool: PgPool) {
+    #[tokio::test]
+    async fn update_replaces_every_named_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = seed(&pool, &alice, "before").await;
 
@@ -642,8 +654,10 @@ mod tests {
         assert!(rewritten.exclusive, "and the named flag all changed");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_with_nothing_named_keeps_the_row(pool: PgPool) {
+    #[tokio::test]
+    async fn update_with_nothing_named_keeps_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = seed(&pool, &alice, "kept").await;
 
@@ -657,8 +671,10 @@ mod tests {
         assert!(!rewritten.exclusive, "the row keeps every column");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_and_delete_of_a_foreign_or_missing_id_do_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn update_and_delete_of_a_foreign_or_missing_id_do_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = create(&pool, alice.id, &titled("mine"))
@@ -705,8 +721,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_takes_a_list_once(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_takes_a_list_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let doomed = seed(&pool, &alice, "doomed").await;
 
@@ -731,8 +749,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn lists_containing_answers_the_owners_membership_in_order(pool: PgPool) {
+    #[tokio::test]
+    async fn lists_containing_answers_the_owners_membership_in_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let first = seed(&pool, &alice, "first").await;
@@ -764,8 +784,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn membership_is_idempotent_only_through_the_key(pool: PgPool) {
+    #[tokio::test]
+    async fn membership_is_idempotent_only_through_the_key() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = seed(&pool, &alice, "hers").await;
@@ -791,8 +813,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_list_takes_its_memberships(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_list_takes_its_memberships() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let doomed = seed(&pool, &alice, "doomed").await;
@@ -812,8 +836,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_user_takes_their_lists_and_memberships(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_user_takes_their_lists_and_memberships() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = seed(&pool, &alice, "hers").await;
@@ -834,8 +860,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_member_takes_their_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_member_takes_their_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = seed(&pool, &alice, "hers").await;
@@ -855,8 +883,10 @@ mod tests {
         assert_eq!(count_lists(&pool).await, 1, "while alice's list stands");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn add_members_records_the_order_it_was_given(pool: PgPool) {
+    #[tokio::test]
+    async fn add_members_records_the_order_it_was_given() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -880,8 +910,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn adding_a_member_twice_writes_no_second_row(pool: PgPool) {
+    #[tokio::test]
+    async fn adding_a_member_twice_writes_no_second_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -906,8 +938,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn adding_nobody_writes_nobody(pool: PgPool) {
+    #[tokio::test]
+    async fn adding_nobody_writes_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let hers = seed(&pool, &alice, "hers").await;
 
@@ -927,8 +961,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn adding_to_a_list_that_does_not_exist_fails(pool: PgPool) {
+    #[tokio::test]
+    async fn adding_to_a_list_that_does_not_exist_fails() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let bob = user(&pool, "bob").await;
 
         let err = add_members(&pool, Uuid::now_v7(), &[bob.id])
@@ -941,8 +977,10 @@ mod tests {
         assert_eq!(count_members(&pool).await, 0, "and nothing was written");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn remove_members_takes_one_list_only(pool: PgPool) {
+    #[tokio::test]
+    async fn remove_members_takes_one_list_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let first = seed(&pool, &alice, "first").await;
@@ -976,8 +1014,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn removing_nobody_takes_nobody(pool: PgPool) {
+    #[tokio::test]
+    async fn removing_nobody_takes_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let carol = user(&pool, "carol").await;
         let hers = seed(&pool, &alice, "hers").await;
@@ -993,8 +1033,28 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn members_page_is_newest_membership_first(pool: PgPool) {
+    /// One page of `list`'s members with `query` applied, unwrapped with the
+    /// caller's own reason `why`.
+    async fn members(pool: &PgPool, list: &List, query: &str, why: &str) -> Vec<MemberEntry> {
+        members_page(pool, list.id, ordinal_page(query))
+            .await
+            .unwrap_or_else(|err| panic!("{why}: {err}"))
+    }
+
+    /// The `position` of entry `index` of `entries` — the ordinal a cursor is
+    /// keyed on — spelled as the page spells it.
+    fn position_of(entries: &[MemberEntry], index: usize, why: &str) -> String {
+        entries
+            .get(index)
+            .unwrap_or_else(|| panic!("{why}"))
+            .position
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn members_page_is_newest_membership_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -1006,79 +1066,57 @@ mod tests {
         let theirs = seed(&pool, &alice, "theirs").await;
         add_member(&pool, &theirs, &bob).await;
 
-        let first = members_page(&pool, hers.id, ordinal_page("limit=2"))
-            .await
-            .expect("the first page reads");
+        let first = members(&pool, &hers, "limit=2", "the first page reads").await;
         assert_eq!(
             nicks(&first),
             ["dave", "carol"],
             "newest membership first, and only the named list's"
         );
-        let oldest = first
-            .last()
-            .expect("the page holds two entries")
-            .position
-            .to_string();
+        let oldest = position_of(&first, 1, "the page holds two entries");
+        let newest = position_of(&first, 0, "the first page holds two entries");
 
-        let second = members_page(
+        let second = members(
             &pool,
-            hers.id,
-            ordinal_page(&format!("limit=2&max_id={oldest}")),
+            &hers,
+            &format!("limit=2&max_id={oldest}"),
+            "the next page reads",
         )
-        .await
-        .expect("the next page reads");
+        .await;
         assert_eq!(
             nicks(&second),
             ["bob"],
             "max_id walks to the older memberships"
         );
+        let only = position_of(&second, 0, "the second page holds one entry");
 
-        let back = members_page(
+        let back = members(
             &pool,
-            hers.id,
-            ordinal_page(&format!(
-                "limit=2&min_id={}",
-                second
-                    .first()
-                    .expect("the second page holds one entry")
-                    .position
-            )),
+            &hers,
+            &format!("limit=2&min_id={only}"),
+            "and min_id walks back",
         )
-        .await
-        .expect("and min_id walks back");
+        .await;
         assert_eq!(nicks(&back), ["dave", "carol"], "newer ones, newest first");
 
-        let since_newest = members_page(
+        let since_newest = members(
             &pool,
-            hers.id,
-            ordinal_page(&format!(
-                "limit=2&since_id={}",
-                first
-                    .first()
-                    .expect("the first page holds two entries")
-                    .position
-            )),
+            &hers,
+            &format!("limit=2&since_id={newest}"),
+            "since_id reads unseen rows",
         )
-        .await
-        .expect("since_id reads unseen rows");
+        .await;
         assert!(
             since_newest.is_empty(),
             "nothing is newer than the newest membership the client has seen"
         );
 
-        let since_oldest = members_page(
+        let since_oldest = members(
             &pool,
-            hers.id,
-            ordinal_page(&format!(
-                "limit=2&since_id={}",
-                second
-                    .first()
-                    .expect("the second page holds one entry")
-                    .position
-            )),
+            &hers,
+            &format!("limit=2&since_id={only}"),
+            "and a cursor further back reads forward",
         )
-        .await
-        .expect("and a cursor further back reads forward");
+        .await;
         assert_eq!(
             nicks(&since_oldest),
             ["dave", "carol"],
@@ -1086,8 +1124,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_zero_limit_answers_every_member(pool: PgPool) {
+    #[tokio::test]
+    async fn a_zero_limit_answers_every_member() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let hers = seed(&pool, &alice, "hers").await;
         let mut added = Vec::new();
@@ -1114,8 +1154,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn members_of_an_empty_list_are_nobody(pool: PgPool) {
+    #[tokio::test]
+    async fn members_of_an_empty_list_are_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let hers = seed(&pool, &alice, "hers").await;
 
@@ -1135,8 +1177,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn member_ids_of_an_unknown_list_are_nobody(pool: PgPool) {
+    #[tokio::test]
+    async fn member_ids_of_an_unknown_list_are_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             member_ids(&pool, Uuid::now_v7())
                 .await

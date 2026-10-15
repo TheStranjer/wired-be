@@ -1227,32 +1227,13 @@ mod tests {
         get_by_id(pool, id).await.unwrap().expect("row exists")
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_round_trips_every_column(pool: PgPool) {
-        let fetched_at = Utc::now().trunc_subsecs(6);
-        let new = NewUser {
-            email: Some("alice@example.org".to_owned()),
-            password_hash: Some(SECRET_HASH.to_owned()),
-            name: "Alice".to_owned(),
-            bio: "<p>hi</p>".to_owned(),
-            raw_bio: "hi".to_owned(),
-            avatar_url: Some(format!("{BASE}/avatar.png")),
-            banner_url: Some(format!("{BASE}/banner.png")),
-            profile_url: Some(local_ap_id(BASE, "alice")),
-            fields: json!([{"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"}]),
-            raw_fields: json!([{"name": "site", "value": "https://alice.example"}]),
-            inbox: Some(inbox(&local_ap_id(BASE, "alice"))),
-            public_key: Some("PUBLIC-PEM".to_owned()),
-            private_key: Some(SECRET_KEY.to_owned()),
-            last_fetched_at: Some(fetched_at),
-            ..local_new("alice")
-        };
-        let user = insert(&pool, &new).await.unwrap();
+    /// Every column of the fixture `NewUser` that came back on the inserted
+    /// row, plus the defaults the model and the database fill in.
+    fn assert_stored_columns(user: &User) {
         assert!(user.id.get_version_num() == 7, "id is a UUIDv7");
         assert_eq!(user.nickname, "alice", "the nickname round trips");
         assert_eq!(user.ap_id, format!("{BASE}/users/alice"), "ap_id");
         assert!(user.local.get(), "the local flag round trips");
-        assert!(user.domain.is_none(), "local users carry no domain");
         assert_eq!(user.actor_type, DEFAULT_ACTOR_TYPE, "constructor default");
         assert_eq!(
             user.email.as_deref(),
@@ -1301,7 +1282,6 @@ mod tests {
             Some("https://test.example/users/alice/inbox"),
             "inbox column"
         );
-        assert!(user.shared_inbox.is_none(), "unset endpoints stay NULL");
         assert_eq!(user.public_key.as_deref(), Some("PUBLIC-PEM"), "public key");
         assert_eq!(
             user.private_key.as_deref(),
@@ -1322,27 +1302,25 @@ mod tests {
             (0, 0, 0),
             "counts default to zero"
         );
-        assert!(user.last_status_at.is_none(), "no statuses yet");
-        assert_eq!(
-            user.last_fetched_at,
-            Some(fetched_at),
-            "timestamptz round trips"
-        );
         assert!(
             user.inserted_at <= user.updated_at,
             "the database stamps both timestamps"
         );
+    }
 
-        let by_id = get_by_id(&pool, user.id).await.unwrap().expect("by id");
-        let by_nickname = get_by_nickname(&pool, "ALiCE")
+    /// The four reads of [`crate::models::user`] all find the inserted row,
+    /// and two of them fold case the way `citext` does.
+    async fn assert_every_lookup_finds(pool: &PgPool, user: &User) {
+        let by_id = get_by_id(pool, user.id).await.unwrap().expect("by id");
+        let by_nickname = get_by_nickname(pool, "ALiCE")
             .await
             .unwrap()
             .expect("citext nickname lookup folds case");
-        let by_ap_id = get_by_ap_id(&pool, &user.ap_id)
+        let by_ap_id = get_by_ap_id(pool, &user.ap_id)
             .await
             .unwrap()
             .expect("by ap_id");
-        let by_email = get_by_email(&pool, "ALICE@example.org")
+        let by_email = get_by_email(pool, "ALICE@example.org")
             .await
             .unwrap()
             .expect("citext email lookup folds case");
@@ -1353,44 +1331,89 @@ mod tests {
             by_id.nickname, by_nickname.nickname,
             "every path reads the same row"
         );
-
-        let many = get_many(&pool, &[user.id, new_id()]).await.unwrap();
+        let many = get_many(pool, &[user.id, new_id()]).await.unwrap();
         assert_eq!(many.len(), 1, "unknown ids are simply absent");
         assert_eq!(
             many.first().map(|found| found.id),
             Some(user.id),
             "the known id comes back"
         );
+    }
+
+    /// The reads that find nothing: an empty id list, and an unknown actor id,
+    /// email or nickname.
+    async fn assert_unknown_lookups_answer_none(pool: &PgPool) {
         assert!(
-            get_many(&pool, &[]).await.unwrap().is_empty(),
+            get_many(pool, &[]).await.unwrap().is_empty(),
             "no ids, no rows"
         );
         assert!(
-            get_by_ap_id(&pool, "https://nowhere.example/users/x")
+            get_by_ap_id(pool, "https://nowhere.example/users/x")
                 .await
                 .unwrap()
                 .is_none(),
             "an unknown ap_id is None"
         );
         assert!(
-            get_by_email(&pool, "nobody@example.org")
+            get_by_email(pool, "nobody@example.org")
                 .await
                 .unwrap()
                 .is_none(),
             "an unknown email is None"
         );
         assert!(
-            get_by_nickname(&pool, "nobody").await.unwrap().is_none(),
+            get_by_nickname(pool, "nobody").await.unwrap().is_none(),
             "an unknown nickname is None"
         );
     }
 
-    /// Every Pleroma extension column at the default the migration states,
-    /// for a row inserted through the plain [`NewUser::local`] constructor
-    /// (which mirrors those defaults).
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn pleroma_columns_default_as_the_migration_states(pool: PgPool) {
-        let user = insert(&pool, &local_new("cara")).await.unwrap();
+    /// The local-user fixture of these tests: every column the model can
+    /// write, set to something distinct.
+    async fn inserted_alice(pool: &PgPool) -> User {
+        let fetched_at = Utc::now().trunc_subsecs(6);
+        let new = NewUser {
+            email: Some("alice@example.org".to_owned()),
+            password_hash: Some(SECRET_HASH.to_owned()),
+            name: "Alice".to_owned(),
+            bio: "<p>hi</p>".to_owned(),
+            raw_bio: "hi".to_owned(),
+            avatar_url: Some(format!("{BASE}/avatar.png")),
+            banner_url: Some(format!("{BASE}/banner.png")),
+            profile_url: Some(local_ap_id(BASE, "alice")),
+            fields: json!([{"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"}]),
+            raw_fields: json!([{"name": "site", "value": "https://alice.example"}]),
+            inbox: Some(inbox(&local_ap_id(BASE, "alice"))),
+            public_key: Some("PUBLIC-PEM".to_owned()),
+            private_key: Some(SECRET_KEY.to_owned()),
+            last_fetched_at: Some(fetched_at),
+            ..local_new("alice")
+        };
+        let user = insert(pool, &new).await.unwrap();
+        assert_eq!(
+            user.last_fetched_at,
+            Some(fetched_at),
+            "timestamptz round trips"
+        );
+        assert!(user.domain.is_none(), "local users carry no domain");
+        assert!(user.shared_inbox.is_none(), "unset endpoints stay NULL");
+        assert!(user.last_status_at.is_none(), "no statuses yet");
+        user
+    }
+
+    #[tokio::test]
+    async fn insert_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = inserted_alice(&pool).await;
+
+        assert_stored_columns(&user);
+        assert_every_lookup_finds(&pool, &user).await;
+        assert_unknown_lookups_answer_none(&pool).await;
+    }
+
+    /// The privacy and behaviour flags a plain [`NewUser::local`] row gets
+    /// from the migration.
+    fn assert_pleroma_flag_defaults(user: &User) {
         assert!(
             !user.hide_followers.get() && !user.hide_follows.get(),
             "the follow collections are public by default"
@@ -1420,13 +1443,19 @@ mod tests {
             !user.no_rich_text.get(),
             "rich text is on unless the account asks for plain text"
         );
-        assert_eq!(
-            user.default_scope, DEFAULT_SCOPE,
-            "statuses default to public"
-        );
         assert!(
             !user.sensitive_default.get(),
             "new statuses are not flagged sensitive by default"
+        );
+    }
+
+    /// The rest of the Pleroma extension columns of a plain
+    /// [`NewUser::local`] row: the empty collections and blobs, the unset
+    /// images and moves, and the account-state stamps.
+    fn assert_pleroma_value_defaults(user: &User) {
+        assert_eq!(
+            user.default_scope, DEFAULT_SCOPE,
+            "statuses default to public"
         );
         assert!(
             user.language.is_none(),
@@ -1480,11 +1509,128 @@ mod tests {
         );
     }
 
+    /// Every Pleroma extension column at the default the migration states,
+    /// for a row inserted through the plain [`NewUser::local`] constructor
+    /// (which mirrors those defaults).
+    #[tokio::test]
+    async fn pleroma_columns_default_as_the_migration_states() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = insert(&pool, &local_new("cara")).await.unwrap();
+
+        assert_pleroma_flag_defaults(&user);
+        assert_pleroma_value_defaults(&user);
+    }
+
+    /// The Pleroma extension flags, [`NewUser::default_scope`] and the
+    /// sensitive default, each set to the opposite of its migration default.
+    fn assert_pleroma_flags_round_trip(user: &User) {
+        assert!(
+            user.hide_followers.get()
+                && user.hide_follows.get()
+                && user.hide_followers_count.get()
+                && user.hide_follows_count.get(),
+            "the four hiding flags round trip as set"
+        );
+        assert!(
+            !user.hide_favorites.get(),
+            "so does the one defaulting to true, flipped"
+        );
+        assert!(
+            !user.allow_following_move.get()
+                && user.skip_thread_containment.get()
+                && !user.accepts_chat_messages.get()
+                && !user.show_role.get()
+                && user.no_rich_text.get(),
+            "behaviour and role flags round trip"
+        );
+        assert_eq!(
+            user.default_scope, "private",
+            "the default scope round trips"
+        );
+        assert!(
+            user.sensitive_default.get(),
+            "the sensitive default round trips through its flag"
+        );
+        assert!(user.show_birthday.get(), "the birthday switch round trips");
+        assert!(
+            !user.email_confirmed.get(),
+            "an unconfirmed email round trips"
+        );
+        assert!(user.approval_pending.get(), "pending approval round trips");
+    }
+
+    /// The Pleroma extension values: both arrays in the order they were
+    /// written, both jsonb blobs, the date, the move and the two stamps.
+    fn assert_pleroma_values_round_trip(user: &User, active_at: DateTime<Utc>) {
+        assert_eq!(
+            user.language.as_deref(),
+            Some("eo"),
+            "the default language round trips"
+        );
+        assert_eq!(
+            user.tags,
+            vec!["gnw".to_owned(), "rust".to_owned()],
+            "a text[] keeps its order"
+        );
+        assert_eq!(
+            user.also_known_as,
+            vec![local_ap_id(BASE, "alicia"), local_ap_id(BASE, "alice2")],
+            "the alias array keeps its order"
+        );
+        assert_eq!(
+            user.settings_store,
+            json!({"pleroma_fe": {"theme": "dark"}}),
+            "the settings blob round trips through jsonb"
+        );
+        assert_eq!(
+            user.background_image_url.as_deref(),
+            Some("https://test.example/bg.png"),
+            "the background url round trips"
+        );
+        assert_eq!(
+            user.birthday,
+            NaiveDate::from_ymd_opt(1990, 1, 31),
+            "a date column round trips"
+        );
+        assert_eq!(
+            user.moved_to_ap_id.as_deref(),
+            Some("https://other.example/users/alice"),
+            "the move target round trips"
+        );
+        assert_eq!(
+            user.last_move_at,
+            Some(active_at),
+            "the last-move timestamp round trips"
+        );
+        assert_eq!(
+            user.last_active_at,
+            Some(active_at),
+            "the last-active timestamp round trips"
+        );
+        assert_eq!(
+            user.mfa_settings,
+            json!({
+                "enabled": true,
+                "totp": {"secret": "BASE32SECRET", "confirmed": true},
+                "backup_codes": ["0123456789abcdef"],
+            }),
+            "the mfa_settings blob round trips through jsonb"
+        );
+        assert_eq!(
+            user.preferred_frontend.as_deref(),
+            Some("pleroma-fe"),
+            "the chosen frontend round trips through the text column"
+        );
+    }
+
     /// The Pleroma extension columns round trip through [`insert`]: arrays
     /// keep their order, the jsonb blob keeps its shape, the date and the
     /// timestamp come back as stored, and every flag keeps its value.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn pleroma_columns_round_trip(pool: PgPool) {
+    #[tokio::test]
+    async fn pleroma_columns_round_trip() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let active_at = Utc::now().trunc_subsecs(6);
         let new = NewUser {
             hide_followers: Flag::new(true),
@@ -1520,102 +1666,14 @@ mod tests {
             ..local_new("dora")
         };
         let user = insert(&pool, &new).await.unwrap();
-        assert!(
-            user.hide_followers.get()
-                && user.hide_follows.get()
-                && user.hide_followers_count.get()
-                && user.hide_follows_count.get(),
-            "the four hiding flags round trip as set"
-        );
-        assert!(
-            !user.hide_favorites.get(),
-            "so does the one defaulting to true, flipped"
-        );
-        assert!(
-            !user.allow_following_move.get()
-                && user.skip_thread_containment.get()
-                && !user.accepts_chat_messages.get()
-                && !user.show_role.get()
-                && user.no_rich_text.get(),
-            "behaviour and role flags round trip"
-        );
-        assert_eq!(
-            user.default_scope, "private",
-            "the default scope round trips"
-        );
-        assert!(
-            user.sensitive_default.get(),
-            "the sensitive default round trips through its flag"
-        );
-        assert_eq!(
-            user.language.as_deref(),
-            Some("eo"),
-            "the default language round trips"
-        );
-        assert_eq!(
-            user.tags,
-            vec!["gnw".to_owned(), "rust".to_owned()],
-            "a text[] keeps its order"
-        );
-        assert_eq!(
-            user.also_known_as,
-            vec![local_ap_id(BASE, "alicia"), local_ap_id(BASE, "alice2")],
-            "the alias array keeps its order"
-        );
-        assert_eq!(
-            user.settings_store,
-            json!({"pleroma_fe": {"theme": "dark"}}),
-            "the settings blob round trips through jsonb"
-        );
-        assert_eq!(
-            user.background_image_url.as_deref(),
-            Some("https://test.example/bg.png"),
-            "the background url round trips"
-        );
-        assert_eq!(
-            user.birthday,
-            NaiveDate::from_ymd_opt(1990, 1, 31),
-            "a date column round trips"
-        );
-        assert!(user.show_birthday.get(), "the birthday switch round trips");
-        assert_eq!(
-            user.moved_to_ap_id.as_deref(),
-            Some("https://other.example/users/alice"),
-            "the move target round trips"
-        );
-        assert_eq!(
-            user.last_move_at,
-            Some(active_at),
-            "the last-move timestamp round trips"
-        );
-        assert!(
-            !user.email_confirmed.get(),
-            "an unconfirmed email round trips"
-        );
-        assert!(user.approval_pending.get(), "pending approval round trips");
-        assert_eq!(
-            user.last_active_at,
-            Some(active_at),
-            "the last-active timestamp round trips"
-        );
-        assert_eq!(
-            user.mfa_settings,
-            json!({
-                "enabled": true,
-                "totp": {"secret": "BASE32SECRET", "confirmed": true},
-                "backup_codes": ["0123456789abcdef"],
-            }),
-            "the mfa_settings blob round trips through jsonb"
-        );
-        assert_eq!(
-            user.preferred_frontend.as_deref(),
-            Some("pleroma-fe"),
-            "the chosen frontend round trips through the text column"
-        );
+        assert_pleroma_flags_round_trip(&user);
+        assert_pleroma_values_round_trip(&user, active_at);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn duplicate_nickname_in_other_case_is_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn duplicate_nickname_in_other_case_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(&pool, &local_new("Alice")).await.unwrap();
         let err = insert(&pool, &local_new("aLiCe")).await.unwrap_err();
         let AppError::Database(SqlxError::Database(db_err)) = err else {
@@ -1637,8 +1695,10 @@ mod tests {
         assert_eq!(stored.nickname, "Alice", "the stored case survives citext");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn remote_user_nickname_carries_the_host(pool: PgPool) {
+    #[tokio::test]
+    async fn remote_user_nickname_carries_the_host() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let ap_id = "https://remote.example/users/bob";
         let new = NewUser {
             nickname: "bob@remote.example".to_owned(),
@@ -1715,8 +1775,10 @@ mod tests {
         assert_eq!(fetched.ap_id, ap_id, "same row by nickname");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_by_acct_folds_case_and_strips_the_local_domain(pool: PgPool) {
+    #[tokio::test]
+    async fn get_by_acct_folds_case_and_strips_the_local_domain() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let config = Config::for_tests();
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         let bob = insert(
@@ -1753,8 +1815,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_counts_adds_atomically_and_clamps_at_zero(pool: PgPool) {
+    #[tokio::test]
+    async fn update_counts_adds_atomically_and_clamps_at_zero() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let user = insert(&pool, &local_new("dave")).await.unwrap();
         update_counts(
             &pool,
@@ -1817,8 +1881,10 @@ mod tests {
         assert_eq!(still.followers_count, 0, "a no-op update changed nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn debug_redacts_secrets_in_user_and_new_user(pool: PgPool) {
+    #[tokio::test]
+    async fn debug_redacts_secrets_in_user_and_new_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let user = insert(
             &pool,
             &NewUser {
@@ -2000,8 +2066,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_also_known_as_replaces_the_array(pool: PgPool) {
+    #[tokio::test]
+    async fn set_also_known_as_replaces_the_array() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         let first = vec![local_ap_id(BASE, "alicia")];
         set_also_known_as(&pool, alice.id, &first).await.unwrap();
@@ -2021,8 +2089,10 @@ mod tests {
         set_also_known_as(&pool, new_id(), &first).await.unwrap();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn mark_moved_records_target_and_stamp(pool: PgPool) {
+    #[tokio::test]
+    async fn mark_moved_records_target_and_stamp() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         assert!(alice.last_move_at.is_none(), "the fixture never moved");
         let target = "https://other.example/users/alice";
@@ -2039,8 +2109,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_settings_store_replaces_the_blob(pool: PgPool) {
+    #[tokio::test]
+    async fn set_settings_store_replaces_the_blob() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         assert_eq!(alice.settings_store, json!({}), "the fixture starts empty");
         set_settings_store(&pool, alice.id, &json!({"pleroma_fe": {"theme": "dark"}}))
@@ -2068,8 +2140,10 @@ mod tests {
             .unwrap();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_preferred_frontend_stores_the_choice(pool: PgPool) {
+    #[tokio::test]
+    async fn set_preferred_frontend_stores_the_choice() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         assert!(alice.preferred_frontend.is_none(), "no choice yet");
         set_preferred_frontend(&pool, alice.id, "pleroma-fe")
@@ -2091,21 +2165,11 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_profile_writes_every_profile_column_and_returns_them(pool: PgPool) {
-        let alice = insert(&pool, &local_new("alice")).await.unwrap();
-        assert_eq!(alice.name, "", "the fixture has no display name");
-        assert!(
-            !alice.locked.get() && !alice.bot.get() && !alice.discoverable.get(),
-            "the option flags default off"
-        );
-        assert!(
-            alice.avatar_url.is_none()
-                && alice.banner_url.is_none()
-                && alice.background_image_url.is_none(),
-            "the fixture has no profile images"
-        );
-        let fields = ProfileFields {
+    /// A [`ProfileFields`] that sets every profile column to something
+    /// distinct: images, notes, rendered and raw fields, the posting defaults,
+    /// the actor type and every Pleroma preference.
+    fn all_profile_fields() -> ProfileFields {
+        ProfileFields {
             name: "Alice Adams".to_owned(),
             bio: "<p>hi</p>".to_owned(),
             raw_bio: "hi".to_owned(),
@@ -2136,11 +2200,12 @@ mod tests {
             birthday: NaiveDate::from_ymd_opt(1990, 1, 31),
             settings_store: json!({"pleroma_fe": {"theme": "dark"}, "bookmarks": true}),
             actor_type: "Service".to_owned(),
-        };
-        let updated = update_profile(&pool, alice.id, &fields)
-            .await
-            .unwrap()
-            .expect("the row exists");
+        }
+    }
+
+    /// Every column [`update_profile`] was handed, on the row it returned —
+    /// and the `updated_at` the write moved on.
+    fn assert_profile_written(updated: &User, before: &User) {
         assert_eq!(updated.name, "Alice Adams", "the returned row is updated");
         assert_eq!(updated.bio, "<p>hi</p>", "the html note");
         assert_eq!(updated.raw_bio, "hi", "the source note");
@@ -2204,9 +2269,33 @@ mod tests {
             "and so does every cleared one"
         );
         assert!(
-            updated.updated_at > alice.updated_at,
+            updated.updated_at > before.updated_at,
             "the write refreshes updated_at"
         );
+    }
+
+    #[tokio::test]
+    async fn update_profile_writes_every_profile_column_and_returns_them() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert_eq!(alice.name, "", "the fixture has no display name");
+        assert!(
+            !alice.locked.get() && !alice.bot.get() && !alice.discoverable.get(),
+            "the option flags default off"
+        );
+        assert!(
+            alice.avatar_url.is_none()
+                && alice.banner_url.is_none()
+                && alice.background_image_url.is_none(),
+            "the fixture has no profile images"
+        );
+        let fields = all_profile_fields();
+        let updated = update_profile(&pool, alice.id, &fields)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert_profile_written(&updated, &alice);
 
         let stored = fetch(&pool, alice.id).await;
         assert_eq!(stored.name, updated.name, "the row is what reads back");

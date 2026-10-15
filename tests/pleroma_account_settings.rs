@@ -123,8 +123,10 @@ async fn relation(pool: &PgPool, follower: &User, target: &User) -> follow::Foll
 
 /// The aliases lifecycle over a mirror-backed alias, a local-account
 /// alias and a raw URL this instance cannot resolve to a row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn add_list_and_remove_aliases(pool: PgPool) {
+#[tokio::test]
+async fn add_list_and_remove_aliases() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.also_known_as = vec![UNSEEN_URL.to_owned()];
         new
@@ -207,8 +209,10 @@ async fn add_list_and_remove_aliases(pool: PgPool) {
 
 /// A target neither the database nor a fast-failing `WebFinger` check
 /// can answer is the 404 the ticket fixes; nothing is appended.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unresolvable_alias_target_is_not_found(pool: PgPool) {
+#[tokio::test]
+async fn an_unresolvable_alias_target_is_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let app = common::test_app(pool.clone());
@@ -233,8 +237,10 @@ async fn an_unresolvable_alias_target_is_not_found(pool: PgPool) {
 }
 
 /// An `alias` the body does not carry is the extractor's 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_alias_body_without_the_parameter_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn an_alias_body_without_the_parameter_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let app = common::test_app(pool.clone());
@@ -251,13 +257,76 @@ async fn an_alias_body_without_the_parameter_is_unprocessable(pool: PgPool) {
     );
 }
 
+/// Alice's four followers: two ordinary local accounts, one that opted out of
+/// having its following moved, and one remote mirror.
+async fn four_followers(pool: &PgPool, alice: &User) -> (User, User, User, User) {
+    let carol = common::create_local_user(pool, "carol").await;
+    let dave = common::create_local_user(pool, "dave").await;
+    let erin = common::create_local_user_with(pool, "erin", |mut new| {
+        new.allow_following_move = Flag::new(false);
+        new
+    })
+    .await;
+    let frank = common::create_remote_user(pool, "frank", "remote.example").await;
+    for follower in [&carol, &dave, &erin, &frank] {
+        follow_user(pool, follower, alice).await;
+    }
+    (carol, dave, erin, frank)
+}
+
+/// A follower the move carried over: accepted on the target (the target is
+/// local and unlocked), gone from the origin, own counter unchanged.
+async fn assert_carried(pool: &PgPool, follower: &User, origin: &User, target: &User) {
+    let carried = relation(pool, follower, target).await;
+    assert_eq!(
+        carried.state,
+        FollowState::Accepted,
+        "{} followed the target and was accepted on the spot",
+        follower.nickname
+    );
+    assert!(
+        follow::get(pool, follower.id, origin.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "{} stopped following the origin",
+        follower.nickname
+    );
+    assert_eq!(
+        stored(pool, follower.id).await.following_count,
+        1,
+        "the follower's own count ends unchanged"
+    );
+}
+
+/// A follower the move left alone: still following the origin, and not
+/// following the target.
+async fn assert_stays(pool: &PgPool, stay: &User, origin: &User, target: &User) {
+    assert_eq!(
+        relation(pool, stay, origin).await.state,
+        FollowState::Accepted,
+        "{} keeps the original relationship",
+        stay.nickname
+    );
+    assert!(
+        follow::get(pool, stay.id, target.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "{} is not carried over",
+        stay.nickname
+    );
+}
+
 /// The full move: gates pass, the account is marked moved with its
 /// cooldown stamp, every local follower that allows the move follows the
 /// target (accepted on the spot, the target is local and unlocked) and
 /// unfollows the origin — while opted-out and remote followers stay —
 /// and the counters end where the relationships are.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn move_transfers_local_followers_and_marks_the_account(pool: PgPool) {
+#[tokio::test]
+async fn move_transfers_local_followers_and_marks_the_account() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let mut bob = aliased_target(&pool, "bob", &alice).await;
     let zoe = common::create_local_user(&pool, "zoe").await;
@@ -271,17 +340,7 @@ async fn move_transfers_local_followers_and_marks_the_account(pool: PgPool) {
         .expect("the target's own move stamps in");
     bob = stored(&pool, bob.id).await;
 
-    let carol = common::create_local_user(&pool, "carol").await;
-    let dave = common::create_local_user(&pool, "dave").await;
-    let erin = common::create_local_user_with(&pool, "erin", |mut new| {
-        new.allow_following_move = Flag::new(false);
-        new
-    })
-    .await;
-    let frank = common::create_remote_user(&pool, "frank", "remote.example").await;
-    for follower in [&carol, &dave, &erin, &frank] {
-        follow_user(&pool, follower, &alice).await;
-    }
+    let (carol, dave, erin, frank) = four_followers(&pool, &alice).await;
 
     let app = common::test_app(pool.clone());
     let response = move_account(&app, &token, PASSWORD, "bob").await;
@@ -304,39 +363,10 @@ async fn move_transfers_local_followers_and_marks_the_account(pool: PgPool) {
     );
 
     for follower in [&carol, &dave] {
-        let carried = relation(&pool, follower, &bob).await;
-        assert_eq!(
-            carried.state,
-            FollowState::Accepted,
-            "{} followed the target and was accepted on the spot",
-            follower.nickname
-        );
-        assert!(
-            follow::get(&pool, follower.id, alice.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "{} stopped following the origin",
-            follower.nickname
-        );
-        assert_eq!(
-            stored(&pool, follower.id).await.following_count,
-            1,
-            "the follower's own count ends unchanged"
-        );
+        assert_carried(&pool, follower, &alice, &bob).await;
     }
     for stay in [&erin, &frank] {
-        assert_eq!(
-            relation(&pool, stay, &alice).await.state,
-            FollowState::Accepted,
-            "{} keeps the original relationship",
-            stay.nickname
-        );
-        assert!(
-            follow::get(&pool, stay.id, bob.id).await.unwrap().is_none(),
-            "{} is not carried over",
-            stay.nickname
-        );
+        assert_stays(&pool, stay, &alice, &bob).await;
     }
     assert_eq!(
         (
@@ -370,8 +400,10 @@ async fn move_transfers_local_followers_and_marks_the_account(pool: PgPool) {
 /// password is a 200 error, an unresolvable target the endpoint's own
 /// 404, and a target that has not listed the origin refuses with the
 /// `alsoKnownAs` message. None of them touches the account.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn move_refuses_at_every_gate(pool: PgPool) {
+#[tokio::test]
+async fn move_refuses_at_every_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let _bob = aliased_target(&pool, "bob", &alice).await;
     let _stranger = common::create_local_user(&pool, "stranger").await;
@@ -410,8 +442,10 @@ async fn move_refuses_at_every_gate(pool: PgPool) {
 
 /// A second move inside the window is refused with the cooldown message;
 /// after 31 days the same account may move again.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn move_is_limited_to_once_per_thirty_days(pool: PgPool) {
+#[tokio::test]
+async fn move_is_limited_to_once_per_thirty_days() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let first = aliased_target(&pool, "first_target", &alice).await;
     let second = aliased_target(&pool, "second_target", &alice).await;
@@ -460,8 +494,10 @@ async fn move_is_limited_to_once_per_thirty_days(pool: PgPool) {
 /// and the mutations `write:accounts`: no token is the extractor's 401,
 /// a narrow or app-only credential one of the 403s, and a dead token
 /// the invalid-token 401.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_route_enforces_auth_and_scope(pool: PgPool) {
+#[tokio::test]
+async fn every_route_enforces_auth_and_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let read_only = common::create_app_and_token(&pool, &alice, "read:accounts").await;
     let wrong_scope = common::create_app_and_token(&pool, &alice, "read:chats").await;

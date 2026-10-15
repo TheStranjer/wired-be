@@ -155,8 +155,10 @@ fn json_keys(value: &Value) -> Vec<&str> {
 }
 
 /// An account with nothing stored answers 200 with the empty JSON array.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn empty_database_answers_the_empty_list(pool: PgPool) {
+#[tokio::test]
+async fn empty_database_answers_the_empty_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:filters").await;
     let app = common::test_app(pool);
 
@@ -173,8 +175,10 @@ async fn empty_database_answers_the_empty_list(pool: PgPool) {
 /// The whole lifecycle in order: `POST` answers the entity, the list and
 /// the show find it, `PUT` replaces every column, `DELETE` answers `{}`
 /// and takes it away.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn crud_round_trip(pool: PgPool) {
+#[tokio::test]
+async fn crud_round_trip() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:filters write:filters").await;
     let app = common::test_app(pool);
 
@@ -250,8 +254,10 @@ async fn crud_round_trip(pool: PgPool) {
 
 /// A form body with `context[]` array keys creates the same filter a JSON
 /// body would, string booleans and `expires_in` included.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn form_bodies_with_array_keys_are_accepted(pool: PgPool) {
+#[tokio::test]
+async fn form_bodies_with_array_keys_are_accepted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "write:filters").await;
     let app = common::test_app(pool);
 
@@ -290,8 +296,10 @@ async fn form_bodies_with_array_keys_are_accepted(pool: PgPool) {
 
 /// A PUT replaces the whole row: an absent `expires_in` clears the old
 /// expiry, absent flags take their defaults.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn update_replaces_defaults_instead_of_keeping_stored_values(pool: PgPool) {
+#[tokio::test]
+async fn update_replaces_defaults_instead_of_keeping_stored_values() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:filters write:filters").await;
     let stored = seed(&pool, &alice, "soon", Some(Utc::now() + Duration::days(2))).await;
     let app = common::test_app(pool);
@@ -314,8 +322,10 @@ async fn update_replaces_defaults_instead_of_keeping_stored_values(pool: PgPool)
 }
 
 /// An expired filter leaves the list and stays readable by id.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn expired_filters_are_hidden_from_the_list(pool: PgPool) {
+#[tokio::test]
+async fn expired_filters_are_hidden_from_the_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:filters").await;
     let expired = seed(
         &pool,
@@ -345,15 +355,10 @@ async fn expired_filters_are_hidden_from_the_list(pool: PgPool) {
     assert_eq!(response.json_value()["phrase"], "expired", "by id");
 }
 
-/// The `{"error":"Validation failed: …"}` bodies the ticket names, and
-/// their precedence: validation runs before any lookup, so even a PUT to
-/// a nonexistent id answers 422 for a bad body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn invalid_parameters_answer_mastodons_validation_wording(pool: PgPool) {
-    let (_alice, token) = fixture(&pool, "alice", "write:filters").await;
-    let app = common::test_app(pool.clone());
-
-    for (what, body, message) in [
+/// The bodies the filter endpoints refuse, each with the case the assertion
+/// names it by and the wording Mastodon's changeset answers.
+fn invalid_bodies() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
         (
             "a missing phrase",
             json!({"context": ["home"]}),
@@ -394,7 +399,20 @@ async fn invalid_parameters_answer_mastodons_validation_wording(pool: PgPool) {
             json!({"phrase": "ok", "context": ["home", "Bogus"]}),
             "Validation failed: Context is invalid",
         ),
-    ] {
+    ]
+}
+
+/// The `{"error":"Validation failed: …"}` bodies the ticket names, and
+/// their precedence: validation runs before any lookup, so even a PUT to
+/// a nonexistent id answers 422 for a bad body.
+#[tokio::test]
+async fn invalid_parameters_answer_mastodons_validation_wording() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = fixture(&pool, "alice", "write:filters").await;
+    let app = common::test_app(pool.clone());
+
+    for (what, body, message) in invalid_bodies() {
         let response = create_json(&app, &token, body).await;
         assert_eq!(
             response.status,
@@ -447,8 +465,10 @@ async fn invalid_parameters_answer_mastodons_validation_wording(pool: PgPool) {
 
 /// A foreign id and a malformed one are the same 404 on every route, and
 /// the owner's row is untouched by another account's attempts.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn ownership_and_missing_ids_answer_404(pool: PgPool) {
+#[tokio::test]
+async fn ownership_and_missing_ids_answer_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, alice_token) = fixture(&pool, "alice", "read:filters write:filters").await;
     let (_bob, bob_token) = fixture(&pool, "bob", "read:filters write:filters").await;
     let hers = seed(&pool, &alice, "hers", None).await;
@@ -528,142 +548,122 @@ async fn ownership_and_missing_ids_answer_404(pool: PgPool) {
     );
 }
 
-/// Reading needs a user token with `read:filters` (or the broader `read`);
-/// writing needs one with `write:filters` (or `write`). Missing tokens are
-/// the 401s, app-only tokens and missing scopes the 403s, all with
-/// Pleroma's wording.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_scope_pipeline_guards_every_route(pool: PgPool) {
-    let (alice, alice_token) = fixture(&pool, "alice", "read write").await;
+/// The credential half of the pipeline: no token at all is the 401 with
+/// Pleroma's "Invalid credentials", a token no row carries the 401 naming it,
+/// and an app-only token the 403 demanding an authenticated user.
+#[tokio::test]
+async fn the_credential_gates_refuse_every_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, _) = fixture(&pool, "alice", "read write").await;
+    let hers = seed(&pool, &alice, "hers", None).await;
+    let app_only = common::create_app_only_token(&pool, "read write").await;
+    let app = common::test_app(pool);
+
+    let anonymous = common::TestRequest::get(ROOT).send(&app).await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "no token is a 401");
+    common::assert_error(&anonymous, "Invalid credentials", "the absent token");
+
+    let bogus = [
+        list(&app, "not-a-real-token").await,
+        show(&app, "not-a-real-token", hers.id).await,
+    ];
+    common::assert_all_refused(
+        &bogus,
+        StatusCode::UNAUTHORIZED,
+        "The access token is invalid",
+        "a token no row carries",
+    );
+
+    let userless = [
+        list(&app, &app_only).await,
+        create_json(&app, &app_only, create_body()).await,
+    ];
+    common::assert_all_refused(
+        &userless,
+        StatusCode::FORBIDDEN,
+        "This API requires an authenticated user",
+        "an app-only token",
+    );
+}
+
+/// The scope half of the pipeline: reading needs `read:filters` (or `read`)
+/// and writing `write:filters` (or `write`); every route a token lacks the
+/// scope for answers the 403 naming it.
+#[tokio::test]
+async fn tokens_without_the_route_scope_are_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, _) = fixture(&pool, "alice", "read write").await;
     let hers = seed(&pool, &alice, "hers", None).await;
     let (_reader, read_only) = fixture(&pool, "reader", "read").await;
     let (_writer, write_broad) = fixture(&pool, "writer", "write").await;
     let (_narrow, wrong_scope) = fixture(&pool, "narrow", "read:statuses write:statuses").await;
-    let (_filer, filter_read) = fixture(&pool, "filer", "read:filters").await;
-    let (_mutator, filter_write) = fixture(&pool, "mutator", "write:filters").await;
-    let app_only = common::create_app_only_token(&pool, "read write").await;
-    let app = common::test_app(pool.clone());
-
-    let anonymous = common::TestRequest::get(ROOT).send(&app).await;
-    assert_eq!(
-        anonymous.status,
-        StatusCode::UNAUTHORIZED,
-        "no token is a 401"
-    );
-    assert_eq!(
-        anonymous.json_value()["error"],
-        "Invalid credentials",
-        "Pleroma's wording for an absent token"
-    );
-    let bogus = list(&app, "not-a-real-token").await;
-    assert_eq!(
-        bogus.status,
-        StatusCode::UNAUTHORIZED,
-        "a bogus token is a 401"
-    );
-    assert_eq!(
-        bogus.json_value()["error"],
-        "The access token is invalid",
-        "naming the token as the problem"
-    );
-    let as_app = list(&app, &app_only).await;
-    assert_eq!(
-        as_app.status,
-        StatusCode::FORBIDDEN,
-        "an app token is a 403"
-    );
-    assert_eq!(
-        as_app.json_value()["error"],
-        "This API requires an authenticated user",
-        "naming what is missing"
-    );
+    let app = common::test_app(pool);
 
     for (who, token) in [("read:statuses", &wrong_scope), ("write", &write_broad)] {
-        let response = list(&app, token).await;
-        assert_eq!(
-            response.status,
+        let refused = [list(&app, token).await, show(&app, token, hers.id).await];
+        common::assert_all_refused(
+            &refused,
             StatusCode::FORBIDDEN,
-            "`{who}` may not list"
-        );
-        assert_eq!(
-            response.json_value()["error"],
             "Insufficient permissions: read:filters.",
-            "the denial names the missing scope for `{who}`"
+            &format!("`{who}` on every reading route"),
         );
-        let shown = show(&app, token, hers.id).await;
-        assert_eq!(shown.status, StatusCode::FORBIDDEN, "`{who}` may not show");
     }
-
     for (who, token) in [("read:statuses", &wrong_scope), ("read", &read_only)] {
-        let response = create_json(&app, token, create_body()).await;
-        assert_eq!(
-            response.status,
+        let refused = [
+            create_json(&app, token, create_body()).await,
+            update(
+                &app,
+                token,
+                hers.id,
+                json!({"phrase": "x", "context": ["home"]}),
+            )
+            .await,
+            destroy(&app, token, hers.id).await,
+        ];
+        common::assert_all_refused(
+            &refused,
             StatusCode::FORBIDDEN,
-            "`{who}` may not create"
-        );
-        assert_eq!(
-            response.json_value()["error"],
             "Insufficient permissions: write:filters.",
-            "the denial names the missing scope for `{who}`"
-        );
-        let replaced = update(
-            &app,
-            token,
-            hers.id,
-            json!({"phrase": "x", "context": ["home"]}),
-        )
-        .await;
-        assert_eq!(
-            replaced.status,
-            StatusCode::FORBIDDEN,
-            "`{who}` may not update"
-        );
-        let deleted = destroy(&app, token, hers.id).await;
-        assert_eq!(
-            deleted.status,
-            StatusCode::FORBIDDEN,
-            "`{who}` may not delete"
+            &format!("`{who}` on every writing route"),
         );
     }
+}
 
-    // The granted side: the narrow sub-scopes on their own users, and the
-    // broad trees on the owner of the row touched by id.
-    assert_eq!(
-        list(&app, &filter_read).await.status,
+/// The granted side: the narrow sub-scopes pass on their own routes, the
+/// broad `read` and `write` trees pass everywhere, and what was denied really
+/// stored nothing.
+#[tokio::test]
+async fn the_granted_scopes_use_every_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, alice_token) = fixture(&pool, "alice", "read write").await;
+    let hers = seed(&pool, &alice, "hers", None).await;
+    let (_filer, filter_read) = fixture(&pool, "filer", "read:filters").await;
+    let (_mutator, filter_write) = fixture(&pool, "mutator", "write:filters").await;
+    let app = common::test_app(pool);
+
+    let granted_reads = [
+        list(&app, &filter_read).await,
+        show(&app, &alice_token, hers.id).await,
+    ];
+    common::assert_all_answered(
+        &granted_reads,
         StatusCode::OK,
-        "`read:filters` lists"
+        "`read:filters` lists and the broad read shows",
     );
-    assert_eq!(
-        create_json(&app, &filter_write, create_body()).await.status,
+    let rewrite = json!({"phrase": "rewritten", "context": ["home"]});
+    let granted_writes = [
+        create_json(&app, &filter_write, create_body()).await,
+        create_json(&app, &alice_token, create_body()).await,
+        update(&app, &alice_token, hers.id, rewrite).await,
+        destroy(&app, &alice_token, hers.id).await,
+    ];
+    common::assert_all_answered(
+        &granted_writes,
         StatusCode::OK,
-        "`write:filters` creates"
-    );
-    assert_eq!(
-        show(&app, &alice_token, hers.id).await.status,
-        StatusCode::OK,
-        "the broad `read` shows"
-    );
-    assert_eq!(
-        create_json(&app, &alice_token, create_body()).await.status,
-        StatusCode::OK,
-        "the broad `write` creates"
-    );
-    assert_eq!(
-        update(
-            &app,
-            &alice_token,
-            hers.id,
-            json!({"phrase": "rewritten", "context": ["home"]})
-        )
-        .await
-        .status,
-        StatusCode::OK,
-        "and updates"
-    );
-    assert_eq!(
-        destroy(&app, &alice_token, hers.id).await.status,
-        StatusCode::OK,
-        "and deletes"
+        "`write:filters` creates; the broad write creates, updates and deletes",
     );
     assert_eq!(
         phrases(&listed(&app, &alice_token).await),
@@ -673,6 +673,6 @@ async fn the_scope_pipeline_guards_every_route(pool: PgPool) {
     assert_eq!(
         phrases(&listed(&app, &filter_read).await),
         Vec::<&str>::new(),
-        "while the denial loop above stored nothing for anybody"
+        "while the read-only filer stored nothing of its own"
     );
 }

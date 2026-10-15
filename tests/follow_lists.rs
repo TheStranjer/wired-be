@@ -189,8 +189,10 @@ fn expected_link(path: &str, oldest: &Uuid, newest: &Uuid) -> String {
 /// remote follower is granted here (this instance owns the target's
 /// answer) and joins the follower list, and a remote followee joins the
 /// outgoing list once the remote instance has answered.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn both_listings_answer_newest_follow_first(pool: PgPool) {
+#[tokio::test]
+async fn both_listings_answer_newest_follow_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_local_user(&pool, "carol").await;
@@ -227,8 +229,10 @@ async fn both_listings_answer_newest_follow_first(pool: PgPool) {
 /// An entry is a full `Account` entity, not an id stub: the remote
 /// follower keeps the handle and actor id federation stored, and an
 /// anonymous listing embeds no relationship.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn entries_render_as_full_account_entities(pool: PgPool) {
+#[tokio::test]
+async fn entries_render_as_full_account_entities() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let mallory = common::create_remote_user(&pool, "mallory", "remote.example").await;
     let _incoming: Follow = granted(&pool, &mallory, &alice).await;
@@ -260,8 +264,10 @@ async fn entries_render_as_full_account_entities(pool: PgPool) {
 /// The page walks by `follows` row id: the `Link` header's cursors, the
 /// `max_id` continuation, the `min_id` page (answered newest-first
 /// again), and the empty ends of the walk, which carry no header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn pages_key_on_follow_row_ids_and_link(pool: PgPool) {
+#[tokio::test]
+async fn pages_key_on_follow_row_ids_and_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let target = common::create_local_user(&pool, "target").await;
     let mut pairs = Vec::new();
     for n in 0..5 {
@@ -348,8 +354,10 @@ async fn pages_key_on_follow_row_ids_and_link(pool: PgPool) {
 }
 
 /// The listing caps like Pleroma's: twenty rows by default, forty at most.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) {
+#[tokio::test]
+async fn the_default_page_is_twenty_and_the_cap_is_forty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let target = common::create_local_user(&pool, "target").await;
     for n in 0..45 {
         let follower = common::create_local_user(&pool, &format!("follower{n}")).await;
@@ -374,8 +382,10 @@ async fn the_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) {
 /// A locked account's follower list is visible as usual — anonymous and
 /// to the owner alike — and what stays out is the request nobody has
 /// answered yet, not the whole list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn locked_accounts_list_visible_and_pending_excluded(pool: PgPool) {
+#[tokio::test]
+async fn locked_accounts_list_visible_and_pending_excluded() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user_with(&pool, "carol", |mut new| {
         new.locked = Flag::new(true);
         new
@@ -421,8 +431,10 @@ async fn locked_accounts_list_visible_and_pending_excluded(pool: PgPool) {
 /// empty array to everyone but the account itself — anonymous, another
 /// account's token and an app-only token alike, 200 with no `Link`
 /// header — while the owner always sees the full list.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn hidden_lists_answer_empty_to_everyone_but_the_owner(pool: PgPool) {
+#[tokio::test]
+async fn hidden_lists_answer_empty_to_everyone_but_the_owner() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.hide_followers = Flag::new(true);
         new.hide_follows = Flag::new(true);
@@ -457,8 +469,10 @@ async fn hidden_lists_answer_empty_to_everyone_but_the_owner(pool: PgPool) {
 /// Hiding the counts does not hide the lists: with only
 /// `hide_followers_count` and `hide_follows_count` set, the rows are
 /// still listed for everyone.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn hidden_counts_do_not_hide_the_lists(pool: PgPool) {
+#[tokio::test]
+async fn hidden_counts_do_not_hide_the_lists() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user_with(&pool, "bob", |mut new| {
         new.hide_followers_count = Flag::new(true);
         new.hide_follows_count = Flag::new(true);
@@ -484,8 +498,10 @@ async fn hidden_counts_do_not_hide_the_lists(pool: PgPool) {
 /// with Pleroma's wording if it does not, whoever's list is asked for —
 /// while the broad `read` covers it, no token at all proceeds, and a
 /// token that does not resolve is the extractor's 401.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listings_gate_on_read_accounts_when_authenticated(pool: PgPool) {
+#[tokio::test]
+async fn the_listings_gate_on_read_accounts_when_authenticated() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     // Mutual follows, so both listings of alice hold exactly bob and the
@@ -545,8 +561,10 @@ async fn the_listings_gate_on_read_accounts_when_authenticated(pool: PgPool) {
 /// but names no row, an id that is not uuid text, and a deactivated
 /// account. A malformed cursor is the page extractor's 400, which runs
 /// ahead of the handler's lookup.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_accounts_are_404_and_bad_cursors_400(pool: PgPool) {
+#[tokio::test]
+async fn unknown_accounts_are_404_and_bad_cursors_400() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let ghost = common::create_local_user_with(&pool, "ghost", |mut new| {
         new.is_active = Flag::new(false);
         new
@@ -593,8 +611,10 @@ async fn unknown_accounts_are_404_and_bad_cursors_400(pool: PgPool) {
 /// account, batched: a stranger sees its own flags on every row, the
 /// account owner sees its relationship to its followers too, and an
 /// anonymous listing keeps Pleroma's empty object.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn entries_embed_the_viewers_relationship(pool: PgPool) {
+#[tokio::test]
+async fn entries_embed_the_viewers_relationship() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let erin = common::create_local_user_with(&pool, "erin", |mut new| {

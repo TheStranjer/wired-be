@@ -91,13 +91,11 @@ fn assert_identity(body: &Value, account: &User, full: &str, username: &str, url
     assert_eq!(body["uri"], account.ap_id, "uri is the actor id");
 }
 
-/// `verify_credentials` answers the caller's own account as they see it,
-/// with the `source` block built from the stored settings: the raw note and
-/// posting defaults, the owner-only `pleroma` keys, the top-level
-/// `also_known_as` list, and the hidden counters visible.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool) {
-    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+/// The account whose own view is the fullest: a raw note and its rendered
+/// form, posting defaults, hidden counters, a role it keeps to itself, a
+/// settings blob and one alias.
+async fn owner_view(pool: &PgPool) -> User {
+    common::create_local_user_with(pool, "alice", |mut new| {
         new.raw_bio = "hi **there**".to_owned();
         new.bio = "<p>hi <strong>there</strong></p>".to_owned();
         new.default_scope = "unlisted".to_owned();
@@ -113,7 +111,18 @@ async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool)
         new.also_known_as = vec!["https://old.example/users/alice".to_owned()];
         new
     })
-    .await;
+    .await
+}
+
+/// `verify_credentials` answers the caller's own account as they see it,
+/// with the `source` block built from the stored settings: the raw note and
+/// posting defaults, the owner-only `pleroma` keys, the top-level
+/// `also_known_as` list, and the hidden counters visible.
+#[tokio::test]
+async fn verify_credentials_renders_the_owner_view_with_its_source() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = owner_view(&pool).await;
     let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
     let app = common::test_app(pool);
     let response = verify_credentials(&app, &token).await;
@@ -186,8 +195,10 @@ async fn verify_credentials_renders_the_owner_view_with_its_source(pool: PgPool)
 /// The columns an account never edited answer the block's documented
 /// defaults: public, not sensitive, no language, no note, no fields and an
 /// empty request queue.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_source_defaults_are_the_column_defaults(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_source_defaults_are_the_column_defaults() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
     let app = common::test_app(pool);
@@ -215,8 +226,10 @@ async fn verify_credentials_source_defaults_are_the_column_defaults(pool: PgPool
 /// The `source` fields are the text an owner edits, not the markup a
 /// stranger reads: the entity renders the `fields` jsonb as stored and the
 /// source block round-trips the `raw_fields` jsonb beside it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_source_fields_are_the_raw_text(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_source_fields_are_the_raw_text() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.fields = json!([
             {"name": "site", "value": "<p><a href=\"https://alice.example\" rel=\"ugc nofollow noopener noreferrer\">alice.example</a></p>"},
@@ -253,8 +266,10 @@ async fn verify_credentials_source_fields_are_the_raw_text(pool: PgPool) {
 /// `follow_requests_count` is the queue waiting for this account: incoming
 /// pending requests only — not an answered one, not a request this account
 /// sent somewhere else — and it shrinks as the account answers it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_counts_the_pending_follow_requests(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_counts_the_pending_follow_requests() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user_with(&pool, "carol", |mut new| {
         new.locked = Flag::new(true);
         new
@@ -302,7 +317,7 @@ async fn verify_credentials_counts_the_pending_follow_requests(pool: PgPool) {
     );
 
     let token = common::create_app_and_token(&pool, &carol, "read:accounts").await;
-    let db = pool.clone();
+    let carol_pool = pool.clone();
     let app = common::test_app(pool);
     let body = verify_credentials(&app, &token).await.json_value();
     assert_eq!(
@@ -312,7 +327,7 @@ async fn verify_credentials_counts_the_pending_follow_requests(pool: PgPool) {
          nor her own outgoing request"
     );
 
-    let carol_answered = follow::accept(&db, waiting[0])
+    let carol_answered = follow::accept(&carol_pool, waiting[0])
         .await
         .expect("carol answers one");
     assert_eq!(
@@ -330,8 +345,10 @@ async fn verify_credentials_counts_the_pending_follow_requests(pool: PgPool) {
 
 /// A token that does not grant `read:accounts` is a 403 naming the scope,
 /// even when it is a valid user token.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_without_the_scope_is_forbidden(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_without_the_scope_is_forbidden() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let app = common::test_app(pool);
@@ -346,8 +363,10 @@ async fn verify_credentials_without_the_scope_is_forbidden(pool: PgPool) {
 
 /// The broad `read` scope covers `read:accounts` (decision 9), so a client
 /// that never asked for the sub-scope still gets its own account.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_accepts_a_broad_read_token(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_accepts_a_broad_read_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read").await;
     let app = common::test_app(pool);
@@ -367,8 +386,10 @@ async fn verify_credentials_accepts_a_broad_read_token(pool: PgPool) {
 
 /// An app-only (`client_credentials`) token has no account to describe: 403
 /// from the extractor, before the scope is even read.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_requires_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_requires_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let token = common::create_app_only_token(&pool, "read:accounts").await;
     let app = common::test_app(pool);
     let response = verify_credentials(&app, &token).await;
@@ -383,8 +404,10 @@ async fn verify_credentials_requires_a_user_token(pool: PgPool) {
 /// No token at all is the 401 [`AuthUser`] owes, and a token that does not
 /// resolve is the invalid-credential 401: the endpoint never answers
 /// anonymously.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn verify_credentials_without_valid_credentials_is_unauthorized(pool: PgPool) {
+#[tokio::test]
+async fn verify_credentials_without_valid_credentials_is_unauthorized() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     let anonymous = common::TestRequest::get("/api/v1/accounts/verify_credentials")
@@ -412,8 +435,10 @@ async fn verify_credentials_without_valid_credentials_is_unauthorized(pool: PgPo
 /// `GET /api/v1/accounts/{id}` for one's own id is still the plain account:
 /// the `source` block belongs to the credentials endpoints and no other
 /// route renders it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_never_renders_the_source_block(pool: PgPool) {
+#[tokio::test]
+async fn show_never_renders_the_source_block() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
     let app = common::test_app(pool);
@@ -432,8 +457,10 @@ async fn show_never_renders_the_source_block(pool: PgPool) {
 /// A local account renders its full entity to an anonymous request: auth
 /// is optional, the JSON is the core `Account` shape (with its `pleroma`
 /// block, which the tests below cover in detail).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_renders_a_local_account_without_auth(pool: PgPool) {
+#[tokio::test]
+async fn show_renders_a_local_account_without_auth() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     let response = show(&app, &alice.id.to_string()).await;
@@ -471,8 +498,10 @@ async fn show_renders_a_local_account_without_auth(pool: PgPool) {
 /// reads `statuses_count` and `last_status_at` off the `users` row, and both
 /// are what [`wired_be::models::status`] moved when
 /// [`common::create_status`](common::create_status) wrote the status.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_counts_the_statuses_an_account_has_posted(pool: PgPool) {
+#[tokio::test]
+async fn show_counts_the_statuses_an_account_has_posted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let status = common::create_status(&pool, &alice, "hello fediverse", Visibility::Public).await;
     let app = common::test_app(pool);
@@ -499,8 +528,10 @@ async fn show_counts_the_statuses_an_account_has_posted(pool: PgPool) {
 
 /// A valid bearer token may watch: same account, same 200. What the token
 /// decides is covered by `show_reveals_the_private_pleroma_state_to_the_owner`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_accepts_a_valid_bearer_token(pool: PgPool) {
+#[tokio::test]
+async fn show_accepts_a_valid_bearer_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read:accounts").await;
     let app = common::test_app(pool);
@@ -519,8 +550,10 @@ async fn show_accepts_a_valid_bearer_token(pool: PgPool) {
 /// The `pleroma` block an anonymous request gets: the public keys with the
 /// column defaults as stored, and none of the seven the account keeps for
 /// itself.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_renders_the_public_pleroma_block_without_auth(pool: PgPool) {
+#[tokio::test]
+async fn show_renders_the_public_pleroma_block_without_auth() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     let body = show(&app, &alice.id.to_string()).await.json_value();
@@ -573,8 +606,10 @@ async fn show_renders_the_public_pleroma_block_without_auth(pool: PgPool) {
 
 /// An account that hides its follow counts and its role: a stranger —
 /// anonymous or authenticated — sees zeroes and no roles.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_hides_counts_and_roles_from_strangers(pool: PgPool) {
+#[tokio::test]
+async fn show_hides_counts_and_roles_from_strangers() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.followers_count = 5;
         new.following_count = 6;
@@ -623,8 +658,10 @@ async fn show_hides_counts_and_roles_from_strangers(pool: PgPool) {
 
 /// The same account, seen by its own user: the stored counters, the real
 /// roles, and the owner-only keys of the block.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_reveals_the_private_pleroma_state_to_the_owner(pool: PgPool) {
+#[tokio::test]
+async fn show_reveals_the_private_pleroma_state_to_the_owner() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.followers_count = 5;
         new.following_count = 6;
@@ -691,8 +728,10 @@ async fn show_reveals_the_private_pleroma_state_to_the_owner(pool: PgPool) {
 
 /// `lookup` renders for its viewer exactly as `show` does: the same token
 /// reveals the private state, another account's token does not.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_renders_for_its_viewer(pool: PgPool) {
+#[tokio::test]
+async fn lookup_renders_for_its_viewer() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.followers_count = 5;
         new.hide_followers_count = Flag::new(true);
@@ -747,8 +786,10 @@ async fn lookup_renders_for_its_viewer(pool: PgPool) {
 
 /// Auth is optional, but a presented token that does not resolve is a 401,
 /// never a silently ignored credential (Pleroma's OAuth plug).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_rejects_an_invalid_bearer_token(pool: PgPool) {
+#[tokio::test]
+async fn show_rejects_an_invalid_bearer_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     let response = common::TestRequest::get(&format!("/api/v1/accounts/{}", alice.id))
@@ -765,8 +806,10 @@ async fn show_rejects_an_invalid_bearer_token(pool: PgPool) {
 
 /// A stored remote mirror renders exactly like a local account: same
 /// entity, the handle carrying its host.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_renders_a_remote_account(pool: PgPool) {
+#[tokio::test]
+async fn show_renders_a_remote_account() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
     let app = common::test_app(pool);
     let response = show(&app, &bob.id.to_string()).await;
@@ -799,8 +842,10 @@ async fn show_renders_a_remote_account(pool: PgPool) {
 }
 
 /// An id that parses but names no row is the plain record-not-found 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_an_unknown_id_is_a_record_not_found(pool: PgPool) {
+#[tokio::test]
+async fn show_an_unknown_id_is_a_record_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = show(&app, &Uuid::now_v7().to_string()).await;
     assert_eq!(response.status, StatusCode::NOT_FOUND, "no row, no account");
@@ -809,8 +854,10 @@ async fn show_an_unknown_id_is_a_record_not_found(pool: PgPool) {
 
 /// An id that is not uuid text answers the same 404 as an unknown one,
 /// never a 400, so the route cannot distinguish noise from misses.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_a_garbage_id_is_a_record_not_found(pool: PgPool) {
+#[tokio::test]
+async fn show_a_garbage_id_is_a_record_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for id in [
         "not-an-id",
@@ -833,8 +880,10 @@ async fn show_a_garbage_id_is_a_record_not_found(pool: PgPool) {
 }
 
 /// A deactivated account is hidden from show: 404, like any other miss.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn show_a_deactivated_account_is_a_record_not_found(pool: PgPool) {
+#[tokio::test]
+async fn show_a_deactivated_account_is_a_record_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let ghost = common::create_local_user_with(&pool, "ghost", |mut new| {
         new.is_active = Flag::new(false);
         new
@@ -851,8 +900,10 @@ async fn show_a_deactivated_account_is_a_record_not_found(pool: PgPool) {
 }
 
 /// `acct` without a domain finds the local account by stored nickname.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_by_plain_nickname(pool: PgPool) {
+#[tokio::test]
+async fn lookup_by_plain_nickname() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     let response = lookup(&app, "?acct=alice").await;
@@ -878,8 +929,10 @@ async fn lookup_by_plain_nickname(pool: PgPool) {
 
 /// A local handle qualified with this instance's own domain resolves to
 /// the bare stored nickname, the domain compared case-insensitively.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_strips_our_own_domain(pool: PgPool) {
+#[tokio::test]
+async fn lookup_strips_our_own_domain() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     for acct in ["alice@test.example", "alice@TEST.example"] {
@@ -899,8 +952,10 @@ async fn lookup_strips_our_own_domain(pool: PgPool) {
 
 /// The nickname column is citext: any casing of the handle finds the row,
 /// with or without the local domain.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_is_case_insensitive(pool: PgPool) {
+#[tokio::test]
+async fn lookup_is_case_insensitive() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "Alice").await;
     let app = common::test_app(pool);
     for acct in ["ALICE", "alice", "AlIce@TEST.example"] {
@@ -916,8 +971,10 @@ async fn lookup_is_case_insensitive(pool: PgPool) {
 
 /// An already-mirrored remote user resolves by its stored `nick@host`
 /// handle (federation to fetch unseen ones is a later ticket).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_finds_a_stored_remote_user(pool: PgPool) {
+#[tokio::test]
+async fn lookup_finds_a_stored_remote_user() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
     let app = common::test_app(pool);
     let response = lookup(&app, "?acct=bob@remote.example").await;
@@ -937,8 +994,10 @@ async fn lookup_finds_a_stored_remote_user(pool: PgPool) {
 }
 
 /// An absent, empty or blank `acct` is the 400 naming the parameter.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_without_a_usable_acct_is_a_bad_request(pool: PgPool) {
+#[tokio::test]
+async fn lookup_without_a_usable_acct_is_a_bad_request() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for query in ["", "?", "?acct=", "?acct=%20%20"] {
         let response = lookup(&app, query).await;
@@ -957,8 +1016,10 @@ async fn lookup_without_a_usable_acct_is_a_bad_request(pool: PgPool) {
 
 /// A handle that names no stored local or mirrored account is the plain
 /// record-not-found 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_an_unresolvable_acct_is_a_record_not_found(pool: PgPool) {
+#[tokio::test]
+async fn lookup_an_unresolvable_acct_is_a_record_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice: User = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool);
     for acct in [
@@ -986,8 +1047,10 @@ async fn lookup_an_unresolvable_acct_is_a_record_not_found(pool: PgPool) {
 
 /// Lookup hides deactivated accounts too (Pleroma's `visible_for` check):
 /// the row exists, but no acct finds it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_a_deactivated_account_is_a_record_not_found(pool: PgPool) {
+#[tokio::test]
+async fn lookup_a_deactivated_account_is_a_record_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let ghost = common::create_local_user_with(&pool, "ghost", |mut new| {
         new.is_active = Flag::new(false);
         new
@@ -1007,8 +1070,10 @@ async fn lookup_a_deactivated_account_is_a_record_not_found(pool: PgPool) {
 }
 
 /// The same optional-auth rule guards lookup: an invalid token is a 401.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn lookup_rejects_an_invalid_bearer_token(pool: PgPool) {
+#[tokio::test]
+async fn lookup_rejects_an_invalid_bearer_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/accounts/lookup?acct=alice")
         .bearer("bogus-token")

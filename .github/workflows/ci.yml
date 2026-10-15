@@ -19,7 +19,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       # Use mold linker (more stable + faster under runner memory limits)
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # Used by `#[sqlx::test]`
+      # Used by the test-database fixture (src/test_db.rs)
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     services:
       postgres:
@@ -54,6 +54,24 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      # The test databases hold nothing but rows a test just wrote, and the
+      # fixture empties every slot before reusing it, so durability is pure
+      # cost here. A GitHub service container cannot be started with a command,
+      # so turn the three settings off over SQL instead: all of them are
+      # reloadable, and `pg_reload_conf()` applies them without a restart.
+      # See the README's "Making a local test database fast" for the same
+      # settings on a development database — never point this at real data.
+      - name: Run Postgres without durability (throwaway test databases)
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          ALTER SYSTEM SET fsync = off;
+          ALTER SYSTEM SET full_page_writes = off;
+          ALTER SYSTEM SET synchronous_commit = off;
+          SELECT pg_reload_conf();
+          SQL
+          # Confirm the reload landed before the suite starts paying for it.
+          test "$(psql "$DATABASE_URL" -Atc 'SHOW fsync')" = off
 
       - name: Run CI suite (scripts/ci.sh)
         run: scripts/ci.sh

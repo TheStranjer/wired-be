@@ -67,6 +67,17 @@ fn unsubscribe_path(target: &Uuid) -> String {
     format!("/api/v1/pleroma/accounts/{target}/unsubscribe")
 }
 
+/// The subscription route segment `unsubscribe` picks — also the word the
+/// assertions name the write by.
+#[must_use]
+fn subscription_verb(unsubscribe: bool) -> &'static str {
+    if unsubscribe {
+        "unsubscribe"
+    } else {
+        "subscribe"
+    }
+}
+
 /// `POST` one subscription route as `token` (the two actions differ only by
 /// their path segment, so both run through here).
 async fn subscription(
@@ -289,8 +300,10 @@ fn expected_relationship(target: &Uuid, computed: &Value) -> Value {
 /// Subscribing needs a granted follow of the target: no relationship at all,
 /// a request nobody answered, and the other direction of a relationship are
 /// the same 422 with the ticket's wording, and none of them writes anything.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn subscribe_requires_an_accepted_follow(pool: PgPool) {
+#[tokio::test]
+async fn subscribe_requires_an_accepted_follow() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = locked_user(&pool, "carol").await;
@@ -350,8 +363,10 @@ async fn subscribe_requires_an_accepted_follow(pool: PgPool) {
 /// follow row, leaves everything else about the relationship alone, and reads
 /// back the same way from the Mastodon relationship batch; subscribing twice
 /// is idempotent.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn subscribe_sets_both_flags_and_answers_the_relationship(pool: PgPool) {
+#[tokio::test]
+async fn subscribe_sets_both_flags_and_answers_the_relationship() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let granted = following(&pool, &alice, &bob).await;
@@ -435,8 +450,10 @@ async fn subscribe_sets_both_flags_and_answers_the_relationship(pool: PgPool) {
 /// caller stays following, and the write needs the same accepted follow the
 /// subscribe route does (a relationship the caller never granted is the 422,
 /// an id that names no account is the shared 404).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unsubscribe_clears_the_flag_again(pool: PgPool) {
+#[tokio::test]
+async fn unsubscribe_clears_the_flag_again() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = locked_user(&pool, "carol").await;
@@ -516,8 +533,10 @@ async fn unsubscribe_clears_the_flag_again(pool: PgPool) {
 /// the caller's incoming requests stay out; an empty list is the empty array
 /// with no `Link` header, and the entries carry Pleroma's empty embedded
 /// relationship.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_outgoing_list_answers_the_callers_own_asks(pool: PgPool) {
+#[tokio::test]
+async fn the_outgoing_list_answers_the_callers_own_asks() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let carol = locked_user(&pool, "carol").await;
     let dave = locked_user(&pool, "dave").await;
@@ -593,8 +612,10 @@ async fn the_outgoing_list_answers_the_callers_own_asks(pool: PgPool) {
 /// The list walks by `follows` row id: the `Link` header's cursors, the
 /// `max_id` continuation, the `min_id` page (answered newest-first again) and
 /// the empty ends of the walk, which carry no header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_outgoing_list_pages_key_on_follow_row_ids_and_link(pool: PgPool) {
+#[tokio::test]
+async fn the_outgoing_list_pages_key_on_follow_row_ids_and_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let mut asks = Vec::new();
     for n in 0..5 {
@@ -659,8 +680,10 @@ async fn the_outgoing_list_pages_key_on_follow_row_ids_and_link(pool: PgPool) {
 
 /// The listing pages with Pleroma's global pair, which is what the plain
 /// [`PageParams`] extractor gives: twenty rows by default, forty at most.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_outgoing_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) {
+#[tokio::test]
+async fn the_outgoing_default_page_is_twenty_and_the_cap_is_forty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     for n in 0..45 {
         let target = locked_user(&pool, &format!("target{n}")).await;
@@ -692,8 +715,10 @@ async fn the_outgoing_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) 
 /// All three routes demand a user token: no token is the 401 "Invalid
 /// credentials", an invalid one the 401 "The access token is invalid", and an
 /// app-only credential the 403 — before any scope or id is ever looked at.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_route_requires_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn every_route_requires_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app_only = common::create_app_only_token(&pool, "follow").await;
     let app = common::test_app(pool);
@@ -760,8 +785,10 @@ async fn every_route_requires_a_user_token(pool: PgPool) {
 /// `write:follows`, the listing anything covering `read:follows`; everything
 /// else is Pleroma's insufficient-permissions 403, naming the missing scopes
 /// the way each route's plug does.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_routes_gate_on_the_follow_scopes(pool: PgPool) {
+#[tokio::test]
+async fn the_routes_gate_on_the_follow_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let _granted: Follow = following(&pool, &alice, &bob).await;
@@ -772,11 +799,7 @@ async fn the_routes_gate_on_the_follow_scopes(pool: PgPool) {
     for scopes in ["follow", "write:follows", "write"] {
         let good = common::create_app_and_token(&pool, &alice, scopes).await;
         for unsubscribe in [false, true] {
-            let action = if unsubscribe {
-                "unsubscribe"
-            } else {
-                "subscribe"
-            };
+            let action = subscription_verb(unsubscribe);
             let response = subscription(&app, &good, &bob.id, unsubscribe).await;
             assert_eq!(response.status, StatusCode::OK, "{scopes} may {action}");
             assert_eq!(
@@ -851,8 +874,10 @@ async fn the_routes_gate_on_the_follow_scopes(pool: PgPool) {
 /// uuid text, an id that names no user, and a deactivated account — and the
 /// refusal comes before the follow check, so a caller who is not following
 /// the id still sees the 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_unknown_account_is_the_same_404(pool: PgPool) {
+#[tokio::test]
+async fn every_unknown_account_is_the_same_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let ghost = deactivated_user(&pool, "ghost").await;
     let token = common::create_app_and_token(&pool, &alice, "follow").await;
@@ -882,8 +907,10 @@ async fn every_unknown_account_is_the_same_404(pool: PgPool) {
 
 /// A malformed cursor is the page parser's 400 with its message, and auth
 /// still runs first: a bad token alongside a bad cursor is the 401.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_malformed_cursor_is_a_bad_request(pool: PgPool) {
+#[tokio::test]
+async fn a_malformed_cursor_is_a_bad_request() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "read:follows").await;
     let app = common::test_app(pool);

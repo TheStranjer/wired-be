@@ -46,6 +46,16 @@ const EXPECTED_KEYS: [&str; 4] = ["last_read_id", "pleroma", "updated_at", "vers
 /// The longest position the endpoint stores.
 const MAX_LAST_READ_ID_CHARS: usize = 255;
 
+/// `GET`s the markers route with no credential at all.
+async fn read_anonymous(app: &Router) -> common::TestResponse {
+    common::TestRequest::get(ROOT).send(app).await
+}
+
+/// `POST`s `body` to the markers route with no credential at all.
+async fn post_anonymous(app: &Router, body: &Value) -> common::TestResponse {
+    common::TestRequest::post(ROOT).json(body).send(app).await
+}
+
 /// A local user named `nickname` plus a bearer token granting `scopes`.
 async fn fixture(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
     let created = common::create_local_user(pool, nickname).await;
@@ -152,8 +162,10 @@ fn marker_keys<'a>(value: &'a Value, timeline: &str) -> Vec<&'a str> {
 
 /// An account that has stored nothing answers the empty object, whether or
 /// not it names timelines — and the response is JSON either way.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_account_without_markers_answers_the_empty_object(pool: PgPool) {
+#[tokio::test]
+async fn an_account_without_markers_answers_the_empty_object() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:statuses").await;
     let app = common::test_app(pool);
 
@@ -180,8 +192,10 @@ async fn an_account_without_markers_answers_the_empty_object(pool: PgPool) {
 /// `POST` answers the marker it wrote and `GET` answers the very same object:
 /// the four keys, the position verbatim, version `0` for a first marker, the
 /// time in the Mastodon format and Pleroma's zero unread count.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn posting_a_position_round_trips_through_the_read(pool: PgPool) {
+#[tokio::test]
+async fn posting_a_position_round_trips_through_the_read() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:statuses write:statuses").await;
     let app = common::test_app(pool);
 
@@ -219,8 +233,10 @@ async fn posting_a_position_round_trips_through_the_read(pool: PgPool) {
 
 /// Every rewrite of one timeline adds one to its `version` and replaces its
 /// position, in the same row; the other timeline counts on its own.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn each_post_bumps_the_version_it_answers(pool: PgPool) {
+#[tokio::test]
+async fn each_post_bumps_the_version_it_answers() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:statuses write:statuses").await;
     let app = common::test_app(pool.clone());
 
@@ -271,8 +287,10 @@ async fn each_post_bumps_the_version_it_answers(pool: PgPool) {
 
 /// A form body with the `home[last_read_id]=…` spelling writes both
 /// timelines, answered in the same object a JSON body would return.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_form_body_with_nested_keys_writes_both_timelines(pool: PgPool) {
+#[tokio::test]
+async fn a_form_body_with_nested_keys_writes_both_timelines() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:statuses write:statuses").await;
     let app = common::test_app(pool.clone());
 
@@ -334,8 +352,10 @@ async fn a_form_body_with_nested_keys_writes_both_timelines(pool: PgPool) {
 
 /// `GET` answers only the timelines it is asked for, in either spelling, and
 /// leaves out the ones with no marker; asking for nothing answers nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn reading_filters_by_the_timeline_parameter(pool: PgPool) {
+#[tokio::test]
+async fn reading_filters_by_the_timeline_parameter() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:statuses").await;
     let rows = seed_both(&pool, &alice).await;
     assert_eq!(rows.len(), 2, "the fixture wrote both markers");
@@ -398,8 +418,10 @@ async fn reading_filters_by_the_timeline_parameter(pool: PgPool) {
 
 /// Keys that name no marker timeline are ignored, and an empty body — in
 /// either content type — answers and writes nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_keys_and_empty_bodies_write_nothing(pool: PgPool) {
+#[tokio::test]
+async fn unknown_keys_and_empty_bodies_write_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:statuses write:statuses").await;
     let app = common::test_app(pool.clone());
 
@@ -432,8 +454,10 @@ async fn unknown_keys_and_empty_bodies_write_nothing(pool: PgPool) {
 
 /// A position longer than 255 characters is stored cut to 255, and a
 /// multi-byte one is cut at a character boundary, never mid-character.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_position_is_capped_at_two_hundred_fifty_five_characters(pool: PgPool) {
+#[tokio::test]
+async fn a_position_is_capped_at_two_hundred_fifty_five_characters() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:statuses write:statuses").await;
     let app = common::test_app(pool.clone());
 
@@ -492,8 +516,10 @@ async fn a_position_is_capped_at_two_hundred_fifty_five_characters(pool: PgPool)
 
 /// Another account neither reads nor moves a marker: their timelines are empty
 /// until they post, and their post is version `0` in its own row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn markers_are_each_account_s_own(pool: PgPool) {
+#[tokio::test]
+async fn markers_are_each_account_s_own() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, alice_token) = fixture(&pool, "alice", "read:statuses write:statuses").await;
     let (bob, bob_token) = fixture(&pool, "bob", "read:statuses write:statuses").await;
     let _seeded: Vec<Marker> = seed_both(&pool, &alice).await;
@@ -531,8 +557,10 @@ async fn markers_are_each_account_s_own(pool: PgPool) {
 
 /// A body whose timeline value is not a marker object is the extractor's 422,
 /// and it writes nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_misshapen_marker_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn a_misshapen_marker_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:statuses").await;
     let app = common::test_app(pool.clone());
 
@@ -563,80 +591,88 @@ async fn a_misshapen_marker_is_unprocessable(pool: PgPool) {
     );
 }
 
-/// Reading needs a user token with `read:statuses` (or the broader `read`);
-/// writing needs one with `write:statuses` (or `write`). No token is the 401,
-/// an unresolvable token the 401 that names it, an app-only token and a
-/// missing scope the 403s, all with Pleroma's wording.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_scope_pipeline_guards_both_routes(pool: PgPool) {
+/// The scope pipeline lets the tokens that carry the route's scope through,
+/// in both its narrow and its broad spelling: `read:statuses` (or `read`)
+/// reads, `write:statuses` (or `write`) writes, and a write answers the
+/// position it just stored.
+#[tokio::test]
+async fn tokens_with_the_scope_use_both_routes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, broad) = fixture(&pool, "alice", "read write").await;
     let _seeded: Vec<Marker> = seed_both(&pool, &alice).await;
-    let (reader, read_only) = fixture(&pool, "reader", "read").await;
+    let (_reader, read_only) = fixture(&pool, "reader", "read").await;
     let (_status_reader, read_statuses) = fixture(&pool, "status_reader", "read:statuses").await;
-    let (writer, write_broad) = fixture(&pool, "writer", "write").await;
+    let (_writer, write_broad) = fixture(&pool, "writer", "write").await;
     let (_status_writer, write_statuses) = fixture(&pool, "status_writer", "write:statuses").await;
-    let (narrow, wrong_scopes) = fixture(&pool, "narrow", "read:accounts write:accounts").await;
-    let app_only = common::create_app_only_token(&pool, "read write").await;
     let app = common::test_app(pool.clone());
 
-    for token in [&broad, &read_only, &read_statuses] {
-        let response = read(&app, token, HOME_QUERY).await;
-        assert_eq!(
-            response.status,
-            StatusCode::OK,
-            "a read token reads: {}",
-            response.text()
-        );
-    }
+    let granted_reads = [
+        read(&app, &broad, HOME_QUERY).await,
+        read(&app, &read_only, HOME_QUERY).await,
+        read(&app, &read_statuses, HOME_QUERY).await,
+    ];
+    common::assert_all_answered(&granted_reads, StatusCode::OK, "a read token reads");
 
+    let both = read(&app, &broad, BOTH_QUERY).await;
     assert_eq!(
-        timeline_keys(&read_object(&app, &broad, BOTH_QUERY).await),
+        timeline_keys(&both.json_value()),
         ["home", "notifications"],
         "and the token of an account with markers is answered its own two"
     );
 
-    for token in [&broad, &write_broad, &write_statuses] {
-        let response = post_json(&app, token, json!({"home": {"last_read_id": "written"}})).await;
-        assert_eq!(
-            response.status,
-            StatusCode::OK,
-            "a write token writes: {}",
-            response.text()
-        );
+    let posted = json!({"home": {"last_read_id": "written"}});
+    let granted_writes = [
+        post_json(&app, &broad, posted.clone()).await,
+        post_json(&app, &write_broad, posted.clone()).await,
+        post_json(&app, &write_statuses, posted).await,
+    ];
+    common::assert_all_answered(&granted_writes, StatusCode::OK, "a write token writes");
+    for response in &granted_writes {
         assert_eq!(
             response.json_value()["home"]["last_read_id"],
             "written",
             "and answers what it stored"
         );
     }
+}
 
-    for token in [&write_broad, &wrong_scopes] {
-        let denied = read(&app, token, BOTH_QUERY).await;
-        assert_eq!(
-            denied.status,
-            StatusCode::FORBIDDEN,
-            "a token without `read:statuses` is turned away"
-        );
-        assert_eq!(
-            denied.json_value()["error"],
-            "Insufficient permissions: read:statuses.",
-            "naming the scope it lacks"
-        );
-    }
+/// A token without the route's scope is the 403 naming it, on either route,
+/// and the refused write stores nothing: not for the read-only account, not
+/// for the narrow one, and the writer that was only denied a read keeps the
+/// marker it posted itself.
+#[tokio::test]
+async fn tokens_without_the_scope_are_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, broad) = fixture(&pool, "alice", "read write").await;
+    let (reader, read_only) = fixture(&pool, "reader", "read").await;
+    let (_writer, write_broad) = fixture(&pool, "writer", "write").await;
+    let (narrow, wrong_scopes) = fixture(&pool, "narrow", "read:accounts write:accounts").await;
+    let app = common::test_app(pool.clone());
 
-    for token in [&read_only, &wrong_scopes] {
-        let denied = post_json(&app, token, json!({"home": {"last_read_id": "x"}})).await;
-        assert_eq!(
-            denied.status,
-            StatusCode::FORBIDDEN,
-            "a token without `write:statuses` may not store"
-        );
-        assert_eq!(
-            denied.json_value()["error"],
-            "Insufficient permissions: write:statuses.",
-            "naming the scope it lacks"
-        );
-    }
+    let refused_reads = [
+        read(&app, &write_broad, BOTH_QUERY).await,
+        read(&app, &wrong_scopes, BOTH_QUERY).await,
+    ];
+    common::assert_all_refused(
+        &refused_reads,
+        StatusCode::FORBIDDEN,
+        "Insufficient permissions: read:statuses.",
+        "a token without `read:statuses`",
+    );
+
+    let denied_body = json!({"home": {"last_read_id": "x"}});
+    let refused_writes = [
+        post_json(&app, &read_only, denied_body.clone()).await,
+        post_json(&app, &wrong_scopes, denied_body.clone()).await,
+    ];
+    common::assert_all_refused(
+        &refused_writes,
+        StatusCode::FORBIDDEN,
+        "Insufficient permissions: write:statuses.",
+        "a token without `write:statuses`",
+    );
 
     assert!(
         stored(&pool, &reader).await.is_empty(),
@@ -646,72 +682,59 @@ async fn the_scope_pipeline_guards_both_routes(pool: PgPool) {
         stored(&pool, &narrow).await.is_empty(),
         "and neither did the narrow token's, on either route"
     );
-    let theirs = stored(&pool, &writer).await;
+    let granted_write = post_json(&app, &broad, denied_body).await;
+    common::assert_answer(&granted_write, StatusCode::OK, "the broad token writes");
+    let hers = stored(&pool, &alice).await;
     assert_eq!(
-        theirs.len(),
+        hers.len(),
         1,
-        "the writer keeps only the marker it posted itself"
+        "and a token's own write is kept, as one row per timeline"
     );
     assert_eq!(
-        theirs.first().expect("home").last_read_id,
-        "written",
-        "at the position it wrote, which its denied read left alone"
+        hers.first().expect("home").last_read_id,
+        "x",
+        "at the position it wrote"
     );
+}
 
-    let anonymous_get = common::TestRequest::get(ROOT).send(&app).await;
-    assert_eq!(
-        anonymous_get.status,
+/// The credential half of the pipeline: no token at all is the 401 with
+/// Pleroma's "Invalid credentials", an unresolvable token the 401 that names
+/// the token, and an app-only token the 403 demanding a user — on both routes.
+#[tokio::test]
+async fn absent_and_app_only_credentials_are_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app_only = common::create_app_only_token(&pool, "read write").await;
+    let app = common::test_app(pool);
+    let denied_body = json!({"home": {"last_read_id": "x"}});
+
+    let anonymous = [
+        read_anonymous(&app).await,
+        post_anonymous(&app, &denied_body).await,
+    ];
+    common::assert_all_refused(
+        &anonymous,
         StatusCode::UNAUTHORIZED,
-        "no token at all is a 401 on GET"
-    );
-    assert_eq!(
-        anonymous_get.json_value()["error"],
         "Invalid credentials",
-        "Pleroma's wording for an absent token"
-    );
-    let anonymous_post = common::TestRequest::post(ROOT)
-        .json(&json!({"home": {"last_read_id": "x"}}))
-        .send(&app)
-        .await;
-    assert_eq!(
-        anonymous_post.status,
-        StatusCode::UNAUTHORIZED,
-        "no token at all is a 401 on POST"
-    );
-    assert_eq!(
-        anonymous_post.json_value()["error"],
-        "Invalid credentials",
-        "the same wording on the write"
+        "no token at all",
     );
 
     let bogus = read(&app, "not-a-real-token", HOME_QUERY).await;
-    assert_eq!(
-        bogus.status,
-        StatusCode::UNAUTHORIZED,
-        "a token no row carries is a 401"
-    );
-    assert_eq!(
-        bogus.json_value()["error"],
+    common::assert_answer(&bogus, StatusCode::UNAUTHORIZED, "a token no row carries");
+    common::assert_error(
+        &bogus,
         "The access token is invalid",
-        "with the wording for an invalid credential"
+        "the invalid credential",
     );
 
-    for (verb, response) in [
-        ("GET", read(&app, &app_only, HOME_QUERY).await),
-        (
-            "POST",
-            post_json(&app, &app_only, json!({"home": {"last_read_id": "x"}})).await,
-        ),
-    ] {
-        assert_eq!(
-            response.status,
-            StatusCode::FORBIDDEN,
-            "an app-only token reaches no marker on {verb}"
-        );
-        assert_eq!(
-            response.json_value()["error"],
-            "This API requires an authenticated user",
-            "Pleroma's wording on {verb}"
-        );
-    }
+    let userless = [
+        read(&app, &app_only, HOME_QUERY).await,
+        post_json(&app, &app_only, denied_body).await,
+    ];
+    common::assert_all_refused(
+        &userless,
+        StatusCode::FORBIDDEN,
+        "This API requires an authenticated user",
+        "an app-only token",
+    );
 }

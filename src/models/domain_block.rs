@@ -349,8 +349,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_block_is_written_and_read_back(pool: PgPool) {
+    #[tokio::test]
+    async fn a_block_is_written_and_read_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         block_domain(&pool, alice.id, "spam.example")
             .await
@@ -371,8 +373,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocking_twice_is_one_row(pool: PgPool) {
+    #[tokio::test]
+    async fn blocking_twice_is_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         block_domain(&pool, alice.id, "spam.example").await.unwrap();
         let second = stored_ids(&pool).await;
@@ -394,8 +398,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unblocking_removes_the_block_and_repeating_is_fine(pool: PgPool) {
+    #[tokio::test]
+    async fn unblocking_removes_the_block_and_repeating_is_fine() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         block_domain(&pool, alice.id, "spam.example").await.unwrap();
 
@@ -419,8 +425,10 @@ mod tests {
         assert_eq!(stored_ids(&pool).await.len(), 0, "and deletes nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocks_are_each_account_s_own(pool: PgPool) {
+    #[tokio::test]
+    async fn blocks_are_each_account_s_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         block_domain(&pool, alice.id, "spam.example").await.unwrap();
@@ -446,8 +454,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn is_domain_blocked_follows_the_canonical_spelling(pool: PgPool) {
+    #[tokio::test]
+    async fn is_domain_blocked_follows_the_canonical_spelling() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         block_domain(&pool, alice.id, "spam.example").await.unwrap();
 
@@ -465,8 +475,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocked_domains_keeps_oldest_first(pool: PgPool) {
+    #[tokio::test]
+    async fn blocked_domains_keeps_oldest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         for domain in ["one.example", "two.example", "three.example"] {
             block_domain(&pool, alice.id, domain).await.unwrap();
@@ -478,8 +490,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_page_newest_first_walks_by_row_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_page_newest_first_walks_by_row_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         for n in 0..5 {
             block_domain(&pool, alice.id, &format!("block{n}.example"))
@@ -551,8 +565,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_the_blocker_takes_the_blocks(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_the_blocker_takes_the_blocks() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         block_domain(&pool, alice.id, "spam.example").await.unwrap();
@@ -572,8 +588,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_block_for_no_stored_account_fails(pool: PgPool) {
+    #[tokio::test]
+    async fn a_block_for_no_stored_account_fails() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         // The foreign key is the model's only guard: the endpoint hands
         // ids that name live users, and a fabricated one is a database
         // error, never a silently stored orphan.

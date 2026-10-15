@@ -142,8 +142,10 @@ mod tests {
         max_attempts: 5,
     };
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_handler_deletes_the_expired_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn the_handler_deletes_the_expired_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -162,8 +164,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_handler_passes_over_a_table_it_need_not_touch(pool: PgPool) {
+    #[tokio::test]
+    async fn the_handler_passes_over_a_table_it_need_not_touch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let outcome = handle_expire(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
         assert_eq!(outcome, Ok(()), "nothing to delete is a clean pass");
@@ -173,8 +177,10 @@ mod tests {
     /// A sweep that cannot reach the database is a retryable failure, so the
     /// queue keeps the pass while the scheduler enqueues the next period: a
     /// lapsed row survives a broken pass, and no mute's effect is lost.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unreachable_database_retries_the_sweep(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unreachable_database_retries_the_sweep() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = broken_state().await;
 
         let outcome = handle_expire(state, FIRST_ATTEMPT, json!({})).await;
@@ -215,8 +221,10 @@ mod tests {
     /// The handler the registry binds to the kind is this module's
     /// [`handle_expire`], not some other sweep: calling the registered handler
     /// deletes the rows.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_registered_handler_is_this_sweep(pool: PgPool) {
+    #[tokio::test]
+    async fn the_registered_handler_is_this_sweep() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         mute_expiring_in(&pool, &alice, &bob, -60).await;

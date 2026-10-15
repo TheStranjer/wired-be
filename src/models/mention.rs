@@ -283,8 +283,10 @@ mod tests {
         String::new()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn link_keeps_the_given_order_and_zero_based_positions(pool: PgPool) {
+    #[tokio::test]
+    async fn link_keeps_the_given_order_and_zero_based_positions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -314,8 +316,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn relinking_continues_the_order_without_moving_the_old_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn relinking_continues_the_order_without_moving_the_old_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -345,8 +349,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_repeated_id_within_one_link_is_one_row(pool: PgPool) {
+    #[tokio::test]
+    async fn a_repeated_id_within_one_link_is_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -362,8 +368,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn linking_nothing_is_no_work(pool: PgPool) {
+    #[tokio::test]
+    async fn linking_nothing_is_no_work() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let status = post(&pool, &alice).await;
         link(&pool, status.id, &[]).await.expect("empty links fine");
@@ -373,8 +381,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unknown_side_of_a_link_is_the_foreign_key(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unknown_side_of_a_link_is_the_foreign_key() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let status = post(&pool, &alice).await;
         let nobody = Uuid::now_v7();
@@ -389,8 +399,10 @@ mod tests {
         assert!(stored_rows(&pool).await.is_empty(), "nothing was stored");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn replace_rewrites_the_set_and_restarts_the_order(pool: PgPool) {
+    #[tokio::test]
+    async fn replace_rewrites_the_set_and_restarts_the_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -416,8 +428,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_bad_replace_keeps_the_old_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn a_bad_replace_keeps_the_old_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let status = post(&pool, &alice).await;
@@ -437,8 +451,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_status_or_an_account_takes_the_links(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_status_or_an_account_takes_the_links() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -471,8 +487,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn for_statuses_groups_by_status_and_skips_the_quiet_ones(pool: PgPool) {
+    #[tokio::test]
+    async fn for_statuses_groups_by_status_and_skips_the_quiet_ones() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -506,8 +524,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn mentioned_status_ids_pages_newest_first(pool: PgPool) {
+    #[tokio::test]
+    async fn mentioned_status_ids_pages_newest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         for _ in 0..3 {

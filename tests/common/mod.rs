@@ -1,10 +1,14 @@
 //! Reusable helpers for the HTTP integration tests (decision 13).
 //!
-//! Every endpoint test follows the same shape: `#[sqlx::test]` hands the
-//! test a fresh, fully migrated database and its `PgPool`; [`test_app`]
-//! builds the real router on top of that pool; [`TestRequest`] drives the
-//! router in-process through `tower::ServiceExt::oneshot` — no sockets, no
-//! ports — and returns a [`TestResponse`] to assert against.
+//! Every endpoint test follows the same shape: [`test_db`] checks out a
+//! private, fully migrated, empty database from the slot pool in
+//! [`wired_be::test_db`] and hands it over as a `PgPool`; [`test_app`] builds
+//! the real router on top of that pool; [`TestRequest`] drives the router
+//! in-process through `tower::ServiceExt::oneshot` — no sockets, no ports —
+//! and returns a [`TestResponse`] to assert against. The fixture replaces
+//! `#[sqlx::test]`, which paid a `CREATE DATABASE`, a full migration run and
+//! a `DROP DATABASE` per test and serialized all of it behind one global
+//! advisory lock.
 //!
 //! The `#![cfg(test)]` gate is always active for crates under `tests/`
 //! (Cargo compiles them with `--test`). It is what lets Clippy's
@@ -43,9 +47,30 @@ use wired_be::{
         user::{Flag, NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
     },
     state::AppState,
+    test_db::TestDb,
     uploads::UploaderBackend,
     util::password::hash_password,
 };
+
+/// A private, fully migrated, empty test database: the slot pool fixture from
+/// [`wired_be::test_db`], handed over as [`TestDb`] with its [`PgPool`].
+///
+/// Every database test starts here and keeps the return value alive for as
+/// long as it uses the pool: the fixture holds the lease on its slot
+/// database, so dropping it frees the slot for the next test. Setup is
+/// migrations and one `TRUNCATE`, not a database per test, which is what
+/// `#[sqlx::test]` used to pay for every test in the suite.
+///
+/// # Panics
+///
+/// If `DATABASE_URL` is unset, or the template and slot databases cannot be
+/// created, migrated or reset.
+#[must_use]
+pub async fn test_db() -> TestDb {
+    wired_be::test_db::test_db()
+        .await
+        .expect("a migrated test database slot")
+}
 
 /// The configuration [`test_app`] runs with: `BASE_URL` `https://test.example`,
 /// defaults everywhere else, no environment access.
@@ -779,5 +804,64 @@ impl TestResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = HeaderName::try_from(name).ok()?;
         self.headers.get(name)?.to_str().ok()
+    }
+}
+
+/// The status a gated route answers, naming the case `who` and showing the
+/// body when the assertion fails.
+///
+/// # Panics
+///
+/// If the status differs.
+pub fn assert_answer(response: &TestResponse, status: StatusCode, who: &str) {
+    assert_eq!(response.status, status, "{who}: {}", response.text());
+}
+
+/// The `{"error": …}` body a gated route answers with, for `who`.
+///
+/// # Panics
+///
+/// If the rendered error differs.
+pub fn assert_error(response: &TestResponse, message: &str, who: &str) {
+    assert_eq!(
+        response.json_value().get("error").and_then(Value::as_str),
+        Some(message),
+        "the refusal wording for {who}: {}",
+        response.text()
+    );
+}
+
+/// The status every response in `refused` answers, for `who`.
+///
+/// # Panics
+///
+/// If any status differs.
+pub fn assert_all_answered(refused: &[TestResponse], status: StatusCode, who: &str) {
+    for response in refused {
+        assert_answer(response, status, who);
+    }
+}
+
+/// The `{"error": …}` body every response in `refused` carries, for `who`.
+///
+/// # Panics
+///
+/// If any rendered error differs.
+pub fn assert_all_errors(refused: &[TestResponse], message: &str, who: &str) {
+    for response in refused {
+        assert_error(response, message, who);
+    }
+}
+
+/// The refusal a gated route answers for every response in `refused`:
+/// `status`, with `message` as its `{"error": …}` body, for `who`.
+///
+/// # Panics
+///
+/// If any status or wording differs.
+pub fn assert_all_refused(refused: &[TestResponse], status: StatusCode, message: &str, who: &str) {
+    for response in refused {
+        assert_answer(response, status, who);
+        assert_error(response, message, who);
     }
 }

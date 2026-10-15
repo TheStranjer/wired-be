@@ -225,8 +225,10 @@ mod tests {
             .expect("the fixture marker upserts");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_first_marker_is_written_at_version_zero(pool: PgPool) {
+    #[tokio::test]
+    async fn a_first_marker_is_written_at_version_zero() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let written = upsert_many(&pool, alice.id, vec![(HOME, "0193abcd")])
             .await
@@ -245,8 +247,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn rewriting_a_marker_bumps_version_and_keeps_the_row(pool: PgPool) {
+    #[tokio::test]
+    async fn rewriting_a_marker_bumps_version_and_keeps_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let first = upsert_many(&pool, alice.id, vec![(HOME, "one")])
             .await
@@ -280,8 +284,10 @@ mod tests {
         assert_eq!(stored.len(), 1, "and there is still only one of them");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn both_timelines_are_written_by_one_call(pool: PgPool) {
+    #[tokio::test]
+    async fn both_timelines_are_written_by_one_call() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let written = upsert_many(&pool, alice.id, vec![(NOTIFICATIONS, "n-1"), (HOME, "h-1")])
             .await
@@ -298,8 +304,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_repeated_timeline_is_written_once_from_its_last_value(pool: PgPool) {
+    #[tokio::test]
+    async fn a_repeated_timeline_is_written_once_from_its_last_value() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let written = upsert_many(&pool, alice.id, vec![(HOME, "first"), (HOME, "second")])
             .await
@@ -318,8 +326,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn nothing_to_write_answers_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn nothing_to_write_answers_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let written = upsert_many(&pool, alice.id, Vec::new())
             .await
@@ -334,8 +344,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_long_position_is_cut_at_two_hundred_fifty_five_characters(pool: PgPool) {
+    #[tokio::test]
+    async fn a_long_position_is_cut_at_two_hundred_fifty_five_characters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let over = "x".repeat(MAX_LAST_READ_ID_CHARS + 45);
         let written = upsert_many(&pool, alice.id, vec![(HOME, over.as_str())])
@@ -366,8 +378,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_many_reads_only_the_asked_for_timelines(pool: PgPool) {
+    #[tokio::test]
+    async fn get_many_reads_only_the_asked_for_timelines() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         mark(&pool, &alice, HOME, "h").await;
         mark(&pool, &alice, NOTIFICATIONS, "n").await;
@@ -389,8 +403,10 @@ mod tests {
         assert_eq!(timelines(&unknown), [HOME], "it is simply absent");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn markers_are_each_account_s_own(pool: PgPool) {
+    #[tokio::test]
+    async fn markers_are_each_account_s_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         mark(&pool, &alice, HOME, "alice-here").await;
@@ -421,8 +437,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_user_takes_their_markers(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_user_takes_their_markers() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         mark(&pool, &alice, HOME, "h").await;
         mark(&pool, &alice, NOTIFICATIONS, "n").await;
