@@ -128,6 +128,9 @@ mod remove_from_followers;
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 
+/// Tags over HTTP (`/api/v1/tags/{name}`, `/api/v1/followed_tags`, trends).
+mod tags;
+
 /// `PATCH /api/v1/accounts/update_credentials`.
 mod update_credentials;
 
