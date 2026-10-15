@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn require_user_scope_passes_everything_without_a_user_token() {
         // The gated arm — a user and its token — needs a stored user row,
-        // so the endpoint tests in `tests/accounts.rs` drive it over HTTP;
+        // so the endpoint tests in `tests/api/accounts.rs` drive it over HTTP;
         // what can be built from nothing is the gate's pass-through side.
         MaybeAuthUser(None, None)
             .require_user_scope("read:accounts")
