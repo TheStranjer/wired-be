@@ -26,6 +26,7 @@ pub mod endorsement;
 pub mod filter;
 pub mod follow;
 pub mod hashtag;
+pub mod hashtag_follow;
 pub mod instance_policy_domain;
 pub mod instance_rule;
 pub mod instance_setting;

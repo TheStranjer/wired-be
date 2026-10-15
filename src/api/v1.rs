@@ -8,7 +8,7 @@ use crate::{
     api::{
         accounts, announcements, apps, blocks, chats, custom_emojis, domain_blocks, emoji_packs,
         endorsements, filters, follow_requests, instance, lists, markers, media, misc, mutes,
-        oauth_tokens, pleroma_accounts, pleroma_settings, scrobbles,
+        oauth_tokens, pleroma_accounts, pleroma_settings, scrobbles, tags,
     },
     config::Config,
     state::AppState,
@@ -47,6 +47,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(pleroma_accounts::router())
         .merge(pleroma_settings::router(config))
         .merge(scrobbles::router())
+        .merge(tags::router())
         .nest("/pleroma", misc::util_router())
         .nest("/pleroma/apps", oauth_tokens::apps_router())
         .nest("/pleroma/chats", chats::router())
