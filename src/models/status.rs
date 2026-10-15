@@ -844,8 +844,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_local_root_status_fills_its_urls_and_counts_its_author(pool: PgPool) {
+    #[tokio::test]
+    async fn a_local_root_status_fills_its_urls_and_counts_its_author() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let status = post(&pool, &alice, "hello world").await;
 
@@ -918,8 +920,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_reply_inherits_the_conversation_and_counts_on_its_parent(pool: PgPool) {
+    #[tokio::test]
+    async fn a_reply_inherits_the_conversation_and_counts_on_its_parent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let root = post(&pool, &alice, "root").await;
@@ -959,8 +963,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_mirrored_status_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn a_mirrored_status_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mallory = remote_user(&pool, "mallory").await;
         let published = (Utc::now() - chrono::Duration::days(3)).trunc_subsecs(6);
         let expires = (Utc::now() + chrono::Duration::days(1)).trunc_subsecs(6);
@@ -1039,8 +1045,10 @@ mod tests {
 
     /// A mirrored post cannot name a quote that is not stored here, so this
     /// covers `quote_of_id` against a real row.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_quote_names_its_original_and_leaves_the_count_alone(pool: PgPool) {
+    #[tokio::test]
+    async fn a_quote_names_its_original_and_leaves_the_count_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let original = post(&pool, &alice, "quote me").await;
@@ -1074,8 +1082,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_links_the_mentioned_accounts_in_order(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_links_the_mentioned_accounts_in_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -1109,8 +1119,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unknown_mention_rolls_the_status_back(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unknown_mention_rolls_the_status_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let err = insert(
             &pool,
@@ -1163,8 +1175,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_links_the_hashtags_extracted_from_local_text(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_links_the_hashtags_extracted_from_local_text() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
 
         let status = post(&pool, &alice, "hello #World #foo #FOO").await;
@@ -1209,8 +1223,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_links_the_explicit_hashtags_of_a_remote_post(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_links_the_explicit_hashtags_of_a_remote_post() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mallory = remote_user(&pool, "mallory").await;
         let status = insert(
             &pool,
@@ -1236,8 +1252,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn importing_an_old_post_never_moves_last_status_back(pool: PgPool) {
+    #[tokio::test]
+    async fn importing_an_old_post_never_moves_last_status_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mallory = remote_user(&pool, "mallory").await;
         let now = Utc::now().trunc_subsecs(6);
         let old = insert(
@@ -1299,8 +1317,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn soft_delete_hides_the_status_and_undoes_its_counts(pool: PgPool) {
+    #[tokio::test]
+    async fn soft_delete_hides_the_status_and_undoes_its_counts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let root = post(&pool, &alice, "to be deleted").await;
@@ -1366,8 +1386,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_by_uri_still_finds_a_tombstone(pool: PgPool) {
+    #[tokio::test]
+    async fn get_by_uri_still_finds_a_tombstone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let mallory = remote_user(&pool, "mallory").await;
         let theirs = insert(
@@ -1417,8 +1439,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_reblog_steps_the_original_back(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_reblog_steps_the_original_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let original = post(&pool, &alice, "worth boosting").await;
@@ -1461,8 +1485,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn every_visibility_round_trips(pool: PgPool) {
+    #[tokio::test]
+    async fn every_visibility_round_trips() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         for visibility in Visibility::ALL {
             let status = insert(
@@ -1504,8 +1530,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_column_rejects_a_visibility_it_does_not_know(pool: PgPool) {
+    #[tokio::test]
+    async fn the_column_rejects_a_visibility_it_does_not_know() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let id = new_id();
         let err = sqlx::query(
@@ -1545,8 +1573,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn counters_never_go_below_zero(pool: PgPool) {
+    #[tokio::test]
+    async fn counters_never_go_below_zero() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let status = post(&pool, &alice, "count me").await;
 
@@ -1593,8 +1623,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_many_reads_live_rows_in_id_order(pool: PgPool) {
+    #[tokio::test]
+    async fn get_many_reads_live_rows_in_id_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let one = post(&pool, &alice, "one").await;
         let two = post(&pool, &alice, "two").await;
@@ -1622,8 +1654,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_mirrored_status_without_a_uri_is_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn a_mirrored_status_without_a_uri_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mallory = remote_user(&pool, "mallory").await;
         let err = insert(
             &pool,
@@ -1647,8 +1681,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unknown_parent_or_author_is_rejected(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unknown_parent_or_author_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let err = insert(
             &pool,
@@ -1688,8 +1724,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_an_author_takes_their_statuses_with_it(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_an_author_takes_their_statuses_with_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let root = post(&pool, &alice, "root").await;
         let answer = reply(&pool, &alice, &root, "answer").await;

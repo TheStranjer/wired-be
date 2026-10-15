@@ -174,8 +174,10 @@ fn expected_link(path: &str, oldest: &Uuid, newest: &Uuid) -> String {
 /// answer the ticket's 422; with one they store the endorsement and
 /// answer the full relationship with `endorsed: true`; and re-pinning is
 /// one row and the same answer.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn endorse_demands_a_follow_and_answers_the_relationship(pool: PgPool) {
+#[tokio::test]
+async fn endorse_demands_a_follow_and_answers_the_relationship() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let app = common::test_app(pool.clone());
@@ -216,8 +218,10 @@ async fn endorse_demands_a_follow_and_answers_the_relationship(pool: PgPool) {
 
 /// `endorsed` is computed by the batch loader: the relationships endpoint
 /// and the embedded view on the account both carry the stored pin.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn endorsed_rides_the_relationship_reads(pool: PgPool) {
+#[tokio::test]
+async fn endorsed_rides_the_relationship_reads() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_pair(&pool, &alice, &bob).await;
@@ -250,8 +254,10 @@ async fn endorsed_rides_the_relationship_reads(pool: PgPool) {
 /// Withdraw: unpinning a pinned account answers the relationship with the
 /// pin off, unpinning one that was never pinned is content with that
 /// (200, nothing written), and both action spellings do the same thing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unendorse_withdraws_the_pin_and_repeating_is_fine(pool: PgPool) {
+#[tokio::test]
+async fn unendorse_withdraws_the_pin_and_repeating_is_fine() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_pair(&pool, &alice, &bob).await;
@@ -280,8 +286,10 @@ async fn unendorse_withdraws_the_pin_and_repeating_is_fine(pool: PgPool) {
 /// Unfollowing a pinned account takes the pin with it: the relationship
 /// batch and the own listing both stop seeing the endorsement the moment
 /// the follow row is gone (see [`crate::models::follow::unfollow`]).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unfollowing_clears_the_endorsement(pool: PgPool) {
+#[tokio::test]
+async fn unfollowing_clears_the_endorsement() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     follow_pair(&pool, &alice, &bob).await;
@@ -314,8 +322,10 @@ async fn unfollowing_clears_the_endorsement(pool: PgPool) {
 
 /// A pending request is not a follow: pinning an account that has not
 /// answered is the same 422, and a self-pin never passes either.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_pending_follow_and_a_self_pin_are_refused(pool: PgPool) {
+#[tokio::test]
+async fn a_pending_follow_and_a_self_pin_are_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let carol = common::create_local_user_with(&pool, "carol", |mut new| {
         new.locked = Flag::new(true);
@@ -352,8 +362,10 @@ async fn a_pending_follow_and_a_self_pin_are_refused(pool: PgPool) {
 /// The malformed, unknown and deactivated id is the shared 404 on every
 /// action route — and it outranks the follow check: an unknown id is
 /// never the 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn actions_require_a_live_account(pool: PgPool) {
+#[tokio::test]
+async fn actions_require_a_live_account() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let ghost = common::create_deactivated_user_with_password(&pool, "ghost", "password123").await;
     let app = common::test_app(pool);
@@ -390,8 +402,10 @@ async fn actions_require_a_live_account(pool: PgPool) {
 
 /// The pin routes demand a user token: no token is the 401, an invalid
 /// one the 401, and an app-only credential the 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn actions_require_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn actions_require_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let app_only = common::create_app_only_token(&pool, "write:accounts").await;
     let app = common::test_app(pool);
@@ -418,8 +432,10 @@ async fn actions_require_a_user_token(pool: PgPool) {
 /// exact sub-scope pass (they reach the follow check, here the 422 —
 /// nobody follows the fresh `bob`), anything else is the 403 at the gate,
 /// ahead of the account lookup and the follow check.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn actions_require_the_write_accounts_scope(pool: PgPool) {
+#[tokio::test]
+async fn actions_require_the_write_accounts_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let ghost = common::create_deactivated_user_with_password(&pool, "ghost", "password123").await;
@@ -463,8 +479,10 @@ async fn actions_require_the_write_accounts_scope(pool: PgPool) {
 /// as full account entities embedding the caller's relationship with
 /// `endorsed: true` on it; a remote mirror pins like a local account; the
 /// endorser with nothing pinned gets the empty array and no `Link` header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn own_endorsements_lists_the_callers_pins(pool: PgPool) {
+#[tokio::test]
+async fn own_endorsements_lists_the_callers_pins() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let carol = common::create_remote_user(&pool, "carol", "remote.example").await;
@@ -529,8 +547,10 @@ async fn own_endorsements_lists_the_callers_pins(pool: PgPool) {
 /// The own listing demands a user token with `read:accounts`: the
 /// extractor's 401/403 half, and the 403 of a presented user token that
 /// grants something narrower.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn own_endorsements_requires_read_accounts_of_a_user(pool: PgPool) {
+#[tokio::test]
+async fn own_endorsements_requires_read_accounts_of_a_user() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let narrow = common::create_app_and_token(&pool, &alice, "read:statuses").await;
     let app_only = common::create_app_only_token(&pool, "read:accounts").await;
@@ -557,8 +577,10 @@ async fn own_endorsements_requires_read_accounts_of_a_user(pool: PgPool) {
 /// the `Link` cursors continue where the page ended (`max_id` older,
 /// `min_id` newer, still answered newest-first), a walk off the end is
 /// the empty array, and a malformed cursor is the extractor's 400.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn own_endorsements_pages_by_endorsement_id(pool: PgPool) {
+#[tokio::test]
+async fn own_endorsements_pages_by_endorsement_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
     for nickname in ["one", "two", "three"] {
         let target = common::create_local_user(&pool, nickname).await;
@@ -644,8 +666,10 @@ async fn own_endorsements_pages_by_endorsement_id(pool: PgPool) {
 /// `/api/v1/pleroma` twin answer the same page to anyone, including
 /// without a token: full account entities, newest first, with the
 /// prefix's own `Link` path.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn account_endorsements_are_public_on_both_prefixes(pool: PgPool) {
+#[tokio::test]
+async fn account_endorsements_are_public_on_both_prefixes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let pinned = common::create_local_user(&pool, "pinned").await;
     endorsement::endorse(&pool, bob.id, pinned.id)
@@ -696,8 +720,10 @@ async fn account_endorsements_are_public_on_both_prefixes(pool: PgPool) {
 /// The miss pipeline of the account listings: a malformed, unknown or
 /// deactivated id is the shared 404 on both prefixes, and a presented
 /// token that does not resolve is the 401, never a silent anonymous read.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn account_endorsements_misses_are_404_and_401(pool: PgPool) {
+#[tokio::test]
+async fn account_endorsements_misses_are_404_and_401() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let narrow = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let ghost = common::create_deactivated_user_with_password(&pool, "ghost", "password123").await;
@@ -758,8 +784,10 @@ async fn account_endorsements_misses_are_404_and_401(pool: PgPool) {
 /// everyone but itself — anonymous, another account's token — while the
 /// `hide_follows_count` flag alone, and the account's own view, keep the
 /// list intact. Both prefixes, since both route the same handler.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn hidden_follows_hides_another_accounts_endorsements(pool: PgPool) {
+#[tokio::test]
+async fn hidden_follows_hides_another_accounts_endorsements() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let secret = common::create_local_user_with(&pool, "secret", |mut new| {
         new.hide_follows = Flag::new(true);
         new

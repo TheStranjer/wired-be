@@ -943,8 +943,10 @@ mod tests {
             .expect("the listener task did not panic");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_reference_table_is_unlogged_and_swept_by_index(pool: PgPool) {
+    #[tokio::test]
+    async fn the_reference_table_is_unlogged_and_swept_by_index() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let persistence: String = sqlx::query_scalar(
             "SELECT relpersistence::text FROM pg_class WHERE relname = 'stream_event_payloads'",
         )
@@ -976,8 +978,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn two_hubs_bridge_small_events_over_postgres(pool: PgPool) {
+    #[tokio::test]
+    async fn two_hubs_bridge_small_events_over_postgres() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hub_a = Hub::new(&pool);
         let hub_b = Hub::new(&pool);
         let (stop_a, task_a) = spawn_listener(&pool, &hub_a);
@@ -1018,8 +1022,10 @@ mod tests {
             .expect("listener B did not panic");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_oversized_payload_crosses_the_bridge_by_reference(pool: PgPool) {
+    #[tokio::test]
+    async fn an_oversized_payload_crosses_the_bridge_by_reference() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hub_a = Hub::new(&pool);
         let hub_b = Hub::new(&pool);
         let (stop_a, task_a) = spawn_listener(&pool, &hub_a);
@@ -1064,8 +1070,10 @@ mod tests {
             .expect("listener B did not panic");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn cleanup_removes_only_expired_reference_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn cleanup_removes_only_expired_reference_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let fresh = Uuid::now_v7();
         let expired = Uuid::now_v7();
         store_payload(&pool, fresh, "fresh-body").await.unwrap();
@@ -1093,8 +1101,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_expired_reference_drops_the_event(pool: PgPool) {
+    #[tokio::test]
+    async fn an_expired_reference_drops_the_event() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hub = Hub::new(&pool);
         let mut rx = hub.subscribe();
         // A reference the sweep took before this instance read it.

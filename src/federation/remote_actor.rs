@@ -557,7 +557,6 @@ fn parse_published(json: &Value) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::PgPool;
 
     use super::*;
     use crate::models::user::{
@@ -1089,12 +1088,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_inserts_then_updates_the_same_row(pool: PgPool) {
-        let mut document = fixture(MASTODON);
-        let first = upsert_remote_user(&pool, parse_actor(&document).unwrap())
-            .await
-            .unwrap();
+    /// The mirror row the first fetch of a Mastodon actor stores: every
+    /// column read off the document, and none of the secrets a local account
+    /// has.
+    fn assert_mirror_of(first: &User, document: &Value) {
         assert_eq!(
             first.nickname, "alice@mastodon.example",
             "the parsed handle"
@@ -1133,6 +1130,17 @@ mod tests {
             first.discoverable.get() && !first.locked.get(),
             "the flags moved"
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_inserts_then_updates_the_same_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut document = fixture(MASTODON);
+        let first = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert_mirror_of(&first, &document);
 
         // Counters move through update_counts only: a re-fetch must not
         // reset them (nor touch the login/role columns, absent here).
@@ -1178,8 +1186,10 @@ mod tests {
         assert_eq!(by_nickname.id, first.id, "one row, both lookups");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_follows_a_rename_of_the_same_actor(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_follows_a_rename_of_the_same_actor() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mut document = fixture(MASTODON);
         let first = upsert_remote_user(&pool, parse_actor(&document).unwrap())
             .await
@@ -1202,8 +1212,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_reports_a_nickname_conflict(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_reports_a_nickname_conflict() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let squatter = insert(
             &pool,
             &NewUser::local(
@@ -1237,8 +1249,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_keeps_distinct_actors_distinct(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_keeps_distinct_actors_distinct() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
             .await
             .unwrap();

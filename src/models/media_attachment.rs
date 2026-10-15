@@ -482,8 +482,10 @@ mod tests {
         get_by_id(pool, id).await.unwrap().expect("row exists")
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let posted = create_status(&pool, &alice).await;
         let stored = insert(
@@ -560,8 +562,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_defaults_to_unattached_remote_media(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_defaults_to_unattached_remote_media() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let stored = insert(
             &pool,
             &NewMediaAttachment {
@@ -596,8 +600,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn insert_rejects_an_unknown_uploader(pool: PgPool) {
+    #[tokio::test]
+    async fn insert_rejects_an_unknown_uploader() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let err = insert(
             &pool,
             &NewMediaAttachment {
@@ -619,8 +625,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_the_uploader_nulls_user_id(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_the_uploader_nulls_user_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let stored = insert(&pool, &new_upload(alice.id)).await.unwrap();
         let dropped = sqlx::query("DELETE FROM users WHERE id = $1")
@@ -637,8 +645,10 @@ mod tests {
         assert_eq!(orphaned.url, stored.url, "the rest of the row is kept");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn lookups_of_unknown_ids_are_empty(pool: PgPool) {
+    #[tokio::test]
+    async fn lookups_of_unknown_ids_are_empty() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             get_by_id(&pool, new_id()).await.unwrap().is_none(),
             "an unknown id finds nothing"
@@ -661,8 +671,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn chat_media_is_own_unattached_image_video_or_audio(pool: PgPool) {
+    #[tokio::test]
+    async fn chat_media_is_own_unattached_image_video_or_audio() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let bob = create_user(&pool, "bob").await;
         let image = insert(&pool, &new_upload(alice.id)).await.unwrap();
@@ -715,8 +727,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn attach_to_status_only_attaches_own_unattached_media(pool: PgPool) {
+    #[tokio::test]
+    async fn attach_to_status_only_attaches_own_unattached_media() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let bob = create_user(&pool, "bob").await;
         let mine1 = insert(&pool, &new_upload(alice.id)).await.unwrap();
@@ -792,8 +806,10 @@ mod tests {
 
     /// The foreign key this ticket added: `status_id` names a stored status,
     /// both on the way in and when attaching afterwards.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn media_can_only_name_a_status_that_exists(pool: PgPool) {
+    #[tokio::test]
+    async fn media_can_only_name_a_status_that_exists() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let err = insert(
             &pool,
@@ -836,8 +852,10 @@ mod tests {
 
     /// A soft delete keeps the status row, so its media stays; the cascade
     /// runs when the row actually goes.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_status_takes_its_media_with_it(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_status_takes_its_media_with_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let posted = create_status(&pool, &alice).await;
         let attached = insert(
@@ -867,63 +885,40 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn for_statuses_groups_by_status_and_orders_by_position(pool: PgPool) {
+    /// An upload of `owner` attached to `status` at `position`, inserted
+    /// through the model so the group reads the very row back.
+    async fn attach(
+        pool: &PgPool,
+        owner: &User,
+        status: &Status,
+        position: i32,
+    ) -> MediaAttachment {
+        insert(
+            pool,
+            &NewMediaAttachment {
+                status_id: Some(status.id),
+                position,
+                ..new_upload(owner.id)
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn for_statuses_groups_by_status_and_orders_by_position() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let first = create_status(&pool, &alice).await;
         let second = create_status(&pool, &alice).await;
         // Insert out of order: positions shuffled against id order, and
         // the second status gets a position tie broken by id.
-        let late = insert(
-            &pool,
-            &NewMediaAttachment {
-                status_id: Some(first.id),
-                position: 2,
-                ..new_upload(alice.id)
-            },
-        )
-        .await
-        .unwrap();
-        let early = insert(
-            &pool,
-            &NewMediaAttachment {
-                status_id: Some(first.id),
-                position: 0,
-                ..new_upload(alice.id)
-            },
-        )
-        .await
-        .unwrap();
-        let middle = insert(
-            &pool,
-            &NewMediaAttachment {
-                status_id: Some(first.id),
-                position: 1,
-                ..new_upload(alice.id)
-            },
-        )
-        .await
-        .unwrap();
-        let tie_b = insert(
-            &pool,
-            &NewMediaAttachment {
-                status_id: Some(second.id),
-                position: 1,
-                ..new_upload(alice.id)
-            },
-        )
-        .await
-        .unwrap();
-        let tie_a = insert(
-            &pool,
-            &NewMediaAttachment {
-                status_id: Some(second.id),
-                position: 1,
-                ..new_upload(alice.id)
-            },
-        )
-        .await
-        .unwrap();
+        let late = attach(&pool, &alice, &first, 2).await;
+        let early = attach(&pool, &alice, &first, 0).await;
+        let middle = attach(&pool, &alice, &first, 1).await;
+        let tie_b = attach(&pool, &alice, &second, 1).await;
+        let tie_a = attach(&pool, &alice, &second, 1).await;
 
         let grouped = for_statuses(&pool, &[first.id, second.id, new_id()])
             .await
@@ -961,8 +956,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_own_unattached_serves_only_the_caller_s_unposted_media(pool: PgPool) {
+    #[tokio::test]
+    async fn get_own_unattached_serves_only_the_caller_s_unposted_media() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let bob = create_user(&pool, "bob").await;
         let mine = insert(&pool, &new_upload(alice.id)).await.unwrap();
@@ -1012,8 +1009,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_own_metadata_writes_all_four_columns(pool: PgPool) {
+    #[tokio::test]
+    async fn update_own_metadata_writes_all_four_columns() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let stored = insert(&pool, &new_upload(alice.id)).await.unwrap();
 
@@ -1066,8 +1065,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_own_metadata_only_touches_own_unattached_media(pool: PgPool) {
+    #[tokio::test]
+    async fn update_own_metadata_only_touches_own_unattached_media() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let bob = create_user(&pool, "bob").await;
         let metadata = MediaMetadata {
@@ -1108,8 +1109,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_removes_the_row_once(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_removes_the_row_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = create_user(&pool, "alice").await;
         let stored = insert(&pool, &new_upload(alice.id)).await.unwrap();
         assert!(

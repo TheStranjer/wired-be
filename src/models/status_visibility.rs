@@ -615,8 +615,10 @@ mod tests {
     /// remote mirror and anonymous — with every row and every rule in
     /// play, including pending follows, mention-scoped directs,
     /// tombstones, and reblogs whose original fell out of view.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_matrix_agrees_through_every_reader(pool: PgPool) {
+    #[tokio::test]
+    async fn the_matrix_agrees_through_every_reader() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let m = seed(&pool).await;
         let all = stored_statuses(&pool).await;
         assert_eq!(all.len(), 11, "every fixture row is stored");
@@ -701,8 +703,10 @@ mod tests {
     /// Rule 7 through both readers: bob's public reblog of alice's
     /// private post travels exactly as far as the original does — to
     /// alice and bob, and nowhere else.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_reblog_is_visible_only_with_its_original(pool: PgPool) {
+    #[tokio::test]
+    async fn a_reblog_is_visible_only_with_its_original() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let carol = local(&pool, "carol").await;
@@ -755,8 +759,10 @@ mod tests {
     /// log in, so that is the audience the rule can ever be asked about
     /// (a remote mirror passed as a viewer struct is refused the same
     /// way).
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn local_visibility_needs_a_local_viewer(pool: PgPool) {
+    #[tokio::test]
+    async fn local_visibility_needs_a_local_viewer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let bob = local(&pool, "bob").await;
         let mallory = remote(&pool, "mallory").await;
@@ -794,8 +800,10 @@ mod tests {
     /// everything alice posted — public posts and a mention-scoped direct
     /// alike, because the block is judged before the visibility — while
     /// carol keeps her own posts and alice keeps carol's.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_blocked_viewer_sees_nothing_of_the_author(pool: PgPool) {
+    #[tokio::test]
+    async fn a_blocked_viewer_sees_nothing_of_the_author() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local(&pool, "alice").await;
         let carol = local(&pool, "carol").await;
         let blocked = block::block(&pool, BASE, &alice, &carol)

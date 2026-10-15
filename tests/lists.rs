@@ -185,8 +185,10 @@ fn json_keys(value: &Value) -> Vec<&str> {
 }
 
 /// An account with nothing stored answers 200 with the empty JSON array.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn empty_database_answers_the_empty_list(pool: PgPool) {
+#[tokio::test]
+async fn empty_database_answers_the_empty_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:lists").await;
     let app = common::test_app(pool);
 
@@ -203,8 +205,10 @@ async fn empty_database_answers_the_empty_list(pool: PgPool) {
 /// The whole lifecycle in order: `POST` answers the entity with its
 /// defaults, the list and the show find it (oldest first), `PUT` changes
 /// what it names, `DELETE` answers `{}` and takes it away.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn crud_round_trip(pool: PgPool) {
+#[tokio::test]
+async fn crud_round_trip() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:lists write:lists").await;
     let app = common::test_app(pool);
 
@@ -265,8 +269,10 @@ async fn crud_round_trip(pool: PgPool) {
 
 /// A form body creates the same list a JSON body would, string booleans
 /// and policy included.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_form_body_creates_the_same_list(pool: PgPool) {
+#[tokio::test]
+async fn a_form_body_creates_the_same_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "write:lists").await;
     let app = common::test_app(pool);
 
@@ -288,8 +294,10 @@ async fn a_form_body_creates_the_same_list(pool: PgPool) {
 }
 
 /// All three policy values create and round trip; anything else is a 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_replies_policy_values_round_trip(pool: PgPool) {
+#[tokio::test]
+async fn the_replies_policy_values_round_trip() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:lists write:lists").await;
     let app = common::test_app(pool);
 
@@ -325,8 +333,10 @@ async fn the_replies_policy_values_round_trip(pool: PgPool) {
 /// A `PUT` changes only the parameters it names: an absent title, policy
 /// or flag keeps its stored value, and an empty body changes nothing (but
 /// still answers the list).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn update_changes_only_what_it_names(pool: PgPool) {
+#[tokio::test]
+async fn update_changes_only_what_it_names() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:lists write:lists").await;
     let stored = seed_full(&pool, &alice, "before", "none", true).await;
     let app = common::test_app(pool);
@@ -353,8 +363,10 @@ async fn update_changes_only_what_it_names(pool: PgPool) {
 /// The `{"error":"Validation failed: …"}` bodies the ticket names, and
 /// their precedence: validation runs before any lookup, so even a PUT to a
 /// nonexistent id answers 422 for a bad body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn invalid_parameters_answer_mastodons_validation_wording(pool: PgPool) {
+#[tokio::test]
+async fn invalid_parameters_answer_mastodons_validation_wording() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "write:lists").await;
     let app = common::test_app(pool.clone());
 
@@ -437,8 +449,10 @@ async fn invalid_parameters_answer_mastodons_validation_wording(pool: PgPool) {
 
 /// A foreign id and a malformed one are the same 404 on every list route,
 /// and the owner's row is untouched by another account's attempts.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn ownership_and_missing_ids_answer_404(pool: PgPool) {
+#[tokio::test]
+async fn ownership_and_missing_ids_answer_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, alice_token) = fixture(&pool, "alice", "read:lists write:lists").await;
     let (_bob, bob_token) = fixture(&pool, "bob", "read:lists write:lists").await;
     let hers = seed(&pool, &alice, "hers").await;
@@ -515,8 +529,10 @@ async fn ownership_and_missing_ids_answer_404(pool: PgPool) {
 /// `GET /api/v1/accounts/{id}/lists` answers the viewer's own lists that
 /// hold the account, oldest first — never another owner's, never a list
 /// the account is not on — and 404s on an unknown or malformed account id.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn account_lists_answers_the_viewers_memberships(pool: PgPool) {
+#[tokio::test]
+async fn account_lists_answers_the_viewers_memberships() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, alice_token) = fixture(&pool, "alice", "read:lists").await;
     let (bob, bob_token) = fixture(&pool, "bob", "read:lists").await;
     let (carol, carol_token) = fixture(&pool, "carol", "read:lists").await;
@@ -572,142 +588,122 @@ async fn account_lists_answers_the_viewers_memberships(pool: PgPool) {
     );
 }
 
-/// Reading needs a user token with `read:lists` (or the broader `read`);
-/// writing needs one with `write:lists` (or `write`). Missing tokens are
-/// the 401s, app-only tokens and missing scopes the 403s, all with
-/// Pleroma's wording.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_scope_pipeline_guards_every_route(pool: PgPool) {
-    let (alice, alice_token) = fixture(&pool, "alice", "read write").await;
+/// The credential half of the pipeline: no token at all is the 401 with
+/// Pleroma's "Invalid credentials", a token no row carries the 401 naming the
+/// token, and an app-only token the 403 demanding an authenticated user.
+#[tokio::test]
+async fn the_credential_gates_refuse_every_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, _) = fixture(&pool, "alice", "read write").await;
+    let hers = seed(&pool, &alice, "hers").await;
+    let app_only = common::create_app_only_token(&pool, "read write").await;
+    let app = common::test_app(pool);
+
+    let anonymous = common::TestRequest::get(ROOT).send(&app).await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "no token is a 401");
+    common::assert_error(&anonymous, "Invalid credentials", "the absent token");
+
+    let bogus = [
+        list_all(&app, "not-a-real-token").await,
+        show(&app, "not-a-real-token", hers.id).await,
+        account_lists(&app, "not-a-real-token", alice.id).await,
+    ];
+    common::assert_all_refused(
+        &bogus,
+        StatusCode::UNAUTHORIZED,
+        "The access token is invalid",
+        "a token no row carries",
+    );
+
+    let userless = [
+        list_all(&app, &app_only).await,
+        create_json(&app, &app_only, create_body()).await,
+    ];
+    common::assert_all_refused(
+        &userless,
+        StatusCode::FORBIDDEN,
+        "This API requires an authenticated user",
+        "an app-only token",
+    );
+}
+
+/// The scope half of the pipeline: reading needs a user token with
+/// `read:lists` (or the broader `read`) and writing one with `write:lists`
+/// (or `write`); every route a token lacks the scope for answers the 403
+/// naming it.
+#[tokio::test]
+async fn tokens_without_the_route_scope_are_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, _) = fixture(&pool, "alice", "read write").await;
     let hers = seed(&pool, &alice, "hers").await;
     let (_reader, read_only) = fixture(&pool, "reader", "read").await;
     let (_writer, write_broad) = fixture(&pool, "writer", "write").await;
     let (_narrow, wrong_scope) = fixture(&pool, "narrow", "read:statuses write:statuses").await;
-    let (_viewer, lists_read) = fixture(&pool, "viewer", "read:lists").await;
-    let (_mutator, lists_write) = fixture(&pool, "mutator", "write:lists").await;
-    let app_only = common::create_app_only_token(&pool, "read write").await;
-    let app = common::test_app(pool.clone());
-
-    let anonymous = common::TestRequest::get(ROOT).send(&app).await;
-    assert_eq!(
-        anonymous.status,
-        StatusCode::UNAUTHORIZED,
-        "no token is a 401"
-    );
-    assert_eq!(
-        anonymous.json_value()["error"],
-        "Invalid credentials",
-        "Pleroma's wording for an absent token"
-    );
-    let bogus = list_all(&app, "not-a-real-token").await;
-    assert_eq!(
-        bogus.status,
-        StatusCode::UNAUTHORIZED,
-        "a bogus token is a 401"
-    );
-    assert_eq!(
-        bogus.json_value()["error"],
-        "The access token is invalid",
-        "naming the token as the problem"
-    );
-    let as_app = list_all(&app, &app_only).await;
-    assert_eq!(
-        as_app.status,
-        StatusCode::FORBIDDEN,
-        "an app token is a 403"
-    );
-    assert_eq!(
-        as_app.json_value()["error"],
-        "This API requires an authenticated user",
-        "naming what is missing"
-    );
+    let app = common::test_app(pool);
 
     for (who, token) in [("read:statuses", &wrong_scope), ("write", &write_broad)] {
-        let response = list_all(&app, token).await;
-        assert_eq!(
-            response.status,
+        let refused = [
+            list_all(&app, token).await,
+            show(&app, token, hers.id).await,
+            account_lists(&app, token, alice.id).await,
+        ];
+        common::assert_all_refused(
+            &refused,
             StatusCode::FORBIDDEN,
-            "`{who}` may not list"
-        );
-        assert_eq!(
-            response.json_value()["error"],
             "Insufficient permissions: read:lists.",
-            "the denial names the missing scope for `{who}`"
-        );
-        let shown = show(&app, token, hers.id).await;
-        assert_eq!(shown.status, StatusCode::FORBIDDEN, "`{who}` may not show");
-        let memberships = account_lists(&app, token, alice.id).await;
-        assert_eq!(
-            memberships.status,
-            StatusCode::FORBIDDEN,
-            "`{who}` may not look up memberships"
+            &format!("`{who}` on every reading route"),
         );
     }
-
     for (who, token) in [("read:statuses", &wrong_scope), ("read", &read_only)] {
-        let response = create_json(&app, token, create_body()).await;
-        assert_eq!(
-            response.status,
+        let refused = [
+            create_json(&app, token, create_body()).await,
+            update(&app, token, hers.id, json!({"title": "x"})).await,
+            destroy(&app, token, hers.id).await,
+        ];
+        common::assert_all_refused(
+            &refused,
             StatusCode::FORBIDDEN,
-            "`{who}` may not create"
-        );
-        assert_eq!(
-            response.json_value()["error"],
             "Insufficient permissions: write:lists.",
-            "the denial names the missing scope for `{who}`"
-        );
-        let replaced = update(&app, token, hers.id, json!({"title": "x"})).await;
-        assert_eq!(
-            replaced.status,
-            StatusCode::FORBIDDEN,
-            "`{who}` may not update"
-        );
-        let deleted = destroy(&app, token, hers.id).await;
-        assert_eq!(
-            deleted.status,
-            StatusCode::FORBIDDEN,
-            "`{who}` may not delete"
+            &format!("`{who}` on every writing route"),
         );
     }
+}
 
-    // The granted side: the narrow sub-scopes on their own users, and the
-    // broad trees on the owner of the row touched by id.
-    assert_eq!(
-        list_all(&app, &lists_read).await.status,
+/// The granted side of the same pipeline: the narrow sub-scopes pass on their
+/// own users, the broad `read` and `write` trees pass everywhere, and what a
+/// token was refused it really did not store.
+#[tokio::test]
+async fn the_granted_scopes_use_every_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, alice_token) = fixture(&pool, "alice", "read write").await;
+    let hers = seed(&pool, &alice, "hers").await;
+    let (_viewer, lists_read) = fixture(&pool, "viewer", "read:lists").await;
+    let (_mutator, lists_write) = fixture(&pool, "mutator", "write:lists").await;
+    let app = common::test_app(pool);
+
+    let granted_reads = [
+        list_all(&app, &lists_read).await,
+        account_lists(&app, &lists_read, alice.id).await,
+        show(&app, &alice_token, hers.id).await,
+    ];
+    common::assert_all_answered(
+        &granted_reads,
         StatusCode::OK,
-        "`read:lists` lists"
+        "`read:lists` lists and looks up memberships; the broad read shows",
     );
-    assert_eq!(
-        account_lists(&app, &lists_read, alice.id).await.status,
+    let granted_writes = [
+        create_json(&app, &lists_write, create_body()).await,
+        create_json(&app, &alice_token, create_body()).await,
+        update(&app, &alice_token, hers.id, json!({"title": "rewritten"})).await,
+        destroy(&app, &alice_token, hers.id).await,
+    ];
+    common::assert_all_answered(
+        &granted_writes,
         StatusCode::OK,
-        "and looks up memberships"
-    );
-    assert_eq!(
-        create_json(&app, &lists_write, create_body()).await.status,
-        StatusCode::OK,
-        "`write:lists` creates"
-    );
-    assert_eq!(
-        show(&app, &alice_token, hers.id).await.status,
-        StatusCode::OK,
-        "the broad `read` shows"
-    );
-    assert_eq!(
-        create_json(&app, &alice_token, create_body()).await.status,
-        StatusCode::OK,
-        "the broad `write` creates"
-    );
-    assert_eq!(
-        update(&app, &alice_token, hers.id, json!({"title": "rewritten"}))
-            .await
-            .status,
-        StatusCode::OK,
-        "and updates"
-    );
-    assert_eq!(
-        destroy(&app, &alice_token, hers.id).await.status,
-        StatusCode::OK,
-        "and the broad `write` deletes the owner's row"
+        "`write:lists` creates; the broad write creates, updates and deletes the owner's row",
     );
     assert_eq!(
         titles(&listed(&app, &alice_token).await),

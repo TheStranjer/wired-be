@@ -108,21 +108,12 @@ async fn backup_codes(app: &Router, token: &str) -> common::TestResponse {
         .await
 }
 
-/// The full lifecycle from the ticket: setup, a rejected wrong code, a
-/// successful confirm, settings, backup codes and the disable.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn full_lifecycle_setup_confirm_backup_codes_disable(pool: PgPool) {
-    let app = common::test_app(pool.clone());
-    let (alice, token) = fixture(&pool, "alice", "read write").await;
-
-    assert_eq!(
-        get_settings(&app, &token).await,
-        json!({"settings": {"enabled": false, "totp": false}}),
-        "a fresh account has MFA off"
-    );
-
-    let opened = setup(&app, &token).await;
-    assert_eq!(opened.status, StatusCode::OK, "setup answers 200");
+/// Runs `POST …/mfa/setup` and asserts everything the first step owes: a
+/// 32-character base32 key, the provisioning URI built from it, and the
+/// stored secret waiting unconfirmed.
+async fn opened_key(app: &Router, token: &str, pool: &PgPool, owner: &User) -> String {
+    let opened = setup(app, token).await;
+    common::assert_answer(&opened, StatusCode::OK, "setup answers 200");
     let opened_body = opened.json_value();
     let key = opened_body["key"]
         .as_str()
@@ -134,7 +125,7 @@ async fn full_lifecycle_setup_confirm_backup_codes_disable(pool: PgPool) {
         Some(totp::provisioning_uri(&key, "alice", "Wired").as_str()),
         "the URI carries issuer INSTANCE_NAME and account nickname"
     );
-    let after_setup = stored(&pool, alice.id).await;
+    let after_setup = stored(pool, owner.id).await;
     assert_eq!(
         after_setup.totp.secret.as_deref(),
         Some(key.as_str()),
@@ -145,45 +136,19 @@ async fn full_lifecycle_setup_confirm_backup_codes_disable(pool: PgPool) {
         !after_setup.totp.confirmed,
         "and the method starts unconfirmed"
     );
+    key
+}
 
-    let real = current_code(&key);
-    let rejected = confirm(&app, &token, PASSWORD, &wrong_code(&real)).await;
-    assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
-    assert_eq!(
-        rejected.json_value(),
-        json!({"error": "invalid_token"}),
-        "the wrong code is Pleroma's invalid_token"
-    );
-    assert!(
-        !stored(&pool, alice.id).await.enabled,
-        "a rejected code enables nothing"
-    );
-
-    let accepted = confirm(&app, &token, PASSWORD, &real).await;
-    assert_eq!(accepted.status, StatusCode::OK, "the right code confirms");
-    assert_eq!(
-        accepted.json_value(),
-        json!({}),
-        "confirm answers the empty object"
-    );
-    let confirmed = stored(&pool, alice.id).await;
-    assert!(
-        confirmed.enabled && confirmed.totp.confirmed,
-        "both flags set"
-    );
-    assert_eq!(
-        confirmed.totp.secret.as_deref(),
-        Some(key.as_str()),
-        "the secret survives for future logins"
-    );
-    assert_eq!(
-        get_settings(&app, &token).await,
-        json!({"settings": {"enabled": true, "totp": true}}),
-        "settings now report the method"
-    );
-
-    let issued = backup_codes(&app, &token).await;
-    assert_eq!(issued.status, StatusCode::OK, "codes are issued");
+/// Asserts the five codes `issued` carries are distinct and lowercase, and
+/// that only their SHA-256 hashes stand in the row.
+async fn assert_issued_codes(
+    app: &Router,
+    token: &str,
+    pool: &PgPool,
+    owner: &User,
+) -> Vec<String> {
+    let issued = backup_codes(app, token).await;
+    common::assert_answer(&issued, StatusCode::OK, "codes are issued");
     let codes = codes_in(&issued.json_value());
     assert_eq!(codes.len(), 5, "Pleroma's count of five codes");
     let unique: HashSet<&String> = codes.iter().collect();
@@ -192,15 +157,21 @@ async fn full_lifecycle_setup_confirm_backup_codes_disable(pool: PgPool) {
         assert_eq!(code.len(), 8, "codes are 8 characters: `{code}`");
         assert!(
             code.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
             "`{code}` is [a-z0-9]"
         );
     }
-    let rotated = stored(&pool, alice.id).await;
+    assert_stored_hashes(pool, owner.id, &codes).await;
+    codes
+}
+
+/// The row holds exactly the SHA-256 hashes of `codes`, and nothing else.
+async fn assert_stored_hashes(pool: &PgPool, owner: Uuid, codes: &[String]) {
     let hashes: HashSet<String> = codes
         .iter()
         .map(|code| totp::hash_backup_code(code))
         .collect();
+    let rotated = stored(pool, owner).await;
     assert_eq!(
         rotated.backup_codes.iter().collect::<HashSet<_>>(),
         hashes.iter().collect::<HashSet<_>>(),
@@ -209,21 +180,80 @@ async fn full_lifecycle_setup_confirm_backup_codes_disable(pool: PgPool) {
     for hash in &rotated.backup_codes {
         assert_eq!(hash.len(), 64, "a SHA-256 is 32 hex bytes: {hash}");
     }
+}
+
+/// The lifecycle from the ticket: setup, a rejected wrong code, a
+/// Confirms the opened method with the account's current code, first proving
+/// that a wrong code is Pleroma's `invalid_token` 422 and enables nothing,
+/// then that the right one sets both flags, keeps the secret and shows up in
+/// the settings.
+async fn confirmed_by_code(app: &Router, token: &str, pool: &PgPool, owner: &User, key: &str) {
+    let real = current_code(key);
+    let rejected = confirm(app, token, PASSWORD, &wrong_code(&real)).await;
+    common::assert_answer(
+        &rejected,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a wrong code is a 422",
+    );
+    assert_eq!(
+        rejected.json_value(),
+        json!({"error": "invalid_token"}),
+        "the wrong code is Pleroma's invalid_token"
+    );
+    assert!(
+        !stored(pool, owner.id).await.enabled,
+        "a rejected code enables nothing"
+    );
+
+    let accepted = confirm(app, token, PASSWORD, &real).await;
+    common::assert_answer(&accepted, StatusCode::OK, "the right code confirms");
+    assert_eq!(
+        accepted.json_value(),
+        json!({}),
+        "confirm answers the empty object"
+    );
+    let confirmed = stored(pool, owner.id).await;
+    assert!(
+        confirmed.enabled && confirmed.totp.confirmed,
+        "both flags set"
+    );
+    assert_eq!(
+        confirmed.totp.secret.as_deref(),
+        Some(key),
+        "the secret survives for future logins"
+    );
+    assert_eq!(
+        get_settings(app, token).await,
+        json!({"settings": {"enabled": true, "totp": true}}),
+        "settings now report the method"
+    );
+}
+
+/// The full lifecycle from the ticket: setup, a rejected wrong code, a
+/// successful confirm, settings, backup codes and the disable.
+#[tokio::test]
+async fn full_lifecycle_setup_confirm_backup_codes_disable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = fixture(&pool, "alice", "read write").await;
+
+    assert_eq!(
+        get_settings(&app, &token).await,
+        json!({"settings": {"enabled": false, "totp": false}}),
+        "a fresh account has MFA off"
+    );
+
+    let key = opened_key(&app, &token, &pool, &alice).await;
+
+    confirmed_by_code(&app, &token, &pool, &alice, &key).await;
+
+    let codes = assert_issued_codes(&app, &token, &pool, &alice).await;
 
     let reissued = backup_codes(&app, &token).await;
     let second_codes = codes_in(&reissued.json_value());
     assert_ne!(codes, second_codes, "a rotation replaces the codes");
-    let after_rotation = stored(&pool, alice.id).await;
-    assert_eq!(after_rotation.backup_codes.len(), 5, "still five hashes");
-    let second_hashes: HashSet<String> = second_codes
-        .iter()
-        .map(|code| totp::hash_backup_code(code))
-        .collect();
-    assert_eq!(
-        after_rotation.backup_codes.iter().collect::<HashSet<_>>(),
-        second_hashes.iter().collect::<HashSet<_>>(),
-        "and they are the new codes' hashes: the old codes stop working"
-    );
+    assert_stored_hashes(&pool, alice.id, &second_codes).await;
 
     let refused = disable(&app, &token, "not-her-password").await;
     assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
@@ -271,8 +301,10 @@ async fn full_lifecycle_setup_confirm_backup_codes_disable(pool: PgPool) {
 
 /// Setup mints a new secret that replaces an unconfirmed one; the
 /// superseded secret stops being able to confirm.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn re_setup_replaces_an_unconfirmed_secret(pool: PgPool) {
+#[tokio::test]
+async fn re_setup_replaces_an_unconfirmed_secret() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (bob, token) = fixture(&pool, "bob", "write:security").await;
 
@@ -303,8 +335,10 @@ async fn re_setup_replaces_an_unconfirmed_secret(pool: PgPool) {
 
 /// A confirmed method cannot be set up again, and setup leaves the
 /// stored secret alone.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn setup_refuses_a_confirmed_method(pool: PgPool) {
+#[tokio::test]
+async fn setup_refuses_a_confirmed_method() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (carol, token) = fixture(&pool, "carol", "read write").await;
     let key = setup(&app, &token).await.json_value()["key"]
@@ -330,8 +364,10 @@ async fn setup_refuses_a_confirmed_method(pool: PgPool) {
 
 /// Confirmation without a prior setup names the missing step, not the
 /// code.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn confirm_without_setup_is_setup_required(pool: PgPool) {
+#[tokio::test]
+async fn confirm_without_setup_is_setup_required() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (_dave, token) = fixture(&pool, "dave", "write").await;
     let refused = confirm(&app, &token, PASSWORD, "123456").await;
@@ -344,8 +380,10 @@ async fn confirm_without_setup_is_setup_required(pool: PgPool) {
 }
 
 /// The password gate runs before the code gate, in both directions.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn confirm_checks_the_password_before_the_code(pool: PgPool) {
+#[tokio::test]
+async fn confirm_checks_the_password_before_the_code() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (erin, token) = fixture(&pool, "erin", "read write").await;
     let key = setup(&app, &token).await.json_value()["key"]
@@ -395,8 +433,10 @@ async fn confirm_checks_the_password_before_the_code(pool: PgPool) {
 }
 
 /// Backup codes require MFA; disabling requires the password.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn backup_codes_and_disable_gates(pool: PgPool) {
+#[tokio::test]
+async fn backup_codes_and_disable_gates() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (fern, token) = fixture(&pool, "fern", "read write").await;
 
@@ -433,134 +473,113 @@ async fn backup_codes_and_disable_gates(pool: PgPool) {
     );
 }
 
-/// Auth and scopes follow Pleroma's plug pipeline: every route demands a
-/// user token, `settings` demands `read:security`, everything that
-/// changes state (including `backup_codes`) demands `write:security`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_and_scope_requirements(pool: PgPool) {
+/// `GET /api/pleroma/accounts/mfa` as `token`, without asserting anything.
+async fn settings_as(app: &Router, token: &str) -> common::TestResponse {
+    common::TestRequest::get(MFA).bearer(token).send(app).await
+}
+
+/// Every MFA route demands a real user token: no token at all is the 401
+/// with Pleroma's "Invalid credentials" body, and an app-only token — which
+/// never names a user — the 403 that says so.
+#[tokio::test]
+async fn every_mfa_route_demands_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let app_only = common::create_app_only_token(&pool, "read write").await;
+
+    let anonymous = [
+        common::TestRequest::get(MFA).send(&app).await,
+        setup(&app, "").await,
+        common::TestRequest::post(&format!("{MFA}/confirm/totp"))
+            .json(&json!({"password": PASSWORD, "code": "123456"}))
+            .send(&app)
+            .await,
+        common::TestRequest::delete(&format!("{MFA}/totp"))
+            .json(&json!({"password": PASSWORD}))
+            .send(&app)
+            .await,
+        backup_codes(&app, "").await,
+    ];
+    common::assert_all_answered(&anonymous, StatusCode::UNAUTHORIZED, "no token at all");
+    common::assert_all_errors(&anonymous, "Invalid credentials", "the no-token body");
+
+    let userless = [
+        settings_as(&app, &app_only).await,
+        setup(&app, &app_only).await,
+    ];
+    common::assert_all_refused(
+        &userless,
+        StatusCode::FORBIDDEN,
+        "This API requires an authenticated user",
+        "an app-only token is not a user",
+    );
+}
+
+/// The scope half of Pleroma's plug pipeline: `settings` demands
+/// `read:security`, everything that changes state (including
+/// `backup_codes`) demands `write:security`, the broad trees cover both, and
+/// an empty scope list grants neither side.
+#[tokio::test]
+async fn the_mfa_routes_gate_on_the_security_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (_kate, no_scopes) = fixture(&pool, "kate", "").await;
     let (_gwen, read_only) = fixture(&pool, "gwen", "read").await;
     let (_hal, write_only) = fixture(&pool, "hal", "write").await;
     let (_ivy, read_security) = fixture(&pool, "ivy", "read:security").await;
     let (_jon, write_security) = fixture(&pool, "jon", "write:security").await;
-    let app_only = common::create_app_only_token(&pool, "read write").await;
 
-    // No token at all: 401 "Invalid credentials" on every route.
-    let anon_settings = common::TestRequest::get(MFA).send(&app).await;
-    assert_eq!(
-        anon_settings.status,
-        StatusCode::UNAUTHORIZED,
-        "401 settings"
+    let refused_reads = [
+        settings_as(&app, &write_only).await,
+        settings_as(&app, &no_scopes).await,
+    ];
+    common::assert_all_answered(
+        &refused_reads,
+        StatusCode::FORBIDDEN,
+        "a write token and an empty scope list read no settings",
     );
-    assert_eq!(
-        anon_settings.json_value(),
-        json!({"error": "Invalid credentials"}),
-        "the no-token body"
-    );
-    let anon_setup = setup(&app, "").await;
-    assert_eq!(anon_setup.status, StatusCode::UNAUTHORIZED, "401 setup");
-    let anon_confirm = common::TestRequest::post(&format!("{MFA}/confirm/totp"))
-        .json(&json!({"password": PASSWORD, "code": "123456"}))
-        .send(&app)
-        .await;
-    assert_eq!(anon_confirm.status, StatusCode::UNAUTHORIZED, "401 confirm");
-    let anon_disable = common::TestRequest::delete(&format!("{MFA}/totp"))
-        .json(&json!({"password": PASSWORD}))
-        .send(&app)
-        .await;
-    assert_eq!(anon_disable.status, StatusCode::UNAUTHORIZED, "401 disable");
-    let anon_codes = backup_codes(&app, "").await;
-    assert_eq!(
-        anon_codes.status,
-        StatusCode::UNAUTHORIZED,
-        "401 backup codes"
+    common::assert_error(
+        &refused_reads[0],
+        "Insufficient permissions: read:security.",
+        "the denial names the missing scope",
     );
 
-    // An app-only token never names a user.
-    let app_view = common::TestRequest::get(MFA)
-        .bearer(&app_only)
-        .send(&app)
-        .await;
-    assert_eq!(
-        app_view.status,
+    let refused_writes = [
+        setup(&app, &read_only).await,
+        backup_codes(&app, &read_only).await,
+        confirm(&app, &read_only, PASSWORD, "123456").await,
+        disable(&app, &read_only, PASSWORD).await,
+    ];
+    common::assert_all_answered(
+        &refused_writes,
         StatusCode::FORBIDDEN,
-        "an app-only token is not a user"
+        "a read token changes no state, and scope is checked before anything else",
     );
-    assert_eq!(
-        app_view.json_value(),
-        json!({"error": "This API requires an authenticated user"}),
-        "Pleroma's user-required wording"
+    common::assert_error(
+        &refused_writes[0],
+        "Insufficient permissions: write:security.",
+        "Pleroma's own test pins this exact body",
     );
 
-    // A `write` token cannot read settings, a `read` token cannot touch
-    // any state — exactly the 403s Pleroma's scope plug answers, and an
-    // empty scope list grants neither side.
-    let write_on_settings = common::TestRequest::get(MFA)
-        .bearer(&write_only)
-        .send(&app)
-        .await;
-    assert_eq!(
-        write_on_settings.status,
-        StatusCode::FORBIDDEN,
-        "settings 403"
-    );
-    assert_eq!(
-        write_on_settings.json_value(),
-        json!({"error": "Insufficient permissions: read:security."}),
-        "the denial names the missing scope"
-    );
-    let none_on_settings = common::TestRequest::get(MFA)
-        .bearer(&no_scopes)
-        .send(&app)
-        .await;
-    assert_eq!(
-        none_on_settings.status,
-        StatusCode::FORBIDDEN,
-        "an empty scope list grants nothing"
-    );
-    let read_on_setup = setup(&app, &read_only).await;
-    assert_eq!(read_on_setup.status, StatusCode::FORBIDDEN, "setup 403");
-    assert_eq!(
-        read_on_setup.json_value(),
-        json!({"error": "Insufficient permissions: write:security."}),
-        "Pleroma's own test pins this exact body"
-    );
-    assert_eq!(
-        backup_codes(&app, &read_only).await.status,
-        StatusCode::FORBIDDEN,
-        "backup_codes is a write action"
-    );
-    assert_eq!(
-        confirm(&app, &read_only, PASSWORD, "123456").await.status,
-        StatusCode::FORBIDDEN,
-        "confirm is gated by scope before anything else"
-    );
-    assert_eq!(
-        disable(&app, &read_only, PASSWORD).await.status,
-        StatusCode::FORBIDDEN,
-        "disable too"
-    );
-    assert_eq!(
-        common::TestRequest::get(MFA)
-            .bearer(&read_security)
-            .send(&app)
-            .await
-            .status,
+    let granted = [
+        settings_as(&app, &read_security).await,
+        setup(&app, &write_security).await,
+    ];
+    common::assert_all_answered(
+        &granted,
         StatusCode::OK,
-        "the narrow read scope suffices for settings"
-    );
-    assert_eq!(
-        setup(&app, &write_security).await.status,
-        StatusCode::OK,
-        "and the narrow write scope for setup"
+        "the narrow read scope suffices for settings and the narrow write scope for setup",
     );
 }
 
 /// The stored TOTP secret must never surface in a `Debug` rendering of
 /// the row (or of the typed settings), and issued backup codes neither.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn secrets_never_appear_in_debug(pool: PgPool) {
+#[tokio::test]
+async fn secrets_never_appear_in_debug() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (mary, token) = fixture(&pool, "mary", "write").await;
     let key = setup(&app, &token).await.json_value()["key"]

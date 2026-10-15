@@ -141,8 +141,10 @@ async fn remove(app: &Router, token: &str, target: &Uuid) -> common::TestRespons
 /// other followers, their counters and the answered `Relationship` say the
 /// same, and the repeat call on the now-absent follower is the unchanged
 /// answer, not an error.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn removing_a_follower_moves_counts_and_answers_the_relationship(pool: PgPool) {
+#[tokio::test]
+async fn removing_a_follower_moves_counts_and_answers_the_relationship() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user(&pool, "carol").await;
     let alice = common::create_local_user(&pool, "alice").await;
     let erin = common::create_local_user(&pool, "erin").await;
@@ -216,8 +218,10 @@ async fn removing_a_follower_moves_counts_and_answers_the_relationship(pool: PgP
 /// unchanged relationship: an unrelated account, and one the caller follows
 /// without being followed back — the caller's own follow is its own to give
 /// back through unfollow, never removed from here.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn non_followers_answer_the_unchanged_relationship(pool: PgPool) {
+#[tokio::test]
+async fn non_followers_answer_the_unchanged_relationship() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user(&pool, "carol").await;
     let dave = common::create_local_user(&pool, "dave").await;
     let bob = common::create_local_user(&pool, "bob").await;
@@ -270,8 +274,10 @@ async fn non_followers_answer_the_unchanged_relationship(pool: PgPool) {
 /// A still-pending follow request is not a follower: the endpoint answers
 /// the unchanged relationship, leaves the request in the queue to be
 /// answered through `/api/v1/follow_requests`, and moves no counters.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_pending_request_stays_out_of_reach(pool: PgPool) {
+#[tokio::test]
+async fn a_pending_request_stays_out_of_reach() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = locked_user(&pool, "carol").await;
     let alice = common::create_local_user(&pool, "alice").await;
     let waiting = pending_follower(&pool, &alice, &carol).await;
@@ -310,8 +316,10 @@ async fn a_pending_request_stays_out_of_reach(pool: PgPool) {
 /// Every miss on the id is the shared 404, resolved before anything else
 /// the request could mean: garbage text, an id that names no account, and a
 /// deactivated follower whose accepted row stays in the table regardless.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_accounts_are_the_shared_404(pool: PgPool) {
+#[tokio::test]
+async fn unknown_accounts_are_the_shared_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user(&pool, "carol").await;
     let ghost = common::create_local_user_with(&pool, "ghost", |mut new| {
         new.is_active = Flag::new(false);
@@ -349,8 +357,10 @@ async fn unknown_accounts_are_the_shared_404(pool: PgPool) {
 /// The caller's own id is the documented 422 — a follower is never the
 /// followee themself — and the guard runs after the account is resolved, so
 /// only a live account id can reach it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn removing_yourself_is_the_documented_422(pool: PgPool) {
+#[tokio::test]
+async fn removing_yourself_is_the_documented_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user(&pool, "carol").await;
     let token = common::create_app_and_token(&pool, &carol, "follow").await;
     let app = common::test_app(pool.clone());
@@ -383,8 +393,10 @@ async fn removing_yourself_is_the_documented_422(pool: PgPool) {
 /// credentials", an invalid one the 401 "The access token is invalid", and
 /// an app-only credential the 403 — before any id or scope is ever looked
 /// at.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_route_requires_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn the_route_requires_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app_only = common::create_app_only_token(&pool, "write:follows").await;
     let app = common::test_app(pool);
@@ -424,8 +436,10 @@ async fn the_route_requires_a_user_token(pool: PgPool) {
 /// alternatives — and another account's token, which passes the gate, is
 /// only ever a caller without that follower: a no-op that leaves the row
 /// where it is.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_route_gates_on_the_follow_scopes(pool: PgPool) {
+#[tokio::test]
+async fn the_route_gates_on_the_follow_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let carol = common::create_local_user(&pool, "carol").await;
     let dave = common::create_local_user(&pool, "dave").await;
     let mut followers = Vec::new();

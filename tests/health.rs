@@ -13,14 +13,15 @@ pub mod common;
 use axum::{Json, Router, extract::Request, http::StatusCode, routing::any};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use wired_be::config::{
     BASE_URL_VAR, DATABASE_URL_VAR, HTTP_ALLOW_PRIVATE_HOSTS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
 };
 
 /// `/health` answers 204 No Content with an empty body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn health_returns_no_content(pool: PgPool) {
+#[tokio::test]
+async fn health_returns_no_content() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/health").send(&app).await;
     assert_eq!(response.status, StatusCode::NO_CONTENT, "health status");
@@ -29,8 +30,10 @@ async fn health_returns_no_content(pool: PgPool) {
 
 /// A path no route matches gets the standard JSON error response
 /// (decision 8), not an empty body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_route_returns_json_not_found(pool: PgPool) {
+#[tokio::test]
+async fn unknown_route_returns_json_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/nope-not-a-route")
         .send(&app)
@@ -55,8 +58,10 @@ async fn unknown_route_returns_json_not_found(pool: PgPool) {
 
 /// A router-level verb mismatch is a 405 from axum, even with the JSON
 /// fallback installed for unknown paths.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn wrong_verb_on_health_gets_method_not_allowed(pool: PgPool) {
+#[tokio::test]
+async fn wrong_verb_on_health_gets_method_not_allowed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let post_response = common::TestRequest::post("/health").send(&app).await;
     assert_eq!(
@@ -75,8 +80,10 @@ async fn wrong_verb_on_health_gets_method_not_allowed(pool: PgPool) {
 
 /// `test_app` answers the health check with the middleware stack active,
 /// proving it is the real `wired_be::app`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn test_app_serves_the_middleware_stack(pool: PgPool) {
+#[tokio::test]
+async fn test_app_serves_the_middleware_stack() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/health").send(&app).await;
     assert_eq!(response.status, StatusCode::NO_CONTENT, "health status");
@@ -276,8 +283,10 @@ fn test_config_is_the_fixed_configuration() {
 /// [`create_local_user`](common::create_local_user) inserts a local,
 /// passwordless row through the model layer, with the test instance's
 /// actor URL, and the row is readable back case-insensitively.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn create_local_user_fixture_inserts_a_row(pool: PgPool) {
+#[tokio::test]
+async fn create_local_user_fixture_inserts_a_row() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let user = common::create_local_user(&pool, "tess").await;
     assert_eq!(user.nickname, "tess", "the nickname is stored as given");
     assert!(user.local.get(), "the fixture builds a local account");
@@ -302,8 +311,10 @@ async fn create_local_user_fixture_inserts_a_row(pool: PgPool) {
 /// a local user whose Argon2id hash and derived email let
 /// [`authenticate`](wired_be::models::user::register::authenticate) find it
 /// by either identifier, and only by the right password.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn create_user_with_password_fixture_authenticates(pool: PgPool) {
+#[tokio::test]
+async fn create_user_with_password_fixture_authenticates() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let user = common::create_user_with_password(&pool, "gina", "a good password").await;
     assert!(user.local.get(), "the fixture builds a local account");
     assert_eq!(

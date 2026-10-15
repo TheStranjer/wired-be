@@ -310,8 +310,10 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn enqueue_claim_complete_round_trip(pool: PgPool) {
+    #[tokio::test]
+    async fn enqueue_claim_complete_round_trip() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let args = json!({ "target": "note/1" });
         let job = enqueue(
             &pool,
@@ -359,8 +361,10 @@ mod tests {
         assert!(drained.is_none(), "a completed job leaves the queue");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn scheduled_job_is_not_claimed_early(pool: PgPool) {
+    #[tokio::test]
+    async fn scheduled_job_is_not_claimed_early() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let when = Utc::now() + TimeDelta::seconds(3600);
         let job = enqueue(
             &pool,
@@ -385,8 +389,10 @@ mod tests {
         assert!(waiting.locked_at.is_none(), "and locks nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn concurrent_claims_never_share_a_job(pool: PgPool) {
+    #[tokio::test]
+    async fn concurrent_claims_never_share_a_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let first = enqueue(&pool, new_job("ingest", "one"))
             .await
             .unwrap()
@@ -415,8 +421,10 @@ mod tests {
         assert!(third.is_none(), "nothing is left to claim");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unique_key_deduplicates_live_jobs(pool: PgPool) {
+    #[tokio::test]
+    async fn unique_key_deduplicates_live_jobs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(
             &pool,
             NewJob {
@@ -488,8 +496,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn fail_retries_then_discards_at_max_attempts(pool: PgPool) {
+    #[tokio::test]
+    async fn fail_retries_then_discards_at_max_attempts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let job = enqueue(
             &pool,
             NewJob {
@@ -568,8 +578,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn rescue_stuck_returns_expired_locks(pool: PgPool) {
+    #[tokio::test]
+    async fn rescue_stuck_returns_expired_locks() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let one = enqueue(&pool, new_job("default", "stuck_a"))
             .await
             .unwrap()

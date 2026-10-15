@@ -150,8 +150,10 @@ fn expected_link(path: &str, next_cursor: &str, prev_cursor: &str) -> String {
     )
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_full_scrobble_is_created_and_lists_back(pool: PgPool) {
+#[tokio::test]
+async fn a_full_scrobble_is_created_and_lists_back() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "write").await;
 
@@ -223,8 +225,10 @@ async fn a_full_scrobble_is_created_and_lists_back(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_form_body_creates_the_same_scrobble_and_snake_case_wins(pool: PgPool) {
+#[tokio::test]
+async fn a_form_body_creates_the_same_scrobble_and_snake_case_wins() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "write").await;
 
@@ -277,8 +281,10 @@ async fn a_form_body_creates_the_same_scrobble_and_snake_case_wins(pool: PgPool)
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_empty_body_and_a_blank_title_are_the_documented_422(pool: PgPool) {
+#[tokio::test]
+async fn an_empty_body_and_a_blank_title_are_the_documented_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "write").await;
 
@@ -328,8 +334,10 @@ async fn an_empty_body_and_a_blank_title_are_the_documented_422(pool: PgPool) {
     assert_eq!(listed.json_value(), json!([]), "and none of them stored");
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_other_parameter_rules_are_422s_too(pool: PgPool) {
+#[tokio::test]
+async fn the_other_parameter_rules_are_422s_too() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "write").await;
 
@@ -394,8 +402,10 @@ async fn the_other_parameter_rules_are_422s_too(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn private_scrobbles_are_visible_to_their_owner_only(pool: PgPool) {
+#[tokio::test]
+async fn private_scrobbles_are_visible_to_their_owner_only() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, alice_token) = fixture(&pool, "alice", "read write").await;
     let (_bob, bob_token) = fixture(&pool, "bob", "read").await;
@@ -449,8 +459,16 @@ async fn private_scrobbles_are_visible_to_their_owner_only(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
+/// `GET`s the scrobble list of `owner`'s own account with `query` (its leading
+/// `?` and all) as `token`.
+async fn own_page(app: &Router, token: &str, owner: &User, query: &str) -> common::TestResponse {
+    list(app, Some(token), &list_path(&owner.id.to_string(), query)).await
+}
+
+#[tokio::test]
+async fn the_listing_pages_by_id_cursor_and_links() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "write").await;
     let mut rows: Vec<Stored> = Vec::new();
@@ -460,12 +478,7 @@ async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
     }
     let path = account_path(&alice, "");
 
-    let first = list(
-        &app,
-        Some(&token),
-        &list_path(&alice.id.to_string(), "?limit=2"),
-    )
-    .await;
+    let first = own_page(&app, &token, &alice, "?limit=2").await;
     let page = first.json_value();
     assert_eq!(titles(&page), ["track 4", "track 3"], "two newest first");
     assert_eq!(
@@ -474,13 +487,11 @@ async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
         "Pleroma's add_link_headers, over the account's own path"
     );
 
-    let older = list(
+    let older = own_page(
         &app,
-        Some(&token),
-        &list_path(
-            &alice.id.to_string(),
-            &format!("?limit=2&max_id={}", rows[3].id),
-        ),
+        &token,
+        &alice,
+        &format!("?limit=2&max_id={}", rows[3].id),
     )
     .await;
     assert_eq!(
@@ -489,13 +500,11 @@ async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
         "the next cursor walks back"
     );
 
-    let forward = list(
+    let forward = own_page(
         &app,
-        Some(&token),
-        &list_path(
-            &alice.id.to_string(),
-            &format!("?limit=2&min_id={}", rows[2].id),
-        ),
+        &token,
+        &alice,
+        &format!("?limit=2&min_id={}", rows[2].id),
     )
     .await;
     assert_eq!(
@@ -504,12 +513,7 @@ async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
         "min_id answers the newest-first page just after the cursor"
     );
 
-    let polled = list(
-        &app,
-        Some(&token),
-        &list_path(&alice.id.to_string(), &format!("?since_id={}", rows[3].id)),
-    )
-    .await;
+    let polled = own_page(&app, &token, &alice, &format!("?since_id={}", rows[3].id)).await;
     assert_eq!(
         titles(&polled.json_value()),
         ["track 4"],
@@ -521,12 +525,7 @@ async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
         "a one-row page carries its own id on both cursors"
     );
 
-    let empty = list(
-        &app,
-        Some(&token),
-        &list_path(&alice.id.to_string(), &format!("?since_id={}", rows[4].id)),
-    )
-    .await;
+    let empty = own_page(&app, &token, &alice, &format!("?since_id={}", rows[4].id)).await;
     assert_eq!(empty.status, StatusCode::OK, "nothing new is still a 200");
     assert_eq!(empty.json_value(), json!([]), "and the empty array");
     assert_eq!(empty.header("link"), None, "with no Link header at all");
@@ -558,8 +557,10 @@ async fn the_listing_pages_by_id_cursor_and_links(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) {
+#[tokio::test]
+async fn the_default_page_is_twenty_and_the_cap_is_forty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "read").await;
     for n in 0..45 {
@@ -572,12 +573,7 @@ async fn the_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) {
     assert_eq!(titles(&body)[0], "track 44", "the newest first");
     assert_eq!(page_len(&body), 20, "and twenty rows by default");
 
-    let greedy = list(
-        &app,
-        Some(&token),
-        &list_path(&alice.id.to_string(), "?limit=100"),
-    )
-    .await;
+    let greedy = own_page(&app, &token, &alice, "?limit=100").await;
     assert_eq!(
         page_len(&greedy.json_value()),
         40,
@@ -585,8 +581,10 @@ async fn the_default_page_is_twenty_and_the_cap_is_forty(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_account_with_no_scrobbles_lists_empty(pool: PgPool) {
+#[tokio::test]
+async fn an_account_with_no_scrobbles_lists_empty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "read").await;
     let (bob, _) = fixture(&pool, "bob", "read").await;
@@ -609,8 +607,10 @@ async fn an_account_with_no_scrobbles_lists_empty(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_malformed_and_deactivated_accounts_are_404(pool: PgPool) {
+#[tokio::test]
+async fn unknown_malformed_and_deactivated_accounts_are_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (_alice, token) = fixture(&pool, "alice", "read").await;
     let ghost = Uuid::now_v7();
@@ -650,8 +650,10 @@ async fn unknown_malformed_and_deactivated_accounts_are_404(pool: PgPool) {
     }
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn creating_needs_a_user_token_granting_write(pool: PgPool) {
+#[tokio::test]
+async fn creating_needs_a_user_token_granting_write() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, read_only) = fixture(&pool, "alice", "read").await;
     let (bob, bob_token) = fixture(&pool, "bob", "write").await;
@@ -724,8 +726,10 @@ async fn creating_needs_a_user_token_granting_write(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn listing_answers_anonymously_but_still_checks_a_present_token(pool: PgPool) {
+#[tokio::test]
+async fn listing_answers_anonymously_but_still_checks_a_present_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, token) = fixture(&pool, "alice", "read").await;
     let _row: Stored = seed(&pool, &alice, "open", Visibility::Public).await;

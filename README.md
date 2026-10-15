@@ -61,7 +61,7 @@ cargo fmt
 scripts/ci.sh          # full gate (same as CI): exits 0 if everything passes, 1 otherwise
 ```
 
-`#[sqlx::test]` integration and model tests read `DATABASE_URL`; `.cargo/config.toml`
+The database tests read `DATABASE_URL`; `.cargo/config.toml`
 supplies the throwaway CI default (`postgres://postgres:postgres@localhost:5432/postgres`)
 when the environment does not set one, and an exported `DATABASE_URL` always wins.
 
@@ -69,4 +69,26 @@ Lint configuration lives in `Cargo.toml` (`[lints]`) and `clippy.toml`. See `AGE
 
 ## Tests
 
-Tests need a reachable PostgreSQL, given by `DATABASE_URL` (or `.env`). They use `#[sqlx::test]`, which creates a fresh throwaway database per test, applies the migrations from `migrations/`, and drops the database afterwards; the database named in `DATABASE_URL` itself is never mutated. The connecting role must be able to create databases.
+Tests need a reachable PostgreSQL, given by `DATABASE_URL` (or `.env`). The connecting role must be able to create databases (`CREATEDB`, or a superuser), because the fixture keeps a pool of test databases beside the one the URL names.
+
+Database tests do not create a database each. They call the fixture in `src/test_db.rs` (`common::test_db()` in the integration tests, `crate::test_db::test_db()` in the unit tests), which:
+
+- migrates a **template** database once per migration set — the databases are named `wired_test_{fingerprint}_{slot}`, where the fingerprint hashes every migration's version and checksum plus the connecting role, so editing `migrations/` starts a fresh template and drops the old databases;
+- **leases a slot** database (a copy of the template, made on a slot's first use) with a session advisory lock, held for as long as the test's `TestDb` is alive — a crashed test releases its slot with its connection, so nothing leaks and the pool grows only as wide as the number of test threads;
+- **resets** the slot on lease, with one `TRUNCATE … RESTART IDENTITY CASCADE` over every table in `schema public` (the migration bookkeeping table aside), and rebuilds the copy from the template if a test changed the schema.
+
+The database named in `DATABASE_URL` is only used for the `CREATE`/`DROP DATABASE` statements and the catalog lookups above; it is never a test target, and the environment is never mutated. What a test pays for is one connect and one `TRUNCATE` (tens of milliseconds) instead of a `CREATE DATABASE`, 38 migrations and a `DROP DATABASE` (half a second), which is what `#[sqlx::test]` did per test.
+
+### Making a local test database fast
+
+Nearly all of the fixture's remaining cost is `CREATE DATABASE` (copying the template) and the migrations' and tests' fsyncs. For a **development or CI database only**, turn durability down — the databases hold nothing but test rows, and every slot is reset before reuse:
+
+```sql
+ALTER SYSTEM SET fsync = off;
+ALTER SYSTEM SET full_page_writes = off;
+ALTER SYSTEM SET synchronous_commit = off;
+SELECT pg_reload_conf();
+```
+
+`fsync`, `full_page_writes` and `synchronous_commit` are all reloadable, so no restart is needed. Never point `DATABASE_URL` at a database you care about with these settings: `fsync = off` means the server does not flush to disk at all. `.github/workflows/ci.yml` applies the same three settings to its throwaway Postgres service in a setup step (GitHub service containers cannot be started with a command).
+

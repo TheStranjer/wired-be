@@ -216,8 +216,10 @@ mod tests {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn create_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let owner = new_id();
         let app = create(
             &pool,
@@ -269,8 +271,10 @@ mod tests {
         assert_eq!(by_client_id.id, app.id, "the client id finds the same row");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn defaults_apply_when_only_the_required_fields_are_set(pool: PgPool) {
+    #[tokio::test]
+    async fn defaults_apply_when_only_the_required_fields_are_set() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let app = create(&pool, &new_app("Plain")).await.unwrap();
         assert_eq!(app.scopes, "read", "the caller-provided default");
         assert!(app.website.is_none(), "website stays NULL");
@@ -278,8 +282,10 @@ mod tests {
         assert!(!app.trusted, "registrations are not trusted");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unknown_lookups_are_none(pool: PgPool) {
+    #[tokio::test]
+    async fn unknown_lookups_are_none() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             get_by_id(&pool, new_id()).await.unwrap().is_none(),
             "an unknown id finds nothing"
@@ -293,8 +299,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn every_registration_gets_its_own_credentials(pool: PgPool) {
+    #[tokio::test]
+    async fn every_registration_gets_its_own_credentials() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let first = create(&pool, &new_app("First")).await.unwrap();
         let second = create(&pool, &new_app("First")).await.unwrap();
         assert_eq!(first.client_name, second.client_name, "names may repeat");
@@ -311,8 +319,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn debug_redacts_the_client_secret(pool: PgPool) {
+    #[tokio::test]
+    async fn debug_redacts_the_client_secret() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let app = create(&pool, &new_app("Secretive")).await.unwrap();
         let debug = format!("{app:?}");
         assert!(
@@ -365,10 +375,12 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_for_user_covers_owned_and_tokened_apps_deduped(pool: PgPool) {
+    #[tokio::test]
+    async fn list_for_user_covers_owned_and_tokened_apps_deduped() {
         use crate::models::oauth_token;
 
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert_user(&pool, "alice").await;
         let bob = insert_user(&pool, "bob").await;
         let owned = create(

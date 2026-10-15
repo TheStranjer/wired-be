@@ -1,12 +1,18 @@
 # Cargo configuration for the whole workspace.
 #
-# `#[sqlx::test]` (decision 13) needs a PostgreSQL to create its throwaway
-# databases from and reads its address from `DATABASE_URL`. A checked-in
-# repository must not carry a `.env` (see AGENTS.md), so the tests' default
-# lives here instead: the same throwaway superuser URL
-# `.github/workflows/ci.yml` declares for its Postgres service — never a
-# real secret. `force = false` keeps the precedence right: an exported
-# `DATABASE_URL` (a developer's own database, the CI job's environment)
-# always wins over this default.
+# The test database fixture (decision 13, `src/test_db.rs`) needs a
+# PostgreSQL to lease its pre-migrated slot databases from and reads its
+# address from `DATABASE_URL`. A checked-in repository must not carry a `.env`
+# (see AGENTS.md), so the tests' default lives here instead: the same throwaway
+# superuser URL `.github/workflows/ci.yml` declares for its Postgres service —
+# never a real secret. `force = false` keeps the precedence right: an exported
+# `DATABASE_URL` (a developer's own database, the CI job's environment) always
+# wins over this default.
+#
+# The fixture creates `wired_test_{fingerprint}_{slot}` databases next to that
+# URL's own database, migrating a template once per fingerprint instead of once
+# per test, and never writes to the database named here. See the README's
+# "Tests" section for what the role needs (CREATE DATABASE) and for the
+# durability settings that make a local test database quick.
 [env]
 DATABASE_URL = { value = "postgres://postgres:postgres@localhost:5432/postgres", force = false }

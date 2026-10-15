@@ -10,6 +10,21 @@ Rules for anyone (human or AI) changing this codebase.
 
 - Every code path you add or change must be covered by tests: success paths, error paths, and edge cases.
 - Run `cargo test` before considering any change done. All tests must pass.
+- A test that needs the database takes a slot from the fixture in `src/test_db.rs`
+  (decision 13) — `let db = common::test_db().await;` in `tests/`,
+  `crate::test_db::test_db().await` in `src/` — and keeps `db` alive while its
+  pool is used. Do not use `#[sqlx::test]`: it creates, migrates and drops a
+  database per test, serialized behind one global lock, which is most of the
+  suite's wall time. The fixture migrates a template once per fingerprint,
+  copies it per slot, leases slots with advisory locks and `TRUNCATE`s a slot
+  when it hands it over.
+- Because a slot is shared by the tests that run after you, a test must leave
+  the schema alone: `TRUNCATE` clears rows, not a `DROP TABLE`. A test that
+  changes the schema makes the next lease of its slot rebuild the database from
+  the template, which is correct but slow.
+- Keep `#[tokio::test]` on the current-thread runtime (the default), like the
+  fixture's own tests; use `flavor = "multi_thread"` only when a test really
+  needs it.
 
 ## Linting
 

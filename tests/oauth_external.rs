@@ -414,8 +414,10 @@ async fn count_identities(pool: &PgPool) -> i64 {
 /// A prepared round trip answers 200 `{"url": …}` naming this instance's
 /// provider entry point and an issued state, and stores the application's
 /// own parameters against it for ten minutes.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn prepare_request_stores_the_round_trip(pool: PgPool) {
+#[tokio::test]
+async fn prepare_request_stores_the_round_trip() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "alice", "read write").await;
     let response = common::TestRequest::get(&format!(
         "/oauth/prepare_request?provider={PROVIDER}&response_type=code&client_id={}&redirect_uri={REDIRECT}&scope=read+write&state=client-state",
@@ -468,8 +470,10 @@ async fn prepare_request_stores_the_round_trip(pool: PgPool) {
 
 /// A missing `scope` prepares the default one, and a missing client `state`
 /// stores none to echo.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn prepare_request_defaults_the_optional_parameters(pool: PgPool) {
+#[tokio::test]
+async fn prepare_request_defaults_the_optional_parameters() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "beth", "read").await;
     let state = prepare(&site.http, &site.app, "").await;
     let (_, params) = stored_params(&pool, &state).await;
@@ -487,8 +491,10 @@ async fn prepare_request_defaults_the_optional_parameters(pool: PgPool) {
 
 /// A name `OAUTH_PROVIDERS` does not configure is the 404 on all three
 /// paths, before any application check and without a query.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unconfigured_provider_is_a_404_everywhere(pool: PgPool) {
+#[tokio::test]
+async fn an_unconfigured_provider_is_a_404_everywhere() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "carl", "read").await;
     for uri in [
         "/oauth/prepare_request?provider=gitlab&response_type=code",
@@ -507,8 +513,10 @@ async fn an_unconfigured_provider_is_a_404_everywhere(pool: PgPool) {
 /// The application half of `prepare_request` is `GET /oauth/authorize`'s:
 /// flow, client, redirect URI and scopes are refused with the very same
 /// bodies, and none of the refusals stores a state.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn prepare_request_validates_the_app_parameters(pool: PgPool) {
+#[tokio::test]
+async fn prepare_request_validates_the_app_parameters() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "dora", "read").await;
     let client = &site.app.client_id;
     for (query, want) in [
@@ -551,8 +559,10 @@ async fn prepare_request_validates_the_app_parameters(pool: PgPool) {
 /// The provider redirect carries the configured client, this instance's
 /// callback URL, the code flow, the provider's own scopes and the state —
 /// in that order, with nothing of the app's parameters leaked into it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_provider_redirect_names_the_flow(pool: PgPool) {
+#[tokio::test]
+async fn the_provider_redirect_names_the_flow() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "erin", "read write").await;
     let state = prepare(
         &site.http,
@@ -590,8 +600,10 @@ async fn the_provider_redirect_names_the_flow(pool: PgPool) {
 /// An unissued state, an empty one, an absent one, an expired one and one
 /// issued to another provider all read as `Invalid state` — on both the
 /// redirect and its callback.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_bad_state_is_refused_on_both_legs(pool: PgPool) {
+#[tokio::test]
+async fn a_bad_state_is_refused_on_both_legs() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "fern", "read").await;
     let live = prepare(&site.http, &site.app, "").await;
     let aged = prepare(&site.http, &site.app, "").await;
@@ -648,8 +660,10 @@ async fn a_bad_state_is_refused_on_both_legs(pool: PgPool) {
 /// ticket), so the code's usability is proven through
 /// [`consume_authorization`](wired_be::models::oauth_token::consume_authorization)
 /// — the one-statement redemption that exchange runs.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_logs_in_a_linked_user_with_a_code(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_logs_in_a_linked_user_with_a_code() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "gabe", "read write").await;
     link(&pool, &site.user, LINKED_UID).await;
 
@@ -710,8 +724,10 @@ async fn the_callback_logs_in_a_linked_user_with_a_code(pool: PgPool) {
 }
 
 /// A client that sent no `state` gets only the code back.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_echoes_only_what_the_client_sent(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_echoes_only_what_the_client_sent() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "helen", "read").await;
     link(&pool, &site.user, LINKED_UID).await;
     let state = prepare(&site.http, &site.app, "").await;
@@ -735,8 +751,10 @@ async fn the_callback_echoes_only_what_the_client_sent(pool: PgPool) {
 
 /// An app registered with the out-of-band redirect URI gets the code page
 /// instead of a redirect, exactly as `POST /oauth/authorize` answers it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_answers_the_out_of_band_code_page(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_answers_the_out_of_band_code_page() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "ivan", "read").await;
     let app = oob_app(&pool, "read").await;
     link(&pool, &site.user, LINKED_UID).await;
@@ -787,8 +805,10 @@ async fn the_callback_answers_the_out_of_band_code_page(pool: PgPool) {
 /// parameters, gains the provider's account info under `pending`, and the
 /// browser is sent to the registration form. No code is minted, and a repeat
 /// callback rewrites one `pending` instead of stacking another.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_hands_an_unlinked_account_to_registration(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_hands_an_unlinked_account_to_registration() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "june", "read").await;
     let state = prepare(&site.http, &site.app, "").await;
     let response = common::TestRequest::get(&format!(
@@ -856,8 +876,10 @@ async fn the_callback_hands_an_unlinked_account_to_registration(pool: PgPool) {
 /// token exchange, an answer with no token, a userinfo read that failed or
 /// answered no JSON, and a document naming no account id — is bounced back to
 /// the app's redirect URI as `error=access_denied`, with no code minted.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_bounces_a_provider_failure_to_the_app(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_bounces_a_provider_failure_to_the_app() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "kate", "read write").await;
     link(&pool, &site.user, LINKED_UID).await;
 
@@ -908,8 +930,10 @@ async fn the_callback_bounces_a_provider_failure_to_the_app(pool: PgPool) {
 
 /// The client's `state` rides the failure redirect too, so the app can tie
 /// the refusal back to the login it started.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_provider_failure_echoes_the_client_state(pool: PgPool) {
+#[tokio::test]
+async fn the_provider_failure_echoes_the_client_state() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "liam", "read").await;
     let state = prepare(&site.http, &site.app, "&state=client-state").await;
     let response = common::TestRequest::get(&format!(
@@ -930,8 +954,10 @@ async fn the_provider_failure_echoes_the_client_state(pool: PgPool) {
 /// A linked account that is deactivated is refused its login the way the
 /// token endpoint refuses it — 403 with Pleroma's machine-readable reason,
 /// not a code and not a registration form.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_refuses_a_deactivated_linked_user(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_refuses_a_deactivated_linked_user() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "mallory", "read").await;
     let state = prepare(&site.http, &site.app, "").await;
     // The account is suspended after the round trip was prepared: the login
@@ -974,8 +1000,10 @@ async fn the_callback_refuses_a_deactivated_linked_user(pool: PgPool) {
 /// A login prepared for an application that no longer exists cannot be
 /// finished: the same 400 the consent endpoint gives an unknown client, and
 /// no code is minted.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_callback_refuses_a_deleted_application(pool: PgPool) {
+#[tokio::test]
+async fn the_callback_refuses_a_deleted_application() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "nina", "read").await;
     link(&pool, &site.user, LINKED_UID).await;
     let state = prepare(&site.http, &site.app, "").await;
@@ -1004,8 +1032,10 @@ async fn the_callback_refuses_a_deleted_application(pool: PgPool) {
 /// Both provider calls go through the SSRF-guarded client: with the guard on,
 /// a provider on loopback is unreachable, and the callback bounces the
 /// app's login back as denied rather than fetching it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_provider_calls_pass_the_ssrf_guard(pool: PgPool) {
+#[tokio::test]
+async fn the_provider_calls_pass_the_ssrf_guard() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "omar", "read").await;
     link(&pool, &site.user, LINKED_UID).await;
     let state = prepare(&site.http, &site.app, "").await;
@@ -1041,8 +1071,10 @@ async fn the_provider_calls_pass_the_ssrf_guard(pool: PgPool) {
 /// `nested.id` reads the uid from the nested object, `nested.missing` says
 /// the provider does not tell us an email, and the account behind the
 /// nested id is logged in.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn dotted_field_names_read_a_nested_document(pool: PgPool) {
+#[tokio::test]
+async fn dotted_field_names_read_a_nested_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "pam", "read").await;
     link(&pool, &site.user, LINKED_UID).await;
     let http = common::test_app_with_config(
@@ -1097,8 +1129,10 @@ async fn dotted_field_names_read_a_nested_document(pool: PgPool) {
 
 /// `GET /oauth/authorize` and the token endpoints keep answering their own
 /// paths: the `{provider}` segment must not swallow them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_provider_route_leaves_the_sibling_paths_alone(pool: PgPool) {
+#[tokio::test]
+async fn the_provider_route_leaves_the_sibling_paths_alone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "quinn", "read").await;
     let consent = common::TestRequest::get("/oauth/authorize?response_type=token")
         .send(&site.http)
@@ -1133,8 +1167,10 @@ async fn the_provider_route_leaves_the_sibling_paths_alone(pool: PgPool) {
 
 /// A user's own row is what the identity link points at: the model write the
 /// endpoint reads through is the one the fixture used.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_link_to_a_remote_actor_is_not_a_login(pool: PgPool) {
+#[tokio::test]
+async fn a_link_to_a_remote_actor_is_not_a_login() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let site = fixture(pool.clone(), "rosa", "read").await;
     let remote = common::create_remote_user(&pool, "octocat", "remote.example").await;
     let made = user_identity::link(&pool, remote.id, PROVIDER, LINKED_UID)

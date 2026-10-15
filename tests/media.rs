@@ -17,7 +17,6 @@ pub mod common;
 use std::path::Path;
 
 use axum::{Router, body::Bytes, http::StatusCode};
-use sqlx::PgPool;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wired_be::{error::AppError, uploads};
@@ -63,8 +62,10 @@ fn error_body(message: &str) -> String {
 
 /// A stored file is served back byte for byte, as the media type of its
 /// extension, cached for a year, un-sniffable and inline.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn put_then_get_serves_the_file(pool: PgPool) {
+#[tokio::test]
+async fn put_then_get_serves_the_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let key = "018f4c2e-1a2b-7000-8000-000000000000/9b3c1d0e4f5a6b7c.png";
     store(dir.path(), key, "image/png", PNG).await;
@@ -101,8 +102,10 @@ async fn put_then_get_serves_the_file(pool: PgPool) {
 
 /// The extension decides the served type, for every media type the uploader
 /// knows; all of them stay inline.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_known_extension_keeps_its_type(pool: PgPool) {
+#[tokio::test]
+async fn every_known_extension_keeps_its_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let app = common::test_app_with_uploads_dir(pool, dir.path());
     for (extension, content_type) in [
@@ -137,8 +140,10 @@ async fn every_known_extension_keeps_its_type(pool: PgPool) {
 /// An uploaded HTML file — or SVG, or anything else that could run — is never
 /// served as a document: it arrives as an octet-stream attachment, with its
 /// bytes unchanged.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn non_media_is_served_as_an_attachment(pool: PgPool) {
+#[tokio::test]
+async fn non_media_is_served_as_an_attachment() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let app = common::test_app_with_uploads_dir(pool, dir.path());
     for (extension, body) in [
@@ -174,8 +179,10 @@ async fn non_media_is_served_as_an_attachment(pool: PgPool) {
 /// Nothing about the route reveals the filesystem: a key that could walk out
 /// of the uploads directory answers exactly like an absent file, and the file
 /// it pointed at is not served.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn traversal_attempts_are_not_found(pool: PgPool) {
+#[tokio::test]
+async fn traversal_attempts_are_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     std::fs::write(dir.path().join("outside.txt"), b"a secret").expect("secret file writes");
     let uploads = dir.path().join("uploads");
@@ -216,8 +223,10 @@ async fn traversal_attempts_are_not_found(pool: PgPool) {
 
 /// A key that holds nothing is a JSON 404; so is a bare `/media`, which is not
 /// a route at all and falls through to the app-wide fallback.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn missing_files_are_json_not_found(pool: PgPool) {
+#[tokio::test]
+async fn missing_files_are_json_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let app = common::test_app_with_uploads_dir(pool, dir.path());
     let response = get(&app, "/media/u/nope.png").await;
@@ -240,8 +249,10 @@ async fn missing_files_are_json_not_found(pool: PgPool) {
 
 /// Deleting a key takes the file away: it is gone from disk, unreadable
 /// through the uploader and a 404 over HTTP.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn delete_removes_the_file(pool: PgPool) {
+#[tokio::test]
+async fn delete_removes_the_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let key = "u/gone.png";
     store(dir.path(), key, "image/png", PNG).await;
@@ -282,8 +293,8 @@ async fn delete_removes_the_file(pool: PgPool) {
 
 /// Deleting a key that holds nothing is a 404 from the uploader, not a silent
 /// success.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn deleting_an_absent_key_is_not_found(_pool: PgPool) {
+#[tokio::test]
+async fn deleting_an_absent_key_is_not_found() {
     let dir = uploads_dir();
     let err = common::test_uploader(dir.path())
         .delete("u/never-stored.png")
@@ -297,8 +308,10 @@ async fn deleting_an_absent_key_is_not_found(_pool: PgPool) {
 
 /// The whole path a client takes: a key from [`uploads::media_key`] stores,
 /// serves, and is announced at `{MEDIA_BASE_URL}/{key}` — which is this route.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_generated_key_round_trips(pool: PgPool) {
+#[tokio::test]
+async fn a_generated_key_round_trips() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let key = uploads::media_key(Uuid::now_v7(), Some("photo.jpeg"), "image/png");
     store(dir.path(), &key, "image/png", PNG).await;
@@ -320,8 +333,8 @@ async fn a_generated_key_round_trips(pool: PgPool) {
 
 /// The backend refuses to store, read or delete a key it would not accept in
 /// a URL, whatever the route does.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_backend_rejects_invalid_keys(_pool: PgPool) {
+#[tokio::test]
+async fn the_backend_rejects_invalid_keys() {
     let dir = uploads_dir();
     let uploader = common::test_uploader(dir.path());
     for key in [
@@ -364,8 +377,10 @@ async fn the_backend_rejects_invalid_keys(_pool: PgPool) {
 
 /// Keys are namespaced by user, so one user's directory holds several files
 /// and nested keys work the same way.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn many_files_share_a_directory(pool: PgPool) {
+#[tokio::test]
+async fn many_files_share_a_directory() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     for (key, content_type) in [
         ("u/two/first.png", "image/png"),

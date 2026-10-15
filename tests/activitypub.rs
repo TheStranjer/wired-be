@@ -110,8 +110,10 @@ fn key_set(document: &Value) -> Vec<&str> {
 /// and value of Pleroma's `user.json`, end to end over HTTP. The `@context`
 /// is taken from the response because its exact terms are the renderer's
 /// own test's business.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_local_user_is_served_as_its_actor_document(pool: PgPool) {
+#[tokio::test]
+async fn a_local_user_is_served_as_its_actor_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         name: "Alice".to_owned(),
         bio: "<p>hello</p>".to_owned(),
@@ -171,8 +173,10 @@ async fn a_local_user_is_served_as_its_actor_document(pool: PgPool) {
 
 /// A user with nothing filled in still renders every documented key — and
 /// neither `icon` nor `image`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_bare_user_has_the_documented_key_set(pool: PgPool) {
+#[tokio::test]
+async fn a_bare_user_has_the_documented_key_set() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let document = fetch_actor(&pool, &alice).await;
     assert_eq!(key_set(&document), ACTOR_KEYS, "exact key set");
@@ -208,8 +212,10 @@ async fn a_bare_user_has_the_documented_key_set(pool: PgPool) {
 }
 
 /// `locked` is what `manuallyApprovesFollowers` means; it changes no key.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_locked_user_approves_followers_manually(pool: PgPool) {
+#[tokio::test]
+async fn a_locked_user_approves_followers_manually() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         locked: Flag::new(true),
         ..new
@@ -225,8 +231,10 @@ async fn a_locked_user_approves_followers_manually(pool: PgPool) {
 
 /// A bot federates as its `actor_type`: Pleroma emits no `bot` key, so the
 /// type is what says it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_bot_is_federated_by_its_actor_type(pool: PgPool) {
+#[tokio::test]
+async fn a_bot_is_federated_by_its_actor_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         actor_type: "Service".to_owned(),
         bot: Flag::new(true),
@@ -245,8 +253,10 @@ async fn a_bot_is_federated_by_its_actor_type(pool: PgPool) {
 
 /// An avatar becomes `icon` and a banner `image`, each an `Image` object;
 /// an account with only an avatar gets only `icon`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_avatar_user_carries_icon_and_image(pool: PgPool) {
+#[tokio::test]
+async fn an_avatar_user_carries_icon_and_image() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         avatar_url: Some(format!("{BASE}/avatar.png")),
         banner_url: Some(format!("{BASE}/banner.png")),
@@ -285,8 +295,10 @@ async fn an_avatar_user_carries_icon_and_image(pool: PgPool) {
 
 /// `application/ld+json` with the `ActivityStreams` profile is an
 /// `ActivityPub` client, and so is an `Accept` that names it among others.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn ld_json_clients_get_the_actor_too(pool: PgPool) {
+#[tokio::test]
+async fn ld_json_clients_get_the_actor_too() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool.clone());
     for accept in [
@@ -323,8 +335,10 @@ async fn ld_json_clients_get_the_actor_too(pool: PgPool) {
 
 /// A client that does not ask for `ActivityPub` gets the router-level 404:
 /// this backend is API-only and has no HTML profile page to answer with.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_browser_is_not_an_activitypub_client(pool: PgPool) {
+#[tokio::test]
+async fn a_browser_is_not_an_activitypub_client() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool.clone());
     for accept in [
@@ -363,8 +377,10 @@ async fn a_browser_is_not_an_activitypub_client(pool: PgPool) {
 
 /// An unknown nickname and a remote mirror are both 404s: this route serves
 /// this instance's actors only (decision 7).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unknown_and_remote_users_are_not_found(pool: PgPool) {
+#[tokio::test]
+async fn unknown_and_remote_users_are_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
     let app = common::test_app(pool.clone());
     for path in ["/users/nobody", &format!("/users/{}", bob.nickname)] {
@@ -389,8 +405,10 @@ async fn unknown_and_remote_users_are_not_found(pool: PgPool) {
 
 /// A deactivated local account is 410 Gone, so a remote instance stops
 /// refetching it; a browser still gets the content-negotiation 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_deactivated_user_is_gone(pool: PgPool) {
+#[tokio::test]
+async fn a_deactivated_user_is_gone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
         is_active: Flag::new(false),
         ..new

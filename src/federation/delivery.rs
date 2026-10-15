@@ -711,8 +711,10 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn best_inbox_prefers_the_shared_inbox(pool: PgPool) {
+    #[tokio::test]
+    async fn best_inbox_prefers_the_shared_inbox() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let shared = mirror(
             &pool,
             "shared",
@@ -957,8 +959,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_signed_delivery_verifies_at_the_peer_and_completes(pool: PgPool) {
+    #[tokio::test]
+    async fn a_signed_delivery_verifies_at_the_peer_and_completes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let (inbox, observable, server) = verifying_inbox().await;
@@ -994,8 +998,10 @@ mod tests {
         assert_eq!(raw.len(), 128, "an RSA-1024 signature is 128 bytes");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blind_recipients_never_reach_the_peer(pool: PgPool) {
+    #[tokio::test]
+    async fn blind_recipients_never_reach_the_peer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let (inbox, observable, server) = verifying_inbox().await;
@@ -1020,8 +1026,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_delivery_carries_every_inbox_header(pool: PgPool) {
+    #[tokio::test]
+    async fn the_delivery_carries_every_inbox_header() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let (inbox, observable, server) = verifying_inbox().await;
@@ -1060,8 +1068,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_gone_inbox_discards_the_delivery(pool: PgPool) {
+    #[tokio::test]
+    async fn a_gone_inbox_discards_the_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let listener = bind().await;
@@ -1087,8 +1097,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_server_error_retries_the_delivery(pool: PgPool) {
+    #[tokio::test]
+    async fn a_server_error_retries_the_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let listener = bind().await;
@@ -1114,8 +1126,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_first_unauthorized_answer_retries_and_a_second_discards(pool: PgPool) {
+    #[tokio::test]
+    async fn a_first_unauthorized_answer_retries_and_a_second_discards() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let listener = bind().await;
@@ -1143,8 +1157,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_throttled_inbox_sets_the_retry_delay(pool: PgPool) {
+    #[tokio::test]
+    async fn a_throttled_inbox_sets_the_retry_delay() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let listener = bind().await;
@@ -1169,8 +1185,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unreachable_inbox_retries(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unreachable_inbox_retries() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
         let listener = bind().await;
@@ -1188,8 +1206,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_delivery_that_can_never_be_signed_is_discarded(pool: PgPool) {
+    #[tokio::test]
+    async fn a_delivery_that_can_never_be_signed_is_discarded() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let state = test_state(&pool);
 
@@ -1208,8 +1228,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_actor_that_cannot_sign_is_discarded(pool: PgPool) {
+    #[tokio::test]
+    async fn an_actor_that_cannot_sign_is_discarded() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let remote = mirror(&pool, "bob", None, None).await;
         let keyless = insert(
             &pool,
@@ -1234,8 +1256,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_local_inbox_is_refused_without_a_job(pool: PgPool) {
+    #[tokio::test]
+    async fn a_local_inbox_is_refused_without_a_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
 
         enqueue_delivery(
@@ -1254,8 +1278,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_rejected_domain_is_refused_without_a_job(pool: PgPool) {
+    #[tokio::test]
+    async fn a_rejected_domain_is_refused_without_a_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         policy(&pool, "spam.example", "reject").await;
         policy(&pool, "quiet.example", "silence").await;
         let alice = actor(&pool).await;
@@ -1276,8 +1302,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_non_http_inbox_is_refused_without_a_job(pool: PgPool) {
+    #[tokio::test]
+    async fn a_non_http_inbox_is_refused_without_a_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         for inbox in ["ftp://peer.example/inbox", "not a url", "https://", ""] {
             enqueue_delivery(&pool, inbox, &alice, &activity())
@@ -1288,8 +1316,10 @@ mod tests {
         assert_eq!(job_count(&pool).await, 0, "nothing was queued");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_unique_key_queues_one_delivery_per_pair(pool: PgPool) {
+    #[tokio::test]
+    async fn the_unique_key_queues_one_delivery_per_pair() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let inbox = "https://peer.example/inbox";
 
@@ -1330,8 +1360,10 @@ mod tests {
         assert_eq!(job_count(&pool).await, 2, "a second inbox is its own job");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_activity_without_an_id_is_an_error(pool: PgPool) {
+    #[tokio::test]
+    async fn an_activity_without_an_id_is_an_error() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = actor(&pool).await;
         let keyless = json!({"type": "Create"});
 

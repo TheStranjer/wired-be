@@ -1018,19 +1018,10 @@ mod tests {
         assert!(debug.contains("alice"), "the rest is visible");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn register_stores_a_complete_local_account(pool: PgPool) {
-        let state = test_state(&pool);
-        let raw_bio = "Hello <script>evil()</script> visit https://example.org";
-        let params = RegisterParams {
-            nickname: "  Alice  ".to_owned(),
-            email: Some(" Alice@Example.ORG ".to_owned()),
-            password: PASSWORD.to_owned(),
-            name: None,
-            bio: Some(raw_bio.to_owned()),
-        };
-        let user = create_local_user(&state, params).await.unwrap();
-
+    /// The profile `create_local_user` stored for the registration: the
+    /// trimmed nickname and email, the actor id on this instance, and the bio
+    /// sanitized but never re-written.
+    fn assert_registered_profile(user: &User, raw_bio: &str) {
         assert_eq!(user.nickname, "Alice", "trimmed, case preserved");
         assert!(user.local.get(), "a registration is a local account");
         assert!(user.is_active.get(), "and an active one");
@@ -1052,14 +1043,11 @@ mod tests {
             "bio is sanitized, linkified HTML, got {:?}",
             user.bio
         );
+    }
 
-        let hash = user.password_hash.clone().expect("a password was set");
-        assert!(hash.starts_with("$argon2id$"), "the hash is Argon2id");
-        assert!(
-            verify_password(PASSWORD, &hash),
-            "and it verifies the submitted password"
-        );
-
+    /// The five activity endpoints and the shared inbox registration derives
+    /// from the new account's actor id.
+    fn assert_actor_endpoints(user: &User) {
         let ap_id = user.ap_id.as_str();
         assert_eq!(user.inbox.as_deref(), Some(inbox(ap_id).as_str()), "inbox");
         assert_eq!(
@@ -1087,7 +1075,15 @@ mod tests {
             Some(format!("{TEST_BASE_URL}/inbox").as_str()),
             "the shared inbox is the instance-wide one"
         );
+    }
 
+    /// The key pair registration generated with the account: two labeled PEMs
+    /// that are one RSA pair, proven by signing and verifying with them.
+    ///
+    /// # Panics
+    ///
+    /// If the row carries no keys, which registration always stores.
+    fn assert_generated_key_pair(user: &User) {
         let public_pem = user.public_key.clone().expect("a public key");
         let private_pem = user.private_key.clone().expect("a private key");
         assert!(
@@ -1110,6 +1106,34 @@ mod tests {
             verify_sha256(&public_pem, SIGNED_DATA, &signature),
             "the pair is a real key pair"
         );
+    }
+
+    #[tokio::test]
+    async fn register_stores_a_complete_local_account() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let raw_bio = "Hello <script>evil()</script> visit https://example.org";
+        let params = RegisterParams {
+            nickname: "  Alice  ".to_owned(),
+            email: Some(" Alice@Example.ORG ".to_owned()),
+            password: PASSWORD.to_owned(),
+            name: None,
+            bio: Some(raw_bio.to_owned()),
+        };
+        let user = create_local_user(&state, params).await.unwrap();
+
+        assert_registered_profile(&user, raw_bio);
+
+        let hash = user.password_hash.clone().expect("a password was set");
+        assert!(hash.starts_with("$argon2id$"), "the hash is Argon2id");
+        assert!(
+            verify_password(PASSWORD, &hash),
+            "and it verifies the submitted password"
+        );
+
+        assert_actor_endpoints(&user);
+        assert_generated_key_pair(&user);
 
         let fetched = get_by_nickname(&state.db, "aLiCe")
             .await
@@ -1118,8 +1142,10 @@ mod tests {
         assert_eq!(fetched.id, user.id, "one row, found in any case");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn register_honours_email_optional_and_requested_name(pool: PgPool) {
+    #[tokio::test]
+    async fn register_honours_email_optional_and_requested_name() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let config = Config {
             accounts_email_optional: true,
             ..Config::for_tests()
@@ -1139,8 +1165,10 @@ mod tests {
         assert_eq!(user.raw_bio, "", "absent bio has no source text");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn register_collects_every_failure_and_inserts_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn register_collects_every_failure_and_inserts_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
 
         let bad_shape = RegisterParams {
@@ -1190,8 +1218,10 @@ mod tests {
         assert_eq!(user_count(&state.db).await, 0, "nothing was inserted");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn duplicates_are_taken_in_any_case(pool: PgPool) {
+    #[tokio::test]
+    async fn duplicates_are_taken_in_any_case() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert_login(&pool, "Alice", "Alice@Example.ORG", None).await;
         let bob = insert_login(&pool, "bob", "bob@example.org", None).await;
         let state = test_state(&pool);
@@ -1241,8 +1271,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_lost_insert_race_maps_to_the_taken_field(pool: PgPool) {
+    #[tokio::test]
+    async fn a_lost_insert_race_maps_to_the_taken_field() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         // Steal `alice`'s actor id from under the availability check: the
         // nickname looks free, so every check passes and only the INSERT
         // notices the `users_ap_id_key` conflict.
@@ -1271,8 +1303,10 @@ mod tests {
         assert_eq!(user_count(&pool).await, 1, "the race inserted nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_other_database_error_stays_a_failure(pool: PgPool) {
+    #[tokio::test]
+    async fn a_other_database_error_stays_a_failure() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         // A constraint failure that is *not* a unique violation must not be
         // dressed up as field errors: run a NOT NULL violation through the
         // mapper and expect the database failure to come out intact.
@@ -1289,8 +1323,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn authenticate_accepts_anyone_it_should_and_no_one_else(pool: PgPool) {
+    #[tokio::test]
+    async fn authenticate_accepts_anyone_it_should_and_no_one_else() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hash = hash_password(PASSWORD).expect("the fixture hash is made");
         let alice = insert_login(&pool, "alice", "alice@example.org", Some(&hash)).await;
 
@@ -1366,8 +1402,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn authenticate_any_status_returns_a_deactivated_user(pool: PgPool) {
+    #[tokio::test]
+    async fn authenticate_any_status_returns_a_deactivated_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hash = hash_password(PASSWORD).expect("the fixture hash is made");
         let alice = insert_login(&pool, "henry", "henry@example.org", Some(&hash)).await;
         set_active(&pool, alice.id, false).await;
@@ -1393,8 +1431,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn authenticate_upgrades_a_legacy_bcrypt_hash(pool: PgPool) {
+    #[tokio::test]
+    async fn authenticate_upgrades_a_legacy_bcrypt_hash() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let user = insert_login(&pool, "dave", "dave@example.org", Some(BCRYPT_2B)).await;
         assert!(needs_rehash(BCRYPT_2B), "the fixture is a legacy hash");
         let logged_in = authenticate(&pool, "dave", PASSWORD)
@@ -1436,8 +1476,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn authenticate_leaves_a_current_hash_alone(pool: PgPool) {
+    #[tokio::test]
+    async fn authenticate_leaves_a_current_hash_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hash = hash_password(PASSWORD).expect("the fixture hash is made");
         let user = insert_login(&pool, "erin", "erin@example.org", Some(&hash)).await;
         let logged_in = authenticate(&pool, "erin", PASSWORD)
@@ -1459,8 +1501,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn authenticate_answers_none_when_the_database_breaks(pool: PgPool) {
+    #[tokio::test]
+    async fn authenticate_answers_none_when_the_database_breaks() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let hash = hash_password(PASSWORD).expect("the fixture hash is made");
         let frank = insert_login(&pool, "frank", "frank@example.org", Some(&hash)).await;
         assert_eq!(frank.nickname, "frank", "the fixture exists");

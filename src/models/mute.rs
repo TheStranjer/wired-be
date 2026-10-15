@@ -540,8 +540,10 @@ mod tests {
         String::new()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_mute_is_written_and_read_back(pool: PgPool) {
+    #[tokio::test]
+    async fn a_mute_is_written_and_read_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let row = write_mute(&pool, &alice, &bob, MuteOptions::default()).await;
@@ -609,8 +611,10 @@ mod tests {
     /// Mastodon's defaults are the column defaults: a row written without
     /// either option hides notifications and never expires — the bare insert
     /// [`mute`] itself never makes.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_column_defaults_are_mastodon_s(pool: PgPool) {
+    #[tokio::test]
+    async fn the_column_defaults_are_mastodon_s() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let sql = "INSERT INTO mutes (id, muter_id, muted_id) VALUES ($1, $2, $3) RETURNING *";
@@ -633,8 +637,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn notifications_false_mutes_the_timeline_only(pool: PgPool) {
+    #[tokio::test]
+    async fn notifications_false_mutes_the_timeline_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let row = write_mute(&pool, &alice, &bob, TIMELINE_ONLY).await;
@@ -664,8 +670,10 @@ mod tests {
     /// The timed side of the write: `expires_in` becomes an `expires_at` that
     /// many seconds ahead, and the reads keep answering the mute while that
     /// instant is still in the future.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_duration_stores_its_expiry(pool: PgPool) {
+    #[tokio::test]
+    async fn a_duration_stores_its_expiry() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let options = MuteOptions {
@@ -699,8 +707,10 @@ mod tests {
     /// `duration=0` is Mastodon's spelling of "no expiry", and a negative
     /// nonsense value is treated the same way rather than as an already expired
     /// mute.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_non_positive_duration_is_an_indefinite_mute(pool: PgPool) {
+    #[tokio::test]
+    async fn a_non_positive_duration_is_an_indefinite_mute() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
 
@@ -729,8 +739,10 @@ mod tests {
     /// A mute whose `expires_at` lies in the past — what the row of a mute
     /// whose duration ran out looks like until the sweep deletes it — is absent
     /// from every read.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_expired_mute_is_absent_everywhere(pool: PgPool) {
+    #[tokio::test]
+    async fn an_expired_mute_is_absent_everywhere() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -764,8 +776,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn muting_twice_updates_the_options_of_one_row(pool: PgPool) {
+    #[tokio::test]
+    async fn muting_twice_updates_the_options_of_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let first = write_mute(&pool, &alice, &bob, MuteOptions::default()).await;
@@ -805,8 +819,10 @@ mod tests {
 
     /// Re-muting a pair whose mute has lapsed but is still stored revives it:
     /// the same row, a fresh expiry, and the reads find it again.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn re_muting_a_lapsed_mute_revives_the_row(pool: PgPool) {
+    #[tokio::test]
+    async fn re_muting_a_lapsed_mute_revives_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         mute_expiring_in(&pool, &alice, &bob, -60).await;
@@ -828,8 +844,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unmuting_reports_the_row_it_removed(pool: PgPool) {
+    #[tokio::test]
+    async fn unmuting_reports_the_row_it_removed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
 
@@ -859,8 +877,10 @@ mod tests {
     /// A lapsed mute's row is nobody's mute to the reads and yet still a row
     /// for the pair key: lifting it is a delete of that row, and muting again
     /// afterwards is an ordinary write.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unmute_removes_a_lapse_that_no_read_would_hide(pool: PgPool) {
+    #[tokio::test]
+    async fn unmute_removes_a_lapse_that_no_read_would_hide() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         mute_expiring_in(&pool, &alice, &bob, -60).await;
@@ -875,8 +895,10 @@ mod tests {
         assert_eq!(mute_count(&pool).await, 0, "and it is gone");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn muting_yourself_is_refused(pool: PgPool) {
+    #[tokio::test]
+    async fn muting_yourself_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
 
         let err = mute(&pool, &alice, &alice, MuteOptions::default())
@@ -896,8 +918,10 @@ mod tests {
 
     /// The pair key the model's upsert builds on, checked against the table,
     /// and the directionality no constraint merges away.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_table_constraints_are_the_ones_the_model_relies_on(pool: PgPool) {
+    #[tokio::test]
+    async fn the_table_constraints_are_the_ones_the_model_relies_on() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         seed_mute(&pool, &alice, &bob, MuteOptions::default()).await;
@@ -929,8 +953,10 @@ mod tests {
 
     /// Deleting either account takes the mute through the foreign key's
     /// cascade, from both ends of the pair.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_either_side_takes_the_mute(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_either_side_takes_the_mute() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -964,8 +990,10 @@ mod tests {
 
     /// Mutes are each account's own: another account's mute of the same target
     /// is a separate row, and lifting one leaves the other.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn mutes_are_each_account_s_own(pool: PgPool) {
+    #[tokio::test]
+    async fn mutes_are_each_account_s_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -993,8 +1021,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_page_of_mutes_newest_first_walks_by_row_id(pool: PgPool) {
+    #[tokio::test]
+    async fn a_page_of_mutes_newest_first_walks_by_row_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let erin = user(&pool, "erin").await;
         for nickname in ["bob", "carol", "dave"] {
@@ -1049,8 +1079,10 @@ mod tests {
 
     /// The `mutes.expire` job's whole statement: expired rows go, indefinite
     /// ones and still-running timed ones stay.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_sweep_deletes_only_expired_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn the_sweep_deletes_only_expired_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let carol = user(&pool, "carol").await;
@@ -1088,8 +1120,10 @@ mod tests {
 
     /// A sweep of an empty table is a no-op, so the periodic job costs nothing
     /// when there is nothing to do.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_sweep_of_an_empty_table_deletes_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn the_sweep_of_an_empty_table_deletes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let removed = delete_expired(&pool)
             .await
             .expect("the sweep over nothing runs");
@@ -1099,8 +1133,10 @@ mod tests {
     /// A mute of one second is a live mute the moment it is written and a
     /// lapsed one once its instant has passed: the reads and the sweep agree on
     /// which side of the database's `now()` it is on.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_lapsing_mute_leaves_the_reads_with_the_sweep(pool: PgPool) {
+    #[tokio::test]
+    async fn a_lapsing_mute_leaves_the_reads_with_the_sweep() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let options = MuteOptions {

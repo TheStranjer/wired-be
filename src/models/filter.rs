@@ -383,8 +383,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn create_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let expires = offset(2);
         let stored = create(
@@ -418,8 +420,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_defaults_match_the_column_defaults(pool: PgPool) {
+    #[tokio::test]
+    async fn create_defaults_match_the_column_defaults() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = create(&pool, alice.id, &phrase("x"))
             .await
@@ -438,8 +442,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_active_is_newest_first_and_the_owners_own(pool: PgPool) {
+    #[tokio::test]
+    async fn list_active_is_newest_first_and_the_owners_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         seed(&pool, &alice, "first").await;
@@ -454,8 +460,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_active_excludes_expired_filters(pool: PgPool) {
+    #[tokio::test]
+    async fn list_active_excludes_expired_filters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         seed(&pool, &alice, "never").await;
         seed_expiry(&pool, &alice, "future", Some(offset(2))).await;
@@ -469,8 +477,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_owned_reads_the_owners_row_and_nobody_elses(pool: PgPool) {
+    #[tokio::test]
+    async fn get_owned_reads_the_owners_row_and_nobody_elses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = create(&pool, alice.id, &phrase("mine"))
@@ -493,8 +503,10 @@ mod tests {
         assert!(missing.is_none(), "an unknown id reads the same way");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_owned_serves_an_expired_filter(pool: PgPool) {
+    #[tokio::test]
+    async fn get_owned_serves_an_expired_filter() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         seed_expiry(&pool, &alice, "expired", Some(offset(-1))).await;
         let listed = list_active(&pool, alice.id).await.expect("list reads");
@@ -517,8 +529,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_rewrites_every_column_once(pool: PgPool) {
+    #[tokio::test]
+    async fn update_rewrites_every_column_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = create(&pool, alice.id, &phrase("before"))
             .await
@@ -557,8 +571,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_can_clear_the_expiry(pool: PgPool) {
+    #[tokio::test]
+    async fn update_can_clear_the_expiry() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let stored = create(
             &pool,
@@ -581,8 +597,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_and_delete_of_a_foreign_or_missing_id_do_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn update_and_delete_of_a_foreign_or_missing_id_do_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let hers = create(&pool, alice.id, &phrase("mine"))
@@ -624,8 +642,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_takes_a_filter_once(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_takes_a_filter_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let doomed = create(&pool, alice.id, &phrase("doomed"))
             .await
@@ -652,8 +672,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_user_takes_their_filters(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_user_takes_their_filters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         seed(&pool, &alice, "hers").await;
 

@@ -114,8 +114,10 @@ async fn fixtures(pool: &PgPool, nickname: &str, app_scopes: &str) -> (User, Oau
 
 /// The full password grant over JSON: the documented body, the entity
 /// fields, and the token row behind them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn json_password_grant_returns_a_token_pair(pool: PgPool) {
+#[tokio::test]
+async fn json_password_grant_returns_a_token_pair() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "alice", "read write").await;
     let http = common::test_app(pool.clone());
     let response = post_json(&http, &grant_body(&app, "alice", "read write")).await;
@@ -186,8 +188,10 @@ async fn json_password_grant_returns_a_token_pair(pool: PgPool) {
 
 /// The same grant over an urlencoded form body, the shape Mastodon
 /// clients post.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn form_password_grant_returns_a_token_pair(pool: PgPool) {
+#[tokio::test]
+async fn form_password_grant_returns_a_token_pair() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "bob", "read write follow").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::post("/oauth/token")
@@ -218,8 +222,10 @@ async fn form_password_grant_returns_a_token_pair(pool: PgPool) {
 
 /// Client credentials through `Authorization: Basic`, the RFC 6749
 /// preferred presentation, win over the body fields.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn basic_client_credentials_authenticate_the_app(pool: PgPool) {
+#[tokio::test]
+async fn basic_client_credentials_authenticate_the_app() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "carol", "read write").await;
     let http = common::test_app(pool.clone());
     let basic = STANDARD.encode(format!("{}:{}", app.client_id, app.client_secret));
@@ -264,8 +270,10 @@ async fn basic_client_credentials_authenticate_the_app(pool: PgPool) {
 
 /// A wrong client secret, an unknown client id and no credentials at all
 /// all answer the same 400, Pleroma's `Invalid credentials`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn bad_client_credentials_are_invalid_credentials(pool: PgPool) {
+#[tokio::test]
+async fn bad_client_credentials_are_invalid_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "dave", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -322,8 +330,10 @@ async fn bad_client_credentials_are_invalid_credentials(pool: PgPool) {
 
 /// A wrong password and an unknown user share the 400 "Invalid
 /// credentials" answer (Pleroma does not tell them apart).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn bad_user_credentials_are_invalid_credentials(pool: PgPool) {
+#[tokio::test]
+async fn bad_user_credentials_are_invalid_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "erin", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -356,8 +366,10 @@ async fn bad_user_credentials_are_invalid_credentials(pool: PgPool) {
 }
 
 /// Missing `username` and missing `password` fail exactly like wrong ones.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn missing_user_parameters_are_invalid_credentials(pool: PgPool) {
+#[tokio::test]
+async fn missing_user_parameters_are_invalid_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "frank", "read").await;
     let http = common::test_app(pool.clone());
     for missing in ["username", "password"] {
@@ -378,8 +390,10 @@ async fn missing_user_parameters_are_invalid_credentials(pool: PgPool) {
 }
 
 /// A scope outside the app's registration is the 400 "Invalid scope".
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_scope_outside_the_registration_is_invalid_scope(pool: PgPool) {
+#[tokio::test]
+async fn a_scope_outside_the_registration_is_invalid_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "grace", "read").await;
     let http = common::test_app(pool.clone());
     let response = post_json(&http, &grant_body(&app, "grace", "read write")).await;
@@ -398,8 +412,10 @@ async fn a_scope_outside_the_registration_is_invalid_scope(pool: PgPool) {
 }
 
 /// Sub-scopes fit inside a broader registration and come back verbatim.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn requested_subscopes_are_granted_verbatim(pool: PgPool) {
+#[tokio::test]
+async fn requested_subscopes_are_granted_verbatim() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "heidi", "read write").await;
     let http = common::test_app(pool.clone());
     let response = post_json(
@@ -429,8 +445,10 @@ async fn requested_subscopes_are_granted_verbatim(pool: PgPool) {
 }
 
 /// Without a `scope` parameter the token gets the default, `read`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_default_scope_is_read(pool: PgPool) {
+#[tokio::test]
+async fn the_default_scope_is_read() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "ivan", "read write").await;
     let http = common::test_app(pool.clone());
     let mut body = grant_body(&app, "ivan", "read write");
@@ -457,8 +475,10 @@ async fn the_default_scope_is_read(pool: PgPool) {
 }
 
 /// `username` is a nickname or an email, in any case (citext).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_email_works_as_username(pool: PgPool) {
+#[tokio::test]
+async fn an_email_works_as_username() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "judy", "read").await;
     let http = common::test_app(pool.clone());
     assert_eq!(
@@ -477,8 +497,10 @@ async fn an_email_works_as_username(pool: PgPool) {
 
 /// A deactivated account with the right password gets Pleroma's 403
 /// `account_is_disabled`, not the invalid-credentials 400.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_deactivated_account_is_refused_with_an_identifier(pool: PgPool) {
+#[tokio::test]
+async fn a_deactivated_account_is_refused_with_an_identifier() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let user = common::create_deactivated_user_with_password(&pool, "kate", PASSWORD).await;
     let app = common::create_app(&pool, "read").await;
     let http = common::test_app(pool.clone());
@@ -530,8 +552,10 @@ fn client_credentials_body(app: &OauthApp, scope: &str) -> Value {
 
 /// A grant type the endpoint does not speak is the 400
 /// `unsupported_grant_type`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unknown_grant_type_is_unsupported(pool: PgPool) {
+#[tokio::test]
+async fn an_unknown_grant_type_is_unsupported() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "luna", "read").await;
     let http = common::test_app(pool.clone());
     for grant in [
@@ -558,8 +582,10 @@ async fn an_unknown_grant_type_is_unsupported(pool: PgPool) {
 
 /// A request without `grant_type` at all is refused by name, matching
 /// Pleroma's message.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_missing_grant_type_is_named(pool: PgPool) {
+#[tokio::test]
+async fn a_missing_grant_type_is_named() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "mike", "read").await;
     let http = common::test_app(pool.clone());
     let mut body = grant_body(&app, "mike", "read");
@@ -593,8 +619,10 @@ async fn a_missing_grant_type_is_named(pool: PgPool) {
 /// The full `client_credentials` grant over JSON with the credentials in
 /// the body: the app-only token — no `refresh_token`, no `me` — and the
 /// `user_id = NULL` row behind it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn client_credentials_grant_returns_an_app_only_token(pool: PgPool) {
+#[tokio::test]
+async fn client_credentials_grant_returns_an_app_only_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::create_app(&pool, "read write").await;
     let http = common::test_app(pool.clone());
     let response = post_json(&http, &client_credentials_body(&app, "read write")).await;
@@ -664,8 +692,10 @@ async fn client_credentials_grant_returns_an_app_only_token(pool: PgPool) {
 /// The same grant with the credentials through `Authorization: Basic`
 /// and no `scope` parameter: the app authenticates and the token
 /// defaults to `read`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn client_credentials_grant_works_with_basic_auth_and_the_default_scope(pool: PgPool) {
+#[tokio::test]
+async fn client_credentials_grant_works_with_basic_auth_and_the_default_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::create_app(&pool, "read write").await;
     let http = common::test_app(pool.clone());
     let basic = STANDARD.encode(format!("{}:{}", app.client_id, app.client_secret));
@@ -690,8 +720,10 @@ async fn client_credentials_grant_works_with_basic_auth_and_the_default_scope(po
 /// A wrong client secret and an unknown client id answer the same 400
 /// "Invalid credentials" as on the password grant; user credentials
 /// cannot stand in for the client's.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn client_credentials_bad_client_credentials_are_invalid_credentials(pool: PgPool) {
+#[tokio::test]
+async fn client_credentials_bad_client_credentials_are_invalid_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "nora", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -736,8 +768,10 @@ async fn client_credentials_bad_client_credentials_are_invalid_credentials(pool:
 
 /// A scope outside the app's registration — and the `read` default
 /// against a write-only app — is the 400 "Invalid scope".
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn client_credentials_scope_outside_the_registration_is_invalid_scope(pool: PgPool) {
+#[tokio::test]
+async fn client_credentials_scope_outside_the_registration_is_invalid_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::create_app(&pool, "read").await;
     let http = common::test_app(pool.clone());
     let response = post_json(&http, &client_credentials_body(&app, "read write")).await;
@@ -771,8 +805,10 @@ async fn client_credentials_scope_outside_the_registration_is_invalid_scope(pool
 /// /api/v1/apps/verify_credentials` answers the issuing app — while
 /// `AuthUser` endpoints refuse it with the 403 "This API requires an
 /// authenticated user".
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_granted_app_only_token_serves_app_auth_but_not_user_auth(pool: PgPool) {
+#[tokio::test]
+async fn a_granted_app_only_token_serves_app_auth_but_not_user_auth() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::create_app(&pool, "read").await;
     let http = common::test_app(pool.clone());
     let response = post_json(&http, &client_credentials_body(&app, "read")).await;
@@ -852,8 +888,10 @@ async fn probe_user_endpoint(http: &Router, token: &str) -> common::TestResponse
 /// Revoking the app's own token over JSON deletes the row, answers the
 /// empty object with the no-store headers, and the bearer token stops
 /// authenticating an authenticated endpoint.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoke_deletes_the_apps_own_token(pool: PgPool) {
+#[tokio::test]
+async fn revoke_deletes_the_apps_own_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "ada", "read write").await;
     let token = common::create_token(&pool, &user, &app, "read write").await;
     let http = common::test_app(pool.clone());
@@ -891,8 +929,10 @@ async fn revoke_deletes_the_apps_own_token(pool: PgPool) {
 
 /// The same revocation over urlencoded forms, and through `Authorization:
 /// Basic` client credentials that win over poisoned body fields.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoke_accepts_form_bodies_and_basic_client_credentials(pool: PgPool) {
+#[tokio::test]
+async fn revoke_accepts_form_bodies_and_basic_client_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "ben", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -935,8 +975,10 @@ async fn revoke_accepts_form_bodies_and_basic_client_credentials(pool: PgPool) {
 /// A token issued to another app is refused the shared 400 "Invalid
 /// credentials" and stays alive; wrong secrets, unknown clients and
 /// absent credentials answer the same.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoke_refuses_foreign_tokens_and_bad_credentials(pool: PgPool) {
+#[tokio::test]
+async fn revoke_refuses_foreign_tokens_and_bad_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, owner) = fixtures(&pool, "cleo", "read").await;
     let stranger = common::create_app(&pool, "read").await;
     let token = common::create_token(&pool, &user, &owner, "read").await;
@@ -1003,8 +1045,10 @@ async fn revoke_refuses_foreign_tokens_and_bad_credentials(pool: PgPool) {
 /// An unknown token revokes to nothing: 200 `{}`, no error (RFC 7009
 /// §2.2 — the client cannot handle such a failure, and the desired end
 /// state already holds).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoking_an_unknown_token_is_not_an_error(pool: PgPool) {
+#[tokio::test]
+async fn revoking_an_unknown_token_is_not_an_error() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "dan", "read").await;
     let http = common::test_app(pool.clone());
     let response = post_revoke_json(&http, &revoke_body(&app, "no-such-token")).await;
@@ -1019,8 +1063,10 @@ async fn revoking_an_unknown_token_is_not_an_error(pool: PgPool) {
 
 /// Without the `token` parameter the request is refused by name before
 /// the credentials are looked at.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_missing_token_parameter_is_named(pool: PgPool) {
+#[tokio::test]
+async fn a_missing_token_parameter_is_named() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "eve", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -1070,8 +1116,10 @@ async fn a_missing_token_parameter_is_named(pool: PgPool) {
 
 /// The second revocation of the same token sees an unknown one and
 /// answers 200 `{}` again.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn revoking_twice_succeeds_both_times(pool: PgPool) {
+#[tokio::test]
+async fn revoking_twice_succeeds_both_times() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "gina", "read").await;
     let token = common::create_token(&pool, &user, &app, "read").await;
     let http = common::test_app(pool.clone());
@@ -1112,8 +1160,10 @@ async fn token_count(pool: &PgPool) -> i64 {
 /// The `refresh_token` grant rotates the pair: the standard
 /// password-grant answer with fresh credentials, the same user and
 /// scopes, and the old row deleted behind it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn refresh_token_grant_rotates_the_pair(pool: PgPool) {
+#[tokio::test]
+async fn refresh_token_grant_rotates_the_pair() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "mel", "read write").await;
     let old = common::create_token(&pool, &user, &app, "read write").await;
     let http = common::test_app(pool.clone());
@@ -1189,8 +1239,10 @@ async fn refresh_token_grant_rotates_the_pair(pool: PgPool) {
 /// authenticating, the old refresh token no longer rotates, while the
 /// new credentials work — and the new refresh token rotates again in
 /// turn.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn rotation_ends_the_old_pair_and_the_new_one_works(pool: PgPool) {
+#[tokio::test]
+async fn rotation_ends_the_old_pair_and_the_new_one_works() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "nia", "read").await;
     let old = common::create_token(&pool, &user, &app, "read").await;
     let http = common::test_app(pool.clone());
@@ -1239,8 +1291,10 @@ async fn rotation_ends_the_old_pair_and_the_new_one_works(pool: PgPool) {
 
 /// Refresh tokens do not expire on their own: an access token pushed
 /// past its `valid_until` still rotates into a fresh, full-lifetime pair.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_expired_access_token_is_still_refreshable(pool: PgPool) {
+#[tokio::test]
+async fn an_expired_access_token_is_still_refreshable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "oli", "read write").await;
     let old = common::create_token(&pool, &user, &app, "read write").await;
     common::expire_token(&pool, old.id).await;
@@ -1265,8 +1319,10 @@ async fn an_expired_access_token_is_still_refreshable(pool: PgPool) {
 
 /// A refresh token issued to another application is the shared 400
 /// "Invalid credentials"; the old pair stays alive and keeps working.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_wrong_app_cannot_rotate_another_apps_token(pool: PgPool) {
+#[tokio::test]
+async fn the_wrong_app_cannot_rotate_another_apps_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, owner) = fixtures(&pool, "pam", "read").await;
     let stranger = common::create_app(&pool, "read").await;
     let token = common::create_token(&pool, &user, &owner, "read").await;
@@ -1311,8 +1367,10 @@ async fn the_wrong_app_cannot_rotate_another_apps_token(pool: PgPool) {
 
 /// An unknown refresh token answers the shared 400 "Invalid
 /// credentials", minting nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unknown_refresh_token_is_invalid_credentials(pool: PgPool) {
+#[tokio::test]
+async fn an_unknown_refresh_token_is_invalid_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "quim", "read").await;
     let http = common::test_app(pool.clone());
     let response = post_json(&http, &refresh_body(&app, "no-such-refresh-token")).await;
@@ -1329,8 +1387,10 @@ async fn an_unknown_refresh_token_is_invalid_credentials(pool: PgPool) {
 /// The deactivated owner's refresh token answers the shared 400 "Invalid
 /// credentials" — unlike the password grant there is no 403 to give —
 /// and the stored pair stays untouched.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_deactivated_owner_cannot_rotate(pool: PgPool) {
+#[tokio::test]
+async fn a_deactivated_owner_cannot_rotate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let user = common::create_deactivated_user_with_password(&pool, "sara", PASSWORD).await;
     let app = common::create_app(&pool, "read").await;
     let token = common::create_token(&pool, &user, &app, "read").await;
@@ -1354,8 +1414,10 @@ async fn a_deactivated_owner_cannot_rotate(pool: PgPool) {
 
 /// Without the `refresh_token` parameter the request is refused by name
 /// before the credentials are looked at, over JSON and form alike.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_missing_refresh_token_parameter_is_named(pool: PgPool) {
+#[tokio::test]
+async fn a_missing_refresh_token_parameter_is_named() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "tess", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -1399,8 +1461,10 @@ async fn a_missing_refresh_token_parameter_is_named(pool: PgPool) {
 
 /// Rotation copies the old scopes verbatim: a `scope` parameter in the
 /// refresh request plays no part.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn rotation_preserves_the_exact_scopes(pool: PgPool) {
+#[tokio::test]
+async fn rotation_preserves_the_exact_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "ugo", "read write").await;
     let old = common::create_token(&pool, &user, &app, "read:accounts write:statuses").await;
     let http = common::test_app(pool.clone());
@@ -1428,8 +1492,10 @@ async fn rotation_preserves_the_exact_scopes(pool: PgPool) {
 /// The grant accepts the Mastodon form body and prefers the
 /// `Authorization: Basic` client pair over poisoned body fields, like
 /// every other half of the endpoint.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn rotation_accepts_form_bodies_and_basic_client_credentials(pool: PgPool) {
+#[tokio::test]
+async fn rotation_accepts_form_bodies_and_basic_client_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "wil", "read").await;
     let token = common::create_token(&pool, &user, &app, "read").await;
     let http = common::test_app(pool.clone());
@@ -1593,8 +1659,10 @@ async fn authorization_count(pool: &PgPool) -> i64 {
 /// `/oauth/authorize` with the login fields, one checked box per
 /// requested scope, and the `client_id`/`redirect_uri`/`state`
 /// round-trip fields — plus the no-store header.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_renders_the_consent_form(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_renders_the_consent_form() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "nina", "read write").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::get(&authorize_get_url(
@@ -1660,8 +1728,10 @@ async fn get_authorize_renders_the_consent_form(pool: PgPool) {
 
 /// Without a `scope` parameter the page offers the default, `read` —
 /// as a single checkbox.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_defaults_the_scope_to_read(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_defaults_the_scope_to_read() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "oscar", "read write").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::get(&authorize_get_url(&app.client_id, REDIRECT, "", ""))
@@ -1684,8 +1754,10 @@ async fn get_authorize_defaults_the_scope_to_read(pool: PgPool) {
 
 /// A malicious app name, `state` and `lang` come back HTML-escaped:
 /// none of them can open a tag or break out of its attribute.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_escapes_every_dynamic_value(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_escapes_every_dynamic_value() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = register_app(&pool, "<script>evil</script>", REDIRECT, "read").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::get(&format!(
@@ -1718,8 +1790,10 @@ async fn get_authorize_escapes_every_dynamic_value(pool: PgPool) {
 }
 
 /// An unknown or missing `client_id` is the 400 "Invalid client".
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_refuses_unknown_clients(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_refuses_unknown_clients() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, _app) = fixtures(&pool, "peggy", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -1747,8 +1821,10 @@ async fn get_authorize_refuses_unknown_clients(pool: PgPool) {
 /// A `redirect_uri` that is not one of the app's registered URIs — not
 /// even a prefix or an extended spelling — is the 400
 /// "Invalid `redirect_uri`".
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_refuses_unregistered_redirect_uris(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_refuses_unregistered_redirect_uris() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "quinn", "read").await;
     let http = common::test_app(pool.clone());
     for unregistered in [
@@ -1774,8 +1850,10 @@ async fn get_authorize_refuses_unregistered_redirect_uris(pool: PgPool) {
 
 /// A requested scope outside the registration — including the `read`
 /// default against a write-only app — is the 400 "Invalid scope".
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_refuses_scopes_outside_the_registration(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_refuses_scopes_outside_the_registration() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "rosa", "read").await;
     let http = common::test_app(pool.clone());
     let broad = common::TestRequest::get(&authorize_get_url(
@@ -1805,8 +1883,10 @@ async fn get_authorize_refuses_scopes_outside_the_registration(pool: PgPool) {
 
 /// `response_type` must name the code flow: anything else, absent
 /// included, is the 400 `unsupported_response_type`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn get_authorize_requires_the_code_response_type(pool: PgPool) {
+#[tokio::test]
+async fn get_authorize_requires_the_code_response_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "steve", "read").await;
     let http = common::test_app(pool.clone());
 
@@ -1841,8 +1921,10 @@ async fn get_authorize_requires_the_code_response_type(pool: PgPool) {
 /// A correct login approves: the reply is a 302 whose `Location` is the
 /// registered URI plus `code`, and the code is a fresh, unused,
 /// single-use row of `oauth_authorizations`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_redirects_with_a_stored_code(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_redirects_with_a_stored_code() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (user, app) = fixtures(&pool, "tina", "read write").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::post("/oauth/authorize")
@@ -1901,8 +1983,10 @@ async fn post_authorize_redirects_with_a_stored_code(pool: PgPool) {
 
 /// The `state` survives both trips: form field into the re-render,
 /// re-render into the redirect, urlencoded characters included.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_round_trips_the_state(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_round_trips_the_state() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "ursula", "read").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::post("/oauth/authorize")
@@ -1934,8 +2018,10 @@ async fn post_authorize_round_trips_the_state(pool: PgPool) {
 /// A registered redirect URI that already carries a query keeps it: the
 /// old pairs come first, `code` is appended and a re-sent `state`
 /// replaces the stored one (Pleroma's `modify_uri_params`).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_respects_an_existing_query_string(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_respects_an_existing_query_string() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let registered = &format!("{REDIRECT}?foo=1&state=old");
     let app = register_app(&pool, "Query Client", registered, "read").await;
     let _user = common::create_user_with_password(&pool, "vera", PASSWORD).await;
@@ -1971,8 +2057,10 @@ async fn post_authorize_respects_an_existing_query_string(pool: PgPool) {
 
 /// The out-of-band client gets no redirect: its page shows the code,
 /// and the code is stored like any other.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_renders_the_code_for_oob_clients(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_renders_the_code_for_oob_clients() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let user = common::create_user_with_password(&pool, "wilma", PASSWORD).await;
     let oob_app = register_app(&pool, "Console Client", OOB, "read").await;
     let http = common::test_app(pool.clone());
@@ -2015,8 +2103,10 @@ async fn post_authorize_renders_the_code_for_oob_clients(pool: PgPool) {
 /// Wrong credentials do not fail the request: the page re-renders, at
 /// 200, with the error line and its round-trip fields intact — and no
 /// code is minted.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_bad_password_rerenders_the_form(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_bad_password_rerenders_the_form() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "xena", "read write").await;
     let http = common::test_app(pool.clone());
     let response = common::TestRequest::post("/oauth/authorize")
@@ -2071,8 +2161,10 @@ async fn post_authorize_bad_password_rerenders_the_form(pool: PgPool) {
 
 /// Pressing Deny needs no credentials: the redirect carries
 /// `error=access_denied` (and the `state`), and no code exists.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_deny_redirects_with_access_denied(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_deny_redirects_with_access_denied() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "yuri", "read").await;
     let http = common::test_app(pool.clone());
     let mut fields = consent_form(&app, "yuri", "", &[], Some("st1"));
@@ -2102,8 +2194,10 @@ async fn post_authorize_deny_redirects_with_access_denied(pool: PgPool) {
 /// The `POST` re-runs the `GET`'s checks on the submitted form: an
 /// unknown client, an unregistered redirect and tampered scopes all
 /// answer their JSON 400, even with correct credentials.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_authorize_revalidates_the_form(pool: PgPool) {
+#[tokio::test]
+async fn post_authorize_revalidates_the_form() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "zoe", "read").await;
     let http = common::test_app(pool.clone());
 

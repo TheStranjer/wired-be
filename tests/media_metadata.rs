@@ -165,6 +165,54 @@ async fn put_multipart(
         .await
 }
 
+/// `PUT`s `fields` as `application/x-www-form-urlencoded` to `path` with
+/// `token`.
+async fn put_form(
+    app: &Router,
+    path: &str,
+    token: &str,
+    fields: &[(&str, &str)],
+) -> common::TestResponse {
+    common::TestRequest::put(path)
+        .bearer(token)
+        .form(fields)
+        .send(app)
+        .await
+}
+
+/// `PUT`s `body` as `application/json` to `path` with `token`.
+async fn put_json(app: &Router, path: &str, token: &str, body: &Value) -> common::TestResponse {
+    common::TestRequest::put(path)
+        .bearer(token)
+        .json(body)
+        .send(app)
+        .await
+}
+
+/// The 401 a route answers when no credential arrived: Pleroma's wording and
+/// the bearer challenge, for `route`.
+///
+/// # Panics
+///
+/// If the response is not that 401 pair.
+fn assert_unauthorized(response: &common::TestResponse, route: &str) {
+    assert_eq!(
+        response.status,
+        StatusCode::UNAUTHORIZED,
+        "{route} needs a token"
+    );
+    assert_eq!(
+        response.text(),
+        error_body("Invalid credentials"),
+        "the anonymous {route} 401 uses Pleroma's wording"
+    );
+    assert_eq!(
+        response.header("www-authenticate"),
+        Some("Bearer"),
+        "and carries the bearer challenge"
+    );
+}
+
 /// The `/api/v1/media/{id}` path of a row.
 fn v1_path(id: Uuid) -> String {
     format!("/api/v1/media/{id}")
@@ -174,8 +222,10 @@ fn v1_path(id: Uuid) -> String {
 /// upload answers the full `Attachment` entity on either version's path,
 /// the broader `read` scope included; Mastodon's 206-while-unprocessed arm
 /// cannot happen here because uploads are processed synchronously.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn own_unattached_media_reads_back_on_both_versions(pool: PgPool) {
+#[tokio::test]
+async fn own_unattached_media_reads_back_on_both_versions() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, reader) = uploader(&pool, "alice", READ_SCOPE).await;
     let read_all = common::create_app_and_token(&pool, &alice, "read").await;
@@ -215,8 +265,10 @@ async fn own_unattached_media_reads_back_on_both_versions(pool: PgPool) {
 /// `GET` answers one 404 "Record not found" for a foreign row, a claimed
 /// one, an ownerless one, an unknown id and an id that is not a `UUID`;
 /// none of them is distinguishable from the others.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn foreign_attached_unknown_and_ownerless_are_one_404(pool: PgPool) {
+#[tokio::test]
+async fn foreign_attached_unknown_and_ownerless_are_one_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, reader) = uploader(&pool, "alice", READ_SCOPE).await;
     let (bob, _) = uploader(&pool, "bob", READ_SCOPE).await;
@@ -260,25 +312,23 @@ async fn foreign_attached_unknown_and_ownerless_are_one_404(pool: PgPool) {
 /// a caption update keeps the stored focal point and vice versa, present
 /// values may arrive as multipart, form or JSON, and a body with no fields
 /// at all answers the unchanged entity.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_update_replaces_present_fields_and_keeps_absent_ones(pool: PgPool) {
+#[tokio::test]
+async fn an_update_replaces_present_fields_and_keeps_absent_ones() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", WRITE_SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
     let row = insert_media(&pool, &alice).await;
     let path = v1_path(row.id);
 
-    let captioned = put_multipart(
-        &app,
-        &path,
-        &writer,
-        &[
-            MultipartPart::text("description", "a new caption"),
-            file_part("file", "stray.png", PNG),
-        ],
-    )
-    .await
-    .json_value();
+    let parts = [
+        MultipartPart::text("description", "a new caption"),
+        file_part("file", "stray.png", PNG),
+    ];
+    let captioned = put_multipart(&app, &path, &writer, &parts)
+        .await
+        .json_value();
     assert_eq!(
         captioned["description"], "a new caption",
         "the present caption is written"
@@ -295,11 +345,7 @@ async fn an_update_replaces_present_fields_and_keeps_absent_ones(pool: PgPool) {
         "and the row agrees"
     );
 
-    let form_response = common::TestRequest::put(&path)
-        .bearer(&writer)
-        .form(&[("focus", "-1,1")])
-        .send(&app)
-        .await;
+    let form_response = put_form(&app, &path, &writer, &[("focus", "-1,1")]).await;
     assert_eq!(
         form_response.status,
         StatusCode::OK,
@@ -317,10 +363,7 @@ async fn an_update_replaces_present_fields_and_keeps_absent_ones(pool: PgPool) {
         "and the caption is still there"
     );
 
-    let json_response = common::TestRequest::put(&path)
-        .bearer(&writer)
-        .json(&json!({ "description": "from json" }))
-        .send(&app)
+    let json_response = put_json(&app, &path, &writer, &json!({ "description": "from json" }))
         .await
         .json_value();
     assert_eq!(
@@ -353,8 +396,10 @@ async fn an_update_replaces_present_fields_and_keeps_absent_ones(pool: PgPool) {
 
 /// A blank `description` clears the alt text and a blank `focus` both axes:
 /// how Mastodon's clients remove either.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn empty_fields_clear_the_stored_values(pool: PgPool) {
+#[tokio::test]
+async fn empty_fields_clear_the_stored_values() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", BOTH_SCOPES).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -388,8 +433,10 @@ async fn empty_fields_clear_the_stored_values(pool: PgPool) {
 
 /// A `focus` that is not two floats in `[-1.0, 1.0]` is the ticket's 422
 /// "Invalid focus", and the stored focal point stays untouched.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_invalid_focus_is_the_ticket_422(pool: PgPool) {
+#[tokio::test]
+async fn an_invalid_focus_is_the_ticket_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", WRITE_SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -433,8 +480,10 @@ async fn an_invalid_focus_is_the_ticket_422(pool: PgPool) {
 /// A `description` over the 1500-character default is the ticket's 422
 /// "Description too long"; the limit is inclusive and counts characters,
 /// not bytes.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_description_over_the_default_limit_is_the_ticket_422(pool: PgPool) {
+#[tokio::test]
+async fn a_description_over_the_default_limit_is_the_ticket_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", WRITE_SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -490,8 +539,10 @@ fn fill(length: usize, multibyte: bool) -> String {
 
 /// The limit is configuration: with `MAX_MEDIA_DESCRIPTION=10` ten
 /// characters pass and eleven fail, and the last accepted one is stored.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_configured_limit_caps_the_description(pool: PgPool) {
+#[tokio::test]
+async fn the_configured_limit_caps_the_description() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", WRITE_SCOPE).await;
     let mut config = common::test_config_with_uploads_dir(dir.path());
@@ -539,8 +590,10 @@ async fn the_configured_limit_caps_the_description(pool: PgPool) {
 /// A `thumbnail` part is stored as the attachment's preview: its own key,
 /// served at the announced URL, while the file itself and every other
 /// column stay as they were.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_thumbnail_part_replaces_the_preview(pool: PgPool) {
+#[tokio::test]
+async fn a_thumbnail_part_replaces_the_preview() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", BOTH_SCOPES).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -614,8 +667,10 @@ async fn a_thumbnail_part_replaces_the_preview(pool: PgPool) {
 
 /// A second `thumbnail` replaces the first one's preview instead of piling
 /// up: the row keeps only the newest URL.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_second_thumbnail_replaces_the_first(pool: PgPool) {
+#[tokio::test]
+async fn a_second_thumbnail_replaces_the_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", WRITE_SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -651,8 +706,10 @@ async fn a_second_thumbnail_replaces_the_first(pool: PgPool) {
 
 /// A `thumbnail` whose bytes name no media type is the upload endpoint's
 /// 422, and nothing is stored — on disk or in the row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_thumbnail_that_is_not_media_changes_nothing(pool: PgPool) {
+#[tokio::test]
+async fn a_thumbnail_that_is_not_media_changes_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", WRITE_SCOPE).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -697,8 +754,10 @@ async fn a_thumbnail_that_is_not_media_changes_nothing(pool: PgPool) {
 /// `PUT` keeps ATTACHED media read-only (Pleroma reaches its description
 /// through the status edit, not here): a write to a claimed row is the same
 /// 404 as `GET` gives, and a foreign user cannot edit it either.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn attached_and_foreign_media_cannot_be_edited(pool: PgPool) {
+#[tokio::test]
+async fn attached_and_foreign_media_cannot_be_edited() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, writer) = uploader(&pool, "alice", BOTH_SCOPES).await;
     let (bob, _bob_token) = uploader(&pool, "bob", BOTH_SCOPES).await;
@@ -756,8 +815,10 @@ async fn attached_and_foreign_media_cannot_be_edited(pool: PgPool) {
 /// even Pleroma's `read:media` is not the ticket's `read:statuses` — and
 /// the scope check answers before the row lookup, so a wrong scope cannot
 /// probe ids.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_scope_gates_answer_401_and_403(pool: PgPool) {
+#[tokio::test]
+async fn the_scope_gates_answer_401_and_403() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, reader) = uploader(&pool, "alice", READ_SCOPE).await;
     let (_narrow, read_media) = uploader(&pool, "narrow", "read:media").await;
@@ -768,30 +829,12 @@ async fn the_scope_gates_answer_401_and_403(pool: PgPool) {
     let path = v1_path(row.id);
 
     let anonymous = common::TestRequest::get(&path).send(&app).await;
-    assert_eq!(
-        anonymous.status,
-        StatusCode::UNAUTHORIZED,
-        "GET needs a token"
-    );
-    assert_eq!(
-        anonymous.text(),
-        error_body("Invalid credentials"),
-        "with Pleroma's wording"
-    );
-    assert_eq!(
-        anonymous.header("www-authenticate"),
-        Some("Bearer"),
-        "and the bearer challenge"
-    );
+    assert_unauthorized(&anonymous, "GET");
     let anonymous_put = common::TestRequest::put(&path)
         .form(&[("description", "anon")])
         .send(&app)
         .await;
-    assert_eq!(
-        anonymous_put.status,
-        StatusCode::UNAUTHORIZED,
-        "so does PUT"
-    );
+    assert_unauthorized(&anonymous_put, "PUT");
 
     for (label, token) in [
         ("app-only", &app_only),
@@ -850,8 +893,10 @@ async fn the_scope_gates_answer_401_and_403(pool: PgPool) {
 
 /// There is no delete on these routes: `DELETE /api/v1/media/{id}` is a
 /// method mismatch, and the `{id}` path serves only `GET` and `PUT`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn no_route_deletes_media(pool: PgPool) {
+#[tokio::test]
+async fn no_route_deletes_media() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, token) = uploader(&pool, "alice", BOTH_SCOPES).await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());

@@ -165,8 +165,10 @@ async fn marker_count(pool: &PgPool) -> i64 {
 }
 
 /// A notice with nothing in the table answers 200 with the empty JSON array.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn empty_database_answers_the_empty_list(pool: PgPool) {
+#[tokio::test]
+async fn empty_database_answers_the_empty_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let app = common::test_app(pool);
 
@@ -182,8 +184,10 @@ async fn empty_database_answers_the_empty_list(pool: PgPool) {
 
 /// Only notices whose window holds this instant are listed, and the newest of
 /// them first.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn list_serves_active_notices_newest_first(pool: PgPool) {
+#[tokio::test]
+async fn list_serves_active_notices_newest_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _oldest: Announcement = seed(&pool, "oldest").await;
     let _middle: Announcement = seed(&pool, "middle").await;
     let _newest: Announcement = seed(&pool, "newest").await;
@@ -211,8 +215,10 @@ async fn list_serves_active_notices_newest_first(pool: PgPool) {
 /// keys, the row's stamps under Mastodon's names, the window in the Mastodon
 /// time format, Pleroma's `raw_content` in the `pleroma` block, and the five
 /// lookups as present-but-empty arrays.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_notice_renders_the_announcement_entity(pool: PgPool) {
+#[tokio::test]
+async fn a_notice_renders_the_announcement_entity() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let stored = create(
         &pool,
         &NewAnnouncement {
@@ -271,8 +277,10 @@ async fn a_notice_renders_the_announcement_entity(pool: PgPool) {
 /// A dismissal takes the notice out of its owner's default list, shows it to
 /// them with `read: true` when they ask for everything, and changes nothing for
 /// anybody else.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn dismissal_is_its_owners_own_state(pool: PgPool) {
+#[tokio::test]
+async fn dismissal_is_its_owners_own_state() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let hidden = seed(&pool, "dismissed").await;
     let seen = seed(&pool, "kept").await;
     let (_alice, alice_token) = fixture(&pool, "alice", "read write:accounts").await;
@@ -318,8 +326,10 @@ async fn dismissal_is_its_owners_own_state(pool: PgPool) {
 
 /// `with_dismissed` is a boolean, in the spellings a form client sends too, and
 /// defaults to hiding dismissed notices.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn with_dismissed_accepts_the_boolean_spellings(pool: PgPool) {
+#[tokio::test]
+async fn with_dismissed_accepts_the_boolean_spellings() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let hidden = seed(&pool, "dismissed").await;
     let (_alice, token) = fixture(&pool, "alice", "read:accounts write:accounts").await;
     let app = common::test_app(pool);
@@ -354,8 +364,10 @@ async fn with_dismissed_accepts_the_boolean_spellings(pool: PgPool) {
 
 /// A `with_dismissed` that is not a boolean in any accepted spelling is a
 /// validation error, not a silently ignored parameter.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unparsable_with_dismissed_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn an_unparsable_with_dismissed_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let app = common::test_app(pool);
 
@@ -374,8 +386,10 @@ async fn an_unparsable_with_dismissed_is_unprocessable(pool: PgPool) {
 }
 
 /// Dismissing twice stores one marker and answers the empty object both times.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn dismissal_is_idempotent(pool: PgPool) {
+#[tokio::test]
+async fn dismissal_is_idempotent() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let news = seed(&pool, "news").await;
     let (_alice, token) = fixture(&pool, "alice", "read:accounts write:accounts").await;
     let app = common::test_app(pool.clone());
@@ -401,8 +415,10 @@ async fn dismissal_is_idempotent(pool: PgPool) {
 
 /// An id that names no notice — never minted, already deleted, or not an id at
 /// all — is a 404, and stores nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn dismiss_of_a_notice_that_is_not_there_is_a_404(pool: PgPool) {
+#[tokio::test]
+async fn dismiss_of_a_notice_that_is_not_there_is_a_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let gone = seed(&pool, "withdrawn").await;
     let (_alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app(pool.clone());
@@ -434,8 +450,10 @@ async fn dismiss_of_a_notice_that_is_not_there_is_a_404(pool: PgPool) {
 
 /// A notice outside its window is still a notice: dismissing it answers 200,
 /// because the row exists even though the list hides it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_notice_outside_its_window_still_dismisses(pool: PgPool) {
+#[tokio::test]
+async fn a_notice_outside_its_window_still_dismisses() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let upcoming = seed_window(&pool, "upcoming", Some(at(FUTURE)), None).await;
     let (_alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app(pool.clone());
@@ -456,8 +474,10 @@ async fn a_notice_outside_its_window_still_dismisses(pool: PgPool) {
 /// `GET /api/v1/announcements` needs a user token: nothing at all is a 401, a
 /// bogus token a 401 naming the token, and an app-only token the 403 that says
 /// a user is required.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn list_requires_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn list_requires_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _news: Announcement = seed(&pool, "news").await;
     let app_only = common::create_app_only_token(&pool, "read").await;
     let app = common::test_app(pool);
@@ -504,8 +524,10 @@ async fn list_requires_a_user_token(pool: PgPool) {
 
 /// Listing needs `read:accounts`: a token that grants only another read
 /// sub-scope, or only writes, is a 403, while the broader `read` covers it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn list_requires_read_accounts(pool: PgPool) {
+#[tokio::test]
+async fn list_requires_read_accounts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_reader, narrow_read) = fixture(&pool, "reader", "read:statuses").await;
     let (_writer, write_only) = fixture(&pool, "writer", "write").await;
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
@@ -540,8 +562,10 @@ async fn list_requires_read_accounts(pool: PgPool) {
 /// Dismissing needs `write:accounts`, which the broader `write` also grants; a
 /// read-only caller — even one who reads accounts — is turned away, and so is a
 /// request with no token at all.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn dismiss_requires_write_accounts(pool: PgPool) {
+#[tokio::test]
+async fn dismiss_requires_write_accounts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let news = seed(&pool, "news").await;
     let (_reader, read_only) = fixture(&pool, "reader", "read").await;
     let (_account, account_read) = fixture(&pool, "account", "read:accounts").await;

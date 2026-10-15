@@ -12,7 +12,6 @@
 pub mod common;
 
 use axum::http::StatusCode;
-use sqlx::PgPool;
 
 /// The `error` string of a JSON error response, or `None` when the body is
 /// not an error object with a string `error` field.
@@ -22,8 +21,10 @@ fn error_message(response: &common::TestResponse) -> Option<String> {
 
 /// `/api/v1/nothing` is unmatched under the empty `/api/v1` router: 404 with
 /// Pleroma's `api_not_implemented` message.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unmatched_api_path_reports_not_implemented(pool: PgPool) {
+#[tokio::test]
+async fn unmatched_api_path_reports_not_implemented() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/nothing").send(&app).await;
     assert_eq!(
@@ -45,8 +46,10 @@ async fn unmatched_api_path_reports_not_implemented(pool: PgPool) {
 
 /// The same applies under `/api/v2` and to any other path below `/api/`,
 /// including the bare `/api` prefix.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn other_api_paths_also_report_not_implemented(pool: PgPool) {
+#[tokio::test]
+async fn other_api_paths_also_report_not_implemented() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for path in ["/api/v2/nothing", "/api/v1/pleroma/nothing", "/api"] {
         let response = common::TestRequest::get(path).send(&app).await;
@@ -65,8 +68,10 @@ async fn other_api_paths_also_report_not_implemented(pool: PgPool) {
 
 /// Any unmatched path outside `/api` answers 404 "Not found", the wording
 /// of Pleroma's router-level fallback.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn unmatched_non_api_path_reports_not_found(pool: PgPool) {
+#[tokio::test]
+async fn unmatched_non_api_path_reports_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/nothing").send(&app).await;
     assert_eq!(
@@ -83,8 +88,10 @@ async fn unmatched_non_api_path_reports_not_found(pool: PgPool) {
 
 /// A path shaped like an API prefix but not below it is not `api`:
 /// `/apibot` gets the plain "Not found" 404.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn api_lookalike_prefix_reports_not_found(pool: PgPool) {
+#[tokio::test]
+async fn api_lookalike_prefix_reports_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/apibot").send(&app).await;
     assert_eq!(
@@ -101,8 +108,10 @@ async fn api_lookalike_prefix_reports_not_found(pool: PgPool) {
 
 /// `/health` still answers 204 through the composed router, and the JSON
 /// fallbacks are error objects, never the health route.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn health_still_serves_no_content(pool: PgPool) {
+#[tokio::test]
+async fn health_still_serves_no_content() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/health").send(&app).await;
     assert_eq!(response.status, StatusCode::NO_CONTENT, "health status");
@@ -111,8 +120,10 @@ async fn health_still_serves_no_content(pool: PgPool) {
 
 /// A wrong verb on `/health`, a known path, is still axum's default 405,
 /// not the JSON fallback.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn known_path_wrong_verb_is_method_not_allowed(pool: PgPool) {
+#[tokio::test]
+async fn known_path_wrong_verb_is_method_not_allowed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::post("/health").send(&app).await;
     assert_eq!(
@@ -130,8 +141,10 @@ async fn known_path_wrong_verb_is_method_not_allowed(pool: PgPool) {
 
 /// Unmatched paths also answer with the fallback for client verbs like
 /// `POST`, since no route restricts the method there.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn fallback_covers_all_verbs(pool: PgPool) {
+#[tokio::test]
+async fn fallback_covers_all_verbs() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::post("/api/v1/nothing")
         .send(&app)

@@ -16,6 +16,8 @@ pub mod pagination;
 pub mod services;
 pub mod state;
 pub mod streaming;
+#[cfg(any(test, feature = "integration-tests"))]
+pub mod test_db;
 pub mod uploads;
 pub mod util;
 
@@ -289,13 +291,342 @@ mod tests {
         );
     }
 
-    /// Migration tests, run against the throwaway database created by `#[sqlx::test]`.
+    /// Migration tests, run against a slot of the pooled fixture in
+    /// [`crate::test_db`].
     mod migrations {
-        use sqlx::PgPool;
+
+        /// One foreign key of the three tables: its name, the table it
+        /// was declared on, its delete action and what it points at.
+        #[derive(Debug, sqlx::FromRow)]
+        struct ForeignKey {
+            /// The table carrying the constraint.
+            relname: String,
+            /// The constraint's name.
+            conname: String,
+            /// Its `ON DELETE` action, as PostgreSQL spells it.
+            confdeltype: String,
+            /// The table it references.
+            target: String,
+        }
+
+        /// One column of the three tables, as `information_schema`
+        /// describes it.
+        #[derive(Debug, sqlx::FromRow)]
+        struct SchemaColumn {
+            /// The table it belongs to.
+            table_name: String,
+            /// Its own name.
+            column_name: String,
+            /// The default expression, `None` when it has none.
+            column_default: Option<String>,
+            /// `NO` for a `NOT NULL` column, `YES` otherwise.
+            is_nullable: String,
+        }
+
+        /// One column of the table, as `information_schema` describes
+        /// it.
+        #[derive(Debug, sqlx::FromRow)]
+        struct RuleColumn {
+            /// Its name.
+            column_name: String,
+            /// The declared type.
+            data_type: String,
+            /// `NO` for a `NOT NULL` column, `YES` otherwise.
+            is_nullable: String,
+            /// The default expression, `None` when it has none.
+            column_default: Option<String>,
+        }
+
+        /// One column of the table, as `information_schema` describes it.
+        #[derive(Debug, sqlx::FromRow)]
+        struct StateColumn {
+            /// Its name.
+            column_name: String,
+            /// The declared type.
+            data_type: String,
+            /// `NO` for a `NOT NULL` column, `YES` otherwise.
+            is_nullable: String,
+            /// The default expression, `None` when it has none.
+            column_default: Option<String>,
+        }
+
+        /// A column as a `(name, type, nullability, default)` tuple, the shape
+        /// the `oauth_login_states` expectation is written in.
+        type Described = (String, String, String, Option<String>);
+        /// One expected foreign key: the table it was declared on, its name,
+        /// its delete action and the table it points at.
+        type ExpectedKey = (&'static str, &'static str, &'static str, &'static str);
+
+        /// The indexes the statuses migration creates on `statuses`: the
+        /// primary key, the uri lookup and the six the timeline and thread
+        /// queries read.
+        const STATUS_INDEXES: [&str; 8] = [
+            "statuses_pkey",
+            "statuses_uri_key",
+            "statuses_user_id_idx",
+            "statuses_in_reply_to_id_idx",
+            "statuses_conversation_id_idx",
+            "statuses_reblog_of_id_idx",
+            "statuses_visibility_idx",
+            "statuses_quote_of_id_idx",
+        ];
+        /// The two newest-first statuses indexes, partial on live rows so
+        /// tombstones drop out of them for free.
+        const PARTIAL_STATUS_INDEXES: [&str; 2] =
+            ["statuses_user_id_idx", "statuses_visibility_idx"];
+        /// The foreign keys the chats migration declares: table, constraint,
+        /// `ON DELETE` action and target.
+        const CHAT_FOREIGN_KEYS: [ExpectedKey; 6] = [
+            ("chats", "chats_user_id_fkey", "c", "users"),
+            ("chats", "chats_recipient_id_fkey", "c", "users"),
+            (
+                "chat_messages",
+                "chat_messages_sender_id_fkey",
+                "c",
+                "users",
+            ),
+            (
+                "chat_messages",
+                "chat_messages_attachment_media_id_fkey",
+                "n",
+                "media_attachments",
+            ),
+            (
+                "chat_message_references",
+                "chat_message_references_chat_id_fkey",
+                "c",
+                "chats",
+            ),
+            (
+                "chat_message_references",
+                "chat_message_references_message_id_fkey",
+                "c",
+                "chat_messages",
+            ),
+        ];
+        /// The unique keys the chats migration declares.
+        const CHAT_UNIQUE_KEYS: [(&str, &str); 3] = [
+            ("chats", "chats_user_id_recipient_id_key"),
+            (
+                "chat_message_references",
+                "chat_message_references_chat_id_message_id_key",
+            ),
+            ("chat_messages", "chat_messages_ap_id_key"),
+        ];
+        /// The indexes the chats migration declares for its list queries.
+        const CHAT_INDEXES: [&str; 6] = [
+            "chats_user_id_updated_at_idx",
+            "chats_recipient_id_idx",
+            "chat_messages_sender_id_idx",
+            "chat_message_references_chat_id_idx",
+            "chat_message_references_chat_id_unread_idx",
+            "chat_message_references_message_id_idx",
+        ];
+        /// The `chat_messages` columns the migration defaults for the model,
+        /// and the columns it makes `NOT NULL`.
+        const CHAT_DEFAULTS: [(&str, &str, &str); 4] = [
+            ("chats", "pinned", "false"),
+            ("chat_messages", "content", "''::text"),
+            ("chat_messages", "raw_text", "''::text"),
+            ("chat_message_references", "unread", "true"),
+        ];
+        /// The columns of the three chat tables no row may leave unset.
+        const CHAT_REQUIRED_COLUMNS: [(&str, &str); 5] = [
+            ("chats", "user_id"),
+            ("chats", "recipient_id"),
+            ("chat_messages", "sender_id"),
+            ("chat_message_references", "chat_id"),
+            ("chat_message_references", "message_id"),
+        ];
+        /// The `instance_rules` columns and their types, in the order the
+        /// migration declares them.
+        const RULE_COLUMNS: [(&str, &str); 6] = [
+            ("id", "uuid"),
+            ("text", "text"),
+            ("hint", "text"),
+            ("priority", "integer"),
+            ("inserted_at", "timestamp with time zone"),
+            ("updated_at", "timestamp with time zone"),
+        ];
+        /// The timestamps of a table, defaulted by the database to `now()`.
+        const NOW_COLUMNS: [&str; 2] = ["inserted_at", "updated_at"];
+
+        /// The `indexname`s of `rows`, the `pg_indexes` rows of one table.
+        fn index_names(rows: &[(String, String)]) -> Vec<&str> {
+            rows.iter().map(|(name, _)| name.as_str()).collect()
+        }
+
+        /// The `indexdef` of the index named `name` in `rows`.
+        ///
+        /// # Panics
+        ///
+        /// If `rows` carries no such index.
+        fn index_definition<'rows>(rows: &'rows [(String, String)], name: &str) -> &'rows str {
+            rows.iter()
+                .find(|(indexname, _)| indexname == name)
+                .map_or_else(
+                    || panic!("{name} exists: {rows:?}"),
+                    |(_, definition)| definition.as_str(),
+                )
+        }
+
+        /// The row of `columns` describing `table`'s column `name`.
+        ///
+        /// # Panics
+        ///
+        /// If `columns` does not carry that column.
+        fn column_of<'columns>(
+            columns: &'columns [SchemaColumn],
+            table: &str,
+            name: &str,
+        ) -> &'columns SchemaColumn {
+            columns
+                .iter()
+                .find(|row| row.table_name == table && row.column_name == name)
+                .unwrap_or_else(|| panic!("{table}.{name} exists"))
+        }
+
+        /// The row of `columns` describing the `instance_rules` column `name`.
+        ///
+        /// # Panics
+        ///
+        /// If `columns` does not carry that column.
+        fn rule_column<'columns>(
+            columns: &'columns [RuleColumn],
+            name: &str,
+        ) -> &'columns RuleColumn {
+            columns
+                .iter()
+                .find(|column| column.column_name == name)
+                .unwrap_or_else(|| panic!("instance_rules.{name} exists"))
+        }
+
+        /// `columns` as `(name, type, nullability, default)` tuples.
+        fn described_of(columns: Vec<StateColumn>) -> Vec<Described> {
+            columns
+                .into_iter()
+                .map(|column| {
+                    (
+                        column.column_name,
+                        column.data_type,
+                        column.is_nullable,
+                        column.column_default,
+                    )
+                })
+                .collect()
+        }
+
+        /// Every index the statuses migration creates, and the two newest-first
+        /// ones partial on live rows only.
+        fn assert_statuses_indexes(rows: &[(String, String)]) {
+            let names = index_names(rows);
+            for expected in STATUS_INDEXES {
+                assert!(names.contains(&expected), "{expected} indexes statuses");
+            }
+            for partial in PARTIAL_STATUS_INDEXES {
+                assert!(
+                    index_definition(rows, partial).contains("deleted_at IS NULL"),
+                    "{partial} is partial on live rows only"
+                );
+            }
+        }
+
+        /// Every foreign key the chats migration declares, with its delete
+        /// action and target.
+        fn assert_chat_foreign_keys(keys: &[ForeignKey]) {
+            for (table, constraint, action, target) in CHAT_FOREIGN_KEYS {
+                let found = keys
+                    .iter()
+                    .find(|key| key.relname == table && key.conname == constraint)
+                    .unwrap_or_else(|| panic!("{constraint} links {table}"));
+                assert_eq!(
+                    found.confdeltype, action,
+                    "{constraint} deletes as {action}"
+                );
+                assert_eq!(found.target, target, "{constraint} points at {target}");
+            }
+        }
+
+        /// The unique keys that keep one chat per participant and account, one
+        /// reference per chat and message, and one `ap_id` per message.
+        fn assert_chat_unique_keys(uniques: &[(String, String)]) {
+            for (table, constraint) in CHAT_UNIQUE_KEYS {
+                assert!(
+                    uniques
+                        .iter()
+                        .any(|(relname, conname)| relname == table && conname == constraint),
+                    "{constraint} keeps {table} free of duplicates"
+                );
+            }
+        }
+
+        /// The indexes the chat list queries read.
+        fn assert_chat_indexes(indexes: &[(String, String)]) {
+            for name in CHAT_INDEXES {
+                assert!(
+                    indexes.iter().any(|(indexname, _)| indexname == name),
+                    "{name} serves a chat query"
+                );
+            }
+        }
+
+        /// The defaults the chats migration leaves the model to rely on, and
+        /// the `NOT NULL`s it fills in for them.
+        fn assert_chat_column_defaults(columns: &[SchemaColumn]) {
+            for (table, column, default) in CHAT_DEFAULTS {
+                let row = column_of(columns, table, column);
+                assert_eq!(
+                    row.column_default.as_deref(),
+                    Some(default),
+                    "{table}.{column} defaults to {default}"
+                );
+                assert_eq!(row.is_nullable, "NO", "{table}.{column} is NOT NULL");
+            }
+        }
+
+        /// The columns of the three chat tables no row may leave unset.
+        fn assert_chat_required_columns(columns: &[SchemaColumn]) {
+            for (table, column) in CHAT_REQUIRED_COLUMNS {
+                assert_eq!(
+                    column_of(columns, table, column).is_nullable,
+                    "NO",
+                    "{table}.{column} cannot be null"
+                );
+            }
+        }
+
+        /// The type and nullability of every `instance_rules` column.
+        fn assert_rule_column_types(columns: &[RuleColumn]) {
+            for (name, data_type) in RULE_COLUMNS {
+                assert_eq!(
+                    rule_column(columns, name).data_type,
+                    data_type,
+                    "instance_rules.{name} is {data_type}"
+                );
+                assert_eq!(
+                    rule_column(columns, name).is_nullable,
+                    "NO",
+                    "instance_rules.{name} is NOT NULL"
+                );
+            }
+        }
+
+        /// The two timestamps the `instance_rules` migration stamps itself.
+        fn assert_rule_timestamps(columns: &[RuleColumn]) {
+            for name in NOW_COLUMNS {
+                assert_eq!(
+                    rule_column(columns, name).column_default.as_deref(),
+                    Some("now()"),
+                    "{name} defaults to now()"
+                );
+            }
+        }
 
         /// The base extensions migration installs `citext`, `pg_trgm` and `pgcrypto`.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn extensions_migration_installs_all_three_extensions(pool: PgPool) {
+        #[tokio::test]
+        async fn extensions_migration_installs_all_three_extensions() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let row: (i64,) = sqlx::query_as(
                 "SELECT count(*) FROM pg_extension WHERE extname IN ('citext','pg_trgm','pgcrypto')",
             )
@@ -310,8 +641,10 @@ mod tests {
         /// `deleted_at IS NULL`, so tombstones drop out of them for free —
         /// and gives `media_attachments.status_id` its foreign key into the
         /// new table.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn statuses_migration_indexes_statuses_and_links_media(pool: PgPool) {
+        #[tokio::test]
+        async fn statuses_migration_indexes_statuses_and_links_media() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let rows: Vec<(String, String)> = sqlx::query_as(
                 "SELECT indexname, indexdef FROM pg_indexes
                   WHERE schemaname = 'public' AND tablename = 'statuses'",
@@ -319,30 +652,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            let names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
-            for expected in [
-                "statuses_pkey",
-                "statuses_uri_key",
-                "statuses_user_id_idx",
-                "statuses_in_reply_to_id_idx",
-                "statuses_conversation_id_idx",
-                "statuses_reblog_of_id_idx",
-                "statuses_visibility_idx",
-                "statuses_quote_of_id_idx",
-            ] {
-                assert!(names.contains(&expected), "{expected} indexes statuses");
-            }
-            for partial in ["statuses_user_id_idx", "statuses_visibility_idx"] {
-                let definition = rows
-                    .iter()
-                    .find(|(name, _)| name == partial)
-                    .map(|(_, definition)| definition.as_str())
-                    .unwrap();
-                assert!(
-                    definition.contains("deleted_at IS NULL"),
-                    "{partial} is partial on live rows only"
-                );
-            }
+            assert_statuses_indexes(&rows);
 
             let keys: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT con.conname, con.confdeltype::text, con.confrelid::regclass::text
@@ -373,22 +683,10 @@ mod tests {
         /// the way the model's queries assume: the accounts and the media a
         /// message may name, the cascades that take a conversation apart with
         /// its owners, and the keys its upserts conflict on.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn chats_migration_links_both_sides_of_a_conversation(pool: PgPool) {
-            /// One foreign key of the three tables: its name, the table it
-            /// was declared on, its delete action and what it points at.
-            #[derive(Debug, sqlx::FromRow)]
-            struct ForeignKey {
-                /// The table carrying the constraint.
-                relname: String,
-                /// The constraint's name.
-                conname: String,
-                /// Its `ON DELETE` action, as PostgreSQL spells it.
-                confdeltype: String,
-                /// The table it references.
-                target: String,
-            }
-
+        #[tokio::test]
+        async fn chats_migration_links_both_sides_of_a_conversation() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let keys: Vec<ForeignKey> = sqlx::query_as(
                 "SELECT cls.relname, con.conname, con.confdeltype::text, conf.relname AS target
                    FROM pg_constraint con
@@ -400,52 +698,17 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            for (table, constraint, action, target) in [
-                ("chats", "chats_user_id_fkey", "c", "users"),
-                ("chats", "chats_recipient_id_fkey", "c", "users"),
-                (
-                    "chat_messages",
-                    "chat_messages_sender_id_fkey",
-                    "c",
-                    "users",
-                ),
-                (
-                    "chat_messages",
-                    "chat_messages_attachment_media_id_fkey",
-                    "n",
-                    "media_attachments",
-                ),
-                (
-                    "chat_message_references",
-                    "chat_message_references_chat_id_fkey",
-                    "c",
-                    "chats",
-                ),
-                (
-                    "chat_message_references",
-                    "chat_message_references_message_id_fkey",
-                    "c",
-                    "chat_messages",
-                ),
-            ] {
-                let found = keys
-                    .iter()
-                    .find(|key| key.relname == table && key.conname == constraint)
-                    .unwrap_or_else(|| panic!("{constraint} links {table}"));
-                assert_eq!(
-                    found.confdeltype, action,
-                    "{constraint} deletes as {action}"
-                );
-                assert_eq!(found.target, target, "{constraint} points at {target}");
-            }
+            assert_chat_foreign_keys(&keys);
         }
 
         /// The unique keys and indexes the chats migration adds: one chat per
         /// participant and account, one reference per chat and message, a
         /// reserved `ap_id`, and the newest-first and unread-only indexes the
         /// list queries read.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn chats_migration_keys_and_indexes_the_chat_tables(pool: PgPool) {
+        #[tokio::test]
+        async fn chats_migration_keys_and_indexes_the_chat_tables() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let uniques: Vec<(String, String)> = sqlx::query_as(
                 "SELECT cls.relname, con.conname
                    FROM pg_constraint con
@@ -456,21 +719,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            for (table, constraint) in [
-                ("chats", "chats_user_id_recipient_id_key"),
-                (
-                    "chat_message_references",
-                    "chat_message_references_chat_id_message_id_key",
-                ),
-                ("chat_messages", "chat_messages_ap_id_key"),
-            ] {
-                assert!(
-                    uniques
-                        .iter()
-                        .any(|(relname, conname)| relname == table && conname == constraint),
-                    "{constraint} keeps {table} free of duplicates"
-                );
-            }
+            assert_chat_unique_keys(&uniques);
 
             let indexes: Vec<(String, String)> = sqlx::query_as(
                 "SELECT indexname, indexdef FROM pg_indexes
@@ -480,19 +729,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            for name in [
-                "chats_user_id_updated_at_idx",
-                "chats_recipient_id_idx",
-                "chat_messages_sender_id_idx",
-                "chat_message_references_chat_id_idx",
-                "chat_message_references_chat_id_unread_idx",
-                "chat_message_references_message_id_idx",
-            ] {
-                assert!(
-                    indexes.iter().any(|(indexname, _)| indexname == name),
-                    "{name} serves a chat query"
-                );
-            }
+            assert_chat_indexes(&indexes);
             let (unread_name, unread_def) = indexes
                 .iter()
                 .find(|(indexname, _)| indexname == "chat_message_references_chat_id_unread_idx")
@@ -506,22 +743,10 @@ mod tests {
         /// The column defaults and `NOT NULL`s the chats migration gives the
         /// three tables, which are exactly what `src/models/chat.rs` leaves
         /// for the database to fill.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn chats_migration_defaults_match_the_model(pool: PgPool) {
-            /// One column of the three tables, as `information_schema`
-            /// describes it.
-            #[derive(Debug, sqlx::FromRow)]
-            struct SchemaColumn {
-                /// The table it belongs to.
-                table_name: String,
-                /// Its own name.
-                column_name: String,
-                /// The default expression, `None` when it has none.
-                column_default: Option<String>,
-                /// `NO` for a `NOT NULL` column, `YES` otherwise.
-                is_nullable: String,
-            }
-
+        #[tokio::test]
+        async fn chats_migration_defaults_match_the_model() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let columns: Vec<SchemaColumn> = sqlx::query_as(
                 "SELECT table_name, column_name, column_default, is_nullable
                    FROM information_schema.columns
@@ -531,43 +756,13 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            let one = |table: &str, column: &str| -> &SchemaColumn {
-                columns
-                    .iter()
-                    .find(|row| row.table_name == table && row.column_name == column)
-                    .unwrap_or_else(|| panic!("{table}.{column} exists"))
-            };
-
-            for (table, column, default) in [
-                ("chats", "pinned", "false"),
-                ("chat_messages", "content", "''::text"),
-                ("chat_messages", "raw_text", "''::text"),
-                ("chat_message_references", "unread", "true"),
-            ] {
-                let row = one(table, column);
-                assert_eq!(
-                    row.column_default.as_deref(),
-                    Some(default),
-                    "{table}.{column} defaults to {default}"
-                );
-                assert_eq!(row.is_nullable, "NO", "{table}.{column} is NOT NULL");
-            }
-            for (table, column) in [
-                ("chats", "user_id"),
-                ("chats", "recipient_id"),
-                ("chat_messages", "sender_id"),
-                ("chat_message_references", "chat_id"),
-                ("chat_message_references", "message_id"),
-            ] {
-                assert_eq!(
-                    one(table, column).is_nullable,
-                    "NO",
-                    "{table}.{column} cannot be null"
-                );
-            }
+            assert_chat_column_defaults(&columns);
+            assert_chat_required_columns(&columns);
             assert!(
-                one("chat_messages", "deleted_at").column_default.is_none()
-                    && one("chat_messages", "deleted_at").is_nullable == "YES",
+                column_of(&columns, "chat_messages", "deleted_at")
+                    .column_default
+                    .is_none()
+                    && column_of(&columns, "chat_messages", "deleted_at").is_nullable == "YES",
                 "a live message has no deleted_at until it is withdrawn"
             );
         }
@@ -576,8 +771,10 @@ mod tests {
         /// table `src/models/instance_setting.rs` reads: the `text`
         /// primary key its upsert conflicts on, the jsonb value and the
         /// `now()`-defaulted `updated_at`.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn instance_settings_migration_creates_the_settings_table(pool: PgPool) {
+        #[tokio::test]
+        async fn instance_settings_migration_creates_the_settings_table() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let columns: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT column_name, data_type, is_nullable
                    FROM information_schema.columns
@@ -636,22 +833,10 @@ mod tests {
         /// `src/models/instance_rule.rs` reads and writes: the minted
         /// `uuid` primary key, the rule text, the defaulted hint and
         /// priority, and the `now()`-stamped timestamps.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn instance_rules_migration_creates_the_rules_table(pool: PgPool) {
-            /// One column of the table, as `information_schema` describes
-            /// it.
-            #[derive(Debug, sqlx::FromRow)]
-            struct RuleColumn {
-                /// Its name.
-                column_name: String,
-                /// The declared type.
-                data_type: String,
-                /// `NO` for a `NOT NULL` column, `YES` otherwise.
-                is_nullable: String,
-                /// The default expression, `None` when it has none.
-                column_default: Option<String>,
-            }
-
+        #[tokio::test]
+        async fn instance_rules_migration_creates_the_rules_table() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let columns: Vec<RuleColumn> = sqlx::query_as(
                 "SELECT column_name, data_type, is_nullable, column_default
                    FROM information_schema.columns
@@ -677,58 +862,28 @@ mod tests {
                 ],
                 "the ticket's columns, in the ticket's order"
             );
-            let one = |name: &str| -> &RuleColumn {
-                columns
-                    .iter()
-                    .find(|column| column.column_name == name)
-                    .unwrap_or_else(|| panic!("instance_rules.{name} exists"))
-            };
-            for (name, data_type) in [
-                ("id", "uuid"),
-                ("text", "text"),
-                ("hint", "text"),
-                ("priority", "integer"),
-                ("inserted_at", "timestamp with time zone"),
-                ("updated_at", "timestamp with time zone"),
-            ] {
-                assert_eq!(
-                    one(name).data_type,
-                    data_type,
-                    "instance_rules.{name} is {data_type}"
-                );
-                assert_eq!(
-                    one(name).is_nullable,
-                    "NO",
-                    "instance_rules.{name} is NOT NULL"
-                );
-            }
+            assert_rule_column_types(&columns);
             assert_eq!(
-                one("id").column_default,
+                rule_column(&columns, "id").column_default,
                 None,
                 "the id is minted in Rust (decision 4)"
             );
             assert_eq!(
-                one("text").column_default,
+                rule_column(&columns, "text").column_default,
                 None,
                 "text has no default: the rule is required"
             );
             assert_eq!(
-                one("hint").column_default.as_deref(),
+                rule_column(&columns, "hint").column_default.as_deref(),
                 Some("''::text"),
                 "the hint defaults to empty"
             );
             assert_eq!(
-                one("priority").column_default.as_deref(),
+                rule_column(&columns, "priority").column_default.as_deref(),
                 Some("0"),
                 "the priority defaults to the middle of the list"
             );
-            for name in ["inserted_at", "updated_at"] {
-                assert_eq!(
-                    one(name).column_default.as_deref(),
-                    Some("now()"),
-                    "{name} defaults to now()"
-                );
-            }
+            assert_rule_timestamps(&columns);
 
             let (primary_key, key_columns): (String, String) = sqlx::query_as(
                 "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
@@ -753,8 +908,10 @@ mod tests {
         /// insert takes the next number, which is the order members were added
         /// in), the primary key still the `(list_id, user_id)` pair that makes
         /// membership idempotent, and one index serving a list's own positions.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn list_members_position_migration_adds_the_ordinal(pool: PgPool) {
+        #[tokio::test]
+        async fn list_members_position_migration_adds_the_ordinal() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let (data_type, is_nullable, default): (String, String, Option<String>) =
                 sqlx::query_as(
                     "SELECT data_type, is_nullable, column_default
@@ -823,8 +980,10 @@ mod tests {
         /// `text` `idempotency_key` on `chat_messages` — and the partial
         /// index that serves the sender-and-key search, keeping every
         /// keyless message out of it.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn chat_message_idempotency_migration_adds_the_key(pool: PgPool) {
+        #[tokio::test]
+        async fn chat_message_idempotency_migration_adds_the_key() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let (data_type, is_nullable, default): (String, String, Option<String>) =
                 sqlx::query_as(
                     "SELECT data_type, is_nullable, column_default
@@ -864,8 +1023,10 @@ mod tests {
         /// `uuid` primary key, the `user_id` foreign key that takes a
         /// provider link down with its account, and the `(provider, uid)`
         /// pair that makes one provider account exactly one login.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn user_identities_migration_links_providers_to_users(pool: PgPool) {
+        #[tokio::test]
+        async fn user_identities_migration_links_providers_to_users() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let columns: Vec<(String, String, String)> = sqlx::query_as(
                 "SELECT column_name, data_type, is_nullable
                    FROM information_schema.columns
@@ -956,25 +1117,10 @@ mod tests {
         /// what the provider echoes back), the provider it was issued to,
         /// the jsonb parameters, and the expiry with no database default
         /// because its lifetime is the model's to stamp.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn oauth_login_states_migration_creates_the_state_table(pool: PgPool) {
-            /// One column of the table, as `information_schema` describes it.
-            #[derive(Debug, sqlx::FromRow)]
-            struct StateColumn {
-                /// Its name.
-                column_name: String,
-                /// The declared type.
-                data_type: String,
-                /// `NO` for a `NOT NULL` column, `YES` otherwise.
-                is_nullable: String,
-                /// The default expression, `None` when it has none.
-                column_default: Option<String>,
-            }
-
-            /// A column as a `(name, type, nullability, default)` tuple, the
-            /// shape the expectation is written in.
-            type Described = (String, String, String, Option<String>);
-
+        #[tokio::test]
+        async fn oauth_login_states_migration_creates_the_state_table() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let columns: Vec<StateColumn> = sqlx::query_as(
                 "SELECT column_name, data_type, is_nullable, column_default
                    FROM information_schema.columns
@@ -984,17 +1130,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-            let described: Vec<Described> = columns
-                .into_iter()
-                .map(|column| {
-                    (
-                        column.column_name,
-                        column.data_type,
-                        column.is_nullable,
-                        column.column_default,
-                    )
-                })
-                .collect();
+            let described = described_of(columns);
             assert_eq!(
                 described,
                 vec![
@@ -1057,8 +1193,10 @@ mod tests {
         /// account that never picked a frontend keeps NULL, and the pick
         /// itself is validated against `AVAILABLE_FRONTENDS`, not against
         /// the schema.
-        #[sqlx::test(migrator = "crate::MIGRATOR")]
-        async fn users_preferred_frontend_migration_adds_the_column(pool: PgPool) {
+        #[tokio::test]
+        async fn users_preferred_frontend_migration_adds_the_column() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
             let (data_type, is_nullable, default): (String, String, Option<String>) =
                 sqlx::query_as(
                     "SELECT data_type, is_nullable, column_default

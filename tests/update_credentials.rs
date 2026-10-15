@@ -156,8 +156,10 @@ async fn stored(pool: &PgPool, id: Uuid) -> User {
 
 /// `display_name` updates through JSON, form and multipart bodies, each
 /// time replacing the stored name and never disturbing anything else.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn display_name_updates_through_every_body_type(pool: PgPool) {
+#[tokio::test]
+async fn display_name_updates_through_every_body_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let via_json = ok_body(&patch_json(&app, &token, &json!({"display_name": "Ada"})).await);
@@ -191,8 +193,10 @@ async fn display_name_updates_through_every_body_type(pool: PgPool) {
 /// A submitted `display_name` is stored through the display-name
 /// sanitizer — markup collapses to one line of plain text — and the empty
 /// string is stored empty, not reset to the nickname.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn display_name_is_sanitized_and_empty_is_stored(pool: PgPool) {
+#[tokio::test]
+async fn display_name_is_sanitized_and_empty_is_stored() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, _) = authed_app(&pool, "alice").await;
     let stripped = ok_body(
         &patch_json(
@@ -221,8 +225,10 @@ async fn display_name_is_sanitized_and_empty_is_stored(pool: PgPool) {
 /// `display_name` is capped at `MAX_DISPLAY_NAME_CHARS` characters,
 /// counted as characters not bytes: 51 scalars are the 422 with the
 /// ticket's wording, 50 fit, and a multibyte 50-character name fits too.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn display_name_length_limit_is_422(pool: PgPool) {
+#[tokio::test]
+async fn display_name_length_limit_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, _) = authed_app(&pool, "alice").await;
     let response = patch_json(&app, &token, &json!({"display_name": "x".repeat(51)})).await;
     assert_eq!(
@@ -247,8 +253,10 @@ async fn display_name_length_limit_is_422(pool: PgPool) {
 /// A `note` updates through JSON, form and multipart bodies: the public
 /// `note` renders the formatted HTML and `source.note` round-trips the
 /// raw text the client sent.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_updates_through_every_body_type(pool: PgPool) {
+#[tokio::test]
+async fn note_updates_through_every_body_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, _) = authed_app(&pool, "alice").await;
 
     let via_json = ok_body(&patch_json(&app, &token, &json!({"note": "hello there"})).await);
@@ -279,8 +287,10 @@ async fn note_updates_through_every_body_type(pool: PgPool) {
 /// The rendered note linkifies bare URLs and hashtags, links the mentions
 /// naming local users (bare or spelled with this instance's domain, case
 /// folded) and leaves unknown and remote mentions as plain text.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_links_urls_hashtags_and_local_mentions(pool: PgPool) {
+#[tokio::test]
+async fn note_links_urls_hashtags_and_local_mentions() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _bob: User = common::create_local_user(&pool, "bob").await;
     let _carol: User = common::create_remote_user(&pool, "carol", "remote.example").await;
     let alice = common::create_local_user(&pool, "alice").await;
@@ -327,8 +337,10 @@ async fn note_links_urls_hashtags_and_local_mentions(pool: PgPool) {
 
 /// A mention spelled with this instance's own domain links to the local
 /// user it names; a different domain never does.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_links_own_domain_mentions_as_local(pool: PgPool) {
+#[tokio::test]
+async fn note_links_own_domain_mentions_as_local() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _bob: User = common::create_local_user(&pool, "bob").await;
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
@@ -360,8 +372,10 @@ async fn note_links_own_domain_mentions_as_local(pool: PgPool) {
 
 /// A `note` over `MAX_BIO_CHARS` characters is the 422, and the limit
 /// moves with the configuration.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_length_limit_is_422(pool: PgPool) {
+#[tokio::test]
+async fn note_length_limit_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, _) = authed_app(&pool, "alice").await;
     let too_long = patch_json(&app, &token, &json!({"note": "x".repeat(5001)})).await;
     assert_eq!(
@@ -415,8 +429,10 @@ fn assert_flags(body: &Value, expect: &Value, why: &str) {
 /// Each of the three booleans updates individually through JSON, form and
 /// multipart bodies — set, cleared and set again — reaching both the
 /// entity and the `source.pleroma` block, and never moving the others.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn boolean_flags_update_through_every_body_type(pool: PgPool) {
+#[tokio::test]
+async fn boolean_flags_update_through_every_body_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let mut expect = json!({"locked": false, "bot": false, "discoverable": false});
 
@@ -465,8 +481,10 @@ async fn boolean_flags_update_through_every_body_type(pool: PgPool) {
 
 /// An unrecognized boolean string is the extractor's 422, and a body
 /// carrying one writes nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn invalid_boolean_strings_are_422(pool: PgPool) {
+#[tokio::test]
+async fn invalid_boolean_strings_are_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, _) = authed_app(&pool, "alice").await;
     for (field, value) in [
         ("locked", "maybe"),
@@ -500,14 +518,11 @@ async fn invalid_boolean_strings_are_422(pool: PgPool) {
     );
 }
 
-/// Fields absent from the body keep their stored values — the flags, the
-/// note, the name, the posting defaults, the Pleroma preferences, the
-/// birthday and the settings store each survive an update of the others,
-/// and a body that carries none of them changes nothing (and is not an
-/// error).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn absent_fields_stay_untouched(pool: PgPool) {
-    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+/// The account every present-only assertion writes against: a name, the note
+/// in both forms, the flags on, the posting defaults and Pleroma preferences
+/// set, a birthday and a settings blob.
+async fn prefilled(pool: &PgPool, nickname: &str) -> User {
+    common::create_local_user_with(pool, nickname, |mut new| {
         new.name = "Ada".to_owned();
         new.raw_bio = "old bio".to_owned();
         new.bio = "<p>old bio</p>".to_owned();
@@ -524,9 +539,25 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
         new.settings_store = json!({"theme": "dark"});
         new
     })
-    .await;
-    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    .await
+}
+
+/// The account and the router every `PATCH` of these tests writes through.
+async fn prefilled_app(pool: &PgPool) -> (Router, String, User) {
+    let alice = prefilled(pool, "alice").await;
+    let token = common::create_app_and_token(pool, &alice, "write:accounts").await;
     let app = common::test_app(pool.clone());
+    (app, token, alice)
+}
+
+/// Fields absent from the body keep their stored values — the flags, the
+/// note, the name, the posting defaults, the Pleroma preferences, the
+/// birthday and the settings store each survive an update of the others.
+#[tokio::test]
+async fn absent_fields_stay_untouched() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, token, _alice) = prefilled_app(&pool).await;
 
     let flipped = ok_body(&patch_json(&app, &token, &json!({"bot": false})).await);
     assert_eq!(flipped["bot"], false, "the sent flag flipped");
@@ -576,6 +607,20 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
         renamed["pleroma"]["show_birthday"], true,
         "the preference flags survive a name change"
     );
+}
+
+/// The other two spellings of absence: a body of JSON nulls (Pleroma's nil
+/// filter reads them as absent) and a bodyless `PATCH`, neither of which
+/// changes anything — not the answer, not the row.
+#[tokio::test]
+async fn nulls_and_an_empty_body_write_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, token, alice) = prefilled_app(&pool).await;
+    let flipped = ok_body(&patch_json(&app, &token, &json!({"bot": false})).await);
+    assert_eq!(flipped["bot"], false, "the sent flag flipped");
+    let renamed = ok_body(&patch_json(&app, &token, &json!({"display_name": "Grace"})).await);
+    assert_eq!(renamed["display_name"], "Grace", "the name updated");
 
     let nulled = ok_body(
         &patch_json(
@@ -641,8 +686,10 @@ async fn absent_fields_stay_untouched(pool: PgPool) {
 /// The 200 is the full owner entity: the `source` block
 /// `verify_credentials` answers (raw note, posting defaults, the pending
 /// queue, the Pleroma settings) and the top-level `also_known_as`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn response_carries_the_verify_credentials_source(pool: PgPool) {
+#[tokio::test]
+async fn response_carries_the_verify_credentials_source() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.default_scope = "private".to_owned();
         new.language = Some("la".to_owned());
@@ -681,8 +728,10 @@ async fn response_carries_the_verify_credentials_source(pool: PgPool) {
 /// The route runs `AuthUser` with `write:accounts`: no or invalid token is
 /// the 401, an app-only credential and a scope-less user token the 403,
 /// and none of them touches the row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn auth_and_scope_gate_the_write(pool: PgPool) {
+#[tokio::test]
+async fn auth_and_scope_gate_the_write() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool.clone());
 
@@ -741,8 +790,10 @@ async fn auth_and_scope_gate_the_write(pool: PgPool) {
 
 /// Old clients `POST` the same body to the same path and get the same
 /// answer as the `PATCH`ers.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn post_alias_updates_the_same_fields(pool: PgPool) {
+#[tokio::test]
+async fn post_alias_updates_the_same_fields() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, _) = authed_app(&pool, "alice").await;
     let form_response = common::TestRequest::post(ROUTE)
         .bearer(&token)
@@ -774,8 +825,10 @@ async fn post_alias_updates_the_same_fields(pool: PgPool) {
 /// moves. The earlier slice of this endpoint ignored file parts altogether;
 /// the image ticket took them over, and this is the test that pinned that
 /// behaviour, rewritten to the one that holds now.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_avatar_upload_rides_along_with_the_text_fields(pool: PgPool) {
+#[tokio::test]
+async fn an_avatar_upload_rides_along_with_the_text_fields() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let body = ok_body(
@@ -822,8 +875,10 @@ async fn an_avatar_upload_rides_along_with_the_text_fields(pool: PgPool) {
 
 /// A file part under a field this endpoint does not read is still ignored,
 /// and stores nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_file_part_under_another_name_is_ignored(pool: PgPool) {
+#[tokio::test]
+async fn a_file_part_under_another_name_is_ignored() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, _) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let body = ok_body(
@@ -855,26 +910,22 @@ fn field(name: &str, value: &str) -> Value {
     json!({"name": name, "value": value, "verified_at": null})
 }
 
-/// `fields_attributes` updates through every body shape: the JSON array,
-/// the JSON object keyed by index, and the `fields_attributes[0][name]`
-/// spelling of form and multipart bodies. Each round answers the top-level
-/// `fields` with the rendered HTML and `source.fields` with the raw text,
-/// and stores the pair of jsonb columns.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn fields_attributes_update_through_every_body_shape(pool: PgPool) {
-    let (app, token, alice) = authed_app(&pool, "alice").await;
+/// `fields_attributes` updates through the JSON array, the JSON object keyed
+/// by index, and the `fields_attributes[0][name]` spelling of a form body.
+/// Each round answers the top-level `fields` with the rendered HTML and
+/// `source.fields` with the raw text; `fields_attributes_arrive_through_multipart`
+/// covers the multipart spelling and the pair of jsonb columns left behind.
+#[tokio::test]
+async fn fields_attributes_update_through_every_body_shape() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, token, _alice) = authed_app(&pool, "alice").await;
 
-    let via_json = ok_body(
-        &patch_json(
-            &app,
-            &token,
-            &json!({"fields_attributes": [
-                {"name": "Site", "value": "https://example.com/a"},
-                {"name": "Motto", "value": "beep boop"},
-            ]}),
-        )
-        .await,
-    );
+    let section = json!({"fields_attributes": [
+        {"name": "Site", "value": "https://example.com/a"},
+        {"name": "Motto", "value": "beep boop"},
+    ]});
+    let via_json = ok_body(&patch_json(&app, &token, &section).await);
     assert_eq!(
         via_json["fields"],
         json!([
@@ -944,6 +995,15 @@ async fn fields_attributes_update_through_every_body_shape(pool: PgPool) {
         ]),
         "and the raw text round-trips the same"
     );
+}
+
+/// The multipart spelling of the same write, and the pair of jsonb columns it
+/// leaves behind: `fields` rendered, `raw_fields` verbatim.
+#[tokio::test]
+async fn fields_attributes_arrive_through_multipart() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let via_multipart = ok_body(
         &patch_multipart(
@@ -979,8 +1039,10 @@ async fn fields_attributes_update_through_every_body_shape(pool: PgPool) {
 /// while `raw_fields` keeps the spelling as typed, and `source.fields`
 /// round-trips that raw spelling so the client's textarea sees what it
 /// wrote.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn field_names_are_stored_as_plain_text(pool: PgPool) {
+#[tokio::test]
+async fn field_names_are_stored_as_plain_text() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let body = ok_body(
         &patch_json(
@@ -1011,8 +1073,10 @@ async fn field_names_are_stored_as_plain_text(pool: PgPool) {
 /// fifth is the 422 "Too many fields" that writes nothing, entries dropped
 /// as empty do not count toward the cap, and the cap moves with the
 /// configuration.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn too_many_fields_is_422(pool: PgPool) {
+#[tokio::test]
+async fn too_many_fields_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let fourth = ok_body(
@@ -1088,6 +1152,14 @@ async fn too_many_fields_is_422(pool: PgPool) {
         Some(4),
         "dropped empties do not count toward the cap"
     );
+}
+
+/// The cap is a setting: `MAX_PROFILE_FIELDS` moves it, and a body over the
+/// smaller cap is the same 422 that writes nothing.
+#[tokio::test]
+async fn the_field_cap_follows_the_configuration() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
 
     let mut config = common::test_config();
     config.max_profile_fields = 2;
@@ -1119,8 +1191,10 @@ async fn too_many_fields_is_422(pool: PgPool) {
 /// A field name over 255 characters and a field value over 2047 are the
 /// 422s, counted in characters not bytes; exactly the maxima fit, and a
 /// refused body writes nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn field_name_and_value_length_limits_are_422(pool: PgPool) {
+#[tokio::test]
+async fn field_name_and_value_length_limits_are_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let long_name = patch_json(
@@ -1187,8 +1261,10 @@ async fn field_name_and_value_length_limits_are_422(pool: PgPool) {
 /// An empty `fields_attributes` — the JSON array and the form index map
 /// alike — clears every stored field from both columns and both renders;
 /// its absence leaves them alone.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn empty_fields_attributes_clears_the_metadata(pool: PgPool) {
+#[tokio::test]
+async fn empty_fields_attributes_clears_the_metadata() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let filled = ok_body(
         &patch_json(
@@ -1245,8 +1321,10 @@ async fn empty_fields_attributes_clears_the_metadata(pool: PgPool) {
 /// An entry whose name and value are both empty is dropped rather than
 /// stored; one with only a name or only a value is kept, so a form that
 /// half-fills a row still writes it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn entries_with_both_empty_name_and_value_are_dropped(pool: PgPool) {
+#[tokio::test]
+async fn entries_with_both_empty_name_and_value_are_dropped() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let body = ok_body(
         &patch_json(
@@ -1295,8 +1373,10 @@ async fn entries_with_both_empty_name_and_value_are_dropped(pool: PgPool) {
 
 /// An all-empty submission drops to nothing, which is the clear: the
 /// stored metadata is replaced by the empty pair, not left behind.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_all_empty_submission_clears_like_the_empty_array(pool: PgPool) {
+#[tokio::test]
+async fn an_all_empty_submission_clears_like_the_empty_array() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let filled = ok_body(
         &patch_json(
@@ -1458,8 +1538,10 @@ fn assert_422(response: &common::TestResponse, message: &str, why: &str) {
 /// holds the public URL of its own stored file, the entity renders them in
 /// `avatar`, `header` and `pleroma.background_image`, and `/media` serves
 /// every one of them with the bytes as sent.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_three_profile_images_upload_and_are_served(pool: PgPool) {
+#[tokio::test]
+async fn the_three_profile_images_upload_and_are_served() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let body = ok_body(
@@ -1520,8 +1602,10 @@ async fn the_three_profile_images_upload_and_are_served(pool: PgPool) {
 
 /// `webp` is the fourth accepted image type, and the endpoint accepts it for
 /// the avatar: the stored key carries the extension the detected type gives.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_webp_avatar_uploads_like_the_others(pool: PgPool) {
+#[tokio::test]
+async fn a_webp_avatar_uploads_like_the_others() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let body = ok_body(&upload(&app, &token, "avatar", WEBP).await);
@@ -1537,8 +1621,10 @@ async fn a_webp_avatar_uploads_like_the_others(pool: PgPool) {
 
 /// A replacement stores a new key and removes the file the column named
 /// before it; the other two images are untouched, file and all.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn replacing_an_image_deletes_the_previous_file(pool: PgPool) {
+#[tokio::test]
+async fn replacing_an_image_deletes_the_previous_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let first = url_of(&ok_body(&upload(&app, &token, "avatar", PNG).await)["avatar"]);
@@ -1564,8 +1650,10 @@ async fn replacing_an_image_deletes_the_previous_file(pool: PgPool) {
 /// default again, and remove the file the column had named: the empty
 /// string through a form and a multipart text part, the `null` through
 /// JSON.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn clearing_an_image_resets_the_entity_and_deletes_the_file(pool: PgPool) {
+#[tokio::test]
+async fn clearing_an_image_resets_the_entity_and_deletes_the_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let avatar = url_of(&ok_body(&upload(&app, &token, "avatar", PNG).await)["avatar"]);
@@ -1616,8 +1704,10 @@ async fn clearing_an_image_resets_the_entity_and_deletes_the_file(pool: PgPool) 
 
 /// Clearing an image that was never set is the accepted no-op, not an
 /// error, and it leaves a stored image of another slot alone.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn clearing_an_unset_image_changes_nothing(pool: PgPool) {
+#[tokio::test]
+async fn clearing_an_unset_image_changes_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, _) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let header = url_of(&ok_body(&upload(&app, &token, "header", JPEG).await)["header"]);
@@ -1633,8 +1723,10 @@ async fn clearing_an_unset_image_changes_nothing(pool: PgPool) {
 /// The two byte caps: the avatar is measured by `AVATAR_LIMIT_BYTES`, the
 /// banner and the background by `BANNER_LIMIT_BYTES`, and passing either is
 /// the 422 "File is too large" that stores nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_oversize_profile_image_is_the_422(pool: PgPool) {
+#[tokio::test]
+async fn an_oversize_profile_image_is_the_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let alice = common::create_local_user(&pool, "alice").await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
@@ -1691,8 +1783,10 @@ async fn an_oversize_profile_image_is_the_422(pool: PgPool) {
 /// The type allowlist: a `BMP` and a `PDF` are both bytes a matcher names and
 /// neither is a profile image, so both are the 422 "Unsupported file type"
 /// that stores nothing.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_wrong_image_type_is_the_422(pool: PgPool) {
+#[tokio::test]
+async fn a_wrong_image_type_is_the_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     for bytes in [BMP, PDF] {
@@ -1739,8 +1833,10 @@ fn hex_head(bytes: &[u8]) -> String {
 /// Non-image bytes under an `image/png` part header: the claim is what the
 /// client says, the answer is what the bytes are, so this is the same 422 as
 /// any other non-image — and an empty part with it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn non_image_bytes_with_an_image_content_type_are_the_422(pool: PgPool) {
+#[tokio::test]
+async fn non_image_bytes_with_an_image_content_type_are_the_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, _) = authed_app_with_uploads(&pool, "alice", &dir).await;
     for bytes in [TEXT, PDF, b""] {
@@ -1761,8 +1857,10 @@ async fn non_image_bytes_with_an_image_content_type_are_the_422(pool: PgPool) {
 /// One bad image in a body with a good one refuses the whole request: every
 /// slot is checked before any file is stored, so the good avatar never
 /// reaches disk and the row never moves.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_body_with_one_bad_image_stores_nothing(pool: PgPool) {
+#[tokio::test]
+async fn a_body_with_one_bad_image_stores_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let response = patch_multipart(
@@ -1792,8 +1890,10 @@ async fn a_body_with_one_bad_image_stores_nothing(pool: PgPool) {
 
 /// The image slots are absent from a text-only body, so an account with a
 /// stored avatar keeps it (and its file) through a name or note update.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_text_update_leaves_a_stored_image_alone(pool: PgPool) {
+#[tokio::test]
+async fn a_text_update_leaves_a_stored_image_alone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (app, token, alice) = authed_app_with_uploads(&pool, "alice", &dir).await;
     let avatar = url_of(&ok_body(&upload(&app, &token, "avatar", PNG).await)["avatar"]);
@@ -1869,8 +1969,10 @@ fn stored_flag(row: &User, field: &str) -> bool {
 /// endpoint takes it in — the nested JSON object, the bracketed form key and
 /// Pleroma's flat `default_scope` — with the block winning over the flat
 /// name, as `AccountController.update_credentials` applies them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn source_privacy_updates_the_posting_default(pool: PgPool) {
+#[tokio::test]
+async fn source_privacy_updates_the_posting_default() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let via_json =
@@ -1917,8 +2019,10 @@ async fn source_privacy_updates_the_posting_default(pool: PgPool) {
 
 /// A privacy outside the four visibilities is the 422, in either spelling,
 /// and the refused body writes nothing at all.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unknown_privacy_is_422(pool: PgPool) {
+#[tokio::test]
+async fn an_unknown_privacy_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     for body in [
         json!({"source": {"privacy": "internal"}}),
@@ -1956,8 +2060,10 @@ async fn an_unknown_privacy_is_422(pool: PgPool) {
 
 /// `source[sensitive]` writes the sensitive posting default through every
 /// body type, flex booleans and all, and never moves its sibling.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn source_sensitive_updates_the_sensitive_default(pool: PgPool) {
+#[tokio::test]
+async fn source_sensitive_updates_the_sensitive_default() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let via_json =
@@ -2007,8 +2113,10 @@ async fn source_sensitive_updates_the_sensitive_default(pool: PgPool) {
 
 /// `source[language]` writes the language posting default, the empty string
 /// clears it back to `null`, and a tag over the ten-character cap is the 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn source_language_is_capped_and_the_empty_tag_clears(pool: PgPool) {
+#[tokio::test]
+async fn source_language_is_capped_and_the_empty_tag_clears() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let via_json =
@@ -2068,8 +2176,10 @@ async fn source_language_is_capped_and_the_empty_tag_clears(pool: PgPool) {
 /// Each of the eleven preference flags updates on its own, through JSON,
 /// form and multipart bodies, reaching the entity wherever Pleroma renders
 /// that key and never moving any of the other ten.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn each_pleroma_flag_updates_on_its_own(pool: PgPool) {
+#[tokio::test]
+async fn each_pleroma_flag_updates_on_its_own() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let initial = ok_body(&patch_json(&app, &token, &json!({"display_name": "Ada"})).await);
     let mut expect = json!({});
@@ -2129,8 +2239,10 @@ fn assert_pref_flags(body: &Value, expect: &Value, why: &str) {
 /// `birthday` is stored from a JSON body and a form alike, the empty string
 /// clears the column, and the answer renders the date back in the owner's
 /// `pleroma` block.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn birthday_updates_and_the_empty_string_clears_it(pool: PgPool) {
+#[tokio::test]
+async fn birthday_updates_and_the_empty_string_clears_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let via_json = ok_body(&patch_json(&app, &token, &json!({"birthday": "1990-01-31"})).await);
@@ -2181,8 +2293,10 @@ async fn birthday_updates_and_the_empty_string_clears_it(pool: PgPool) {
 
 /// A birthday that is not `YYYY-MM-DD` text or one after today is the 422,
 /// and neither writes anything.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_invalid_or_future_birthday_is_422(pool: PgPool) {
+#[tokio::test]
+async fn an_invalid_or_future_birthday_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let stored_date = ok_body(&patch_json(&app, &token, &json!({"birthday": "1990-01-31"})).await);
     assert_eq!(
@@ -2240,8 +2354,10 @@ async fn an_invalid_or_future_birthday_is_422(pool: PgPool) {
 /// `pleroma_settings_store` merges into the stored blob key by key: a
 /// submitted key wins, an untouched key stays, a nested object is replaced
 /// whole, and the owner's `pleroma.settings_store` answers the result.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_settings_store_merges_key_by_key(pool: PgPool) {
+#[tokio::test]
+async fn the_settings_store_merges_key_by_key() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.settings_store = json!({"theme": "dark", "locale": "pt", "fe": {"a": 1, "b": 2}});
         new
@@ -2304,8 +2420,10 @@ async fn the_settings_store_merges_key_by_key(pool: PgPool) {
 /// A form body carries `pleroma_settings_store` as JSON *text*; so does a
 /// multipart text part. Both parse into the object they name and merge like
 /// the JSON spelling.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_form_settings_store_arrives_as_json_text(pool: PgPool) {
+#[tokio::test]
+async fn a_form_settings_store_arrives_as_json_text() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let patch = r#"{"theme": "light", "fe": {"v": 1}}"#;
 
@@ -2347,8 +2465,10 @@ async fn a_form_settings_store_arrives_as_json_text(pool: PgPool) {
 
 /// A settings store that is no object, and a merged blob past 1 MiB, are both
 /// the 422 with nothing written.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_bad_or_oversize_settings_store_is_422(pool: PgPool) {
+#[tokio::test]
+async fn a_bad_or_oversize_settings_store_is_422() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.settings_store = json!({"theme": "dark"});
         new
@@ -2400,8 +2520,10 @@ async fn a_bad_or_oversize_settings_store_is_422(pool: PgPool) {
 /// `actor_type` and `bot` are one pair: the stated kind decides the flag, the
 /// flag picks the kind when no kind is stated, and a kind outside `Person`
 /// and `Service` is the 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn actor_type_and_bot_are_written_as_one_pair(pool: PgPool) {
+#[tokio::test]
+async fn actor_type_and_bot_are_written_as_one_pair() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
 
     let service = ok_body(&patch_json(&app, &token, &json!({"actor_type": "Service"})).await);
@@ -2468,8 +2590,10 @@ async fn actor_type_and_bot_are_written_as_one_pair(pool: PgPool) {
 /// The new parameters are the owner's own settings: the answer carries them
 /// in the `source` block and the `pleroma` block, and a stranger's `show`
 /// view keeps Pleroma's restricted render of the same row.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_response_reflects_every_new_value(pool: PgPool) {
+#[tokio::test]
+async fn the_response_reflects_every_new_value() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (app, token, alice) = authed_app(&pool, "alice").await;
     let body = ok_body(
         &patch_json(

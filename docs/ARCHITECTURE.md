@@ -65,11 +65,16 @@ cite these decisions by number.
     table.
 
 13. **Tests**: unit tests at the bottom of the file. HTTP tests live in
-    `tests/<area>.rs` and use `tests/common/mod.rs` helpers with `#[sqlx::test]`
-    (each test gets a fresh migrated DB; it reads `DATABASE_URL` but never
-    mutates the environment) and `tower::ServiceExt::oneshot`. Every endpoint
-    needs: success, auth failure (401/403), not found (404), validation error
-    (422), pagination where applicable.
+    `tests/<area>.rs` and use `tests/common/mod.rs` helpers with the pooled
+    test-database fixture in `src/test_db.rs` (`common::test_db()` hands out a
+    slot; it reads `DATABASE_URL` but never mutates the environment) and
+    `tower::ServiceExt::oneshot`. The fixture replaced `#[sqlx::test]`, which
+    created, migrated and dropped a database per test behind one global lock:
+    it migrates one template per fingerprint of the migration set, copies it
+    per slot, leases a slot with a session advisory lock and empties it with
+    `TRUNCATE` on the way out. Every endpoint needs: success, auth failure
+    (401/403), not found (404), validation error (422), pagination where
+    applicable.
 
 14. **Clippy realities** (pedantic+nursery+selected restriction, all denied):
     every item needs `///` docs (also private ones, struct fields, enum
@@ -100,9 +105,11 @@ cite these decisions by number.
 enabled by the `integration-tests` cargo feature (a self dev-dependency
 turns it on for `tests/` only; it is not named `test-support` because the
 denied `redundant_feature_names` lint rejects the `-support` suffix) and
-provides `test_config()` (wraps `Config::for_tests()`), `test_app(pool)`,
-the `TestRequest` verb/body builders, and `TestResponse`. The shape every
-endpoint test takes (`tests/health.rs` is the reference):
+provides `test_config()` (wraps `Config::for_tests()`), `test_db()` (a slot of
+the fixture in `src/test_db.rs`), `test_app(pool)`, the `TestRequest`
+verb/body builders, `TestResponse` and the `assert_answer`/`assert_error`
+gate helpers. The shape every endpoint test takes (`tests/health.rs` is the
+reference):
 
 ```rust
 #![cfg(test)]
@@ -110,11 +117,12 @@ endpoint test takes (`tests/health.rs` is the reference):
 pub mod common;
 
 use axum::http::StatusCode;
-use sqlx::PgPool;
 
 /// `/health` answers 204 No Content with an empty body.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn health_returns_no_content(pool: PgPool) {
+#[tokio::test]
+async fn health_returns_no_content() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/health")
         .bearer("tok3n") // optional: .json(&v), .form(&[(k, v)]), .header(k, v)
@@ -138,8 +146,11 @@ Rules that fall out of the lint gate (all verified against `scripts/ci.sh`):
   only combination that passes — and the `cfg(test)` gate is what lets
   Clippy's `allow-unwrap-in-tests` family apply at all (integration crates
   do not get that exemption by virtue of living under `tests/`).
-- `#[sqlx::test(migrator = "wired_be::MIGRATOR")]` gives the test a fresh
-  migrated database and its `PgPool`.
+- `common::test_db().await` leases a migrated, emptied slot database and hands
+  back a `TestDb`; `db.pool()` is the `PgPool` to build the router on. Keep the
+  `TestDb` binding alive for the whole test — dropping it releases the slot.
+  In `src/`, the same fixture is `crate::test_db::test_db().await`, whose
+  `Result` a test unwraps with `.expect("test database slot")`.
 - `TestResponse` has `status`, `headers` and `body` fields, plus
   `.json::<T>()`, `.json_value()`, `.text()` and `.header(name)`.
 - Every added code path needs coverage, including the harness itself:

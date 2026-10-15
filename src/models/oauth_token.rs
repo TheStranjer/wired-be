@@ -702,8 +702,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_token_round_trips_and_validates(pool: PgPool) {
+    #[tokio::test]
+    async fn create_token_round_trips_and_validates() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert_user(&pool, "alice").await;
         let app = insert_app(&pool, "Client").await;
         let token = create_token(
@@ -769,8 +771,10 @@ mod tests {
         assert_eq!(listed.first().map(|t| t.id), Some(token.id), "same row");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn custom_ttl_is_applied(pool: PgPool) {
+    #[tokio::test]
+    async fn custom_ttl_is_applied() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let app = insert_app(&pool, "Dial-Down").await;
         let token = create_token(
             &pool,
@@ -791,8 +795,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn app_only_tokens_validate_without_a_user(pool: PgPool) {
+    #[tokio::test]
+    async fn app_only_tokens_validate_without_a_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let app = insert_app(&pool, "Machine").await;
         let token = create_token(&pool, &new_token(None, app.id)).await.unwrap();
         let (found, user) = get_valid_token(&pool, &token.token)
@@ -808,8 +814,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn expired_tokens_are_not_returned(pool: PgPool) {
+    #[tokio::test]
+    async fn expired_tokens_are_not_returned() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert_user(&pool, "carol").await;
         let app = insert_app(&pool, "Stale").await;
         let token = create_token(&pool, &new_token(Some(alice.id), app.id))
@@ -832,8 +840,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deactivated_users_tokens_are_not_returned(pool: PgPool) {
+    #[tokio::test]
+    async fn deactivated_users_tokens_are_not_returned() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dave = insert_user(&pool, "dave").await;
         let app = insert_app(&pool, "Suspension").await;
         let token = create_token(&pool, &new_token(Some(dave.id), app.id))
@@ -856,8 +866,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_with_app_returns_the_stored_rows_verbatim(pool: PgPool) {
+    #[tokio::test]
+    async fn get_with_app_returns_the_stored_rows_verbatim() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let nina = insert_user(&pool, "nina").await;
         let app = insert_app(&pool, "Bearer").await;
         let token = create_token(
@@ -920,8 +932,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_with_app_applies_no_validity_filter(pool: PgPool) {
+    #[tokio::test]
+    async fn get_with_app_applies_no_validity_filter() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let oscar = insert_user(&pool, "oscar").await;
         let app = insert_app(&pool, "Unfiltered").await;
         let token = create_token(&pool, &new_token(Some(oscar.id), app.id))
@@ -950,8 +964,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unknown_credentials_are_none(pool: PgPool) {
+    #[tokio::test]
+    async fn unknown_credentials_are_none() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             get_valid_token(&pool, "no-such-token")
                 .await
@@ -977,8 +993,10 @@ mod tests {
         delete_token(&pool, new_id()).await.unwrap();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_token_removes_the_row(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_token_removes_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let erin = insert_user(&pool, "erin").await;
         let app = insert_app(&pool, "Revoke").await;
         let token = create_token(&pool, &new_token(Some(erin.id), app.id))
@@ -995,8 +1013,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_expired_sweeps_only_expired_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_expired_sweeps_only_expired_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let frank = insert_user(&pool, "frank").await;
         let app = insert_app(&pool, "Janitor").await;
         let stale = create_token(&pool, &new_token(Some(frank.id), app.id))
@@ -1031,8 +1051,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_for_user_only_shows_that_users_tokens(pool: PgPool) {
+    #[tokio::test]
+    async fn list_for_user_only_shows_that_users_tokens() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let grace = insert_user(&pool, "grace").await;
         let heidi = insert_user(&pool, "heidi").await;
         let app = insert_app(&pool, "Listed").await;
@@ -1068,8 +1090,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_a_user_cascades_to_tokens_and_codes(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_a_user_cascades_to_tokens_and_codes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let ivan = insert_user(&pool, "ivan").await;
         let app = insert_app(&pool, "Cascade").await;
         let token = create_token(&pool, &new_token(Some(ivan.id), app.id))
@@ -1098,8 +1122,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn authorization_codes_are_one_time(pool: PgPool) {
+    #[tokio::test]
+    async fn authorization_codes_are_one_time() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let judy = insert_user(&pool, "judy").await;
         let app = insert_app(&pool, "Redeem").await;
         let authorization = create_authorization(&pool, judy.id, app.id, "read write")
@@ -1140,8 +1166,10 @@ mod tests {
         assert!(again.is_none(), "a code cannot be spent twice");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_wrong_app_cannot_consume_a_code(pool: PgPool) {
+    #[tokio::test]
+    async fn the_wrong_app_cannot_consume_a_code() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let ken = insert_user(&pool, "ken").await;
         let app = insert_app(&pool, "Owner").await;
         let thief = insert_app(&pool, "Stranger").await;
@@ -1164,8 +1192,10 @@ mod tests {
         assert!(ok.is_some(), "the owning app still gets its code");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn expired_codes_are_not_consumed(pool: PgPool) {
+    #[tokio::test]
+    async fn expired_codes_are_not_consumed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let luna = insert_user(&pool, "luna").await;
         let app = insert_app(&pool, "Timebox").await;
         let authorization = create_authorization(&pool, luna.id, app.id, "read")
@@ -1185,8 +1215,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn debug_redacts_tokens_and_codes(pool: PgPool) {
+    #[tokio::test]
+    async fn debug_redacts_tokens_and_codes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mia = insert_user(&pool, "mia").await;
         let app = insert_app(&pool, "Loose-Lips").await;
         let token = create_token(&pool, &new_token(Some(mia.id), app.id))
@@ -1226,8 +1258,10 @@ mod tests {
         assert!(auth_debug.contains("read"), "the rest shows");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_valid_with_app_names_skips_expired_and_sorts_newest_first(pool: PgPool) {
+    #[tokio::test]
+    async fn list_valid_with_app_names_skips_expired_and_sorts_newest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let grace = insert_user(&pool, "grace").await;
         let heidi = insert_user(&pool, "heidi").await;
         let first_app = insert_app(&pool, "First App").await;
@@ -1280,8 +1314,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_for_user_only_removes_the_owners_row(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_for_user_only_removes_the_owners_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let grace = insert_user(&pool, "grace").await;
         let heidi = insert_user(&pool, "heidi").await;
         let app = insert_app(&pool, "Revoke").await;

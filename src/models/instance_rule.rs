@@ -145,16 +145,20 @@ mod tests {
     }
 
     /// [`list`] on a fresh table answers the empty list.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_of_an_empty_table_is_empty(pool: PgPool) {
+    #[tokio::test]
+    async fn list_of_an_empty_table_is_empty() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let rules = list(&pool).await.expect("the list query runs");
         assert!(rules.is_empty(), "a fresh table holds no rules");
     }
 
     /// [`create`] stores what it is handed, mints the id (decision 4) and
     /// returns the row with its database-stamped timestamps.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_returns_the_stored_row(pool: PgPool) {
+    #[tokio::test]
+    async fn create_returns_the_stored_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let rule = create(&pool, "Be nice", "say hi first", 3)
             .await
             .expect("the insert runs");
@@ -175,8 +179,10 @@ mod tests {
     /// The column defaults show through when a caller passes the empties:
     /// [`create`] is the only writer, so the defaults belong to rows that
     /// hand it `""` and `0`.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn empty_hint_and_zero_priority_store_cleanly(pool: PgPool) {
+    #[tokio::test]
+    async fn empty_hint_and_zero_priority_store_cleanly() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let rule = create(&pool, "No spam", "", 0)
             .await
             .expect("the insert runs");
@@ -186,8 +192,10 @@ mod tests {
 
     /// [`list`] orders by priority first and, within one priority, by
     /// creation order on the id (decision 4).
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_orders_by_priority_then_id(pool: PgPool) {
+    #[tokio::test]
+    async fn list_orders_by_priority_then_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let low = create(&pool, "first rule", "", 1)
             .await
             .expect("first rule inserts");
@@ -211,8 +219,10 @@ mod tests {
 
     /// [`update`] rewrites every content column of one rule, leaves the
     /// others alone and answers `None` for an id no rule carries.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn update_rewrites_one_rule_or_misses(pool: PgPool) {
+    #[tokio::test]
+    async fn update_rewrites_one_rule_or_misses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let kept = create(&pool, "keep me", "", 0)
             .await
             .expect("the kept rule inserts");
@@ -244,8 +254,10 @@ mod tests {
 
     /// [`delete`] removes exactly the named rule and reports the second
     /// attempt of the same id as a miss.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_removes_one_rule(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_removes_one_rule() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let doomed = create(&pool, "doomed", "", 0)
             .await
             .expect("the doomed rule inserts");

@@ -567,8 +567,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn nothing_recorded_answers_the_default_flags(pool: PgPool) {
+    #[tokio::test]
+    async fn nothing_recorded_answers_the_default_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
 
@@ -591,8 +593,10 @@ mod tests {
         assert_placeholder_flags(&relationship);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_accepted_follow_computes_following_and_the_toggles(pool: PgPool) {
+    #[tokio::test]
+    async fn an_accepted_follow_computes_following_and_the_toggles() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let granted = follow::follow(&pool, TEST_BASE_URL, &alice, &bob)
@@ -632,8 +636,10 @@ mod tests {
         assert_placeholder_flags(&toggled);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_pending_request_is_requested_but_not_following(pool: PgPool) {
+    #[tokio::test]
+    async fn a_pending_request_is_requested_but_not_following() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let carol = locked_user(&pool, "carol").await;
         let waiting = follow::follow(&pool, TEST_BASE_URL, &alice, &carol)
@@ -653,8 +659,10 @@ mod tests {
         assert_placeholder_flags(&relationship);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_accepted_incoming_follow_computes_followed_by(pool: PgPool) {
+    #[tokio::test]
+    async fn an_accepted_incoming_follow_computes_followed_by() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let incoming = follow::follow(&pool, TEST_BASE_URL, &bob, &alice)
@@ -684,8 +692,10 @@ mod tests {
         assert_placeholder_flags(&relationship);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_mutual_follow_computes_both_directions(pool: PgPool) {
+    #[tokio::test]
+    async fn a_mutual_follow_computes_both_directions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let outgoing = follow::follow(&pool, TEST_BASE_URL, &alice, &bob)
@@ -719,8 +729,10 @@ mod tests {
         assert_placeholder_flags(&relationship);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn rejected_rows_compute_no_following_flags(pool: PgPool) {
+    #[tokio::test]
+    async fn rejected_rows_compute_no_following_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         rejected_relation(&pool, &alice, &bob).await;
@@ -743,8 +755,10 @@ mod tests {
         assert_placeholder_flags(&relationship);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_stored_note_rides_the_relationship(pool: PgPool) {
+    #[tokio::test]
+    async fn a_stored_note_rides_the_relationship() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -780,8 +794,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_cleared_note_leaves_the_relationship(pool: PgPool) {
+    #[tokio::test]
+    async fn a_cleared_note_leaves_the_relationship() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         account_note::set(&pool, alice.id, bob.id, "here for a while")
@@ -807,8 +823,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn results_keep_the_requested_order_in_one_query_set(pool: PgPool) {
+    #[tokio::test]
+    async fn results_keep_the_requested_order_in_one_query_set() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = locked_user(&pool, "carol").await;
@@ -857,15 +875,19 @@ mod tests {
         assert_eq!(flags(unknown), (false, false, false), "an unknown target");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_empty_batch_touches_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn an_empty_batch_touches_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let loaded = Relationship::load_many(&pool, alice.id, &[]).await.unwrap();
         assert!(loaded.is_empty(), "no targets, no relationships");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_remote_target_on_a_blocked_domain_is_domain_blocking(pool: PgPool) {
+    #[tokio::test]
+    async fn a_remote_target_on_a_blocked_domain_is_domain_blocking() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = remote_user(&pool, "bob", "spam.example").await;
         let carol = remote_user(&pool, "carol", "other.example").await;
@@ -899,8 +921,10 @@ mod tests {
         assert!(!after.domain_blocking.0, "lifting the block lifts the flag");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn local_accounts_are_never_domain_blocking(pool: PgPool) {
+    #[tokio::test]
+    async fn local_accounts_are_never_domain_blocking() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         // Block this very instance's domain: even a "blocked" host cannot
@@ -917,8 +941,10 @@ mod tests {
         assert_placeholder_flags(&relationship);
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_endorsement_lights_the_endorsed_flag(pool: PgPool) {
+    #[tokio::test]
+    async fn an_endorsement_lights_the_endorsed_flag() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -996,8 +1022,10 @@ mod tests {
     /// lights `blocked_by`, a pair blocked both ways lights both, and a
     /// target with no block either way keeps both defaults — as does every
     /// account once its block is lifted.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn blocks_light_blocking_and_blocked_by(pool: PgPool) {
+    #[tokio::test]
+    async fn blocks_light_blocking_and_blocked_by() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;
@@ -1114,8 +1142,10 @@ mod tests {
     /// lights `muting`, the same mute with notifications hidden lights both, a
     /// lapsed mute lights neither, and a target nobody muted keeps both
     /// defaults — as does every account once its mute is lifted.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn mutes_light_muting_and_muting_notifications(pool: PgPool) {
+    #[tokio::test]
+    async fn mutes_light_muting_and_muting_notifications() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
         let carol = local_user(&pool, "carol").await;

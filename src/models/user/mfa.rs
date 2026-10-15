@@ -339,8 +339,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn new_rows_carry_the_migration_default(pool: PgPool) {
+    #[tokio::test]
+    async fn new_rows_carry_the_migration_default() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let user = insert(&pool, &NewUser::local("erin", &local_ap_id(BASE, "erin")))
             .await
             .unwrap();
@@ -356,8 +358,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn save_round_trips_through_the_column(pool: PgPool) {
+    #[tokio::test]
+    async fn save_round_trips_through_the_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let user = insert(&pool, &NewUser::local("fern", &local_ap_id(BASE, "fern")))
             .await
             .unwrap();

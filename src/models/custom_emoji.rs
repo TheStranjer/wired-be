@@ -322,8 +322,10 @@ mod tests {
         rows.iter().map(|row| row.shortcode.as_str()).collect()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_round_trips_every_column(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_round_trips_every_column() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let stored = upsert(
             &pool,
             &NewCustomEmoji {
@@ -364,8 +366,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_defaults_match_the_column_defaults(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_defaults_match_the_column_defaults() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let stored = upsert(
             &pool,
             &NewCustomEmoji::local("blob", &format!("{BASE}/e/blob.png")),
@@ -380,8 +384,10 @@ mod tests {
         assert!(!stored.disabled, "fresh emojis are enabled");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn upsert_is_idempotent_and_updates_in_place(pool: PgPool) {
+    #[tokio::test]
+    async fn upsert_is_idempotent_and_updates_in_place() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let first = upsert(&pool, &local_emoji("cat", Some("cats")))
             .await
             .unwrap();
@@ -425,8 +431,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_same_shortcode_coexists_across_domains(pool: PgPool) {
+    #[tokio::test]
+    async fn the_same_shortcode_coexists_across_domains() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let mine = upsert(&pool, &local_emoji("cat", None)).await.unwrap();
         let theirs = upsert(
             &pool,
@@ -467,8 +475,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_local_serves_enabled_local_emojis_ordered(pool: PgPool) {
+    #[tokio::test]
+    async fn list_local_serves_enabled_local_emojis_ordered() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         seed(&pool, &local_emoji("uncategorised", None)).await;
         seed(&pool, &local_emoji("zebra", Some("animals"))).await;
         seed(&pool, &local_emoji("aardvark", Some("animals"))).await;
@@ -497,16 +507,20 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn list_local_of_an_empty_table_is_empty(pool: PgPool) {
+    #[tokio::test]
+    async fn list_local_of_an_empty_table_is_empty() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             list_local(&pool).await.unwrap().is_empty(),
             "no rows, no emojis"
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_by_shortcodes_selects_domain_and_skips_misses(pool: PgPool) {
+    #[tokio::test]
+    async fn get_by_shortcodes_selects_domain_and_skips_misses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         seed(&pool, &local_emoji("cat", None)).await;
         seed(&pool, &local_emoji("dog", Some("pets"))).await;
         seed(
@@ -561,8 +575,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_removes_one_domain_row_once(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_removes_one_domain_row_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         seed(&pool, &local_emoji("cat", None)).await;
         seed(
             &pool,
@@ -598,8 +614,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_local_under_sweeps_only_prefix_local_rows(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_local_under_sweeps_only_prefix_local_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let prefix = format!("{BASE}/emoji/");
         seed(
             &pool,
@@ -648,8 +666,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_local_under_matches_prefix_bytes_literally(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_local_under_matches_prefix_bytes_literally() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         // The `_` in the prefix must match an underscore, not any character:
         // the underscored host goes, the look-alike without one stays.
         seed(

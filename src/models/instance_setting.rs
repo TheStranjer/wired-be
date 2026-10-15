@@ -61,11 +61,12 @@ pub async fn set(pool: &PgPool, key: &str, value: &Value) -> AppResult<()> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use sqlx::PgPool;
 
     /// [`get`] answers `None` for a key the table never held.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_of_unknown_key_is_none(pool: PgPool) {
+    #[tokio::test]
+    async fn get_of_unknown_key_is_none() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let value = get(&pool, "frontend_configurations")
             .await
             .expect("the lookup reaches the database");
@@ -74,8 +75,10 @@ mod tests {
 
     /// [`set`] then [`get`] round-trips a value, and a second [`set`]
     /// replaces it in place: one row per key, the last write's value.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_then_get_round_trips_and_overwrites(pool: PgPool) {
+    #[tokio::test]
+    async fn set_then_get_round_trips_and_overwrites() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         set(&pool, "frontend_configurations", &json!({"a": 1}))
             .await
             .expect("the first write inserts");
@@ -97,8 +100,10 @@ mod tests {
     }
 
     /// Keys are independent: writing one never touches another.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn keys_do_not_clobber_each_other(pool: PgPool) {
+    #[tokio::test]
+    async fn keys_do_not_clobber_each_other() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         set(&pool, "one", &json!(1))
             .await
             .expect("the first key writes");
@@ -117,8 +122,10 @@ mod tests {
 
     /// A write restamps `updated_at`: the column is the setting's own
     /// update time, not a fixed creation stamp.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn set_restamps_updated_at(pool: PgPool) {
+    #[tokio::test]
+    async fn set_restamps_updated_at() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         set(&pool, "when", &json!(true))
             .await
             .expect("the first write inserts");

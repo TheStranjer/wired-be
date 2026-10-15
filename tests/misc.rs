@@ -51,8 +51,10 @@ const NOT_FOUND_BODY: &str = r#"{"error":"Not found"}"#;
 
 /// With `MONGOOSEIM_ENABLED` unset (the default), both auth endpoints are
 /// the fallback 404, exact body included.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn mongooseim_endpoints_are_absent_when_disabled(pool: PgPool) {
+#[tokio::test]
+async fn mongooseim_endpoints_are_absent_when_disabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     for path in [
         "/user_exists?user=alice",
@@ -73,8 +75,10 @@ async fn mongooseim_endpoints_are_absent_when_disabled(pool: PgPool) {
 /// JSON `true`, and the citext nickname answers case-insensitively:
 /// create the fixture, then mount the enabled router, then ask both
 /// spellings.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn user_exists_round_trip(pool: PgPool) {
+#[tokio::test]
+async fn user_exists_round_trip() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _alice = common::create_local_user(&pool, "alice").await;
     let app = mongooseim_app(pool);
     for nickname in ["alice", "ALICE"] {
@@ -94,8 +98,10 @@ async fn user_exists_round_trip(pool: PgPool) {
 /// Everything that is not an active local user gets 404 with JSON
 /// `false`: an unknown nickname, a deactivated account, a remote mirror
 /// and a request without the `user` parameter.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn user_exists_false_cases(pool: PgPool) {
+#[tokio::test]
+async fn user_exists_false_cases() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _suspended = common::create_local_user_with(&pool, "suspended", |user| NewUser {
         is_active: Flag::new(false),
         ..user
@@ -120,8 +126,10 @@ async fn user_exists_false_cases(pool: PgPool) {
 
 /// `GET /check_password?user=<nick>&pass=<password>` answers the right
 /// credential for an active local user 200 with JSON `true`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn check_password_true_for_valid_credentials(pool: PgPool) {
+#[tokio::test]
+async fn check_password_true_for_valid_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _gina = common::create_user_with_password(&pool, "gina", "a good password").await;
     let app = mongooseim_app(pool);
     let response = common::TestRequest::get("/check_password?user=gina&pass=a%20good%20password")
@@ -142,8 +150,10 @@ async fn check_password_true_for_valid_credentials(pool: PgPool) {
 /// of the nickname (`MongooseIM` authenticates handles), and either
 /// parameter missing. The disabled branch is covered by
 /// [`mongooseim_endpoints_are_absent_when_disabled`].
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn check_password_denies_every_bad_credential(pool: PgPool) {
+#[tokio::test]
+async fn check_password_denies_every_bad_credential() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let _gina = common::create_user_with_password(&pool, "gina", "a good password").await;
     let _gone =
         common::create_deactivated_user_with_password(&pool, "gone", "still-my-password").await;
@@ -182,8 +192,10 @@ async fn check_password_denies_every_bad_credential(pool: PgPool) {
 
 /// With no captcha configured, `GET /api/v1/pleroma/captcha` answers
 /// exactly `{"type":"none"}`, Pleroma's provider-less document.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn captcha_reports_none_when_disabled(pool: PgPool) {
+#[tokio::test]
+async fn captcha_reports_none_when_disabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = captcha_app(pool, false);
     let response = common::TestRequest::get("/api/v1/pleroma/captcha")
         .send(&app)
@@ -199,8 +211,10 @@ async fn captcha_reports_none_when_disabled(pool: PgPool) {
 
 /// With `CAPTCHA_ENABLED` set, the endpoint says so: 501 with the
 /// standard error body (no captcha implementation exists to serve).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn captcha_is_not_implemented_when_enabled(pool: PgPool) {
+#[tokio::test]
+async fn captcha_is_not_implemented_when_enabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = captcha_app(pool, true);
     let response = common::TestRequest::get("/api/v1/pleroma/captcha")
         .send(&app)
@@ -222,8 +236,10 @@ async fn captcha_is_not_implemented_when_enabled(pool: PgPool) {
 /// With `HEALTHCHECK_ENABLED` unset, the endpoint is the fallback 404
 /// (Pleroma answers 503 "Healthcheck disabled"; the ticket routes it out
 /// of existence instead).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn healthcheck_is_absent_when_disabled(pool: PgPool) {
+#[tokio::test]
+async fn healthcheck_is_absent_when_disabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     // Contrast: an unrouted path under `/api` gets "Not implemented"…
     let typo = common::TestRequest::get("/api/v1/plerma-nothing")
@@ -247,11 +263,13 @@ async fn healthcheck_is_absent_when_disabled(pool: PgPool) {
     assert_eq!(response.text(), NOT_FOUND_BODY, "the fallback 404 body");
 }
 
-/// The enabled healthcheck over the live `#[sqlx::test]` pool answers 200
+/// The enabled healthcheck over the live leased slot answers 200
 /// with the ticket's five keys; the probe succeeded, so `healthy` is
 /// `true` and memory is the unreported `0.0`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn healthcheck_reports_a_healthy_database(pool: PgPool) {
+#[tokio::test]
+async fn healthcheck_reports_a_healthy_database() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = healthcheck_app(pool);
     let response = common::TestRequest::get("/api/v1/pleroma/healthcheck")
         .send(&app)
@@ -295,8 +313,10 @@ async fn healthcheck_reports_a_healthy_database(pool: PgPool) {
 /// The unhealthy path: close the pool underneath the router, and the
 /// `SELECT 1` probe fails, so the same body answers 503 with
 /// `healthy: false`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn healthcheck_is_unhealthy_over_a_closed_pool(pool: PgPool) {
+#[tokio::test]
+async fn healthcheck_is_unhealthy_over_a_closed_pool() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = healthcheck_app(pool.clone());
     pool.close().await;
     let response = common::TestRequest::get("/api/v1/pleroma/healthcheck")
@@ -319,8 +339,10 @@ async fn healthcheck_is_unhealthy_over_a_closed_pool(pool: PgPool) {
 
 /// `GET /api/pleroma/frontend_configurations` answers the empty object
 /// while no setting row exists.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn frontend_configurations_default_to_the_empty_object(pool: PgPool) {
+#[tokio::test]
+async fn frontend_configurations_default_to_the_empty_object() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/pleroma/frontend_configurations")
         .send(&app)
@@ -336,8 +358,10 @@ async fn frontend_configurations_default_to_the_empty_object(pool: PgPool) {
 
 /// The endpoint serves exactly the document stored under the
 /// `frontend_configurations` key.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn frontend_configurations_serves_the_stored_document(pool: PgPool) {
+#[tokio::test]
+async fn frontend_configurations_serves_the_stored_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let stored = json!({
         "mobile": {"features": {"notifications": true}},
         "enableReactions": ["😄"],
@@ -359,8 +383,10 @@ async fn frontend_configurations_serves_the_stored_document(pool: PgPool) {
 
 /// The exact manifest body for the default test configuration, content
 /// type included.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn manifest_is_the_ticket_document(pool: PgPool) {
+#[tokio::test]
+async fn manifest_is_the_ticket_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/manifest.json").send(&app).await;
     assert_eq!(response.status, StatusCode::OK, "manifest status");
@@ -378,8 +404,10 @@ async fn manifest_is_the_ticket_document(pool: PgPool) {
 
 /// The manifest's `name`, `short_name` and `description` follow the
 /// instance configuration.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn manifest_follows_the_instance_config(pool: PgPool) {
+#[tokio::test]
+async fn manifest_follows_the_instance_config() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let mut config = common::test_config();
     config.instance_name = "Snatter".to_owned();
     config.instance_description = "Where we all chatter".to_owned();

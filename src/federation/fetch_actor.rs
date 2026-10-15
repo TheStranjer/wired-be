@@ -1038,8 +1038,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn get_or_fetch_by_ap_id_inserts_then_serves_from_the_database(pool: PgPool) {
+    #[tokio::test]
+    async fn get_or_fetch_by_ap_id_inserts_then_serves_from_the_database() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1081,8 +1083,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_stale_mirror_is_refetched_and_updated(pool: PgPool) {
+    #[tokio::test]
+    async fn a_stale_mirror_is_refetched_and_updated() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1114,8 +1118,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_dead_peer_falls_back_to_the_stale_mirror(pool: PgPool) {
+    #[tokio::test]
+    async fn a_dead_peer_falls_back_to_the_stale_mirror() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let dead = format!("http://{}/users/alice", listener.local_addr().unwrap());
         drop(listener);
@@ -1131,8 +1137,10 @@ mod tests {
         assert_eq!(served.name, "First", "the failed refresh overwrote nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_gone_refresh_survives_the_stale_fallback(pool: PgPool) {
+    #[tokio::test]
+    async fn a_gone_refresh_survives_the_stale_fallback() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1162,8 +1170,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unknown_local_ap_id_is_not_found_without_network(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unknown_local_ap_id_is_not_found_without_network() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(pool);
         let ap_id = local_ap_id(TEST_BASE_URL, "nobody");
 
@@ -1175,8 +1185,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_local_row_answers_as_stored(pool: PgPool) {
+    #[tokio::test]
+    async fn a_local_row_answers_as_stored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(
             &pool,
             &NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice")),
@@ -1191,21 +1203,23 @@ mod tests {
         assert!(found.local.get(), "and it stays a local row");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_first_fetch_of_a_document_that_is_not_an_actor_is_invalid(pool: PgPool) {
-        /// The self-identifying document with the required username removed.
-        async fn not_an_actor(State(peer): State<Peer>) -> Response {
-            let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
-            let mut document = actor_document(&format!("{}/users/alice", peer.base));
-            drop(
-                document
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("preferredUsername"),
-            );
-            json_response(&document)
-        }
+    /// The self-identifying document with the required username removed.
+    async fn not_an_actor(State(peer): State<Peer>) -> Response {
+        let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
+        let mut document = actor_document(&format!("{}/users/alice", peer.base));
+        drop(
+            document
+                .as_object_mut()
+                .unwrap()
+                .remove("preferredUsername"),
+        );
+        json_response(&document)
+    }
 
+    #[tokio::test]
+    async fn a_first_fetch_of_a_document_that_is_not_an_actor_is_invalid() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1230,8 +1244,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_stored_nickname_answers_without_webfinger(pool: PgPool) {
+    #[tokio::test]
+    async fn a_stored_nickname_answers_without_webfinger() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let stored = insert(
             &pool,
             &NewUser {
@@ -1254,13 +1270,15 @@ mod tests {
         assert_eq!(found.id, stored.id, "the stored row, however spelled");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_actor_that_denies_the_requested_handle_is_rejected(pool: PgPool) {
-        /// The JRD pointing at this peer's actor path.
-        async fn webfinger(State(body): State<String>) -> Response {
-            ([(CONTENT_TYPE, "application/jrd+json")], body).into_response()
-        }
+    /// The JRD pointing at this peer's actor path.
+    async fn webfinger(State(body): State<String>) -> Response {
+        ([(CONTENT_TYPE, "application/jrd+json")], body).into_response()
+    }
 
+    #[tokio::test]
+    async fn an_actor_that_denies_the_requested_handle_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let peer = peer_at(&base);
@@ -1314,8 +1332,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn an_unresolvable_handle_reports_the_webfinger_error(pool: PgPool) {
+    #[tokio::test]
+    async fn an_unresolvable_handle_reports_the_webfinger_error() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(pool);
 
         let error = get_or_fetch_by_acct(&state, "alice@localhost")
@@ -1328,8 +1348,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn refresh_user_refetches_despite_a_fresh_mirror(pool: PgPool) {
+    #[tokio::test]
+    async fn refresh_user_refetches_despite_a_fresh_mirror() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let listener = bind().await;
         let base = origin(&listener);
         let ap_id = format!("{base}/users/alice");
@@ -1354,8 +1376,10 @@ mod tests {
         server.abort();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn refreshing_a_local_user_rereads_the_row(pool: PgPool) {
+    #[tokio::test]
+    async fn refreshing_a_local_user_rereads_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert(
             &pool,
             &NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice")),

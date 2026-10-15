@@ -136,8 +136,10 @@ async fn noted_relationship(app: &Router, token: &str, target: &Uuid) -> Value {
 
 /// Set, overwrite and clear: each write answers the relationship with the
 /// note it left stored, and the next read agrees.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_round_trips_set_overwrite_and_clear(pool: PgPool) {
+#[tokio::test]
+async fn note_round_trips_set_overwrite_and_clear() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     // `read write` so the same token can also read the relationship back
     // through `GET …/relationships` at the end.
     let (_alice, token) = fixture(&pool, "alice", "read write").await;
@@ -182,8 +184,10 @@ async fn note_round_trips_set_overwrite_and_clear(pool: PgPool) {
 /// A blank (all-whitespace) comment clears like the empty string, and an
 /// over-long comment is 422 — before the account lookup, and without
 /// touching the stored note. Exactly 2000 characters store.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn blank_clears_and_too_long_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn blank_clears_and_too_long_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let app = common::test_app(pool);
@@ -251,8 +255,10 @@ async fn blank_clears_and_too_long_is_unprocessable(pool: PgPool) {
 /// `GET /api/v1/accounts/{id}` embeds it in `pleroma.relationship`, and
 /// another user reading the same account sees the empty default — notes
 /// are per viewer.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn relationship_and_embed_show_the_note_per_viewer(pool: PgPool) {
+#[tokio::test]
+async fn relationship_and_embed_show_the_note_per_viewer() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, alice_token) = fixture(&pool, "alice", "read write").await;
     let (_carol, carol_token) = fixture(&pool, "carol", "read write").await;
     let bob = common::create_local_user(&pool, "bob").await;
@@ -286,8 +292,10 @@ async fn relationship_and_embed_show_the_note_per_viewer(pool: PgPool) {
 
 /// Noting yourself is allowed: the answered relationship is the default
 /// flags with the self-note on them.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_self_note_is_allowed(pool: PgPool) {
+#[tokio::test]
+async fn a_self_note_is_allowed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let app = common::test_app(pool);
 
@@ -302,8 +310,10 @@ async fn a_self_note_is_allowed(pool: PgPool) {
 
 /// An id that is malformed, unknown or a deactivated account is the 404
 /// every account route shares.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_requires_a_live_account(pool: PgPool) {
+#[tokio::test]
+async fn note_requires_a_live_account() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let ghost = common::create_deactivated_user_with_password(&pool, "ghost", "password123").await;
     let app = common::test_app(pool);
@@ -340,8 +350,10 @@ async fn note_requires_a_live_account(pool: PgPool) {
 
 /// The endpoint demands a user token: no token is the 401, an invalid one
 /// the 401, and an app-only credential the 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_requires_a_user_token(pool: PgPool) {
+#[tokio::test]
+async fn note_requires_a_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let app_only = common::create_app_only_token(&pool, "write:accounts").await;
     let app = common::test_app(pool);
@@ -376,8 +388,10 @@ async fn note_requires_a_user_token(pool: PgPool) {
 
 /// The scope gate is Pleroma's `write:accounts`: the root `write` and the
 /// exact sub-scope pass; anything else is the insufficient-permissions 403.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn note_requires_the_write_accounts_scope(pool: PgPool) {
+#[tokio::test]
+async fn note_requires_the_write_accounts_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let bob = common::create_local_user(&pool, "bob").await;
     let alice = common::create_local_user(&pool, "alice").await;
     let mut passing = Vec::new();

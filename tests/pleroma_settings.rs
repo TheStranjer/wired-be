@@ -133,8 +133,10 @@ fn storage_key(url: &str) -> String {
 /// An unknown `{app}` reads as `{}`, and the merge lifecycle — add,
 /// deep-merge, `null`-delete — round-trips through `GET` while a sibling
 /// app's settings are kept untouched and the whole store lands in jsonb.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn settings_merge_delete_and_read_back(pool: PgPool) {
+#[tokio::test]
+async fn settings_merge_delete_and_read_back() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app(pool.clone());
 
@@ -198,8 +200,10 @@ async fn settings_merge_delete_and_read_back(pool: PgPool) {
 /// A stored non-object under the app name reads (and merges) as `{}` —
 /// Pleroma's `ensure_object` — and a form-encoded patch body merges like
 /// the JSON one (decision 10).
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_scalar_app_setting_reads_empty_and_a_form_body_merges(pool: PgPool) {
+#[tokio::test]
+async fn a_scalar_app_setting_reads_empty_and_a_form_body_merges() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.settings_store = json!({"junk-app": 5});
         new
@@ -229,8 +233,10 @@ async fn a_scalar_app_setting_reads_empty_and_a_form_body_merges(pool: PgPool) {
 /// `{app}` must be 1 to 64 characters of `[A-Za-z0-9_.:-]`: a space, a
 /// 65th character, a star and non-ASCII are 422 `{"error":"Invalid app"}`
 /// on both verbs; the maximal legal name works.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_app_segment_is_limited_to_bare_short_names(pool: PgPool) {
+#[tokio::test]
+async fn the_app_segment_is_limited_to_bare_short_names() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app(pool.clone());
 
@@ -258,8 +264,10 @@ async fn the_app_segment_is_limited_to_bare_short_names(pool: PgPool) {
 /// that fits to the last byte succeeds, the one byte larger answers 422
 /// with the ticket's body and leaves the store as it was — and a second
 /// app cannot smuggle past a cap the first app already fills.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_settings_store_is_capped_at_one_mebibyte(pool: PgPool) {
+#[tokio::test]
+async fn the_settings_store_is_capped_at_one_mebibyte() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app(pool.clone());
     let fits = "x".repeat(MAX_STORE_BYTES - store_overhead());
@@ -303,8 +311,10 @@ async fn the_settings_store_is_capped_at_one_mebibyte(pool: PgPool) {
 /// A patch body that is not a JSON object is the extractor's 422, and a
 /// store that already holds a `mascot` key round-trips through a merge
 /// untouched.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_non_object_patch_body_is_unprocessable(pool: PgPool) {
+#[tokio::test]
+async fn a_non_object_patch_body_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |mut new| {
         new.settings_store = json!({"mascot": {"id": "m"}});
         new
@@ -336,8 +346,10 @@ async fn a_non_object_patch_body_is_unprocessable(pool: PgPool) {
 
 /// Without a stored mascot the answer is the instance default: Pleroma's
 /// tan fox, under `BASE_URL`.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_mascot_default_is_the_fox(pool: PgPool) {
+#[tokio::test]
+async fn the_mascot_default_is_the_fox() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let app = common::test_app(pool.clone());
 
@@ -353,8 +365,10 @@ async fn the_mascot_default_is_the_fox(pool: PgPool) {
 /// attachment entity (`id`, `url`, `type`, `pleroma.mime_type`), recorded
 /// under `settings_store["mascot"]` and comes back from `GET`; the bytes
 /// are readable at the URL the entity named.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn the_mascot_upload_round_trips(pool: PgPool) {
+#[tokio::test]
+async fn the_mascot_upload_round_trips() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, token) = fixture(&pool, "alice", "read write").await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -410,8 +424,10 @@ async fn the_mascot_upload_round_trips(pool: PgPool) {
 /// Bytes that are not an image — whatever `content-type` the part claims —
 /// are the 415 with the ticket's body, a file part without bytes included;
 /// no `file` part at all is a 422. Neither touches the stored mascot.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_mascot_can_only_be_an_image(pool: PgPool) {
+#[tokio::test]
+async fn a_mascot_can_only_be_an_image() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let dir = uploads_dir();
     let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
     let app = common::test_app_with_uploads_dir(pool.clone(), dir.path());
@@ -466,8 +482,10 @@ async fn a_mascot_can_only_be_an_image(pool: PgPool) {
 
 /// The available list is `AVAILABLE_FRONTENDS`: empty by default, and the
 /// configured names in configuration order.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn available_frontends_come_from_the_config(pool: PgPool) {
+#[tokio::test]
+async fn available_frontends_come_from_the_config() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let default_app = common::test_app(pool.clone());
     assert_eq!(
@@ -498,8 +516,10 @@ async fn available_frontends_come_from_the_config(pool: PgPool) {
 /// column, echoed back in the year-lived cookie and answered as
 /// `{"frontend_name": …}`; a later pick — sent as a form body, the other
 /// spelling decision 10 accepts — replaces it.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn a_preferred_frontend_pick_is_stored_and_cookied(pool: PgPool) {
+#[tokio::test]
+async fn a_preferred_frontend_pick_is_stored_and_cookied() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let mut config = common::test_config();
     config.available_frontends = vec![FRONTEND.to_owned(), SECOND_FRONTEND.to_owned()];
@@ -552,8 +572,10 @@ async fn a_preferred_frontend_pick_is_stored_and_cookied(pool: PgPool) {
 /// A name the operator did not make pickable — and any name at all on the
 /// default empty list — is 422 `{"error":"Invalid frontend"}` without a
 /// write; a body without `frontend_name` is the extractor's 422.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn an_unpickable_frontend_is_refused(pool: PgPool) {
+#[tokio::test]
+async fn an_unpickable_frontend_is_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let mut config = common::test_config();
     config.available_frontends = vec![FRONTEND.to_owned()];
@@ -604,8 +626,10 @@ async fn an_unpickable_frontend_is_refused(pool: PgPool) {
 /// `write:accounts` one; the preferred-frontend pair gates on the token
 /// alone. A narrower grant, an app-only credential or no credential never
 /// reaches the handlers.
-#[sqlx::test(migrator = "wired_be::MIGRATOR")]
-async fn every_route_enforces_auth_and_scope(pool: PgPool) {
+#[tokio::test]
+async fn every_route_enforces_auth_and_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
     let (alice, read_only) = fixture(&pool, "alice", "read:accounts").await;
     let write_only = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let wrong_scope = common::create_app_and_token(&pool, &alice, "read:chats").await;
