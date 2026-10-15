@@ -256,6 +256,29 @@ impl AuthUser {
     }
 }
 
+/// Resolves the raw bearer string `raw` into the credential behind it.
+///
+/// For the callers that read a token from somewhere a [`Parts`] cannot be
+/// built from: the streaming WebSocket takes it from its query string *or* the
+/// `Sec-WebSocket-Protocol` header, where the first protocol value is the
+/// token (Pleroma's `find_access_token`,
+/// `lib/pleroma/web/mastodon_api/websocket_handler.ex`), and rejects the
+/// upgrade with its own 401 instead of an extractor's rejection.
+///
+/// `None` is every credential the extractors refuse — no such row, past
+/// `valid_until`, a deactivated owner, or an app-only token that names no
+/// user to act as.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the two lookups `resolve` runs.
+pub async fn credential(state: &AppState, raw: &str) -> AppResult<Option<AuthContext>> {
+    match resolve(state, raw).await? {
+        Auth::Valid(ctx) if ctx.user.is_some() => Ok(Some(*ctx)),
+        Auth::Valid(_) | Auth::Deactivated | Auth::Invalid => Ok(None),
+    }
+}
+
 /// Checks that `token` grants the scope `needed` (see
 /// [`AuthUser::require`] for the hierarchy).
 ///
@@ -455,6 +478,124 @@ mod tests {
         MaybeAuthUser(None, Some(token_with("write")))
             .require_user_scope("read:accounts")
             .expect("an app-only token names no user, so the gate does not bind");
+    }
+
+    /// The [`AppState`] the credential lookups run on, over a slot's pool.
+    fn app_state(pool: &sqlx::PgPool) -> AppState {
+        use std::sync::Arc;
+
+        use crate::{config::Config, http_client::HttpClient, uploads::UploaderBackend};
+
+        let config = Arc::new(Config::for_tests());
+        AppState {
+            db: pool.clone(),
+            hub: crate::streaming::hub::Hub::new(pool),
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+        }
+    }
+
+    /// A fresh local user named `nickname`, active unless `active` says so.
+    async fn reader(pool: &sqlx::PgPool, nickname: &str, active: bool) -> User {
+        use crate::models::user::{Flag, NewUser, insert};
+
+        insert(
+            pool,
+            &NewUser {
+                is_active: Flag::new(active),
+                ..NewUser::local(nickname, &format!("https://test.example/users/{nickname}"))
+            },
+        )
+        .await
+        .expect("user fixture inserts")
+    }
+
+    /// A token minted by a fresh app for `owner` (`None` for an app-only
+    /// credential), with the default lifetime.
+    async fn token(pool: &sqlx::PgPool, owner: Option<&User>, scopes: &str) -> OauthToken {
+        use crate::models::{
+            oauth_app::{NewOauthApp, create as create_app},
+            oauth_token::{NewToken, create_token},
+        };
+
+        let app = create_app(
+            pool,
+            &NewOauthApp {
+                client_name: "Credential Client".to_owned(),
+                redirect_uris: "https://client.example/callback".to_owned(),
+                scopes: scopes.to_owned(),
+                website: None,
+                user_id: owner.map(|found| found.id),
+            },
+        )
+        .await
+        .expect("app fixture inserts");
+        create_token(
+            pool,
+            &NewToken {
+                user_id: owner.map(|found| found.id),
+                app_id: app.id,
+                scopes: scopes.to_owned(),
+                ttl: None,
+            },
+        )
+        .await
+        .expect("token fixture inserts")
+    }
+
+    /// Moves `token`'s row an hour into the past: the state a lapsed
+    /// credential has, which no lookup should honour.
+    async fn lapse(pool: &sqlx::PgPool, id: Uuid) {
+        let _lapsed = sqlx::query(
+            "UPDATE oauth_tokens SET valid_until = now() - interval '1 hour' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("the expiry update runs");
+    }
+
+    #[tokio::test]
+    async fn credential_resolves_a_live_user_token() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let app = app_state(db.pool());
+        let owner = reader(&app.db, "credential-reader", true).await;
+        let live = token(&app.db, Some(&owner), "read").await;
+
+        let resolved = credential(&app, &live.token).await.unwrap();
+
+        assert_eq!(
+            resolved.and_then(|ctx| ctx.user.map(|found| found.id)),
+            Some(owner.id),
+            "a live user token resolves to its user"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_refuses_every_token_that_names_no_live_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let app = app_state(db.pool());
+        let owner = reader(&app.db, "credential-owner", true).await;
+        let dormant = reader(&app.db, "credential-dormant", false).await;
+        let unknown = "no-such-token".to_owned();
+        let lapsed = token(&app.db, Some(&owner), "read").await;
+        lapse(&app.db, lapsed.id).await;
+        let app_only = token(&app.db, None, "read").await;
+        let dormant_token = token(&app.db, Some(&dormant), "read").await;
+
+        for (raw, who) in [
+            (unknown.as_str(), "an unknown string"),
+            (lapsed.token.as_str(), "an expired token"),
+            (app_only.token.as_str(), "an app-only token"),
+            (dormant_token.token.as_str(), "a deactivated owner's token"),
+        ] {
+            assert!(
+                credential(&app, raw).await.unwrap().is_none(),
+                "{who} credentials nobody"
+            );
+        }
     }
 
     #[test]

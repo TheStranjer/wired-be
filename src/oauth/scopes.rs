@@ -36,6 +36,14 @@ pub const READ_FOLLOWS: &str = "read:follows";
 /// The write side of the follow actions, granted by `write` and by `follow`.
 pub const WRITE_FOLLOWS: &str = "write:follows";
 
+/// The read side of the notification stream.
+///
+/// `user:notification` on the streaming WebSocket (Pleroma's
+/// `read:notifications` in `Streamer.get_topic`'s `required_scopes`,
+/// `lib/pleroma/web/streamer.ex`), the one private stream that is not a
+/// statuses stream.
+pub const READ_NOTIFICATIONS: &str = "read:notifications";
+
 /// The read side of account data: `GET /api/v1/announcements`, the list a
 /// client shows its user (Pleroma's own pipeline asks only for a user token
 /// here, the ticket for its `read:accounts` sub-scope).

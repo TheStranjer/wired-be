@@ -23,7 +23,11 @@ ammonia = "4.2.1"
 # what `src/util/password.rs` needs — pbkdf2 and base64 for Pleroma's legacy
 # Comeonin hashes, bcrypt for its bcrypt hashes.
 argon2 = { version = "0.6.0", features = ["password-hash"] }
-axum = { version = "0.8.9", features = ["multipart"] }
+# The web framework (`src/lib.rs`, `src/api/`). `multipart` is what the upload
+# extractor of `src/extract/multipart.rs` needs; `ws` is the WebSocket upgrade
+# behind `/api/v1/streaming` (`src/api/streaming.rs`): handshake, frames and
+# the server-side ping come from the `tokio-tungstenite` this feature enables.
+axum = { version = "0.8.9", features = ["multipart", "ws"] }
 # Base32 secrets for two-factor auth (`src/util/totp.rs`): RFC 4648
 # encoding/decoding is what authenticator apps display and consume.
 base32 = "0.5.1"
@@ -108,11 +112,21 @@ uuid = { version = "1.28.0", features = ["v7", "serde"] }
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# The `Stream`/`Sink` traits a `tokio-tungstenite` client socket is driven
+# through in `tests/api/streaming.rs`; named here so the `sink` feature the
+# tests use is this crate's own and not only what the client enables.
+futures-util = { version = "0.3.34", features = ["sink", "std"] }
 # Throwaway directories for the upload tests (`src/uploads.rs`,
 # `tests/media.rs`): `TempDir` makes one per test and removes it on drop, so
 # no test writes into the repository.
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["test-util"] }
+# The WebSocket client the streaming tests drive a real listener with
+# (`tests/api/streaming.rs`), on the same 0.29 line `axum`'s `ws` feature
+# upgrades with, so client and server speak one tungstenite. Its default
+# `connect` + `handshake` features are all `connect_async` needs: the tests
+# talk plain HTTP to `127.0.0.1`, so no TLS stays compiled in.
+tokio-tungstenite = "0.29"
 tower = { version = "0.5.3", features = ["util"] }
 tracing-core = "0.1.36"
 # Self-dependency: turns on `integration-tests` for the integration tests only.

@@ -10,9 +10,10 @@
 //! [`StreamEvent`](hub::StreamEvent) carries instead.
 //!
 //! Producers build a [`StreamEvent`](hub::StreamEvent) and hand it to
-//! [`Hub::publish`](hub::Hub::publish); WebSocket connections (a later
-//! ticket) take [`Hub::subscribe`](hub::Hub::subscribe) receivers and
-//! filter them with [`stream_matches`](hub::stream_matches) and the
-//! event's [`Audience`](hub::Audience).
+//! [`Hub::publish`](hub::Hub::publish); WebSocket connections take
+//! [`Hub::subscribe`](hub::Hub::subscribe) receivers and filter them with
+//! [`stream_matches`](hub::stream_matches) and the event's
+//! [`Audience`](hub::Audience) — that reader side is
+//! [`crate::api::streaming`], the `/api/v1/streaming` endpoint.
 
 pub mod hub;
