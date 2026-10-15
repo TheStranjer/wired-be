@@ -891,6 +891,7 @@ mod tests {
             inserted_at: stamped(),
             updated_at: stamped(),
             preferred_frontend: None,
+            is_suggested: Flag::new(false),
         }
     }
 

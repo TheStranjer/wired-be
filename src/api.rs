@@ -31,6 +31,7 @@
 //! endpoints and `manifest.json` live at `/…`, the addresses `MongooseIM`'s
 //! `extauth` http contract and the manifest `<link>` convention fix.
 
+pub mod account_lists;
 pub mod accounts;
 pub mod activitypub;
 pub mod announcements;

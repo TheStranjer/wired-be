@@ -6,9 +6,9 @@ use axum::Router;
 
 use crate::{
     api::{
-        accounts, announcements, apps, blocks, chats, custom_emojis, domain_blocks, emoji_packs,
-        endorsements, filters, follow_requests, instance, lists, markers, media, misc, mutes,
-        oauth_tokens, pleroma_accounts, pleroma_settings, scrobbles, streaming, tags,
+        account_lists, accounts, announcements, apps, blocks, chats, custom_emojis, domain_blocks,
+        emoji_packs, endorsements, filters, follow_requests, instance, lists, markers, media, misc,
+        mutes, oauth_tokens, pleroma_accounts, pleroma_settings, scrobbles, streaming, tags,
     },
     config::Config,
     state::AppState,
@@ -29,6 +29,7 @@ use crate::{
 /// which axum's multipart extractor cannot read from the state on its own.
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
+        .merge(account_lists::router())
         .merge(accounts::router(config))
         .merge(announcements::router())
         .merge(apps::router())

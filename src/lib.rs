@@ -1212,5 +1212,98 @@ mod tests {
             assert_eq!(is_nullable, "YES", "no choice is stored as NULL");
             assert!(default.is_none(), "and nothing defaults to a frontend");
         }
+
+        /// The suggestions migration (WBE-124) is the pair the suggestion
+        /// endpoints read and write: an `is_suggested` flag on `users` that
+        /// defaults to `false` (an account joins the pool only when an admin
+        /// says so), and `dismissed_suggestions`, whose only columns are the
+        /// viewer and the account they dismissed and whose primary key is
+        /// that pair — one dismissal per pair, and either account leaving
+        /// takes the row with it.
+        #[tokio::test]
+        async fn suggestions_migration_flags_the_pool_and_keys_the_dismissals() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let (data_type, is_nullable, default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'users'
+                        AND column_name = 'is_suggested'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(data_type, "boolean", "the pool is a flag");
+            assert_eq!(is_nullable, "NO", "every account answers it one way");
+            assert_eq!(
+                default.as_deref(),
+                Some("false"),
+                "and nothing starts in the pool: {default:?}"
+            );
+
+            let columns: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'dismissed_suggestions'
+               ORDER BY ordinal_position",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                columns,
+                vec![
+                    ("user_id".to_owned(), "uuid".to_owned(), "NO".to_owned()),
+                    ("target_id".to_owned(), "uuid".to_owned(), "NO".to_owned()),
+                ],
+                "the dismissal table is the pair and nothing else"
+            );
+
+            let (key, key_columns): (String, String) = sqlx::query_as(
+                "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'dismissed_suggestions'
+             GROUP BY con.conname",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                key_columns, "target_id,user_id",
+                "the pair is the key {key}: one dismissal per viewer and account"
+            );
+
+            let foreign_keys: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT con.conname, con.confdeltype::text, conf.relname
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_class conf ON conf.oid = con.confrelid
+                  WHERE con.contype = 'f' AND cls.relname = 'dismissed_suggestions'
+               ORDER BY con.conname",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                foreign_keys,
+                vec![
+                    (
+                        "dismissed_suggestions_target_id_fkey".to_owned(),
+                        "c".to_owned(),
+                        "users".to_owned()
+                    ),
+                    (
+                        "dismissed_suggestions_user_id_fkey".to_owned(),
+                        "c".to_owned(),
+                        "users".to_owned()
+                    ),
+                ],
+                "both ends are accounts, and deleting either takes the dismissal"
+            );
+        }
     }
 }

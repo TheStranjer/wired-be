@@ -23,10 +23,10 @@ use std::fmt;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
-use sqlx::{Executor, PgPool, Postgres};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{config::Config, error::AppResult, util::id::new_id};
+use crate::{config::Config, error::AppResult, pagination::PageParams, util::id::new_id};
 
 pub mod mfa;
 pub mod register;
@@ -225,6 +225,11 @@ pub struct User {
     /// `None` when it never chose one. The `preferred_frontend` cookie
     /// mirrors it (Pleroma keeps the choice in the cookie alone).
     pub preferred_frontend: Option<String>,
+    /// Whether an admin put the account in the suggestion pool the
+    /// `GET /api/v{1,2}/suggestions` endpoints answer from
+    /// (Pleroma's `is_suggested`). Nothing here sets it: the admin API
+    /// (a later ticket) is the writer.
+    pub is_suggested: Flag,
 }
 
 /// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
@@ -296,6 +301,7 @@ impl fmt::Debug for User {
             .field("updated_at", &self.updated_at)
             .field("mfa_settings", &"<redacted>")
             .field("preferred_frontend", &self.preferred_frontend)
+            .field("is_suggested", &self.is_suggested)
             .finish()
     }
 }
@@ -433,6 +439,10 @@ pub struct NewUser {
     pub mfa_settings: Value,
     /// The frontend the account picked; `None` (no choice) by default.
     pub preferred_frontend: Option<String>,
+    /// Whether the account sits in the suggestion pool; `false` by default,
+    /// because only an admin puts it there (the admin API is a later
+    /// ticket).
+    pub is_suggested: Flag,
 }
 
 /// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
@@ -501,6 +511,7 @@ impl fmt::Debug for NewUser {
             .field("last_fetched_at", &self.last_fetched_at)
             .field("mfa_settings", &"<redacted>")
             .field("preferred_frontend", &self.preferred_frontend)
+            .field("is_suggested", &self.is_suggested)
             .finish()
     }
 }
@@ -570,6 +581,7 @@ impl Default for NewUser {
             last_fetched_at: None,
             mfa_settings: mfa::MfaSettings::default_value(),
             preferred_frontend: None,
+            is_suggested: Flag::new(false),
         }
     }
 }
@@ -619,13 +631,13 @@ const INSERT_SQL: &str = "INSERT INTO users (
      also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
-     preferred_frontend, raw_fields
+     preferred_frontend, raw_fields, is_suggested
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60, $61
+     $55, $56, $57, $58, $59, $60, $61, $62
 ) RETURNING *";
 
 /// Inserts `new_user` and returns the stored row.
@@ -704,6 +716,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.mfa_settings.clone())
         .bind(new_user.preferred_frontend.as_deref())
         .bind(new_user.raw_fields.clone())
+        .bind(new_user.is_suggested)
         .fetch_one(pool)
         .await?;
     Ok(user)
@@ -821,6 +834,137 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<User>> {
     let ids = ids.to_vec();
     let users = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ANY($1) ORDER BY id")
         .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+    Ok(users)
+}
+
+/// The order the profile directory walks its accounts in
+/// (`GET /api/v1/directory`'s `order` parameter).
+///
+/// Which column the listing sorts on is the model's business; reading the
+/// client's `active`/`new` text and defaulting an unrecognised value is the
+/// endpoint's (Pleroma's `order_by_creation_date/2` matches `"new"` exactly
+/// and falls back to the active order for anything else).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DirectoryOrder {
+    /// Most recently active first: `last_status_at` descending, the accounts
+    /// that never posted last (`DIRECTORY_ACTIVE_SQL`).
+    #[default]
+    Active,
+    /// Newest account first: `inserted_at` descending
+    /// (`DIRECTORY_NEW_SQL`).
+    New,
+}
+
+impl DirectoryOrder {
+    /// The `ORDER BY` clause of this order, with `id DESC` as tiebreak: two
+    /// accounts sharing a timestamp must not land on both sides of an
+    /// `OFFSET` boundary, which is how the directory pages.
+    const fn order_by(self) -> &'static str {
+        match self {
+            Self::Active => DIRECTORY_ACTIVE_SQL,
+            Self::New => DIRECTORY_NEW_SQL,
+        }
+    }
+}
+
+/// The shared head of [`directory_page`]: the accounts the directory may
+/// answer with at all — active, and opted into discovery. The text stops
+/// where the optional `local` filter belongs, because that is what
+/// [`directory_page`] appends next; [`DIRECTORY_ACTIVE_SQL`] and
+/// [`DIRECTORY_NEW_SQL`] carry the order, and the page's `LIMIT` and
+/// `OFFSET` are binds the function pushes after them.
+const DIRECTORY_SQL: &str = "SELECT * FROM users WHERE is_active AND discoverable";
+
+/// The `active` order: newest `last_status_at` first, `NULL` (an account
+/// that never posted) last, exactly Pleroma's `desc_nulls_last`.
+const DIRECTORY_ACTIVE_SQL: &str = " ORDER BY last_status_at DESC NULLS LAST, id DESC";
+
+/// The `new` order: newest account first.
+const DIRECTORY_NEW_SQL: &str = " ORDER BY inserted_at DESC, id DESC";
+
+/// One [`directory_page`] offset: the row to start at, `0` for the first
+/// page — a directory has no pages before the first row.
+const NO_OFFSET: i64 = 0;
+
+/// The directory's discoverable, active accounts, `page`'s `limit` at a
+/// time starting at its `offset`, in `order`'s order.
+///
+/// `local_only` is the caller's `local` flag: `true` restricts the listing
+/// to accounts this instance owns (Pleroma's `exclude_remote`), `false`
+/// leaves the remote mirrors in. Of [`PageParams`], only
+/// [`limit`](PageParams::limit) and [`offset`](PageParams::offset) mean
+/// anything here: a directory has no id cursor to walk, so
+/// [`max_id`](PageParams::max_id) and its siblings are ignored, and
+/// `offset` absent is the first page.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn directory_page(
+    pool: &PgPool,
+    order: DirectoryOrder,
+    local_only: bool,
+    page: PageParams,
+) -> AppResult<Vec<User>> {
+    let mut builder = QueryBuilder::<Postgres>::new(DIRECTORY_SQL);
+    if local_only {
+        let _local: &mut _ = builder.push(" AND local");
+    }
+    let _ordered: &mut _ = builder.push(order.order_by());
+    let _limited: &mut _ = builder
+        .push(" LIMIT ")
+        .push_bind(page.limit)
+        .push(" OFFSET ")
+        .push_bind(page.offset.unwrap_or(NO_OFFSET));
+    let users = builder.build_query_as::<User>().fetch_all(pool).await?;
+    Ok(users)
+}
+
+/// The `SELECT` behind [`birthday_accounts`]: the `month`/`day` match is on
+/// the calendar parts of the `birthday` column, so a `2000-02-29` birthday
+/// lands only on a `2`/`29` query — a leap day, and no other day, ever
+/// matches it (Pleroma's `birthday_month`/`birthday_day` filters of
+/// `User.Query` compare the same two extracted parts). A `NULL` birthday
+/// extracts to `NULL` and fails the comparison, so the explicit
+/// `birthday IS NOT NULL` states what the comparison already implies.
+const BIRTHDAYS_SQL: &str = "SELECT * FROM users
+      WHERE is_active AND show_birthday AND birthday IS NOT NULL
+        AND EXTRACT(MONTH FROM birthday)::int = $2
+        AND EXTRACT(DAY FROM birthday)::int = $3
+        AND (id = $1 OR id IN (
+                 SELECT followee_id FROM follows
+                  WHERE follower_id = $1 AND state = 'accepted'))
+   ORDER BY id DESC";
+
+/// The accounts whose birthday `GET /api/v1/pleroma/birthdays` answers for
+/// `viewer_id`: the accounts it names.
+///
+/// That is the viewer itself and the accounts of their *accepted* follows,
+/// each with [`show_birthday`](User::show_birthday) set and a
+/// [`birthday`](User::birthday) falling on `month`/`day`, newest account
+/// first.
+///
+/// A deactivated account is out (the flag the whole API hides suspended
+/// rows behind), and a remote mirror is in: the follows of a local account
+/// are local and remote alike.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn birthday_accounts(
+    pool: &PgPool,
+    viewer_id: Uuid,
+    month: i32,
+    day: i32,
+) -> AppResult<Vec<User>> {
+    let users = sqlx::query_as::<_, User>(BIRTHDAYS_SQL)
+        .bind(viewer_id)
+        .bind(month)
+        .bind(day)
         .fetch_all(pool)
         .await?;
     Ok(users)
@@ -1446,6 +1590,10 @@ mod tests {
         assert!(
             !user.sensitive_default.get(),
             "new statuses are not flagged sensitive by default"
+        );
+        assert!(
+            !user.is_suggested.get(),
+            "the suggestion pool is admin-curated, so nothing starts in it"
         );
     }
 
@@ -2333,6 +2481,407 @@ mod tests {
         assert_eq!(
             after.background_image_url, stored.background_image_url,
             "the background keeps its value"
+        );
+    }
+
+    /// A discoverable local user named `nickname` whose newest status was
+    /// posted at `active` (`None`: never).
+    async fn discoverable(pool: &PgPool, nickname: &str, active: Option<DateTime<Utc>>) -> User {
+        insert(
+            pool,
+            &NewUser {
+                discoverable: Flag::new(true),
+                last_status_at: active,
+                ..local_new(nickname)
+            },
+        )
+        .await
+        .expect("the discoverable fixture inserts")
+    }
+
+    /// Moves `target`'s `inserted_at` back to `days` ago, so an
+    /// `order = new` expectation does not depend on how fast the fixture
+    /// loop ran.
+    async fn insert_days_ago(pool: &PgPool, target: &User, days: i64) {
+        let moved = sqlx::query(
+            "UPDATE users SET inserted_at = now() - $1::bigint * interval '1 day' WHERE id = $2",
+        )
+        .bind(days)
+        .bind(target.id)
+        .execute(pool)
+        .await
+        .expect("the fixture backdates the account");
+        assert_eq!(moved.rows_affected(), 1, "the row was there to move");
+    }
+
+    /// The ids of `users`, in the order the query answered them.
+    fn ids_of(users: &[User]) -> Vec<Uuid> {
+        users.iter().map(|found| found.id).collect()
+    }
+
+    /// The directory page `query` asks for, with this endpoint's page sizes.
+    fn directory_page_params(query: &str) -> PageParams {
+        PageParams::from_query_with_default(Some(query), 40, 80).expect("the fixture page parses")
+    }
+
+    #[tokio::test]
+    async fn directory_page_needs_discoverable_and_active() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listed = discoverable(&pool, "listed", None).await;
+        let hidden = insert(&pool, &local_new("hidden")).await.unwrap();
+        let gone = discoverable(&pool, "gone", None).await;
+        let _deactivated = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(gone.id)
+            .execute(&pool)
+            .await
+            .expect("the fixture deactivates");
+
+        let seen = directory_page(
+            &pool,
+            DirectoryOrder::Active,
+            false,
+            directory_page_params(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids_of(&seen), vec![listed.id], "opted in and active");
+        assert!(
+            !ids_of(&seen).contains(&hidden.id),
+            "an account that never opted into discovery is not listed"
+        );
+        assert!(
+            !ids_of(&seen).contains(&gone.id),
+            "and neither is a deactivated one"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_page_lists_remote_accounts_unless_asked_locally() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let local = discoverable(&pool, "local-one", None).await;
+        let ap_id = "https://remote.example/users/mirror";
+        let mirror = insert(
+            &pool,
+            &NewUser {
+                nickname: "mirror@remote.example".to_owned(),
+                ap_id: ap_id.to_owned(),
+                domain: Some("remote.example".to_owned()),
+                discoverable: Flag::new(true),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+
+        let everyone = directory_page(
+            &pool,
+            DirectoryOrder::Active,
+            false,
+            directory_page_params(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids_of(&everyone).len(),
+            2,
+            "with no `local` flag the mirrors stay in, as Pleroma's \
+             `exclude_remote` only fires on true"
+        );
+        let local_only = directory_page(
+            &pool,
+            DirectoryOrder::Active,
+            true,
+            directory_page_params(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids_of(&local_only),
+            vec![local.id],
+            "`local` true answers this instance's own accounts"
+        );
+        assert!(!ids_of(&local_only).contains(&mirror.id), "and no mirror");
+    }
+
+    #[tokio::test]
+    async fn directory_active_order_puts_never_posted_accounts_last() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let quiet = discoverable(&pool, "quiet", None).await;
+        let older =
+            discoverable(&pool, "older", Some(Utc::now() - chrono::Duration::days(1))).await;
+        let newest = discoverable(&pool, "newest", Some(Utc::now())).await;
+
+        let seen = directory_page(
+            &pool,
+            DirectoryOrder::Active,
+            false,
+            directory_page_params(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids_of(&seen),
+            vec![newest.id, older.id, quiet.id],
+            "newest status first, the accounts that never posted last"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_new_order_sorts_on_the_account_itself() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        // The newest account posted long ago: the two orders must disagree.
+        let fresh =
+            discoverable(&pool, "fresh", Some(Utc::now() - chrono::Duration::days(9))).await;
+        let veteran = discoverable(
+            &pool,
+            "veteran",
+            Some(Utc::now() - chrono::Duration::days(1)),
+        )
+        .await;
+        insert_days_ago(&pool, &veteran, 5).await;
+        insert_days_ago(&pool, &fresh, 1).await;
+
+        let seen = directory_page(&pool, DirectoryOrder::New, false, directory_page_params(""))
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(&seen),
+            vec![fresh.id, veteran.id],
+            "`new` sorts on `inserted_at`, ignoring last activity"
+        );
+        let by_activity = directory_page(
+            &pool,
+            DirectoryOrder::Active,
+            false,
+            directory_page_params(""),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids_of(&by_activity),
+            vec![veteran.id, fresh.id],
+            "and the default order is the other way round for the same rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_pages_by_limit_and_offset() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        for nickname in ["one", "two", "three", "four", "five"] {
+            let posted = discoverable(&pool, nickname, Some(Utc::now())).await;
+            assert!(posted.discoverable.get(), "{nickname} is listed");
+        }
+        let all = directory_page(&pool, DirectoryOrder::New, false, directory_page_params(""))
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&all).len(), 5, "the whole listing");
+
+        let second = directory_page(
+            &pool,
+            DirectoryOrder::New,
+            false,
+            directory_page_params("limit=2&offset=2"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids_of(&second),
+            ids_of(&all)[2..4],
+            "offset 2 skips the first two of the same order"
+        );
+        let tail = directory_page(
+            &pool,
+            DirectoryOrder::New,
+            false,
+            directory_page_params("limit=2&offset=4"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tail.len(), 1, "and the last page is what is left");
+        assert_eq!(ids_of(&tail), ids_of(&all)[4..], "the fifth account");
+        let past = directory_page(
+            &pool,
+            DirectoryOrder::New,
+            false,
+            directory_page_params("offset=99"),
+        )
+        .await
+        .unwrap();
+        assert!(past.is_empty(), "an offset past the end answers nothing");
+    }
+
+    /// A local user named `nickname` born on `birthday`, showing it only
+    /// when `show` says so.
+    async fn born(pool: &PgPool, nickname: &str, birthday: Option<NaiveDate>, show: bool) -> User {
+        insert(
+            pool,
+            &NewUser {
+                birthday,
+                show_birthday: Flag::new(show),
+                ..local_new(nickname)
+            },
+        )
+        .await
+        .expect("the birthday fixture inserts")
+    }
+
+    /// `year-month-day` as a date, from the parts a test names.
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("the fixture date is a real day")
+    }
+
+    /// Deactivates `target` — the state a suspended or closed account is in.
+    async fn deactivate(pool: &PgPool, target: &User) {
+        let gone = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(target.id)
+            .execute(pool)
+            .await
+            .expect("the fixture deactivates");
+        assert_eq!(gone.rows_affected(), 1, "the row was there to close");
+    }
+
+    /// Records `follower`'s accepted follow of the local `target`.
+    async fn follow(pool: &PgPool, follower: &User, target: &User) {
+        let row = crate::models::follow::follow(pool, BASE, follower, target)
+            .await
+            .expect("the fixture follow records");
+        assert_eq!(
+            row.state,
+            crate::models::follow::FollowState::Accepted,
+            "an open local account answers on the spot"
+        );
+    }
+
+    #[tokio::test]
+    async fn birthday_accounts_answers_the_viewer_and_their_follows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let day = date(1990, 5, 17);
+        let alice = born(&pool, "alice", Some(day), true).await;
+        let followed = born(&pool, "followed", Some(day), true).await;
+        let unfollowed = born(&pool, "unfollowed", Some(day), true).await;
+        let private = born(&pool, "private", Some(day), false).await;
+        let closed = born(&pool, "closed", Some(day), true).await;
+        let blank = born(&pool, "blank", None, true).await;
+        let wrong_day = born(&pool, "wrong-day", Some(date(1990, 5, 18)), true).await;
+        deactivate(&pool, &closed).await;
+        // A remote follow counts once it is accepted: the request a mirror
+        // leaves pending is no follow for the listing.
+        let ap_id = "https://remote.example/users/mirror";
+        let mirror = insert(
+            &pool,
+            &NewUser {
+                nickname: "mirror@remote.example".to_owned(),
+                ap_id: ap_id.to_owned(),
+                domain: Some("remote.example".to_owned()),
+                birthday: Some(day),
+                show_birthday: Flag::new(true),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote birthday fixture inserts");
+        follow(&pool, &alice, &followed).await;
+
+        let seen = ids_of(&birthday_accounts(&pool, alice.id, 5, 17).await.unwrap());
+        assert!(
+            seen.contains(&alice.id),
+            "the viewer is in their own birthday list"
+        );
+        assert!(seen.contains(&followed.id), "so is an accepted follow");
+        for absent in [unfollowed.id, private.id, closed.id, blank.id, wrong_day.id] {
+            assert!(
+                !seen.contains(&absent),
+                "{absent} is not on the list: an account the viewer does not \
+                 follow, one that hides its birthday, a closed one, one with \
+                 no birthday and one born on another day are all out"
+            );
+        }
+
+        let request = crate::models::follow::follow(&pool, BASE, &alice, &mirror)
+            .await
+            .expect("the outgoing request records");
+        assert_eq!(
+            request.state,
+            crate::models::follow::FollowState::Pending,
+            "a mirror answers nothing on the spot"
+        );
+        assert_eq!(
+            ids_of(&birthday_accounts(&pool, alice.id, 5, 17).await.unwrap()),
+            seen,
+            "a pending request to a remote account adds nobody"
+        );
+        let accepted = crate::models::follow::accept(&pool, request.id)
+            .await
+            .expect("the fixture's other side accepts it");
+        assert_eq!(
+            accepted.state,
+            crate::models::follow::FollowState::Accepted,
+            "the request is answered"
+        );
+        let after = ids_of(&birthday_accounts(&pool, alice.id, 5, 17).await.unwrap());
+        assert!(
+            after.contains(&mirror.id),
+            "and the accepted follow of a remote account is in: local and \
+             remote follows count alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leap_day_birthday_matches_the_leap_day_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = born(&pool, "alice", Some(date(2000, 2, 29)), true).await;
+
+        let on = ids_of(&birthday_accounts(&pool, alice.id, 2, 29).await.unwrap());
+        assert_eq!(on, vec![alice.id], "2/29 finds the account born on it");
+        for (month, day) in [(2, 28), (3, 29), (2, 30), (13, 29)] {
+            assert!(
+                birthday_accounts(&pool, alice.id, month, day)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "and {month}/{day} does not: the match is on both calendar \
+                 parts, so in a year without a 29th of February the list is \
+                 simply empty"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn birthday_accounts_orders_newest_account_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let day = date(1990, 12, 25);
+        let alice = born(&pool, "alice", Some(day), true).await;
+        let first = born(&pool, "first", Some(day), true).await;
+        let second = born(&pool, "second", Some(day), true).await;
+        follow(&pool, &alice, &first).await;
+        follow(&pool, &alice, &second).await;
+
+        let mut expected = vec![alice.id, first.id, second.id];
+        // `ORDER BY id DESC` on `UUIDv7` text is creation order (decision 4);
+        // the fixture ids are minted in the same millisecond, so the
+        // expectation is the byte order the database sorts on, not the
+        // insert order.
+        expected.sort_by(|left, right| right.cmp(left));
+        let seen = ids_of(&birthday_accounts(&pool, alice.id, 12, 25).await.unwrap());
+        assert_eq!(
+            seen, expected,
+            "newest account first, the viewer among them"
+        );
+        assert!(
+            birthday_accounts(&pool, alice.id, 1, 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a day nobody the viewer knows is born on answers nothing, \
+             which is no error"
         );
     }
 }

@@ -131,6 +131,7 @@ mod tests {
             inserted_at: Utc.with_ymd_and_hms(2024, 1, 31, 12, 34, 56).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2024, 1, 31, 12, 34, 56).unwrap(),
             preferred_frontend: None,
+            is_suggested: Flag::new(false),
         }
     }
 

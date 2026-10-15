@@ -360,8 +360,10 @@ struct Metadata {
     /// Whether registration alone does not get a user in; wired-be has no
     /// private-instance mode, so `false` (Pleroma's `public` default).
     private: Toggle,
-    /// The account-suggestions feature; not served, so disabled (Pleroma
-    /// reports its `[:instance, :suggestions]` state the same way).
+    /// The account-suggestions feature; disabled, because it reports the
+    /// `[:instance, :suggestions]` switch this server has no setting for
+    /// (Pleroma answers its `false` default the same way, and the
+    /// `is_suggested` pool is admin-curated, not an instance feature).
     suggestions: Suggestions,
     /// Actor ids of the admin and moderator accounts.
     staff_accounts: Vec<String>,
