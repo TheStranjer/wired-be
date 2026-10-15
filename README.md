@@ -49,6 +49,7 @@ All configuration comes from environment variables. For local development, copy 
 | `MEDIA_BASE_URL` | no | `{BASE_URL}/media` | Public prefix of uploaded files' URLs, served by `GET /media/{key}` (no trailing slash) |
 | `JOB_CONCURRENCY` | no | `10` | Job handlers a single worker runs at the same time |
 | `JOB_QUEUES` | no | `default,federator_incoming,federator_outgoing,mailer,scheduled,background` | Comma-separated job queue names, in claim priority order |
+| `STREAMING_PING_INTERVAL_SECS` | no | `30` | Seconds between the heartbeat pings one `/api/v1/streaming` WebSocket receives; a socket that never answers a ping is closed on the next tick |
 
 ## Development
 

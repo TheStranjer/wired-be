@@ -128,6 +128,9 @@ mod remove_from_followers;
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 
+/// The streaming WebSocket (`/api/v1/streaming`) over a real listener.
+mod streaming;
+
 /// Tags over HTTP (`/api/v1/tags/{name}`, `/api/v1/followed_tags`, trends).
 mod tags;
 

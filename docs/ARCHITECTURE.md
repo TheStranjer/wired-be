@@ -165,5 +165,11 @@ Rules that fall out of the lint gate (all verified against `scripts/ci.sh`):
 - Every added code path needs coverage, including the harness itself:
   `tests/api/health.rs` checks the builders and accessors against an echo
   route.
+- A WebSocket route is the one endpoint a real socket tests: `oneshot` never
+  completes an upgrade (`hyper` needs the live connection to hand over), so
+  `tests/api/streaming.rs` binds a `TcpListener` on `127.0.0.1:0`, serves the
+  real router with `axum::serve`, and drives it with `tokio-tungstenite`. It
+  still leases its database from the fixture, and it still runs in the one test
+  crate.
 - Later tickets add fixture helpers (`create_user`, `create_token`, ...) to
   `tests/api/common.rs`; keep them there, do not duplicate them per area.

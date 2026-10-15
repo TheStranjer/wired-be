@@ -102,6 +102,9 @@ pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.
 pub const JOB_QUEUES_VAR: &str = "JOB_QUEUES";
+/// Environment variable holding how many seconds the streaming WebSocket
+/// waits between two heartbeat pings of one socket.
+pub const STREAMING_PING_INTERVAL_SECS_VAR: &str = "STREAMING_PING_INTERVAL_SECS";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -237,6 +240,10 @@ pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
 pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
 /// Worker concurrency used when `JOB_CONCURRENCY` is unset.
 pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
+/// Streaming heartbeat period used when `STREAMING_PING_INTERVAL_SECS` is
+/// unset: the 30 seconds Pleroma's `WebsocketHandler` pings a socket on
+/// (`lib/pleroma/web/mastodon_api/websocket_handler.ex`, `@tick`).
+pub const DEFAULT_STREAMING_PING_INTERVAL_SECS: usize = 30;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from the fixture
 /// in [`crate::test_db`].
@@ -476,6 +483,12 @@ pub struct Config {
     pub job_concurrency: usize,
     /// Job queue names the worker drains, in claim priority order.
     pub job_queues: Vec<String>,
+    /// Seconds between the heartbeat pings of one streaming socket, from
+    /// `STREAMING_PING_INTERVAL_SECS`: [`PING_INTERVAL`] spells the same span
+    /// (30, Pleroma's `@tick`), and a test keeps the two agreeing.
+    ///
+    /// [`PING_INTERVAL`]: crate::api::streaming::PING_INTERVAL
+    pub streaming_ping_interval_secs: usize,
 }
 
 impl Config {
@@ -576,6 +589,7 @@ impl Config {
             available_frontends,
             job_concurrency,
             job_queues,
+            streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
         })
     }
 
@@ -672,6 +686,7 @@ impl Config {
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
             job_queues: comma_list(DEFAULT_JOB_QUEUES),
+            streaming_ping_interval_secs: DEFAULT_STREAMING_PING_INTERVAL_SECS,
         }
     }
 }
@@ -745,6 +760,25 @@ where
     let job_queues =
         comma_list(&lookup(JOB_QUEUES_VAR).unwrap_or_else(|| DEFAULT_JOB_QUEUES.to_owned()));
     Ok((job_concurrency, job_queues))
+}
+
+/// Reads the one setting that shapes the streaming WebSocket: how many
+/// seconds pass between two heartbeat pings of one socket
+/// (`STREAMING_PING_INTERVAL_SECS`, 30 — Pleroma's `@tick` — when unset).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when the variable holds a value
+/// that is not a whole number.
+fn streaming_heartbeat<F>(lookup: &F) -> Result<usize, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    number(
+        lookup,
+        STREAMING_PING_INTERVAL_SECS_VAR,
+        DEFAULT_STREAMING_PING_INTERVAL_SECS,
+    )
 }
 
 /// What [`auth_settings`] reads, in [`Config`] field order: the email
@@ -1028,6 +1062,10 @@ impl fmt::Debug for Config {
             .field("available_frontends", &self.available_frontends)
             .field("job_concurrency", &self.job_concurrency)
             .field("job_queues", &self.job_queues)
+            .field(
+                "streaming_ping_interval_secs",
+                &self.streaming_ping_interval_secs,
+            )
             .finish()
     }
 }
@@ -1403,6 +1441,25 @@ mod tests {
                 "scheduled".to_owned(),
             ],
             "comma list is trimmed, empty entries dropped"
+        );
+    }
+
+    #[test]
+    fn streaming_heartbeat_defaults_and_reads_its_variable() {
+        assert_eq!(
+            config_with(&[]).streaming_ping_interval_secs,
+            DEFAULT_STREAMING_PING_INTERVAL_SECS,
+            "default streaming heartbeat"
+        );
+        assert_eq!(
+            config_with(&[(STREAMING_PING_INTERVAL_SECS_VAR, "5")]).streaming_ping_interval_secs,
+            5,
+            "custom streaming heartbeat"
+        );
+        assert_eq!(
+            config_with(&[(STREAMING_PING_INTERVAL_SECS_VAR, "")]).streaming_ping_interval_secs,
+            DEFAULT_STREAMING_PING_INTERVAL_SECS,
+            "an empty value applies the default"
         );
     }
 
@@ -2128,6 +2185,7 @@ mod tests {
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
             JOB_CONCURRENCY_VAR,
+            STREAMING_PING_INTERVAL_SECS_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");
