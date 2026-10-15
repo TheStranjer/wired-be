@@ -121,6 +121,12 @@ wired-be = { path = ".", features = ["integration-tests"] }
 # `zip` the library uses (see `[dependencies]`).
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
+[profile.dev.package."*"]
+# Dependencies (RSA, Argon2, PBKDF2, bcrypt, image codecs) are
+# unusably slow at opt-level 0; our own crate stays unoptimized so
+# incremental rebuilds stay fast.
+opt-level = 3
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
