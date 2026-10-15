@@ -14,16 +14,19 @@
 //! handlers here.
 //!
 //! The route negotiates content: an `Accept` header naming one of the two
-//! `ActivityPub` media types gets the actor document, anything else gets
-//! Pleroma's 404 `{"error":"Not found"}` for now, because this backend is
-//! API-only and has no HTML page to hand an agent back (a later feed ticket
-//! redirects HTML clients). Every answer carries `Vary: Accept`, since the
-//! header decides which of the two the client sees.
+//! `ActivityPub` media types gets the actor document; an `Accept` naming
+//! `text/html` (and no `ActivityPub` type) is a browser and gets Pleroma's
+//! redirect to the frontend profile page — 302 with `Location:`
+//! `{BASE_URL}/{nickname}` (this backend is API-only and serves no HTML of
+//! its own, `lib/pleroma/web/feed/user_controller.ex`'s `feed_redirect`);
+//! anything else gets Pleroma's 404 `{"error":"Not found"}`. Every answer
+//! carries `Vary: Accept`, since the header decides which of the three the
+//! client sees.
 
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse as _, Response},
     routing::get,
 };
@@ -41,12 +44,15 @@ use crate::{
 /// axum's `Json` type would send it without one.
 const ACTIVITY_JSON: &str = "application/activity+json; charset=utf-8";
 /// The `Vary` value of every response: the `Accept` header picks the
-/// document, the 404 or (later) the redirect.
+/// document, the redirect or the 404.
 const VARY_ACCEPT: &str = "Accept";
 /// The media types whose presence in `Accept` means "this is an
 /// `ActivityPub` client", the pair Pleroma's `:activitypub` accepts
 /// pipeline lists.
 const AP_MEDIA_TYPES: [&str; 2] = ["application/activity+json", "application/ld+json"];
+/// The media type whose presence in `Accept` means "this is a browser":
+/// Pleroma's HTML clients are sent to the frontend, and so here.
+const HTML_MEDIA_TYPE: &str = "text/html";
 
 /// The top-level `ActivityPub` router, merged by [`crate::app`].
 pub fn router() -> Router<AppState> {
@@ -69,14 +75,18 @@ async fn get_actor(
 }
 
 /// The response the route sends: the actor document for an `ActivityPub`
-/// client that asks for a live local account, and the errors the ticket
-/// prescribes for everyone else.
+/// client that asks for a live local account, Pleroma's frontend redirect
+/// for an HTML client, and the errors the ticket prescribes for everyone
+/// else.
 async fn negotiated_actor(
     state: &AppState,
     nickname: &str,
     headers: &HeaderMap,
 ) -> AppResult<Response> {
     if !wants_activity_json(headers) {
+        if wants_html(headers) {
+            return html_redirect(&state.config, nickname);
+        }
         return Err(AppError::RouteNotFound);
     }
     let Some(user) = get_by_nickname(&state.db, nickname).await? else {
@@ -96,10 +106,7 @@ async fn negotiated_actor(
 /// non-`ActivityPub` answer. The comparison is case-insensitive, as the
 /// media type of a header value is.
 fn wants_activity_json(headers: &HeaderMap) -> bool {
-    let Some(accept) = headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(accept) = accept_text(headers) else {
         return false;
     };
     let folded = accept.to_ascii_lowercase();
@@ -107,6 +114,34 @@ fn wants_activity_json(headers: &HeaderMap) -> bool {
         .iter()
         .copied()
         .any(|media_type| folded.contains(media_type))
+}
+
+/// Whether `headers` name `text/html` in `Accept`: a browser, which the
+/// frontend — not this API — serves. Case-insensitive, and an absent
+/// header is no browser.
+fn wants_html(headers: &HeaderMap) -> bool {
+    accept_text(headers).is_some_and(|accept| accept.to_ascii_lowercase().contains(HTML_MEDIA_TYPE))
+}
+
+/// The readable `Accept` header value: `None` when the header is absent
+/// or holds bytes that are not text.
+fn accept_text(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// The 302 an HTML client gets instead of a document: Pleroma sends
+/// browsers to the frontend profile page, `{BASE_URL}/{nickname}` (this
+/// instance serves no HTML of its own, decision 1), and lets the frontend
+/// decide whether that page exists. A nickname whose text cannot ride a
+/// `Location` header names no page either, and answers the 404.
+fn html_redirect(config: &Config, nickname: &str) -> AppResult<Response> {
+    let location = format!("{}/{}", config.base_url, nickname);
+    let value = HeaderValue::from_str(&location)
+        .ok()
+        .ok_or(AppError::RouteNotFound)?;
+    Ok((StatusCode::FOUND, [(header::LOCATION, value)]).into_response())
 }
 
 /// The actor document for `user` as an `ActivityPub` response.
@@ -224,6 +259,61 @@ mod tests {
             response.status(),
             StatusCode::NOT_FOUND,
             "adding the header keeps the error's status"
+        );
+    }
+
+    #[test]
+    fn html_accepts_are_browsers_and_everything_else_is_not() {
+        for accept in [
+            "text/html",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "TEXT/HTML;q=0.9",
+            "application/json, text/html",
+        ] {
+            let headers = headers_with_accept(Some(accept));
+            assert!(wants_html(&headers), "{accept} names text/html");
+        }
+        for accept in [
+            "*/*",
+            "application/json",
+            "text/plain",
+            "application/xhtml+xml",
+            "application/activity+json",
+        ] {
+            let headers = headers_with_accept(Some(accept));
+            assert!(!wants_html(&headers), "{accept} is not a browser");
+        }
+        assert!(
+            !wants_html(&headers_with_accept(None)),
+            "a request that states nothing is not a browser"
+        );
+    }
+
+    #[test]
+    fn browsers_are_redirected_to_the_frontend_profile_url() {
+        let config = Config::for_tests();
+        let response = html_redirect(&config, "alice").expect("a plain nickname redirects");
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "the redirect is a 302"
+        );
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&HeaderValue::from_static("https://test.example/alice")),
+            "the Location is the frontend profile URL built from the base URL"
+        );
+    }
+
+    #[test]
+    fn a_nickname_no_header_can_carry_is_the_plain_404() {
+        let config = Config::for_tests();
+        let err = html_redirect(&config, "bad\nnickname")
+            .expect_err("no Location header can carry a newline");
+        assert_eq!(
+            err.to_string(),
+            "Not found",
+            "and then the route answers like any other unrouted request"
         );
     }
 }
