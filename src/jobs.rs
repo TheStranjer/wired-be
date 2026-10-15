@@ -58,8 +58,10 @@ pub const QUEUE_BACKGROUND: &str = "background";
 pub const DEFAULT_JOB_QUEUES: &str =
     "default,federator_incoming,federator_outgoing,mailer,scheduled,background";
 
-/// Pause between claim rounds when no job is due (keeps an idle worker off
-/// the database without a busy loop).
+/// Default pause between claim rounds when no job is due (keeps an idle
+/// worker off the database without a busy loop). [`Worker`] stores this as
+/// its `idle_poll_interval`; [`Worker::with_idle_poll_interval`] overrides
+/// it.
 const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the running worker sweeps jobs stuck in `executing`.
 const RESCUE_INTERVAL: Duration = Duration::from_secs(60);
@@ -188,10 +190,11 @@ pub fn backoff(attempt: i32) -> Duration {
 /// Each round claims the due job at the front of the queues (decision 11's
 /// `FOR UPDATE SKIP LOCKED` core in [`crate::models::job`]) and runs its
 /// handler on a task of its own; a [`Semaphore`] of `concurrency` permits
-/// bounds how many handlers run at once. Nothing due costs a one-second
-/// sleep, expired locks are swept every minute, and once the shutdown
-/// future resolves the worker stops claiming and returns only after every
-/// in-flight job has reached a terminal state.
+/// bounds how many handlers run at once. Nothing due costs a sleep of
+/// [`idle_poll_interval`](Self::with_idle_poll_interval) that the shutdown
+/// future interrupts at any time, expired locks are swept every minute,
+/// and once the shutdown future resolves the worker stops claiming and
+/// returns only after every in-flight job has reached a terminal state.
 #[derive(Debug)]
 pub struct Worker {
     /// Shared state handed to every handler.
@@ -202,11 +205,15 @@ pub struct Worker {
     queues: Vec<String>,
     /// Maximum number of handlers running at once.
     concurrency: usize,
+    /// Pause between claim rounds when nothing was due; the loop sleeps in
+    /// interruptible increments of this, not inside a claim.
+    idle_poll_interval: Duration,
 }
 
 impl Worker {
     /// Builds a worker over `queues` with at most `concurrency` handlers
-    /// running at once.
+    /// running at once and the default (one second) idle poll interval;
+    /// see [`with_idle_poll_interval`](Self::with_idle_poll_interval).
     #[must_use]
     pub const fn new(
         state: AppState,
@@ -219,7 +226,19 @@ impl Worker {
             registry,
             queues,
             concurrency,
+            idle_poll_interval: IDLE_POLL_INTERVAL,
         }
+    }
+
+    /// Sets the pause between claim rounds when nothing is due, replacing
+    /// the default one second. The wait is interruptible either way, so a
+    /// shorter interval only shortens how long newly enqueued work takes
+    /// to be claimed; tests use this to keep claim rounds in milliseconds,
+    /// while production keeps the default.
+    #[must_use]
+    pub const fn with_idle_poll_interval(mut self, interval: Duration) -> Self {
+        self.idle_poll_interval = interval;
+        self
     }
 
     /// Runs the claim-dispatch loop until `shutdown` resolves.
@@ -237,23 +256,42 @@ impl Worker {
             registry,
             queues,
             concurrency,
+            idle_poll_interval,
         } = self;
         let semaphore = Arc::new(Semaphore::new(concurrency));
         let mut rescuer = interval_at(Instant::now() + RESCUE_INTERVAL, RESCUE_INTERVAL);
         rescuer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut shutdown = Box::pin(shutdown);
+        // The idle wait lives here, not inside a claim: `waiting` gates the
+        // permit arm, and the pinned sleep is an arm of its own, so a
+        // shutdown (or a rescuer tick) lands while the worker is idle
+        // instead of after the interval has run its course.
+        let mut idle = Box::pin(sleep(idle_poll_interval));
+        let mut waiting = false;
         let mut draining = false;
         while !draining {
+            let mut go_idle = false;
             tokio::select! {
                 biased;
                 () = &mut shutdown => draining = true,
+                () = &mut idle, if waiting => waiting = false,
                 _ = rescuer.tick() => sweep_stuck(&state).await,
-                maybe_permit = Arc::clone(&semaphore).acquire_owned() => {
+                maybe_permit = Arc::clone(&semaphore).acquire_owned(), if !waiting => {
                     match maybe_permit {
-                        Ok(permit) => claim_and_dispatch(&state, &registry, &queues, permit).await,
+                        // `claim_and_dispatch` returns quickly either way:
+                        // an empty queue arms the idle timer below instead
+                        // of sleeping here.
+                        Ok(permit) => {
+                            go_idle =
+                                !claim_and_dispatch(&state, &registry, &queues, permit).await;
+                        }
                         Err(_closed) => draining = true,
                     }
                 }
+            }
+            if go_idle {
+                idle.as_mut().reset(Instant::now() + idle_poll_interval);
+                waiting = true;
             }
         }
         // Every permit back means every dispatched job reached its terminal
@@ -266,29 +304,32 @@ impl Worker {
     }
 }
 
-/// Claims one job with `permit` and hands it to [`run_job`]; an empty queue
-/// costs the permit back and an [`IDLE_POLL_INTERVAL`] sleep.
+/// Claims one job with `permit` and hands it to [`run_job`]. Returns
+/// whether the claim found work; when it did not, the permit is back and
+/// the caller waits [`Worker::idle_poll_interval`] before the next round —
+/// an interruptible wait in [`Worker::run`], not a sleep here.
 async fn claim_and_dispatch(
     state: &AppState,
     registry: &Arc<JobRegistry>,
     queues: &[String],
     permit: OwnedSemaphorePermit,
-) {
+) -> bool {
     let names: Vec<&str> = queues.iter().map(String::as_str).collect();
     match claim_next(&state.db, &names).await {
         Ok(Some(job)) => {
             let state = state.clone();
             let registry = Arc::clone(registry);
             let _dispatched = tokio::spawn(run_job(state, registry, job, permit));
+            true
         }
         Ok(None) => {
             drop(permit);
-            sleep(IDLE_POLL_INTERVAL).await;
+            false
         }
         Err(err) => {
             warn!(%err, "job claim failed");
             drop(permit);
-            sleep(IDLE_POLL_INTERVAL).await;
+            false
         }
     }
 }
@@ -414,7 +455,13 @@ mod tests {
             .unwrap()
     }
 
-    /// A worker over the `test` queue with `concurrency` slots.
+    /// Idle-poll interval for worker tests: short enough that a claim round
+    /// after an empty one costs milliseconds, so tests never sit through the
+    /// production second.
+    const TEST_IDLE_POLL: Duration = Duration::from_millis(10);
+
+    /// A worker over the `test` queue with `concurrency` slots and a fast
+    /// idle poll.
     fn worker_for(pool: &PgPool, registry: JobRegistry, concurrency: usize) -> Worker {
         Worker::new(
             app_state(pool),
@@ -422,6 +469,7 @@ mod tests {
             vec!["test".to_owned()],
             concurrency,
         )
+        .with_idle_poll_interval(TEST_IDLE_POLL)
     }
 
     /// A job payload on the `test` queue with `kind`.
@@ -936,12 +984,88 @@ mod tests {
         registry.register("greet", ok_handler);
         let queues = state.config.job_queues.clone();
         let concurrency = state.config.job_concurrency;
-        let worker = Worker::new(state, Arc::new(registry), queues, concurrency);
+        let worker = Worker::new(state, Arc::new(registry), queues, concurrency)
+            .with_idle_poll_interval(TEST_IDLE_POLL);
 
         let done = run_until_state(worker, &pool, job.id, "completed").await;
         assert_eq!(
             done.state, "completed",
             "the config-shaped worker drained the queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_an_idle_sleep_returns_immediately() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        // Nothing is ever enqueued, so after its first empty claim round the
+        // worker sits in the default one-second idle sleep; the shutdown
+        // below at 100 ms always lands mid-idle.
+        let worker = Worker::new(
+            app_state(&pool),
+            Arc::new(JobRegistry::new()),
+            vec!["test".to_owned()],
+            1,
+        );
+
+        let started = Instant::now();
+        // Generous bound, still below the idle poll interval: the worker
+        // must return while its first idle sleep is counting down, not
+        // after it has run its course.
+        let ran = tokio::time::timeout(
+            Duration::from_millis(800),
+            worker.run(sleep(Duration::from_millis(100))),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            ran.is_ok(),
+            "shutdown mid-idle waited out the sleep: run() had not returned \
+             after {elapsed:?}, against a {IDLE_POLL_INTERVAL:?} idle poll"
+        );
+        assert!(
+            elapsed < IDLE_POLL_INTERVAL,
+            "run() took {elapsed:?} to notice shutdown, well into the \
+             {IDLE_POLL_INTERVAL:?} idle sleep it was supposed to interrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_poll_interval_is_honoured_for_work_enqueued_while_idle() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut registry = JobRegistry::new();
+        registry.register("greet", ok_handler);
+        let worker = Worker::new(
+            app_state(&pool),
+            Arc::new(registry),
+            vec!["test".to_owned()],
+            1,
+        )
+        .with_idle_poll_interval(Duration::from_millis(20));
+
+        // Go idle on the empty queue for several short rounds, then enqueue:
+        // the job must be claimed and completed within 600 ms — a dozen
+        // rounds at the 20 ms interval, but far inside the one-second
+        // default the builder is meant to have replaced. Were the field
+        // ignored, the claim after the enqueue could not happen before the
+        // first default sleep expired and this would time out.
+        let ran = tokio::time::timeout(
+            Duration::from_millis(600),
+            worker.run(async move {
+                sleep(Duration::from_millis(100)).await;
+                let late = enqueue(&pool, test_job("greet"))
+                    .await
+                    .unwrap()
+                    .expect("the follow-up job inserts");
+                wait_for_state(&pool, late.id, "completed").await;
+            }),
+        )
+        .await;
+        assert!(
+            ran.is_ok(),
+            "a job enqueued into an idling worker was not drained within \
+             600 ms: the 20 ms idle poll interval was not honoured"
         );
     }
 
