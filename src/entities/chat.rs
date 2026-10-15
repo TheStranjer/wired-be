@@ -369,6 +369,7 @@ mod tests {
             inserted_at: at(SENT),
             updated_at: at(SENT),
             preferred_frontend: None,
+            is_suggested: Flag::new(false),
         }
     }
 

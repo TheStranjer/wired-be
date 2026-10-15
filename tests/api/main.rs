@@ -17,6 +17,9 @@
 // only a `pub` module makes the harness helpers lint-clean.
 pub mod common;
 
+/// The directory, suggestions, familiar-followers and birthday listings.
+mod account_lists;
+
 /// The account note endpoints (`/api/v1/accounts/{id}/note`).
 mod account_notes;
 
