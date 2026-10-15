@@ -1,0 +1,135 @@
+//! The HTTP integration test suite for wired-be, one crate.
+//!
+//! Every area file next to this one (`accounts.rs`, `activitypub.rs`, ...,
+//! `well_known.rs`) is a module of this crate, not its own test binary.
+//! Cargo compiles each top-level `tests/*.rs` file into a separate
+//! executable that statically links the whole `wired_be` crate and all its
+//! dependencies, so 39 files meant 39 relinks of every change to `src/` and
+//! gigabytes of duplicated debuginfo; one crate means one link and
+//! `cargo test --test api` runs the whole suite.
+//!
+//! The shared HTTP harness is [`common`]; the shape every endpoint test
+//! takes is documented in `docs/ARCHITECTURE.md` (“Writing tests”), and
+//! `health.rs` remains the reference example.
+
+// `pub` because Clippy's nursery `redundant_pub_crate` forbids `pub(crate)`
+// items inside a private module, while `unreachable_pub` forbids `pub` ones:
+// only a `pub` module makes the harness helpers lint-clean.
+pub mod common;
+
+/// The account note endpoints (`/api/v1/accounts/{id}/note`).
+mod account_notes;
+
+/// The core account endpoints: `verify_credentials`, `GET /accounts/{id}` and `lookup`.
+mod accounts;
+
+/// The `ActivityPub` actor document (`GET /users/{nickname}`).
+mod activitypub;
+
+/// Announcements over HTTP (`/api/v1/announcements`).
+mod announcements;
+
+/// The API router skeleton (`src/api.rs`) and its JSON fallback.
+mod api_skeleton;
+
+/// App registration and verification (`/api/v1/apps`).
+mod apps;
+
+/// The bearer extractors and scope guards of `wired_be::auth` over HTTP.
+mod auth;
+
+/// The blocks endpoints (`block`, `unblock` and the blocks list).
+mod blocks;
+
+/// The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 twin).
+mod chats;
+
+/// The custom emoji list (`GET /api/v1/custom_emojis`).
+mod custom_emojis;
+
+/// Domain blocks (`/api/v1/domain_blocks`).
+mod domain_blocks;
+
+/// The emoji-pack endpoints of `src/api/emoji_packs.rs`.
+mod emoji_packs;
+
+/// The endorsements endpoints (`/api/v1/endorsements`).
+mod endorsements;
+
+/// Filters over HTTP (`/api/v1/filters`).
+mod filters;
+
+/// The follower and following lists of an account.
+mod follow_lists;
+
+/// Follow requests (`/api/v1/follow_requests` and the answer routes).
+mod follow_requests;
+
+/// The `/health` endpoint and the `common` harness itself.
+mod health;
+
+/// The public instance endpoints (`src/api/instance.rs`).
+mod instance;
+
+/// List members (`/api/v1/lists/{id}/accounts`).
+mod list_accounts;
+
+/// Lists over HTTP (`/api/v1/lists`).
+mod lists;
+
+/// Read markers (`/api/v1/markers`).
+mod markers;
+
+/// The media route (`src/api/media_files.rs`) and the local uploader.
+mod media;
+
+/// The media metadata endpoints (`GET`/`PUT`/`DELETE /api/v1/media/{id}`).
+mod media_metadata;
+
+/// The media upload endpoints (`POST /api/v1/media` and `/api/v2/media`).
+mod media_upload;
+
+/// The MFA endpoints (`/api/pleroma/accounts/mfa`).
+mod mfa;
+
+/// The `MongooseIM` auth endpoints and the small utility endpoints.
+mod misc;
+
+/// The mutes endpoints.
+mod mutes;
+
+/// NodeInfo (`/.well-known/nodeinfo` and `/nodeinfo/{version}`).
+mod nodeinfo;
+
+/// The `/oauth` endpoints: the token, revoke and authorize flows.
+mod oauth;
+
+/// The external OAuth login endpoints.
+mod oauth_external;
+
+/// OAuth token management (`/api/oauth_tokens` and the pleroma apps).
+mod oauth_tokens;
+
+/// Account aliases and `move_account` (`/api/pleroma`).
+mod pleroma_account_settings;
+
+/// The Pleroma account extensions merged at `/api/pleroma/accounts`.
+mod pleroma_accounts;
+
+/// The frontend settings store, mascot and preferred frontend.
+mod pleroma_settings;
+
+/// `GET /api/v1/accounts/relationships`.
+mod relationships;
+
+/// `POST /api/v1/accounts/{id}/remove_from_followers`.
+mod remove_from_followers;
+
+/// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
+mod scrobbles;
+
+/// `PATCH /api/v1/accounts/update_credentials`.
+mod update_credentials;
+
+/// WebFinger and host-meta (`/.well-known/webfinger`, `/.well-known/host-meta`).
+mod well_known;

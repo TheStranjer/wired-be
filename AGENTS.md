@@ -74,7 +74,7 @@ These are community conventions, not compiler rules. Follow them anyway.
 - `src/main.rs` stays thin: read config, build the app, start the server. Logic lives in `src/lib.rs` and its modules so integration tests can import it.
 - Module files: use `src/foo.rs` plus `src/foo/bar.rs`. Don't use the old `src/foo/mod.rs` style.
 - Unit tests go at the bottom of the file they test, in `#[cfg(test)] mod tests { use super::*; ... }`.
-- Integration tests (exercise the whole router over HTTP) go in `tests/*.rs`. Shared test helpers go in `tests/common/mod.rs` (the one place `mod.rs` is conventional, so Cargo doesn't treat it as its own test binary).
+- Integration tests (exercise the whole router over HTTP) live in one test crate: `tests/api/main.rs` is its root and declares one `mod <area>;` per area file `tests/api/<area>.rs`; shared test helpers go in `tests/api/common.rs`. Cargo compiles every *top-level* `tests/*.rs` file as its own test binary that statically links the whole crate and all dependencies, so each extra top-level file costs a full relink on every `src/` change and a private copy of the debuginfo. One crate means one binary and one link. Add a new area as a module of `tests/api/` (and a `mod` line in `tests/api/main.rs`); never as a new top-level `tests/*.rs`.
 - Commit `Cargo.lock` (this is an application).
 
 Target layout as the project grows:
@@ -94,8 +94,11 @@ src/
     well_known.rs # /.well-known/webfinger, nodeinfo, host-meta
   models/         # domain types and DB access
 tests/
-  common/mod.rs
-  *.rs
+  fixtures/      # sample actors, included by src/ unit tests
+  api/
+    main.rs      # the one integration-test crate: `mod`s every file below
+    common.rs    # shared HTTP test harness
+    <area>.rs    # one module per API area (accounts.rs, ...)
 ```
 
 ### Axum specifics (v0.8)

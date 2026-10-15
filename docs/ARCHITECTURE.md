@@ -22,7 +22,7 @@ cite these decisions by number.
    Account, Status, Notification...) as `serde::Serialize` structs built from
    models; `src/federation/` = ActivityPub; `src/jobs/` = background job
    handlers; `src/util/` = helpers. Always `src/foo.rs` + `src/foo/bar.rs`,
-   never mod.rs (except tests/common/mod.rs).
+   never mod.rs.
 
 4. **IDs**: every primary key is a `uuid` column holding a UUIDv7 generated in
    Rust (`uuid::Uuid::now_v7()`), serialized to JSON as the hyphenated
@@ -65,7 +65,9 @@ cite these decisions by number.
     table.
 
 13. **Tests**: unit tests at the bottom of the file. HTTP tests live in
-    `tests/<area>.rs` and use `tests/common/mod.rs` helpers with the pooled
+    one test crate, `tests/api/` (`main.rs` + one `<area>.rs` module per
+    area, so the suite is one binary and one link, not 39 of each), and use
+    `tests/api/common.rs` helpers with the pooled
     test-database fixture in `src/test_db.rs` (`common::test_db()` hands out a
     slot; it reads `DATABASE_URL` but never mutates the environment) and
     `tower::ServiceExt::oneshot`. The fixture replaced `#[sqlx::test]`, which
@@ -101,22 +103,23 @@ cite these decisions by number.
 
 ## Writing tests
 
-`tests/common/mod.rs` holds the HTTP test harness (decision 13). It is
+`tests/api/common.rs` holds the HTTP test harness (decision 13). It is
 enabled by the `integration-tests` cargo feature (a self dev-dependency
 turns it on for `tests/` only; it is not named `test-support` because the
 denied `redundant_feature_names` lint rejects the `-support` suffix) and
 provides `test_config()` (wraps `Config::for_tests()`), `test_db()` (a slot of
 the fixture in `src/test_db.rs`), `test_app(pool)`, the `TestRequest`
 verb/body builders, `TestResponse` and the `assert_answer`/`assert_error`
-gate helpers. The shape every endpoint test takes (`tests/health.rs` is the
-reference):
+gate helpers. The whole suite is one crate (`tests/api/main.rs`) so Cargo
+builds one test binary instead of one per area file. The shape every
+endpoint test takes (`tests/api/health.rs` is the reference):
 
 ```rust
 #![cfg(test)]
 
-pub mod common;
-
 use axum::http::StatusCode;
+
+use crate::common;
 
 /// `/health` answers 204 No Content with an empty body.
 #[tokio::test]
@@ -139,13 +142,19 @@ async fn health_returns_no_content() {
 
 Rules that fall out of the lint gate (all verified against `scripts/ci.sh`):
 
-- Start every `tests/<area>.rs` with `#![cfg(test)]` and declare the harness
-  as `pub mod common;`. Bare `mod common;` makes `unreachable_pub` deny the
-  helpers' `pub`, while `pub(crate)` helpers trip the nursery
-  `redundant_pub_crate`; `pub` in a `pub` module under `#![cfg(test)]` is the
-  only combination that passes — and the `cfg(test)` gate is what lets
-  Clippy's `allow-unwrap-in-tests` family apply at all (integration crates
-  do not get that exemption by virtue of living under `tests/`).
+- The suite is one test crate: `tests/api/main.rs` is its root, declares the
+  harness once as `pub mod common;`, and `mod`s every `tests/api/<area>.rs`
+  with a `///` doc line. Never add a top-level `tests/*.rs` file: Cargo
+  compiles each one into its own test binary, statically linking the whole
+  crate again — 39 such files cost 39 relinks and 39 debuginfo copies per
+  `src/` change. Start every `tests/api/<area>.rs` with `#![cfg(test)]` and
+  pull in the harness with `use crate::common;`. Bare `mod common;` at the
+  root makes `unreachable_pub` deny the helpers' `pub`, while `pub(crate)`
+  helpers trip the nursery `redundant_pub_crate`; `pub` in a `pub` module
+  under `#![cfg(test)]` is the only combination that passes — and the
+  `cfg(test)` gate is what lets Clippy's `allow-unwrap-in-tests` family
+  apply at all (integration crates do not get that exemption by virtue of
+  living under `tests/`).
 - `common::test_db().await` leases a migrated, emptied slot database and hands
   back a `TestDb`; `db.pool()` is the `PgPool` to build the router on. Keep the
   `TestDb` binding alive for the whole test — dropping it releases the slot.
@@ -154,7 +163,7 @@ Rules that fall out of the lint gate (all verified against `scripts/ci.sh`):
 - `TestResponse` has `status`, `headers` and `body` fields, plus
   `.json::<T>()`, `.json_value()`, `.text()` and `.header(name)`.
 - Every added code path needs coverage, including the harness itself:
-  `tests/health.rs` checks the builders and accessors against an echo route.
+  `tests/api/health.rs` checks the builders and accessors against an echo
+  route.
 - Later tickets add fixture helpers (`create_user`, `create_token`, ...) to
-  `tests/common/mod.rs`; keep them there, do not duplicate them per test
-  file.
+  `tests/api/common.rs`; keep them there, do not duplicate them per area.

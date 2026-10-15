@@ -121,11 +121,21 @@ wired-be = { path = ".", features = ["integration-tests"] }
 # `zip` the library uses (see `[dependencies]`).
 zip = { version = "9.0.1", default-features = false, features = ["deflate"] }
 
+[profile.dev]
+# Full debuginfo made every debug binary hundreds of megabytes, and linking
+# and writing those dominated test builds. Line tables keep file:line in
+# backtraces and profilers at a fraction of the size; raise `debug` to
+# `true` for the odd session of stepping through dependencies.
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 # Dependencies (RSA, Argon2, PBKDF2, bcrypt, image codecs) are
 # unusably slow at opt-level 0; our own crate stays unoptimized so
 # incremental rebuilds stay fast.
 opt-level = 3
+# Dependencies' debuginfo is dead weight in every binary that links them:
+# we debug our own code, not the crates.io sources.
+debug = false
 
 [lints.rust]
 unsafe_code = "forbid"
