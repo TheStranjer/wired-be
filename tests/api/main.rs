@@ -59,6 +59,9 @@ mod emoji_packs;
 /// The endorsements endpoints (`/api/v1/endorsements`).
 mod endorsements;
 
+/// Atom and RSS feeds (`/users/{nickname}/feed*`, `/tags/{tag}`).
+mod feeds;
+
 /// Filters over HTTP (`/api/v1/filters`).
 mod filters;
 

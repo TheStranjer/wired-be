@@ -402,6 +402,20 @@ const LIVE_BY_ID_SQL: &str = "SELECT * FROM statuses WHERE id = $1 AND deleted_a
 const MANY_SQL: &str =
     "SELECT * FROM statuses WHERE id = ANY($1) AND deleted_at IS NULL ORDER BY id";
 
+/// [`newest_public_posts`]: one author's live `public` root posts (a reply
+/// or a reblog is neither), newest id first (decision 4), optionally a
+/// keyset page older than the cursor. `$2` is bound `NULL` on a first page,
+/// which keeps every row.
+const NEWEST_PUBLIC_POSTS_SQL: &str = "SELECT * FROM statuses
+   WHERE user_id = $1
+     AND visibility = 'public'
+     AND deleted_at IS NULL
+     AND in_reply_to_id IS NULL
+     AND reblog_of_id IS NULL
+     AND ($2::uuid IS NULL OR id < $2)
+ORDER BY id DESC
+    LIMIT $3";
+
 /// [`get_by_id_including_deleted`]: one row, tombstone or not.
 const ANY_BY_ID_SQL: &str = "SELECT * FROM statuses WHERE id = $1";
 
@@ -522,6 +536,36 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<Status>> {
     let ids = ids.to_vec();
     let statuses = sqlx::query_as::<_, Status>(MANY_SQL)
         .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+    Ok(statuses)
+}
+
+/// The newest `limit` live, `public`, root posts of author `user_id`,
+/// newest first (decision 4): the page the account's `Atom`/`RSS` feeds
+/// ([`crate::api::feeds`]) enumerate.
+///
+/// A root post is neither a reply nor a reblog — the feed carries what the
+/// account itself said, not its side of a conversation or its boosts — and
+/// `public` is the only visibility that is (an `unlisted` post is public to
+/// timelines but not advertised, `private`, `direct` and `local` are not
+/// public at all). `max_id`, when given, is the keyset cursor: only posts
+/// strictly older than it are returned.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn newest_public_posts(
+    pool: &PgPool,
+    user_id: Uuid,
+    max_id: Option<Uuid>,
+    limit: i64,
+) -> AppResult<Vec<Status>> {
+    let statuses = sqlx::query_as::<_, Status>(NEWEST_PUBLIC_POSTS_SQL)
+        .bind(user_id)
+        .bind(max_id)
+        .bind(limit)
         .fetch_all(pool)
         .await?;
     Ok(statuses)
@@ -1651,6 +1695,95 @@ mod tests {
         assert!(
             get_many(&pool, &[]).await.unwrap().is_empty(),
             "no ids, no rows"
+        );
+    }
+
+    /// Inserts `text` as `author`'s reblog of `original`.
+    async fn reblog(pool: &PgPool, author: &User, original: &Status, text: &str) -> Status {
+        insert(
+            pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original.id),
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("a reblog of a stored status inserts")
+    }
+
+    /// Inserts `text` as `author`'s status at the given visibility.
+    async fn visible(pool: &PgPool, author: &User, text: &str, visibility: Visibility) -> Status {
+        insert(
+            pool,
+            BASE,
+            &NewStatus {
+                visibility,
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("a fixture status at any visibility inserts")
+    }
+
+    /// The ids `newest_public_posts` answers, newest first, only the live
+    /// `public` roots of the asked-for author: the other visibilities, the
+    /// replies, the reblogs and the tombstones stay out, another author's
+    /// posts stay out, `max_id` keys the next page on the id (decision 4),
+    /// and `limit` cuts the page.
+    #[tokio::test]
+    async fn newest_public_posts_reads_the_author_s_public_roots() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let one = post(&pool, &alice, "one").await;
+        let _unlisted = visible(&pool, &alice, "unlisted", Visibility::Unlisted).await;
+        let _direct = visible(&pool, &alice, "direct", Visibility::Direct).await;
+        let _private = visible(&pool, &alice, "private", Visibility::Private).await;
+        let _localonly = visible(&pool, &alice, "local", Visibility::Local).await;
+        let _reply = reply(&pool, &alice, &one, "in answer").await;
+        let two = post(&pool, &alice, "two").await;
+        let _reblog = reblog(&pool, &alice, &two, "").await;
+        let three = post(&pool, &alice, "three").await;
+        let bob_post = post(&pool, &bob, "bob speaks").await;
+        assert!(
+            soft_delete(&pool, two.id).await.unwrap().is_some(),
+            "one public root is deleted"
+        );
+
+        assert_eq!(
+            ids(&newest_public_posts(&pool, alice.id, None, 20)
+                .await
+                .unwrap()),
+            vec![three.id, one.id],
+            "newest first; the unlisted, direct, private, local, reply, \
+             reblog and deleted rows are out, and bob's posts were never in"
+        );
+        assert_eq!(
+            ids(&newest_public_posts(&pool, alice.id, Some(three.id), 20)
+                .await
+                .unwrap()),
+            vec![one.id],
+            "the cursor page holds only the strictly older posts"
+        );
+        assert_eq!(
+            ids(&newest_public_posts(&pool, alice.id, None, 1).await.unwrap()),
+            vec![three.id],
+            "the limit cuts the page"
+        );
+        let carol = user(&pool, "carol").await;
+        assert!(
+            newest_public_posts(&pool, carol.id, None, 20)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an author with nothing to show answers the empty page"
+        );
+        assert_eq!(
+            ids(&newest_public_posts(&pool, bob.id, None, 20).await.unwrap()),
+            vec![bob_post.id],
+            "the other author keeps their own single public root"
         );
     }
 

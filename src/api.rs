@@ -13,13 +13,15 @@
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
 //!
-//! [`media_files`], [`activitypub`], [`well_known`], [`nodeinfo`],
+//! [`media_files`], [`activitypub`], [`feeds`], [`well_known`], [`nodeinfo`],
 //! [`oauth`], [`oauth_external`] and [`emoji_packs::files_router`] are the
 //! routers in this module that [`crate::app`] does not nest under `/api`:
 //! uploaded files live at `/media/{key}`, the address [`crate::uploads`]
 //! writes into activities; `ActivityPub` actors live at `/users/{nickname}`,
-//! the address federation sends as an actor's id; `WebFinger` and host-meta
-//! live at `/.well-known/…`, the discovery addresses fixed by their RFCs;
+//! the address federation sends as an actor's id; [`feeds`] joins it at
+//! `/users/{nickname}/feed*` and `/tags/{tag}`, the syndication addresses
+//! readers discover; `WebFinger` and host-meta live at `/.well-known/…`,
+//! the discovery addresses fixed by their RFCs;
 //! `NodeInfo` lives at `/.well-known/nodeinfo` and `/nodeinfo/{version}`,
 //! the addresses fixed by its schema; the OAuth endpoints live at
 //! `/oauth/…`, the token addresses fixed by RFC 6749, and so do the
@@ -42,6 +44,7 @@ pub mod custom_emojis;
 pub mod domain_blocks;
 pub mod emoji_packs;
 pub mod endorsements;
+pub mod feeds;
 pub mod filters;
 pub mod follow_requests;
 pub mod helpers;

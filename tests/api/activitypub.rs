@@ -2,10 +2,12 @@
 //!
 //! An `ActivityPub` client (an `Accept` naming `application/activity+json`
 //! or `application/ld+json`) gets Pleroma's `user.json` document as
-//! `application/activity+json; charset=utf-8`; anyone else gets 404
-//! `{"error":"Not found"}` for now, an unknown or remote account gets the
-//! same 404, and a deactivated local account gets 410 Gone. Every answer
-//! says it varies on `Accept`.
+//! `application/activity+json; charset=utf-8`; a browser (`Accept` naming
+//! `text/html`, no `ActivityPub` type) gets Pleroma's 302 to the frontend
+//! profile URL; anyone else gets 404 `{"error":"Not found"}`. An unknown
+//! or remote account gets the same 404 to an `ActivityPub` ask, and a
+//! deactivated local account gets 410 Gone. Every answer says it varies
+//! on `Accept`.
 //!
 //! The renderer's corner cases are covered where they live, in
 //! `src/federation/actor.rs`; what these tests own is the route: the
@@ -330,21 +332,39 @@ async fn ld_json_clients_get_the_actor_too() {
     }
 }
 
-/// A client that does not ask for `ActivityPub` gets the router-level 404:
-/// this backend is API-only and has no HTML profile page to answer with.
+/// A browser is not an `ActivityPub` client: it gets Pleroma's redirect to
+/// the frontend profile page, 302 with `Location: {BASE_URL}/{nickname}`.
+/// A client that asks for neither `ActivityPub` nor HTML still gets the
+/// router-level 404 (this backend is API-only and serves no HTML, decision
+/// 1).
 #[tokio::test]
-async fn a_browser_is_not_an_activitypub_client() {
+async fn a_browser_is_redirected_to_the_frontend() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let app = common::test_app(pool.clone());
-    for accept in [
-        "*/*",
-        "text/html",
-        "text/html,application/xhtml+xml",
-        "application/json",
-        "application/activity+xml",
-    ] {
+    for accept in ["text/html", "text/html,application/xhtml+xml"] {
+        let response = common::TestRequest::get(&format!("/users/{}", alice.nickname))
+            .header("accept", accept)
+            .send(&app)
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::FOUND,
+            "{accept} is redirected, not served a document"
+        );
+        assert_eq!(
+            response.header("location"),
+            Some("https://test.example/alice"),
+            "{accept} is sent to the frontend profile URL"
+        );
+        assert_eq!(
+            response.header("vary"),
+            Some("Accept"),
+            "the redirect for {accept} says it varies on Accept"
+        );
+    }
+    for accept in ["*/*", "application/json", "application/activity+xml"] {
         let response = common::TestRequest::get(&format!("/users/{}", alice.nickname))
             .header("accept", accept)
             .send(&app)
@@ -352,7 +372,7 @@ async fn a_browser_is_not_an_activitypub_client() {
         assert_eq!(
             response.status,
             StatusCode::NOT_FOUND,
-            "{accept} is not an ActivityPub client"
+            "{accept} is neither an ActivityPub client nor a browser"
         );
         assert_eq!(
             response.header("content-type"),
@@ -440,7 +460,13 @@ async fn a_deactivated_user_is_gone() {
         .await;
     assert_eq!(
         browser.status,
-        StatusCode::NOT_FOUND,
-        "a browser is not an ActivityPub client, gone or not"
+        StatusCode::FOUND,
+        "a browser is redirected to the frontend, gone or not — the \
+         frontend decides what to show there"
+    );
+    assert_eq!(
+        browser.header("location"),
+        Some("https://test.example/alice"),
+        "the redirect is the ordinary frontend profile URL"
     );
 }
