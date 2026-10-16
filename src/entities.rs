@@ -20,7 +20,9 @@
 //! and [`relationship`]
 //! the Mastodon `Relationship` entity (with Pleroma's `subscribing`
 //! alias), which [`models::relationship`](crate::models::relationship)
-//! batch-loads.
+//! batch-loads. [`status`] renders the Mastodon `Status` entity with
+//! Pleroma's extension block; its batch loader is
+//! [`services::render_status`](crate::services::render_status).
 
 pub mod account;
 pub mod announcement;
@@ -34,4 +36,5 @@ pub mod media_attachment;
 pub mod mention;
 pub mod relationship;
 pub mod scrobble;
+pub mod status;
 pub mod tag;

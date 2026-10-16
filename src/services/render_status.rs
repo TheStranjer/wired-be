@@ -1,0 +1,941 @@
+//! Turning [`models::status`] rows into rendered [`Status`] entities.
+//!
+//! [`render_statuses`] is the page renderer every timeline, list, thread
+//! and single-status endpoint will share (Pleroma's equivalent is
+//! `StatusView.render("index.json", …)`,
+//! `lib/pleroma/web/mastodon_api/views/status_view.ex`, with its
+//! `safe_render_many`): it takes the already-paged rows and loads
+//! everything they render from — authors, media attachments, mentions,
+//! hashtags, reblogged originals and quoted originals — with a FIXED set
+//! of batched queries, one per part, each keyed by an id list
+//! (`WHERE … = ANY($1)`), never a query per row. The count does not grow
+//! with the page size: seven statement groups whatever the batch —
+//!
+//! 1. reblogged originals — one [`status::get_many`];
+//! 2. quoted originals — one [`status::get_many`];
+//! 3. authors and replied-to authors — one [`user::get_many`];
+//! 4. media attachments — one [`media_attachment::for_statuses`];
+//! 5. mentions — one [`mention::for_statuses`];
+//! 6. hashtags — one [`hashtag::for_statuses`];
+//! 7. the viewer's relationships to the page's authors — the one fixed
+//!    [`Relationship::load_many`] set, run only for an authenticated viewer.
+//!
+//! Loaders whose id list came out empty skip the database entirely, so a
+//! page of plain posts costs four queries, and a viewer adds the
+//! relationship set.
+//!
+//! # Extension points
+//!
+//! The [entity](crate::entities::status) renders one placeholder per part
+//! no ticket has stored yet, and each later ticket fills exactly one by
+//! adding exactly one batched loader here (the shape `Batch::load`
+//! already shows: one id list, one keyed map) and threading that map
+//! through the batch context into [`StatusSource`]:
+//!
+//! - `favourited`: one read of the favourites table, `WHERE user_id =
+//!   viewer AND status_id = ANY(…)`.
+//! - `reblogged`: one read of the viewer's own reblog rows keyed by
+//!   `reblog_of_id` (statuses the viewer reblogs, not just statuses on
+//!   the page).
+//! - `bookmarked` and `pleroma.bookmark_folder`: the bookmarks ticket,
+//!   one read keyed by status and viewer.
+//! - `pinned` and `pleroma.pinned_at`: the pins table, one read keyed by
+//!   status.
+//! - `muted` and `pleroma.thread_muted`: one read of the viewer's muted
+//!   threads keyed by `conversation_id`.
+//! - `pleroma.direct_conversation_id`: the chat-participation ticket,
+//!   one read keyed by status and viewer.
+//! - `card`: the rich-media cards table, one read keyed by status id.
+//! - `poll`: the polls tables, one read keyed by status id.
+//! - `emojis`: the custom emojis, one read keyed by the shortcodes the
+//!   content uses.
+//! - `pleroma.emoji_reactions`: the reactions table, one read keyed by
+//!   status id, grouped per emoji and user.
+//! - `quote`: the quoted originals are *already* batch-loaded here
+//!   (step 2 above); the quoting ticket renders them into the entity —
+//!   one nested render, no new query — and decides its visibility.
+//!
+//! [`models::status`]: crate::models::status
+//! [`Status`]: crate::entities::status::Status
+//! [`StatusSource`]: crate::entities::status::StatusSource
+//! [`Relationship::load_many`]: crate::entities::relationship::Relationship::load_many
+
+use std::collections::{HashMap, HashSet};
+
+use sqlx::PgPool;
+use tracing::debug;
+use uuid::Uuid;
+
+use crate::{
+    config::Config,
+    entities::{
+        relationship::{Relationship, RelationshipMap},
+        status::{Status, StatusSource},
+    },
+    error::AppResult,
+    models::{
+        hashtag::{self, Hashtag},
+        media_attachment::{self, MediaAttachment as AttachmentRow},
+        mention,
+        status::{self, Status as StatusRow},
+        user::{self, User},
+    },
+    state::AppState,
+};
+
+/// Renders `statuses` as the [`Status`] entity for `viewer` (`None`: an
+/// anonymous request), in the input order.
+///
+/// The rows arrive as the caller paged and narrowed them — per-status
+/// visibility is the caller's [`filter_visible`] step — and this renderer
+/// only drops the rows no render can answer for:
+///
+/// - a tombstone ([`deleted_at`](StatusRow::deleted_at) set) is skipped:
+///   a deleted status is gone from every API surface, and list reads
+///   already exclude it;
+/// - a reblog row is skipped when its original is gone (deleted or never
+///   stored): Pleroma's renderer has nothing to nest either, and a reblog
+///   of a gone post is invisible by rule 7 of
+///   [`crate::models::status_visibility`].
+///
+/// All batch loading happens once per call, whatever the page size — see
+/// the [module docs](self) for the fixed query set and where each later
+/// flag's loader goes.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+///
+/// [`filter_visible`]: crate::models::status_visibility::filter_visible
+pub async fn render_statuses(
+    state: &AppState,
+    viewer: Option<&User>,
+    statuses: &[StatusRow],
+) -> AppResult<Vec<Status>> {
+    let rows: Vec<&StatusRow> = statuses
+        .iter()
+        .filter(|row| row.deleted_at.is_none())
+        .collect();
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch = Batch::load(state, viewer, &rows).await?;
+    Ok(batch.render_all(&rows))
+}
+
+/// Renders the single `status`, delegating to [`render_statuses`]: `None`
+/// when the row is a tombstone, or a reblog whose original is gone. One
+/// row costs the same fixed query set, no more.
+///
+/// # Errors
+///
+/// As [`render_statuses`].
+pub async fn render_status(
+    state: &AppState,
+    viewer: Option<&User>,
+    status: &StatusRow,
+) -> AppResult<Option<Status>> {
+    let mut rendered = render_statuses(state, viewer, std::slice::from_ref(status)).await?;
+    Ok(rendered.pop())
+}
+
+/// The batch-loaded parts of one page: every map keyed by the id its
+/// loader was asked about, so a row's render is a lookup, never a query.
+#[derive(Debug)]
+struct Batch<'a> {
+    /// The instance configuration the [`Account`] and tag URLs render
+    /// from.
+    ///
+    /// [`Account`]: crate::entities::account::Account
+    config: &'a Config,
+    /// The account whose view is being rendered, if any.
+    viewer: Option<&'a User>,
+    /// Every author and replied-to author on the page, keyed by id.
+    users: HashMap<Uuid, User>,
+    /// The reblogged originals, keyed by id.
+    originals: HashMap<Uuid, StatusRow>,
+    /// Media attachments, keyed by status, in position order.
+    media: HashMap<Uuid, Vec<AttachmentRow>>,
+    /// Mentions, keyed by status, in mention order.
+    mentions: HashMap<Uuid, Vec<User>>,
+    /// Hashtags, keyed by status, in name order.
+    tags: HashMap<Uuid, Vec<Hashtag>>,
+    /// The viewer's relationships to the page's authors, keyed by account
+    /// id; `None` for an anonymous viewer.
+    relationships: Option<RelationshipMap>,
+}
+
+impl<'a> Batch<'a> {
+    /// Runs the fixed query set of the [module docs](self) for `rows` and
+    /// keeps the results together. Every loader is handed its id list
+    /// deduplicated, and each one skips the database when the list is
+    /// empty.
+    async fn load(
+        state: &'a AppState,
+        viewer: Option<&'a User>,
+        rows: &[&'a StatusRow],
+    ) -> AppResult<Self> {
+        let pool = &state.db;
+        let reblog_ids = distinct(rows.iter().copied().filter_map(|row| row.reblog_of_id));
+        let originals = load_statuses_by_id(pool, &reblog_ids).await?;
+        let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
+        let quoted = load_statuses_by_id(pool, &quote_ids).await?;
+        debug!(
+            quotes = quoted.len(),
+            "quoted originals batch-loaded; the quoting ticket renders them"
+        );
+        let rendered_ids = distinct(
+            rows.iter()
+                .copied()
+                .map(|row| row.id)
+                .chain(originals.keys().copied()),
+        );
+        let account_ids = distinct(
+            rows.iter()
+                .copied()
+                .chain(originals.values())
+                .flat_map(|row| [Some(row.user_id), row.in_reply_to_account_id])
+                .flatten(),
+        );
+        let author_ids = distinct(
+            rows.iter()
+                .copied()
+                .map(|row| row.user_id)
+                .chain(originals.values().map(|row| row.user_id)),
+        );
+        Ok(Self {
+            config: state.config.as_ref(),
+            viewer,
+            users: load_users(pool, &account_ids).await?,
+            originals,
+            media: load_media(pool, &rendered_ids).await?,
+            mentions: load_mentions(pool, &rendered_ids).await?,
+            tags: load_tags(pool, &rendered_ids).await?,
+            relationships: load_relationships(pool, viewer, &author_ids).await?,
+        })
+    }
+
+    /// Renders every row of `rows` in order, nesting the original of a
+    /// reblog and dropping the rows the [`render_statuses`] contract
+    /// cannot answer for.
+    fn render_all(&self, rows: &[&StatusRow]) -> Vec<Status> {
+        let mut rendered = Vec::with_capacity(rows.len());
+        for row in rows {
+            let reblog = self.render_reblog(row);
+            if row.reblog_of_id.is_some() && reblog.is_none() {
+                continue;
+            }
+            if let Some(entity) = self.render_entity(row, reblog) {
+                rendered.push(entity);
+            }
+        }
+        rendered
+    }
+
+    /// The nested render of the original `row` reblogs: `None` when the
+    /// row reblogs nothing, and also when its original is gone — the
+    /// caller drops such reblogs. Every reblog renders its original
+    /// afresh, from maps already in memory; chains longer than one link
+    /// do not occur in stored data (see [`crate::models::status_visibility`]).
+    fn render_reblog(&self, row: &StatusRow) -> Option<Box<Status>> {
+        let original = self.originals.get(&row.reblog_of_id?)?;
+        Some(Box::new(self.render_entity(original, None)?))
+    }
+
+    /// Renders one `row` from the loaded maps, attaching `reblog` as its
+    /// nested entity. `None` when the row's author is not in the batch —
+    /// the foreign keys make that unobservable in stored data, and a
+    /// status with no author has no render.
+    fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
+        let author = self.users.get(&row.user_id)?;
+        let source = StatusSource {
+            row,
+            author,
+            reply_author: row
+                .in_reply_to_account_id
+                .and_then(|id| self.users.get(&id)),
+            media: self.media.get(&row.id).map_or(&[], Vec::as_slice),
+            mentions: self.mentions.get(&row.id).map_or(&[], Vec::as_slice),
+            tags: self.tags.get(&row.id).map_or(&[], Vec::as_slice),
+            reblog,
+        };
+        Some(Status::from_source(
+            source,
+            self.viewer,
+            self.relationships.as_ref(),
+            self.config,
+        ))
+    }
+}
+
+/// The distinct ids of `ids`, in order of first appearance: one ask of a
+/// batch loader is enough, whatever references an id on the page.
+fn distinct<I>(ids: I) -> Vec<Uuid>
+where
+    I: IntoIterator<Item = Uuid>,
+{
+    let mut seen = HashSet::new();
+    ids.into_iter().filter(|id| seen.insert(*id)).collect()
+}
+
+/// [`status::get_many`] keyed by id — one query for a page's reblogged
+/// originals or quoted originals, and no query at all for an empty list.
+/// Tombstones are already excluded by the loader, which is how a reblog
+/// of a deleted original falls out of the render.
+async fn load_statuses_by_id(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, StatusRow>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = status::get_many(pool, ids).await?;
+    Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+}
+
+/// [`user::get_many`] keyed by id — one query for every author and
+/// replied-to author on the page.
+async fn load_users(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, User>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let accounts = user::get_many(pool, ids).await?;
+    Ok(accounts
+        .into_iter()
+        .map(|account| (account.id, account))
+        .collect())
+}
+
+/// [`media_attachment::for_statuses`]: one query for every attachment.
+async fn load_media(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, Vec<AttachmentRow>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    media_attachment::for_statuses(pool, ids).await
+}
+
+/// [`mention::for_statuses`]: one query for every @-mention.
+async fn load_mentions(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, Vec<User>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    mention::for_statuses(pool, ids).await
+}
+
+/// [`hashtag::for_statuses`]: one query for every hashtag.
+async fn load_tags(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, Vec<Hashtag>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    hashtag::for_statuses(pool, ids).await
+}
+
+/// The viewer's relationships to the page's authors, keyed by account id:
+/// [`Relationship::load_many`] runs its own fixed set of queries once per
+/// page; an anonymous viewer has none to load, and an empty author list
+/// skips even that set.
+async fn load_relationships(
+    pool: &PgPool,
+    viewer: Option<&User>,
+    ids: &[Uuid],
+) -> AppResult<Option<RelationshipMap>> {
+    let Some(viewer) = viewer else {
+        return Ok(None);
+    };
+    if ids.is_empty() {
+        return Ok(Some(RelationshipMap::new()));
+    }
+    let loaded = Relationship::load_many(pool, viewer.id, ids).await?;
+    Ok(Some(ids.iter().copied().zip(loaded).collect()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::{SubsecRound as _, TimeZone as _, Utc};
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+
+    use super::*;
+    use crate::{
+        config::TEST_BASE_URL,
+        http_client::HttpClient,
+        models::{
+            follow,
+            media_attachment::NewMediaAttachment,
+            status::{NewStatus, Visibility, insert, soft_delete},
+            user::{NewUser, local_ap_id},
+        },
+        uploads::UploaderBackend,
+    };
+
+    /// The instance origin the fixtures post under.
+    const BASE: &str = TEST_BASE_URL;
+
+    /// The state under test: `pool` and the test config, with the
+    /// collaborators the renderer never touches.
+    fn test_state(pool: &PgPool) -> AppState {
+        let config = Arc::new(Config::for_tests());
+        AppState {
+            db: pool.clone(),
+            hub: crate::streaming::hub::Hub::new(pool),
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+        }
+    }
+
+    /// Inserts a local user named `nickname`.
+    async fn user(pool: &PgPool, nickname: &str) -> User {
+        user::insert(
+            pool,
+            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
+        )
+        .await
+        .expect("the fixture user inserts")
+    }
+
+    /// Inserts `text` as a local public status of `author`.
+    async fn post(pool: &PgPool, author: &User, text: &str) -> StatusRow {
+        insert(pool, BASE, &NewStatus::local(author, text))
+            .await
+            .expect("a plain local post inserts")
+    }
+
+    /// Every stored status, live or not, oldest id first.
+    async fn stored_statuses(pool: &PgPool) -> Vec<StatusRow> {
+        sqlx::query_as::<_, StatusRow>("SELECT * FROM statuses ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("the table reads")
+    }
+
+    /// The id strings of `statuses`, in order.
+    fn id_strings(statuses: &[StatusRow]) -> Vec<String> {
+        statuses
+            .iter()
+            .map(|status| status.id.to_string())
+            .collect()
+    }
+
+    /// The ids of rendered entities, in order.
+    fn rendered_ids(rendered: &[Status]) -> Vec<&str> {
+        rendered.iter().map(|status| status.id.as_str()).collect()
+    }
+
+    /// A local user named `nickname` with `count` plain posts.
+    async fn author_with_posts(pool: &PgPool, nickname: &str, count: i32) -> User {
+        let author = user(pool, nickname).await;
+        for n in 0..count {
+            let _posted = post(pool, &author, &format!("{nickname} post {n}")).await;
+        }
+        author
+    }
+
+    /// Renders `statuses` anonymously and returns the first entity's JSON.
+    async fn render_first(state: &AppState, statuses: &[StatusRow]) -> Value {
+        let rendered = render_statuses(state, None, statuses).await.unwrap();
+        serde_json::to_value(&rendered[0]).unwrap()
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_plain_status_renders_its_stored_facts(pool: PgPool) {
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let status = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                language: Some("en".to_owned()),
+                application_name: Some("Wired".to_owned()),
+                application_website: Some("https://wired.example".to_owned()),
+                visibility: Visibility::Local,
+                ..NewStatus::local(&alice, "hello #world")
+            },
+        )
+        .await
+        .unwrap();
+
+        let rendered = render_status(&state, None, &status).await.unwrap();
+        let entity = rendered.expect("a live status renders");
+        let value = serde_json::to_value(&entity).unwrap();
+        assert_eq!(value["id"], status.id.to_string());
+        assert_eq!(value["uri"], status.uri);
+        assert_eq!(value["url"], json!(status.url));
+        assert_eq!(value["content"], "<p>hello #world</p>");
+        assert_eq!(
+            value["visibility"], "local",
+            "Pleroma's local visibility emits its literal value"
+        );
+        assert_eq!(value["account"]["acct"], "alice", "the author entity");
+        assert_eq!(value["application"]["name"], "Wired");
+        assert_eq!(value["application"]["website"], "https://wired.example");
+        assert_eq!(value["language"], "en");
+        assert_eq!(value["reblog"], Value::Null, "a root post nests nothing");
+        assert_eq!(
+            value["pleroma"]["content"],
+            json!({ "text/plain": "hello #world" }),
+            "the raw text the author wrote"
+        );
+        assert_eq!(
+            value["pleroma"]["conversation_id"],
+            status.conversation_id.to_string()
+        );
+        assert_eq!(value["pleroma"]["local"], true);
+        assert_eq!(value["pleroma"]["parent_visible"], true);
+        assert_eq!(value["pleroma"]["emoji_reactions"], json!([]));
+        assert_eq!(value["pleroma"]["quotes_count"], 0);
+        assert_eq!(value["pleroma"]["expires_at"], Value::Null);
+        assert_eq!(value["pleroma"]["direct_conversation_id"], Value::Null);
+        assert_eq!(value["pleroma"]["bookmark_folder"], Value::Null);
+        assert_eq!(value["pleroma"]["pinned_at"], Value::Null);
+        assert_eq!(
+            value["tags"],
+            json!([{ "name": "world", "url": format!("{BASE}/tags/world") }]),
+            "the hashtag the batch loader brought along"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn replies_mentions_and_media_render_their_links(pool: PgPool) {
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let root = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                mentioned_user_ids: vec![bob.id],
+                ..NewStatus::local(&alice, "@bob look")
+            },
+        )
+        .await
+        .unwrap();
+        let reply = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                in_reply_to_id: Some(root.id),
+                in_reply_to_account_id: Some(alice.id),
+                ..NewStatus::local(&bob, "I will")
+            },
+        )
+        .await
+        .unwrap();
+        let media = insert(&pool, BASE, &NewStatus::local(&bob, "with a picture"))
+            .await
+            .unwrap();
+        let attachment = media_attachment::insert(
+            &pool,
+            &NewMediaAttachment {
+                user_id: Some(bob.id),
+                status_id: Some(media.id),
+                url: "https://media.example/pic.png".to_owned(),
+                content_type: "image/png".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let page = [reply.clone(), media.clone()];
+        let rendered = render_statuses(&state, None, &page).await.unwrap();
+        assert_eq!(
+            rendered_ids(&rendered),
+            id_strings(&page),
+            "input order, one entity per row"
+        );
+
+        let reply_json = serde_json::to_value(&rendered[0]).unwrap();
+        assert_eq!(reply_json["in_reply_to_id"], root.id.to_string());
+        assert_eq!(reply_json["in_reply_to_account_id"], alice.id.to_string());
+        assert_eq!(
+            reply_json["pleroma"]["in_reply_to_account_acct"], "alice",
+            "the parent author's handle, from the same batched user read"
+        );
+        assert_eq!(
+            reply_json["mentions"],
+            json!([]),
+            "this reply linked no mention row"
+        );
+
+        let media_json = serde_json::to_value(&rendered[1]).unwrap();
+        assert_eq!(
+            media_json["media_attachments"][0]["id"],
+            attachment.id.to_string(),
+            "the attached media renders"
+        );
+        assert_eq!(media_json["media_attachments"][0]["url"], attachment.url);
+
+        // The mention on the root status renders through the same path.
+        let root_json = render_first(&state, std::slice::from_ref(&root)).await;
+        assert_eq!(
+            root_json["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "bob",
+                     "url": format!("{BASE}/users/bob"), "acct": "bob" }]),
+            "NewStatus::mentioned_user_ids linked bob, and the mention \
+             loader brings him back"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn twenty_statuses_by_five_authors_render_in_one_batch(pool: PgPool) {
+        let state = test_state(&pool);
+        let mut authors = Vec::new();
+        for n in 0..5 {
+            authors.push(author_with_posts(&pool, &format!("user{n}"), 4).await);
+        }
+        let all = stored_statuses(&pool).await;
+        assert_eq!(all.len(), 20, "five authors with four posts each");
+        let want = id_strings(&all);
+
+        // The structural bound on the query set: one call over the whole
+        // slice (ids in, entities out — no per-row round in this API)
+        // renders all twenty rows, anonymous and authenticated alike. A
+        // per-row loader would show up as twenty times the queries, and
+        // this call makes exactly the fixed set of the module docs.
+        let anonymous = render_statuses(&state, None, &all).await.unwrap();
+        assert_eq!(
+            rendered_ids(&anonymous),
+            want,
+            "every row of a 20-strong slice renders, in id order"
+        );
+
+        let viewer = &authors[0];
+        let for_viewer = render_statuses(&state, Some(viewer), &all).await.unwrap();
+        assert_eq!(for_viewer.len(), 20, "a viewer renders the same page");
+        let value = serde_json::to_value(&for_viewer[0]).unwrap();
+        assert_eq!(
+            value["pleroma"]["local"], true,
+            "the pleroma block rides along on every entry"
+        );
+    }
+
+    /// The mixed page for the equivalence check below: a plain post with
+    /// a mention and a tag, an answer to it, a reblog of it, and a remote
+    /// mirror — every render branch in one batch.
+    async fn mixed_page(pool: &PgPool) -> (User, Vec<StatusRow>) {
+        let alice = user(pool, "alice").await;
+        let bob = user(pool, "bob").await;
+        let root = insert(
+            pool,
+            BASE,
+            &NewStatus {
+                mentioned_user_ids: vec![bob.id],
+                ..NewStatus::local(&alice, "@bob hello #world")
+            },
+        )
+        .await
+        .unwrap();
+        let answer = insert(
+            pool,
+            BASE,
+            &NewStatus {
+                in_reply_to_id: Some(root.id),
+                in_reply_to_account_id: Some(alice.id),
+                ..NewStatus::local(&bob, "hi back")
+            },
+        )
+        .await
+        .unwrap();
+        let reblog = insert(
+            pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(root.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .unwrap();
+        let mirror = insert(
+            pool,
+            BASE,
+            &NewStatus {
+                user_id: bob.id,
+                uri: Some("https://remote.example/posts/mirror".to_owned()),
+                content: "<p>mirrored</p>".to_owned(),
+                ..NewStatus::default()
+            },
+        )
+        .await
+        .unwrap();
+        let _attached = media_attachment::insert(
+            pool,
+            &NewMediaAttachment {
+                user_id: Some(alice.id),
+                status_id: Some(root.id),
+                url: "https://media.example/pic.png".to_owned(),
+                content_type: "image/png".to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (alice, vec![root, answer, reblog, mirror])
+    }
+
+    /// The batch renderer and the single-row helper must agree entry for
+    /// entry: one shared page of batch-loaded maps, then the same rows
+    /// rendered one at a time, produce byte-identical JSON. That is the
+    /// structural guarantee behind the fixed query set — the maps are
+    /// keyed by id, so a row cannot leak its page-mates' media, mentions,
+    /// tags or nested reblog into another entry.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_batched_page_equals_row_by_row_rendering(pool: PgPool) {
+        let state = test_state(&pool);
+        let (alice, page) = mixed_page(&pool).await;
+
+        for viewer in [None, Some(&alice)] {
+            let batched = render_statuses(&state, viewer, &page).await.unwrap();
+            assert_eq!(batched.len(), 4, "every live row of the page renders");
+            for (entry, row) in batched.iter().zip(&page) {
+                let alone = render_status(&state, viewer, row)
+                    .await
+                    .unwrap()
+                    .expect("each row also renders alone");
+                assert_eq!(
+                    serde_json::to_value(entry).unwrap(),
+                    serde_json::to_value(alone).unwrap(),
+                    "the batch entry of {} equals its single render for \
+                     the same viewer",
+                    row.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_collapses_repeats_and_keeps_first_seen_order() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let ids = distinct([a, b, a, a, b]);
+        assert_eq!(ids, vec![a, b], "one ask per id, in first-seen order");
+        assert!(distinct(std::iter::empty()).is_empty(), "nothing in");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_reblog_nests_the_original_and_keeps_its_own_identity(pool: PgPool) {
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                spoiler_text: "cats".to_owned(),
+                sensitive: true,
+                ..NewStatus::local(&alice, "original text")
+            },
+        )
+        .await
+        .unwrap();
+        let reblog = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity = render_status(&state, None, &reblog)
+            .await
+            .unwrap()
+            .expect("a reblog of a live original renders");
+        let value = serde_json::to_value(&entity).unwrap();
+
+        assert_eq!(value["id"], reblog.id.to_string());
+        assert_eq!(value["uri"], reblog.uri, "the reblog's own uri");
+        assert_eq!(value["url"], json!(reblog.url), "and its own url");
+        assert_eq!(value["content"], "", "the outer content is empty");
+        assert_eq!(
+            value["pleroma"]["content"],
+            json!({ "text/plain": "" }),
+            "a reblog has no source text of its own"
+        );
+        assert_eq!(value["account"]["acct"], "bob", "the reblogger speaks");
+        let nested = &value["reblog"];
+        assert_eq!(nested["id"], original.id.to_string());
+        assert_eq!(nested["uri"], original.uri);
+        assert_eq!(nested["content"], "<p>original text</p>");
+        assert_eq!(nested["account"]["acct"], "alice");
+        assert_eq!(nested["sensitive"], true, "the original keeps its flags");
+        assert_eq!(nested["spoiler_text"], "cats");
+        assert_eq!(
+            nested["reblog"],
+            Value::Null,
+            "one level deep, Pleroma's non-recursive Announce arm"
+        );
+
+        assert_eq!(
+            value["reblogs_count"], 0,
+            "the reblog row's own counter, not the original's"
+        );
+        let counted: (i32,) = sqlx::query_as("SELECT reblogs_count FROM statuses WHERE id = $1")
+            .bind(original.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(counted.0, 1, "the original is the one counted");
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn tombstones_and_reblogs_of_gone_originals_are_skipped(pool: PgPool) {
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let keep = post(&pool, &alice, "kept").await;
+        let doomed = post(&pool, &alice, "doomed").await;
+        let orphan_reblog = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(doomed.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .unwrap();
+        let tombstone = soft_delete(&pool, doomed.id)
+            .await
+            .unwrap()
+            .expect("the fixture delete found the live post");
+        assert!(tombstone.deleted_at.is_some(), "the row is a tombstone");
+
+        let keep_id = keep.id.to_string();
+        let rendered = render_statuses(&state, None, &[keep, tombstone.clone(), orphan_reblog])
+            .await
+            .unwrap();
+        assert_eq!(
+            rendered_ids(&rendered),
+            [keep_id],
+            "the tombstone and the reblog of a deleted original are both \
+             skipped; whatever survives keeps its place"
+        );
+        assert!(
+            render_status(&state, None, &tombstone)
+                .await
+                .unwrap()
+                .is_none(),
+            "the single helper answers None for a tombstone"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_viewers_relationship_lands_in_the_account_entity(pool: PgPool) {
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let following = follow::follow(&pool, BASE, &bob, &alice)
+            .await
+            .expect("bob follows alice");
+        assert_eq!(
+            following.state,
+            follow::FollowState::Accepted,
+            "alice is unlocked, so the follow is granted"
+        );
+        let status = post(&pool, &alice, "public hello").await;
+
+        let anonymous = render_first(&state, std::slice::from_ref(&status)).await;
+        assert_eq!(
+            anonymous["account"]["pleroma"]["relationship"],
+            json!({}),
+            "the anonymous viewer embeds Pleroma's empty relationship"
+        );
+
+        let for_bob = render_status(&state, Some(&bob), &status)
+            .await
+            .unwrap()
+            .expect("it renders for bob too");
+        let value = serde_json::to_value(&for_bob).unwrap();
+        assert_eq!(
+            value["account"]["pleroma"]["relationship"]["following"], true,
+            "the batched relationship preload reaches the account entity"
+        );
+
+        let for_alice = render_status(&state, Some(&alice), &status)
+            .await
+            .unwrap()
+            .expect("and for the author");
+        let owner_view = serde_json::to_value(&for_alice).unwrap();
+        assert_eq!(
+            owner_view["account"]["pleroma"]["relationship"],
+            json!({}),
+            "Pleroma keeps the owner's own relationship out of the render"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn remote_mirrors_render_their_stored_urls_and_text(pool: PgPool) {
+        let state = test_state(&pool);
+        let mallory = user(&pool, "mallory").await;
+        let published = Utc
+            .with_ymd_and_hms(2024, 2, 1, 8, 0, 0)
+            .unwrap()
+            .trunc_subsecs(6);
+        let status = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                user_id: mallory.id,
+                uri: Some("https://remote.example/posts/1".to_owned()),
+                url: Some("https://remote.example/notice/1".to_owned()),
+                content: "<p>from elsewhere</p>".to_owned(),
+                raw_text: String::new(),
+                expires_at: Some(published),
+                edited_at: Some(published),
+                inserted_at: Some(published),
+                language: Some("ko".to_owned()),
+                ..NewStatus::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let rendered = render_status(&state, None, &status)
+            .await
+            .unwrap()
+            .expect("a mirror renders");
+        let value = serde_json::to_value(&rendered).unwrap();
+        assert_eq!(value["uri"], "https://remote.example/posts/1");
+        assert_eq!(value["url"], "https://remote.example/notice/1");
+        assert_eq!(value["pleroma"]["local"], false, "a mirror is not local");
+        assert_eq!(
+            value["pleroma"]["content"],
+            json!({ "text/plain": "from elsewhere\n" }),
+            "no stored source text: the plain variant strips the HTML, the \
+             way strip_html renders a paragraph's end as a newline"
+        );
+        assert_eq!(value["pleroma"]["expires_at"], "2024-02-01T08:00:00.000Z");
+        assert_eq!(value["edited_at"], "2024-02-01T08:00:00.000Z");
+        assert_eq!(value["created_at"], "2024-02-01T08:00:00.000Z");
+        assert_eq!(value["language"], "ko");
+    }
+
+    /// The two degenerate pages: an empty slice and a slice of nothing
+    /// but tombstones both render empty, and the renderer returns before
+    /// any loader (or the database) is needed.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn empty_and_tombstone_pages_render_empty(pool: PgPool) {
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let status = post(&pool, &alice, "gone").await;
+        let tombstone = soft_delete(&pool, status.id)
+            .await
+            .unwrap()
+            .expect("the post was live");
+
+        let rendered = render_statuses(&state, None, &[]).await.unwrap();
+        assert!(rendered.is_empty(), "nothing in answers nothing out");
+        let tombstoned = render_statuses(&state, None, std::slice::from_ref(&tombstone))
+            .await
+            .unwrap();
+        assert!(
+            tombstoned.is_empty(),
+            "a page of tombstones renders empty without loading anything"
+        );
+    }
+}
