@@ -9,6 +9,7 @@ pub mod extract;
 pub mod federation;
 pub mod http_client;
 pub mod jobs;
+pub mod mailer;
 pub mod middleware;
 pub mod models;
 pub mod oauth;
@@ -62,8 +63,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// ([`Config::job_concurrency`] slots at once) until the process is
 /// interrupted. Job handlers are bound in the [`JobRegistry`] this builds:
 /// today the federation delivery job
-/// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)), so the
-/// worker idles, sweeps and delivers.
+/// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)) and the
+/// mailer job ([`mailer::KIND_SEND`]), so the worker idles, sweeps, delivers
+/// and sends. The state's mail transport comes from
+/// [`mailer::transport_from_config`]: the SMTP relay when `SMTP_HOST` is
+/// set, the disabled stand-in while it is not.
 ///
 /// # Errors
 ///
@@ -83,6 +87,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        mailer: mailer::transport_from_config(&config),
     };
     let listener = TcpListener::bind(state.config.bind_addr).await?;
     info!(addr = %state.config.bind_addr, "listening");
@@ -110,6 +115,7 @@ fn job_registry() -> JobRegistry {
         federation::delivery::KIND_DELIVER,
         federation::delivery::handle,
     );
+    registry.register(mailer::KIND_SEND, mailer::handle);
     registry
 }
 
@@ -205,6 +211,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(mailer::MemoryTransport::new()),
         })
     }
 

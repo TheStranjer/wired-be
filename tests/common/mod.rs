@@ -36,6 +36,7 @@ use uuid::Uuid;
 use wired_be::{
     config::Config,
     http_client::HttpClient,
+    mailer::MemoryTransport,
     models::{
         oauth_app::{self, NewOauthApp},
         oauth_token::{self, NewToken},
@@ -131,6 +132,7 @@ pub fn test_app_with_config(pool: PgPool, config: Config) -> Router {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        mailer: Arc::new(MemoryTransport::new()),
     })
 }
 

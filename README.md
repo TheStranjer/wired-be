@@ -42,6 +42,12 @@ All configuration comes from environment variables. For local development, copy 
 | `MEDIA_BASE_URL` | no | `{BASE_URL}/media` | Public prefix of uploaded files' URLs, served by `GET /media/{key}` (no trailing slash) |
 | `JOB_CONCURRENCY` | no | `10` | Job handlers a single worker runs at the same time |
 | `JOB_QUEUES` | no | `default,federator_incoming,federator_outgoing,mailer,scheduled,background` | Comma-separated job queue names, in claim priority order |
+| `SMTP_HOST` | no | | SMTP relay host for outbound email; while unset, mail is disabled and emails are dropped at queue time (logged at debug), never sent |
+| `SMTP_PORT` | no | `587` | SMTP relay port (the submission port; usually `465` with `SMTP_TLS=tls`) |
+| `SMTP_USERNAME` | no | | SMTP relay login name; authenticated only when it and `SMTP_PASSWORD` are both set |
+| `SMTP_PASSWORD` | no | | SMTP relay login secret; never logged |
+| `SMTP_TLS` | no | `starttls` | Relay encryption: `starttls` (upgrade required), `tls` (SMTPS) or `none` (plaintext, trusted local relay only) |
+| `MAIL_FROM` | no | `noreply@<instance domain>` | The `From:` address every sent email carries |
 
 ## Development
 

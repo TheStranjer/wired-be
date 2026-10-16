@@ -19,6 +19,7 @@ use wired_be::{
     auth::{AppAuth, AuthContext, AuthUser, MaybeAuthUser},
     error::AppError,
     http_client::HttpClient,
+    mailer::MemoryTransport,
     models::user::{Flag, NewUser},
     state::AppState,
     uploads::UploaderBackend,
@@ -39,6 +40,7 @@ fn auth_test_app(pool: PgPool) -> Router {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        mailer: Arc::new(MemoryTransport::new()),
     };
     Router::new()
         .route("/auth-user", get(auth_user_view))

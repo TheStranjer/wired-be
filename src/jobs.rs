@@ -16,7 +16,7 @@
 //! (see [`crate::federation::delivery`]). When the shutdown future resolves
 //! the worker stops claiming and waits for its in-flight jobs. Concrete
 //! handlers are registered by [`crate::serve`], which starts with the
-//! federation delivery job kind.
+//! federation delivery and mailer job kinds.
 
 use std::{
     collections::HashMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
@@ -399,6 +399,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
 
@@ -614,6 +615,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };
         let mut registry = JobRegistry::new();
         registry.register("flaky", retry_handler);
@@ -634,6 +636,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };
         let registry = JobRegistry::new();
         let outcome = dispatch_handler(&registry, &state, &job_row("mystery")).await;
@@ -723,6 +726,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };
         let mut registry = JobRegistry::new();
         registry.register("greet", reporting_handler);
