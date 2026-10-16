@@ -4,24 +4,31 @@
 //! (`lib/pleroma/web/mastodon_api/views/status_view.ex`); the JSON keys are
 //! emitted exactly as that view names them. [`MediaAttachment::from_model`]
 //! is pure (decision 3): it renders a
-//! [`media_attachments`](crate::models::media_attachment) row with no
-//! database and no config, because every URL the entity carries is already
-//! stored on the row.
+//! [`media_attachments`](crate::models::media_attachment) row and the
+//! instance [`Config`] — which it only consults
+//! to decide whether remote media URLs become signed proxy links — with
+//! no database access.
 //!
 //! Deliberate differences from the Pleroma view, per the ticket: the
 //! `type` is derived from the stored `content_type` prefix
 //! (`image/*` is `image`, `video/*` is `video`, `audio/*` is `audio`,
 //! anything else `unknown`; the `gifv` case — a `GIF` previewing as
 //! `video/mp4` — needs transcoding no ticket has stored yet, so nothing
-//! derives it), media proxying does not exist here so `url` is
-//! the stored public URL and `remote_url` the stored origin, and `meta`
-//! is assembled from the detection columns the row actually has, empty
-//! when none are filled.
+//! derives it), and `meta` is assembled from the detection columns the
+//! row actually has, empty when none are filled. `url`, `preview_url`
+//! and `text_url` pass through the media proxy helper
+//! ([`proxy_url`](crate::services::media_proxy::proxy_url)), which
+//! rewrites remote media to signed proxy links when `MEDIA_PROXY_ENABLED`
+//! is set and leaves everything else (local uploads, or any URL when the
+//! proxy is off) exactly as stored; `remote_url` stays the original.
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crate::models::media_attachment::MediaAttachment as AttachmentRow;
+use crate::{
+    config::Config, models::media_attachment::MediaAttachment as AttachmentRow,
+    services::media_proxy,
+};
 
 /// What kind of media an attachment is, as Mastodon names it in the
 /// entity's `type` field.
@@ -83,20 +90,25 @@ pub struct MediaAttachment {
 impl MediaAttachment {
     /// Renders `row` as an `Attachment` entity.
     ///
-    /// Pure (decision 3): every value comes from the row — the media type
-    /// from its content type, `preview_url` falling back to its public
-    /// URL, `meta` assembled from whichever detection columns are filled.
+    /// Pure (decision 3): every value comes from the row or `config` —
+    /// the media type from the content type, `preview_url` falling back
+    /// to the public URL, `meta` assembled from whichever detection
+    /// columns are filled. `url`, `preview_url` and `text_url` pass
+    /// through the media proxy helper; `remote_url` keeps the stored
+    /// origin verbatim.
     #[must_use]
-    pub fn from_model(row: &AttachmentRow) -> Self {
+    pub fn from_model(row: &AttachmentRow, config: &Config) -> Self {
         let media_type = type_for_content_type(&row.content_type);
-        let preview_url = row.preview_url.clone().unwrap_or_else(|| row.url.clone());
+        let url = media_proxy::proxy_url(config, &row.url);
+        let preview_url =
+            media_proxy::proxy_url(config, row.preview_url.as_deref().unwrap_or(&row.url));
         Self {
             id: row.id.to_string(),
             media_type,
-            url: row.url.clone(),
+            text_url: url.clone(),
+            url,
             preview_url,
             remote_url: row.remote_url.clone(),
-            text_url: row.url.clone(),
             meta: meta_for(row, media_type),
             description: row.description.clone().filter(|text| !text.is_empty()),
             blurhash: row.blurhash.clone(),
@@ -181,12 +193,15 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::{TEST_BASE_URL, TEST_DATABASE_URL};
     use crate::util::time::parse_time;
 
     /// The hyphenated lowercase id every fixture row carries.
     const ATTACHMENT_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
     /// The instance origin fixture URLs point at.
     const BASE: &str = "https://test.example";
+    /// The stored origin of a remote media fixture row.
+    const REMOTE_ORIGIN: &str = "https://remote.example/media/cat.gif";
 
     /// Every JSON key the entity must emit, sorted.
     const EXPECTED_KEYS: [&str; 10] = [
@@ -238,7 +253,7 @@ mod tests {
 
     /// `row` rendered to a JSON value; these structs always serialize.
     fn render(row: &AttachmentRow) -> Value {
-        serde_json::to_value(MediaAttachment::from_model(row)).unwrap()
+        serde_json::to_value(MediaAttachment::from_model(row, &Config::for_tests())).unwrap()
     }
 
     /// The rendered object's keys, sorted, for exact key-set assertions.
@@ -438,6 +453,92 @@ mod tests {
                 "original": { "width": 100, "height": 0, "size": "100x0" },
             }),
             "nothing divides by the stored zero height"
+        );
+    }
+
+    /// `row` rendered as an `Attachment` entity with the media proxy
+    /// `config` and returned as JSON.
+    fn render_with(row: &AttachmentRow, config: &Config) -> Value {
+        serde_json::to_value(MediaAttachment::from_model(row, config)).unwrap()
+    }
+
+    /// A signing secret comfortably past the 32-character minimum.
+    const TEST_PROXY_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A `Config` on the test origin with the media proxy enabled.
+    fn proxy_config() -> Config {
+        Config::from_lookup(|key| match key {
+            crate::config::DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+            crate::config::BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            crate::config::MEDIA_PROXY_ENABLED_VAR => Some("true".to_owned()),
+            crate::config::MEDIA_PROXY_SECRET_VAR => Some(TEST_PROXY_SECRET.to_owned()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    /// The `(sig, encoded)` pair a generated proxy link carries.
+    fn proxy_parts(link: &str) -> (String, String) {
+        let (_, tail) = link.split_once("/proxy/").unwrap();
+        let mut segments = tail.split('/');
+        (
+            segments.next().unwrap().to_owned(),
+            segments.next().unwrap().to_owned(),
+        )
+    }
+
+    #[test]
+    fn remote_urls_are_proxied_when_the_media_proxy_is_enabled() {
+        let mut row = base_row("image/gif");
+        row.storage_key = None;
+        row.remote_url = Some(REMOTE_ORIGIN.to_owned());
+        row.url = REMOTE_ORIGIN.to_owned();
+        row.preview_url = Some("https://remote.example/media/cat-small.png".to_owned());
+
+        let config = proxy_config();
+        let value = render_with(&row, &config);
+        let url = value["url"].as_str().unwrap();
+        assert!(
+            url.starts_with("https://test.example/proxy/") && url.ends_with("/cat.gif"),
+            "the public url becomes a signed proxy link: {url}"
+        );
+        assert_eq!(
+            value["text_url"],
+            Value::String(url.to_owned()),
+            "text_url tracks the proxied url"
+        );
+        let (sig, encoded) = proxy_parts(url);
+        assert_eq!(
+            media_proxy::decode(&config, &sig, &encoded).unwrap(),
+            REMOTE_ORIGIN,
+            "the link decodes back to the stored url"
+        );
+        let preview = value["preview_url"].as_str().unwrap();
+        assert!(
+            preview.starts_with("https://test.example/proxy/"),
+            "the remote preview is proxied too: {preview}"
+        );
+        assert_eq!(
+            value["remote_url"],
+            Value::String(REMOTE_ORIGIN.to_owned()),
+            "remote_url stays the original origin"
+        );
+    }
+
+    #[test]
+    fn local_uploads_are_not_proxied_even_when_the_media_proxy_is_enabled() {
+        let mut row = base_row("image/png");
+        row.preview_url = Some(format!("{BASE}/media/9b3c-small.png"));
+        let value = render_with(&row, &proxy_config());
+        assert_eq!(
+            value["url"],
+            serde_json::json!(format!("{BASE}/media/9b3c1d0e4f5a6b7c")),
+            "the instance's own media stays on the instance"
+        );
+        assert_eq!(
+            value["preview_url"],
+            serde_json::json!(format!("{BASE}/media/9b3c-small.png")),
+            "and so does its preview"
         );
     }
 

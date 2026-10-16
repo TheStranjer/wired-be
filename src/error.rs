@@ -10,8 +10,10 @@
 //! (Pleroma's `api_not_implemented`), "Not found" for any other unrouted
 //! path, "Throttled" for a rate limit (the wording of its rate limiter),
 //! "Gone" for a resource that used to exist and no longer does (Mastodon's
-//! wording for a deactivated account) and "Something went wrong" for
-//! server-side failures, whose real cause is only written to the log.
+//! wording for a deactivated account), "Something went wrong" for
+//! server-side failures, whose real cause is only written to the log, and
+//! 424/502 variants for upstreams this instance proxies to (see
+//! [`crate::services::media_proxy`]) whose detail is sent as-is.
 
 use std::{error::Error, fmt};
 
@@ -72,6 +74,15 @@ pub enum AppError {
     /// The request body's content type is not one the endpoint parses
     /// (415); see [`crate::extract`] for the accepted types.
     UnsupportedMediaType(String),
+    /// The upstream this endpoint fronts refused or failed the request,
+    /// or its body is not of a kind this endpoint serves (424 Failed
+    /// Dependency, Pleroma's answer when a media proxy fetch cannot be
+    /// served, `lib/pleroma/web/media_proxy/media_proxy_controller.ex`).
+    FailedDependency(String),
+    /// The upstream server this instance proxies to could not be reached
+    /// or answered unhelpfully (502), e.g. a media proxy fetch whose
+    /// transport failed (see [`crate::services::media_proxy`]).
+    BadGateway(String),
     /// The request is well formed but semantically invalid (422).
     Unprocessable(String),
     /// The caller exceeded its rate limit (429).
@@ -94,6 +105,8 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::FailedDependency(_) => StatusCode::FAILED_DEPENDENCY,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -110,6 +123,8 @@ impl AppError {
             | Self::Conflict(detail)
             | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
+            | Self::FailedDependency(detail)
+            | Self::BadGateway(detail)
             | Self::Unprocessable(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
             Self::NotImplemented => NOT_IMPLEMENTED_MESSAGE,
@@ -143,6 +158,8 @@ impl fmt::Display for AppError {
             | Self::Conflict(detail)
             | Self::PayloadTooLarge(detail)
             | Self::UnsupportedMediaType(detail)
+            | Self::FailedDependency(detail)
+            | Self::BadGateway(detail)
             | Self::Unprocessable(detail)
             | Self::Internal(detail) => f.write_str(detail),
             Self::NotFound => f.write_str(NOT_FOUND_MESSAGE),
@@ -169,6 +186,8 @@ impl Error for AppError {
             | Self::Conflict(_)
             | Self::PayloadTooLarge(_)
             | Self::UnsupportedMediaType(_)
+            | Self::FailedDependency(_)
+            | Self::BadGateway(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
             | Self::Internal(_) => None,
@@ -258,6 +277,11 @@ mod tests {
                 AppError::UnsupportedMediaType("Unsupported media type".to_owned()),
                 "Unsupported media type",
             ),
+            (
+                AppError::FailedDependency("Unsupported media type".to_owned()),
+                "Unsupported media type",
+            ),
+            (AppError::BadGateway("no route".to_owned()), "no route"),
             (AppError::Unprocessable("too long".to_owned()), "too long"),
             (AppError::RateLimited, RATE_LIMITED_MESSAGE),
             (AppError::Internal(SECRET.to_owned()), INTERNAL_MESSAGE),

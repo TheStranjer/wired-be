@@ -9,13 +9,18 @@
 //!
 //! Deliberately absent here: the `source` and `pleroma` extension objects
 //! (later tickets add them as `Account` options that `skip_serializing_if`
-//! they are unset), `hide_collections`, and any media proxying.
+//! they are unset) and `hide_collections`. Remote users' `avatar`,
+//! `avatar_static`, `header` and `header_static` pass through the media
+//! proxy helper ([`proxy_url`](crate::services::media_proxy::proxy_url)):
+//! with `MEDIA_PROXY_ENABLED` their remote image URLs become signed proxy
+//! links; local users, instance defaults and a disabled proxy all render
+//! the URL as stored.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{config::Config, models::user::User};
+use crate::{config::Config, models::user::User, services::media_proxy};
 
 /// The `actor_type` value that makes the entity's `group` flag true.
 const GROUP_ACTOR_TYPE: &str = "Group";
@@ -135,14 +140,18 @@ impl Account {
     /// users are exactly the counters federation stored.
     #[must_use]
     pub fn from_user(user: &User, config: &Config) -> Self {
-        let avatar = user
-            .avatar_url
-            .clone()
-            .unwrap_or_else(|| format!("{}{DEFAULT_AVATAR_PATH}", config.base_url));
-        let header = user
-            .banner_url
-            .clone()
-            .unwrap_or_else(|| format!("{}{DEFAULT_BANNER_PATH}", config.base_url));
+        let avatar = profile_image(
+            user,
+            config,
+            user.avatar_url.as_deref(),
+            DEFAULT_AVATAR_PATH,
+        );
+        let header = profile_image(
+            user,
+            config,
+            user.banner_url.as_deref(),
+            DEFAULT_BANNER_PATH,
+        );
         let url = user
             .profile_url
             .clone()
@@ -187,6 +196,25 @@ impl Account {
 #[must_use]
 pub fn local_url(config: &Config, nickname: &str) -> String {
     format!("{}/users/{nickname}", config.base_url)
+}
+
+/// The avatar/banner URL a remote user's profile renders with: the stored
+/// `stored_url`, or `{base_url}{default_path}` when unset, then through
+/// the media proxy helper — remote users only (ticket), so a local user's
+/// images pass through untouched.
+fn profile_image(
+    user: &User,
+    config: &Config,
+    stored_url: Option<&str>,
+    default_path: &str,
+) -> String {
+    let fallback = format!("{}{default_path}", config.base_url);
+    let url = stored_url.unwrap_or(&fallback);
+    if user.local.get() {
+        url.to_owned()
+    } else {
+        media_proxy::proxy_url(config, url)
+    }
 }
 
 /// The part of `nickname` before the first `@` — Pleroma's
@@ -238,7 +266,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{models::user::Flag, util::time::parse_time};
+    use crate::{
+        config::{TEST_BASE_URL, TEST_DATABASE_URL},
+        models::user::Flag,
+        util::time::parse_time,
+    };
 
     /// The hyphenated lowercase id every fixture row carries.
     const ACCOUNT_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
@@ -579,6 +611,90 @@ mod tests {
             local_url(&config, "alice"),
             "https://test.example/users/alice",
             "the profile url is the base url plus the users path and nickname"
+        );
+    }
+
+    /// A signing secret comfortably past the 32-character minimum.
+    const TEST_PROXY_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A `Config` on the test origin with the media proxy enabled.
+    fn proxy_config() -> Config {
+        Config::from_lookup(|key| match key {
+            crate::config::DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+            crate::config::BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            crate::config::MEDIA_PROXY_ENABLED_VAR => Some("true".to_owned()),
+            crate::config::MEDIA_PROXY_SECRET_VAR => Some(TEST_PROXY_SECRET.to_owned()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    /// A remote `bob@remote.example` mirroring the images federation stored.
+    fn remote_user_with_images() -> User {
+        let mut bob = base_user("bob@remote.example", "https://remote.example/users/bob");
+        bob.domain = Some("remote.example".to_owned());
+        bob.avatar_url = Some("https://remote.example/avatar.png".to_owned());
+        bob.banner_url = Some("https://remote.example/banner.gif".to_owned());
+        bob
+    }
+
+    #[test]
+    fn remote_user_images_are_proxied_when_the_media_proxy_is_enabled() {
+        let config = proxy_config();
+        let value = render(&remote_user_with_images(), &config);
+        for (key, suffix) in [
+            ("avatar", "/avatar.png"),
+            ("avatar_static", "/avatar.png"),
+            ("header", "/banner.gif"),
+            ("header_static", "/banner.gif"),
+        ] {
+            let url = value[key].as_str().unwrap();
+            assert!(
+                url.starts_with("https://test.example/proxy/") && url.ends_with(suffix),
+                "{key} becomes a signed proxy link with its filename: {url}"
+            );
+        }
+        let link = value["avatar"].as_str().unwrap();
+        let (_, tail) = link.split_once("/proxy/").unwrap();
+        let mut segments = tail.split('/');
+        let (sig, encoded) = (segments.next().unwrap(), segments.next().unwrap());
+        assert_eq!(
+            media_proxy::decode(&config, sig, encoded).unwrap(),
+            "https://remote.example/avatar.png",
+            "the proxied avatar decodes back to the stored url"
+        );
+    }
+
+    #[test]
+    fn local_images_and_instance_defaults_pass_through_when_enabled() {
+        let config = proxy_config();
+        let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
+        alice.local = Flag::new(true);
+        alice.avatar_url = Some("https://remote.example/bought.png".to_owned());
+        let local = render(&alice, &config);
+        assert_eq!(
+            local["avatar"], "https://remote.example/bought.png",
+            "only remote users' images are proxied"
+        );
+        assert_eq!(
+            local["header"],
+            serde_json::json!(format!("{BASE}/images/banner.png")),
+            "the unset banner is the instance default on the instance's own host"
+        );
+
+        let disabled = render(&remote_user_with_images(), &Config::for_tests());
+        assert_eq!(
+            disabled["avatar"], "https://remote.example/avatar.png",
+            "a disabled proxy leaves a remote user's images as stored"
+        );
+
+        let mut carol = base_user("carol@remote.example", "https://remote.example/users/carol");
+        carol.domain = Some("remote.example".to_owned());
+        let defaults = render(&carol, &config);
+        assert_eq!(
+            defaults["avatar"],
+            serde_json::json!(format!("{BASE}/images/avi.png")),
+            "a remote user without a stored avatar keeps the instance default, proxied or not"
         );
     }
 }

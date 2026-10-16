@@ -83,7 +83,10 @@ pub fn test_app_with_uploads_dir(pool: PgPool, uploads_dir: &Path) -> Router {
 
 /// The real application router from [`wired_be::app`] over `pool` and
 /// `config`.
-fn test_app_with_config(pool: PgPool, config: Config) -> Router {
+///
+/// Integration tests that need non-default settings (the media proxy,
+/// for instance) build a [`Config`] and pass it here.
+pub fn test_app_with_config(pool: PgPool, config: Config) -> Router {
     let config = Arc::new(config);
     wired_be::app(AppState {
         db: pool,
@@ -91,6 +94,37 @@ fn test_app_with_config(pool: PgPool, config: Config) -> Router {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
     })
+}
+
+/// The media proxy signing secret the tests use: 40 characters, safely
+/// past the 32-character minimum, and never a real secret.
+pub const MEDIA_PROXY_TEST_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// [`test_config`] with the media proxy enabled and a proxied body capped
+/// at `max_bytes` bytes.
+///
+/// # Panics
+///
+/// Never for the `max_bytes` values tests pass: every variable is fixed
+/// and valid.
+#[must_use]
+pub fn test_media_proxy_config(max_bytes: usize) -> Config {
+    Config::from_lookup(|key| match key {
+        wired_be::config::DATABASE_URL_VAR => Some(wired_be::config::TEST_DATABASE_URL.to_owned()),
+        wired_be::config::BASE_URL_VAR => Some(wired_be::config::TEST_BASE_URL.to_owned()),
+        wired_be::config::HTTP_ALLOW_PRIVATE_HOSTS_VAR
+        | wired_be::config::MEDIA_PROXY_ENABLED_VAR => Some("true".to_owned()),
+        wired_be::config::MEDIA_PROXY_SECRET_VAR => Some(MEDIA_PROXY_TEST_SECRET.to_owned()),
+        wired_be::config::MEDIA_PROXY_MAX_BYTES_VAR => Some(max_bytes.to_string()),
+        _ => None,
+    })
+    .expect("the fixed media proxy test config is valid")
+}
+
+/// The media-proxy application: [`test_media_proxy_config`] with a
+/// `max_bytes` cap on proxied bodies, served over `pool`.
+pub fn test_media_proxy_app(pool: PgPool, max_bytes: usize) -> Router {
+    test_app_with_config(pool, test_media_proxy_config(max_bytes))
 }
 
 /// Inserts a local [`User`] named `nickname` straight through

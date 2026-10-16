@@ -11,6 +11,7 @@ pub mod middleware;
 pub mod models;
 pub mod oauth;
 pub mod pagination;
+pub mod services;
 pub mod state;
 pub mod uploads;
 pub mod util;
@@ -22,7 +23,7 @@ use axum::{
 };
 use sqlx::PgPool;
 
-use crate::{api::media_files, error::AppError, state::AppState};
+use crate::{api::media_files, error::AppError, services::media_proxy, state::AppState};
 
 /// The migrations embedded from `migrations/`, applied by [`run_migrations`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -39,11 +40,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the three that serve
-/// addresses outside `/api` fixed by their protocols — `/media`
-/// ([`media_files`]), `/users/{nickname}` ([`api::activitypub`]) and
-/// `/.well-known` ([`api::well_known`]) — are merged at the top level.
-/// Paths no route matches get the standard JSON error response (decision 8).
+/// The [`api`] routers are merged under their prefixes; the four that serve
+/// addresses outside `/api` fixed by their protocols or their clients —
+/// `/media` ([`media_files`]), `/proxy` ([`media_proxy`]),
+/// `/users/{nickname}` ([`api::activitypub`]) and `/.well-known`
+/// ([`api::well_known`]) — are merged at the top level. Paths no route
+/// matches get the standard JSON error response (decision 8).
 pub fn app(state: AppState) -> Router {
     middleware::apply(
         Router::new()
@@ -52,6 +54,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::activitypub::router())
             .merge(api::well_known::router())
             .merge(media_files::router())
+            .merge(media_proxy::router())
             .fallback(not_found)
             .with_state(state),
     )

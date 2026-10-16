@@ -51,6 +51,23 @@ pub const MIN_PASSWORD_LENGTH_VAR: &str = "MIN_PASSWORD_LENGTH";
 /// Environment variable holding the lifetime of issued OAuth access
 /// tokens, in seconds.
 pub const OAUTH_TOKEN_TTL_SECS_VAR: &str = "OAUTH_TOKEN_TTL_SECS";
+/// Environment variable holding whether the media proxy rewrites remote
+/// media URLs (see [`crate::services::media_proxy`]).
+pub const MEDIA_PROXY_ENABLED_VAR: &str = "MEDIA_PROXY_ENABLED";
+/// Environment variable holding the HMAC-SHA256 secret the media proxy
+/// signs its URLs with; required, at least
+/// [`MIN_MEDIA_PROXY_SECRET_CHARS`] characters, whenever the proxy is
+/// enabled.
+pub const MEDIA_PROXY_SECRET_VAR: &str = "MEDIA_PROXY_SECRET";
+/// Environment variable overriding the base URL media proxy links are
+/// built from (e.g. a CDN in front of this instance's `/proxy` routes).
+pub const MEDIA_PROXY_BASE_URL_VAR: &str = "MEDIA_PROXY_BASE_URL";
+/// Environment variable holding the hard byte cap for one proxied media
+/// fetch.
+pub const MEDIA_PROXY_MAX_BYTES_VAR: &str = "MEDIA_PROXY_MAX_BYTES";
+/// Environment variable holding the comma-separated list of hosts the
+/// media proxy never proxies.
+pub const MEDIA_PROXY_BLACKLIST_VAR: &str = "MEDIA_PROXY_BLACKLIST";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -99,6 +116,16 @@ pub const DEFAULT_MIN_PASSWORD_LENGTH: usize = 8;
 ///
 /// [`DEFAULT_TOKEN_TTL`]: crate::models::oauth_token::DEFAULT_TOKEN_TTL
 pub const DEFAULT_OAUTH_TOKEN_TTL_SECS: usize = 2_592_000;
+/// Media proxy enablement used when `MEDIA_PROXY_ENABLED` is unset: the
+/// proxy is off, so entity URLs pass through untouched.
+pub const DEFAULT_MEDIA_PROXY_ENABLED: bool = false;
+/// Proxied media byte cap used when `MEDIA_PROXY_MAX_BYTES` is unset:
+/// 50 MB, the order of magnitude Pleroma's `max_body_length` media
+/// proxying allows.
+pub const DEFAULT_MEDIA_PROXY_MAX_BYTES: usize = 50_000_000;
+/// Minimum length, in characters, of `MEDIA_PROXY_SECRET` when the media
+/// proxy is enabled: 32 bytes of key material for HMAC-SHA256.
+pub const MIN_MEDIA_PROXY_SECRET_CHARS: usize = 32;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -107,6 +134,45 @@ pub const TEST_DATABASE_URL: &str = "postgres://localhost/wired_test";
 /// `BASE_URL` used by [`Config::for_tests`].
 #[cfg(any(test, feature = "integration-tests"))]
 pub const TEST_BASE_URL: &str = "https://test.example";
+
+/// Media proxy settings, from the five `MEDIA_PROXY_*` variables.
+///
+/// When [`enabled`](Self::enabled) is set, remote media URLs in API
+/// responses are rewritten to signed links this instance serves itself
+/// (see [`crate::services::media_proxy`]).
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaProxyConfig {
+    /// Whether remote media URLs are rewritten to proxy links, from
+    /// `MEDIA_PROXY_ENABLED`.
+    pub enabled: bool,
+    /// HMAC-SHA256 signing secret, from `MEDIA_PROXY_SECRET`; required
+    /// (and validated to be at least [`MIN_MEDIA_PROXY_SECRET_CHARS`]
+    /// characters) whenever [`enabled`](Self::enabled) is set. Redacted
+    /// in `Debug` output like `Config`'s `database_url`.
+    pub secret: Option<String>,
+    /// Base URL proxy links are built from, from `MEDIA_PROXY_BASE_URL`;
+    /// `None` means [`Config::base_url`]. Never ends in a slash.
+    pub base_url: Option<String>,
+    /// Hard cap on the bytes served for one proxied media file, from
+    /// `MEDIA_PROXY_MAX_BYTES`.
+    pub max_bytes: usize,
+    /// Hosts that are never proxied, from `MEDIA_PROXY_BLACKLIST`;
+    /// compared case-insensitively against the URL's host.
+    pub blacklist: Vec<String>,
+}
+
+/// Redacts [`secret`](Self::secret), which is signing key material.
+impl fmt::Debug for MediaProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaProxyConfig")
+            .field("enabled", &self.enabled)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("max_bytes", &self.max_bytes)
+            .field("blacklist", &self.blacklist)
+            .finish()
+    }
+}
 
 /// Application configuration.
 #[derive(Clone, PartialEq, Eq)]
@@ -157,6 +223,9 @@ pub struct Config {
     /// [`create_token`](crate::models::oauth_token::create_token) as the
     /// token's `ttl`.
     pub oauth_token_ttl_secs: usize,
+    /// The media proxy settings, from the `MEDIA_PROXY_*` variables
+    /// (see [`crate::services::media_proxy`]).
+    pub media_proxy: MediaProxyConfig,
 }
 
 impl Config {
@@ -228,6 +297,7 @@ impl Config {
             .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"));
         let (accounts_email_optional, min_password_length, oauth_token_ttl_secs) =
             auth_settings(&lookup)?;
+        let media_proxy = media_proxy_settings(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -246,6 +316,7 @@ impl Config {
             accounts_email_optional,
             min_password_length,
             oauth_token_ttl_secs,
+            media_proxy,
         })
     }
 
@@ -314,6 +385,13 @@ impl Config {
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
             oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
+            media_proxy: MediaProxyConfig {
+                enabled: DEFAULT_MEDIA_PROXY_ENABLED,
+                secret: None,
+                base_url: None,
+                max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
+                blacklist: Vec::new(),
+            },
         }
     }
 }
@@ -369,6 +447,46 @@ where
         min_password_length,
         oauth_token_ttl_secs,
     ))
+}
+
+/// Reads the five settings that configure the media proxy
+/// (see [`crate::services::media_proxy`]). Grouped because each is a
+/// plain default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); enabling the proxy without a long-enough secret is an
+/// error, since every proxy link would be unsignable (and the route
+/// unservable) without it.
+fn media_proxy_settings<F>(lookup: &F) -> Result<MediaProxyConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let enabled = boolean(lookup, MEDIA_PROXY_ENABLED_VAR, DEFAULT_MEDIA_PROXY_ENABLED)?;
+    let secret = lookup(MEDIA_PROXY_SECRET_VAR)
+        .map(|secret| secret.trim().to_owned())
+        .filter(|secret| !secret.is_empty());
+    if enabled {
+        let secret = secret
+            .as_deref()
+            .ok_or(ConfigError::Missing(MEDIA_PROXY_SECRET_VAR))?;
+        if secret.chars().count() < MIN_MEDIA_PROXY_SECRET_CHARS {
+            return Err(ConfigError::ShortMediaProxySecret(MEDIA_PROXY_SECRET_VAR));
+        }
+    }
+    let base_url = lookup(MEDIA_PROXY_BASE_URL_VAR)
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty());
+    let max_bytes = number(
+        lookup,
+        MEDIA_PROXY_MAX_BYTES_VAR,
+        DEFAULT_MEDIA_PROXY_MAX_BYTES,
+    )?;
+    let blacklist = comma_list(&lookup(MEDIA_PROXY_BLACKLIST_VAR).unwrap_or_default());
+    Ok(MediaProxyConfig {
+        enabled,
+        secret,
+        base_url,
+        max_bytes,
+        blacklist,
+    })
 }
 
 /// Reads a non-negative integer setting, applying `default` when the variable
@@ -438,6 +556,7 @@ impl fmt::Debug for Config {
             .field("accounts_email_optional", &self.accounts_email_optional)
             .field("min_password_length", &self.min_password_length)
             .field("oauth_token_ttl_secs", &self.oauth_token_ttl_secs)
+            .field("media_proxy", &self.media_proxy)
             .finish()
     }
 }
@@ -456,6 +575,10 @@ pub enum ConfigError {
     /// A boolean setting is not `true`/`false` (or `1`/`0`); the value is the
     /// variable name.
     InvalidBoolean(&'static str),
+    /// The media proxy is enabled but its `MEDIA_PROXY_SECRET` is shorter
+    /// than [`MIN_MEDIA_PROXY_SECRET_CHARS`] requires; the value is the
+    /// variable name.
+    ShortMediaProxySecret(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -470,6 +593,10 @@ impl fmt::Display for ConfigError {
             ),
             Self::InvalidNumber(var) => write!(f, "invalid {var}: expected a whole number"),
             Self::InvalidBoolean(var) => write!(f, "invalid {var}: expected true or false"),
+            Self::ShortMediaProxySecret(var) => write!(
+                f,
+                "invalid {var}: expected at least {MIN_MEDIA_PROXY_SECRET_CHARS} characters"
+            ),
         }
     }
 }
@@ -481,7 +608,8 @@ impl Error for ConfigError {
             Self::Missing(_)
             | Self::InvalidBaseUrl
             | Self::InvalidNumber(_)
-            | Self::InvalidBoolean(_) => None,
+            | Self::InvalidBoolean(_)
+            | Self::ShortMediaProxySecret(_) => None,
         }
     }
 }
@@ -896,6 +1024,158 @@ mod tests {
     }
 
     #[test]
+    fn media_proxy_defaults_to_disabled_passthrough() {
+        let config = config_with(&[]);
+        assert!(!config.media_proxy.enabled, "the proxy is off by default");
+        assert_eq!(
+            config.media_proxy.secret, None,
+            "no signing secret unless configured"
+        );
+        assert_eq!(
+            config.media_proxy.base_url, None,
+            "proxy links default to BASE_URL"
+        );
+        assert_eq!(
+            config.media_proxy.max_bytes, 50_000_000,
+            "default MEDIA_PROXY_MAX_BYTES"
+        );
+        assert!(
+            config.media_proxy.blacklist.is_empty(),
+            "nothing is blacklisted by default"
+        );
+    }
+
+    #[test]
+    fn reads_custom_media_proxy_settings() {
+        let config = config_with(&[
+            (MEDIA_PROXY_ENABLED_VAR, "true"),
+            (
+                MEDIA_PROXY_SECRET_VAR,
+                "  a-secret-of-exactly-32-characters  ",
+            ),
+            (MEDIA_PROXY_BASE_URL_VAR, " https://cdn.example/ "),
+            (MEDIA_PROXY_MAX_BYTES_VAR, "1024"),
+            (
+                MEDIA_PROXY_BLACKLIST_VAR,
+                "evil.example, cdn-only.example ,",
+            ),
+        ]);
+        assert!(config.media_proxy.enabled, "custom MEDIA_PROXY_ENABLED");
+        assert_eq!(
+            config.media_proxy.secret.as_deref(),
+            Some("a-secret-of-exactly-32-characters"),
+            "the secret is trimmed"
+        );
+        assert_eq!(
+            config.media_proxy.base_url.as_deref(),
+            Some("https://cdn.example"),
+            "MEDIA_PROXY_BASE_URL is trimmed and loses its trailing slash"
+        );
+        assert_eq!(config.media_proxy.max_bytes, 1024, "custom byte cap");
+        assert_eq!(
+            config.media_proxy.blacklist,
+            vec!["evil.example".to_owned(), "cdn-only.example".to_owned()],
+            "the blacklist is a trimmed comma list"
+        );
+    }
+
+    #[test]
+    fn media_proxy_secret_empty_string_is_unset() {
+        let err = try_config_with(&[
+            (MEDIA_PROXY_ENABLED_VAR, "true"),
+            (MEDIA_PROXY_SECRET_VAR, "   "),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Missing(MEDIA_PROXY_SECRET_VAR),
+            "an empty secret is a missing secret when enabled"
+        );
+    }
+
+    #[test]
+    fn enabling_the_media_proxy_without_a_secret_is_an_error() {
+        let err = try_config_with(&[(MEDIA_PROXY_ENABLED_VAR, "true")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::Missing(MEDIA_PROXY_SECRET_VAR),
+            "error variant"
+        );
+        assert!(
+            err.to_string().contains(MEDIA_PROXY_SECRET_VAR),
+            "message names the variable: {err}"
+        );
+    }
+
+    #[test]
+    fn short_media_proxy_secret_is_an_error() {
+        let err = try_config_with(&[
+            (MEDIA_PROXY_ENABLED_VAR, "true"),
+            (MEDIA_PROXY_SECRET_VAR, "too-short"),
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ShortMediaProxySecret(MEDIA_PROXY_SECRET_VAR),
+            "error variant"
+        );
+        assert!(err.source().is_none(), "no source");
+        assert_eq!(
+            err.to_string(),
+            "invalid MEDIA_PROXY_SECRET: expected at least 32 characters",
+            "message states the minimum"
+        );
+    }
+
+    #[test]
+    fn media_proxy_secret_needs_no_length_when_disabled() {
+        let config = config_with(&[
+            (MEDIA_PROXY_ENABLED_VAR, "false"),
+            (MEDIA_PROXY_SECRET_VAR, "short"),
+        ]);
+        assert!(
+            !config.media_proxy.enabled,
+            "the disabled proxy accepts any configured secret"
+        );
+        assert_eq!(
+            config.media_proxy.secret.as_deref(),
+            Some("short"),
+            "the configured secret is kept for when it is enabled"
+        );
+    }
+
+    #[test]
+    fn invalid_media_proxy_enabled_is_an_error() {
+        let err = try_config_with(&[(MEDIA_PROXY_ENABLED_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(MEDIA_PROXY_ENABLED_VAR),
+            "error variant"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_the_media_proxy_secret() {
+        let config = config_with(&[
+            (MEDIA_PROXY_ENABLED_VAR, "true"),
+            (MEDIA_PROXY_SECRET_VAR, "a-secret-of-exactly-32-characters"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("a-secret-of-exactly-32-characters"),
+            "the signing secret must not leak: {debug}"
+        );
+        assert!(
+            debug.contains("secret: Some(\"<redacted>\")"),
+            "the redaction marker stands in: {debug}"
+        );
+        assert!(
+            debug.contains("enabled: true"),
+            "the enablement flag is visible: {debug}"
+        );
+    }
+
+    #[test]
     fn empty_contact_email_is_none() {
         let config = config_with(&[(CONTACT_EMAIL_VAR, "")]);
         assert_eq!(config.contact_email, None, "empty contact_email");
@@ -982,6 +1262,7 @@ mod tests {
             UPLOAD_MAX_FILES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
+            MEDIA_PROXY_MAX_BYTES_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");
@@ -997,7 +1278,10 @@ mod tests {
     fn debug_redacts_database_url() {
         let config = config_with(&[]);
         let debug = format!("{config:?}");
-        assert!(!debug.contains("secret"), "password must not leak");
+        // The URL is `postgres://user:secret@localhost/wired`; the literal
+        // word `secret` also names the media proxy's (redacted) field, so
+        // the leak check is against the credential, not the word.
+        assert!(!debug.contains("user:secret@"), "password must not leak");
         assert!(debug.contains("<redacted>"), "redaction marker");
         assert!(debug.contains(ORIGIN), "base_url is shown");
     }
@@ -1036,6 +1320,10 @@ mod tests {
         assert_eq!(
             config.media_base_url, "https://test.example/media",
             "test media URLs hang off the test BASE_URL"
+        );
+        assert!(
+            !config.media_proxy.enabled,
+            "the media proxy is off for tests by default, so entity URLs pass through"
         );
         let expected = Config::from_lookup(lookup_from(&[
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
