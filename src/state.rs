@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use crate::{
     api::instance::InstanceStatsCache, config::Config, http_client::HttpClient,
-    streaming::hub::Hub, uploads::UploaderBackend,
+    mailer::MailTransport, streaming::hub::Hub, uploads::UploaderBackend,
 };
 
 /// State shared across all requests. Cheap to clone.
@@ -33,4 +33,25 @@ pub struct AppState {
     /// [`STATS_TTL`](crate::api::instance::STATS_TTL)). Construct it with
     /// `Arc::default()`, which applies the endpoint's TTL.
     pub instance_stats_cache: Arc<InstanceStatsCache>,
+    /// How emails leave this instance: the SMTP relay transport in
+    /// production (see [`crate::mailer::transport_from_config`]), the
+    /// recording [`MemoryTransport`](crate::mailer::MemoryTransport) in
+    /// tests. The [`mailer`](crate::mailer) job handler sends through it.
+    pub mailer: Arc<dyn MailTransport + Send + Sync>,
+}
+
+/// Test support: finding the recording mailbox behind [`mailer`](Self::mailer).
+#[cfg(any(test, feature = "integration-tests"))]
+impl AppState {
+    /// The [`MemoryTransport`](crate::mailer::MemoryTransport) behind
+    /// [`mailer`](Self::mailer), when the state was built with one — the
+    /// mailbox integration and unit tests assert deliveries on. `None` for
+    /// any other transport.
+    #[must_use]
+    pub fn mailbox(&self) -> Option<crate::mailer::MemoryTransport> {
+        self.mailer
+            .as_any()
+            .downcast_ref::<crate::mailer::MemoryTransport>()
+            .cloned()
+    }
 }

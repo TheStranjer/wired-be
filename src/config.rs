@@ -105,6 +105,19 @@ pub const JOB_QUEUES_VAR: &str = "JOB_QUEUES";
 /// Environment variable holding how many seconds the streaming WebSocket
 /// waits between two heartbeat pings of one socket.
 pub const STREAMING_PING_INTERVAL_SECS_VAR: &str = "STREAMING_PING_INTERVAL_SECS";
+/// Environment variable holding the SMTP relay host; mail is disabled while
+/// it is unset.
+pub const SMTP_HOST_VAR: &str = "SMTP_HOST";
+/// Environment variable holding the SMTP relay port.
+pub const SMTP_PORT_VAR: &str = "SMTP_PORT";
+/// Environment variable holding the SMTP relay login name.
+pub const SMTP_USERNAME_VAR: &str = "SMTP_USERNAME";
+/// Environment variable holding the SMTP relay login secret.
+pub const SMTP_PASSWORD_VAR: &str = "SMTP_PASSWORD";
+/// Environment variable holding the SMTP encryption mode.
+pub const SMTP_TLS_VAR: &str = "SMTP_TLS";
+/// Environment variable holding the `From:` address of every sent email.
+pub const MAIL_FROM_VAR: &str = "MAIL_FROM";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -244,6 +257,13 @@ pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// unset: the 30 seconds Pleroma's `WebsocketHandler` pings a socket on
 /// (`lib/pleroma/web/mastodon_api/websocket_handler.ex`, `@tick`).
 pub const DEFAULT_STREAMING_PING_INTERVAL_SECS: usize = 30;
+/// SMTP relay port used when `SMTP_PORT` is unset: the `SUBMISSION` port,
+/// where a relay accepts authenticated client connections.
+pub const DEFAULT_SMTP_PORT: u16 = 587;
+/// Sender user part used when `MAIL_FROM` is unset: the `noreply` of the
+/// default address, attached to the instance domain, so an unset `MAIL_FROM`
+/// on `social.example` sends as `noreply@social.example`.
+pub const DEFAULT_MAIL_FROM_USER: &str = "noreply";
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from the fixture
 /// in [`crate::test_db`].
@@ -361,6 +381,37 @@ impl fmt::Debug for OauthProvider {
             .field("email_field", &self.email_field)
             .field("name_field", &self.name_field)
             .finish()
+    }
+}
+
+/// How the SMTP relay connection is encrypted, the value of `SMTP_TLS`.
+///
+/// Parsed by the `SMTP_TLS` reader in `mailer_settings`; the unset or blank
+/// default is [`Starttls`](Self::Starttls), the mode submission-port relays
+/// speak.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SmtpTls {
+    /// Plain connection upgraded with STARTTLS, required before any
+    /// credential is sent.
+    #[default]
+    Starttls,
+    /// Implicit TLS for the whole connection (SMTPS, traditionally port
+    /// 465).
+    Tls,
+    /// No encryption at all, for a trusted local relay.
+    None,
+}
+
+impl SmtpTls {
+    /// The mode an `SMTP_TLS` value names, case-insensitively and trimmed;
+    /// `None` for any other spelling.
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "starttls" => Some(Self::Starttls),
+            "tls" => Some(Self::Tls),
+            "none" => Some(Self::None),
+            _ => None,
+        }
     }
 }
 
@@ -489,6 +540,25 @@ pub struct Config {
     ///
     /// [`PING_INTERVAL`]: crate::api::streaming::PING_INTERVAL
     pub streaming_ping_interval_secs: usize,
+    /// SMTP relay host the mailer connects to, from `SMTP_HOST`; `None`
+    /// (the default) disables mail entirely, so nothing is even queued.
+    /// See [`crate::mailer`].
+    pub smtp_host: Option<String>,
+    /// SMTP relay port, from `SMTP_PORT`; 587, the submission port, by
+    /// default. With [`SmtpTls::Tls`] an operator usually sets 465.
+    pub smtp_port: u16,
+    /// SMTP relay login name, from `SMTP_USERNAME`; `None` sends
+    /// unauthenticated.
+    pub smtp_username: Option<String>,
+    /// SMTP relay login secret, from `SMTP_PASSWORD`. Secret material: the
+    /// manual `Debug` impl below redacts it.
+    pub smtp_password: Option<String>,
+    /// How the relay connection is encrypted, from `SMTP_TLS`
+    /// ([`SmtpTls::Starttls`] by default).
+    pub smtp_tls: SmtpTls,
+    /// The `From:` address every sent email carries, from `MAIL_FROM`;
+    /// `noreply@<instance domain>` by default.
+    pub mail_from: String,
 }
 
 impl Config {
@@ -525,18 +595,8 @@ impl Config {
         let base_url = normalize_base_url(&base_url_raw)?;
         let (instance_name, instance_description, contact_email, instance_languages) =
             instance_profile(&lookup);
-        let max_status_chars = number(&lookup, MAX_STATUS_CHARS_VAR, DEFAULT_MAX_STATUS_CHARS)?;
-        let max_media_attachments = number(
-            &lookup,
-            MAX_MEDIA_ATTACHMENTS_VAR,
-            DEFAULT_MAX_MEDIA_ATTACHMENTS,
-        )?;
-        let max_poll_options = number(&lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?;
-        let max_chat_message_chars = number(
-            &lookup,
-            MAX_CHAT_MESSAGE_CHARS_VAR,
-            DEFAULT_MAX_CHAT_MESSAGE_CHARS,
-        )?;
+        let (max_status_chars, max_media_attachments, max_poll_options, max_chat_message_chars) =
+            content_limits(&lookup)?;
         let (max_media_description, max_display_name_chars, max_bio_chars, max_profile_fields) =
             text_length_limits(&lookup)?;
         let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
@@ -553,6 +613,8 @@ impl Config {
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (registrations_open, available_frontends) = client_exposure(&lookup)?;
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
+        let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
+            mailer_settings(&lookup, domain_of(&base_url))?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -590,16 +652,20 @@ impl Config {
             job_concurrency,
             job_queues,
             streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
+            smtp_host,
+            smtp_port,
+            smtp_username,
+            smtp_password,
+            smtp_tls,
+            mail_from,
         })
     }
 
-    /// The host of [`base_url`](Self::base_url), plus `:port` when the port is
-    /// not the scheme's default, e.g. `social.example` or `localhost:4000`.
+    /// The [`base_url`](Self::base_url) without its scheme: `social.example`,
+    /// or `localhost:4000` when a non-default port is part of the origin.
     #[must_use]
     pub fn domain(&self) -> &str {
-        self.base_url
-            .split_once("://")
-            .map_or(self.base_url.as_str(), |(_, domain)| domain)
+        domain_of(&self.base_url)
     }
 
     /// Whether [`base_url`](Self::base_url) uses the `https` scheme.
@@ -687,6 +753,12 @@ impl Config {
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
             job_queues: comma_list(DEFAULT_JOB_QUEUES),
             streaming_ping_interval_secs: DEFAULT_STREAMING_PING_INTERVAL_SECS,
+            smtp_host: None,
+            smtp_port: DEFAULT_SMTP_PORT,
+            smtp_username: None,
+            smtp_password: None,
+            smtp_tls: SmtpTls::default(),
+            mail_from: default_mail_from(domain_of(TEST_BASE_URL)),
         }
     }
 }
@@ -781,6 +853,104 @@ where
     )
 }
 
+/// What [`mailer_settings`] reads, in [`Config`] field order: the relay
+/// host, the relay port, the login name and secret, the encryption mode and
+/// the sender address.
+type MailerSettings = (
+    Option<String>,
+    u16,
+    Option<String>,
+    Option<String>,
+    SmtpTls,
+    String,
+);
+
+/// Reads the six settings that configure outbound mail: the relay host
+/// (unset means mail is disabled), the relay port, the login name and
+/// secret, the encryption mode and the sender address. Grouped because each
+/// is a plain default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); the tuple comes back in field order. `domain` is the
+/// [`domain_of`] the default sender address is built from.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when `SMTP_PORT` is not a whole
+/// number in the `u16` range, and [`ConfigError::InvalidSmtpTls`] when
+/// `SMTP_TLS` names no known mode.
+fn mailer_settings<F>(lookup: &F, domain: &str) -> Result<MailerSettings, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let smtp_host = lookup(SMTP_HOST_VAR)
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty());
+    let smtp_port = smtp_port(lookup)?;
+    let smtp_username = lookup(SMTP_USERNAME_VAR)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    let smtp_password = lookup(SMTP_PASSWORD_VAR).filter(|secret| !secret.is_empty());
+    let smtp_tls = smtp_tls(lookup)?;
+    let mail_from = lookup(MAIL_FROM_VAR)
+        .map(|from| from.trim().to_owned())
+        .filter(|from| !from.is_empty())
+        .unwrap_or_else(|| default_mail_from(domain));
+    Ok((
+        smtp_host,
+        smtp_port,
+        smtp_username,
+        smtp_password,
+        smtp_tls,
+        mail_from,
+    ))
+}
+
+/// Reads `SMTP_PORT`: a whole number in the `u16` range,
+/// [`DEFAULT_SMTP_PORT`] when unset.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] for a non-number or a value
+/// outside the port range.
+fn smtp_port<F>(lookup: &F) -> Result<u16, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let port = number(lookup, SMTP_PORT_VAR, usize::from(DEFAULT_SMTP_PORT))?;
+    u16::try_from(port).map_err(|_out_of_range| ConfigError::InvalidNumber(SMTP_PORT_VAR))
+}
+
+/// Reads `SMTP_TLS`: one of the [`SmtpTls`] spellings, case-insensitive,
+/// [`SmtpTls::default`] when unset or blank.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidSmtpTls`] for any other spelling.
+fn smtp_tls<F>(lookup: &F) -> Result<SmtpTls, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) = lookup(SMTP_TLS_VAR).filter(|value| !value.trim().is_empty()) else {
+        return Ok(SmtpTls::default());
+    };
+    SmtpTls::parse(&raw).ok_or(ConfigError::InvalidSmtpTls(SMTP_TLS_VAR))
+}
+
+/// The [`Config::domain`] of a normalized base URL: everything after the
+/// `://`.
+fn domain_of(base_url: &str) -> &str {
+    base_url
+        .split_once("://")
+        .map_or(base_url, |(_, domain)| domain)
+}
+
+/// The `MAIL_FROM` value used when the variable is unset:
+/// `noreply@<instance domain>`. A port is not part of an email domain, so
+/// `localhost:4000` contributes only `localhost`.
+fn default_mail_from(domain: &str) -> String {
+    let host = domain.split_once(':').map_or(domain, |(host, _)| host);
+    format!("{DEFAULT_MAIL_FROM_USER}@{host}")
+}
+
 /// What [`auth_settings`] reads, in [`Config`] field order: the email
 /// requirement, the password minimum, the token lifetime and the providers.
 type AuthSettings = (bool, usize, usize, Vec<OauthProvider>);
@@ -861,6 +1031,43 @@ where
         boolean(lookup, MONGOOSEIM_ENABLED_VAR, DEFAULT_MONGOOSEIM_ENABLED)?.into(),
         boolean(lookup, CAPTCHA_ENABLED_VAR, DEFAULT_CAPTCHA_ENABLED)?.into(),
         boolean(lookup, HEALTHCHECK_ENABLED_VAR, DEFAULT_HEALTHCHECK_ENABLED)?.into(),
+    ))
+}
+
+/// The shape [`content_limits`] answers: the four plain numeric content
+/// limits in field order (status length, attachment count, poll options,
+/// chat message length); factored out because a bare fourfold tuple is
+/// Clippy's `type_complexity` fodder.
+type ContentLimits = (usize, usize, usize, usize);
+
+/// Reads the four plain numeric content limits: the maximum status length
+/// (`MAX_STATUS_CHARS`), the media attachment count
+/// (`MAX_MEDIA_ATTACHMENTS`), the poll option count (`MAX_POLL_OPTIONS`)
+/// and the chat message length (`MAX_CHAT_MESSAGE_CHARS`). Grouped because
+/// each is the same `number` read and [`Config::from_lookup`] has a size
+/// budget (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] for whichever variable holds a
+/// value that is not a whole number.
+fn content_limits<F>(lookup: &F) -> Result<ContentLimits, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        number(lookup, MAX_STATUS_CHARS_VAR, DEFAULT_MAX_STATUS_CHARS)?,
+        number(
+            lookup,
+            MAX_MEDIA_ATTACHMENTS_VAR,
+            DEFAULT_MAX_MEDIA_ATTACHMENTS,
+        )?,
+        number(lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?,
+        number(
+            lookup,
+            MAX_CHAT_MESSAGE_CHARS_VAR,
+            DEFAULT_MAX_CHAT_MESSAGE_CHARS,
+        )?,
     ))
 }
 
@@ -1066,6 +1273,12 @@ impl fmt::Debug for Config {
                 "streaming_ping_interval_secs",
                 &self.streaming_ping_interval_secs,
             )
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_username", &self.smtp_username)
+            .field("smtp_password", &"<redacted>")
+            .field("smtp_tls", &self.smtp_tls)
+            .field("mail_from", &self.mail_from)
             .finish()
     }
 }
@@ -1087,6 +1300,9 @@ pub enum ConfigError {
     /// `OAUTH_PROVIDERS` is not the JSON text of an array of provider
     /// objects; the value is what the JSON parser said.
     InvalidOauthProviders(String),
+    /// `SMTP_TLS` is not one of `starttls`, `tls` or `none`; the value is the
+    /// variable name.
+    InvalidSmtpTls(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -1105,6 +1321,9 @@ impl fmt::Display for ConfigError {
                 f,
                 "invalid {OAUTH_PROVIDERS_VAR}: expected a JSON array of provider objects: {detail}"
             ),
+            Self::InvalidSmtpTls(var) => {
+                write!(f, "invalid {var}: expected one of starttls, tls or none")
+            }
         }
     }
 }
@@ -1117,7 +1336,8 @@ impl Error for ConfigError {
             | Self::InvalidBaseUrl
             | Self::InvalidNumber(_)
             | Self::InvalidBoolean(_)
-            | Self::InvalidOauthProviders(_) => None,
+            | Self::InvalidOauthProviders(_)
+            | Self::InvalidSmtpTls(_) => None,
         }
     }
 }
@@ -1460,6 +1680,157 @@ mod tests {
             config_with(&[(STREAMING_PING_INTERVAL_SECS_VAR, "")]).streaming_ping_interval_secs,
             DEFAULT_STREAMING_PING_INTERVAL_SECS,
             "an empty value applies the default"
+        );
+    }
+
+    #[test]
+    fn mailer_settings_default_to_disabled_mail() {
+        let config = config_with(&[]);
+        assert_eq!(config.smtp_host, None, "mail is disabled by default");
+        assert_eq!(config.smtp_port, 587, "default SMTP_PORT is submission");
+        assert_eq!(config.smtp_username, None, "default SMTP_USERNAME");
+        assert_eq!(config.smtp_password, None, "default SMTP_PASSWORD");
+        assert_eq!(config.smtp_tls, SmtpTls::Starttls, "default SMTP_TLS");
+        assert_eq!(
+            config.mail_from, "noreply@social.example",
+            "MAIL_FROM defaults to noreply at the instance domain"
+        );
+    }
+
+    #[test]
+    fn reads_custom_mailer_settings() {
+        let config = config_with(&[
+            (SMTP_HOST_VAR, " smtp.example.org "),
+            (SMTP_PORT_VAR, "465"),
+            (SMTP_USERNAME_VAR, " relay-user "),
+            (SMTP_PASSWORD_VAR, "relay-secret"),
+            (SMTP_TLS_VAR, "tls"),
+            (MAIL_FROM_VAR, " hello@example.org "),
+        ]);
+        assert_eq!(
+            config.smtp_host.as_deref(),
+            Some("smtp.example.org"),
+            "custom SMTP_HOST, trimmed"
+        );
+        assert_eq!(config.smtp_port, 465, "custom SMTP_PORT");
+        assert_eq!(
+            config.smtp_username.as_deref(),
+            Some("relay-user"),
+            "custom SMTP_USERNAME, trimmed"
+        );
+        assert_eq!(
+            config.smtp_password.as_deref(),
+            Some("relay-secret"),
+            "custom SMTP_PASSWORD, kept verbatim"
+        );
+        assert_eq!(config.smtp_tls, SmtpTls::Tls, "custom SMTP_TLS");
+        assert_eq!(
+            config.mail_from, "hello@example.org",
+            "custom MAIL_FROM, trimmed"
+        );
+    }
+
+    #[test]
+    fn empty_mailer_variables_read_as_unset() {
+        let config = config_with(&[
+            (SMTP_HOST_VAR, "  "),
+            (SMTP_USERNAME_VAR, ""),
+            (SMTP_PASSWORD_VAR, ""),
+            (MAIL_FROM_VAR, " "),
+        ]);
+        assert_eq!(config.smtp_host, None, "blank SMTP_HOST leaves mail off");
+        assert_eq!(config.smtp_username, None, "blank SMTP_USERNAME");
+        assert_eq!(config.smtp_password, None, "blank SMTP_PASSWORD");
+        assert_eq!(
+            config.mail_from, "noreply@social.example",
+            "blank MAIL_FROM falls back to the default"
+        );
+    }
+
+    #[test]
+    fn smtp_tls_parses_its_spellings() {
+        for (value, want) in [
+            ("starttls", SmtpTls::Starttls),
+            (" STARTTLS ", SmtpTls::Starttls),
+            ("tls", SmtpTls::Tls),
+            ("TLS", SmtpTls::Tls),
+            ("none", SmtpTls::None),
+            ("None", SmtpTls::None),
+        ] {
+            let config = config_with(&[(SMTP_TLS_VAR, value)]);
+            assert_eq!(config.smtp_tls, want, "SMTP_TLS={value:?}");
+        }
+        for value in ["", "  "] {
+            let config = config_with(&[(SMTP_TLS_VAR, value)]);
+            assert_eq!(
+                config.smtp_tls,
+                SmtpTls::Starttls,
+                "SMTP_TLS={value:?} falls back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_smtp_tls_is_an_error() {
+        let err = try_config_with(&[(SMTP_TLS_VAR, "opportunistic")]).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidSmtpTls(SMTP_TLS_VAR), "variant");
+        assert!(err.source().is_none(), "no source");
+        assert_eq!(
+            err.to_string(),
+            "invalid SMTP_TLS: expected one of starttls, tls or none",
+            "message names the variable and its vocabulary"
+        );
+    }
+
+    #[test]
+    fn smtp_port_must_be_a_port() {
+        for value in ["many", "0.5", "65536"] {
+            let err = try_config_with(&[(SMTP_PORT_VAR, value)]).unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::InvalidNumber(SMTP_PORT_VAR),
+                "SMTP_PORT={value:?} is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn mail_from_default_drops_the_base_url_port() {
+        let config = config_with(&[(BASE_URL_VAR, "http://localhost:4000")]);
+        assert_eq!(
+            config.mail_from, "noreply@localhost",
+            "a port is not part of an email domain"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_the_smtp_password() {
+        let config = config_with(&[
+            (SMTP_HOST_VAR, "smtp.example.org"),
+            (SMTP_USERNAME_VAR, "relay-user"),
+            (SMTP_PASSWORD_VAR, "relay-secret"),
+            (SMTP_TLS_VAR, "tls"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("relay-secret"),
+            "the SMTP password must not leak: {debug}"
+        );
+        assert!(
+            debug.contains(r#"smtp_password: "<redacted>""#),
+            "the marker names the field: {debug}"
+        );
+        assert!(
+            debug.contains(r#"smtp_host: Some("smtp.example.org")"#),
+            "the relay host shows: {debug}"
+        );
+        assert!(
+            debug.contains(r#"smtp_username: Some("relay-user")"#),
+            "the login name shows: {debug}"
+        );
+        assert!(
+            debug.contains("smtp_tls: Tls"),
+            "the encryption mode shows: {debug}"
         );
     }
 
@@ -2245,6 +2616,11 @@ mod tests {
         assert_eq!(
             config.media_base_url, "https://test.example/media",
             "test media URLs hang off the test BASE_URL"
+        );
+        assert_eq!(config.smtp_host, None, "test config has mail disabled");
+        assert_eq!(
+            config.mail_from, "noreply@test.example",
+            "test mail defaults to the test domain"
         );
         let expected = Config::from_lookup(lookup_from(&[
             (DATABASE_URL_VAR, TEST_DATABASE_URL),

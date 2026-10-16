@@ -446,6 +446,7 @@ mod tests {
             http_client: HttpClient::new_for_tests(TEST_UA),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
 

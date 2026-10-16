@@ -62,6 +62,11 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # is what its bytes say, not what the client's part header claimed. The default
 # matchers (image, video and audio among them) are all the endpoint needs.
 infer = "0.22.0"
+# SMTP mailer (`src/mailer.rs`): the async `tokio1` transport with rustls only
+# (never native-tls), plus the message builder for the text and HTML parts; the
+# default features (native-tls, pool, hostname, the sendmail and file
+# transports) stay off.
+lettre = { version = "0.11.23", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 # Markdown for `text/markdown` statuses (`src/util/format.rs`): only the pull
 # parser is used, so the default features (`html`, `getopts`,

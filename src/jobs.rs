@@ -16,8 +16,8 @@
 //! (see [`crate::federation::delivery`]). When the shutdown future resolves
 //! the worker stops claiming and waits for its in-flight jobs. Concrete
 //! handlers are registered by [`crate::serve`], which starts with the
-//! federation delivery job kind. The sibling [`scheduler`] module is the
-//! producer side: it enqueues the recurring, cron-like jobs.
+//! federation delivery and mailer job kinds. The sibling [`scheduler`] module
+//! is the producer side: it enqueues the recurring, cron-like jobs.
 
 pub mod mutes;
 pub mod scheduler;
@@ -445,6 +445,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
 
@@ -669,6 +670,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };
         let mut registry = JobRegistry::new();
         registry.register("flaky", retry_handler);
@@ -691,6 +693,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };
         let registry = JobRegistry::new();
         let outcome = dispatch_handler(&registry, &state, &job_row("mystery")).await;
@@ -786,6 +789,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };
         let mut registry = JobRegistry::new();
         registry.register("greet", reporting_handler);
