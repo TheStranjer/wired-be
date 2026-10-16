@@ -40,7 +40,7 @@ use crate::{
     error::AppError,
     http_client::HttpClient,
     jobs::{JobRegistry, Worker, scheduler},
-    services::emoji_packs,
+    services::{emoji_packs, media_proxy},
     state::AppState,
     streaming::hub::Hub,
     uploads::UploaderBackend,
@@ -161,17 +161,17 @@ async fn wait_for_ctrl_c() {
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the nine that
+/// The [`api`] routers are merged under their prefixes; the ten that
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
-/// or by the clients that call them — `/media` ([`media_files`]), `/emoji`
-/// ([`api::emoji_packs`]), `/users/{nickname}` ([`api::activitypub`]) and
-/// its feed variants plus `/tags/{tag}` ([`api::feeds`]),
-/// `/.well-known` ([`api::well_known`]), `/.well-known/nodeinfo` and
-/// `/nodeinfo/{version}` ([`api::nodeinfo`]), `/oauth` ([`api::oauth`]),
-/// the `/oauth` provider-login paths ([`api::oauth_external`]) and the
-/// `MongooseIM` auth endpoints plus `/manifest.json` ([`api::misc`]) —
-/// are merged at the top level. Paths no route matches get the standard
-/// JSON error response (decision 8).
+/// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
+/// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]),
+/// `/users/{nickname}` ([`api::activitypub`]) and its feed variants plus
+/// `/tags/{tag}` ([`api::feeds`]), `/.well-known` ([`api::well_known`]),
+/// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
+/// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
+/// ([`api::oauth_external`]) and the `MongooseIM` auth endpoints plus
+/// `/manifest.json` ([`api::misc`]) — are merged at the top level. Paths
+/// no route matches get the standard JSON error response (decision 8).
 ///
 /// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
@@ -189,6 +189,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::well_known::router())
             .merge(api::nodeinfo::router())
             .merge(media_files::router())
+            .merge(media_proxy::router())
             .merge(api::emoji_packs::files_router())
             .merge(api::misc::router())
             .fallback(not_found)

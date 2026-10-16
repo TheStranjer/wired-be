@@ -56,6 +56,11 @@ All configuration comes from environment variables. For local development, copy 
 | `SMTP_PASSWORD` | no | | SMTP relay login secret; never logged |
 | `SMTP_TLS` | no | `starttls` | Relay encryption: `starttls` (upgrade required), `tls` (SMTPS) or `none` (plaintext, trusted local relay only) |
 | `MAIL_FROM` | no | `noreply@<instance domain>` | The `From:` address every sent email carries |
+| `MEDIA_PROXY_ENABLED` | no | `false` | Rewrite remote media URLs into signed proxy links served under `/proxy` (`true`/`false`, or `1`/`0`) |
+| `MEDIA_PROXY_SECRET` | when the proxy is enabled | | HMAC-SHA256 signing secret for proxy links; at least 32 characters, redacted in logs |
+| `MEDIA_PROXY_BASE_URL` | no | `BASE_URL` | Base URL proxy links are built from (no trailing slash), e.g. a CDN fronting `/proxy` |
+| `MEDIA_PROXY_MAX_BYTES` | no | `50000000` | Hard cap on the bytes served for one proxied media file; the fetch aborts beyond it |
+| `MEDIA_PROXY_BLACKLIST` | no | *(empty)* | Comma-separated hosts the media proxy never proxies; their URLs pass through unchanged |
 
 ## Development
 

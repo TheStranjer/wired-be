@@ -103,6 +103,11 @@ serde_json = "1.0.151"
 # never a collision-resistant digest.)
 sha1 = "0.11.0"
 sha2 = { version = "0.10", features = ["oid"] }
+# HMAC-SHA256 (`src/services/media_proxy.rs`): `hmac` 0.13 speaks `digest`
+# 0.11, which the `sha2` above (0.10, pinned there by `rsa`'s `sha2`
+# feature) does not, so the proxy hashes through this alias of the newer
+# sha2 line already in the tree via `pbkdf2` and `sqlx` (0.11.0).
+sha2_011 = { version = "0.11.0", package = "sha2" }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "uuid", "json", "chrono"] }
 # Constant-time equality (`src/util/totp.rs`): comparing user-supplied
 # one-time codes must not leak how close they were through timing.

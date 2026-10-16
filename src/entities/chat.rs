@@ -138,12 +138,19 @@ impl ChatMessage {
     /// Renders `row` — one side's reference to a message — as a `ChatMessage`
     /// entity, with `attachment` as its media when the message carries one.
     ///
+    /// `config` renders the attachment's URLs (see
+    /// [`MediaAttachment::from_model`], the one media proxy entry point).
+    ///
     /// The entity's `id` is the reference's id, not
     /// [`message_id`](ChatMessageReference::message_id) — the row the
     /// attachment and the `ActivityPub` id belong to — exactly as Pleroma
     /// renders `cm_ref.id`.
     #[must_use]
-    pub fn from_reference(row: &ChatMessageReference, attachment: Option<&AttachmentRow>) -> Self {
+    pub fn from_reference(
+        row: &ChatMessageReference,
+        attachment: Option<&AttachmentRow>,
+        config: &Config,
+    ) -> Self {
         Self {
             id: row.id.to_string(),
             content: row.content.clone(),
@@ -151,7 +158,7 @@ impl ChatMessage {
             account_id: row.sender_id.to_string(),
             created_at: row.message_inserted_at,
             emojis: Vec::new(),
-            attachment: attachment.map(MediaAttachment::from_model),
+            attachment: attachment.map(|media| MediaAttachment::from_model(media, config)),
             unread: row.unread,
             card: None,
             idempotency_key: row.idempotency_key.clone(),
@@ -416,7 +423,11 @@ mod tests {
     #[test]
     fn a_message_renders_the_reference_view() {
         let row = reference_row();
-        let value = render(&ChatMessage::from_reference(&row, None));
+        let value = render(&ChatMessage::from_reference(
+            &row,
+            None,
+            &Config::for_tests(),
+        ));
 
         assert_eq!(json_keys(&value), MESSAGE_KEYS, "exactly the view's keys");
         assert_eq!(
@@ -447,7 +458,11 @@ mod tests {
         row.attachment_media_id = Some(id(ATTACHMENT_ID));
         row.unread = false;
 
-        let value = render(&ChatMessage::from_reference(&row, Some(&attachment_row())));
+        let value = render(&ChatMessage::from_reference(
+            &row,
+            Some(&attachment_row()),
+            &Config::for_tests(),
+        ));
 
         assert_eq!(
             json_keys(&value["attachment"]),
@@ -464,7 +479,7 @@ mod tests {
 
     #[test]
     fn an_idempotency_key_appears_only_when_the_row_carries_one() {
-        let plain = ChatMessage::from_reference(&reference_row(), None);
+        let plain = ChatMessage::from_reference(&reference_row(), None, &Config::for_tests());
         assert!(
             plain.idempotency_key.is_none(),
             "a reference of a keyless message has none"
@@ -476,7 +491,11 @@ mod tests {
 
         let mut row = reference_row();
         row.idempotency_key = Some("7c9e6679-7425-40de-944b-e07fc1f90ae7".to_owned());
-        let value = render(&ChatMessage::from_reference(&row, None));
+        let value = render(&ChatMessage::from_reference(
+            &row,
+            None,
+            &Config::for_tests(),
+        ));
 
         assert_eq!(
             json_keys(&value).len(),
@@ -516,7 +535,7 @@ mod tests {
     #[test]
     fn a_chat_carries_its_last_message_when_it_has_one() {
         let row = reference_row();
-        let last = ChatMessage::from_reference(&row, None);
+        let last = ChatMessage::from_reference(&row, None, &Config::for_tests());
         let value = render_chat(1, Some(last));
 
         assert_eq!(
@@ -570,7 +589,11 @@ mod tests {
         reference.content = message_row.content.clone();
         reference.message_inserted_at = message_row.inserted_at;
 
-        let value = render(&ChatMessage::from_reference(&reference, None));
+        let value = render(&ChatMessage::from_reference(
+            &reference,
+            None,
+            &Config::for_tests(),
+        ));
 
         assert_eq!(value["account_id"], OWNER_ID, "the writer of the row");
         assert_eq!(value["content"], "<p>mine</p>", "their text");
@@ -591,7 +614,11 @@ mod tests {
         row.raw_text = String::new();
         row.ap_id = None;
 
-        let value = render(&ChatMessage::from_reference(&row, None));
+        let value = render(&ChatMessage::from_reference(
+            &row,
+            None,
+            &Config::for_tests(),
+        ));
 
         assert_eq!(
             value["content"], "",

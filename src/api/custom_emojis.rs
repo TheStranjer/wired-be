@@ -30,5 +30,10 @@ pub fn router() -> Router<AppState> {
 /// [`AppError::Database`](crate::error::AppError).
 async fn list_custom_emojis(State(state): State<AppState>) -> AppResult<Json<Vec<CustomEmoji>>> {
     let emojis = custom_emoji::list_local(&state.db).await?;
-    Ok(Json(emojis.iter().map(CustomEmoji::from_model).collect()))
+    Ok(Json(
+        emojis
+            .iter()
+            .map(|row| CustomEmoji::from_model(row, &state.config))
+            .collect(),
+    ))
 }

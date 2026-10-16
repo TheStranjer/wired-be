@@ -95,6 +95,9 @@ mod media;
 /// The media metadata endpoints (`GET`/`PUT`/`DELETE /api/v1/media/{id}`).
 mod media_metadata;
 
+/// The media proxy route (`GET /proxy/{sig}/{url}[/{filename}]`) against a mock upstream.
+mod media_proxy;
+
 /// The media upload endpoints (`POST /api/v1/media` and `/api/v2/media`).
 mod media_upload;
 

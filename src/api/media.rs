@@ -195,7 +195,7 @@ async fn upload_media(
         %upload.content_type,
         "media uploaded"
     );
-    Ok(Json(MediaAttachment::from_model(&row)))
+    Ok(Json(MediaAttachment::from_model(&row, &state.config)))
 }
 
 /// What one blocking pass over an image upload's bytes found out: the
@@ -490,7 +490,7 @@ async fn get_media(
 ) -> AppResult<Json<MediaAttachment>> {
     auth.require(READ_STATUSES)?;
     let row = own_unattached_media(&state, auth.0.id, &id).await?;
-    Ok(Json(MediaAttachment::from_model(&row)))
+    Ok(Json(MediaAttachment::from_model(&row, &state.config)))
 }
 
 /// `PUT /api/v1/media/{id}` and `PUT /api/v2/media/{id}` — write the
@@ -533,7 +533,7 @@ async fn update_media(
         user = %auth.0.id,
         "media metadata updated"
     );
-    Ok(Json(MediaAttachment::from_model(&updated)))
+    Ok(Json(MediaAttachment::from_model(&updated, &state.config)))
 }
 
 /// The row `id` names when it is the user `user_id`'s own unattached media.

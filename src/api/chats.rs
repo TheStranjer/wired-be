@@ -974,7 +974,11 @@ async fn message_of(state: &AppState, reference: &ChatMessageReference) -> AppRe
         Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await?,
         None => None,
     };
-    Ok(ChatMessage::from_reference(reference, attachment.as_ref()))
+    Ok(ChatMessage::from_reference(
+        reference,
+        attachment.as_ref(),
+        &state.config,
+    ))
 }
 
 /// The [`ChatMessage`] entity for a freshly marked reference.

@@ -307,7 +307,10 @@ impl Status {
             visibility: row.visibility.as_str().to_owned(),
             sensitive: JsonBool(row.sensitive),
             spoiler_text: row.spoiler_text.clone(),
-            media_attachments: media.iter().map(MediaAttachment::from_model).collect(),
+            media_attachments: media
+                .iter()
+                .map(|attachment| MediaAttachment::from_model(attachment, config))
+                .collect(),
             application: application_block(row),
             mentions: mentions.iter().map(Mention::from_user).collect(),
             tags: tags
@@ -533,6 +536,7 @@ mod tests {
             last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
+            registration_reason: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,
@@ -542,6 +546,7 @@ mod tests {
             inserted_at: stamped(),
             updated_at: stamped(),
             preferred_frontend: None,
+            is_suggested: Flag::new(false),
         }
     }
 

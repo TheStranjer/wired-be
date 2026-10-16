@@ -359,6 +359,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         http_client::HttpClient,
+        mailer::MemoryTransport,
         models::{
             follow,
             media_attachment::NewMediaAttachment,
@@ -382,6 +383,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mailer: Arc::new(MemoryTransport::new()),
         }
     }
 

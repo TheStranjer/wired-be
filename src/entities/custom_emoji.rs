@@ -4,19 +4,24 @@
 //! (`lib/pleroma/web/mastodon_api/views/custom_emoji_view.ex`); the JSON
 //! keys are emitted exactly as that view names them, plus Pleroma's
 //! `tags` extension. [`CustomEmoji::from_model`] is pure (decision 3): it
-//! renders a [`custom_emojis`](crate::models::custom_emoji) row with no
-//! database and no config, because both URLs the entity carries are
-//! already stored on the row.
+//! renders a [`custom_emojis`](crate::models::custom_emoji) row and the
+//! instance [`Config`] — which it only consults
+//! to decide whether remote emoji URLs become signed proxy links — with
+//! no database access.
 //!
 //! Differences from the Pleroma view, per the ticket: file-backed pack
 //! emojis always know their url, while a row here may have no still
 //! variant, so `static_url` is `null` when the column is (clients fall
 //! back to `url`), and `category` is the stored pack name or `null`, not
-//! the tag list joined with commas.
+//! the tag list joined with commas. `url` and `static_url` pass through
+//! the media proxy helper ([`proxy_url`](crate::services::media_proxy::proxy_url)):
+//! with `MEDIA_PROXY_ENABLED` set, emojis hosted on foreign domains get
+//! signed proxy links, while local ones (served from this instance) and
+//! everything under a disabled proxy render as stored.
 
 use serde::Serialize;
 
-use crate::models::custom_emoji::CustomEmoji as EmojiRow;
+use crate::{config::Config, models::custom_emoji::CustomEmoji as EmojiRow, services::media_proxy};
 
 /// The Mastodon `CustomEmoji` entity.
 ///
@@ -42,13 +47,17 @@ pub struct CustomEmoji {
 
 impl CustomEmoji {
     /// Renders `row` as a `CustomEmoji` entity: every field passes
-    /// through from the stored row, `url` taking the image url.
+    /// through from the stored row, `url` taking the image url through
+    /// the media proxy helper (`static_url` likewise when present).
     #[must_use]
-    pub fn from_model(row: &EmojiRow) -> Self {
+    pub fn from_model(row: &EmojiRow, config: &Config) -> Self {
         Self {
             shortcode: row.shortcode.clone(),
-            url: row.image_url.clone(),
-            static_url: row.static_url.clone(),
+            url: media_proxy::proxy_url(config, &row.image_url),
+            static_url: row
+                .static_url
+                .as_deref()
+                .map(|url| media_proxy::proxy_url(config, url)),
             visible_in_picker: row.visible_in_picker,
             category: row.category.clone(),
             tags: row.tags.clone(),
@@ -62,6 +71,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::{TEST_BASE_URL, TEST_DATABASE_URL};
     use crate::util::time::parse_time;
 
     /// The hyphenated lowercase id every fixture row carries.
@@ -105,7 +115,59 @@ mod tests {
 
     /// `row` rendered to a JSON value; these structs always serialize.
     fn render(row: &EmojiRow) -> serde_json::Value {
-        serde_json::to_value(CustomEmoji::from_model(row)).unwrap()
+        serde_json::to_value(CustomEmoji::from_model(row, &Config::for_tests())).unwrap()
+    }
+
+    /// `row` rendered with the media proxy enabled.
+    fn render_proxied(row: &EmojiRow) -> serde_json::Value {
+        let config = Config::from_lookup(|key| match key {
+            crate::config::DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+            crate::config::BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            crate::config::MEDIA_PROXY_ENABLED_VAR => Some("true".to_owned()),
+            // A signing secret comfortably past the 32-character minimum.
+            crate::config::MEDIA_PROXY_SECRET_VAR => {
+                Some("0123456789abcdef0123456789abcdef01234567".to_owned())
+            }
+            _ => None,
+        })
+        .unwrap();
+        serde_json::to_value(CustomEmoji::from_model(row, &config)).unwrap()
+    }
+
+    #[test]
+    fn remote_domain_emojis_are_proxied_when_the_media_proxy_is_enabled() {
+        let mut row = base_row("blobcat");
+        row.domain = Some("remote.example".to_owned());
+        row.image_url = "https://remote.example/emoji/blobcat.gif".to_owned();
+        row.static_url = Some("https://remote.example/emoji/blobcat.png".to_owned());
+
+        let value = render_proxied(&row);
+        let url = value["url"].as_str().unwrap();
+        assert!(
+            url.starts_with("https://test.example/proxy/") && url.ends_with("/blobcat.gif"),
+            "the remote emoji becomes a signed proxy link: {url}"
+        );
+        let static_url = value["static_url"].as_str().unwrap();
+        assert!(
+            static_url.starts_with("https://test.example/proxy/")
+                && static_url.ends_with("/blobcat.png"),
+            "the remote still variant is proxied too: {static_url}"
+        );
+    }
+
+    #[test]
+    fn local_emoji_urls_pass_through_when_the_media_proxy_is_enabled() {
+        let value = render_proxied(&base_row("cat"));
+        assert_eq!(
+            value["url"],
+            serde_json::json!(format!("{BASE}/emoji/custom/cat.gif")),
+            "a local emoji is served from the instance's own host"
+        );
+        assert_eq!(
+            value["static_url"],
+            serde_json::json!(format!("{BASE}/emoji/custom/cat.png")),
+            "and so is its still variant"
+        );
     }
 
     /// The rendered object's keys, sorted, for exact key-set assertions.
