@@ -208,8 +208,37 @@
 //! federation will owe that account a `Reject` for its `Follow`; the later
 //! federation ticket wires the delivery into this module's
 //! `after_follower_removed` hook.
+//!
+//! `POST /api/v1/accounts` is open-mode registration: Pleroma's
+//! `AccountController.create` (`lib/pleroma/web/mastodon_api/controllers/
+//! account_controller.ex`) over `Registration.register_user`
+//! (`lib/pleroma/web/registration.ex`). Like Pleroma's `OAuthPlug` the
+//! route authenticates with [`AppAuth`] — any valid bearer token,
+//! app-only (`client_credentials`) or user-bound — plus the
+//! `write:accounts` scope, and a caller who already holds a user token
+//! may register another account (Pleroma permits it). While
+//! `REGISTRATIONS_OPEN` is false the route answers 403 `{"error":
+//! "Registration is disabled"}`; Pleroma's 2.10 `create` action carries
+//! no such string (closed registrations there mean "return with an invite
+//! token"), so this endpoint's ticket pins the wording. The body is
+//! `username`, `email`, `password`, `agreement` (which must be `true`,
+//! else 422), `locale`, `reason`, `fullname` (the display name) and
+//! `bio`; `locale` and `confirm` are accepted and ignored, as Pleroma
+//! reads neither on this path. The user lands through
+//! [`create_local_user`]
+//! — every validation failure arrives as its 422 whose `error` value is
+//! the JSON string of the field map — and `reason` is stored in
+//! `users.registration_reason` for the later approval flow. Success mints
+//! a fresh user token for the issuing app carrying the presenting
+//! token's scopes (Pleroma's `OAuthController.login(user, app, …)`) and
+//! answers the token JSON: `token_type`, `access_token`, `scope`,
+//! `created_at` (unix seconds), the token row's `id`, `expires_in` and
+//! `refresh_token`.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -219,7 +248,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{NaiveDate, Utc};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tracing::{debug, warn};
@@ -230,7 +259,7 @@ use crate::{
         helpers::{account_or_404, requested_ids},
         pleroma_settings::{check_store_size, shallow_merge},
     },
-    auth::{AuthUser, MaybeAuthUser},
+    auth::{AppAuth, AuthUser, MaybeAuthUser, require_scope},
     config::Config,
     entities::{
         account::{Account, AccountViewer, local_url},
@@ -244,7 +273,12 @@ use crate::{
     models::{
         account_note,
         follow::{self, Follow},
-        user::{self, DEFAULT_ACTOR_TYPE, Flag, PleromaPrefs, ProfileFields, User},
+        oauth_app::OauthApp,
+        oauth_token::{self, NewToken, OauthToken},
+        user::{
+            self, DEFAULT_ACTOR_TYPE, Flag, PleromaPrefs, ProfileFields, User,
+            register::{RegisterParams, create_local_user},
+        },
     },
     oauth::scopes::{FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
@@ -363,6 +397,21 @@ const ACCEPTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif",
 /// scrobbles listing's constant, same rule).
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
+/// `token_type` of the registration answer: issued tokens are bearer
+/// credentials, as on `/oauth/token` (see [`crate::api::oauth`]).
+const TOKEN_TYPE_BEARER: &str = "Bearer";
+
+/// The 403 body message `POST /api/v1/accounts` answers while
+/// `REGISTRATIONS_OPEN` is false. Pleroma's 2.10 `create` action has no
+/// such string (closed registrations there route to invite tokens), so
+/// this endpoint's ticket pins this wording.
+const REGISTRATIONS_CLOSED: &str = "Registration is disabled";
+
+/// The 422 body message `POST /api/v1/accounts` answers when `agreement`
+/// is present but not true (Mastodon's signup terms wording; Pleroma's
+/// schema requires only that the field is there).
+const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
+
 /// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
 ///
 /// `config` is what [`upload_body_limit`] sizes the routes' body limit from:
@@ -375,6 +424,7 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// [`DEFAULT_AVATAR_LIMIT_BYTES`]: crate::config::DEFAULT_AVATAR_LIMIT_BYTES
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
+        .route("/accounts", post(create_account))
         .route("/accounts/verify_credentials", get(verify_credentials))
         .route(
             "/accounts/update_credentials",
@@ -391,6 +441,182 @@ pub fn router(config: &Config) -> Router<AppState> {
         )
         .route("/accounts/{id}", get(show_account))
         .layer(upload_body_limit(config))
+}
+
+/// The request parameters of `POST /api/v1/accounts`, Pleroma's
+/// `AccountCreateRequest` (`lib/pleroma/web/api_spec/operations/
+/// account_operation.ex`) minus the captcha and invite fields:
+/// `username`, `email`, `password` and `agreement` are read, the first
+/// three required and `agreement` required too (an absent one is the
+/// extractor's 422). `agreement` deserializes through [`flex::bool`] so
+/// the form spelling `true` arrives. Every other key the body carries —
+/// `locale`, `confirm`, the captcha pair, Pleroma's own `token` and
+/// `birthday` — is accepted and ignored, as
+/// [`Registration.register_user`] reads none of them on this path;
+/// `reason`, `fullname` and `bio` are the optional registration facts
+/// that do reach the row.
+///
+/// [`Registration.register_user`]: https://hexdocs.pm/pleroma/Pleroma.Web.Registration.html
+#[derive(Debug, Deserialize)]
+struct CreateAccountParams {
+    /// The desired handle, validated by [`create_local_user`] as
+    /// `RegisterParams::nickname`.
+    username: String,
+    /// Contact email; required unless
+    /// [`accounts_email_optional`](crate::config::Config::accounts_email_optional).
+    #[serde(default)]
+    email: Option<String>,
+    /// Plaintext password, stored only as a hash.
+    password: String,
+    /// Whether the applicant accepts the instance's terms; must be true.
+    #[serde(deserialize_with = "flex::bool")]
+    agreement: bool,
+    /// Free-text reason for the later approval flow, stored in
+    /// `users.registration_reason`.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Display name (Pleroma's `fullname`); the nickname stands in when
+    /// absent or blank.
+    #[serde(default)]
+    fullname: Option<String>,
+    /// Profile note as source text, stored as `raw_bio` and rendered for
+    /// `bio`.
+    #[serde(default)]
+    bio: Option<String>,
+}
+
+impl CreateAccountParams {
+    /// The registration [`RegisterParams`] these body parameters claim:
+    /// `fullname` is Pleroma's display `name` fallback to the username,
+    /// and `reason` rides along for storage.
+    fn into_register_params(self) -> RegisterParams {
+        RegisterParams {
+            nickname: self.username,
+            email: self.email,
+            password: self.password,
+            name: self.fullname,
+            bio: self.bio,
+            reason: self.reason,
+        }
+    }
+}
+
+/// The 200 body of a successful registration: the freshly minted user
+/// token in the shape Pleroma's "token.json" view renders on this
+/// endpoint (its `me` key belongs to `/oauth/token`; the registration
+/// ticket's response does not carry it).
+#[derive(Debug, Serialize)]
+struct RegistrationToken {
+    /// Token type, always `Bearer`.
+    token_type: &'static str,
+    /// The access token, to present as `Authorization: Bearer`.
+    access_token: String,
+    /// The granted scopes, space-separated — the presenting token's.
+    scope: String,
+    /// Issue time, in unix seconds (Pleroma's `format_created_at`).
+    created_at: i64,
+    /// The token row's `UUIDv7` id, hyphenated (decision 4).
+    id: String,
+    /// Seconds of validity left at render time.
+    expires_in: i64,
+    /// The refresh token, to exchange for a fresh pair.
+    refresh_token: String,
+}
+
+impl RegistrationToken {
+    /// Renders the freshly minted `token` (always user-bound here, so
+    /// `refresh_token` is always in).
+    fn new(token: OauthToken) -> Self {
+        Self {
+            token_type: TOKEN_TYPE_BEARER,
+            access_token: token.token,
+            scope: token.scopes,
+            created_at: token.inserted_at.timestamp(),
+            id: token.id.to_string(),
+            expires_in: token
+                .valid_until
+                .signed_duration_since(Utc::now())
+                .num_seconds(),
+            refresh_token: token.refresh_token,
+        }
+    }
+}
+
+/// `POST /api/v1/accounts` — register a local account and receive a
+/// bearer token for it (Pleroma's `.create`, which ends in
+/// `OAuthController.login(user, app, …)` + the token view).
+///
+/// The gates run in Pleroma's plug order: [`AppAuth`] first rejects a
+/// missing or invalid credential (401) — an app-only `client_credentials`
+/// token satisfies it exactly as a user token does — then the
+/// `write:accounts` scope check (403), then the `REGISTRATIONS_OPEN`
+/// gate (403 [`REGISTRATIONS_CLOSED`]), then the agreement (422). The
+/// account itself is built by [`create_local_user`], whose errors this
+/// endpoint's ticket maps as implemented there: a 422 whose `error`
+/// value is the JSON string of the field map. Success mints the new
+/// user's token for the presenting token's app with the presenting
+/// token's scopes, valid for `OAUTH_TOKEN_TTL_SECS`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] from [`AppAuth`] without a valid token;
+/// [`AppError::Forbidden`] from [`require_scope`] without `write:accounts`
+/// or while registrations are closed; [`AppError::Unprocessable`] when
+/// `agreement` is absent (the extractor's) or not true, and
+/// [`create_local_user`]'s field-map 422s for every invalid parameter.
+/// Any database or key-generation failure arrives through `?` as
+/// [`AppError::Database`] or [`AppError::Internal`].
+async fn create_account(
+    State(state): State<AppState>,
+    AppAuth(app, token): AppAuth,
+    ApiBody(params): ApiBody<CreateAccountParams>,
+) -> AppResult<Json<RegistrationToken>> {
+    require_scope(&token, WRITE_ACCOUNTS)?;
+    if !state.config.registrations_open.get() {
+        return Err(AppError::Forbidden(REGISTRATIONS_CLOSED.to_owned()));
+    }
+    if !params.agreement {
+        return Err(AppError::Unprocessable(AGREEMENT_REQUIRED.to_owned()));
+    }
+    let user = create_local_user(&state, params.into_register_params()).await?;
+    let issued = issue_registration_token(&state, &app, &token.scopes, user.id).await?;
+    debug!(
+        user = %user.id,
+        app = %app.id,
+        "registered a new local account"
+    );
+    Ok(Json(RegistrationToken::new(issued)))
+}
+
+/// Mints the new user's bearer token: the presenting token's scopes on
+/// the issuing application, valid for the configured
+/// `OAUTH_TOKEN_TTL_SECS` (the `/oauth/token` grant's
+/// `issue_token`, with the scopes fixed by the presenting credential
+/// rather than requested).
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn issue_registration_token(
+    state: &AppState,
+    app: &OauthApp,
+    scopes: &str,
+    user_id: Uuid,
+) -> AppResult<OauthToken> {
+    // `OAUTH_TOKEN_TTL_SECS` is a `usize`; on any target where it could
+    // exceed `u64::MAX` the absurd upper bound fails the insert instead
+    // of silently shortening the lifetime.
+    let ttl_secs = u64::try_from(state.config.oauth_token_ttl_secs).unwrap_or(u64::MAX);
+    oauth_token::create_token(
+        &state.db,
+        &NewToken {
+            user_id: Some(user_id),
+            app_id: app.id,
+            scopes: scopes.to_owned(),
+            ttl: Some(Duration::from_secs(ttl_secs)),
+        },
+    )
+    .await
 }
 
 /// `GET /api/v1/accounts/verify_credentials` — the caller's own account,
@@ -1846,6 +2072,8 @@ fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) ->
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// Builds a `MentionRef` for the key and domain helpers.
@@ -2271,6 +2499,7 @@ mod tests {
             last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
+            registration_reason: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,
@@ -2527,6 +2756,147 @@ mod tests {
                 && !prefs.hide_followers_count.get()
                 && !prefs.hide_follows_count.get(),
             "and so do the off-by-default ones"
+        );
+    }
+
+    /// Parses `value` as the registration endpoint's parameters, as
+    /// `ApiBody` would.
+    fn registration_params(value: Value) -> AppResult<CreateAccountParams> {
+        crate::extract::into_params(value)
+    }
+
+    /// A stored-looking token row minted right now, for the
+    /// [`RegistrationToken`] render.
+    fn minted_token() -> OauthToken {
+        let now = Utc::now();
+        OauthToken {
+            id: Uuid::now_v7(),
+            token: "access-secret".to_owned(),
+            refresh_token: "refresh-secret".to_owned(),
+            user_id: Some(Uuid::now_v7()),
+            app_id: Uuid::now_v7(),
+            scopes: "read write follow push".to_owned(),
+            valid_until: now + chrono::Duration::days(30),
+            inserted_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn registration_params_take_their_required_fields_and_default_the_rest() {
+        let params = registration_params(json!({
+            "username": "lain",
+            "email": "lain@example.org",
+            "password": "PlzDontHackLain",
+            "agreement": true,
+        }))
+        .expect("the required four are there");
+        assert_eq!(params.username, "lain", "username");
+        assert!(params.agreement, "a real json boolean");
+        assert!(
+            params.reason.is_none() && params.fullname.is_none() && params.bio.is_none(),
+            "every optional field defaults away when absent"
+        );
+    }
+
+    #[test]
+    fn registration_agreement_accepts_the_form_spellings() {
+        // The extractor turns `agreement=true` into this shape
+        // (`src/extract.rs` covers the parsing itself).
+        let params = registration_params(json!({
+            "username": "lain",
+            "password": "PlzDontHackLain",
+            "agreement": "true",
+            "reason": "I'm a cool dude, bro",
+            "fullname": "Lain Iwakura",
+            "bio": "☕️",
+        }))
+        .expect("a form-style body");
+        assert!(params.agreement, "`\"true\"` is the form spelling");
+        assert_eq!(params.reason.as_deref(), Some("I'm a cool dude, bro"));
+    }
+
+    #[test]
+    fn ignored_fields_are_accepted_and_untyped() {
+        // `locale` and `confirm` are on the wire but never read: the
+        // endpoint takes them as sent, in any shape, and ignores them.
+        let params = registration_params(json!({
+            "username": "lain",
+            "password": "PlzDontHackLain",
+            "agreement": "on",
+            "locale": "en",
+            "confirm": "PlzDontHackLain",
+            "captcha_response": 9001,
+        }))
+        .expect("unknown keys do not bind and do not reject");
+        assert!(params.agreement, "`\"on\"` is the checkbox spelling");
+    }
+
+    #[test]
+    fn a_missing_or_unboolean_agreement_is_unprocessable() {
+        for value in [
+            json!({"username": "lain", "password": "x"}),
+            json!({"username": "lain", "password": "x", "agreement": "maybe"}),
+        ] {
+            let err = registration_params(value).expect_err("`agreement` is required");
+            assert!(
+                matches!(err, AppError::Unprocessable(_)),
+                "a bad agreement is a 422, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_params_map_onto_the_register_model() {
+        let params = registration_params(json!({
+            "username": "lain",
+            "email": "lain@example.org",
+            "password": "PlzDontHackLain",
+            "agreement": true,
+            "fullname": "Lain Iwakura",
+            "bio": "wired",
+            "reason": "let me in",
+            "locale": "ja",
+            "confirm": "PlzDontHackLain",
+        }))
+        .expect("a full body");
+        let register = params.into_register_params();
+        assert_eq!(register.nickname, "lain", "username is the nickname");
+        assert_eq!(register.email.as_deref(), Some("lain@example.org"), "email");
+        assert_eq!(register.password, "PlzDontHackLain", "password");
+        assert_eq!(register.name.as_deref(), Some("Lain Iwakura"), "fullname");
+        assert_eq!(register.bio.as_deref(), Some("wired"), "bio");
+        assert_eq!(register.reason.as_deref(), Some("let me in"), "reason");
+    }
+
+    #[test]
+    fn the_registration_answer_is_the_token_json() {
+        let stored = minted_token();
+        let expected_id = stored.id;
+        let expected_created = stored.inserted_at.timestamp();
+        let body = serde_json::to_value(RegistrationToken::new(stored)).unwrap();
+        assert_eq!(body["token_type"], "Bearer", "bearer credentials");
+        assert_eq!(body["access_token"], "access-secret", "the access token");
+        assert_eq!(body["refresh_token"], "refresh-secret", "the refresh token");
+        assert_eq!(
+            body["scope"], "read write follow push",
+            "the presenting token's scopes"
+        );
+        assert_eq!(body["created_at"], expected_created, "unix seconds");
+        assert_eq!(
+            body["id"],
+            expected_id.to_string().as_str(),
+            "hyphenated `UUIDv7`"
+        );
+        let ttl = i64::try_from(crate::config::DEFAULT_OAUTH_TOKEN_TTL_SECS).unwrap();
+        assert!(
+            (ttl - 60..=ttl + 1).contains(&body["expires_in"].as_i64().unwrap()),
+            "expires_in counts down the month-long lifetime"
+        );
+        assert_eq!(
+            body.as_object().expect("an object").len(),
+            7,
+            "exactly the ticket's seven keys, no `me`"
         );
     }
 }

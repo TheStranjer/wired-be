@@ -882,6 +882,7 @@ mod tests {
             last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
+            registration_reason: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,

@@ -135,6 +135,10 @@ pub struct RegisterParams {
     /// Profile note as source text; stored as `raw_bio` verbatim and
     /// rendered to sanitized HTML for `bio` with [`text_to_html`].
     pub bio: Option<String>,
+    /// Free-text registration reason for the later approval flow, stored
+    /// verbatim in `users.registration_reason` (Pleroma's
+    /// `reason` parameter); `None` stores `NULL`.
+    pub reason: Option<String>,
 }
 
 /// The password is secret material and renders as `<redacted>`; everything
@@ -147,6 +151,7 @@ impl fmt::Debug for RegisterParams {
             .field("password", &"<redacted>")
             .field("name", &self.name)
             .field("bio", &self.bio)
+            .field("reason", &self.reason)
             .finish()
     }
 }
@@ -384,6 +389,7 @@ async fn build_and_insert(
         name: display_name(params.name.as_deref(), nickname),
         bio,
         raw_bio,
+        registration_reason: params.reason.clone(),
         inbox: Some(inbox(&ap_id)),
         shared_inbox: Some(shared_inbox),
         outbox: Some(outbox(&ap_id)),
@@ -655,6 +661,7 @@ mod tests {
             password: PASSWORD.to_owned(),
             name: None,
             bio: None,
+            reason: None,
         }
     }
 
@@ -1020,8 +1027,9 @@ mod tests {
     }
 
     /// The profile `create_local_user` stored for the registration: the
-    /// trimmed nickname and email, the actor id on this instance, and the bio
-    /// sanitized but never re-written.
+    /// trimmed nickname and email, the actor id on this instance, the
+    /// registration reason kept verbatim, and the bio sanitized but never
+    /// re-written.
     fn assert_registered_profile(user: &User, raw_bio: &str) {
         assert_eq!(user.nickname, "Alice", "trimmed, case preserved");
         assert!(user.local.get(), "a registration is a local account");
@@ -1038,6 +1046,11 @@ mod tests {
         );
         assert_eq!(user.name, "Alice", "the name defaults to the nickname");
         assert_eq!(user.raw_bio, raw_bio, "raw_bio keeps the source text");
+        assert_eq!(
+            user.registration_reason.as_deref(),
+            Some("I'm a cool dude, bro"),
+            "the registration reason is stored verbatim"
+        );
         assert_eq!(user.bio, text_to_html(raw_bio), "the formatter output");
         assert!(
             !user.bio.contains("<script") && user.bio.contains("https://example.org"),
@@ -1121,6 +1134,7 @@ mod tests {
             password: PASSWORD.to_owned(),
             name: None,
             bio: Some(raw_bio.to_owned()),
+            reason: Some("I'm a cool dude, bro".to_owned()),
         };
         let user = create_local_user(&state, params).await.unwrap();
 
@@ -1158,12 +1172,17 @@ mod tests {
             password: PASSWORD.to_owned(),
             name: Some("<b>Mr Nobody</b>".to_owned()),
             bio: None,
+            reason: None,
         };
         let user = create_local_user(&state, params).await.unwrap();
         assert!(user.email.is_none(), "the account has no email");
         assert_eq!(user.name, "Mr Nobody", "the sanitized requested name");
         assert_eq!(user.bio, "", "absent bio is empty HTML");
         assert_eq!(user.raw_bio, "", "absent bio has no source text");
+        assert!(
+            user.registration_reason.is_none(),
+            "an unstated reason stays NULL"
+        );
     }
 
     #[tokio::test]
@@ -1178,6 +1197,7 @@ mod tests {
             password: SHORT_PASSWORD.to_owned(),
             name: None,
             bio: None,
+            reason: None,
         };
         let shape_err = create_local_user(&state, bad_shape).await.unwrap_err();
         let RegisterError::Invalid(shape_errors) = shape_err else {
@@ -1205,6 +1225,7 @@ mod tests {
             password: String::new(),
             name: None,
             bio: None,
+            reason: None,
         };
         let blank_err = create_local_user(&state, all_blank).await.unwrap_err();
         let RegisterError::Invalid(blank_errors) = blank_err else {
