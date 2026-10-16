@@ -458,8 +458,7 @@ struct Instance {
     /// mode yet, so `false` until the registration-modes ticket updates
     /// it (Pleroma's `account_approval_required` default).
     approval_required: bool,
-    /// Whether registration invites exist; they do not here (Pleroma's
-    /// `invites_enabled` default).
+    /// Whether registration invites exist (`INVITES_ENABLED`).
     invites_enabled: bool,
     /// The account clients should contact the staff through: the first
     /// local admin, or JSON `null` when there is none (Pleroma resolves
@@ -519,7 +518,7 @@ impl Instance {
             languages: config.instance_languages.clone(),
             registrations: config.registrations_open,
             approval_required: false,
-            invites_enabled: false,
+            invites_enabled: config.invites_enabled.get(),
             contact_account: contact.map(|user| Account::from_user(user, config)),
             rules: rules.iter().map(Rule::from_model).collect(),
             max_toot_chars: config.max_status_chars,
@@ -1456,7 +1455,10 @@ mod tests {
             document["approval_required"], false,
             "until the registration ticket"
         );
-        assert_eq!(document["invites_enabled"], false, "no invites exist");
+        assert_eq!(
+            document["invites_enabled"], false,
+            "INVITES_ENABLED is off by default"
+        );
         assert_eq!(document["contact_account"], Value::Null, "no admin fixture");
         assert_eq!(document["rules"], json!([]), "no rules stored");
         assert_eq!(
@@ -1464,6 +1466,27 @@ mod tests {
             json!({"user_count": 0, "status_count": 0, "domain_count": 0}),
             "the zeroed counters"
         );
+    }
+
+    /// `invites_enabled` is the `INVITES_ENABLED` setting, on both sides
+    /// of its default.
+    #[test]
+    fn invites_enabled_mirrors_the_config() {
+        let stats = InstanceStats {
+            users: 0,
+            statuses: 0,
+            domains: 0,
+        };
+        let mut config = Config::for_tests();
+        config.invites_enabled = Toggle::new(true);
+        let on = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
+        assert_eq!(
+            on["invites_enabled"], true,
+            "INVITES_ENABLED=true is advertised"
+        );
+        config.invites_enabled = Toggle::new(false);
+        let off = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
+        assert_eq!(off["invites_enabled"], false, "and the off state stays off");
     }
 
     #[test]

@@ -448,6 +448,7 @@ fn other_config() -> Config {
     config.max_poll_options = 12;
     config.upload_limits.max_file_bytes = 1_048_576;
     config.registrations_open = Toggle::new(false);
+    config.invites_enabled = Toggle::new(true);
     config
 }
 
@@ -491,7 +492,10 @@ async fn identity_fields_mirror_the_config() {
         document["approval_required"], false,
         "until the registration-modes ticket, never required"
     );
-    assert_eq!(document["invites_enabled"], false, "no invites exist");
+    assert_eq!(
+        document["invites_enabled"], true,
+        "INVITES_ENABLED=true is advertised"
+    );
 }
 
 /// The status, attachment, poll and upload limits mirror the configured

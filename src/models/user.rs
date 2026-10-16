@@ -669,7 +669,8 @@ const INSERT_SQL: &str = "INSERT INTO users (
      $55, $56, $57, $58, $59, $60, $61, $62, $63
 ) RETURNING *";
 
-/// Inserts `new_user` and returns the stored row.
+/// Inserts `new_user` on `executor` — the pool or an open transaction —
+/// and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4); every other column comes from
 /// `new_user`, whose [`Default`](NewUser::default) mirrors the column
@@ -682,7 +683,10 @@ const INSERT_SQL: &str = "INSERT INTO users (
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError); a unique violation
 /// (SQLSTATE `23505`) is reported through it unchanged.
-pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
+pub async fn insert<'e, E>(executor: E, new_user: &NewUser) -> AppResult<User>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let user = sqlx::query_as::<_, User>(INSERT_SQL)
         .bind(new_id())
         .bind(new_user.nickname.as_str())
@@ -747,7 +751,7 @@ pub async fn insert(pool: &PgPool, new_user: &NewUser) -> AppResult<User> {
         .bind(new_user.raw_fields.clone())
         .bind(new_user.is_suggested)
         .bind(new_user.registration_reason.as_deref())
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     Ok(user)
 }

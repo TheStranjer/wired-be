@@ -23,7 +23,8 @@ mod account_lists;
 /// The account note endpoints (`/api/v1/accounts/{id}/note`).
 mod account_notes;
 
-/// The open-mode registration endpoint (`POST /api/v1/accounts`).
+/// The registration endpoint (`POST /api/v1/accounts`), open mode and
+/// invite tokens alike.
 mod account_registration;
 
 /// The core account endpoints: `verify_credentials`, `GET /accounts/{id}` and `lookup`.
