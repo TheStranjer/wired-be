@@ -135,6 +135,12 @@ pub const MEDIA_PROXY_MAX_BYTES_VAR: &str = "MEDIA_PROXY_MAX_BYTES";
 /// Environment variable holding the comma-separated list of hosts the
 /// media proxy never proxies.
 pub const MEDIA_PROXY_BLACKLIST_VAR: &str = "MEDIA_PROXY_BLACKLIST";
+/// Environment variable holding whether outgoing actor `GET`s are signed
+/// with the instance actor's key (authorized-fetch mode on the peers).
+pub const SIGN_FETCHES_VAR: &str = "SIGN_FETCHES";
+/// Environment variable holding whether incoming `GET`s to the
+/// `ActivityPub` actor routes must carry a valid HTTP signature.
+pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -291,6 +297,17 @@ pub const DEFAULT_MEDIA_PROXY_MAX_BYTES: usize = 50_000_000;
 /// Minimum length, in characters, of `MEDIA_PROXY_SECRET` when the media
 /// proxy is enabled: 32 bytes of key material for HMAC-SHA256.
 pub const MIN_MEDIA_PROXY_SECRET_CHARS: usize = 32;
+/// Signed-fetch state used when `SIGN_FETCHES` is unset: actor `GET`s are
+/// signed.
+///
+/// Pleroma signs dereferences with the instance actor key by default
+/// (`Pleroma.User.get_or_create_service_actor_by_ap_id` plus
+/// `Signature.sign`), so peers with authorized fetch answer our fetches.
+pub const DEFAULT_SIGN_FETCHES: bool = true;
+/// Authorized-fetch state used when `AUTHORIZED_FETCH` is unset: this
+/// instance serves `ActivityPub` `GET`s to unsigned requests too; Pleroma's
+/// `[:federator, :authorized_fetch]`-style gate is an explicit opt-in.
+pub const DEFAULT_AUTHORIZED_FETCH: bool = false;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from the fixture
 /// in [`crate::test_db`].
@@ -628,6 +645,14 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
+    /// Whether outgoing actor `GET`s are HTTP-signed with the instance
+    /// actor's key, from `SIGN_FETCHES` (see
+    /// [`crate::federation::fetch_actor`]).
+    pub sign_fetches: Toggle,
+    /// Whether incoming `GET`s to the `ActivityPub` actor routes must carry
+    /// a valid HTTP signature, from `AUTHORIZED_FETCH` (see
+    /// [`crate::federation::authorized_fetch`]).
+    pub authorized_fetch: Toggle,
 }
 
 impl Config {
@@ -671,11 +696,7 @@ impl Config {
         let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
-        let http_allow_private_hosts = boolean(
-            &lookup,
-            HTTP_ALLOW_PRIVATE_HOSTS_VAR,
-            DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
-        )?;
+        let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
         let (accounts_email_optional, min_password_length, oauth_token_ttl_secs, oauth_providers) =
             auth_settings(&lookup)?;
@@ -729,6 +750,8 @@ impl Config {
             smtp_tls,
             mail_from,
             media_proxy,
+            sign_fetches,
+            authorized_fetch,
         })
     }
 
@@ -837,6 +860,8 @@ impl Config {
                 max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
                 blacklist: Vec::new(),
             },
+            sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
+            authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
         }
     }
 }
@@ -1149,6 +1174,33 @@ where
     ))
 }
 
+/// Reads the three settings that govern how this instance fetches and is
+/// fetched by peers: whether the client may reach private/loopback hosts
+/// (`HTTP_ALLOW_PRIVATE_HOSTS`), whether it signs its outgoing actor
+/// `GET`s, and whether it demands signatures on incoming `ActivityPub`
+/// `GET`s. Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
+/// back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] for whichever variable holds a
+/// value that is neither spelling.
+fn fetch_settings<F>(lookup: &F) -> Result<(bool, Toggle, Toggle), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        boolean(
+            lookup,
+            HTTP_ALLOW_PRIVATE_HOSTS_VAR,
+            DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
+        )?,
+        boolean(lookup, SIGN_FETCHES_VAR, DEFAULT_SIGN_FETCHES)?.into(),
+        boolean(lookup, AUTHORIZED_FETCH_VAR, DEFAULT_AUTHORIZED_FETCH)?.into(),
+    ))
+}
+
 /// The shape [`text_length_limits`] answers: the four default-or-parse
 /// profile limits in field order (media description, display name, bio,
 /// profile-field count); factored out because a bare fourfold tuple is
@@ -1398,6 +1450,8 @@ impl fmt::Debug for Config {
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
             .field("media_proxy", &self.media_proxy)
+            .field("sign_fetches", &self.sign_fetches)
+            .field("authorized_fetch", &self.authorized_fetch)
             .finish()
     }
 }
@@ -2167,6 +2221,71 @@ mod tests {
         assert!(
             debug.contains("registrations_open: Toggle(false)"),
             "the registration toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn fetch_toggles_parse_booleans() {
+        for var in [SIGN_FETCHES_VAR, AUTHORIZED_FETCH_VAR] {
+            for (value, want) in [
+                ("true", true),
+                ("TRUE", true),
+                (" 1 ", true),
+                ("false", false),
+                ("FaLsE", false),
+                ("0", false),
+            ] {
+                let config = config_with(&[(var, value)]);
+                let got = match var {
+                    SIGN_FETCHES_VAR => config.sign_fetches,
+                    _ => config.authorized_fetch,
+                };
+                assert_eq!(got.get(), want, "{var}={value:?} means {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_toggle_defaults_apply_when_unset_or_empty() {
+        let unset = config_with(&[]);
+        assert!(
+            unset.sign_fetches.get() && !unset.authorized_fetch.get(),
+            "unset toggles sit at their defaults"
+        );
+        let config = config_with(&[(SIGN_FETCHES_VAR, ""), (AUTHORIZED_FETCH_VAR, "")]);
+        assert!(
+            config.sign_fetches.get(),
+            "empty SIGN_FETCHES stays at the default"
+        );
+        assert!(
+            !config.authorized_fetch.get(),
+            "empty AUTHORIZED_FETCH stays at the default"
+        );
+    }
+
+    #[test]
+    fn invalid_fetch_toggles_are_errors() {
+        for var in [SIGN_FETCHES_VAR, AUTHORIZED_FETCH_VAR] {
+            let err = try_config_with(&[(var, "maybe")]).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidBoolean(var), "error for {var}");
+            assert!(
+                err.to_string().starts_with(&format!("invalid {var}: ")),
+                "message names {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_shows_the_fetch_toggles() {
+        let config = config_with(&[(SIGN_FETCHES_VAR, "false"), (AUTHORIZED_FETCH_VAR, "true")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("sign_fetches: Toggle(false)"),
+            "the signed-fetch toggle is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("authorized_fetch: Toggle(true)"),
+            "the authorized-fetch toggle is visible in Debug output: {debug}"
         );
     }
 

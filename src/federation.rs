@@ -9,7 +9,9 @@
 //! HTTP Signatures (draft-cavage-http-signatures-12) Mastodon and Pleroma
 //! expect on every fetch and delivery, both directions:
 //! [`signature::sign_request`] signs outbound requests, [`signature::verify`]
-//! authenticates inbound ones.
+//! authenticates inbound ones — the `GET` side of that authentication is
+//! [`authorized_fetch`], the gate `AUTHORIZED_FETCH` puts in front of the
+//! `ActivityPub` read routes.
 //! [`json`] holds the shared JSON-LD shape normalizers those readers use.
 //! [`delivery`] is the way back out: the `federator.deliver` job that signs
 //! an activity as its actor and POSTs it to a remote inbox, retrying the
@@ -20,6 +22,7 @@
 //! modules beside them.
 
 pub mod actor;
+pub mod authorized_fetch;
 pub mod delivery;
 pub mod fetch_actor;
 pub mod inbox_auth;

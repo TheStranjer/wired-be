@@ -1,5 +1,6 @@
-//! Outbound HTTP Signatures: draft-cavage-http-signatures-12, the scheme
-//! Mastodon and Pleroma use to authenticate every federation request.
+//! HTTP Signatures: draft-cavage-http-signatures-12, the scheme
+//! Mastodon and Pleroma use to authenticate every federation request,
+//! outbound ([`sign_request`]) and inbound ([`verify`]).
 //!
 //! Pleroma signs through `lib/pleroma/signature.ex` and its
 //! `http_signatures` dep; Mastodon through `app/lib/request.rb`. Both
@@ -20,7 +21,8 @@
 //! [`signing_string`] is the same text builder split out (it writes one
 //! `name: value` line per signed header, in the order it is given) so the
 //! inbound verifier in [`verify`] can rebuild the exact text from a
-//! received request.
+//! received request. That module is also what the authorized-fetch gate
+//! ([`crate::federation::authorized_fetch`]) authenticates `GET`s with.
 
 pub mod verify;
 

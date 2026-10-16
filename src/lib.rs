@@ -40,7 +40,7 @@ use crate::{
     error::AppError,
     http_client::HttpClient,
     jobs::{JobRegistry, Worker, scheduler},
-    services::{emoji_packs, media_proxy},
+    services::{emoji_packs, instance_actor, media_proxy},
     state::AppState,
     streaming::hub::Hub,
     uploads::UploaderBackend,
@@ -63,7 +63,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// streaming listener, and shuts everything down on ctrl-c.
 ///
 /// Connects to PostgreSQL, applies [`MIGRATOR`], syncs the emoji packs
-/// (see [`crate::services::emoji_packs`]), binds
+/// (see [`crate::services::emoji_packs`]), provisions the instance actor
+/// (see [`crate::services::instance_actor`]), binds
 /// [`config.bind_addr`](Config::bind_addr), and runs [`app`] together with a
 /// [`Worker`] over [`config`](Config::job_queues)
 /// ([`Config::job_concurrency`] slots at once) until the process is
@@ -84,8 +85,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 ///
 /// # Errors
 ///
-/// Returns the connection, migration, emoji-sync or bind failure that
-/// stopped startup.
+/// Returns the connection, migration, emoji-sync, instance-actor or bind
+/// failure that stopped startup.
 pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let db = PgPoolOptions::new().connect(&config.database_url).await?;
     run_migrations(&db).await?;
@@ -94,6 +95,8 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let emoji_count =
         emoji_packs::sync_custom_emojis(&db, &config.base_url, &config.emoji_dir).await?;
     info!(emoji_count, "emoji packs synced into custom_emojis");
+    let fetch_actor = instance_actor::ensure_instance_actor(&db, &config).await?;
+    info!(ap_id = %fetch_actor.ap_id, "instance actor ready");
     let hub = Hub::new(&db);
     let state = AppState {
         db,
@@ -164,8 +167,8 @@ async fn wait_for_ctrl_c() {
 /// The [`api`] routers are merged under their prefixes; the ten that
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
 /// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
-/// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]),
-/// `/users/{nickname}` ([`api::activitypub`]) and its feed variants plus
+/// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/users/{nickname}`
+/// and `/internal/fetch` ([`api::activitypub`]) and its feed variants plus
 /// `/tags/{tag}` ([`api::feeds`]), `/.well-known` ([`api::well_known`]),
 /// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths

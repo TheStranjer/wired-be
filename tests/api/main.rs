@@ -44,6 +44,9 @@ mod apps;
 /// The bearer extractors and scope guards of `wired_be::auth` over HTTP.
 mod auth;
 
+/// The `AUTHORIZED_FETCH` gate on the `ActivityPub` actor route.
+mod authorized_fetch;
+
 /// The blocks endpoints (`block`, `unblock` and the blocks list).
 mod blocks;
 
@@ -79,6 +82,9 @@ mod health;
 
 /// The public instance endpoints (`src/api/instance.rs`).
 mod instance;
+
+/// The instance actor document and its exclusion from public listings.
+mod instance_actor;
 
 /// List members (`/api/v1/lists/{id}/accounts`).
 mod list_accounts;

@@ -14,6 +14,7 @@
 //! the top level by [`crate::app`]).
 
 pub mod emoji_packs;
+pub mod instance_actor;
 pub mod instance_meta;
 pub mod media_processing;
 pub mod media_proxy;

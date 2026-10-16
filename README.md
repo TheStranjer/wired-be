@@ -37,6 +37,8 @@ All configuration comes from environment variables. For local development, copy 
 | `HEALTHCHECK_ENABLED` | no | `false` | Report pool and liveness data on `GET /api/v1/pleroma/healthcheck`; while off the path answers 404 `{"error":"Not found"}` (`true`/`false`, or `1`/`0`) |
 | `REGISTRATIONS_OPEN` | no | `true` | Whether the instance accepts new local registrations; NodeInfo reports it as `openRegistrations` (`true`/`false`, or `1`/`0`) |
 | `AVAILABLE_FRONTENDS` | no | | Comma-separated frontends clients may pick at `PUT /api/v1/pleroma/preferred_frontend`; while empty, the available list is `[]` and every pick is refused with 422 |
+| `SIGN_FETCHES` | no | `true` | Sign outgoing actor `GET`s with the instance actor's HTTP Signature so peers in authorized-fetch mode answer them (`true`/`false`, or `1`/`0`) |
+| `AUTHORIZED_FETCH` | no | `false` | Require a valid HTTP Signature on `GET`s of the ActivityPub actor routes; while off they answer anonymous requests (`true`/`false`, or `1`/`0`) |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
 | `AVATAR_LIMIT_BYTES` | no | `2000000` | Maximum size of the `avatar` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
