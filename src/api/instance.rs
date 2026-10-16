@@ -28,13 +28,17 @@ use axum::{Json, Router, extract::State, routing::get};
 use chrono::{TimeDelta, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::{
     config::{Config, Toggle},
     entities::account::Account,
     error::AppResult,
-    models::{instance_rule, instance_rule::InstanceRule, user::User},
+    models::{
+        instance_rule,
+        instance_rule::InstanceRule,
+        user::{NOT_INSTANCE_ACTOR, User},
+    },
     services::instance_meta,
     state::AppState,
     util::cache::TimedCache,
@@ -152,10 +156,17 @@ pub struct InstanceStats {
 /// active local accounts, `status_count` the live non-reblog posts this
 /// instance owns (a reblog shares its original's post, so counting both
 /// would double it), and `domain_count` the distinct hosts of the remote
-/// actors mirrored here.
-const STATS_SQL: &str = "SELECT
+/// actors mirrored here. The `user_count` subquery is closed with the
+/// shared [`NOT_INSTANCE_ACTOR`] fragment: the instance actor is a local
+/// active account and belongs in no public statistic.
+///
+/// [`NOT_INSTANCE_ACTOR`]: crate::models::user::NOT_INSTANCE_ACTOR
+const STATS_SQL_LOCAL: &str = "SELECT
        (SELECT count(*) FROM users
-         WHERE local AND is_active) AS user_count,
+         WHERE local AND is_active";
+/// The rest of [`STATS_SQL_LOCAL`], pushed after the instance-actor
+/// exclusion (see [`read_stats`]).
+const STATS_SQL_REST: &str = ") AS user_count,
        (SELECT count(*) FROM statuses
          WHERE local AND deleted_at IS NULL AND reblog_of_id IS NULL) AS status_count,
        (SELECT count(DISTINCT domain) FROM users
@@ -206,7 +217,11 @@ async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance
 ///
 /// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
 async fn read_stats(pool: &PgPool) -> AppResult<InstanceStats> {
-    let stats = sqlx::query_as::<_, InstanceStats>(STATS_SQL)
+    let mut builder = QueryBuilder::<Postgres>::new(STATS_SQL_LOCAL);
+    let _exclude: &mut _ = builder.push(NOT_INSTANCE_ACTOR);
+    let _rest: &mut _ = builder.push(STATS_SQL_REST);
+    let stats = builder
+        .build_query_as::<InstanceStats>()
         .fetch_one(pool)
         .await?;
     Ok(stats)

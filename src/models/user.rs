@@ -39,6 +39,25 @@ pub const DEFAULT_ACTOR_TYPE: &str = "Person";
 /// get, matching the column default (Pleroma's `:defaults` `access`).
 pub const DEFAULT_SCOPE: &str = "public";
 
+/// The nickname of the instance actor: the local `Application` account
+/// that signs this instance's fetches and owns server-level activities
+/// (see [`crate::services::instance_actor`]).
+///
+/// It is deliberately not a registrable handle and never a listed account.
+pub const INSTANCE_ACTOR_NICKNAME: &str = "internal.fetch";
+
+/// Shared SQL fragment appending the exclusion of the instance actor to a
+/// `WHERE` clause: ` AND nickname <> 'internal.fetch'`.
+///
+/// Every query that counts or lists users for a public listing (instance
+/// stats, `NodeInfo` counters, and their search/directory/suggestions
+/// counterparts when they arrive) ends its predicate with this fragment, so
+/// the actor never shows up in them; lookups that name the account directly
+/// ([`get_by_nickname`], [`get_by_acct`]) are allowed to find it.
+///
+/// The literal is kept in step with [`INSTANCE_ACTOR_NICKNAME`] by a test.
+pub const NOT_INSTANCE_ACTOR: &str = " AND nickname <> 'internal.fetch'";
+
 /// A Postgres `boolean` column as a named flag.
 ///
 /// `User` and `NewUser` carry twenty booleans each; Clippy's
@@ -1515,6 +1534,16 @@ mod tests {
         assert!(
             new_debug.contains(r#"password_hash: "<redacted>""#),
             "and shows the markers"
+        );
+    }
+
+    /// The shared exclusion fragment must name exactly the instance actor
+    /// nickname, or the listing queries and the service would drift apart.
+    #[test]
+    fn the_instance_actor_exclusion_names_the_instance_actor() {
+        assert!(
+            NOT_INSTANCE_ACTOR.contains(INSTANCE_ACTOR_NICKNAME),
+            "the SQL fragment excludes the account the constant names"
         );
     }
 

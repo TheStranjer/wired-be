@@ -65,6 +65,12 @@ pub const HEALTHCHECK_ENABLED_VAR: &str = "HEALTHCHECK_ENABLED";
 /// Environment variable holding whether the instance accepts new local
 /// registrations; `NodeInfo` reports it as `openRegistrations`.
 pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
+/// Environment variable holding whether outgoing actor `GET`s are signed
+/// with the instance actor's key (authorized-fetch mode on the peers).
+pub const SIGN_FETCHES_VAR: &str = "SIGN_FETCHES";
+/// Environment variable holding whether incoming `GET`s to the
+/// `ActivityPub` actor routes must carry a valid HTTP signature.
+pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -134,6 +140,17 @@ pub const DEFAULT_HEALTHCHECK_ENABLED: bool = false;
 /// `[:instance, :registrations_open]` default is open, so closing
 /// registration is always an explicit operator decision.
 pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
+/// Signed-fetch state used when `SIGN_FETCHES` is unset: actor `GET`s are
+/// signed.
+///
+/// Pleroma signs dereferences with the instance actor key by default
+/// (`Pleroma.User.get_or_create_service_actor_by_ap_id` plus
+/// `Signature.sign`), so peers with authorized fetch answer our fetches.
+pub const DEFAULT_SIGN_FETCHES: bool = true;
+/// Authorized-fetch state used when `AUTHORIZED_FETCH` is unset: this
+/// instance serves `ActivityPub` `GET`s to unsigned requests too; Pleroma's
+/// `[:federator, :authorized_fetch]`-style gate is an explicit opt-in.
+pub const DEFAULT_AUTHORIZED_FETCH: bool = false;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from
 /// `#[sqlx::test]`.
@@ -246,6 +263,14 @@ pub struct Config {
     /// `REGISTRATIONS_OPEN`; `NodeInfo` reports it as `openRegistrations`
     /// (see [`crate::api::nodeinfo`]).
     pub registrations_open: Toggle,
+    /// Whether outgoing actor `GET`s are HTTP-signed with the instance
+    /// actor's key, from `SIGN_FETCHES` (see
+    /// [`crate::federation::fetch_actor`]).
+    pub sign_fetches: Toggle,
+    /// Whether incoming `GET`s to the `ActivityPub` actor routes must carry
+    /// a valid HTTP signature, from `AUTHORIZED_FETCH` (see
+    /// [`crate::federation::authorized_fetch`]).
+    pub authorized_fetch: Toggle,
 }
 
 impl Config {
@@ -311,6 +336,7 @@ impl Config {
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let registrations_open =
             boolean(&lookup, REGISTRATIONS_OPEN_VAR, DEFAULT_REGISTRATIONS_OPEN)?.into();
+        let (sign_fetches, authorized_fetch) = fetch_toggles(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -334,6 +360,8 @@ impl Config {
             captcha_enabled,
             healthcheck_enabled,
             registrations_open,
+            sign_fetches,
+            authorized_fetch,
         })
     }
 
@@ -407,6 +435,8 @@ impl Config {
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
+            sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
+            authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
         }
     }
 }
@@ -514,6 +544,26 @@ where
     ))
 }
 
+/// Reads the two toggles that govern HTTP-signed federation fetches:
+/// whether this instance signs its outgoing actor `GET`s, and whether it
+/// demands signatures on incoming `ActivityPub` `GET`s. Grouped because
+/// each is a plain default-or-parse and [`Config::from_lookup`] has a size
+/// budget (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] for whichever variable holds a
+/// value that is neither spelling.
+fn fetch_toggles<F>(lookup: &F) -> Result<(Toggle, Toggle), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        boolean(lookup, SIGN_FETCHES_VAR, DEFAULT_SIGN_FETCHES)?.into(),
+        boolean(lookup, AUTHORIZED_FETCH_VAR, DEFAULT_AUTHORIZED_FETCH)?.into(),
+    ))
+}
+
 /// Reads a non-negative integer setting, applying `default` when the variable
 /// is unset or empty.
 ///
@@ -586,6 +636,8 @@ impl fmt::Debug for Config {
             .field("captcha_enabled", &self.captcha_enabled)
             .field("healthcheck_enabled", &self.healthcheck_enabled)
             .field("registrations_open", &self.registrations_open)
+            .field("sign_fetches", &self.sign_fetches)
+            .field("authorized_fetch", &self.authorized_fetch)
             .finish()
     }
 }
@@ -824,6 +876,14 @@ mod tests {
             config.registrations_open.get(),
             "registration is open by default (Pleroma's default)"
         );
+        assert!(
+            config.sign_fetches.get(),
+            "actor fetches are signed by default (Pleroma's behavior)"
+        );
+        assert!(
+            !config.authorized_fetch.get(),
+            "incoming fetches need no signature by default"
+        );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
@@ -954,6 +1014,71 @@ mod tests {
         assert!(
             debug.contains("registrations_open: Toggle(false)"),
             "the registration toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn fetch_toggles_parse_booleans() {
+        for var in [SIGN_FETCHES_VAR, AUTHORIZED_FETCH_VAR] {
+            for (value, want) in [
+                ("true", true),
+                ("TRUE", true),
+                (" 1 ", true),
+                ("false", false),
+                ("FaLsE", false),
+                ("0", false),
+            ] {
+                let config = config_with(&[(var, value)]);
+                let got = match var {
+                    SIGN_FETCHES_VAR => config.sign_fetches,
+                    _ => config.authorized_fetch,
+                };
+                assert_eq!(got.get(), want, "{var}={value:?} means {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_toggle_defaults_apply_when_unset_or_empty() {
+        let unset = config_with(&[]);
+        assert!(
+            unset.sign_fetches.get() && !unset.authorized_fetch.get(),
+            "unset toggles sit at their defaults"
+        );
+        let config = config_with(&[(SIGN_FETCHES_VAR, ""), (AUTHORIZED_FETCH_VAR, "")]);
+        assert!(
+            config.sign_fetches.get(),
+            "empty SIGN_FETCHES stays at the default"
+        );
+        assert!(
+            !config.authorized_fetch.get(),
+            "empty AUTHORIZED_FETCH stays at the default"
+        );
+    }
+
+    #[test]
+    fn invalid_fetch_toggles_are_errors() {
+        for var in [SIGN_FETCHES_VAR, AUTHORIZED_FETCH_VAR] {
+            let err = try_config_with(&[(var, "maybe")]).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidBoolean(var), "error for {var}");
+            assert!(
+                err.to_string().starts_with(&format!("invalid {var}: ")),
+                "message names {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_shows_the_fetch_toggles() {
+        let config = config_with(&[(SIGN_FETCHES_VAR, "false"), (AUTHORIZED_FETCH_VAR, "true")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("sign_fetches: Toggle(false)"),
+            "the signed-fetch toggle is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("authorized_fetch: Toggle(true)"),
+            "the authorized-fetch toggle is visible in Debug output: {debug}"
         );
     }
 

@@ -31,11 +31,12 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::{
     config::{Config, Toggle},
     error::{AppError, AppResult},
+    models::user::NOT_INSTANCE_ACTOR,
     services::instance_meta,
     state::AppState,
 };
@@ -579,7 +580,10 @@ impl Markup {
 /// The `usage.users` counters: every active local account counts toward
 /// `total`, and the two activity windows count the accounts whose
 /// `last_active_at` — falling back to their newest post's time, as Pleroma
-/// treats "active" — is inside them.
+/// treats "active" — is inside them. The instance actor never counts: the
+/// shared [`NOT_INSTANCE_ACTOR`] fragment closes the predicate.
+///
+/// [`NOT_INSTANCE_ACTOR`]: crate::models::user::NOT_INSTANCE_ACTOR
 const USER_COUNTS_SQL: &str = "SELECT
        count(*) AS total,
        count(*) FILTER (
@@ -605,13 +609,18 @@ const STAFF_ACCOUNTS_SQL: &str = "SELECT ap_id FROM users
    WHERE (is_admin OR is_moderator) AND local AND is_active
 ORDER BY ap_id";
 
-/// The [`usage`](NodeInfo::usage) user counters, read live.
+/// The [`usage`](NodeInfo::usage) user counters, read live. The builder
+/// exists only to splice the shared [`NOT_INSTANCE_ACTOR`] fragment onto
+/// the constant [`USER_COUNTS_SQL`] — no request data enters the text.
 ///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
 async fn read_user_counts(pool: &PgPool) -> AppResult<UserCounts> {
-    let counts = sqlx::query_as::<_, UserCounts>(USER_COUNTS_SQL)
+    let mut builder = QueryBuilder::<Postgres>::new(USER_COUNTS_SQL);
+    let _exclude: &mut _ = builder.push(NOT_INSTANCE_ACTOR);
+    let counts = builder
+        .build_query_as::<UserCounts>()
         .fetch_one(pool)
         .await?;
     Ok(counts)

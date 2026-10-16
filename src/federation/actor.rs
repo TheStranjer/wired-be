@@ -34,7 +34,7 @@ use crate::{
 const FEATURED_PATH: &str = "/collections/featured";
 /// Fragment appended to the actor id for the key's own id (Pleroma's
 /// `common_actor_fields`, `"#{user.ap_id}#main-key"`).
-const MAIN_KEY_FRAGMENT: &str = "#main-key";
+pub const MAIN_KEY_FRAGMENT: &str = "#main-key";
 /// The `type` of the `attachment` entries (Mastodon's profile metadata).
 const PROPERTY_VALUE_TYPE: &str = "PropertyValue";
 /// The `type` of an `icon` or `image` value.

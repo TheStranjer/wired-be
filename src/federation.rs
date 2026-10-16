@@ -7,12 +7,14 @@
 //! [`fetch_actor`], which dereferences remote actor documents over HTTP and
 //! keeps the user mirrors fresh, plus outbound authentication, the
 //! [`signature`] module that creates the HTTP Signatures (draft-cavage-http-
-//! signatures-12) Mastodon and Pleroma expect on every fetch and delivery.
-//! [`json`] holds the shared JSON-LD shape normalizers those readers use.
-//! Inbound signature verification, activity documents, inboxes and outboxes
-//! arrive in later tickets and get their modules beside them.
+//! signatures-12) Mastodon and Pleroma expect on every fetch and delivery
+//! and verifies them on inbound requests. [`authorized_fetch`] is the
+//! inbound gate built on that verification. [`json`] holds the shared
+//! JSON-LD shape normalizers those readers use. Activity documents, inboxes
+//! and outboxes arrive in later tickets and get their modules beside them.
 
 pub mod actor;
+pub mod authorized_fetch;
 pub mod fetch_actor;
 pub mod json;
 pub mod remote_actor;

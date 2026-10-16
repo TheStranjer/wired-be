@@ -46,8 +46,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// The [`api`] routers are merged under their prefixes; the seven that
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
 /// or by the clients that call them — `/media` ([`media_files`]), `/emoji`
-/// ([`api::emoji_packs`]), `/users/{nickname}` ([`api::activitypub`]),
-/// `/.well-known` ([`api::well_known`]), `/.well-known/nodeinfo` and
+/// ([`api::emoji_packs`]), `/users/{nickname}` and `/internal/fetch`
+/// ([`api::activitypub`]), `/.well-known/webfinger`
+/// ([`api::well_known`]), `/.well-known/nodeinfo` and
 /// `/nodeinfo/{version}` ([`api::nodeinfo`]), `/oauth` ([`api::oauth`]) and
 /// the `MongooseIM` auth endpoints plus `/manifest.json` ([`api::misc`]) —
 /// are merged at the top level. Paths no route matches get the standard

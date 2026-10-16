@@ -1,5 +1,5 @@
 //! Server entry point: read config, connect to PostgreSQL, migrate, sync
-//! the emoji packs, serve.
+//! the emoji packs, provision the instance actor, serve.
 
 use std::{error::Error, sync::Arc};
 
@@ -8,8 +8,13 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use wired_be::{
-    app, config::Config, http_client::HttpClient, run_migrations, services::emoji_packs,
-    state::AppState, uploads::UploaderBackend,
+    app,
+    config::Config,
+    http_client::HttpClient,
+    run_migrations,
+    services::{emoji_packs, instance_actor},
+    state::AppState,
+    uploads::UploaderBackend,
 };
 
 /// Installs a `tracing-subscriber` formatter filtered by `RUST_LOG`, defaulting to `info`.
@@ -37,6 +42,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let emoji_count =
         emoji_packs::sync_custom_emojis(&db, &config.base_url, &config.emoji_dir).await?;
     info!(emoji_count, "emoji packs synced into custom_emojis");
+    let fetch_actor = instance_actor::ensure_instance_actor(&db, &config).await?;
+    info!(ap_id = %fetch_actor.ap_id, "instance actor ready");
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!(addr = %config.bind_addr, "listening");
     let state = AppState {
