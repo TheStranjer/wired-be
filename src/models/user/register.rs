@@ -7,7 +7,10 @@
 //! RSA key pair, derives the `ActivityPub` endpoint URLs and inserts the
 //! row. A lost race against a concurrent registration on one of `users`'
 //! unique constraints maps to the same field error as the up-front
-//! availability check.
+//! availability check. When the request came in on a registration invite,
+//! the caller hands the validated [`InviteToken`] in and its consumption
+//! runs on the same transaction as the insert, so a failed registration
+//! spends nothing.
 //!
 //! [`authenticate`] is the login path: it verifies the password against
 //! any supported hash for the local, active user found by nickname or
@@ -37,6 +40,7 @@ use super::{
 use crate::{
     config::Config,
     error::{AppError, AppResult},
+    models::invite_token::{self, InviteToken},
     state::AppState,
     util::{
         format::text_to_html,
@@ -231,15 +235,28 @@ impl From<RegisterError> for AppError {
 /// re-checked through the insert, so a concurrent registration of the same
 /// account loses with the same field error the check would have produced.
 ///
+/// `invite` is the already-validated [`InviteToken`] the registration came
+/// in with, or `None` for an open-registrations request: an invited
+/// account's [`consume`] runs on the same transaction as the user insert,
+/// so a registration that fails validation spends no invite and the
+/// invite is never left spent without its account. An invited user skips
+/// approval when the approval mode lands (this server activates every
+/// registered account today, and the invited one must stay active when
+/// others start awaiting approval); email confirmation, when it lands,
+/// gates invited accounts like every other.
+///
 /// # Errors
 ///
 /// [`RegisterError::Invalid`] with every failed rule keyed by field when
 /// validation or an availability check does not pass;
 /// [`RegisterError::Failed`] for hashing, key generation or database
 /// failures beyond those.
+///
+/// [`consume`]: crate::models::invite_token::consume
 pub async fn create_local_user(
     state: &AppState,
     params: RegisterParams,
+    invite: Option<&InviteToken>,
 ) -> Result<User, RegisterError> {
     let nickname = params.nickname.trim().to_owned();
     let email = normalize_email(params.email.as_deref());
@@ -251,7 +268,7 @@ pub async fn create_local_user(
     if !errors.is_empty() {
         return Err(RegisterError::Invalid(errors));
     }
-    build_and_insert(state, &params, &nickname, email).await
+    build_and_insert(state, &params, &nickname, email, invite).await
 }
 
 /// Verifies `password` for the local, active user whose nickname or email
@@ -366,12 +383,14 @@ async fn set_password_hash(pool: &PgPool, id: Uuid, hash: &str) -> AppResult<()>
 
 /// The registration's second half, reached only once every rule passed:
 /// hash the password, generate the keys, assemble the [`NewUser`] and
-/// insert it.
+/// insert it — on the pool alone, or, when `invite` names one, inside a
+/// transaction with the invite's consumption (see [`create_local_user`]).
 async fn build_and_insert(
     state: &AppState,
     params: &RegisterParams,
     nickname: &str,
     email: Option<String>,
+    invite: Option<&InviteToken>,
 ) -> Result<User, RegisterError> {
     let password_hash = hash_password(&params.password)?;
     let keys = generate_keypair_async().await?;
@@ -400,10 +419,34 @@ async fn build_and_insert(
         private_key: Some(keys.private_pem),
         ..NewUser::local(nickname, &ap_id)
     };
-    match insert(&state.db, &new_user).await {
+    let inserted = match invite {
+        None => insert(&state.db, &new_user).await,
+        Some(spent) => insert_with_invite(&state.db, &new_user, spent).await,
+    };
+    match inserted {
         Ok(user) => Ok(user),
         Err(err) => Err(map_insert_error(err)),
     }
+}
+
+/// The invited registration's write: user insert and invite consumption
+/// in one transaction, so the two land together or not at all. A failed
+/// insert aborts the transaction and the invite keeps its count and its
+/// flag; the [`AppError`]s propagate as the caller's own (a
+/// [`consume`] miss — the invite revoked under the registration's feet —
+/// stays the internal arm it reports).
+///
+/// [`consume`]: invite_token::consume
+async fn insert_with_invite(
+    pool: &PgPool,
+    new_user: &NewUser,
+    spent: &InviteToken,
+) -> AppResult<User> {
+    let mut tx = pool.begin().await?;
+    let user = insert(&mut *tx, new_user).await?;
+    invite_token::consume(&mut *tx, spent.id).await?;
+    tx.commit().await?;
+    Ok(user)
 }
 
 /// Turns a database failure from the insert into a [`RegisterError`]: a
@@ -1136,7 +1179,7 @@ mod tests {
             bio: Some(raw_bio.to_owned()),
             reason: Some("I'm a cool dude, bro".to_owned()),
         };
-        let user = create_local_user(&state, params).await.unwrap();
+        let user = create_local_user(&state, params, None).await.unwrap();
 
         assert_registered_profile(&user, raw_bio);
 
@@ -1174,7 +1217,7 @@ mod tests {
             bio: None,
             reason: None,
         };
-        let user = create_local_user(&state, params).await.unwrap();
+        let user = create_local_user(&state, params, None).await.unwrap();
         assert!(user.email.is_none(), "the account has no email");
         assert_eq!(user.name, "Mr Nobody", "the sanitized requested name");
         assert_eq!(user.bio, "", "absent bio is empty HTML");
@@ -1199,7 +1242,9 @@ mod tests {
             bio: None,
             reason: None,
         };
-        let shape_err = create_local_user(&state, bad_shape).await.unwrap_err();
+        let shape_err = create_local_user(&state, bad_shape, None)
+            .await
+            .unwrap_err();
         let RegisterError::Invalid(shape_errors) = shape_err else {
             panic!("a validation failure must be Invalid, got {shape_err:?}")
         };
@@ -1227,7 +1272,9 @@ mod tests {
             bio: None,
             reason: None,
         };
-        let blank_err = create_local_user(&state, all_blank).await.unwrap_err();
+        let blank_err = create_local_user(&state, all_blank, None)
+            .await
+            .unwrap_err();
         let RegisterError::Invalid(blank_errors) = blank_err else {
             panic!("blank parameters must be Invalid, got {blank_err:?}")
         };
@@ -1252,7 +1299,9 @@ mod tests {
             email: Some("alice@example.org".to_owned()),
             ..params_for("aLiCe")
         };
-        let dup_err = create_local_user(&state, dup_params).await.unwrap_err();
+        let dup_err = create_local_user(&state, dup_params, None)
+            .await
+            .unwrap_err();
         let RegisterError::Invalid(dup_errors) = dup_err else {
             panic!("a duplicate must be Invalid, got {dup_err:?}")
         };
@@ -1271,7 +1320,9 @@ mod tests {
             email: Some("BOB@example.org".to_owned()),
             ..params_for("carol")
         };
-        let carol_err = create_local_user(&state, carol_params).await.unwrap_err();
+        let carol_err = create_local_user(&state, carol_params, None)
+            .await
+            .unwrap_err();
         let RegisterError::Invalid(carol_errors) = carol_err else {
             panic!("a duplicate email must be Invalid, got {carol_err:?}")
         };
@@ -1311,7 +1362,7 @@ mod tests {
         .expect("the squatter inserts");
         assert_eq!(squatter.nickname, "mallory", "the squatter owns ap_id");
         let state = test_state(&pool);
-        let race_err = create_local_user(&state, params_for("alice"))
+        let race_err = create_local_user(&state, params_for("alice"), None)
             .await
             .unwrap_err();
         let RegisterError::Invalid(race_errors) = race_err else {
@@ -1542,5 +1593,71 @@ mod tests {
             authenticate(&pool, "frank", PASSWORD).await.is_none(),
             "a broken lookup is not a login"
         );
+    }
+
+    /// Reads the invite `id` back, panicking if it is gone.
+    async fn stored_invite(pool: &PgPool, id: Uuid) -> InviteToken {
+        invite_token::list(pool)
+            .await
+            .expect("the list runs")
+            .into_iter()
+            .find(|invite| invite.id == id)
+            .expect("the invite exists")
+    }
+
+    #[tokio::test]
+    async fn an_invited_registration_consumes_the_invite_in_its_transaction() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let invite = invite_token::create(&pool, &invite_token::InviteParams::one_time())
+            .await
+            .expect("the invite mints");
+        let user = create_local_user(&state, params_for("invited"), Some(&invite))
+            .await
+            .expect("the invited registration lands");
+        assert!(user.is_active.get(), "an invited user is active");
+        assert!(
+            !user.approval_pending.get(),
+            "an invited user skips approval: it never awaits one"
+        );
+        let spent = stored_invite(&pool, invite.id).await;
+        assert_eq!(spent.uses, 1, "the registration was counted");
+        assert!(spent.used, "and the one-time invite is spent");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_invited_registration_spends_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let squatter = insert_login(&pool, "taken", "taken@example.org", None).await;
+        assert_eq!(squatter.nickname, "taken", "the collision fixture exists");
+        let state = test_state(&pool);
+        let invite = invite_token::create(
+            &pool,
+            &invite_token::InviteParams {
+                expires_at: None,
+                max_use: Some(2),
+            },
+        )
+        .await
+        .expect("the invite mints");
+        // The same nickname the insert race would lose on: validation
+        // fails after the invite was picked up, and the shared
+        // transaction must leave the invite exactly as it was.
+        let dup_params = RegisterParams {
+            nickname: "taken".to_owned(),
+            ..params_for("taken")
+        };
+        let err = create_local_user(&state, dup_params, Some(&invite))
+            .await
+            .expect_err("the duplicate nickname is refused");
+        assert!(
+            matches!(err, RegisterError::Invalid(_)),
+            "the field-map error survives, got {err:?}"
+        );
+        let untouched = stored_invite(&pool, invite.id).await;
+        assert_eq!(untouched.uses, 0, "a refused registration counted nothing");
+        assert!(!untouched.used, "and spent nothing");
     }
 }

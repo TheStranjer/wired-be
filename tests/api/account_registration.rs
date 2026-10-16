@@ -1,26 +1,38 @@
-//! Integration tests for `POST /api/v1/accounts` (open-mode registration,
+//! Integration tests for `POST /api/v1/accounts` (registration,
 //! Pleroma's `AccountController.create`).
 //!
 //! The route takes any valid bearer token — app-only or user-bound —
 //! with the `write:accounts` scope: no token is the 401 "Invalid
 //! credentials", a scopeless token the 403 "Insufficient permissions:
 //! write:accounts.", and a closed `REGISTRATIONS_OPEN` the 403
-//! "Registration is disabled". A well-formed body lands a local account
-//! through `create_local_user` and answers the token JSON (Bearer, the
-//! presenting token's scopes, the token row's id, `expires_in` and a
-//! `refresh_token`); the issued access token authenticates
-//! `GET /api/v1/accounts/verify_credentials` for the new account.
-//! Validation failures — absent or false `agreement`, a duplicate
-//! nickname, an invalid email, a short password — answer 422s, the
-//! model's carrying the JSON *string* of the field map in `error`.
+//! "Registration is disabled" — unless `INVITES_ENABLED` is on, when a
+//! valid invite `token` registers instead and every refused invite
+//! (absent, unknown, spent, expired, exhausted) is the 400 "Invalid
+//! token". An accepted invite is consumed in the user's own insert
+//! transaction, and an open instance ignores the parameter: an invalid
+//! token still registers, and no invite is ever spent. A well-formed
+//! body lands a local account through `create_local_user` and answers
+//! the token JSON (Bearer, the presenting token's scopes, the token
+//! row's id, `expires_in` and a `refresh_token`); the issued access
+//! token authenticates `GET /api/v1/accounts/verify_credentials` for the
+//! new account. Validation failures — absent or false `agreement`, a
+//! duplicate nickname, an invalid email, a short password — answer 422s,
+//! the model's carrying the JSON *string* of the field map in `error`.
 
 #![cfg(test)]
 
 use axum::{Router, http::StatusCode};
+use chrono::{NaiveDate, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::{config::Toggle, models::user};
+use wired_be::{
+    config::{Config, Toggle},
+    models::{
+        invite_token::{self, InviteParams, InviteToken},
+        user,
+    },
+};
 
 use crate::common;
 
@@ -440,4 +452,346 @@ async fn a_write_token_is_enough() {
         "write",
         "the issued token copies the presenting scopes"
     );
+}
+
+/// Today on the instance clock: invite expiries are calendar dates.
+fn today() -> NaiveDate {
+    Utc::now().date_naive()
+}
+
+/// A closed instance that takes invites: `REGISTRATIONS_OPEN=false`,
+/// `INVITES_ENABLED=true`.
+fn invite_config() -> Config {
+    let mut config = common::test_config();
+    config.registrations_open = Toggle::new(false);
+    config.invites_enabled = Toggle::new(true);
+    config
+}
+
+/// The router of [`invite_config`], mounted over `pool`.
+fn invite_app(pool: &PgPool) -> Router {
+    common::test_app_with_config(pool.clone(), invite_config())
+}
+
+/// Mints an invite through the model and returns its row.
+async fn mint_invite(pool: &PgPool, params: &InviteParams) -> InviteToken {
+    invite_token::create(pool, params)
+        .await
+        .expect("the invite mints")
+}
+
+/// The invite row behind `invite`, re-read from storage.
+async fn reload_invite(pool: &PgPool, invite: &InviteToken) -> InviteToken {
+    invite_token::get_by_token(pool, &invite.token)
+        .await
+        .expect("the lookup runs")
+        .expect("the invite is still stored")
+}
+
+/// Registers `username` on the invite-gated `app`, submitting `token`
+/// as the body's invite, over a fresh app-only bearer.
+async fn register_with_invite(
+    app: &Router,
+    pool: &PgPool,
+    username: &str,
+    token: &str,
+) -> common::TestResponse {
+    let bearer = common::create_app_only_token(pool, FULL_SCOPES).await;
+    register_json(app, &bearer, &body_with(username, &json!({"token": token}))).await
+}
+
+/// The 400 body an invite refusal carries, for `who`.
+fn assert_invalid_token(response: &common::TestResponse, who: &str) {
+    common::assert_answer(response, StatusCode::BAD_REQUEST, who);
+    common::assert_error(response, "Invalid token", who);
+}
+
+/// The number of rows in `users`, for "nobody registered" proofs.
+async fn user_count(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+        .fetch_one(pool)
+        .await
+        .expect("users can be counted");
+    row.0
+}
+
+/// A one-time invite opens the closed gate exactly once: the first
+/// registration lands an active, approval-skipping account and spends
+/// the invite (`uses` 1, `used`), and the same token then registers
+/// nobody.
+#[tokio::test]
+async fn a_one_time_invite_registers_once_and_is_spent() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = invite_app(&pool);
+    let invite = mint_invite(&pool, &InviteParams::one_time()).await;
+
+    let first = register_with_invite(&app, &pool, "invited", &invite.token).await;
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "a valid invite registers: {}",
+        first.text()
+    );
+    let stored = user::get_by_nickname(&pool, "invited")
+        .await
+        .expect("the lookup runs")
+        .expect("the invited account landed");
+    assert!(stored.is_active.get(), "an invited user is active");
+    assert!(
+        !stored.approval_pending.get(),
+        "an invited user skips approval"
+    );
+
+    let spent = reload_invite(&pool, &invite).await;
+    assert_eq!(spent.uses, 1, "the registration was counted");
+    assert!(spent.used, "a one-time invite is spent by its use");
+    assert!(!spent.is_valid(today()), "and it is no longer valid");
+
+    let again = register_with_invite(&app, &pool, "twice", &invite.token).await;
+    assert_invalid_token(&again, "the spent invite");
+    assert!(
+        user::get_by_nickname(&pool, "twice")
+            .await
+            .expect("the lookup runs")
+            .is_none(),
+        "the spent invite registered nobody"
+    );
+}
+
+/// A reusable invite counts every registration and stops exactly at its
+/// cap: two serves a `max_use` of two, the third is refused, and the row
+/// is marked used at the cap.
+#[tokio::test]
+async fn a_reusable_invite_serves_up_to_its_cap() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = invite_app(&pool);
+    let params = InviteParams {
+        expires_at: None,
+        max_use: Some(2),
+    };
+    let invite = mint_invite(&pool, &params).await;
+
+    let first = register_with_invite(&app, &pool, "reuse1", &invite.token).await;
+    assert_eq!(first.status, StatusCode::OK, "the first serve passes");
+    let once = reload_invite(&pool, &invite).await;
+    assert_eq!(once.uses, 1, "one of two counted");
+    assert!(!once.used, "short of the cap the invite stays open");
+
+    let second = register_with_invite(&app, &pool, "reuse2", &invite.token).await;
+    assert_eq!(second.status, StatusCode::OK, "the second serve passes");
+    let twice = reload_invite(&pool, &invite).await;
+    assert_eq!(twice.uses, 2, "both counted");
+    assert!(twice.used, "reaching the cap marks the invite used");
+
+    let third = register_with_invite(&app, &pool, "reuse3", &invite.token).await;
+    assert_invalid_token(&third, "the exhausted invite");
+    assert_eq!(
+        user_count(&pool).await,
+        2,
+        "exactly the two invited accounts"
+    );
+}
+
+/// A date-limited invite serves every registration up to and including
+/// its day — counting uses but never marking `used` — and the day after
+/// its expiry it is the 400.
+#[tokio::test]
+async fn a_date_limited_invite_serves_until_its_day() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = invite_app(&pool);
+    let params = InviteParams {
+        expires_at: Some(today()),
+        max_use: None,
+    };
+    let invite = mint_invite(&pool, &params).await;
+
+    let first = register_with_invite(&app, &pool, "dated1", &invite.token).await;
+    assert_eq!(first.status, StatusCode::OK, "the expiry day is still open");
+    let second = register_with_invite(&app, &pool, "dated2", &invite.token).await;
+    assert_eq!(second.status, StatusCode::OK, "a date limit serves twice");
+    let after = reload_invite(&pool, &invite).await;
+    assert_eq!(after.uses, 2, "both counted");
+    assert!(
+        !after.used,
+        "a date-limited invite is spent by its date, not its use"
+    );
+    assert!(
+        after.is_valid(today()),
+        "still valid on the expiry day itself"
+    );
+    assert!(
+        !after.is_valid(today() + chrono::Duration::days(1)),
+        "and invalid the day after"
+    );
+
+    let lapsed = InviteParams {
+        expires_at: Some(today() - chrono::Duration::days(1)),
+        max_use: None,
+    };
+    let expired = mint_invite(&pool, &lapsed).await;
+    let refused = register_with_invite(&app, &pool, "latershow", &expired.token).await;
+    assert_invalid_token(&refused, "the expired invite");
+    assert_eq!(
+        user_count(&pool).await,
+        2,
+        "the expired invite registered nobody"
+    );
+}
+
+/// Every refusal the invite gate makes is the same 400 "Invalid token":
+/// an absent parameter, an unknown text, an expired date, a used row and
+/// an exhausted cap — and none of them stores anybody or spends
+/// anything.
+#[tokio::test]
+async fn every_refused_invite_is_a_400_invalid_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = invite_app(&pool);
+
+    let absent = {
+        let bearer = common::create_app_only_token(&pool, FULL_SCOPES).await;
+        register_json(&app, &bearer, &body_for("nobody1")).await
+    };
+    let unknown = register_with_invite(&app, &pool, "nobody2", "never-minted-text").await;
+
+    let expired = mint_invite(
+        &pool,
+        &InviteParams {
+            expires_at: Some(today() - chrono::Duration::days(1)),
+            max_use: Some(5),
+        },
+    )
+    .await;
+    let expired_answer = register_with_invite(&app, &pool, "nobody3", &expired.token).await;
+
+    let used = mint_invite(&pool, &InviteParams::one_time()).await;
+    invite_token::consume(&pool, used.id)
+        .await
+        .expect("the model spends the invite");
+    let used_answer = register_with_invite(&app, &pool, "nobody4", &used.token).await;
+
+    let exhausted = mint_invite(
+        &pool,
+        &InviteParams {
+            expires_at: None,
+            max_use: Some(1),
+        },
+    )
+    .await;
+    invite_token::consume(&pool, exhausted.id)
+        .await
+        .expect("the model reaches the cap");
+    let exhausted_answer = register_with_invite(&app, &pool, "nobody5", &exhausted.token).await;
+
+    common::assert_all_refused(
+        &[
+            absent,
+            unknown,
+            expired_answer,
+            used_answer,
+            exhausted_answer,
+        ],
+        StatusCode::BAD_REQUEST,
+        "Invalid token",
+        "every invite refusal",
+    );
+    assert_eq!(user_count(&pool).await, 0, "nobody registered");
+    assert_eq!(
+        reload_invite(&pool, &used).await.uses,
+        1,
+        "the pre-spent one-time invite counted only the fixture consume"
+    );
+    assert_eq!(
+        reload_invite(&pool, &expired).await.uses,
+        0,
+        "a refused registration spends nothing"
+    );
+}
+
+/// While `INVITES_ENABLED` is off a closed gate keeps the
+/// registration-ticket answer even against a freshly minted valid
+/// invite — the 403, and the invite stays untouched.
+#[tokio::test]
+async fn closed_without_invites_refuses_even_a_valid_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let mut config = common::test_config();
+    config.registrations_open = Toggle::new(false);
+    let app = common::test_app_with_config(pool.clone(), config);
+    let invite = mint_invite(&pool, &InviteParams::one_time()).await;
+
+    let response = register_with_invite(&app, &pool, "wishful", &invite.token).await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN, "403 when closed");
+    assert_eq!(
+        error_text(&response),
+        "Registration is disabled",
+        "the pinned wording"
+    );
+    assert_eq!(user_count(&pool).await, 0, "nothing registered");
+    let untouched = reload_invite(&pool, &invite).await;
+    assert_eq!(untouched.uses, 0, "a refused gate spends nothing");
+    assert!(!untouched.used, "and marks nothing used");
+}
+
+/// With `REGISTRATIONS_OPEN` true the token is optional and ignored: a
+/// valid invite registers but is never checked or consumed, and a
+/// nonsense one changes nothing about the open answer.
+#[tokio::test]
+async fn open_registrations_ignore_invite_tokens() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let invite = mint_invite(&pool, &InviteParams::one_time()).await;
+
+    let good = register_with_invite(&app, &pool, "shownone", &invite.token).await;
+    assert_eq!(good.status, StatusCode::OK, "an open gate takes the body");
+    let ignored = reload_invite(&pool, &invite).await;
+    assert_eq!(ignored.uses, 0, "an open registration spends nothing");
+    assert!(!ignored.used, "and marks nothing used");
+
+    let nonsense = register_with_invite(&app, &pool, "shownull", "not-an-invite").await;
+    assert_eq!(
+        nonsense.status,
+        StatusCode::OK,
+        "and an invalid token is no obstacle while open"
+    );
+    assert_eq!(user_count(&pool).await, 2, "both accounts landed");
+}
+
+/// The invite is consumed in the user's own transaction: a registration
+/// the model rejects (a too-short password) is the 422 and the invite
+/// keeps its count and its flag exactly as they were.
+#[tokio::test]
+async fn a_rejected_invited_registration_spends_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = invite_app(&pool);
+    let params = InviteParams {
+        expires_at: Some(today()),
+        max_use: Some(2),
+    };
+    let invite = mint_invite(&pool, &params).await;
+
+    let bearer = common::create_app_only_token(&pool, FULL_SCOPES).await;
+    let response = register_json(
+        &app,
+        &bearer,
+        &body_with(
+            "nospend",
+            &json!({"token": invite.token, "password": "tiny"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the field-map 422 still answers"
+    );
+    let after = reload_invite(&pool, &invite).await;
+    assert_eq!(after.uses, 0, "the rolled-back transaction spent nothing");
+    assert!(!after.used, "and marked nothing");
+    assert_eq!(user_count(&pool).await, 0, "and stored nobody");
 }

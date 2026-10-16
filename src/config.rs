@@ -92,6 +92,10 @@ pub const HEALTHCHECK_ENABLED_VAR: &str = "HEALTHCHECK_ENABLED";
 /// Environment variable holding whether the instance accepts new local
 /// registrations; `NodeInfo` reports it as `openRegistrations`.
 pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
+/// Environment variable holding whether registration invite tokens
+/// substitute for open registrations on `POST /api/v1/accounts`; the
+/// instance endpoints report it as `invites_enabled`.
+pub const INVITES_ENABLED_VAR: &str = "INVITES_ENABLED";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
@@ -265,6 +269,10 @@ pub const DEFAULT_HEALTHCHECK_ENABLED: bool = false;
 /// `[:instance, :registrations_open]` default is open, so closing
 /// registration is always an explicit operator decision.
 pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
+/// Invite state used when `INVITES_ENABLED` is unset: invites are off, so
+/// while registrations are closed every registration attempt is refused —
+/// accepting invite tokens is an explicit operator decision.
+pub const DEFAULT_INVITES_ENABLED: bool = false;
 /// The provider list used when `OAUTH_PROVIDERS` is unset: no external
 /// login provider is configured, so `GET /oauth/prepare_request` and the
 /// provider endpoints answer their errors for every name.
@@ -604,6 +612,13 @@ pub struct Config {
     /// `REGISTRATIONS_OPEN`; `NodeInfo` reports it as `openRegistrations`
     /// (see [`crate::api::nodeinfo`]).
     pub registrations_open: Toggle,
+    /// Whether registration invite tokens substitute for open
+    /// registrations, from `INVITES_ENABLED`: while registrations are
+    /// closed, `POST /api/v1/accounts` accepts a valid invite `token` and
+    /// refuses every attempt without one (see
+    /// [`crate::models::invite_token`]). The instance endpoints report the
+    /// state as `invites_enabled`, `NodeInfo` as `invitesEnabled`.
+    pub invites_enabled: Toggle,
     /// The external OAuth login providers, from `OAUTH_PROVIDERS`; empty
     /// when none is configured. Each one answers the `/oauth` provider
     /// endpoints under its own name (see [`crate::api::oauth_external`]).
@@ -701,7 +716,7 @@ impl Config {
         let (accounts_email_optional, min_password_length, oauth_token_ttl_secs, oauth_providers) =
             auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
-        let (registrations_open, available_frontends) = client_exposure(&lookup)?;
+        let (registrations_open, invites_enabled, available_frontends) = client_exposure(&lookup)?;
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
         let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
             mailer_settings(&lookup, domain_of(&base_url))?;
@@ -738,6 +753,7 @@ impl Config {
             captcha_enabled,
             healthcheck_enabled,
             registrations_open,
+            invites_enabled,
             oauth_providers,
             available_frontends,
             job_concurrency,
@@ -842,6 +858,7 @@ impl Config {
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
+            invites_enabled: Toggle::new(DEFAULT_INVITES_ENABLED),
             oauth_providers: Vec::new(),
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
@@ -1270,26 +1287,35 @@ where
     ))
 }
 
-/// Reads the two settings that gate what the instance exposes to clients:
-/// whether new registrations are open (`NodeInfo`'s `openRegistrations`)
-/// and the frontends the settings endpoints let a user pick. Grouped
-/// because each is a plain default-or-parse and [`Config::from_lookup`]
-/// has a size budget (AGENTS.md); the tuple comes back in field order.
+/// The shape [`client_exposure`] reads: the registrations-open toggle, the
+/// invites-enabled toggle and the pickable-frontend list, in [`Config`]
+/// field order; factored out because a mixed tuple of two toggles and a
+/// list reads better by name.
+type ExposureSettings = (Toggle, Toggle, Vec<String>);
+
+/// Reads the settings that gate what the instance exposes to clients:
+/// whether new registrations are open (`NodeInfo`'s `openRegistrations`),
+/// whether invite tokens substitute for open registrations
+/// (`invites_enabled` on the instance endpoints), and the frontends the
+/// settings endpoints let a user pick. Grouped because each is a plain
+/// default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); the tuple comes back in field order.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidBoolean`] when `REGISTRATIONS_OPEN` holds
-/// a value that is neither spelling.
-fn client_exposure<F>(lookup: &F) -> Result<(Toggle, Vec<String>), ConfigError>
+/// Returns [`ConfigError::InvalidBoolean`] when `REGISTRATIONS_OPEN` or
+/// `INVITES_ENABLED` holds a value that is neither spelling.
+fn client_exposure<F>(lookup: &F) -> Result<ExposureSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
     let registrations_open =
         boolean(lookup, REGISTRATIONS_OPEN_VAR, DEFAULT_REGISTRATIONS_OPEN)?.into();
+    let invites_enabled = boolean(lookup, INVITES_ENABLED_VAR, DEFAULT_INVITES_ENABLED)?.into();
     let available_frontends = comma_list(
         &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
     );
-    Ok((registrations_open, available_frontends))
+    Ok((registrations_open, invites_enabled, available_frontends))
 }
 
 /// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login
@@ -1435,6 +1461,7 @@ impl fmt::Debug for Config {
             .field("captcha_enabled", &self.captcha_enabled)
             .field("healthcheck_enabled", &self.healthcheck_enabled)
             .field("registrations_open", &self.registrations_open)
+            .field("invites_enabled", &self.invites_enabled)
             .field("oauth_providers", &self.oauth_providers)
             .field("available_frontends", &self.available_frontends)
             .field("job_concurrency", &self.job_concurrency)
@@ -2221,6 +2248,63 @@ mod tests {
         assert!(
             debug.contains("registrations_open: Toggle(false)"),
             "the registration toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    /// `INVITES_ENABLED` keeps its false default when the variable is
+    /// unset: closed registrations refuse every attempt until the
+    /// operator turns invites on.
+    #[test]
+    fn invites_are_off_by_default() {
+        let config = config_with(&[]);
+        assert!(
+            !config.invites_enabled.get(),
+            "invites are off by default: closed registrations refuse every attempt"
+        );
+    }
+
+    #[test]
+    fn invites_enabled_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", false),
+        ] {
+            let config = config_with(&[(INVITES_ENABLED_VAR, value)]);
+            assert_eq!(
+                config.invites_enabled.get(),
+                want,
+                "INVITES_ENABLED={value:?} means {want} (unset is off)"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_invites_enabled_is_an_error() {
+        let err = try_config_with(&[(INVITES_ENABLED_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(INVITES_ENABLED_VAR),
+            "error variant"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {INVITES_ENABLED_VAR}: ")),
+            "message names the variable"
+        );
+    }
+
+    #[test]
+    fn debug_shows_invites_enabled() {
+        let config = config_with(&[(INVITES_ENABLED_VAR, "true")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("invites_enabled: Toggle(true)"),
+            "the invite toggle is visible in Debug output: {debug}"
         );
     }
 

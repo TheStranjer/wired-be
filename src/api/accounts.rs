@@ -216,15 +216,25 @@
 //! route authenticates with [`AppAuth`] — any valid bearer token,
 //! app-only (`client_credentials`) or user-bound — plus the
 //! `write:accounts` scope, and a caller who already holds a user token
-//! may register another account (Pleroma permits it). While
-//! `REGISTRATIONS_OPEN` is false the route answers 403 `{"error":
+//! may register another account (Pleroma permits it). The gate behind
+//! that: while `REGISTRATIONS_OPEN` is true the route registers, and the
+//! body's invite `token` — if it carries one — is optional and ignored,
+//! never checked and never spent. While it is false and `INVITES_ENABLED`
+//! is true a valid invite `token` is REQUIRED: the unknown, spent,
+//! expired or exhausted token (and the absent one) is the 400
+//! `{"error":"Invalid token"}`, and the accepted token is consumed in
+//! the same transaction that creates the user (see
+//! [`crate::models::invite_token`]). An invited user skips approval —
+//! moot until the approval-flow ticket, which must keep the invited row
+//! active — but not email confirmation. While registrations are closed
+//! and invites are disabled the route answers the 403 `{"error":
 //! "Registration is disabled"}`; Pleroma's 2.10 `create` action carries
 //! no such string (closed registrations there mean "return with an invite
 //! token"), so this endpoint's ticket pins the wording. The body is
 //! `username`, `email`, `password`, `agreement` (which must be `true`,
-//! else 422), `locale`, `reason`, `fullname` (the display name) and
-//! `bio`; `locale` and `confirm` are accepted and ignored, as Pleroma
-//! reads neither on this path. The user lands through
+//! else 422), `locale`, `reason`, `fullname` (the display name), `bio`
+//! and the invite `token`; `locale` and `confirm` are accepted and
+//! ignored, as Pleroma reads neither on this path. The user lands through
 //! [`create_local_user`]
 //! — every validation failure arrives as its 422 whose `error` value is
 //! the JSON string of the field map — and `reason` is stored in
@@ -273,6 +283,7 @@ use crate::{
     models::{
         account_note,
         follow::{self, Follow},
+        invite_token::{self, InviteToken},
         oauth_app::OauthApp,
         oauth_token::{self, NewToken, OauthToken},
         user::{
@@ -402,10 +413,17 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 const TOKEN_TYPE_BEARER: &str = "Bearer";
 
 /// The 403 body message `POST /api/v1/accounts` answers while
-/// `REGISTRATIONS_OPEN` is false. Pleroma's 2.10 `create` action has no
-/// such string (closed registrations there route to invite tokens), so
-/// this endpoint's ticket pins this wording.
+/// `REGISTRATIONS_OPEN` is false and `INVITES_ENABLED` is false. Pleroma's
+/// 2.10 `create` action has no such string (closed registrations there route
+/// to invite tokens), so this endpoint's ticket pins this wording.
 const REGISTRATIONS_CLOSED: &str = "Registration is disabled";
+
+/// The 400 body message `POST /api/v1/accounts` answers while
+/// `REGISTRATIONS_OPEN` is false and `INVITES_ENABLED` is true and the
+/// submitted invite `token` is absent, unknown, spent, expired or
+/// exhausted (Pleroma's `Registration.create_user_with_invite` wording;
+/// this endpoint's ticket pins the one message for every refusal).
+const INVALID_TOKEN: &str = "Invalid token";
 
 /// The 422 body message `POST /api/v1/accounts` answers when `agreement`
 /// is present but not true (Mastodon's signup terms wording; Pleroma's
@@ -445,13 +463,15 @@ pub fn router(config: &Config) -> Router<AppState> {
 
 /// The request parameters of `POST /api/v1/accounts`, Pleroma's
 /// `AccountCreateRequest` (`lib/pleroma/web/api_spec/operations/
-/// account_operation.ex`) minus the captcha and invite fields:
-/// `username`, `email`, `password` and `agreement` are read, the first
-/// three required and `agreement` required too (an absent one is the
-/// extractor's 422). `agreement` deserializes through [`flex::bool`] so
-/// the form spelling `true` arrives. Every other key the body carries —
-/// `locale`, `confirm`, the captcha pair, Pleroma's own `token` and
-/// `birthday` — is accepted and ignored, as
+/// account_operation.ex`) minus the captcha fields: `username`, `email`,
+/// `password` and `agreement` are read, the first three required and
+/// `agreement` required too (an absent one is the extractor's 422).
+/// `agreement` deserializes through [`flex::bool`] so the form spelling
+/// `true` arrives. The invite `token` is read as well — required and
+/// checked while registrations are closed and invites are enabled,
+/// optional and ignored otherwise (see [`load_invite`]). Every other key
+/// the body carries — `locale`, `confirm`, the captcha pair, Pleroma's
+/// own `birthday` — is accepted and ignored, as
 /// [`Registration.register_user`] reads none of them on this path;
 /// `reason`, `fullname` and `bio` are the optional registration facts
 /// that do reach the row.
@@ -471,6 +491,11 @@ struct CreateAccountParams {
     /// Whether the applicant accepts the instance's terms; must be true.
     #[serde(deserialize_with = "flex::bool")]
     agreement: bool,
+    /// The registration invite Pleroma's `token` parameter carries: read
+    /// only through [`load_invite`]'s gate, and consumed by
+    /// [`create_local_user`] in the user's own insert transaction.
+    #[serde(default)]
+    token: Option<String>,
     /// Free-text reason for the later approval flow, stored in
     /// `users.registration_reason`.
     #[serde(default)]
@@ -549,43 +574,83 @@ impl RegistrationToken {
 /// The gates run in Pleroma's plug order: [`AppAuth`] first rejects a
 /// missing or invalid credential (401) — an app-only `client_credentials`
 /// token satisfies it exactly as a user token does — then the
-/// `write:accounts` scope check (403), then the `REGISTRATIONS_OPEN`
-/// gate (403 [`REGISTRATIONS_CLOSED`]), then the agreement (422). The
-/// account itself is built by [`create_local_user`], whose errors this
-/// endpoint's ticket maps as implemented there: a 422 whose `error`
-/// value is the JSON string of the field map. Success mints the new
-/// user's token for the presenting token's app with the presenting
-/// token's scopes, valid for `OAUTH_TOKEN_TTL_SECS`.
+/// `write:accounts` scope check (403), then the registration/invite gate
+/// (403 [`REGISTRATIONS_CLOSED`] or the invite check, [`load_invite`]),
+/// then the agreement (422). The account itself is built by
+/// [`create_local_user`], whose errors this endpoint's ticket maps as
+/// implemented there: a 422 whose `error` value is the JSON string of the
+/// field map; an invited registration spends its token inside that same
+/// write's transaction. Success mints the new user's token for the
+/// presenting token's app with the presenting token's scopes, valid for
+/// `OAUTH_TOKEN_TTL_SECS`.
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] from [`AppAuth`] without a valid token;
 /// [`AppError::Forbidden`] from [`require_scope`] without `write:accounts`
-/// or while registrations are closed; [`AppError::Unprocessable`] when
-/// `agreement` is absent (the extractor's) or not true, and
-/// [`create_local_user`]'s field-map 422s for every invalid parameter.
-/// Any database or key-generation failure arrives through `?` as
-/// [`AppError::Database`] or [`AppError::Internal`].
+/// or while registrations are closed without invites;
+/// [`AppError::BadRequest`] from [`load_invite`] for a refused invite;
+/// [`AppError::Unprocessable`] when `agreement` is absent (the
+/// extractor's) or not true, and [`create_local_user`]'s field-map 422s
+/// for every invalid parameter. Any database or key-generation failure
+/// arrives through `?` as [`AppError::Database`] or [`AppError::Internal`].
 async fn create_account(
     State(state): State<AppState>,
     AppAuth(app, token): AppAuth,
     ApiBody(params): ApiBody<CreateAccountParams>,
 ) -> AppResult<Json<RegistrationToken>> {
     require_scope(&token, WRITE_ACCOUNTS)?;
-    if !state.config.registrations_open.get() {
-        return Err(AppError::Forbidden(REGISTRATIONS_CLOSED.to_owned()));
-    }
+    let invite = load_invite(&state, params.token.as_deref()).await?;
     if !params.agreement {
         return Err(AppError::Unprocessable(AGREEMENT_REQUIRED.to_owned()));
     }
-    let user = create_local_user(&state, params.into_register_params()).await?;
+    let user = create_local_user(&state, params.into_register_params(), invite.as_ref()).await?;
     let issued = issue_registration_token(&state, &app, &token.scopes, user.id).await?;
     debug!(
         user = %user.id,
         app = %app.id,
+        invited = invite.is_some(),
         "registered a new local account"
     );
     Ok(Json(RegistrationToken::new(issued)))
+}
+
+/// The invite the registration gate hands the user-creation write, or the
+/// refusal it owes: with `REGISTRATIONS_OPEN` the invite path is off and
+/// the submitted `token` is optional and ignored — `Ok(None)`, whatever
+/// it holds, and it is never checked or spent; with registrations closed
+/// and `INVITES_ENABLED` off nobody registers — 403
+/// [`REGISTRATIONS_CLOSED`]; with registrations closed and invites on a
+/// valid invite is REQUIRED — the absent or blank text, an unknown token,
+/// and a row [`is_valid`] denies on today's date (spent, expired,
+/// exhausted) all answer the 400 [`INVALID_TOKEN`], this endpoint's
+/// ticket pinning one message for every refusal.
+///
+/// [`is_valid`]: InviteToken::is_valid
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] while closed without invites;
+/// [`AppError::BadRequest`] for every refused invite; any database
+/// failure arrives through `?` as [`AppError::Database`].
+async fn load_invite(state: &AppState, submitted: Option<&str>) -> AppResult<Option<InviteToken>> {
+    if state.config.registrations_open.get() {
+        return Ok(None);
+    }
+    if !state.config.invites_enabled.get() {
+        return Err(AppError::Forbidden(REGISTRATIONS_CLOSED.to_owned()));
+    }
+    let invalid = || AppError::BadRequest(INVALID_TOKEN.to_owned());
+    let Some(text) = submitted.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Err(invalid());
+    };
+    let Some(invite) = invite_token::get_by_token(&state.db, text).await? else {
+        return Err(invalid());
+    };
+    if !invite.is_valid(Utc::now().date_naive()) {
+        return Err(invalid());
+    }
+    Ok(Some(invite))
 }
 
 /// Mints the new user's bearer token: the presenting token's scopes on
@@ -2797,6 +2862,7 @@ mod tests {
             params.reason.is_none() && params.fullname.is_none() && params.bio.is_none(),
             "every optional field defaults away when absent"
         );
+        assert!(params.token.is_none(), "an absent invite token is None");
     }
 
     #[test]
@@ -2830,6 +2896,24 @@ mod tests {
         }))
         .expect("unknown keys do not bind and do not reject");
         assert!(params.agreement, "`\"on\"` is the checkbox spelling");
+    }
+
+    #[test]
+    fn the_invite_token_is_a_read_optional() {
+        // Unlike the ignored extras, Pleroma's `token` binds: the gate in
+        // `load_invite` weighs it, and a body without it still parses.
+        let with = registration_params(json!({
+            "username": "lain",
+            "password": "PlzDontHackLain",
+            "agreement": true,
+            "token": "VjtxW_-a-some-random-text",
+        }))
+        .expect("a body carrying an invite");
+        assert_eq!(
+            with.token.as_deref(),
+            Some("VjtxW_-a-some-random-text"),
+            "the token text arrives verbatim"
+        );
     }
 
     #[test]

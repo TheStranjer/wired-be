@@ -481,21 +481,27 @@ async fn staff_accounts_lists_admins_and_moderators() {
     );
 }
 
-/// `openRegistrations` follows `REGISTRATIONS_OPEN`, and the feature and
-/// access-restriction blocks are the ones the shared instance-metadata
-/// builders produce.
+/// `openRegistrations` follows `REGISTRATIONS_OPEN`, `invitesEnabled`
+/// follows `INVITES_ENABLED`, and the feature and access-restriction
+/// blocks are the ones the shared instance-metadata builders produce.
 #[tokio::test]
 async fn registrations_toggle_and_shared_metadata_follow_the_builders() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let mut config = common::test_config();
     config.registrations_open = Toggle::new(false);
+    config.invites_enabled = Toggle::new(true);
     let app = common::test_app_with_config(pool, config);
     let document = get_document(&app, "/nodeinfo/2.0").await;
     assert_eq!(
         document["openRegistrations"],
         json!(false),
         "a closed instance reports itself closed"
+    );
+    assert_eq!(
+        document["metadata"]["invitesEnabled"],
+        json!(true),
+        "INVITES_ENABLED=true is reported"
     );
     assert_eq!(
         document["metadata"]["features"],

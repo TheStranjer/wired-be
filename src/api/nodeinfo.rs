@@ -382,8 +382,8 @@ struct Metadata {
     /// wired-be activates on registration (Pleroma's
     /// `account_activation_required` default).
     account_activation_required: Toggle,
-    /// Whether registration invites exist; they do not here (Pleroma's
-    /// `invites_enabled` default).
+    /// Whether registration invites exist (`INVITES_ENABLED`); Pleroma's
+    /// `invites_enabled` mirror.
     invites_enabled: Toggle,
     /// Whether the instance sends mail; no mailer exists, so `false`
     /// (Pleroma's `Pleroma.Emails.Mailer` `enabled` default).
@@ -422,7 +422,7 @@ impl Metadata {
             upload_limits: UploadLimits::for_config(config),
             fields_limits: FieldsLimits::pleroma_defaults(),
             account_activation_required: Toggle::new(false),
-            invites_enabled: Toggle::new(false),
+            invites_enabled: config.invites_enabled,
             mailer_enabled: Toggle::new(false),
             features: instance_meta::features(),
             restrict_unauthenticated: instance_meta::restrict_unauthenticated(),
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(metadata["private"], false, "a public instance");
         assert_eq!(metadata["suggestions"], json!({"enabled": false}));
         assert_eq!(metadata["accountActivationRequired"], false);
-        assert_eq!(metadata["invitesEnabled"], false);
+        assert_eq!(metadata["invitesEnabled"], false, "INVITES_ENABLED default");
         assert_eq!(metadata["mailerEnabled"], false);
         assert_eq!(metadata["skipThreadContainment"], true, "Pleroma 2.10's");
         assert_eq!(
@@ -880,6 +880,22 @@ mod tests {
             "the shared access restrictions, under its snake_case key"
         );
         assert_eq!(metadata["staffAccounts"], json!([]), "no staff fixture");
+    }
+
+    /// `invitesEnabled` is the `INVITES_ENABLED` setting, on both sides
+    /// of its default.
+    #[test]
+    fn invites_enabled_mirrors_the_config() {
+        let mut config = Config::for_tests();
+        config.invites_enabled = Toggle::new(true);
+        let on = serde_json::to_value(Metadata::build(&config, Vec::new())).unwrap();
+        assert_eq!(
+            on["invitesEnabled"], true,
+            "INVITES_ENABLED=true is reported"
+        );
+        config.invites_enabled = Toggle::new(false);
+        let off = serde_json::to_value(Metadata::build(&config, Vec::new())).unwrap();
+        assert_eq!(off["invitesEnabled"], false, "and off stays off");
     }
 
     #[test]
