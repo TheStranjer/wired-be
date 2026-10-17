@@ -65,6 +65,7 @@ pub mod pleroma_account_settings;
 pub mod pleroma_accounts;
 pub mod pleroma_settings;
 pub mod scrobbles;
+pub mod statuses;
 pub mod streaming;
 pub mod tags;
 pub mod v1;
