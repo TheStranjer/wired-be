@@ -32,6 +32,9 @@
 //! [`misc::router`] joins that list at the root: the `MongooseIM` auth
 //! endpoints and `manifest.json` live at `/…`, the addresses `MongooseIM`'s
 //! `extauth` http contract and the manifest `<link>` convention fix.
+//! [`password_reset::auth_router`] joins it at `POST /auth/password`, the
+//! address Pleroma routes the reset request on outside `/api` (its two
+//! `/api/v1/pleroma/password_reset` pages ride on [`v1`]).
 
 pub mod account_lists;
 pub mod accounts;
@@ -60,6 +63,7 @@ pub mod nodeinfo;
 pub mod oauth;
 pub mod oauth_external;
 pub mod oauth_tokens;
+pub mod password_reset;
 pub mod pleroma;
 pub mod pleroma_account_settings;
 pub mod pleroma_accounts;

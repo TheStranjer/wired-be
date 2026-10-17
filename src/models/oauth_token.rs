@@ -27,7 +27,7 @@
 use std::{fmt, time::Duration};
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::{
@@ -484,6 +484,32 @@ pub async fn delete_for_user(pool: &PgPool, user_id: Uuid, id: Uuid) -> AppResul
         .execute(pool)
         .await?;
     Ok(deleted.rows_affected() == 1)
+}
+
+/// Deletes every token belonging to user `user_id` (expired included,
+/// app-only rows excluded — their `user_id` is `NULL`), reporting how
+/// many went.
+///
+/// This is Pleroma's `OAuth.Token.Query.delete_by_user`, the revocation a
+/// completed password reset runs on the account: no bearer credential the
+/// account ever issued may outlive the password change.
+///
+/// Runs on the caller's executor (or any transaction), so the reset
+/// endpoint can land the revocation with the password write.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user<'e, E>(executor: E, user_id: Uuid) -> AppResult<u64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let deleted = sqlx::query("DELETE FROM oauth_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .execute(executor)
+        .await?;
+    Ok(deleted.rows_affected())
 }
 
 /// The `INSERT` behind [`create_authorization`]: the code is minted by

@@ -85,6 +85,9 @@ pub const MIN_PASSWORD_LENGTH_VAR: &str = "MIN_PASSWORD_LENGTH";
 /// Environment variable holding the lifetime of issued OAuth access
 /// tokens, in seconds.
 pub const OAUTH_TOKEN_TTL_SECS_VAR: &str = "OAUTH_TOKEN_TTL_SECS";
+/// Environment variable holding the lifetime of a password-reset token,
+/// in seconds.
+pub const PASSWORD_RESET_TTL_SECS_VAR: &str = "PASSWORD_RESET_TTL_SECS";
 /// Environment variable holding whether the `MongooseIM` auth endpoints
 /// (`GET /user_exists`, `GET /check_password`) are served.
 pub const MONGOOSEIM_ENABLED_VAR: &str = "MONGOOSEIM_ENABLED";
@@ -271,6 +274,10 @@ pub const DEFAULT_MIN_PASSWORD_LENGTH: usize = 8;
 ///
 /// [`DEFAULT_TOKEN_TTL`]: crate::models::oauth_token::DEFAULT_TOKEN_TTL
 pub const DEFAULT_OAUTH_TOKEN_TTL_SECS: usize = 2_592_000;
+/// Password-reset token lifetime used when `PASSWORD_RESET_TTL_SECS` is
+/// unset: `86_400` seconds, 24 hours — Pleroma's
+/// `[:instance, :password_reset_token_validity]` default.
+pub const DEFAULT_PASSWORD_RESET_TTL_SECS: usize = 86_400;
 /// `MongooseIM` auth endpoint state used when `MONGOOSEIM_ENABLED` is
 /// unset: the endpoints answer the standard fallback 404 until an operator
 /// turns them on for their `extauth` backend.
@@ -648,6 +655,11 @@ pub struct Config {
     /// [`create_token`](crate::models::oauth_token::create_token) as the
     /// token's `ttl`.
     pub oauth_token_ttl_secs: usize,
+    /// Lifetime of a password-reset token, in seconds, from
+    /// `PASSWORD_RESET_TTL_SECS`. A token is valid while it is unused and
+    /// its `inserted_at` is within this window (see
+    /// [`crate::models::password_reset`]).
+    pub password_reset_ttl_secs: usize,
     /// Whether the `MongooseIM` auth endpoints (`GET /user_exists`,
     /// `GET /check_password`) are served, from `MONGOOSEIM_ENABLED`. See
     /// [`crate::api::misc`].
@@ -773,8 +785,7 @@ impl Config {
         let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
-        let (accounts_email_optional, min_password_length, oauth_token_ttl_secs, oauth_providers) =
-            auth_settings(&lookup)?;
+        let auth = auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (registrations_open, invites_enabled, available_frontends) = client_exposure(&lookup)?;
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
@@ -805,15 +816,16 @@ impl Config {
             emoji_dir,
             media_base_url,
             http_allow_private_hosts,
-            accounts_email_optional,
-            min_password_length,
-            oauth_token_ttl_secs,
+            accounts_email_optional: auth.accounts_email_optional,
+            min_password_length: auth.min_password_length,
+            oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
+            password_reset_ttl_secs: auth.password_reset_ttl_secs,
             mongooseim_enabled,
             captcha_enabled,
             healthcheck_enabled,
             registrations_open,
             invites_enabled,
-            oauth_providers,
+            oauth_providers: auth.oauth_providers,
             available_frontends,
             job_concurrency,
             job_queues,
@@ -919,6 +931,7 @@ impl Config {
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
             oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
+            password_reset_ttl_secs: DEFAULT_PASSWORD_RESET_TTL_SECS,
             mongooseim_enabled: Toggle::new(DEFAULT_MONGOOSEIM_ENABLED),
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
@@ -1142,16 +1155,28 @@ fn default_mail_from(domain: &str) -> String {
     format!("{DEFAULT_MAIL_FROM_USER}@{host}")
 }
 
-/// What [`auth_settings`] reads, in [`Config`] field order: the email
-/// requirement, the password minimum, the token lifetime and the providers.
-type AuthSettings = (bool, usize, usize, Vec<OauthProvider>);
+/// What [`auth_settings`] reads: the five settings that gate registration,
+/// token issuance, password resets and the external logins, in [`Config`]
+/// field order.
+#[derive(Debug)]
+struct AuthSettings {
+    /// Whether registration may omit the email address
+    /// (`ACCOUNTS_EMAIL_OPTIONAL`).
+    accounts_email_optional: bool,
+    /// The registration password minimum (`MIN_PASSWORD_LENGTH`).
+    min_password_length: usize,
+    /// The access-token lifetime (`OAUTH_TOKEN_TTL_SECS`).
+    oauth_token_ttl_secs: usize,
+    /// The password-reset token lifetime (`PASSWORD_RESET_TTL_SECS`).
+    password_reset_ttl_secs: usize,
+    /// The external login providers (`OAUTH_PROVIDERS`).
+    oauth_providers: Vec<OauthProvider>,
+}
 
-/// Reads the four settings that gate registration, token issuance and the
-/// external logins: whether registration may omit the email address, the
-/// registration password minimum, the access-token lifetime and the
-/// provider list. Grouped because each is a plain default-or-parse and
-/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
-/// back in field order.
+/// Reads the five settings that gate registration, token issuance, password
+/// resets and the external logins. Grouped because each is a plain
+/// default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md).
 fn auth_settings<F>(lookup: &F) -> Result<AuthSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -1167,12 +1192,18 @@ where
         OAUTH_TOKEN_TTL_SECS_VAR,
         DEFAULT_OAUTH_TOKEN_TTL_SECS,
     )?;
-    Ok((
+    let password_reset_ttl_secs = number(
+        lookup,
+        PASSWORD_RESET_TTL_SECS_VAR,
+        DEFAULT_PASSWORD_RESET_TTL_SECS,
+    )?;
+    Ok(AuthSettings {
         accounts_email_optional,
         min_password_length,
         oauth_token_ttl_secs,
-        oauth_providers(lookup)?,
-    ))
+        password_reset_ttl_secs,
+        oauth_providers: oauth_providers(lookup)?,
+    })
 }
 
 /// Reads the three settings that locate stored files and the URLs they
@@ -1573,6 +1604,7 @@ impl fmt::Debug for Config {
             .field("accounts_email_optional", &self.accounts_email_optional)
             .field("min_password_length", &self.min_password_length)
             .field("oauth_token_ttl_secs", &self.oauth_token_ttl_secs)
+            .field("password_reset_ttl_secs", &self.password_reset_ttl_secs)
             .field("mongooseim_enabled", &self.mongooseim_enabled)
             .field("captcha_enabled", &self.captcha_enabled)
             .field("healthcheck_enabled", &self.healthcheck_enabled)
@@ -2703,6 +2735,20 @@ mod tests {
     }
 
     #[test]
+    fn reads_password_reset_token_ttl() {
+        let default = config_with(&[]);
+        assert_eq!(
+            default.password_reset_ttl_secs, 86_400,
+            "default PASSWORD_RESET_TTL_SECS is 24 hours"
+        );
+        let custom = config_with(&[(PASSWORD_RESET_TTL_SECS_VAR, "7200")]);
+        assert_eq!(
+            custom.password_reset_ttl_secs, 7_200,
+            "custom PASSWORD_RESET_TTL_SECS is honored"
+        );
+    }
+
+    #[test]
     fn debug_shows_the_registration_settings() {
         let config = config_with(&[
             (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
@@ -2748,11 +2794,18 @@ mod tests {
 
     #[test]
     fn debug_shows_the_token_ttl_setting() {
-        let config = config_with(&[(OAUTH_TOKEN_TTL_SECS_VAR, "600")]);
+        let config = config_with(&[
+            (OAUTH_TOKEN_TTL_SECS_VAR, "600"),
+            (PASSWORD_RESET_TTL_SECS_VAR, "1200"),
+        ]);
         let debug = format!("{config:?}");
         assert!(
             debug.contains("oauth_token_ttl_secs: 600"),
             "the token lifetime is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("password_reset_ttl_secs: 1200"),
+            "the reset-token lifetime is visible in Debug output: {debug}"
         );
     }
 
@@ -3219,6 +3272,7 @@ mod tests {
             INBOX_MAX_BYTES_VAR,
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
+            PASSWORD_RESET_TTL_SECS_VAR,
             JOB_CONCURRENCY_VAR,
             STREAMING_PING_INTERVAL_SECS_VAR,
             MEDIA_PROXY_MAX_BYTES_VAR,
