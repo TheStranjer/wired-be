@@ -514,6 +514,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(mailbox.clone()),
         };
         (state, mailbox)
@@ -535,6 +536,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: transport,
         }
     }

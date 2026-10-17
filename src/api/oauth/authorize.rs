@@ -90,9 +90,17 @@ pub(crate) const ACCESS_DENIED: &str = "access_denied";
 const AUTHORIZE_PATH: &str = "/oauth/authorize";
 
 /// The `/oauth/authorize` routes, merged into the `/oauth` router by
-/// [`super::router`].
-pub fn router() -> Router<AppState> {
-    Router::new().route(AUTHORIZE_PATH, get(show).post(create))
+/// [`super::router`], in the limiter's `authentication` bucket.
+///
+/// Pleroma throttles the whole path, `GET` consent page and `POST`
+/// consent alike (see [`crate::rate_limit`]).
+pub fn router(state: &AppState) -> Router<AppState> {
+    Router::new().route(
+        AUTHORIZE_PATH,
+        get(show)
+            .post(create)
+            .layer(crate::rate_limit::rate_limit(state, "authentication")),
+    )
 }
 
 /// Where a finished authorization goes back to: the request's registered
@@ -832,13 +840,15 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
 
     #[tokio::test]
     async fn get_answers_at_oauth_authorize_and_refuses_other_flows() {
-        let app = router().with_state(test_state());
+        let state = test_state();
+        let app = router(&state).with_state(state);
         let request = Request::get("/oauth/authorize?response_type=token&client_id=whatever")
             .body(axum::body::Body::empty())
             .unwrap();
@@ -857,7 +867,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_without_an_authorization_object_is_an_invalid_client() {
-        let app = router().with_state(test_state());
+        let state = test_state();
+        let app = router(&state).with_state(state);
         let request = Request::post(AUTHORIZE_PATH)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(axum::body::Body::from("name=alice"))

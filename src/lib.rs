@@ -15,6 +15,7 @@ pub mod middleware;
 pub mod models;
 pub mod oauth;
 pub mod pagination;
+pub mod rate_limit;
 pub mod services;
 pub mod state;
 pub mod streaming;
@@ -23,7 +24,7 @@ pub mod test_db;
 pub mod uploads;
 pub mod util;
 
-use std::{error::Error, sync::Arc};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -107,6 +108,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        rate_limiter: Arc::new(rate_limit::RateLimiter::from_config(config.as_ref())),
         mailer: mailer::transport_from_config(&config),
     };
     let listener = TcpListener::bind(state.config.bind_addr).await?;
@@ -132,7 +134,14 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         state.hub.clone(),
         wait_for_ctrl_c(),
     ));
-    let server = axum::serve(listener, app(state)).with_graceful_shutdown(wait_for_ctrl_c());
+    // The socket peer rides into the services as `ConnectInfo`, which is
+    // what the rate limiter counts anonymous requests against (see
+    // [`crate::rate_limit`]).
+    let server = axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_ctrl_c());
     let outcome = tokio::join!(
         server,
         worker.run(wait_for_ctrl_c()),
@@ -182,18 +191,20 @@ async fn wait_for_ctrl_c() {
 /// `/manifest.json` ([`api::misc`]) — are merged at the top level. Paths
 /// no route matches get the standard JSON error response (decision 8).
 ///
+/// `state` is handed to [`api::router`] and [`api::oauth::router`] before
+/// it is consumed: the registration routes those build mount the rate
+/// limiter (see [`crate::rate_limit`]), whose middleware layer carries its
+/// own cheap clone of the shared state.
+///
 /// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
-    // The `/api` routers need the configuration itself (the upload route's
-    // body limit is sized from it), so the `Arc` is cloned and not the config.
-    let config = Arc::clone(&state.config);
     middleware::apply(
         Router::new()
             .route("/health", get(health))
-            .merge(api::router(&config))
+            .merge(api::router(&state))
             .merge(api::activitypub::router())
             .merge(api::feeds::router())
-            .merge(api::oauth::router())
+            .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())
             .merge(api::well_known::router())
             .merge(api::nodeinfo::router())
@@ -259,6 +270,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(mailer::MemoryTransport::new()),
         })
     }

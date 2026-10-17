@@ -692,6 +692,7 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }

@@ -41,9 +41,16 @@ use crate::{
 };
 
 /// The `/api/v1/apps` router, merged into [`crate::api::v1`].
-pub fn router() -> Router<AppState> {
+///
+/// `POST /apps` runs in the limiter's `app_account_creation` bucket
+/// (Pleroma throttles app registration there), so `state` is handed to it
+/// for the middleware layer; see [`crate::rate_limit`].
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .route("/apps", post(create_app))
+        .route(
+            "/apps",
+            post(create_app).layer(crate::rate_limit::rate_limit(state, "app_account_creation")),
+        )
         .route("/apps/verify_credentials", get(verify_credentials))
 }
 

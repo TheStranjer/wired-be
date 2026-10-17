@@ -10,7 +10,6 @@ use crate::{
         emoji_packs, endorsements, filters, follow_requests, instance, lists, markers, media, misc,
         mutes, oauth_tokens, pleroma_accounts, pleroma_settings, scrobbles, streaming, tags,
     },
-    config::Config,
     state::AppState,
 };
 
@@ -23,16 +22,20 @@ use crate::{
 /// Pleroma's `api_not_implemented`, and merging two routers that each set
 /// a fallback panics.
 ///
-/// `config` reaches [`media::router`] and [`pleroma_settings::router`],
-/// the merged routers that need it: their upload routes carry their own
-/// body limit (see [`crate::extract::multipart::upload_body_limit`]),
-/// which axum's multipart extractor cannot read from the state on its own.
-pub fn router(config: &Config) -> Router<AppState> {
+/// `state` reaches [`accounts::router`] and [`apps::router`], the merged
+/// routers whose registration routes mount the rate limiter, and — as
+/// [`state.config`] — [`media::router`] and [`pleroma_settings::router`],
+/// whose upload routes carry their own body limit (see
+/// [`crate::extract::multipart::upload_body_limit`]), which axum's
+/// multipart extractor cannot read from the state on its own.
+///
+/// [`state.config`]: AppState::config
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .merge(account_lists::router())
-        .merge(accounts::router(config))
+        .merge(accounts::router(state))
         .merge(announcements::router())
-        .merge(apps::router())
+        .merge(apps::router(state))
         .merge(blocks::router())
         .merge(custom_emojis::router())
         .merge(domain_blocks::router())
@@ -43,10 +46,10 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(instance::router())
         .merge(lists::router())
         .merge(markers::router())
-        .merge(media::router(config))
+        .merge(media::router(&state.config))
         .merge(mutes::router())
         .merge(pleroma_accounts::router())
-        .merge(pleroma_settings::router(config))
+        .merge(pleroma_settings::router(&state.config))
         .merge(scrobbles::router())
         .merge(streaming::router())
         .merge(tags::router())

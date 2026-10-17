@@ -138,6 +138,9 @@ mod pleroma_accounts;
 /// The frontend settings store, mascot and preferred frontend.
 mod pleroma_settings;
 
+/// The per-route rate limiter: mounted buckets, headers, and 429s.
+mod rate_limit;
+
 /// `GET /api/v1/accounts/relationships`.
 mod relationships;
 

@@ -9,7 +9,8 @@ use axum::{Json, Router, extract::Request, http::StatusCode, routing::any};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use wired_be::config::{
-    BASE_URL_VAR, DATABASE_URL_VAR, HTTP_ALLOW_PRIVATE_HOSTS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+    BASE_URL_VAR, DATABASE_URL_VAR, HTTP_ALLOW_PRIVATE_HOSTS_VAR, RATE_LIMITS_ENABLED_VAR,
+    TEST_BASE_URL, TEST_DATABASE_URL,
 };
 
 use crate::common;
@@ -266,6 +267,7 @@ fn test_config_is_the_fixed_configuration() {
         DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
         BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
         HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
+        RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
         _ => None,
     })
     .expect("the fixed test values are valid");
@@ -273,6 +275,10 @@ fn test_config_is_the_fixed_configuration() {
     assert!(
         config.http_allow_private_hosts,
         "the harness disables the SSRF guard so integration tests can reach local servers"
+    );
+    assert!(
+        !config.rate_limit.enabled.get(),
+        "the harness runs unthrottled so a suite never trips a limiter of its own"
     );
     assert_eq!(config.domain(), "test.example", "test domain");
 }

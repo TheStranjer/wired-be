@@ -1,6 +1,7 @@
 //! Runtime configuration, read from environment variables.
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     net::{AddrParseError, SocketAddr},
@@ -9,7 +10,11 @@ use std::{
 
 use url::Url;
 
-use crate::{extract::multipart::UploadLimits, jobs::DEFAULT_JOB_QUEUES};
+use crate::{
+    extract::multipart::UploadLimits,
+    jobs::DEFAULT_JOB_QUEUES,
+    rate_limit::{self, RateLimit},
+};
 
 /// Environment variable holding the PostgreSQL connection URL.
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
@@ -149,6 +154,14 @@ pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
 /// while off the `ActivityPub` inbox routes answer 403 and outbound
 /// delivery queues nothing.
 pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
+/// Environment variable holding whether routes that mount a rate-limit
+/// bucket throttle their requests.
+pub const RATE_LIMITS_ENABLED_VAR: &str = "RATE_LIMITS_ENABLED";
+/// Environment variable holding the rate limiter's bucket overrides.
+pub const RATE_LIMITS_VAR: &str = "RATE_LIMITS";
+/// Environment variable holding whether the leftmost `X-Forwarded-For`
+/// entry may name the client for rate limiting.
+pub const TRUST_PROXY_HEADERS_VAR: &str = "TRUST_PROXY_HEADERS";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -324,6 +337,13 @@ pub const DEFAULT_AUTHORIZED_FETCH: bool = false;
 /// federates, the way Pleroma's `[:federator, :enabled]` default does;
 /// going quiet is an explicit operator decision.
 pub const DEFAULT_FEDERATION_ENABLED: bool = true;
+/// Rate limiting used when `RATE_LIMITS_ENABLED` is unset: routes that
+/// mount a bucket throttle, like Pleroma's `RateLimiterPlug`.
+pub const DEFAULT_RATE_LIMITS_ENABLED: bool = true;
+/// Proxy trust used when `TRUST_PROXY_HEADERS` is unset: the socket peer
+/// is always the client, so a plain `X-Forwarded-For` header cannot name
+/// another one.
+pub const DEFAULT_TRUST_PROXY_HEADERS: bool = false;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from the fixture
 /// in [`crate::test_db`].
@@ -481,6 +501,29 @@ impl fmt::Debug for MediaProxyConfig {
             .field("blacklist", &self.blacklist)
             .finish()
     }
+}
+
+/// Rate limiter settings, from `RATE_LIMITS_ENABLED`, `RATE_LIMITS` and
+/// `TRUST_PROXY_HEADERS`.
+///
+/// While [`enabled`](Self::enabled) is set — the default — routes that
+/// mount a bucket throttle their requests against the windows of
+/// [`crate::rate_limit`]; the rest of the struct fixes what they throttle
+/// with and whom they count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RateLimitConfig {
+    /// Whether limited routes throttle, from `RATE_LIMITS_ENABLED`: while
+    /// off they answer uncounted and without `x-ratelimit-*` headers.
+    pub enabled: Toggle,
+    /// The bucket table, from `RATE_LIMITS`: Pleroma's defaults
+    /// (see [`DEFAULT_LIMITS`](crate::rate_limit::DEFAULT_LIMITS)) with the
+    /// variable's `bucket=max:window_secs` entries overriding them; a
+    /// bucket the table does not name is unlimited.
+    pub limits: BTreeMap<String, RateLimit>,
+    /// Whether the leftmost `X-Forwarded-For` entry may name the client a
+    /// window counts against, from `TRUST_PROXY_HEADERS`: while off (the
+    /// default) the socket peer always does.
+    pub trust_proxy_headers: Toggle,
 }
 
 /// How the SMTP relay connection is encrypted, the value of `SMTP_TLS`.
@@ -682,6 +725,9 @@ pub struct Config {
     /// and [`enqueue_delivery`](crate::federation::delivery::enqueue_delivery)
     /// queues nothing (see [`crate::federation::delivery`]).
     pub federation_enabled: Toggle,
+    /// The rate limiter settings, from `RATE_LIMITS_ENABLED`, `RATE_LIMITS`
+    /// and `TRUST_PROXY_HEADERS` (see [`crate::rate_limit`]).
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Config {
@@ -734,7 +780,6 @@ impl Config {
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
         let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
             mailer_settings(&lookup, domain_of(&base_url))?;
-        let media_proxy = media_proxy_settings(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -779,10 +824,11 @@ impl Config {
             smtp_password,
             smtp_tls,
             mail_from,
-            media_proxy,
+            media_proxy: media_proxy_settings(&lookup)?,
             sign_fetches,
             authorized_fetch,
             federation_enabled: federation_enabled(&lookup)?,
+            rate_limit: rate_limit_settings(&lookup)?,
         })
     }
 
@@ -811,7 +857,10 @@ impl Config {
 
     /// Configuration for tests: `BASE_URL` is `https://test.example`,
     /// `HTTP_ALLOW_PRIVATE_HOSTS` is `true` (the suites talk to local
-    /// mini-servers), every other setting is at its default, and
+    /// mini-servers), `RATE_LIMITS_ENABLED` is `false` (so a suite can
+    /// exercise an endpoint's own budget without tripping the limiter —
+    /// tests that want throttling read the var through `from_lookup`),
+    /// every other setting is at its default, and
     /// `DATABASE_URL` is an inert placeholder (tests get their real pool
     /// from the fixture in [`crate::test_db`]). Reads no environment
     /// variables, so it is safe in parallel tests.
@@ -828,6 +877,7 @@ impl Config {
             DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
             BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
             HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
+            RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
             _ => None,
         })
         .unwrap_or_else(|_| Self::test_defaults())
@@ -895,6 +945,11 @@ impl Config {
             sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
+            rate_limit: RateLimitConfig {
+                enabled: Toggle::new(false),
+                limits: rate_limit::default_limits(),
+                trust_proxy_headers: Toggle::new(DEFAULT_TRUST_PROXY_HEADERS),
+            },
         }
     }
 }
@@ -1413,6 +1468,34 @@ where
     })
 }
 
+/// Reads the rate limiter settings (see [`crate::rate_limit`]): whether
+/// limited routes throttle at all, the bucket table — Pleroma's defaults
+/// with the `RATE_LIMITS` overrides merged in — and whether
+/// `X-Forwarded-For` may name the client.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when a toggle variable holds a
+/// value that is neither spelling, and [`ConfigError::InvalidRateLimits`]
+/// when `RATE_LIMITS` holds a malformed entry.
+fn rate_limit_settings<F>(lookup: &F) -> Result<RateLimitConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let enabled = boolean(lookup, RATE_LIMITS_ENABLED_VAR, DEFAULT_RATE_LIMITS_ENABLED)?.into();
+    let trust_proxy_headers =
+        boolean(lookup, TRUST_PROXY_HEADERS_VAR, DEFAULT_TRUST_PROXY_HEADERS)?.into();
+    let mut limits = rate_limit::default_limits();
+    if let Some(text) = lookup(RATE_LIMITS_VAR).filter(|text| !text.trim().is_empty()) {
+        limits.extend(rate_limit::parse_limits(&text).map_err(ConfigError::InvalidRateLimits)?);
+    }
+    Ok(RateLimitConfig {
+        enabled,
+        limits,
+        trust_proxy_headers,
+    })
+}
+
 /// Reads a non-negative integer setting, applying `default` when the variable
 /// is unset or empty.
 ///
@@ -1513,6 +1596,7 @@ impl fmt::Debug for Config {
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
             .field("federation_enabled", &self.federation_enabled)
+            .field("rate_limit", &self.rate_limit)
             .finish()
     }
 }
@@ -1541,6 +1625,9 @@ pub enum ConfigError {
     /// than [`MIN_MEDIA_PROXY_SECRET_CHARS`] requires; the value is the
     /// variable name.
     ShortMediaProxySecret(&'static str),
+    /// `RATE_LIMITS` holds an entry that is not a `bucket=max:window_secs`
+    /// triple (or a degenerate one); the value is the parser's reason.
+    InvalidRateLimits(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -1566,6 +1653,9 @@ impl fmt::Display for ConfigError {
                 f,
                 "invalid {var}: expected at least {MIN_MEDIA_PROXY_SECRET_CHARS} characters"
             ),
+            Self::InvalidRateLimits(detail) => {
+                write!(f, "invalid {RATE_LIMITS_VAR}: {detail}")
+            }
         }
     }
 }
@@ -1580,7 +1670,8 @@ impl Error for ConfigError {
             | Self::InvalidBoolean(_)
             | Self::InvalidOauthProviders(_)
             | Self::InvalidSmtpTls(_)
-            | Self::ShortMediaProxySecret(_) => None,
+            | Self::ShortMediaProxySecret(_)
+            | Self::InvalidRateLimits(_) => None,
         }
     }
 }
@@ -3207,6 +3298,7 @@ mod tests {
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
             (BASE_URL_VAR, TEST_BASE_URL),
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
+            (RATE_LIMITS_ENABLED_VAR, "false"),
         ]))
         .unwrap();
         assert_eq!(config, expected, "for_tests equals from_lookup");
@@ -3220,12 +3312,198 @@ mod tests {
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
             (BASE_URL_VAR, TEST_BASE_URL),
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
+            (RATE_LIMITS_ENABLED_VAR, "false"),
         ]))
         .unwrap();
         assert_eq!(
             Config::test_defaults(),
             parsed,
             "fallback equals the parsed test config"
+        );
+    }
+
+    /// The limiter's three settings, at their defaults: on, Pleroma's
+    /// bucket table, and no proxy trust.
+    #[test]
+    fn rate_limit_settings_default() {
+        let config = config_with(&[]);
+        assert!(
+            config.rate_limit.enabled.get(),
+            "rate limiting is on by default"
+        );
+        assert!(
+            !config.rate_limit.trust_proxy_headers.get(),
+            "X-Forwarded-For is not trusted by default"
+        );
+        assert_eq!(
+            config.rate_limit.limits,
+            rate_limit::default_limits(),
+            "the table is Pleroma's defaults"
+        );
+        let authentication = config
+            .rate_limit
+            .limits
+            .get("authentication")
+            .copied()
+            .unwrap();
+        assert_eq!(
+            (authentication.max, authentication.window),
+            (20, std::time::Duration::from_secs(5)),
+            "authentication is 20 per 5 seconds"
+        );
+        let confirmation = config
+            .rate_limit
+            .limits
+            .get("account_confirmation_resend")
+            .copied()
+            .unwrap();
+        assert_eq!(
+            (confirmation.max, confirmation.window),
+            (5, std::time::Duration::from_secs(8_600)),
+            "account_confirmation_resend is 5 per 8600 seconds"
+        );
+        assert_eq!(config.rate_limit.limits.len(), 9, "exactly nine buckets");
+    }
+
+    /// `RATE_LIMITS` overrides entries of the default table and adds
+    /// buckets to it; the untouched defaults stay.
+    #[test]
+    fn reads_custom_rate_limits() {
+        let config = config_with(&[(
+            RATE_LIMITS_VAR,
+            "authentication=20:5,app_account_creation=5:1800,search=2:2",
+        )]);
+        assert_eq!(
+            config.rate_limit.limits.len(),
+            9,
+            "no bucket left the table"
+        );
+        assert_eq!(
+            config.rate_limit.limits.get("search").copied().unwrap().max,
+            2,
+            "the override replaces the default"
+        );
+        assert_eq!(
+            config
+                .rate_limit
+                .limits
+                .get("relations_actions")
+                .copied()
+                .unwrap()
+                .max,
+            10,
+            "an untouched bucket keeps its default"
+        );
+    }
+
+    /// A malformed `RATE_LIMITS` entry refuses startup, and the error
+    /// names the variable and the reason.
+    #[test]
+    fn invalid_rate_limits_is_an_error() {
+        let err = try_config_with(&[(RATE_LIMITS_VAR, "authentication=20")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidRateLimits(
+                "entry 'authentication=20' is not max:window_secs".to_owned()
+            ),
+            "error variant"
+        );
+        assert!(err.source().is_none(), "no source");
+        assert_eq!(
+            err.to_string(),
+            "invalid RATE_LIMITS: entry 'authentication=20' is not max:window_secs",
+            "message names the variable and the reason"
+        );
+    }
+
+    /// The two new toggles parse the shared boolean spellings, and a blank
+    /// value keeps the default.
+    #[test]
+    fn rate_limit_toggles_parse_booleans() {
+        for var in [RATE_LIMITS_ENABLED_VAR, TRUST_PROXY_HEADERS_VAR] {
+            for (value, want) in [
+                ("true", true),
+                ("TRUE", true),
+                (" 1 ", true),
+                ("false", false),
+                ("FaLsE", false),
+                ("0", false),
+            ] {
+                let config = config_with(&[(var, value)]);
+                assert_eq!(
+                    toggle_of(&config, var),
+                    want,
+                    "{var}={value:?} means {want}"
+                );
+            }
+            let default = if var == RATE_LIMITS_ENABLED_VAR {
+                DEFAULT_RATE_LIMITS_ENABLED
+            } else {
+                DEFAULT_TRUST_PROXY_HEADERS
+            };
+            let config = config_with(&[(var, "")]);
+            assert_eq!(
+                toggle_of(&config, var),
+                default,
+                "empty {var} keeps the default"
+            );
+            let err = try_config_with(&[(var, "maybe")]).unwrap_err();
+            assert_eq!(err, ConfigError::InvalidBoolean(var), "error for {var}");
+        }
+    }
+
+    /// The named toggle's value on this config.
+    fn toggle_of(config: &Config, var: &str) -> bool {
+        if var == RATE_LIMITS_ENABLED_VAR {
+            config.rate_limit.enabled.get()
+        } else {
+            config.rate_limit.trust_proxy_headers.get()
+        }
+    }
+
+    /// `Debug` shows the limiter settings; nothing here is secret material.
+    #[test]
+    fn debug_shows_the_rate_limit_settings() {
+        let config = config_with(&[
+            (RATE_LIMITS_ENABLED_VAR, "false"),
+            (TRUST_PROXY_HEADERS_VAR, "true"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("enabled: Toggle(false)"),
+            "the enablement is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("trust_proxy_headers: Toggle(true)"),
+            "the proxy trust is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("limits:"),
+            "the bucket table is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("\"authentication\": RateLimit"),
+            "and it shows the buckets by name: {debug}"
+        );
+    }
+
+    /// The test configuration runs with the limiter off, so a suite never
+    /// trips its own budget, and the table still carries the defaults.
+    #[test]
+    fn for_tests_disables_rate_limiting() {
+        let config = Config::for_tests();
+        assert!(
+            !config.rate_limit.enabled.get(),
+            "tests answer unthrottled unless they read the var themselves"
+        );
+        assert_eq!(
+            config.rate_limit.limits,
+            rate_limit::default_limits(),
+            "the table keeps the defaults for tests that opt in"
+        );
+        assert!(
+            !config.rate_limit.trust_proxy_headers.get(),
+            "tests are unproxied by default"
         );
     }
 }

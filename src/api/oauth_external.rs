@@ -662,6 +662,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
@@ -1036,9 +1037,10 @@ mod tests {
         // `/oauth/authorize` is the sibling router's static route; the
         // `{provider}` segment must not swallow it. Both refusals run
         // before any query, so the lazy pool stays untouched.
-        let app = crate::api::oauth::router()
+        let state = test_state(&["github"]);
+        let app = crate::api::oauth::router(&state)
             .merge(router())
-            .with_state(test_state(&["github"]));
+            .with_state(state);
         let authorize_side = app
             .oneshot(
                 Request::get("/oauth/authorize?response_type=token")

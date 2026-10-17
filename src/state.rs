@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 use crate::{
     api::instance::InstanceStatsCache, config::Config, http_client::HttpClient,
-    mailer::MailTransport, streaming::hub::Hub, uploads::UploaderBackend,
+    mailer::MailTransport, rate_limit::RateLimiter, streaming::hub::Hub, uploads::UploaderBackend,
 };
 
 /// State shared across all requests. Cheap to clone.
@@ -33,6 +33,15 @@ pub struct AppState {
     /// [`STATS_TTL`](crate::api::instance::STATS_TTL)). Construct it with
     /// `Arc::default()`, which applies the endpoint's TTL.
     pub instance_stats_cache: Arc<InstanceStatsCache>,
+    /// The in-memory fixed-window rate limiter shared by every throttled
+    /// route (see [`crate::rate_limit`]): one instance per process, so a
+    /// bucket counts one budget across the routes that mount it. Build it
+    /// from the same config with
+    /// [`RateLimiter::from_config`](crate::rate_limit::RateLimiter::from_config),
+    /// or over an injected clock with
+    /// [`RateLimiter::with_clock`](crate::rate_limit::RateLimiter::with_clock)
+    /// in tests that roll windows.
+    pub rate_limiter: Arc<RateLimiter>,
     /// How emails leave this instance: the SMTP relay transport in
     /// production (see [`crate::mailer::transport_from_config`]), the
     /// recording [`MemoryTransport`](crate::mailer::MemoryTransport) in
