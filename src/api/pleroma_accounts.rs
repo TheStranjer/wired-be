@@ -41,7 +41,10 @@
 //!   only one that needs its confirmation letter again. It reads `email`,
 //!   re-mails the local account that is still unconfirmed (and nothing for
 //!   any other request, including the ones naming no address), and answers
-//!   204 with an empty body always — see `confirmation_resend`.
+//!   204 with an empty body always — see `confirmation_resend`. Pleroma
+//!   throttles this action through its `account_confirmation_resend` bucket;
+//!   this server has no rate limiter yet, so the bucket waits for the ticket
+//!   that adds one.
 //!
 //! [`Relationship`]: crate::entities::relationship::Relationship
 //! [`set_notify`]: crate::models::follow::set_notify
