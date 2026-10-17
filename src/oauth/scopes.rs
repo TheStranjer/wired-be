@@ -115,6 +115,13 @@ pub const READ_STATUSES: &str = "read:statuses";
 /// (Pleroma's `write:statuses` on the marker `upsert` action).
 pub const WRITE_STATUSES: &str = "write:statuses";
 
+/// The write side of reports: `POST /api/v1/reports`.
+///
+/// Mastodon's `write:reports`, the scope Pleroma's `ReportController`
+/// `create` action demands in
+/// `lib/pleroma/web/mastodon_api/controllers/report_controller.ex`.
+pub const WRITE_REPORTS: &str = "write:reports";
+
 /// The read side of account security: `GET /api/pleroma/accounts/mfa`
 /// (Pleroma's `read:security` scope on the MFA settings action).
 pub const READ_SECURITY: &str = "read:security";
