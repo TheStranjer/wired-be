@@ -32,12 +32,13 @@
 //! `RATE_LIMITS_ENABLED=false` (on by default) switches the middleware to
 //! a plain pass-through: no counting, no headers.
 //!
-//! Two tickets have mounted buckets so far: WBE-56 the ones whose routes
+//! Three tickets have mounted buckets so far: WBE-56 the ones whose routes
 //! already existed — `authentication` on `POST /oauth/token` and
 //! `/oauth/authorize`, and `app_account_creation` on `POST /api/v1/apps`
 //! and `POST /api/v1/accounts`; WBE-135 `password_reset` on
-//! `POST /auth/password`. The remaining buckets (`relations_actions`,
-//! `relation_id_action`, `statuses_actions`, `status_id_action`,
+//! `POST /auth/password`; WBE-120 `statuses_actions` on
+//! `POST /api/v1/reports`. The remaining buckets (`relations_actions`,
+//! `relation_id_action`, `status_id_action`,
 //! `account_confirmation_resend` and `search`) are
 //! already configured and counted by name; the later tickets that add
 //! their routes attach [`rate_limit`] with the matching bucket there.

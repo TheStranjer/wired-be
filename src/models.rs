@@ -43,6 +43,7 @@ pub mod oauth_login_state;
 pub mod oauth_token;
 pub mod password_reset;
 pub mod relationship;
+pub mod report;
 pub mod scrobble;
 pub mod status;
 pub mod status_visibility;

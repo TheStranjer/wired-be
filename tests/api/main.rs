@@ -150,6 +150,9 @@ mod relationships;
 /// `POST /api/v1/accounts/{id}/remove_from_followers`.
 mod remove_from_followers;
 
+/// Reports over HTTP (`POST /api/v1/reports`): filing a report.
+mod reports;
+
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 

@@ -51,6 +51,9 @@ pub const MAX_BIO_CHARS_VAR: &str = "MAX_BIO_CHARS";
 /// Environment variable holding the maximum number of profile metadata
 /// fields (`fields_attributes`).
 pub const MAX_PROFILE_FIELDS_VAR: &str = "MAX_PROFILE_FIELDS";
+/// Environment variable holding the maximum length of a report's comment
+/// in characters.
+pub const MAX_REPORT_COMMENT_VAR: &str = "MAX_REPORT_COMMENT";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -210,6 +213,12 @@ pub const DEFAULT_MAX_BIO_CHARS: usize = 5_000;
 /// `PATCH /api/v1/accounts/update_credentials` refuses more with 422
 /// `{"error":"Too many fields"}`.
 pub const DEFAULT_MAX_PROFILE_FIELDS: usize = 4;
+/// Report comment length used when `MAX_REPORT_COMMENT` is unset.
+///
+/// Mastodon caps a report's `comment` at 1000 characters
+/// (`Report`'s length validation); `POST /api/v1/reports` refuses a longer
+/// one with 422.
+pub const DEFAULT_MAX_REPORT_COMMENT: usize = 1_000;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -609,6 +618,10 @@ pub struct Config {
     /// `PATCH /api/v1/accounts/update_credentials` refuses more with 422
     /// `{"error":"Too many fields"}`.
     pub max_profile_fields: usize,
+    /// Maximum length of a report's `comment` in characters, from
+    /// `MAX_REPORT_COMMENT`; `POST /api/v1/reports` refuses a longer one
+    /// with 422.
+    pub max_report_comment: usize,
     /// Maximum pixel count (width times height) of an uploaded image, from
     /// `MAX_IMAGE_PIXELS`; the media upload endpoints reject an image that
     /// decodes larger with 422 "Image too large" (see
@@ -762,17 +775,13 @@ impl Config {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let database_url = lookup(DATABASE_URL_VAR)
-            .filter(|url| !url.is_empty())
-            .ok_or(ConfigError::Missing(DATABASE_URL_VAR))?;
+        let database_url = required_var(&lookup, DATABASE_URL_VAR)?;
         let bind_addr = lookup(BIND_ADDR_VAR)
             .as_deref()
             .unwrap_or(DEFAULT_BIND_ADDR)
             .parse()
             .map_err(ConfigError::InvalidBindAddr)?;
-        let base_url_raw = lookup(BASE_URL_VAR)
-            .filter(|url| !url.is_empty())
-            .ok_or(ConfigError::Missing(BASE_URL_VAR))?;
+        let base_url_raw = required_var(&lookup, BASE_URL_VAR)?;
         let base_url = normalize_base_url(&base_url_raw)?;
         let (instance_name, instance_description, contact_email, instance_languages) =
             instance_profile(&lookup);
@@ -780,7 +789,7 @@ impl Config {
             content_limits(&lookup)?;
         let (max_media_description, max_display_name_chars, max_bio_chars, max_profile_fields) =
             text_length_limits(&lookup)?;
-        let max_image_pixels = number(&lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?;
+        let (max_image_pixels, max_report_comment) = cap_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
@@ -807,6 +816,7 @@ impl Config {
             max_display_name_chars,
             max_bio_chars,
             max_profile_fields,
+            max_report_comment,
             max_image_pixels,
             upload_limits,
             avatar_limit_bytes,
@@ -916,6 +926,7 @@ impl Config {
             max_display_name_chars: DEFAULT_MAX_DISPLAY_NAME_CHARS,
             max_bio_chars: DEFAULT_MAX_BIO_CHARS,
             max_profile_fields: DEFAULT_MAX_PROFILE_FIELDS,
+            max_report_comment: DEFAULT_MAX_REPORT_COMMENT,
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
@@ -1293,6 +1304,33 @@ where
     ))
 }
 
+/// The shape [`cap_limits`] answers: the two content caps that sit outside
+/// the text-length groups, in [`Config`] field order (an uploaded image's
+/// pixel count, then a report comment's character count); factored out
+/// because a bare pair of same-typed numbers reads better by name.
+type CapLimits = (usize, usize);
+
+/// Reads the two caps that bound one request's content beside the text
+/// limits: the pixel count an uploaded image may decode to
+/// (`MAX_IMAGE_PIXELS`) and the length of a report's `comment`
+/// (`MAX_REPORT_COMMENT`). Grouped because each is a plain default-or-parse
+/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
+/// comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] for whichever variable holds a
+/// value that is not a whole number.
+fn cap_limits<F>(lookup: &F) -> Result<CapLimits, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
+        number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
+    ))
+}
+
 /// Reads the three settings that govern how this instance fetches and is
 /// fetched by peers: whether the client may reach private/loopback hosts
 /// (`HTTP_ALLOW_PRIVATE_HOSTS`), whether it signs its outgoing actor
@@ -1527,6 +1565,23 @@ where
     })
 }
 
+/// Reads a variable the instance cannot start without: its value, refusing
+/// [`ConfigError::Missing`] when it is unset or empty. Both required settings
+/// read through here, which is also what keeps [`Config::from_lookup`] inside
+/// the size budget AGENTS.md gives it.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Missing`] naming `var`.
+fn required_var<F>(lookup: &F, var: &'static str) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(var)
+        .filter(|value| !value.is_empty())
+        .ok_or(ConfigError::Missing(var))
+}
+
 /// Reads a non-negative integer setting, applying `default` when the variable
 /// is unset or empty.
 ///
@@ -1592,6 +1647,7 @@ impl fmt::Debug for Config {
             .field("max_display_name_chars", &self.max_display_name_chars)
             .field("max_bio_chars", &self.max_bio_chars)
             .field("max_profile_fields", &self.max_profile_fields)
+            .field("max_report_comment", &self.max_report_comment)
             .field("max_image_pixels", &self.max_image_pixels)
             .field("upload_limits", &self.upload_limits)
             .field("avatar_limit_bytes", &self.avatar_limit_bytes)
@@ -2268,6 +2324,25 @@ mod tests {
         assert!(
             debug.contains("max_profile_fields: 2"),
             "the field-count limit is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The report comment cap: Mastodon's 1000 by default, the environment
+    /// overriding it, and `Debug` showing the value.
+    #[test]
+    fn reads_custom_max_report_comment() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.max_report_comment, 1_000,
+            "default MAX_REPORT_COMMENT"
+        );
+
+        let config = config_with(&[(MAX_REPORT_COMMENT_VAR, "140")]);
+        assert_eq!(config.max_report_comment, 140, "custom MAX_REPORT_COMMENT");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_report_comment: 140"),
+            "the report comment limit is visible in Debug output: {debug}"
         );
     }
 
@@ -3265,6 +3340,7 @@ mod tests {
             MAX_DISPLAY_NAME_CHARS_VAR,
             MAX_BIO_CHARS_VAR,
             MAX_PROFILE_FIELDS_VAR,
+            MAX_REPORT_COMMENT_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             AVATAR_LIMIT_BYTES_VAR,

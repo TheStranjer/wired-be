@@ -23,6 +23,8 @@
 //! batch-loads. [`status`] renders the Mastodon `Status` entity with
 //! Pleroma's extension block; its batch loader is
 //! [`services::render_status`](crate::services::render_status).
+//! [`report`] renders the Mastodon `Report` entity from a
+//! [`models::report`](crate::models::report) row and the reported account.
 
 pub mod account;
 pub mod announcement;
@@ -35,6 +37,7 @@ pub mod marker;
 pub mod media_attachment;
 pub mod mention;
 pub mod relationship;
+pub mod report;
 pub mod scrobble;
 pub mod status;
 pub mod tag;
