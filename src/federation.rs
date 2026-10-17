@@ -17,13 +17,16 @@
 //! an activity as its actor and POSTs it to a remote inbox, retrying the
 //! answers that may yet succeed. [`inbox_auth`] is its inbound counterpart:
 //! the `SignedActivity` extractor that authenticates a peer's inbox `POST`
-//! against its actor's key before any handler sees the activity. Activity
-//! documents, inboxes and outboxes arrive in later tickets and get their
-//! modules beside them.
+//! against its actor's key before any handler sees the activity, and
+//! [`dispatch`] is what the inbox routes do with it once authenticated —
+//! the `federator.incoming` job handler, a documented stub until the
+//! dispatcher ticket fills it in. Activity documents, inboxes and outboxes
+//! arrive in later tickets and get their modules beside them.
 
 pub mod actor;
 pub mod authorized_fetch;
 pub mod delivery;
+pub mod dispatch;
 pub mod fetch_actor;
 pub mod inbox_auth;
 pub mod json;
