@@ -145,6 +145,10 @@ pub const SIGN_FETCHES_VAR: &str = "SIGN_FETCHES";
 /// Environment variable holding whether incoming `GET`s to the
 /// `ActivityPub` actor routes must carry a valid HTTP signature.
 pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
+/// Environment variable holding whether this instance federates at all:
+/// while off the `ActivityPub` inbox routes answer 403 and outbound
+/// delivery queues nothing.
+pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
 /// Listen address used when `BIND_ADDR` is unset.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
@@ -316,6 +320,10 @@ pub const DEFAULT_SIGN_FETCHES: bool = true;
 /// instance serves `ActivityPub` `GET`s to unsigned requests too; Pleroma's
 /// `[:federator, :authorized_fetch]`-style gate is an explicit opt-in.
 pub const DEFAULT_AUTHORIZED_FETCH: bool = false;
+/// Federation state used when `FEDERATION_ENABLED` is unset: this instance
+/// federates, the way Pleroma's `[:federator, :enabled]` default does;
+/// going quiet is an explicit operator decision.
+pub const DEFAULT_FEDERATION_ENABLED: bool = true;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from the fixture
 /// in [`crate::test_db`].
@@ -668,6 +676,12 @@ pub struct Config {
     /// a valid HTTP signature, from `AUTHORIZED_FETCH` (see
     /// [`crate::federation::authorized_fetch`]).
     pub authorized_fetch: Toggle,
+    /// Whether this instance federates at all, from `FEDERATION_ENABLED`:
+    /// while off the `ActivityPub` inbox routes answer 403
+    /// `{"error":"Federation is disabled"}` (see [`crate::api::activitypub`])
+    /// and [`enqueue_delivery`](crate::federation::delivery::enqueue_delivery)
+    /// queues nothing (see [`crate::federation::delivery`]).
+    pub federation_enabled: Toggle,
 }
 
 impl Config {
@@ -768,6 +782,7 @@ impl Config {
             media_proxy,
             sign_fetches,
             authorized_fetch,
+            federation_enabled: federation_enabled(&lookup)?,
         })
     }
 
@@ -879,6 +894,7 @@ impl Config {
             },
             sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
+            federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
         }
     }
 }
@@ -1218,6 +1234,23 @@ where
     ))
 }
 
+/// Reads `FEDERATION_ENABLED`: whether this instance federates at all,
+/// [`DEFAULT_FEDERATION_ENABLED`] when unset or blank. Read as its own
+/// setting because the inbox routes and the delivery enqueuer both gate on
+/// it (see [`crate::api::activitypub`] and
+/// [`crate::federation::delivery`]).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when the variable holds a value
+/// that is neither spelling.
+fn federation_enabled<F>(lookup: &F) -> Result<Toggle, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(boolean(lookup, FEDERATION_ENABLED_VAR, DEFAULT_FEDERATION_ENABLED)?.into())
+}
+
 /// The shape [`text_length_limits`] answers: the four default-or-parse
 /// profile limits in field order (media description, display name, bio,
 /// profile-field count); factored out because a bare fourfold tuple is
@@ -1479,6 +1512,7 @@ impl fmt::Debug for Config {
             .field("media_proxy", &self.media_proxy)
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
+            .field("federation_enabled", &self.federation_enabled)
             .finish()
     }
 }
@@ -2370,6 +2404,62 @@ mod tests {
         assert!(
             debug.contains("authorized_fetch: Toggle(true)"),
             "the authorized-fetch toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    /// `FEDERATION_ENABLED` keeps its true default when the variable is
+    /// unset: an instance federates unless its operator turns it off.
+    #[test]
+    fn federation_is_enabled_by_default() {
+        let config = config_with(&[]);
+        assert!(
+            config.federation_enabled.get(),
+            "federation is on by default (Pleroma's `[:federator, :enabled]`)"
+        );
+    }
+
+    #[test]
+    fn federation_enabled_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", true),
+        ] {
+            let config = config_with(&[(FEDERATION_ENABLED_VAR, value)]);
+            assert_eq!(
+                config.federation_enabled.get(),
+                want,
+                "FEDERATION_ENABLED={value:?} means {want} (unset federates)"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_federation_enabled_is_an_error() {
+        let err = try_config_with(&[(FEDERATION_ENABLED_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(FEDERATION_ENABLED_VAR),
+            "error variant"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {FEDERATION_ENABLED_VAR}: ")),
+            "message names the variable"
+        );
+    }
+
+    #[test]
+    fn debug_shows_federation_enabled() {
+        let config = config_with(&[(FEDERATION_ENABLED_VAR, "false")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("federation_enabled: Toggle(false)"),
+            "the federation toggle is visible in Debug output: {debug}"
         );
     }
 

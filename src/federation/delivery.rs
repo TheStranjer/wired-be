@@ -14,9 +14,11 @@
 //! activity is already here), one that is not an `http(s)` URL, and one whose
 //! host the instance's own policy rejects, and in every one of those cases it
 //! reports `Ok(())` without queueing anything — refusing to federate is not a
-//! failure. The same `(activity, inbox)` pair is enqueued once: the job's
-//! `unique_key` (`deliver:{activity_id}:{inbox}`) makes the queue's dedup
-//! index swallow a repeated call while a delivery for it is still live.
+//! failure. While `FEDERATION_ENABLED` is off it is a plain no-op: an
+//! instance that does not federate queues no deliveries at all. The same
+//! `(activity, inbox)` pair is enqueued once: the job's `unique_key`
+//! (`deliver:{activity_id}:{inbox}`) makes the queue's dedup index swallow a
+//! repeated call while a delivery for it is still live.
 //!
 //! A delivery attempt re-reads the signing actor from the database (a local
 //! row with its own private key: decision 7), drops the activity's blind
@@ -43,6 +45,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    config::Config,
     error::{AppError, AppResult},
     federation::signature::{SignedHeaders, SigningKey, sign_request},
     http_client::HttpError,
@@ -124,6 +127,10 @@ pub fn best_inbox(actor: &User) -> Option<String> {
 /// key `deliver:{activity_id}:{inbox}`, so calling this twice for the same
 /// pair while a delivery is live queues nothing the second time.
 ///
+/// While `config` says federation is off ([`Config::federation_enabled`]),
+/// the call is a no-op: an instance that does not federate sends nothing,
+/// and refusing to federate is not a failure.
+///
 /// Three inboxes are refused without an error and without a job: one this
 /// instance serves itself (its authority is the actor's own, so the activity
 /// needs no round trip through HTTP), one that is not an `http(s)` URL with a
@@ -139,10 +146,15 @@ pub fn best_inbox(actor: &User) -> Option<String> {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn enqueue_delivery(
     pool: &PgPool,
+    config: &Config,
     inbox: &str,
     actor: &User,
     activity: &Value,
 ) -> AppResult<()> {
+    if !config.federation_enabled.get() {
+        debug!(inbox, "delivery skipped: federation is disabled");
+        return Ok(());
+    }
     let Some(target) = parse_inbox(inbox) else {
         warn!(inbox, "delivery refused: the inbox is not an http(s) URL");
         return Ok(());
@@ -413,7 +425,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::{Config, TEST_BASE_URL, Toggle},
         federation::signature::{
             digest_header,
             verify::{SignedRequestParts, parse_signature_header, verify, verify_digest},
@@ -1265,6 +1277,7 @@ mod tests {
 
         enqueue_delivery(
             &pool,
+            &Config::for_tests(),
             "https://test.example/users/bob/inbox",
             &alice,
             &activity(),
@@ -1291,7 +1304,7 @@ mod tests {
             ("https://spam.example/inbox", 0),
             ("https://quiet.example/inbox", 1),
         ] {
-            enqueue_delivery(&pool, inbox, &alice, &activity())
+            enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
                 .await
                 .unwrap();
             assert_eq!(
@@ -1309,7 +1322,7 @@ mod tests {
         let pool = db.pool().clone();
         let alice = actor(&pool).await;
         for inbox in ["ftp://peer.example/inbox", "not a url", "https://", ""] {
-            enqueue_delivery(&pool, inbox, &alice, &activity())
+            enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
                 .await
                 .unwrap_or_else(|err| panic!("`{inbox}` refuses without an error: {err}"));
         }
@@ -1324,10 +1337,10 @@ mod tests {
         let alice = actor(&pool).await;
         let inbox = "https://peer.example/inbox";
 
-        enqueue_delivery(&pool, inbox, &alice, &activity())
+        enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
             .await
             .unwrap();
-        enqueue_delivery(&pool, inbox, &alice, &activity())
+        enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
             .await
             .unwrap();
 
@@ -1355,10 +1368,44 @@ mod tests {
             "and its id is spelled out"
         );
 
-        enqueue_delivery(&pool, "https://other.example/inbox", &alice, &activity())
-            .await
-            .unwrap();
+        enqueue_delivery(
+            &pool,
+            &Config::for_tests(),
+            "https://other.example/inbox",
+            &alice,
+            &activity(),
+        )
+        .await
+        .unwrap();
         assert_eq!(job_count(&pool).await, 2, "a second inbox is its own job");
+    }
+
+    /// While `FEDERATION_ENABLED` is off, [`enqueue_delivery`] is a no-op:
+    /// even a well-formed pair aimed at a reachable remote leaves no job
+    /// behind, because an instance that does not federate sends nothing.
+    #[tokio::test]
+    async fn a_disabled_instance_queues_no_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        let mut config = Config::for_tests();
+        config.federation_enabled = Toggle::new(false);
+
+        enqueue_delivery(
+            &pool,
+            &config,
+            "https://peer.example/inbox",
+            &alice,
+            &activity(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "a disabled federation refuses to queue, without an error"
+        );
     }
 
     #[tokio::test]
@@ -1368,9 +1415,15 @@ mod tests {
         let alice = actor(&pool).await;
         let keyless = json!({"type": "Create"});
 
-        let err = enqueue_delivery(&pool, "https://peer.example/inbox", &alice, &keyless)
-            .await
-            .expect_err("an unnamed activity cannot be deduplicated");
+        let err = enqueue_delivery(
+            &pool,
+            &Config::for_tests(),
+            "https://peer.example/inbox",
+            &alice,
+            &keyless,
+        )
+        .await
+        .expect_err("an unnamed activity cannot be deduplicated");
 
         assert!(
             matches!(err, AppError::Unprocessable(_)),

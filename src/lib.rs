@@ -72,9 +72,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// today the federation delivery job
 /// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)), the
 /// streaming reference-table sweep
-/// ([`KIND_CLEANUP`](streaming::hub::KIND_CLEANUP)) and the mailer job
-/// ([`mailer::KIND_SEND`]), so the worker idles, sweeps, delivers and sends.
-/// The state's mail transport comes from
+/// ([`KIND_CLEANUP`](streaming::hub::KIND_CLEANUP)), the mailer job
+/// ([`mailer::KIND_SEND`]) and the incoming-activity stub
+/// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)), so
+/// the worker idles, sweeps, delivers, sends and drains received
+/// activities. The state's mail transport comes from
 /// [`mailer::transport_from_config`]: the SMTP relay when `SMTP_HOST` is
 /// set, the disabled stand-in while it is not. Alongside it, a spawned
 /// [`scheduler::run`] task enqueues the [`scheduler::periodic_jobs`]
@@ -152,6 +154,10 @@ fn job_registry() -> JobRegistry {
     registry.register(streaming::hub::KIND_CLEANUP, streaming::hub::handle_cleanup);
     registry.register(jobs::mutes::KIND_EXPIRE, jobs::mutes::handle_expire);
     registry.register(mailer::KIND_SEND, mailer::handle);
+    registry.register(
+        federation::dispatch::KIND_INCOMING,
+        federation::dispatch::handle,
+    );
     registry
 }
 
