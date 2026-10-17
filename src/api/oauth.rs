@@ -29,10 +29,13 @@
 //! requested scopes (default `read`) must fit inside the application's
 //! registration, and the user logs in with nickname or email and a
 //! password. Unknown apps, unknown users and wrong secrets or passwords
-//! all answer the same 400 "Invalid credentials" (Pleroma's way); a
-//! deactivated account instead gets its distinct 403
-//! "`account_is_disabled`", checked by `check_account_ready`, where the
-//! later approval/confirmation/MFA tickets join.
+//! all answer the same 400 "Invalid credentials" (Pleroma's way); an
+//! account that is not ready to log in instead gets its distinct 403 from
+//! `check_account_ready`, with the machine-readable identifier Pleroma
+//! names the refusal by: `account_is_disabled` for a deactivated account,
+//! `awaiting_approval` while staff have not approved it
+//! (`REGISTRATIONS_APPROVAL_REQUIRED`) and `missing_confirmed_email` while
+//! its address is not (`ACCOUNT_ACTIVATION_REQUIRED`).
 //!
 //! The endpoint serves `/oauth/token`, outside `/api` (decision 1), and
 //! [`crate::app`] merges this router at the top level. Per RFC 6749 §5.1
@@ -70,12 +73,13 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq as _;
 
 use crate::{
+    auth::{AWAITING_APPROVAL, AWAITING_APPROVAL_ID, EMAIL_UNCONFIRMED, EMAIL_UNCONFIRMED_ID},
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
         oauth_app::{self, OauthApp},
         oauth_token::{self, NewToken, OauthToken},
-        user::{self, User, register},
+        user::{self, AccountStatus, User, register},
     },
     oauth::scopes::Scopes,
     state::AppState,
@@ -215,11 +219,14 @@ async fn client_credentials_grant(
 /// authenticates exactly like on `/oauth/revoke` (body fields or HTTP
 /// Basic); the presented refresh token must name a row issued to that
 /// same app, owned by an active account — every failure answers the
-/// shared 400 [`INVALID_CREDENTIALS`]. The replacement carries the same
-/// user and scopes and is minted before the old row goes, so the old
-/// access and refresh tokens stop working at the answer. No expiry is
-/// applied to the old row: refreshing is precisely what a client does
-/// after its access token has lapsed.
+/// shared 400 [`INVALID_CREDENTIALS`]. An account that is active but not
+/// ready to log in — still awaiting approval, or still unconfirmed — gets
+/// [`check_account_ready`]'s 403 with its identifier instead: rotating a
+/// pair is a login, and the registration modes gate it like the password
+/// grant. The replacement carries the same user and scopes and is minted
+/// before the old row goes, so the old access and refresh tokens stop
+/// working at the answer. No expiry is applied to the old row: refreshing
+/// is precisely what a client does after its access token has lapsed.
 async fn refresh_token_grant(
     state: &AppState,
     headers: &HeaderMap,
@@ -236,6 +243,7 @@ async fn refresh_token_grant(
     let owner = active_owner(&state.db, &old)
         .await?
         .ok_or_else(invalid_credentials)?;
+    check_account_ready(&owner)?;
     let fresh = issue_token(state, Some(&owner), &app, Scopes::parse(&old.scopes)).await?;
     oauth_token::delete_token(&state.db, old.id).await?;
     Ok(Json(TokenResponse::new(fresh, Some(&owner))))
@@ -244,7 +252,10 @@ async fn refresh_token_grant(
 /// The active user behind `token`: `None` when the row is app-only
 /// (`user_id = NULL`, so it never had a refreshable pair), its user was
 /// deleted out from under it, or the account is deactivated — a
-/// suspended account cannot rotate its tokens.
+/// suspended account cannot rotate its tokens. The readiness the
+/// *registration modes* add is checked after this, by
+/// [`check_account_ready`], so a pending account keeps the shared 400 for
+/// a deactivated one and gets its own 403 identifier otherwise.
 ///
 /// # Errors
 ///
@@ -438,23 +449,38 @@ async fn authenticate_user(pool: &PgPool, params: &TokenParams) -> AppResult<Use
         .ok_or_else(invalid_credentials)
 }
 
-/// Whether an authenticated account may receive a token right now. Today
-/// that is the deactivated check alone (Pleroma's `User.account_status`,
-/// applied by `do_create_authorization`); the approval, confirmation and
-/// MFA checks join here in later tickets.
+/// Whether an authenticated account may receive a token right now: Pleroma's
+/// `User.account_status` (`lib/pleroma/user.ex`) reduced to the three states
+/// this server tracks, weighed in its order — deactivated, then awaiting
+/// approval, then awaiting email confirmation. The MFA check Pleroma runs
+/// after these arrives with its own ticket.
+///
+/// [`crate::api::oauth_external`] and the `POST /oauth/authorize` submission
+/// gate their logins through here too, and [`crate::auth`] answers an
+/// approval-pending account's still-live bearer token with the same refusal.
 ///
 /// # Errors
 ///
 /// 403 [`ACCOUNT_DISABLED`] with identifier [`ACCOUNT_IS_DISABLED`] for a
-/// deactivated account.
+/// deactivated account, 403 [`AWAITING_APPROVAL`] with
+/// [`AWAITING_APPROVAL_ID`] for one staff have not approved, and 403
+/// [`EMAIL_UNCONFIRMED`] with [`EMAIL_UNCONFIRMED_ID`] for one whose address
+/// is not confirmed.
 pub(crate) fn check_account_ready(user: &User) -> Result<(), AppError> {
-    if user.is_active.get() {
-        Ok(())
-    } else {
-        Err(AppError::forbidden_with_identifier(
+    match user.account_status() {
+        AccountStatus::Active => Ok(()),
+        AccountStatus::Deactivated => Err(AppError::forbidden_with_identifier(
             ACCOUNT_DISABLED,
             ACCOUNT_IS_DISABLED,
-        ))
+        )),
+        AccountStatus::ApprovalPending => Err(AppError::forbidden_with_identifier(
+            AWAITING_APPROVAL,
+            AWAITING_APPROVAL_ID,
+        )),
+        AccountStatus::ConfirmationPending => Err(AppError::forbidden_with_identifier(
+            EMAIL_UNCONFIRMED,
+            EMAIL_UNCONFIRMED_ID,
+        )),
     }
 }
 
@@ -754,6 +780,8 @@ mod tests {
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
             registration_reason: None,
+            confirmation_token: None,
+            confirmation_sent_at: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,
@@ -969,6 +997,57 @@ mod tests {
         };
         assert_eq!(message, ACCOUNT_DISABLED, "Pleroma's wording");
         assert_eq!(identifier, &ACCOUNT_IS_DISABLED, "and its reason code");
+    }
+
+    /// `user_row` with the three account-status flags set as named: the
+    /// fixture behind the registration-mode arms of the gate.
+    fn user_with(active: bool, approval_pending: Flag, email_confirmed: Flag) -> User {
+        let mut user = user_row(active);
+        user.approval_pending = approval_pending;
+        user.email_confirmed = email_confirmed;
+        user
+    }
+
+    /// The refusal [`check_account_ready`] answers with, both halves of it.
+    fn refusal_of(user: &User) -> (String, &'static str) {
+        let err = check_account_ready(user).expect_err("the account is not ready");
+        let AppError::ForbiddenWithIdentifier(message, identifier) = err else {
+            panic!("the refusal must carry an identifier, got {err}")
+        };
+        (message, identifier)
+    }
+
+    #[test]
+    fn an_unapproved_account_is_refused_with_its_identifier() {
+        let (message, identifier) = refusal_of(&user_with(true, Flag::new(true), Flag::new(true)));
+        assert_eq!(message, AWAITING_APPROVAL, "Pleroma's wording");
+        assert_eq!(identifier, AWAITING_APPROVAL_ID, "and its reason code");
+    }
+
+    #[test]
+    fn an_unconfirmed_account_is_refused_with_its_identifier() {
+        let (message, identifier) =
+            refusal_of(&user_with(true, Flag::new(false), Flag::new(false)));
+        assert_eq!(message, EMAIL_UNCONFIRMED, "Pleroma's wording");
+        assert_eq!(identifier, EMAIL_UNCONFIRMED_ID, "and its reason code");
+    }
+
+    #[test]
+    fn the_readiness_gate_weighs_deactivation_then_approval_then_confirmation() {
+        // Pleroma's `User.account_status` order: the first arm that matches
+        // is the answer, so the refusals nest.
+        let (_, identifier) = refusal_of(&user_with(false, Flag::new(true), Flag::new(false)));
+        assert_eq!(
+            identifier, ACCOUNT_IS_DISABLED,
+            "a deactivated account says disabled whatever else waits"
+        );
+        let (_, reason) = refusal_of(&user_with(true, Flag::new(true), Flag::new(false)));
+        assert_eq!(
+            reason, AWAITING_APPROVAL_ID,
+            "approval is reported before the mailbox is checked"
+        );
+        check_account_ready(&user_with(true, Flag::new(false), Flag::new(true)))
+            .expect("approved and confirmed");
     }
 
     #[test]

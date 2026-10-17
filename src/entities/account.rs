@@ -914,6 +914,8 @@ mod tests {
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
             registration_reason: None,
+            confirmation_token: None,
+            confirmation_sent_at: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,

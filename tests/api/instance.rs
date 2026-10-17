@@ -490,7 +490,7 @@ async fn identity_fields_mirror_the_config() {
     );
     assert_eq!(
         document["approval_required"], false,
-        "until the registration-modes ticket, never required"
+        "REGISTRATIONS_APPROVAL_REQUIRED is off by default"
     );
     assert_eq!(
         document["invites_enabled"], true,

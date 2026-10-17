@@ -454,9 +454,8 @@ struct Instance {
     languages: Vec<String>,
     /// Whether anyone may register (`REGISTRATIONS_OPEN`).
     registrations: Toggle,
-    /// Whether registration needs approval; wired-be has no approval
-    /// mode yet, so `false` until the registration-modes ticket updates
-    /// it (Pleroma's `account_approval_required` default).
+    /// Whether registration needs staff approval
+    /// (`REGISTRATIONS_APPROVAL_REQUIRED`).
     approval_required: bool,
     /// Whether registration invites exist (`INVITES_ENABLED`).
     invites_enabled: bool,
@@ -517,7 +516,7 @@ impl Instance {
             thumbnail: format!("{}{THUMBNAIL_PATH}", config.base_url),
             languages: config.instance_languages.clone(),
             registrations: config.registrations_open,
-            approval_required: false,
+            approval_required: config.registrations_approval_required.get(),
             invites_enabled: config.invites_enabled.get(),
             contact_account: contact.map(|user| Account::from_user(user, config)),
             rules: rules.iter().map(Rule::from_model).collect(),
@@ -530,7 +529,7 @@ impl Instance {
             banner_upload_limit: BANNER_UPLOAD_LIMIT,
             description_limit: DESCRIPTION_LIMIT,
             configuration: Configuration::for_config(config),
-            pleroma: PleromaBlock::pleroma(),
+            pleroma: PleromaBlock::pleroma(config),
         }
     }
 }
@@ -731,10 +730,11 @@ struct PleromaBlock {
 
 impl PleromaBlock {
     /// The block of a plain public instance: the shared capability lists,
-    /// no push key, and the zeroed extra counters.
-    fn pleroma() -> Self {
+    /// no push key, the zeroed extra counters, and `config`'s registration
+    /// modes.
+    fn pleroma(config: &Config) -> Self {
         Self {
-            metadata: PleromaMetadata::build(),
+            metadata: PleromaMetadata::build(config),
             stats: PleromaStats {
                 mau: MONTHLY_ACTIVE_USERS,
             },
@@ -756,8 +756,8 @@ struct PleromaStats {
 /// key order.
 #[derive(Debug, Serialize)]
 struct PleromaMetadata {
-    /// Whether a new account needs activation before it works;
-    /// wired-be activates on registration (Pleroma's default).
+    /// Whether a new account must confirm its email before it works
+    /// (`ACCOUNT_ACTIVATION_REQUIRED`).
     account_activation_required: bool,
     /// Whether registration must state a birthday; it need not.
     birthday_required: bool,
@@ -781,10 +781,11 @@ struct PleromaMetadata {
 
 impl PleromaMetadata {
     /// The metadata of a plain public instance: the shared feature and
-    /// access lists, no moderation filters, Pleroma's shipped limits.
-    fn build() -> Self {
+    /// access lists, no moderation filters, Pleroma's shipped limits, and
+    /// `config`'s activation mode.
+    fn build(config: &Config) -> Self {
         Self {
-            account_activation_required: false,
+            account_activation_required: config.account_activation_required.get(),
             birthday_required: false,
             birthday_min_age: 0,
             features: instance_meta::features(),
@@ -945,7 +946,7 @@ impl InstanceV2 {
             registrations: RegistrationsV2::for_config(config),
             contact: Contact::build(config, contact),
             rules: rules.iter().map(Rule::from_model).collect(),
-            pleroma: PleromaBlock::pleroma(),
+            pleroma: PleromaBlock::pleroma(config),
         }
     }
 }
@@ -1115,9 +1116,8 @@ impl TranslationConfiguration {
 struct RegistrationsV2 {
     /// Whether anyone may register (`REGISTRATIONS_OPEN`).
     enabled: Toggle,
-    /// Whether registration needs approval; wired-be has no approval
-    /// mode yet, so `false` until the registration-modes ticket updates
-    /// it (Pleroma's `account_approval_required` default).
+    /// Whether registration needs staff approval
+    /// (`REGISTRATIONS_APPROVAL_REQUIRED`).
     approval_required: bool,
     /// The text shown on the registration form; `None` renders JSON
     /// `null`, the answer when the instance writes none.
@@ -1133,7 +1133,7 @@ impl RegistrationsV2 {
     const fn for_config(config: &Config) -> Self {
         Self {
             enabled: config.registrations_open,
-            approval_required: false,
+            approval_required: config.registrations_approval_required.get(),
             message: Value::Null,
             url: Value::Null,
         }
@@ -1453,7 +1453,7 @@ mod tests {
         assert_eq!(document["registrations"], true, "open by default");
         assert_eq!(
             document["approval_required"], false,
-            "until the registration ticket"
+            "REGISTRATIONS_APPROVAL_REQUIRED is off by default"
         );
         assert_eq!(
             document["invites_enabled"], false,
@@ -1487,6 +1487,42 @@ mod tests {
         config.invites_enabled = Toggle::new(false);
         let off = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
         assert_eq!(off["invites_enabled"], false, "and the off state stays off");
+    }
+
+    /// The two registration modes are the two settings, in all three places
+    /// they are advertised: `approval_required` on `GET /api/v1/instance`,
+    /// `registrations.approval_required` on `/api/v2/instance` and
+    /// `pleroma.metadata.account_activation_required` on both documents.
+    #[test]
+    fn registration_modes_mirror_the_config() {
+        let stats = InstanceStats {
+            users: 0,
+            statuses: 0,
+            domains: 0,
+        };
+        let mut config = Config::for_tests();
+        for (approval, activation) in [(false, false), (true, false), (false, true), (true, true)] {
+            config.registrations_approval_required = Toggle::new(approval);
+            config.account_activation_required = Toggle::new(activation);
+            let v1 = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
+            let v2 = serde_json::to_value(InstanceV2::build(&config, &[], None)).unwrap();
+            assert_eq!(
+                v1["approval_required"], approval,
+                "v1 approval_required follows REGISTRATIONS_APPROVAL_REQUIRED={approval}"
+            );
+            assert_eq!(
+                v1["pleroma"]["metadata"]["account_activation_required"], activation,
+                "v1 metadata follows ACCOUNT_ACTIVATION_REQUIRED={activation}"
+            );
+            assert_eq!(
+                v2["registrations"]["approval_required"], approval,
+                "v2 follows the approval setting too"
+            );
+            assert_eq!(
+                v2["pleroma"]["metadata"]["account_activation_required"], activation,
+                "and the shared pleroma block reports activation on v2"
+            );
+        }
     }
 
     #[test]

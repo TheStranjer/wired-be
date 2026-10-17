@@ -1,10 +1,11 @@
 //! Pleroma's account extensions under `/api/v1/pleroma`
-//! (`docs/ARCHITECTURE.md` decision 1): the subscription toggles and the
-//! caller's own unanswered follow asks.
+//! (`docs/ARCHITECTURE.md` decision 1): the subscription toggles, the
+//! caller's own unanswered follow asks, and the confirmation resend.
 //!
 //! The reference is Pleroma's `PleromaAPI.AccountController`
 //! (`lib/pleroma/web/pleroma_api/controllers/account_controller.ex`, the
-//! `subscribe` and `unsubscribe` actions) and `PleromaAPI.FollowRequestController`
+//! `subscribe`, `unsubscribe` and `confirmation_resend` actions) and
+//! `PleromaAPI.FollowRequestController`
 //! (`lib/pleroma/web/pleroma_api/controllers/follow_request_controller.ex`,
 //! the `outgoing` action). What a subscription *is* on this server stays
 //! behind [`crate::models::follow`]: Pleroma's `subscribe` sets the
@@ -13,7 +14,8 @@
 //! `subscribing` flags of [`Relationship`] are read from, so
 //! [`set_notify`] is the one write all three endpoints share.
 //!
-//! All three routes require a user token ([`AuthUser`]).
+//! The three subscription and listing routes require a user token
+//! ([`AuthUser`]).
 //!
 //! - `POST /api/v1/pleroma/accounts/{id}/subscribe` and `…/unsubscribe`
 //!   need either the `follow` root or `write:follows` (Pleroma's scopes plug
@@ -34,6 +36,12 @@
 //!   cursors are [`Follow::id`](crate::models::follow::Follow::id), as
 //!   Pleroma's are), with Pleroma's global page sizes (default 20, at most
 //!   40). The queue is the caller's own, so no privacy check is needed.
+//! - `POST /api/v1/pleroma/accounts/confirmation_resend` is the one route
+//!   here with no credential at all: an account that cannot log in is the
+//!   only one that needs its confirmation letter again. It reads `email`,
+//!   re-mails the local account that is still unconfirmed (and nothing for
+//!   any other request, including the ones naming no address), and answers
+//!   204 with an empty body always — see `confirmation_resend`.
 //!
 //! [`Relationship`]: crate::entities::relationship::Relationship
 //! [`set_notify`]: crate::models::follow::set_notify
@@ -41,9 +49,10 @@
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use serde::Deserialize;
 use tracing::debug;
 
 use crate::{
@@ -54,7 +63,11 @@ use crate::{
         relationship::Relationship,
     },
     error::{AppError, AppResult},
-    models::{follow, user::User},
+    extract::ApiBody,
+    models::{
+        follow,
+        user::{User, confirmation},
+    },
     oauth::scopes::{FOLLOW, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
     state::AppState,
@@ -76,7 +89,67 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/pleroma/accounts/{id}/subscribe", post(subscribe))
         .route("/pleroma/accounts/{id}/unsubscribe", post(unsubscribe))
+        .route(
+            "/pleroma/accounts/confirmation_resend",
+            post(confirmation_resend),
+        )
         .route("/pleroma/outgoing_follow_requests", get(outgoing))
+}
+
+/// The request parameters of `POST /api/v1/pleroma/accounts/confirmation_resend`:
+/// Pleroma's `User.get_by_nickname_or_email` accepts either spelling, and
+/// this ticket's parameter list names the address, so `email` is the only
+/// key read — and it is optional, because its absence is the same 204 every
+/// other refusal answers.
+#[derive(Debug, Deserialize)]
+struct ConfirmationResendParams {
+    /// The address to re-mail, `None` when the body carried none.
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// `POST /api/v1/pleroma/accounts/confirmation_resend` — send the
+/// confirmation letter again to the account whose `email` is still
+/// unconfirmed (Pleroma's `PleromaAPI.AccountController.confirmation_resend`,
+/// `lib/pleroma/web/pleroma_api/controllers/account_controller.ex`).
+///
+/// No credential is asked for — the caller cannot log in yet, which is the
+/// whole reason the letter is owed — and the answer is 204 with an empty
+/// body whether or not anything was sent, so the endpoint cannot be used to
+/// probe which addresses are registered here. When an unconfirmed account
+/// does own the address, [`send`] replaces its token with a freshly minted
+/// one — the old link stops working — and queues the letter carrying it.
+///
+/// Pleroma runs this action through its `account_confirmation_resend`
+/// throttle bucket (`config/config.exs`); this server has no rate limiter
+/// yet, and the ticket that adds one registers the route under that bucket
+/// name.
+///
+/// [`send`]: crate::models::user::confirmation::send
+///
+/// # Errors
+///
+/// Any database or job-queue failure arrives through `?` as
+/// [`AppError::Database`]; the body shape [`ApiBody`] accepts is the only
+/// other refusal, and it leaks nothing about the address.
+async fn confirmation_resend(
+    State(state): State<AppState>,
+    ApiBody(params): ApiBody<ConfirmationResendParams>,
+) -> AppResult<StatusCode> {
+    let Some(email) = params
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let Some(user) = confirmation::unconfirmed_by_email(&state.db, email).await? else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    confirmation::send(&state, &user).await?;
+    debug!(account = %user.id, "resent the confirmation letter");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/v1/pleroma/accounts/{id}/subscribe` — turn notifications on for

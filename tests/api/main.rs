@@ -27,6 +27,10 @@ mod account_notes;
 /// invite tokens alike.
 mod account_registration;
 
+/// The registration modes over HTTP: approval required, email confirmation,
+/// the confirmation link, the resend, and the instance flags they drive.
+mod registration_modes;
+
 /// The core account endpoints: `verify_credentials`, `GET /accounts/{id}` and `lookup`.
 mod accounts;
 

@@ -96,6 +96,16 @@ pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
 /// substitute for open registrations on `POST /api/v1/accounts`; the
 /// instance endpoints report it as `invites_enabled`.
 pub const INVITES_ENABLED_VAR: &str = "INVITES_ENABLED";
+/// Environment variable holding whether a new account waits for staff
+/// approval before it may log in; the instance endpoints report it as
+/// `approval_required`.
+pub const REGISTRATIONS_APPROVAL_REQUIRED_VAR: &str = "REGISTRATIONS_APPROVAL_REQUIRED";
+/// Environment variable holding whether a new account must confirm its
+/// email address before it may log in.
+///
+/// The instance endpoints report it as `account_activation_required` and
+/// `NodeInfo` as `accountActivationRequired`.
+pub const ACCOUNT_ACTIVATION_REQUIRED_VAR: &str = "ACCOUNT_ACTIVATION_REQUIRED";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
@@ -273,6 +283,19 @@ pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
 /// while registrations are closed every registration attempt is refused —
 /// accepting invite tokens is an explicit operator decision.
 pub const DEFAULT_INVITES_ENABLED: bool = false;
+/// Approval state used when `REGISTRATIONS_APPROVAL_REQUIRED` is unset:
+/// nobody waits for staff.
+///
+/// Matches Pleroma's `[:instance, :account_approval_required]` `false`
+/// default — requiring approval is an explicit operator decision.
+pub const DEFAULT_REGISTRATIONS_APPROVAL_REQUIRED: bool = false;
+/// Activation state used when `ACCOUNT_ACTIVATION_REQUIRED` is unset: a new
+/// account works without confirming its email.
+///
+/// Matches Pleroma's `[:instance, :account_activation_required]` `false`
+/// default — making confirmation a condition of logging in is an explicit
+/// operator decision.
+pub const DEFAULT_ACCOUNT_ACTIVATION_REQUIRED: bool = false;
 /// The provider list used when `OAUTH_PROVIDERS` is unset: no external
 /// login provider is configured, so `GET /oauth/prepare_request` and the
 /// provider endpoints answer their errors for every name.
@@ -619,6 +642,23 @@ pub struct Config {
     /// [`crate::models::invite_token`]). The instance endpoints report the
     /// state as `invites_enabled`, `NodeInfo` as `invitesEnabled`.
     pub invites_enabled: Toggle,
+    /// Whether a new local account waits for staff approval before it may
+    /// log in, from `REGISTRATIONS_APPROVAL_REQUIRED`: `POST
+    /// /api/v1/accounts` then registers the account with
+    /// [`approval_pending`](crate::models::user::User::approval_pending) set
+    /// and answers without a token (see [`crate::api::accounts`]). A
+    /// registration that came in on an invite token skips the wait. The
+    /// instance endpoints report the state as `approval_required`.
+    pub registrations_approval_required: Toggle,
+    /// Whether a new local account has to confirm its email address before
+    /// it may log in, from `ACCOUNT_ACTIVATION_REQUIRED`: `POST
+    /// /api/v1/accounts` then registers the account unconfirmed with a fresh
+    /// [`confirmation_token`](crate::models::user::User::confirmation_token),
+    /// queues the confirmation email and answers without a token (see
+    /// [`crate::api::accounts`]). `GET /api/v1/instance` reports the state
+    /// as `account_activation_required`, `NodeInfo` as
+    /// `accountActivationRequired`.
+    pub account_activation_required: Toggle,
     /// The external OAuth login providers, from `OAUTH_PROVIDERS`; empty
     /// when none is configured. Each one answers the `/oauth` provider
     /// endpoints under its own name (see [`crate::api::oauth_external`]).
@@ -690,14 +730,7 @@ impl Config {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let database_url = lookup(DATABASE_URL_VAR)
-            .filter(|url| !url.is_empty())
-            .ok_or(ConfigError::Missing(DATABASE_URL_VAR))?;
-        let bind_addr = lookup(BIND_ADDR_VAR)
-            .as_deref()
-            .unwrap_or(DEFAULT_BIND_ADDR)
-            .parse()
-            .map_err(ConfigError::InvalidBindAddr)?;
+        let (database_url, bind_addr) = endpoints(&lookup)?;
         let base_url_raw = lookup(BASE_URL_VAR)
             .filter(|url| !url.is_empty())
             .ok_or(ConfigError::Missing(BASE_URL_VAR))?;
@@ -717,6 +750,8 @@ impl Config {
             auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (registrations_open, invites_enabled, available_frontends) = client_exposure(&lookup)?;
+        let (registrations_approval_required, account_activation_required) =
+            registration_modes(&lookup)?;
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
         let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
             mailer_settings(&lookup, domain_of(&base_url))?;
@@ -754,6 +789,8 @@ impl Config {
             healthcheck_enabled,
             registrations_open,
             invites_enabled,
+            registrations_approval_required,
+            account_activation_required,
             oauth_providers,
             available_frontends,
             job_concurrency,
@@ -859,6 +896,8 @@ impl Config {
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
             invites_enabled: Toggle::new(DEFAULT_INVITES_ENABLED),
+            registrations_approval_required: Toggle::new(DEFAULT_REGISTRATIONS_APPROVAL_REQUIRED),
+            account_activation_required: Toggle::new(DEFAULT_ACCOUNT_ACTIVATION_REQUIRED),
             oauth_providers: Vec::new(),
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
@@ -907,6 +946,32 @@ fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
         .port()
         .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
     Ok(format!("{}://{domain}", url.scheme()))
+}
+
+/// Reads the two settings that say where the process itself is reached: the
+/// database URL it connects to and the socket address it listens on.
+/// Grouped because each is a few lines of its own and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
+/// back in [`Config`] field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Missing`] when `DATABASE_URL` is unset or blank,
+/// and [`ConfigError::InvalidBindAddr`] when `BIND_ADDR` holds something
+/// that is not a socket address.
+fn endpoints<F>(lookup: &F) -> Result<(String, SocketAddr), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let database_url = lookup(DATABASE_URL_VAR)
+        .filter(|url| !url.is_empty())
+        .ok_or(ConfigError::Missing(DATABASE_URL_VAR))?;
+    let bind_addr = lookup(BIND_ADDR_VAR)
+        .as_deref()
+        .unwrap_or(DEFAULT_BIND_ADDR)
+        .parse()
+        .map_err(ConfigError::InvalidBindAddr)?;
+    Ok((database_url, bind_addr))
 }
 
 /// What [`instance_profile`] reads, in [`Config`] field order: the display
@@ -1318,6 +1383,41 @@ where
     Ok((registrations_open, invites_enabled, available_frontends))
 }
 
+/// The two registration-mode toggles [`registration_modes`] reads, in
+/// [`Config`] field order; factored out because a pair of same-typed
+/// toggles reads better by name than as a tuple.
+type RegistrationModes = (Toggle, Toggle);
+
+/// Reads the two settings that decide what a finished registration means:
+/// whether the new account waits for staff approval (`approval_required` on
+/// the instance endpoints) and whether it has to confirm its email address
+/// (`account_activation_required` and `accountActivationRequired`). Grouped
+/// because each is a plain default-or-parse and [`Config::from_lookup`] has
+/// a size budget (AGENTS.md); the tuple comes back in field order. Both are
+/// enforced by [`create_local_user`](crate::models::user::register::create_local_user)
+/// and reported by the account-status gate of [`crate::api::oauth`].
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when either variable holds a
+/// value that is neither spelling.
+fn registration_modes<F>(lookup: &F) -> Result<RegistrationModes, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let approvals = boolean(
+        lookup,
+        REGISTRATIONS_APPROVAL_REQUIRED_VAR,
+        DEFAULT_REGISTRATIONS_APPROVAL_REQUIRED,
+    )?;
+    let activation = boolean(
+        lookup,
+        ACCOUNT_ACTIVATION_REQUIRED_VAR,
+        DEFAULT_ACCOUNT_ACTIVATION_REQUIRED,
+    )?;
+    Ok((approvals.into(), activation.into()))
+}
+
 /// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login
 /// provider array, [`DEFAULT_OAUTH_PROVIDERS`] when the variable is unset
 /// or blank.
@@ -1462,6 +1562,14 @@ impl fmt::Debug for Config {
             .field("healthcheck_enabled", &self.healthcheck_enabled)
             .field("registrations_open", &self.registrations_open)
             .field("invites_enabled", &self.invites_enabled)
+            .field(
+                "registrations_approval_required",
+                &self.registrations_approval_required,
+            )
+            .field(
+                "account_activation_required",
+                &self.account_activation_required,
+            )
             .field("oauth_providers", &self.oauth_providers)
             .field("available_frontends", &self.available_frontends)
             .field("job_concurrency", &self.job_concurrency)
@@ -2305,6 +2413,83 @@ mod tests {
         assert!(
             debug.contains("invites_enabled: Toggle(true)"),
             "the invite toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    /// Both registration modes are off until the operator says otherwise:
+    /// a plain instance registers and logs in without approval or an email
+    /// confirmation.
+    #[test]
+    fn registration_modes_are_off_by_default() {
+        let config = config_with(&[]);
+        assert!(
+            !config.registrations_approval_required.get(),
+            "approval is not required by default"
+        );
+        assert!(
+            !config.account_activation_required.get(),
+            "email confirmation is not required by default"
+        );
+    }
+
+    #[test]
+    fn registration_mode_toggles_parse_booleans() {
+        for var in [
+            REGISTRATIONS_APPROVAL_REQUIRED_VAR,
+            ACCOUNT_ACTIVATION_REQUIRED_VAR,
+        ] {
+            for (value, want) in [
+                ("true", true),
+                ("TRUE", true),
+                (" 1 ", true),
+                ("false", false),
+                ("FaLsE", false),
+                ("0", false),
+                ("", false),
+            ] {
+                let config = config_with(&[(var, value)]);
+                let got = match var {
+                    REGISTRATIONS_APPROVAL_REQUIRED_VAR => config.registrations_approval_required,
+                    _ => config.account_activation_required,
+                };
+                assert_eq!(got.get(), want, "{var}={value:?} means {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_registration_modes_are_errors() {
+        for var in [
+            REGISTRATIONS_APPROVAL_REQUIRED_VAR,
+            ACCOUNT_ACTIVATION_REQUIRED_VAR,
+        ] {
+            let err = try_config_with(&[(var, "maybe")]).unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::InvalidBoolean(var),
+                "error variant for {var}"
+            );
+            assert!(
+                err.to_string().starts_with(&format!("invalid {var}: ")),
+                "message names the variable"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_shows_the_registration_modes() {
+        let config = config_with(&[
+            (REGISTRATIONS_APPROVAL_REQUIRED_VAR, "true"),
+            (ACCOUNT_ACTIVATION_REQUIRED_VAR, "true"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("registrations_approval_required: Toggle(true)"),
+            "the approval toggle is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("account_activation_required: Toggle(true)"),
+            "the activation toggle is visible in Debug output: {debug}"
         );
     }
 
