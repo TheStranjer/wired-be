@@ -179,7 +179,7 @@ async fn wait_for_ctrl_c() {
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the ten that
+/// The [`api`] routers are merged under their prefixes; the routers that
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
 /// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
 /// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/users/{nickname}`
@@ -187,8 +187,10 @@ async fn wait_for_ctrl_c() {
 /// `/tags/{tag}` ([`api::feeds`]), `/.well-known` ([`api::well_known`]),
 /// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
-/// ([`api::oauth_external`]) and the `MongooseIM` auth endpoints plus
-/// `/manifest.json` ([`api::misc`]) — are merged at the top level. Paths
+/// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
+/// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
+/// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
+/// top level. Paths
 /// no route matches get the standard JSON error response (decision 8).
 ///
 /// `state` is handed to [`api::router`] and [`api::oauth::router`] before
@@ -206,6 +208,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::feeds::router())
             .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())
+            .merge(api::password_reset::auth_router(&state))
             .merge(api::well_known::router())
             .merge(api::nodeinfo::router())
             .merge(media_files::router())
@@ -1336,6 +1339,125 @@ mod tests {
                     ),
                 ],
                 "both ends are accounts, and deleting either takes the dismissal"
+            );
+        }
+
+        /// The password-reset migration (WBE-135) creates the token table
+        /// `src/models/password_reset.rs` reads and writes: the minted
+        /// `uuid` key, the unique secret text, the cascading account
+        /// foreign key, the `false`-defaulted spend flag and the
+        /// `now()`-stamped issue time the TTL counts from.
+        #[tokio::test]
+        async fn password_reset_tokens_migration_creates_the_token_table() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let columns: Vec<StateColumn> = sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'password_reset_tokens'
+               ORDER BY ordinal_position",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                described_of(columns),
+                vec![
+                    ("id".to_owned(), "uuid".to_owned(), "NO".to_owned(), None),
+                    ("token".to_owned(), "text".to_owned(), "NO".to_owned(), None),
+                    (
+                        "user_id".to_owned(),
+                        "uuid".to_owned(),
+                        "NO".to_owned(),
+                        None
+                    ),
+                    (
+                        "used".to_owned(),
+                        "boolean".to_owned(),
+                        "NO".to_owned(),
+                        Some("false".to_owned())
+                    ),
+                    (
+                        "inserted_at".to_owned(),
+                        "timestamp with time zone".to_owned(),
+                        "NO".to_owned(),
+                        Some("now()".to_owned())
+                    ),
+                ],
+                "the ticket's five columns, in the ticket's order"
+            );
+
+            let (key, key_columns): (String, String) = sqlx::query_as(
+                "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'password_reset_tokens'
+             GROUP BY con.conname",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(key_columns, "id", "the id alone is the key {key}");
+
+            let uniques: Vec<String> = sqlx::query_scalar(
+                "SELECT con.conname
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'u' AND cls.relname = 'password_reset_tokens'
+                    AND att.attname = 'token'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                uniques,
+                vec!["password_reset_tokens_token_key".to_owned()],
+                "the secret text is the unique lookup key"
+            );
+
+            let (foreign, action, target): (String, String, String) = sqlx::query_as(
+                "SELECT con.conname, con.confdeltype::text, conf.relname
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_class conf ON conf.oid = con.confrelid
+                  WHERE con.contype = 'f'
+                    AND cls.relname = 'password_reset_tokens'
+                    AND con.conname = 'password_reset_tokens_user_id_fkey'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(action, "c", "{foreign} deletes with the account");
+            assert_eq!(target, "users", "{foreign} points at users");
+        }
+
+        /// The same migration adds `password_reset_pending` to `users`: a
+        /// `NOT NULL` `boolean` defaulted to `false`, the login gate
+        /// `check_account_ready` reads (the admin force-reset flow that
+        /// sets it true is a later ticket).
+        #[tokio::test]
+        async fn password_reset_tokens_migration_adds_the_pending_flag() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let (pending_type, pending_null, pending_default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'users'
+                        AND column_name = 'password_reset_pending'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(pending_type, "boolean", "the login gate is a flag");
+            assert_eq!(pending_null, "NO", "every account answers it");
+            assert_eq!(
+                pending_default.as_deref(),
+                Some("false"),
+                "and nothing starts pending: {pending_default:?}"
             );
         }
     }

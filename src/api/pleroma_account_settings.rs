@@ -567,6 +567,7 @@ mod tests {
             mfa_settings: user::mfa::MfaSettings::default_value(),
             preferred_frontend: None,
             is_suggested: user::Flag::new(false),
+            password_reset_pending: user::Flag::new(false),
         }
     }
 

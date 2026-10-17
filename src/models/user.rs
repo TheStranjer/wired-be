@@ -253,6 +253,11 @@ pub struct User {
     /// (Pleroma's `is_suggested`). Nothing here sets it: the admin API
     /// (a later ticket) is the writer.
     pub is_suggested: Flag,
+    /// Whether the account must change its password before it may log in
+    /// again (Pleroma's `password_reset_pending`): the admin force-reset
+    /// flow (a later ticket) sets it, and completing a password reset
+    /// clears it again. `check_account_ready` refuses a pending account.
+    pub password_reset_pending: Flag,
 }
 
 /// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
@@ -326,6 +331,7 @@ impl fmt::Debug for User {
             .field("mfa_settings", &"<redacted>")
             .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
+            .field("password_reset_pending", &self.password_reset_pending)
             .finish()
     }
 }
@@ -470,6 +476,10 @@ pub struct NewUser {
     /// because only an admin puts it there (the admin API is a later
     /// ticket).
     pub is_suggested: Flag,
+    /// Whether the account must reset its password before logging in;
+    /// `false` by default, because only the admin force-reset flow (a
+    /// later ticket) puts an account in that state.
+    pub password_reset_pending: Flag,
 }
 
 /// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
@@ -540,6 +550,7 @@ impl fmt::Debug for NewUser {
             .field("mfa_settings", &"<redacted>")
             .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
+            .field("password_reset_pending", &self.password_reset_pending)
             .finish()
     }
 }
@@ -611,6 +622,7 @@ impl Default for NewUser {
             mfa_settings: mfa::MfaSettings::default_value(),
             preferred_frontend: None,
             is_suggested: Flag::new(false),
+            password_reset_pending: Flag::new(false),
         }
     }
 }
@@ -660,13 +672,14 @@ const INSERT_SQL: &str = "INSERT INTO users (
      also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
-     preferred_frontend, raw_fields, is_suggested, registration_reason
+     preferred_frontend, raw_fields, is_suggested, registration_reason,
+     password_reset_pending
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60, $61, $62, $63
+     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64
 ) RETURNING *";
 
 /// Inserts `new_user` on `executor` — the pool or an open transaction —
@@ -751,6 +764,7 @@ where
         .bind(new_user.raw_fields.clone())
         .bind(new_user.is_suggested)
         .bind(new_user.registration_reason.as_deref())
+        .bind(new_user.password_reset_pending)
         .fetch_one(executor)
         .await?;
     Ok(user)
@@ -819,6 +833,34 @@ pub async fn get_by_email(pool: &PgPool, email: &str) -> AppResult<Option<User>>
         .bind(email)
         .fetch_optional(pool)
         .await?;
+    Ok(user)
+}
+
+/// The `password_reset` lookup: the local, active account whose nickname or
+/// email is exactly `identifier` (citext folds case in both columns).
+///
+/// A remote mirror, a deactivated account and an account with no email to
+/// write to are never a candidate — there is no reset letter to send them
+/// (Pleroma's `Registration.password_reset` matches
+/// `%User{local: true, is_active: true, email: email} when is_binary(email)`).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn find_password_reset_target(
+    pool: &PgPool,
+    identifier: &str,
+) -> AppResult<Option<User>> {
+    let user = sqlx::query_as::<_, User>(
+        "SELECT * FROM users
+          WHERE local AND is_active AND email IS NOT NULL
+            AND (nickname = $1::citext OR email = $1::citext)
+          LIMIT 1",
+    )
+    .bind(identifier)
+    .fetch_optional(pool)
+    .await?;
     Ok(user)
 }
 
@@ -1143,6 +1185,41 @@ pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> 
         .bind(id)
         .bind(frontend)
         .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_password`]: writes the new hash, clears the
+/// pending-reset flag (the account has just proven mailbox control by
+/// completing the flow) and refreshes `updated_at`.
+const SET_PASSWORD_SQL: &str = "UPDATE users
+           SET password_hash = $2,
+               password_reset_pending = false,
+               updated_at = now()
+         WHERE id = $1";
+
+/// Stores `password_hash` as user `id`'s `password_hash` and clears
+/// [`password_reset_pending`](User::password_reset_pending): the write a
+/// completed password reset performs (see
+/// [`crate::models::password_reset`] and [`crate::api::password_reset`]).
+///
+/// Runs on the caller's executor (or any transaction), so the reset
+/// endpoint can land the password, the token spend and the revocations as
+/// one transaction.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_password<'e, E>(executor: E, id: Uuid, password_hash: &str) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(SET_PASSWORD_SQL)
+        .bind(id)
+        .bind(password_hash)
+        .execute(executor)
         .await
         .map(drop)?;
     Ok(())

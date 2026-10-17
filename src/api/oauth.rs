@@ -31,8 +31,10 @@
 //! password. Unknown apps, unknown users and wrong secrets or passwords
 //! all answer the same 400 "Invalid credentials" (Pleroma's way); a
 //! deactivated account instead gets its distinct 403
-//! "`account_is_disabled`", checked by `check_account_ready`, where the
-//! later approval/confirmation/MFA tickets join.
+//! "`account_is_disabled`", and an account on a forced password reset the
+//! 403 "`password_reset_required`", both checked by `check_account_ready`,
+//! where the later approval/confirmation/MFA tickets join (see
+//! [`crate::api::password_reset`]).
 //!
 //! The endpoint serves `/oauth/token`, outside `/api` (decision 1), and
 //! [`crate::app`] merges this router at the top level. Per RFC 6749 §5.1
@@ -70,6 +72,7 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq as _;
 
 use crate::{
+    api::password_reset::{PASSWORD_RESET_REQUIRED, PASSWORD_RESET_REQUIRED_ID},
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
@@ -445,24 +448,32 @@ async fn authenticate_user(pool: &PgPool, params: &TokenParams) -> AppResult<Use
         .ok_or_else(invalid_credentials)
 }
 
-/// Whether an authenticated account may receive a token right now. Today
-/// that is the deactivated check alone (Pleroma's `User.account_status`,
-/// applied by `do_create_authorization`); the approval, confirmation and
-/// MFA checks join here in later tickets.
+/// Whether an authenticated account may receive a token right now: an
+/// active account that is not sitting on a forced password reset (Pleroma's
+/// `User.account_status`, applied by `do_create_authorization` — a
+/// deactivated account is refused first, a pending-reset account next).
+/// The approval and confirmation checks join here in later tickets.
 ///
 /// # Errors
 ///
 /// 403 [`ACCOUNT_DISABLED`] with identifier [`ACCOUNT_IS_DISABLED`] for a
-/// deactivated account.
+/// deactivated account, and 403 [`PASSWORD_RESET_REQUIRED`] with identifier
+/// [`PASSWORD_RESET_REQUIRED_ID`] for an account whose password an admin
+/// forced a reset on (see [`crate::api::password_reset`]).
 pub(crate) fn check_account_ready(user: &User) -> Result<(), AppError> {
-    if user.is_active.get() {
-        Ok(())
-    } else {
-        Err(AppError::forbidden_with_identifier(
+    if !user.is_active.get() {
+        return Err(AppError::forbidden_with_identifier(
             ACCOUNT_DISABLED,
             ACCOUNT_IS_DISABLED,
-        ))
+        ));
     }
+    if user.password_reset_pending.get() {
+        return Err(AppError::forbidden_with_identifier(
+            PASSWORD_RESET_REQUIRED,
+            PASSWORD_RESET_REQUIRED_ID,
+        ));
+    }
+    Ok(())
 }
 
 /// Mints the access/refresh token pair for the granted scopes, valid for
@@ -771,6 +782,7 @@ mod tests {
             updated_at: now,
             preferred_frontend: None,
             is_suggested: Flag::new(false),
+            password_reset_pending: Flag::new(false),
         }
     }
 
@@ -976,6 +988,33 @@ mod tests {
         };
         assert_eq!(message, ACCOUNT_DISABLED, "Pleroma's wording");
         assert_eq!(identifier, &ACCOUNT_IS_DISABLED, "and its reason code");
+    }
+
+    #[test]
+    fn an_account_awaiting_forced_reset_is_refused_with_its_identifier() {
+        let mut user = user_row(true);
+        user.password_reset_pending = Flag::new(true);
+        let err = check_account_ready(&user).expect_err("a pending reset is not ready");
+        let AppError::ForbiddenWithIdentifier(message, identifier) = &err else {
+            panic!("the refusal must carry an identifier, got {err}")
+        };
+        assert_eq!(message, PASSWORD_RESET_REQUIRED, "the ticket's wording");
+        assert_eq!(
+            identifier, &PASSWORD_RESET_REQUIRED_ID,
+            "and its reason code"
+        );
+    }
+
+    #[test]
+    fn deactivation_is_refused_before_a_pending_reset() {
+        // Pleroma's `account_status` matches `is_active: false` first.
+        let mut user = user_row(false);
+        user.password_reset_pending = Flag::new(true);
+        let err = check_account_ready(&user).expect_err("deactivated is not ready");
+        let AppError::ForbiddenWithIdentifier(message, _) = &err else {
+            panic!("the refusal must carry an identifier, got {err}")
+        };
+        assert_eq!(message, ACCOUNT_DISABLED, "the disabled answer wins");
     }
 
     #[test]

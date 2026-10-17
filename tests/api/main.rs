@@ -129,6 +129,9 @@ mod oauth_external;
 /// OAuth token management (`/api/oauth_tokens` and the pleroma apps).
 mod oauth_tokens;
 
+/// Password reset (`/auth/password` and `/api/v1/pleroma/password_reset`).
+mod password_reset;
+
 /// Account aliases and `move_account` (`/api/pleroma`).
 mod pleroma_account_settings;
 
