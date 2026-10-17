@@ -147,6 +147,9 @@ mod remove_from_followers;
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 
+/// The status read endpoints (`GET /api/v1/statuses/{id}` and its batch form).
+mod statuses;
+
 /// The streaming WebSocket (`/api/v1/streaming`) over a real listener.
 mod streaming;
 
