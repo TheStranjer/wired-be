@@ -432,17 +432,25 @@ const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 
 /// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
 ///
-/// `config` is what [`upload_body_limit`] sizes the routes' body limit from:
-/// `update_credentials` takes the three profile images as multipart file
-/// parts, and axum's multipart extractor refuses a body over its 2 MiB
-/// default unless the route raises that — which for an avatar capped at
-/// [`DEFAULT_AVATAR_LIMIT_BYTES`] it must, or a legal upload would never
-/// reach the handler.
+/// [`state.config`](AppState::config) is what [`upload_body_limit`] sizes
+/// the routes' body limit from: `update_credentials` takes the three
+/// profile images as multipart file parts, and axum's multipart extractor
+/// refuses a body over its 2 MiB default unless the route raises that —
+/// which for an avatar capped at [`DEFAULT_AVATAR_LIMIT_BYTES`] it must,
+/// or a legal upload would never reach the handler.
+///
+/// `POST /accounts` runs in the limiter's `app_account_creation` bucket
+/// (Pleroma throttles registration there; see [`crate::rate_limit`]), so
+/// the whole `state` rides along for the middleware layer.
 ///
 /// [`DEFAULT_AVATAR_LIMIT_BYTES`]: crate::config::DEFAULT_AVATAR_LIMIT_BYTES
-pub fn router(config: &Config) -> Router<AppState> {
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .route("/accounts", post(create_account))
+        .route(
+            "/accounts",
+            post(create_account)
+                .layer(crate::rate_limit::rate_limit(state, "app_account_creation")),
+        )
         .route("/accounts/verify_credentials", get(verify_credentials))
         .route(
             "/accounts/update_credentials",
@@ -458,7 +466,7 @@ pub fn router(config: &Config) -> Router<AppState> {
             post(remove_from_followers),
         )
         .route("/accounts/{id}", get(show_account))
-        .layer(upload_body_limit(config))
+        .layer(upload_body_limit(&state.config))
 }
 
 /// The request parameters of `POST /api/v1/accounts`, Pleroma's

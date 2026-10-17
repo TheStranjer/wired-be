@@ -22,11 +22,12 @@
 
 #![cfg(test)]
 
-use std::{path::Path, sync::Arc};
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use axum::{
     Router,
     body::{Body, Bytes},
+    extract::ConnectInfo,
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
     response::Response,
 };
@@ -73,11 +74,36 @@ pub async fn test_db() -> TestDb {
         .expect("a migrated test database slot")
 }
 
-/// The configuration [`test_app`] runs with: `BASE_URL` `https://test.example`,
-/// defaults everywhere else, no environment access.
+/// The configuration [`test_app`] runs with: `BASE_URL`
+/// `https://test.example`, no environment access, and defaults everywhere
+/// else.
+///
+/// That includes `RATE_LIMITS_ENABLED=false`, so a suite never trips a
+/// limiter of its own; tests that want throttling build their own
+/// [`Config`].
 #[must_use]
 pub fn test_config() -> Config {
     Config::for_tests()
+}
+
+/// [`test_config`] with the rate limiter on and `RATE_LIMITS` overridden
+/// to the `bucket=max:window_secs` text, for the throttle tests in
+/// `rate_limit.rs`.
+///
+/// # Panics
+///
+/// Never for the fixed `RATE_LIMITS` texts tests pass; a malformed one is
+/// a bug in the calling test.
+#[must_use]
+pub fn test_config_with_rate_limits(rate_limits: &str) -> Config {
+    Config::from_lookup(|key| match key {
+        wired_be::config::DATABASE_URL_VAR => Some(wired_be::config::TEST_DATABASE_URL.to_owned()),
+        wired_be::config::BASE_URL_VAR => Some(wired_be::config::TEST_BASE_URL.to_owned()),
+        wired_be::config::RATE_LIMITS_ENABLED_VAR => Some("true".to_owned()),
+        wired_be::config::RATE_LIMITS_VAR => Some(rate_limits.to_owned()),
+        _ => None,
+    })
+    .expect("the fixed rate limit test config is valid")
 }
 
 /// [`test_config`] with its uploads moved to `uploads_dir`, for tests that
@@ -161,6 +187,9 @@ pub fn test_app_state(pool: PgPool, config: Config) -> AppState {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        rate_limiter: Arc::new(wired_be::rate_limit::RateLimiter::from_config(
+            config.as_ref(),
+        )),
         mailer: Arc::new(MemoryTransport::new()),
     }
 }
@@ -531,6 +560,8 @@ pub struct TestRequest {
     headers: HeaderMap,
     /// The request body; empty until a body method sets it.
     body: Bytes,
+    /// The socket peer to carry as `ConnectInfo`; `None` sends none.
+    peer: Option<SocketAddr>,
 }
 
 impl TestRequest {
@@ -571,6 +602,7 @@ impl TestRequest {
             path: path.to_owned(),
             headers: HeaderMap::new(),
             body: Bytes::new(),
+            peer: None,
         }
     }
 
@@ -625,6 +657,18 @@ impl TestRequest {
         self.push_header(name, value)
     }
 
+    /// Carries `addr` as the request's `ConnectInfo` socket peer, the way
+    /// `axum::serve` does for a real connection. The rate limiter reads it
+    /// when no proxy header names the client (see
+    /// [`wired_be::rate_limit`]).
+    #[must_use]
+    pub fn peer(self, addr: SocketAddr) -> Self {
+        Self {
+            peer: Some(addr),
+            ..self
+        }
+    }
+
     /// Sets the body to `parts` framed as `multipart/form-data` with
     /// `boundary`, and the `content-type` that announces it, so an upload
     /// endpoint sees exactly what a browser's `FormData` would send.
@@ -669,6 +713,7 @@ impl TestRequest {
             path: self.path,
             headers: self.headers,
             body,
+            peer: self.peer,
         }
     }
 
@@ -681,6 +726,9 @@ impl TestRequest {
     #[must_use]
     pub async fn send(self, app: &Router) -> TestResponse {
         let mut builder = Request::builder().method(self.method).uri(self.path);
+        if let Some(peer) = self.peer {
+            builder = builder.extension(ConnectInfo(peer));
+        }
         for (name, value) in &self.headers {
             builder = builder.header(name.clone(), value.clone());
         }

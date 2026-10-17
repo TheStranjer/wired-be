@@ -129,11 +129,18 @@ const NO_CACHE: &str = "no-cache";
 /// paths are fixed by OAuth (`/oauth/token`, `/oauth/revoke`,
 /// `/oauth/authorize` and the rest in later tickets), not nested under
 /// `/api`.
-pub fn router() -> Router<AppState> {
+///
+/// `POST /oauth/token` and the `/oauth/authorize` half it merges run in
+/// the limiter's `authentication` bucket (Pleroma throttles both paths in
+/// `router.ex`), so `state` is handed to them for the middleware layer.
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .route("/oauth/token", post(token))
+        .route(
+            "/oauth/token",
+            post(token).layer(crate::rate_limit::rate_limit(state, "authentication")),
+        )
         .route("/oauth/revoke", post(revoke))
-        .merge(authorize::router())
+        .merge(authorize::router(state))
 }
 
 /// `POST /oauth/token` — exchange credentials for a bearer token pair.
@@ -1242,6 +1249,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
@@ -1249,7 +1257,8 @@ mod tests {
     #[tokio::test]
     async fn the_route_answers_at_oauth_token() {
         use tower::ServiceExt as _;
-        let app = router().with_state(test_state());
+        let state = test_state();
+        let app = router(&state).with_state(state);
         let request = Request::post("/oauth/token")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
@@ -1272,7 +1281,8 @@ mod tests {
     #[tokio::test]
     async fn the_revoke_route_answers_at_oauth_revoke() {
         use tower::ServiceExt as _;
-        let app = router().with_state(test_state());
+        let state = test_state();
+        let app = router(&state).with_state(state);
         let request = Request::post("/oauth/revoke")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(

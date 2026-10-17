@@ -354,10 +354,10 @@ async fn resolve(state: &AppState, raw: &str) -> AppResult<Auth> {
     Ok(Auth::Valid(Box::new(AuthContext { token, user, app })))
 }
 
-/// The raw bearer token string the request presents: the
-/// `Authorization` header first ("header wins"), then the
+/// Looks up the bearer token the request presents: the
+/// `Authorization: Bearer <token>` header first ("header wins"), then the
 /// `access_token` query parameter.
-fn bearer_string(parts: &Parts) -> Option<String> {
+pub(crate) fn bearer_string(parts: &Parts) -> Option<String> {
     bearer_from_headers(&parts.headers).or_else(|| bearer_from_query(&parts.uri))
 }
 
@@ -365,7 +365,7 @@ fn bearer_string(parts: &Parts) -> Option<String> {
 /// matched case-insensitively and any whitespace around the token
 /// dropped; `None` for an absent or unparsable header, a different
 /// scheme, or an empty token.
-fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(char::is_whitespace)?;
     if !scheme.eq_ignore_ascii_case(BEARER_SCHEME) {
@@ -377,7 +377,7 @@ fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
 
 /// The `access_token` query parameter of `uri`, percent-decoded; the
 /// first occurrence wins and an empty value counts as no token.
-fn bearer_from_query(uri: &Uri) -> Option<String> {
+pub(crate) fn bearer_from_query(uri: &Uri) -> Option<String> {
     let query = uri.query()?;
     form_urlencoded::parse(query.as_bytes())
         .find(|(key, _)| *key == ACCESS_TOKEN_PARAM)
@@ -494,6 +494,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
     }
