@@ -156,6 +156,9 @@ mod reports;
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 
+/// Account search (`/api/v1/accounts/search`, `/api/v1/search`, `/api/v2/search`).
+mod search;
+
 /// The status read endpoints (`GET /api/v1/statuses/{id}` and its batch form).
 mod statuses;
 

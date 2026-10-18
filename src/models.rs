@@ -50,3 +50,4 @@ pub mod status_visibility;
 pub mod suggestion;
 pub mod user;
 pub mod user_identity;
+pub mod user_search;

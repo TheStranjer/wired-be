@@ -70,6 +70,7 @@ pub mod pleroma_accounts;
 pub mod pleroma_settings;
 pub mod reports;
 pub mod scrobbles;
+pub mod search;
 pub mod statuses;
 pub mod streaming;
 pub mod tags;
@@ -92,14 +93,15 @@ use crate::state::AppState;
 /// `ActivityPub` documents, and [`crate::app`] merges them directly.
 ///
 /// `state` is passed down to the two version routers because the `/api/v1`
-/// registration routes mount the rate limiter (see
-/// [`crate::rate_limit`]) and the media upload route sizes its body limit
-/// from [`state.config`](AppState::config) (see
+/// registration and search routes mount the rate limiter (see
+/// [`crate::rate_limit`], and the same on `/api/v2`'s search route), and the
+/// media upload route sizes its body limit from
+/// [`state.config`](AppState::config) (see
 /// [`crate::extract::multipart::upload_body_limit`]).
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .nest("/api/v1", v1::router(state))
-        .nest("/api/v2", v2::router(&state.config))
+        .nest("/api/v2", v2::router(state))
         .nest("/api/pleroma", pleroma::router())
         .nest("/api/oauth_tokens", oauth_tokens::router())
 }

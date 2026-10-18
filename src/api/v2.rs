@@ -4,8 +4,7 @@
 use axum::Router;
 
 use crate::{
-    api::{account_lists, chats, instance, media},
-    config::Config,
+    api::{account_lists, chats, instance, media, search},
     state::AppState,
 };
 
@@ -18,19 +17,24 @@ use crate::{
 /// contributes `GET /api/v2/instance`, the reshaped instance document; its
 /// `/instance` sub-resources stay v1-only.
 /// [`account_lists::v2_router`] contributes `GET /api/v2/suggestions`, the
-/// source-wrapped twin of that area's v1 listing. Do not call
-/// [`Router::fallback`] here (or on anything merged here): unmatched paths
-/// must reach the app-wide JSON fallback in [`crate::app`], which answers
-/// them with Pleroma's `api_not_implemented`, and merging two routers that
-/// each set a fallback panics.
+/// source-wrapped twin of that area's v1 listing. [`search::v2_router`]
+/// contributes `GET /api/v2/search`, the combined search whose accounts-only
+/// answer is this ticket's. Do not call [`Router::fallback`] here (or on
+/// anything merged here): unmatched paths must reach the app-wide JSON
+/// fallback in [`crate::app`], which answers them with Pleroma's
+/// `api_not_implemented`, and merging two routers that each set a fallback
+/// panics.
 ///
-/// `config` reaches [`media::router`] for the same reason it reaches
+/// `state` reaches [`media::router`] (as
+/// [`state.config`](AppState::config)) for the same reason it reaches
 /// [`crate::api::v1::router`]: the upload route's body limit comes from the
-/// configured upload limits.
-pub fn router(config: &Config) -> Router<AppState> {
+/// configured upload limits. And [`search::v2_router`] takes it whole: its
+/// route mounts the rate limiter (see [`crate::rate_limit`]).
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .merge(account_lists::v2_router())
         .merge(instance::v2_router())
-        .merge(media::router(config))
+        .merge(media::router(&state.config))
+        .merge(search::v2_router(state))
         .nest("/pleroma/chats", chats::v2_router())
 }

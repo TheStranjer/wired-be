@@ -37,9 +37,12 @@
 //! `/oauth/authorize`, and `app_account_creation` on `POST /api/v1/apps`
 //! and `POST /api/v1/accounts`; WBE-135 `password_reset` on
 //! `POST /auth/password`; WBE-120 `statuses_actions` on
-//! `POST /api/v1/reports`. The remaining buckets (`relations_actions`,
-//! `relation_id_action`, `status_id_action`,
-//! `account_confirmation_resend` and `search`) are
+//! `POST /api/v1/reports`. WBE-115 adds `search` on the three account
+//! search routes (`GET /api/v1/accounts/search`, `GET /api/v1/search`
+//! and `GET /api/v2/search`, see [`crate::api::search`]). The remaining
+//! buckets (`relations_actions`,
+//! `relation_id_action`, `status_id_action` and
+//! `account_confirmation_resend`) are
 //! already configured and counted by name; the later tickets that add
 //! their routes attach [`rate_limit`] with the matching bucket there.
 //!
