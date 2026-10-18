@@ -39,9 +39,12 @@
 //! `POST /auth/password`; WBE-120 `statuses_actions` on
 //! `POST /api/v1/reports`. WBE-115 adds `search` on the three account
 //! search routes (`GET /api/v1/accounts/search`, `GET /api/v1/search`
-//! and `GET /api/v2/search`, see [`crate::api::search`]). The remaining
-//! buckets (`relations_actions`,
-//! `relation_id_action`, `status_id_action` and
+//! and `GET /api/v2/search`, see [`crate::api::search`]). WBE-57 adds
+//! `relations_actions` on `POST /api/v1/accounts/{id}/follow` and its
+//! `…/unfollow` twin (see [`crate::api::accounts`]); every other
+//! relationship write joins that one bucket as its ticket mounts it. The
+//! remaining
+//! buckets (`relation_id_action`, `status_id_action` and
 //! `account_confirmation_resend`) are
 //! already configured and counted by name; the later tickets that add
 //! their routes attach [`rate_limit`] with the matching bucket there.

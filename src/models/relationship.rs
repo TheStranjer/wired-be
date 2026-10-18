@@ -416,7 +416,8 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            account_note, block, domain_block, follow,
+            account_note, block, domain_block,
+            follow::{self, FollowToggles},
             user::{Flag, NewUser, User, insert, local_ap_id},
         },
         util::id::new_id,
@@ -490,25 +491,27 @@ mod tests {
         relationship.clone()
     }
 
-    /// Stores `toggles` on the `viewer → target` row the way the (later)
-    /// follow-actions ticket's endpoints will: [`follow::follow`] itself
-    /// only ever writes the column defaults.
+    /// Stores `toggles` on the `viewer → target` row through the model's own
+    /// writer, [`follow::set_toggles`] — the write Mastodon's
+    /// `POST /api/v1/accounts/{id}/follow` puts its `reblogs` / `notify`
+    /// parameters through. [`follow::follow`] itself only ever writes the
+    /// column defaults, so a fixture that wants the non-default side of a
+    /// toggle goes this way.
     async fn set_toggles(pool: &PgPool, viewer: &User, target: &User, toggles: Toggles) {
-        let updated = sqlx::query(
-            "UPDATE follows SET show_reblogs = $3, notify = $4, updated_at = now()
-              WHERE follower_id = $1 AND followee_id = $2",
+        let stored = follow::set_toggles(
+            pool,
+            viewer.id,
+            target.id,
+            FollowToggles {
+                show_reblogs: Some(toggles.show_reblogs),
+                notify: Some(toggles.notify),
+            },
         )
-        .bind(viewer.id)
-        .bind(target.id)
-        .bind(toggles.show_reblogs)
-        .bind(toggles.notify)
-        .execute(pool)
         .await
         .unwrap();
-        assert_eq!(
-            updated.rows_affected(),
-            1,
-            "the fixture row is there to update"
+        assert!(
+            stored.is_some(),
+            "the fixture's open row is there to update"
         );
     }
 

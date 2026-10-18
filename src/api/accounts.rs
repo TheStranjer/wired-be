@@ -1,12 +1,12 @@
 //! The account endpoints: the single-account reads and listings, the
-//! relationship batch, the notes write, and the profile write.
+//! relationship batch, the notes and follow writes, and the profile write.
 //!
 //! `GET /api/v1/accounts/verify_credentials`, `GET /api/v1/accounts/{id}`,
 //! `…/lookup`, `…/relationships` and the relationship listings
 //! `…/{id}/followers` and `…/{id}/following` are the reads;
 //! `PATCH /api/v1/accounts/update_credentials`,
-//! `POST /api/v1/accounts/{id}/note` and `…/{id}/remove_from_followers`
-//! are the writes.
+//! `POST /api/v1/accounts/{id}/note`, `…/{id}/remove_from_followers`,
+//! `…/{id}/follow` and `…/{id}/unfollow` are the writes.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
 //! `.relationships`, `.followers` and `.following`
@@ -209,6 +209,31 @@
 //! federation ticket wires the delivery into this module's
 //! `after_follower_removed` hook.
 //!
+//! `POST /api/v1/accounts/{id}/follow` and `…/unfollow` are Pleroma's
+//! `AccountController.follow` and `.unfollow` over `MastodonAPI.follow` /
+//! `CommonAPI.unfollow` (`lib/pleroma/web/mastodon_api/controllers/
+//! account_controller.ex`, `lib/pleroma/web/mastodon_api/mastodon_api.ex`,
+//! `lib/pleroma/user.ex`): [`AuthUser`] plus the `write:follows` / `follow`
+//! scope, both running in the limiter's `relations_actions` bucket. Follow
+//! writes through [`follow::follow`] and unfollow through
+//! [`follow::unfollow`]; both answer the
+//! caller's [`Relationship`] to the account, read back off the row so the
+//! answer states the stored fact rather than trusting the request. Follow
+//! takes the two per-follow toggles through [`ApiParams`] — `reblogs`
+//! (default `true`) and `notify` (default `false`), the JSON, form and query
+//! spellings alike — and stores the ones the request named with
+//! [`set_toggles`](crate::models::follow::set_toggles), which is how a repeat
+//! follow of an existing pair updates its flags instead of being a plain
+//! no-op; a parameter the body left out keeps what the row holds. Errors:
+//! the malformed, unknown or deactivated id is the usual 404, following
+//! yourself is the model's 422 `{"error":"Can not follow yourself"}`, and
+//! unfollowing an account the caller does not follow is no error at all
+//! (where Pleroma's controller answers "Not subscribed!", this ticket is
+//! idempotent) — the unchanged [`Relationship`] answers it with 200. Creating
+//! or withdrawing a follow is the moment federation will owe the pair a
+//! `Follow` or its `Undo`; the later ticket wires that into this module's
+//! `after_follow_changed` hook.
+//!
 //! `POST /api/v1/accounts` is open-mode registration: Pleroma's
 //! `AccountController.create` (`lib/pleroma/web/mastodon_api/controllers/
 //! account_controller.ex`) over `Registration.register_user`
@@ -277,12 +302,12 @@ use crate::{
     },
     error::{AppError, AppResult},
     extract::{
-        ApiBody, flex, index_map_to_vec,
+        ApiBody, ApiParams, flex, index_map_to_vec,
         multipart::{MultipartForm, UploadedFile, UploadedFiles as _, upload_body_limit},
     },
     models::{
         account_note,
-        follow::{self, Follow},
+        follow::{self, Follow, FollowState, FollowToggles},
         invite_token::{self, InviteToken},
         oauth_app::OauthApp,
         oauth_token::{self, NewToken, OauthToken},
@@ -441,7 +466,9 @@ const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 ///
 /// `POST /accounts` runs in the limiter's `app_account_creation` bucket
 /// (Pleroma throttles registration there; see [`crate::rate_limit`]), so
-/// the whole `state` rides along for the middleware layer.
+/// the whole `state` rides along for the middleware layer. The two follow
+/// routes run in `relations_actions`, the bucket Pleroma throttles every
+/// relationship write through.
 ///
 /// [`DEFAULT_AVATAR_LIMIT_BYTES`]: crate::config::DEFAULT_AVATAR_LIMIT_BYTES
 pub fn router(state: &AppState) -> Router<AppState> {
@@ -461,6 +488,14 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/accounts/{id}/followers", get(list_followers))
         .route("/accounts/{id}/following", get(list_following))
         .route("/accounts/{id}/note", post(set_note))
+        .route(
+            "/accounts/{id}/follow",
+            post(follow_account).layer(crate::rate_limit::rate_limit(state, "relations_actions")),
+        )
+        .route(
+            "/accounts/{id}/unfollow",
+            post(unfollow_account).layer(crate::rate_limit::rate_limit(state, "relations_actions")),
+        )
         .route(
             "/accounts/{id}/remove_from_followers",
             post(remove_from_followers),
@@ -1963,6 +1998,181 @@ async fn one_relationship(
 /// `User.remove_follower` delivers the `Reject` inline, and this server's
 /// delivery queue is a later ticket.
 const fn after_follower_removed(_state: &AppState, _followee: &User, _removed: &Follow) {}
+
+/// The request parameters of `POST /api/v1/accounts/{id}/follow`: Mastodon's
+/// two per-follow toggles, read from the query string, a form body or a JSON
+/// body alike ([`ApiParams`], decision 10 — clients use all three, and a
+/// request may carry no body at all). Both are optional, and a form's
+/// `"true"` / `"1"` spells the same thing through [`flex::opt_bool`]; anything
+/// that is neither is the extractor's 422.
+#[derive(Debug, Deserialize)]
+struct FollowParams {
+    /// Mastodon's `reblogs`, the row's [`Follow::show_reblogs`] column.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    reblogs: Option<bool>,
+    /// Mastodon's `notify`, the row's [`Follow::notify`] column.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    notify: Option<bool>,
+}
+
+impl FollowParams {
+    /// The toggles to store, exactly the parameters the request named: an
+    /// absent one keeps the flag the row holds, which needs no default here
+    /// because the documented ones (`reblogs` true, `notify` false) *are*
+    /// the `follows` column defaults a fresh row is inserted with (see
+    /// [`set_toggles`](crate::models::follow::set_toggles)).
+    const fn into_toggles(self) -> FollowToggles {
+        FollowToggles {
+            show_reblogs: self.reblogs,
+            notify: self.notify,
+        }
+    }
+}
+
+/// `POST /api/v1/accounts/{id}/follow` — follow the account and answer the
+/// caller's [`Relationship`] to it: `following: true` when this instance
+/// grants the follow on the spot (its own unlocked account), `requested: true`
+/// when the target is locked and the request waits on
+/// `/api/v1/follow_requests`. The two toggles the request names are stored on
+/// the relationship the write created *or* found already there, so a repeat
+/// follow of a pair is how a client rewrites its flags (Pleroma's `follow`
+/// does the same: the second call changes nothing but the toggles).
+///
+/// The account is resolved by [`account_or_404`] before the write, so a
+/// malformed, unknown or deactivated id is the shared 404 whatever the body
+/// asked for; following the caller's own account is the model's 422 (its
+/// wording, Pleroma's `Can not follow yourself`). A pair blocked either way is
+/// the model's own 403 refusal, which stands between this route and the write.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:follows | follow` check; [`AppError::NotFound`] for a
+/// malformed, unknown or deactivated account id; [`AppError::Unprocessable`]
+/// with `"Can not follow yourself"`, with the model's block refusal, or with
+/// the extractor's message when a toggle is not a boolean. Any database
+/// failure arrives through `?` as [`AppError::Database`].
+async fn follow_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiParams(params): ApiParams<FollowParams>,
+) -> AppResult<Json<Relationship>> {
+    auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
+    let target = account_or_404(&state, &id).await?;
+    let toggles = params.into_toggles();
+    let created = follow::follow(&state.db, &state.config.base_url, &auth.0, &target).await?;
+    let stored = store_toggles(&state, created, toggles).await?;
+    debug!(
+        follow = %stored.id,
+        user = %auth.0.id,
+        target = %target.id,
+        granted = stored.state == FollowState::Accepted,
+        reblogs = stored.show_reblogs,
+        notifying = stored.notify,
+        "account followed"
+    );
+    after_follow_changed(&state, &auth.0, &target, Some(&stored), true);
+    one_relationship(&state, auth.0.id, target.id).await
+}
+
+/// Writes the toggles a follow named onto the row [`follow::follow`] returned
+/// and hands that row back as it now stands, so the log and the federation
+/// hook state the stored fact rather than the request. A call that named
+/// neither toggle writes nothing, and a relationship the pair lost to a
+/// concurrent unfollow between the two statements keeps the row the follow
+/// returned.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn store_toggles(
+    state: &AppState,
+    created: Follow,
+    toggles: FollowToggles,
+) -> AppResult<Follow> {
+    if toggles.is_empty() {
+        return Ok(created);
+    }
+    let updated =
+        follow::set_toggles(&state.db, created.follower_id, created.followee_id, toggles).await?;
+    Ok(updated.unwrap_or(created))
+}
+
+/// `POST /api/v1/accounts/{id}/unfollow` — withdraw the caller's follow of the
+/// account and answer their [`Relationship`] to it, `following: false` and
+/// `requested: false` afterwards.
+///
+/// [`follow::unfollow`] takes back an accepted follow or a request of the
+/// caller's that is still waiting, and is content with neither: unfollowing an
+/// account the caller never followed (or one that already stopped following
+/// them, or a `rejected` mirror) changes nothing and is the unchanged
+/// [`Relationship`] with 200 — this ticket's idempotence, where Pleroma's
+/// controller would answer "Not subscribed!". The usual 404 resolves the
+/// account first, and unfollowing *yourself* is one of those no-op withdrawals
+/// rather than an error, because no follow row of the pair can exist.
+///
+/// # Errors
+///
+/// Those of [`follow_account`] minus the parameter and self-follow refusals.
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn unfollow_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Relationship>> {
+    auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
+    let target = account_or_404(&state, &id).await?;
+    // The row the delete removes is read while it still exists: the `Undo` the
+    // federation hook will one day send names the `Follow` activity the
+    // relationship holds, and `unfollow` reports only whether a row was there.
+    let previous = follow::get(&state.db, auth.0.id, target.id).await?;
+    let removed = follow::unfollow(&state.db, &auth.0, &target).await?;
+    debug!(
+        user = %auth.0.id,
+        target = %target.id,
+        removed,
+        "follow withdrawn"
+    );
+    after_follow_changed(
+        &state,
+        &auth.0,
+        &target,
+        previous.as_ref().filter(|_| removed),
+        false,
+    );
+    one_relationship(&state, auth.0.id, target.id).await
+}
+
+/// Post-write hook of [`follow_account`] and [`unfollow_account`], the landing
+/// point of the `Follow` / `Undo` federation: the ticket that delivers them
+/// wires the queueing in here (decision 11) — the activity to federate is
+/// `follow`'s [`Follow::ap_id`], its sender [`User::ap_id`] and its target
+/// [`Follow::followee_id`], and `following` states which way the write moved
+/// the fact: `true` for the `Follow` a `…/follow` created or reopened, `false`
+/// for the `Undo` of the `Follow` a `…/unfollow` withdrew.
+///
+/// `follow` is the relationship the write left behind (a `…/follow` always has
+/// one; a `…/unfollow` names the row it deleted and is `None` for a pair with
+/// nothing to take back, which is nothing to federate either).
+///
+/// Intentionally empty until then: like [`after_follower_removed`] and the
+/// blocks' [`after_block_changed`](crate::api::blocks), it waits for the
+/// delivery queue — Pleroma's `User.follow` / `User.unfollow` build and send
+/// their activities inline, and this server's federation is a later ticket.
+/// It is a plain `fn` rather than an `async` one for the reason the others
+/// are: the gate denies the `unused_async` an empty `async fn` would be and
+/// forbids silencing it, so the ticket that queues the `Follow` / `Undo`
+/// delivery grows the body and the `async` together and leaves these two
+/// call sites alone.
+const fn after_follow_changed(
+    _state: &AppState,
+    _follower: &User,
+    _target: &User,
+    _follow: Option<&Follow>,
+    _following: bool,
+) {
+}
 
 /// `GET /api/v1/accounts/{id}/followers` — the accounts that follow `id`
 /// with an accepted relationship, newest follow first, one [`PageParams`]

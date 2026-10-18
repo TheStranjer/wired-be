@@ -72,6 +72,9 @@ mod feeds;
 /// Filters over HTTP (`/api/v1/filters`).
 mod filters;
 
+/// Following and unfollowing an account (`/api/v1/accounts/{id}/follow`).
+mod follow_actions;
+
 /// The follower and following lists of an account.
 mod follow_lists;
 
