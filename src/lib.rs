@@ -191,8 +191,8 @@ async fn wait_for_ctrl_c() {
 /// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
 /// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
-/// [`api::html_pages`] (`/frontend_switcher` today, the embed, player and
-/// unsubscribe pages in later tickets). Paths
+/// [`api::html_pages`] (`/frontend_switcher` and `/embed/{id}` today, the
+/// player and unsubscribe pages in later tickets). Paths
 /// no route matches get the standard JSON error response (decision 8).
 ///
 /// `state` is handed to [`api::router`] and [`api::oauth::router`] before

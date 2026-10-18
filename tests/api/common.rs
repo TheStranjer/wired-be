@@ -43,6 +43,7 @@ use wired_be::{
     http_client::HttpClient,
     mailer::MemoryTransport,
     models::{
+        media_attachment::{self, MediaAttachment, NewMediaAttachment},
         oauth_app::{self, NewOauthApp},
         oauth_token::{self, NewToken},
         status::{self, NewStatus, Status, Visibility},
@@ -372,6 +373,41 @@ pub async fn create_status(
     status::insert(pool, &test_config().base_url, &new)
         .await
         .expect("status fixture inserts")
+}
+
+/// Attaches one media file to `status` and returns its row: of
+/// `content_type`, served at `url`, sitting at `position` within the
+/// status, uploaded by the status's author.
+///
+/// The embed card and the media-shaped tests need a status that actually
+/// carries attachments without restating the whole
+/// [`NewMediaAttachment`]; everything the card does not read (preview,
+/// description, dimensions) keeps its default.
+///
+/// # Panics
+///
+/// If the insert fails, e.g. because `status` has no row in the test
+/// database.
+pub async fn create_status_attachment(
+    pool: &PgPool,
+    status: &Status,
+    content_type: &str,
+    url: &str,
+    position: i32,
+) -> MediaAttachment {
+    media_attachment::insert(
+        pool,
+        &NewMediaAttachment {
+            user_id: Some(status.user_id),
+            status_id: Some(status.id),
+            position,
+            content_type: content_type.to_owned(),
+            url: url.to_owned(),
+            ..NewMediaAttachment::default()
+        },
+    )
+    .await
+    .expect("attachment fixture inserts")
 }
 
 /// The redirect URI every app fixture registers.
