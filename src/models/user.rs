@@ -258,6 +258,11 @@ pub struct User {
     /// flow (a later ticket) sets it, and completing a password reset
     /// clears it again. `check_account_ready` refuses a pending account.
     pub password_reset_pending: Flag,
+    /// Whether the account wants email from the instance (Pleroma's
+    /// `email_notifications`, moved by `User.switch_email_notifications`).
+    /// The HTML unsubscribe page (a later ticket) clears it; nothing reads
+    /// it yet.
+    pub email_notifications: Flag,
 }
 
 /// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
@@ -332,6 +337,7 @@ impl fmt::Debug for User {
             .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
             .field("password_reset_pending", &self.password_reset_pending)
+            .field("email_notifications", &self.email_notifications)
             .finish()
     }
 }
@@ -480,6 +486,10 @@ pub struct NewUser {
     /// `false` by default, because only the admin force-reset flow (a
     /// later ticket) puts an account in that state.
     pub password_reset_pending: Flag,
+    /// Whether the account wants email from the instance; `true` by
+    /// default, matching the column default (Pleroma's
+    /// `email_notifications`).
+    pub email_notifications: Flag,
 }
 
 /// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
@@ -551,6 +561,7 @@ impl fmt::Debug for NewUser {
             .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
             .field("password_reset_pending", &self.password_reset_pending)
+            .field("email_notifications", &self.email_notifications)
             .finish()
     }
 }
@@ -623,6 +634,7 @@ impl Default for NewUser {
             preferred_frontend: None,
             is_suggested: Flag::new(false),
             password_reset_pending: Flag::new(false),
+            email_notifications: Flag::new(true),
         }
     }
 }
@@ -673,13 +685,13 @@ const INSERT_SQL: &str = "INSERT INTO users (
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
      preferred_frontend, raw_fields, is_suggested, registration_reason,
-     password_reset_pending
+     password_reset_pending, email_notifications
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64
+     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65
 ) RETURNING *";
 
 /// Inserts `new_user` on `executor` — the pool or an open transaction —
@@ -765,6 +777,7 @@ where
         .bind(new_user.is_suggested)
         .bind(new_user.registration_reason.as_deref())
         .bind(new_user.password_reset_pending)
+        .bind(new_user.email_notifications)
         .fetch_one(executor)
         .await?;
     Ok(user)
@@ -1184,6 +1197,33 @@ pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> 
     sqlx::query(SET_PREFERRED_FRONTEND_SQL)
         .bind(id)
         .bind(frontend)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_email_notifications`]: writes the flag and
+/// refreshes `updated_at`.
+const SET_EMAIL_NOTIFICATIONS_SQL: &str =
+    "UPDATE users SET email_notifications = $2, updated_at = now() WHERE id = $1";
+
+/// Stores `enabled` as user `id`'s [`email_notifications`](User::email_notifications)
+/// flag, replacing what was there.
+///
+/// This is the switch Pleroma's `User.switch_email_notifications`
+/// (`lib/pleroma/user.ex`) moves, and the write the HTML unsubscribe page
+/// (a later ticket) performs to clear it. Unknown ids match no row and
+/// change nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_email_notifications(pool: &PgPool, id: Uuid, enabled: bool) -> AppResult<()> {
+    sqlx::query(SET_EMAIL_NOTIFICATIONS_SQL)
+        .bind(id)
+        .bind(enabled)
         .execute(pool)
         .await
         .map(drop)?;
@@ -1706,6 +1746,10 @@ mod tests {
             !user.is_suggested.get(),
             "the suggestion pool is admin-curated, so nothing starts in it"
         );
+        assert!(
+            user.email_notifications.get(),
+            "accounts start opted in to email"
+        );
     }
 
     /// The rest of the Pleroma extension columns of a plain
@@ -1821,6 +1865,10 @@ mod tests {
             "an unconfirmed email round trips"
         );
         assert!(user.approval_pending.get(), "pending approval round trips");
+        assert!(
+            !user.email_notifications.get(),
+            "the email switch round trips flipped"
+        );
     }
 
     /// The Pleroma extension values: both arrays in the order they were
@@ -1927,6 +1975,7 @@ mod tests {
                 "backup_codes": ["0123456789abcdef"],
             }),
             preferred_frontend: Some("pleroma-fe".to_owned()),
+            email_notifications: Flag::new(false),
             ..local_new("dora")
         };
         let user = insert(&pool, &new).await.unwrap();
@@ -2302,7 +2351,8 @@ mod tests {
                 && new.allow_following_move.get()
                 && new.accepts_chat_messages.get()
                 && new.show_role.get()
-                && new.email_confirmed.get(),
+                && new.email_confirmed.get()
+                && new.email_notifications.get(),
             "the Pleroma flags whose column defaults to true are set"
         );
         assert!(
@@ -2443,6 +2493,38 @@ mod tests {
             Some("mochi-pub"),
             "a new choice replaces the old one"
         );
+    }
+
+    #[tokio::test]
+    async fn set_email_notifications_stores_the_flag() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert!(
+            alice.email_notifications.get(),
+            "an account starts opted in"
+        );
+
+        set_email_notifications(&pool, alice.id, false)
+            .await
+            .unwrap();
+        assert!(
+            !fetch(&pool, alice.id).await.email_notifications.get(),
+            "the unsubscribe write is what reads back"
+        );
+
+        set_email_notifications(&pool, alice.id, true)
+            .await
+            .unwrap();
+        assert!(
+            fetch(&pool, alice.id).await.email_notifications.get(),
+            "and opting back in flips it again"
+        );
+
+        // An unknown id matches no row and is not an error.
+        set_email_notifications(&pool, new_id(), false)
+            .await
+            .unwrap();
     }
 
     /// A [`ProfileFields`] that sets every profile column to something

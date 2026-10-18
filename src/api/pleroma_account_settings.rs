@@ -568,6 +568,7 @@ mod tests {
             preferred_frontend: None,
             is_suggested: user::Flag::new(false),
             password_reset_pending: user::Flag::new(false),
+            email_notifications: user::Flag::new(true),
         }
     }
 

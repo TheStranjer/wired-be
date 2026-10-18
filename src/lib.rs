@@ -1460,5 +1460,35 @@ mod tests {
                 "and nothing starts pending: {pending_default:?}"
             );
         }
+
+        /// The email-notifications migration (WBE-220) adds the one column
+        /// the HTML unsubscribe page (a later ticket) clears: a `NOT NULL`
+        /// `boolean` `email_notifications` on `users` defaulted to `true`,
+        /// the flag Pleroma's `User.switch_email_notifications`
+        /// (`lib/pleroma/user.ex`) moves — an account is opted in to email
+        /// until it says otherwise.
+        #[tokio::test]
+        async fn users_email_notifications_migration_adds_the_column() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let (data_type, is_nullable, default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'users'
+                        AND column_name = 'email_notifications'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(data_type, "boolean", "the mail switch is a flag");
+            assert_eq!(is_nullable, "NO", "every account answers it one way");
+            assert_eq!(
+                default.as_deref(),
+                Some("true"),
+                "accounts start opted in to email: {default:?}"
+            );
+        }
     }
 }
