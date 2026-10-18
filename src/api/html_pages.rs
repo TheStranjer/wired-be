@@ -1,10 +1,14 @@
 //! Top-level HTML helper pages: the small standalone documents this
 //! server serves outside `/api`.
 //!
-//! This ticket ships the frontend switcher and the embeddable status card,
-//! both built from the shared page helpers here; the player and
-//! unsubscribe pages arrive in later tickets, on the same contract and out
-//! of the same helpers.
+//! This module ships all four of its pages: the frontend switcher, the
+//! embeddable status card, the media player for one attachment of a
+//! status (`GET /notice/{id}/embed_player`, Pleroma's `notice_player` in
+//! `lib/pleroma/web/o_status/o_status_controller.ex`) and the mailer
+//! unsubscribe page (`GET /mailer/unsubscribe/{token}`, Pleroma's
+//! `SubscriptionController` in
+//! `lib/pleroma/web/mailer/subscription_controller.ex`), all built from
+//! the same contract and out of the shared page helpers here.
 //!
 //! The contract every response this module answers keeps:
 //!
@@ -30,13 +34,18 @@
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse as _, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::Deserialize;
+use sha2_011::Sha256;
+use subtle::ConstantTimeEq as _;
+use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
@@ -108,6 +117,25 @@ const EMBED_TITLE: &str = "Status embed";
 /// refusal with: an unknown, deleted or unembeddable id is told no
 /// differently than a malformed one, so the page never leaks which it was.
 const NOT_FOUND_MESSAGE: &str = "Not found";
+/// The path of the player, `{id}` the status's primary key, the
+/// attachment to play named by the `url` query parameter.
+const PLAYER_PATH: &str = "/notice/{id}/embed_player";
+/// The title of the player page.
+const PLAYER_TITLE: &str = "Media player";
+/// The path of the mailer unsubscribe page, `{token}` the link token as
+/// [`unsubscribe_token`] mints it.
+const UNSUBSCRIBE_PATH: &str = "/mailer/unsubscribe/{token}";
+/// The title and body of the page a verified token answers with.
+const UNSUBSCRIBED_MESSAGE: &str = "You have been unsubscribed";
+/// The title and body of the one 400 page the unsubscribe route answers
+/// every refusal with: a forged, malformed or un-mintable token is told
+/// the same, so the page never leaks which it was.
+const INVALID_TOKEN_MESSAGE: &str = "Invalid token";
+
+/// The HMAC flavor unsubscribe tokens carry: HMAC-SHA256 over the
+/// user-id text, the [`crate::services::media_proxy`] signing recipe
+/// with a different message.
+type HmacSha256 = Hmac<Sha256>;
 
 /// Whether a page may be framed: [`Framing`] decides if [`secure`] adds
 /// `X-Frame-Options: DENY` or leaves the header off.
@@ -129,15 +157,27 @@ struct SwitcherForm {
     frontend: Option<String>,
 }
 
+/// The query of `GET /notice/{id}/embed_player`: Pleroma's
+/// `conn.params["url"]`, with the url optional so a request without it
+/// deserializes and is refused as no match rather than as a parse error.
+#[derive(Debug, Default, Deserialize)]
+struct PlayerQuery {
+    /// The attachment url to play, matched verbatim against the status's
+    /// attachments; `None` when the query carries no `url`.
+    url: Option<String>,
+}
+
 /// The HTML helper-pages router, merged at the root by [`crate::app`].
 ///
-/// Mounts `/frontend_switcher` and `/embed/{id}`; later tickets add the
-/// player and unsubscribe routes here. Do not call [`Router::fallback`] on
+/// Mounts `/frontend_switcher`, `/embed/{id}`, `/notice/{id}/embed_player`
+/// and `/mailer/unsubscribe/{token}`. Do not call [`Router::fallback`] on
 /// it: unmatched paths must reach the app-wide fallback in [`crate::app`].
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(SWITCHER_PATH, get(switcher_index).post(switcher_update))
         .route(EMBED_PATH, get(embed))
+        .route(PLAYER_PATH, get(embed_player))
+        .route(UNSUBSCRIBE_PATH, get(unsubscribe))
 }
 
 /// `GET /frontend_switcher` (Pleroma's `FrontendSwitcherController.index`):
@@ -276,15 +316,37 @@ struct CardRows {
 }
 
 /// Loads the rows behind the card for path segment `id`, or `None` for
-/// every refusal the route answers with one 404 page: `id` is no
-/// [`uuid::Uuid`], no live status carries it (an unknown id and a tombstone
-/// read the same), its visibility is not [`Visibility::Public`] or
-/// [`Visibility::Unlisted`], or its author has no row.
+/// every refusal the route answers with one 404 page: the refusals of
+/// [`embeddable_status`] plus an author with no row.
 ///
 /// # Errors
 ///
 /// [`AppError::Database`] when a lookup fails.
 async fn load_card(state: &AppState, id: &str) -> AppResult<Option<CardRows>> {
+    let Some(status) = embeddable_status(state, id).await? else {
+        return Ok(None);
+    };
+    let Some(author) = user::get_by_id(&state.db, status.user_id).await? else {
+        return Ok(None);
+    };
+    let attachments = attachments_of(state, status.id).await?;
+    Ok(Some(CardRows {
+        status,
+        author,
+        attachments,
+    }))
+}
+
+/// The status path segment `id` names when it is embeddable: `id` is a
+/// [`uuid::Uuid`], a live status carries it (an unknown id and a
+/// tombstone read the same) and its visibility is [`Visibility::Public`]
+/// or [`Visibility::Unlisted`]. `None` is the one refusal both the embed
+/// card and the player answer with a 404 page for.
+///
+/// # Errors
+///
+/// [`AppError::Database`] when the lookup fails.
+async fn embeddable_status(state: &AppState, id: &str) -> AppResult<Option<Status>> {
     let Some(uuid) = parse_id(id) else {
         return Ok(None);
     };
@@ -294,18 +356,20 @@ async fn load_card(state: &AppState, id: &str) -> AppResult<Option<CardRows>> {
     if !matches!(status.visibility, Visibility::Public | Visibility::Unlisted) {
         return Ok(None);
     }
-    let Some(author) = user::get_by_id(&state.db, status.user_id).await? else {
-        return Ok(None);
-    };
-    let attachments = media_attachment::for_statuses(&state.db, &[status.id])
+    Ok(Some(status))
+}
+
+/// The attachments of status `status_id` in the loaded `position` order:
+/// the single-status batch lookup, empty when it carries none.
+///
+/// # Errors
+///
+/// [`AppError::Database`] when the lookup fails.
+async fn attachments_of(state: &AppState, status_id: Uuid) -> AppResult<Vec<MediaAttachment>> {
+    Ok(media_attachment::for_statuses(&state.db, &[status_id])
         .await?
-        .remove(&status.id)
-        .unwrap_or_default();
-    Ok(Some(CardRows {
-        status,
-        author,
-        attachments,
-    }))
+        .remove(&status_id)
+        .unwrap_or_default())
 }
 
 /// The borrowed bundle [`embed_card`] renders: everything the card shows,
@@ -378,9 +442,9 @@ fn push_author(out: &mut String, card: &Card<'_>) {
     out.push_str("</span></a>\n");
 }
 
-/// The media an embed card (and the player page of a later ticket) can
-/// show: the three kinds an element exists for. A MIME type outside them
-/// is no media and renders nothing.
+/// The media an embed card (and the player page) can show: the three
+/// kinds an element exists for. A MIME type outside them is no media and
+/// renders nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaKind {
     /// Rendered as an `<img>`.
@@ -463,6 +527,162 @@ fn not_found_page() -> Response {
     )
 }
 
+/// `GET /notice/{id}/embed_player` (Pleroma's `notice_player` action,
+/// `lib/pleroma/web/o_status/o_status_controller.ex`): the bare player
+/// for the one attachment of the status whose `url` equals the `url`
+/// query parameter exactly, under the same embeddability rule as the
+/// card ([`embeddable_status`]). Video and audio only: an image match,
+/// no match, a missing or empty `url`, a malformed or unknown id and a
+/// non-media content type all answer the shared 404
+/// [`NOT_FOUND_MESSAGE`] page. The 200 is [`player_body`]'s document
+/// through [`embed_page`]: framable, HTML and CSP'd like a card.
+///
+/// # Errors
+///
+/// [`AppError::Database`] when a lookup fails.
+async fn embed_player(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<PlayerQuery>,
+) -> AppResult<Response> {
+    let Some(url) = query.url.filter(|url| !url.is_empty()) else {
+        return Ok(not_found_page());
+    };
+    let Some(status) = embeddable_status(&state, &id).await? else {
+        return Ok(not_found_page());
+    };
+    let attachments = attachments_of(&state, status.id).await?;
+    let Some(element) = player_element(&attachments, &url) else {
+        return Ok(not_found_page());
+    };
+    Ok(embed_page(
+        StatusCode::OK,
+        PLAYER_TITLE,
+        &player_body(&element),
+    ))
+}
+
+/// The player element for `url` among `attachments`: the first
+/// attachment in [`MediaAttachment::position`] order (a stable sort, so
+/// equal positions keep their loaded order) whose `url` equals the
+/// parameter verbatim, rendered through [`media_element`]. `None` when
+/// nothing matches, when the match is an image, and when its content
+/// type is no [`MediaKind`] at all — the player plays video and audio
+/// only.
+fn player_element(attachments: &[MediaAttachment], url: &str) -> Option<String> {
+    let mut ordered: Vec<&MediaAttachment> = attachments.iter().collect();
+    ordered.sort_by_key(|attachment| attachment.position);
+    let attachment = ordered.into_iter().find(|found| found.url == url)?;
+    let kind = MediaKind::of(&attachment.content_type)?;
+    (!matches!(kind, MediaKind::Image)).then(|| {
+        media_element(
+            kind,
+            &attachment.url,
+            attachment.description.as_deref().unwrap_or_default(),
+        )
+    })
+}
+
+/// The body of the player page: just the player element inside
+/// `<main class="player">`, the frame Pleroma's `embed_player` template
+/// puts its media in.
+fn player_body(element: &str) -> String {
+    format!("<main class=\"player\">{element}</main>\n")
+}
+
+/// `GET /mailer/unsubscribe/{token}` (Pleroma's `SubscriptionController`,
+/// `lib/pleroma/web/mailer/subscription_controller.ex`): the link
+/// [`unsubscribe_token`] mints. A verified token clears the user's
+/// `email_notifications` flag through
+/// [`set_email_notifications`](crate::models::user::set_email_notifications)
+/// and answers 200 [`UNSUBSCRIBED_MESSAGE`] as a [`protected_page`] —
+/// `X-Frame-Options: DENY`, unlike the embed pages, because a mailer
+/// link is no frame's content. Every refusal is the one 400
+/// [`INVALID_TOKEN_MESSAGE`] page: a token that does not verify, and,
+/// since no token can verify without a signing secret, a state built off
+/// the boot path with
+/// [`secret_key_base`](crate::config::Config::secret_key_base) unset.
+///
+/// # Errors
+///
+/// [`AppError::Database`] when the update fails.
+async fn unsubscribe(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> AppResult<Response> {
+    let verified = state
+        .config
+        .secret_key_base
+        .as_deref()
+        .and_then(|secret| unsubscribe_user_id(secret, &token));
+    let Some(user_id) = verified else {
+        return Ok(invalid_token_page());
+    };
+    user::set_email_notifications(&state.db, user_id, false).await?;
+    Ok(protected_page(
+        StatusCode::OK,
+        UNSUBSCRIBED_MESSAGE,
+        &message_body(UNSUBSCRIBED_MESSAGE),
+    ))
+}
+
+/// The raw HMAC-SHA256 of `message` keyed by `secret`, the recipe of
+/// [`crate::services::media_proxy`]; `None` only for key material its
+/// API refuses, which HMAC cannot (it hashes keys of any length).
+fn hmac_signature(secret: &str, message: &str) -> Option<Vec<u8>> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
+    mac.update(message.as_bytes());
+    Some(mac.finalize().into_bytes().to_vec())
+}
+
+/// Mints the unsubscribe token of user `user_id` under `secret`:
+/// `base64url_nopad(HMAC-SHA256(secret, user-id-text))` + `.` + the
+/// hyphenated lowercase uuid.
+///
+/// Both halves are path-safe verbatim — the base64url alphabet carries
+/// no padding, no `/` and no `+`, and uuid text needs no escaping in a
+/// path segment — so the digest mailer can drop the token straight into
+/// a link. The empty string is the only other answer, for the HMAC
+/// failure the signing step cannot reach.
+#[must_use]
+pub fn unsubscribe_token(secret: &str, user_id: Uuid) -> String {
+    let id_text = user_id.to_string();
+    let Some(signature) = hmac_signature(secret, &id_text) else {
+        return String::new();
+    };
+    format!("{}.{id_text}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+/// The user id `token` names when its signature verifies, and `None`
+/// for every token [`unsubscribe_token`] would not mint.
+///
+/// Every refusal reads the same: no `.` separator (the split takes the
+/// first dot, so an id segment carrying more never parses), a signature
+/// that is no base64url text, one that disagrees with the HMAC-SHA256
+/// of the id segment under `secret` (compared in constant time, so the
+/// route leaks nothing about how far a guess was), and an id segment
+/// that is no [`Uuid`].
+#[must_use]
+pub fn unsubscribe_user_id(secret: &str, token: &str) -> Option<Uuid> {
+    let (provided, id_text) = token.split_once('.')?;
+    let want = hmac_signature(secret, id_text)?;
+    let given = URL_SAFE_NO_PAD.decode(provided).ok()?;
+    if !bool::from(given.as_slice().ct_eq(want.as_slice())) {
+        return None;
+    }
+    Uuid::parse_str(id_text).ok()
+}
+
+/// The one 400 answer of the unsubscribe route: [`INVALID_TOKEN_MESSAGE`]
+/// as a [`protected_page`], the module headers and all.
+fn invalid_token_page() -> Response {
+    protected_page(
+        StatusCode::BAD_REQUEST,
+        INVALID_TOKEN_MESSAGE,
+        &message_body(INVALID_TOKEN_MESSAGE),
+    )
+}
+
 /// The full document of a page: the doctype, the escaped `title`, the one
 /// inline [`PAGE_STYLE`] sheet and `body` inside `<main>`. The body is
 /// markup the helpers here built (already escaped as it was appended), not
@@ -502,9 +722,9 @@ fn protected_page(status: StatusCode, title: &str, body: &str) -> Response {
 /// A `status` response for the embed pages: `respond` with the
 /// `Framing::Allow` flavour.
 ///
-/// The embed route answers with it now, and the player pages of later
-/// tickets do the same. It is public (where the rest of the shared helpers
-/// are module-internal) so those later tickets call it from here anyway.
+/// The embed route and the player answer with it. It is public (where the
+/// rest of the shared helpers are module-internal) so framable pages
+/// built elsewhere can reuse it.
 #[must_use]
 pub fn embed_page(status: StatusCode, title: &str, body: &str) -> Response {
     respond(status, title, body, Framing::Allow)
@@ -734,7 +954,6 @@ mod tests {
     }
 
     use chrono::TimeZone as _;
-    use uuid::Uuid;
 
     /// The fixed publication instant of the card fixtures:
     /// `2024-01-31T12:34:56.000Z` in the Mastodon spelling.
@@ -957,6 +1176,216 @@ mod tests {
         assert!(
             !headers.contains_key(FRAME_OPTIONS_HEADER.clone()),
             "and framable like a card, so it tells nothing away"
+        );
+    }
+
+    #[test]
+    fn the_player_query_reads_the_url_and_may_miss_it() {
+        let picked: PlayerQuery = serde_json::from_value(serde_json::json!({ "url": "/m/v.mp4" }))
+            .expect("a query with the url deserializes");
+        assert_eq!(picked.url.as_deref(), Some("/m/v.mp4"), "the url");
+        let empty: PlayerQuery =
+            serde_json::from_value(serde_json::json!({})).expect("a query without it deserializes");
+        assert_eq!(empty.url, None, "and reads as no url");
+        let default = PlayerQuery::default();
+        assert_eq!(default.url, None, "the default is no url");
+    }
+
+    #[test]
+    fn player_element_wants_a_verbatim_video_or_audio_match() {
+        let attachments = [
+            attachment("image/png", "/m/a.png", 0, Some("a picture")),
+            attachment("video/mp4", "/m/v.mp4", 1, Some("a film")),
+            attachment("audio/mpeg", "/m/s.mp3", 2, None),
+            attachment("application/pdf", "/m/doc.pdf", 3, None),
+        ];
+        assert_eq!(
+            player_element(&attachments, "/m/v.mp4").as_deref(),
+            Some("<video controls src=\"/m/v.mp4\" title=\"a film\"></video>"),
+            "the video plays with its description as title"
+        );
+        assert_eq!(
+            player_element(&attachments, "/m/s.mp3").as_deref(),
+            Some("<audio controls src=\"/m/s.mp3\" title=\"\"></audio>"),
+            "the audio plays with an empty title"
+        );
+        assert_eq!(
+            player_element(&attachments, "/m/a.png"),
+            None,
+            "an image match is no player"
+        );
+        assert_eq!(
+            player_element(&attachments, "/m/doc.pdf"),
+            None,
+            "a non-media content type is no player"
+        );
+        assert_eq!(
+            player_element(&attachments, "/m/other.mp4"),
+            None,
+            "a url that no attachment carries is no player"
+        );
+        assert_eq!(
+            player_element(&attachments, "/m/v.mp?4"),
+            None,
+            "the match is verbatim, not fuzzy"
+        );
+    }
+
+    #[test]
+    fn player_element_takes_the_first_position_match() {
+        let attachments = [
+            attachment("video/mp4", "/m/same.mp4", 5, None),
+            attachment("image/png", "/m/same.mp4", 1, None),
+        ];
+        assert_eq!(
+            player_element(&attachments, "/m/same.mp4"),
+            None,
+            "the position-first match is the image, so there is no player"
+        );
+    }
+
+    #[test]
+    fn player_body_frames_the_element_in_main_player() {
+        assert_eq!(
+            player_body("<video controls src=\"/m/v.mp4\" title=\"\"></video>"),
+            "<main class=\"player\"><video controls src=\"/m/v.mp4\" title=\"\"></video></main>\n",
+            "just the element inside the player main"
+        );
+    }
+
+    /// A token with its first base64url character swapped for another
+    /// (both fully significant, so the decoded signature must change).
+    fn flipped_signature(token: &str) -> String {
+        let mut chars = token.chars();
+        let first = chars.next().expect("a token is not empty");
+        let swap = if first == 'A' { 'B' } else { 'A' };
+        let mut flipped = String::new();
+        flipped.push(swap);
+        flipped.extend(chars);
+        flipped
+    }
+
+    #[test]
+    fn unsubscribe_tokens_roundtrip_to_their_user_id() {
+        let secret = "roundtrip-secret";
+        let user_id = Uuid::now_v7();
+        let token = unsubscribe_token(secret, user_id);
+        assert_eq!(
+            unsubscribe_user_id(secret, &token),
+            Some(user_id),
+            "a fresh token names its user"
+        );
+        assert!(
+            token.ends_with(&format!(".{}", user_id.as_hyphenated())),
+            "the id segment is the hyphenated lowercase uuid verbatim: {token}"
+        );
+        assert_eq!(
+            token,
+            unsubscribe_token(secret, user_id),
+            "minting is deterministic"
+        );
+    }
+
+    #[test]
+    fn unsubscribe_tokens_are_path_safe_verbatim() {
+        let token = unsubscribe_token("a-secret", Uuid::now_v7());
+        assert!(
+            !token.contains(['=', '/', '+']),
+            "no padding, no slash, no plus: {token}"
+        );
+        assert_eq!(
+            token.split('.').count(),
+            2,
+            "the one signature dot splits the token in two: {token}"
+        );
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "every character is path-safe: {token}"
+        );
+    }
+
+    #[test]
+    fn tampered_unsubscribe_tokens_verify_as_no_one() {
+        let secret = "tamper-secret";
+        let alice = Uuid::now_v7();
+        let bob = Uuid::now_v7();
+        let token = unsubscribe_token(secret, alice);
+        assert_eq!(
+            unsubscribe_user_id(secret, &flipped_signature(&token)),
+            None,
+            "a flipped signature byte does not verify"
+        );
+        let (_sig, id_text) = token.split_once('.').expect("a minted token has a dot");
+        assert_eq!(id_text, alice.to_string(), "the minted id segment");
+        assert_eq!(
+            unsubscribe_user_id(
+                secret,
+                &token.replace(&format!(".{alice}"), &format!(".{bob}"))
+            ),
+            None,
+            "the id segment cannot be swapped for another user's"
+        );
+        assert_eq!(
+            unsubscribe_user_id("another-secret", &token),
+            None,
+            "a different secret does not verify"
+        );
+    }
+
+    #[test]
+    fn malformed_unsubscribe_tokens_verify_as_no_one() {
+        let secret = "malformed-secret";
+        let token = unsubscribe_token(secret, Uuid::now_v7());
+        let (signature, _) = token.split_once('.').expect("a minted token has a dot");
+        assert_eq!(
+            unsubscribe_user_id(secret, &token.replace('.', "")),
+            None,
+            "a token with no dot is refused"
+        );
+        assert_eq!(
+            unsubscribe_user_id(secret, signature),
+            None,
+            "a bare signature with no id is refused"
+        );
+        assert_eq!(
+            unsubscribe_user_id(secret, ""),
+            None,
+            "the empty token is refused"
+        );
+        assert_eq!(
+            unsubscribe_user_id(secret, &format!("not.base64!!.{token}")),
+            None,
+            "an undecodable signature segment is refused"
+        );
+        assert_eq!(
+            unsubscribe_user_id(secret, &format!("{token}=.not-base64!!")),
+            None,
+            "a second dot leaves an undecodable id segment"
+        );
+        assert_eq!(
+            unsubscribe_user_id(secret, &format!("{signature}={token}")),
+            None,
+            "a padded signature segment is no base64url: refused"
+        );
+    }
+
+    #[test]
+    fn the_invalid_token_page_is_a_protected_400() {
+        let response = invalid_token_page();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "400");
+        let headers = headers_of(&response);
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            PAGE_CONTENT_TYPE,
+            "the refusal is an HTML page"
+        );
+        assert_eq!(headers[CSP_HEADER.clone()], PAGE_CSP, "with the CSP");
+        assert_eq!(
+            headers[FRAME_OPTIONS_HEADER.clone()],
+            "DENY",
+            "and not framable, like every non-embed page"
         );
     }
 }

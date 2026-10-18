@@ -3,23 +3,33 @@
 //! its empty case, the cookie-carrying redirect, the 422 refusals, the
 //! `GET /embed/{id}` status card (public and unlisted statuses, remote
 //! handles, media attachments, escaping, and the one 404 page every
-//! refusal shares) and the module headers every answer carries. Later
-//! tickets append their player and unsubscribe coverage to this file.
+//! refusal shares), the `GET /notice/{id}/embed_player` bare media player
+//! (its verbatim url match, the refusals that all share the 404 page, and
+//! its framable headers), the `GET /mailer/unsubscribe/{token}` page
+//! (HMAC-verified tokens, the one 400 `Invalid token` refusal, and the
+//! flag it clears in the database) and the module headers every answer
+//! carries.
 //!
 //! The switcher endpoints read [`Config::available_frontends`] only, never
-//! the database; the embed card reads statuses, authors and attachments.
+//! the database; the embed card and the player read statuses, authors and
+//! attachments; the unsubscribe page signs against
+//! [`Config::secret_key_base`] and writes the `email_notifications` flag.
 //! Every test leases a slot so the full router can be mounted.
 //!
 //! [`Config::available_frontends`]: wired_be::config::Config::available_frontends
+//! [`Config::secret_key_base`]: wired_be::config::Config::secret_key_base
 
 #![cfg(test)]
 
 use axum::{Router, http::StatusCode};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::models::{
-    status::{self, NewStatus, Visibility},
-    user::NewUser,
+use wired_be::{
+    api::html_pages::unsubscribe_token,
+    models::{
+        status::{self, NewStatus, Status, Visibility},
+        user::{self, NewUser},
+    },
 };
 
 use crate::common;
@@ -503,5 +513,328 @@ async fn a_hostile_author_field_is_escaped_and_content_passes_through() {
     assert!(
         !html.contains("&amp;amp;"),
         "and never escaped a second time: {html}"
+    );
+}
+
+/// `GET /notice/{id}/embed_player{query}` over the mounted router.
+async fn get_player(app: &Router, id: &str, query: &str) -> common::TestResponse {
+    common::TestRequest::get(&format!("/notice/{id}/embed_player{query}"))
+        .send(app)
+        .await
+}
+
+/// A public status authored by a fresh local user named `nickname`,
+/// carrying one image, one video, one audio and one non-media
+/// attachment — everything the player must refuse or accept between.
+async fn media_status(pool: &PgPool, nickname: &str) -> Status {
+    let author = common::create_local_user(pool, nickname).await;
+    let posted =
+        common::create_status(pool, &author, "a post with media", Visibility::Public).await;
+    let _image =
+        common::create_status_attachment(pool, &posted, "image/png", "/media/one.png", 0).await;
+    let _video =
+        common::create_status_attachment(pool, &posted, "video/mp4", "/media/two.mp4", 1).await;
+    let _audio =
+        common::create_status_attachment(pool, &posted, "audio/mpeg", "/media/three.mp3", 2).await;
+    let _other =
+        common::create_status_attachment(pool, &posted, "application/pdf", "/media/four.pdf", 3)
+            .await;
+    posted
+}
+
+/// The player of a video attachment's url is just the `video controls`
+/// element inside `<main class="player">`, framed by the embed headers:
+/// no `X-Frame-Options`, the CSP and HTML.
+#[tokio::test]
+async fn the_player_page_streams_the_matching_video_attachment() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let posted = media_status(&pool, "playeralice").await;
+    let response = get_player(&app, &posted.id.to_string(), "?url=/media/two.mp4").await;
+    assert_eq!(response.status, StatusCode::OK, "the video plays");
+    assert_embed_headers(&response, "the player");
+    let html = response.text();
+    assert!(
+        html.starts_with("<!DOCTYPE html>"),
+        "a full HTML document: {html}"
+    );
+    assert!(
+        html.contains(
+            "<main class=\"player\"><video controls src=\"/media/two.mp4\" title=\"\"></video></main>"
+        ),
+        "just the video element inside <main class=\"player\">: {html}"
+    );
+    assert!(!html.contains("<img"), "the page carries no card: {html}");
+    assert!(
+        !html.contains("a post with media"),
+        "and none of the status content: {html}"
+    );
+}
+
+/// The player of an audio attachment's url renders the `audio controls`
+/// element.
+#[tokio::test]
+async fn the_player_page_streams_the_matching_audio_attachment() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let posted = media_status(&pool, "playeraudio").await;
+    let response = get_player(&app, &posted.id.to_string(), "?url=/media/three.mp3").await;
+    assert_eq!(response.status, StatusCode::OK, "the audio plays");
+    assert_embed_headers(&response, "the audio player");
+    assert!(
+        response.text().contains(
+            "<main class=\"player\"><audio controls src=\"/media/three.mp3\" title=\"\"></audio></main>"
+        ),
+        "just the audio element inside <main class=\"player\">: {}",
+        response.text()
+    );
+}
+
+/// An image match, a non-media content type, a url no attachment of the
+/// status carries, a url belonging to another status, no `url` at all and
+/// an empty `url` all answer the shared 404 `Not found` page.
+#[tokio::test]
+async fn the_player_refuses_every_url_that_is_no_video_or_audio() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let posted = media_status(&pool, "playerrefuse").await;
+    let other_author = common::create_local_user(&pool, "playerother").await;
+    let other = common::create_status(&pool, &other_author, "elsewhere", Visibility::Public).await;
+    let _video =
+        common::create_status_attachment(&pool, &other, "video/mp4", "/media/five.mp4", 0).await;
+    let id = posted.id.to_string();
+    for (query, who) in [
+        ("?url=/media/one.png", "an image match"),
+        ("?url=/media/four.pdf", "a non-media content type"),
+        ("?url=/media/nowhere.mp4", "a url no attachment carries"),
+        ("?url=/media/five.mp4", "a url belonging to another status"),
+        ("", "no url parameter at all"),
+        ("?url=", "an empty url parameter"),
+    ] {
+        let response = get_player(&app, &id, query).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{who} is 404");
+        assert_embed_headers(&response, who);
+        let html = response.text();
+        assert!(
+            html.contains("<title>Not found</title>") && html.contains("<h1>Not found</h1>"),
+            "{who} gets the shared Not found page: {html}"
+        );
+    }
+}
+
+/// A private status, an unknown id and a malformed id all answer the
+/// same 404 page even when the `url` names one of the status's videos.
+#[tokio::test]
+async fn the_player_refuses_statuses_that_are_not_embeddable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let author = common::create_local_user(&pool, "playerpriv").await;
+    let private =
+        common::create_status(&pool, &author, "followers only film", Visibility::Private).await;
+    let _video =
+        common::create_status_attachment(&pool, &private, "video/mp4", "/media/secret.mp4", 0)
+            .await;
+    let unknown = Uuid::now_v7().to_string();
+    for (id, who) in [
+        (private.id.to_string(), "a private status"),
+        (unknown, "an unknown id"),
+        ("not-a-uuid".to_owned(), "a malformed id"),
+    ] {
+        let response = get_player(&app, &id, "?url=/media/secret.mp4").await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{who} is 404");
+        assert_embed_headers(&response, who);
+        let html = response.text();
+        assert!(
+            html.contains("<h1>Not found</h1>"),
+            "{who} gets the shared Not found page: {html}"
+        );
+        assert!(
+            !html.contains("secret.mp4"),
+            "{who} leaks nothing of the film: {html}"
+        );
+    }
+}
+
+/// A url containing quotes is matched only verbatim — the double-encoded
+/// spelling is a different string and gets the 404 — and is escaped on
+/// output, where a raw quote could close the `src` attribute.
+#[tokio::test]
+async fn a_url_with_quotes_matches_verbatim_and_is_escaped_on_output() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let author = common::create_local_user(&pool, "playerquote").await;
+    let posted = common::create_status(&pool, &author, "quoted film", Visibility::Public).await;
+    let stored = r#"/media/a"b&c.mp4"#;
+    let _video = common::create_status_attachment(&pool, &posted, "video/mp4", stored, 0).await;
+    let id = posted.id.to_string();
+    let response = get_player(&app, &id, "?url=/media/a%22b%26c.mp4").await;
+    assert_eq!(response.status, StatusCode::OK, "the verbatim match plays");
+    let html = response.text();
+    assert!(
+        html.contains("src=\"/media/a&quot;b&amp;c.mp4\""),
+        "the url arrives escaped: {html}"
+    );
+    assert!(
+        !html.contains("src=\"/media/a\""),
+        "a raw quote cannot close the attribute: {html}"
+    );
+    let refused = get_player(&app, &id, "?url=/media/a%2522b%2526c.mp4").await;
+    assert_eq!(
+        refused.status,
+        StatusCode::NOT_FOUND,
+        "the double-encoded spelling is a different url"
+    );
+}
+
+/// The `SECRET_KEY_BASE` value the mailer tests sign with; never a real
+/// secret.
+const MAILER_SECRET: &str = "a-mailer-signing-secret-for-tests";
+
+/// The real router with `Config::secret_key_base` set to `secret` (or
+/// left unset for `None`), over `pool`.
+fn mailer_app(pool: PgPool, secret: Option<&str>) -> Router {
+    let mut config = common::test_config();
+    config.secret_key_base = secret.map(str::to_owned);
+    common::test_app_with_config(pool, config)
+}
+
+/// `GET /mailer/unsubscribe/{token}` over the mounted router.
+async fn get_unsubscribe(app: &Router, token: &str) -> common::TestResponse {
+    common::TestRequest::get(&format!("/mailer/unsubscribe/{token}"))
+        .send(app)
+        .await
+}
+
+/// `user`'s stored `email_notifications` flag.
+async fn notifications_on(pool: &PgPool, user_id: Uuid) -> bool {
+    let found = user::get_by_id(pool, user_id)
+        .await
+        .expect("the user lookup runs");
+    found
+        .expect("the user row is there")
+        .email_notifications
+        .get()
+}
+
+/// `token` with its first base64url character swapped for another (both
+/// fully significant, so the decoded signature must change).
+fn flipped_signature(token: &str) -> String {
+    let mut chars = token.chars();
+    let first = chars.next().expect("a minted token is not empty");
+    let swap = if first == 'A' { 'B' } else { 'A' };
+    let mut flipped = String::new();
+    flipped.push(swap);
+    flipped.extend(chars);
+    flipped
+}
+
+/// A token minted with the configured secret answers 200
+/// `You have been unsubscribed` as a protected page (`X-Frame-Options:
+/// DENY`, unlike the embed pages) and leaves `email_notifications` false
+/// in the database.
+#[tokio::test]
+async fn a_valid_unsubscribe_token_clears_the_flag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = mailer_app(pool.clone(), Some(MAILER_SECRET));
+    let subscriber = common::create_local_user(&pool, "unsubalice").await;
+    assert!(
+        notifications_on(&pool, subscriber.id).await,
+        "the fixture starts subscribed"
+    );
+    let token = unsubscribe_token(MAILER_SECRET, subscriber.id);
+    let response = get_unsubscribe(&app, &token).await;
+    assert_eq!(response.status, StatusCode::OK, "a good token unsubscribes");
+    assert_module_headers(&response, "the unsubscribe page");
+    let html = response.text();
+    assert!(
+        html.contains("<title>You have been unsubscribed</title>")
+            && html.contains("<h1>You have been unsubscribed</h1>"),
+        "the page says so: {html}"
+    );
+    assert!(
+        !notifications_on(&pool, subscriber.id).await,
+        "the flag is stored cleared"
+    );
+}
+
+/// A flipped signature byte, a token whose id segment names another
+/// user, one signed with a different secret, one with no dot and one
+/// whose signature segment is no base64url all answer the 400
+/// `Invalid token` page and change no row.
+#[tokio::test]
+async fn every_bad_unsubscribe_token_answers_the_invalid_page_and_changes_no_row() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = mailer_app(pool.clone(), Some(MAILER_SECRET));
+    let alice = common::create_local_user(&pool, "unsubbob").await;
+    let bob = common::create_local_user(&pool, "unsubcarol").await;
+    let token = unsubscribe_token(MAILER_SECRET, alice.id);
+    let (signature, id_text) = token.split_once('.').expect("a minted token has a dot");
+    for (bad_token, who) in [
+        (flipped_signature(&token), "a flipped signature byte"),
+        (
+            format!("{signature}.{}", bob.id),
+            "an id segment swapped for another user",
+        ),
+        (
+            unsubscribe_token("a-different-secret", alice.id),
+            "a token signed with a different secret",
+        ),
+        (signature.to_owned(), "a token with no dot"),
+        (
+            format!("!!!.{id_text}"),
+            "a signature segment that is no base64url",
+        ),
+    ] {
+        let response = get_unsubscribe(&app, &bad_token).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{who} is 400");
+        assert_module_headers(&response, who);
+        assert!(
+            response.text().contains("Invalid token"),
+            "{who} says Invalid token: {}",
+            response.text()
+        );
+    }
+    assert!(
+        notifications_on(&pool, alice.id).await,
+        "no refusal touched alice's row"
+    );
+    assert!(
+        notifications_on(&pool, bob.id).await,
+        "and none touched bob's"
+    );
+}
+
+/// With `secret_key_base` unset no token can verify: even one freshly
+/// minted with the secret the tests otherwise use answers 400
+/// `Invalid token` and changes no row.
+#[tokio::test]
+async fn without_a_signing_secret_every_unsubscribe_token_is_invalid() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = mailer_app(pool.clone(), None);
+    let subscriber = common::create_local_user(&pool, "unsubdave").await;
+    let token = unsubscribe_token(MAILER_SECRET, subscriber.id);
+    let response = get_unsubscribe(&app, &token).await;
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "an un-mintable config is 400"
+    );
+    assert_module_headers(&response, "the unconfigured token");
+    assert!(
+        response.text().contains("Invalid token"),
+        "the page says so: {}",
+        response.text()
+    );
+    assert!(
+        notifications_on(&pool, subscriber.id).await,
+        "the row is untouched"
     );
 }

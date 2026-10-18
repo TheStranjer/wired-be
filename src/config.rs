@@ -107,6 +107,10 @@ pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
 /// substitute for open registrations on `POST /api/v1/accounts`; the
 /// instance endpoints report it as `invites_enabled`.
 pub const INVITES_ENABLED_VAR: &str = "INVITES_ENABLED";
+/// Environment variable holding the application-wide HMAC signing secret
+/// (`SECRET_KEY_BASE` in Pleroma's config); unset by default, so anything
+/// that signs links refuses while it is missing.
+pub const SECRET_KEY_BASE_VAR: &str = "SECRET_KEY_BASE";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
@@ -733,6 +737,13 @@ pub struct Config {
     /// The `From:` address every sent email carries, from `MAIL_FROM`;
     /// `noreply@<instance domain>` by default.
     pub mail_from: String,
+    /// The application-wide HMAC signing secret, from `SECRET_KEY_BASE`
+    /// (Pleroma's `:pleroma, Pleroma.Web.Endpoint` `secret_key_base`);
+    /// `None` (the default) makes every page that verifies a signed link
+    /// refuse every token (see
+    /// [`crate::api::html_pages::unsubscribe_user_id`]). Secret material:
+    /// the manual `Debug` impl below redacts it.
+    pub secret_key_base: Option<String>,
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
@@ -800,6 +811,7 @@ impl Config {
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
         let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
             mailer_settings(&lookup, domain_of(&base_url))?;
+        let secret_key_base = signing_secret(&lookup);
         Ok(Self {
             database_url,
             bind_addr,
@@ -846,6 +858,7 @@ impl Config {
             smtp_password,
             smtp_tls,
             mail_from,
+            secret_key_base,
             media_proxy: media_proxy_settings(&lookup)?,
             sign_fetches,
             authorized_fetch,
@@ -959,6 +972,7 @@ impl Config {
             smtp_password: None,
             smtp_tls: SmtpTls::default(),
             mail_from: default_mail_from(domain_of(TEST_BASE_URL)),
+            secret_key_base: None,
             media_proxy: MediaProxyConfig {
                 enabled: DEFAULT_MEDIA_PROXY_ENABLED,
                 secret: None,
@@ -1164,6 +1178,20 @@ fn domain_of(base_url: &str) -> &str {
 fn default_mail_from(domain: &str) -> String {
     let host = domain.split_once(':').map_or(domain, |(host, _)| host);
     format!("{DEFAULT_MAIL_FROM_USER}@{host}")
+}
+
+/// Reads `SECRET_KEY_BASE`: the trimmed signing secret, `None` when the
+/// variable is unset or blank (the default — nothing that verifies a
+/// signed link accepts anything then). Grouped because each is a plain
+/// default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md).
+fn signing_secret<F>(lookup: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(SECRET_KEY_BASE_VAR)
+        .map(|secret| secret.trim().to_owned())
+        .filter(|secret| !secret.is_empty())
 }
 
 /// What [`auth_settings`] reads: the five settings that gate registration,
@@ -1680,6 +1708,10 @@ impl fmt::Debug for Config {
             .field("smtp_password", &"<redacted>")
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
+            .field(
+                "secret_key_base",
+                &self.secret_key_base.as_ref().map(|_| "<redacted>"),
+            )
             .field("media_proxy", &self.media_proxy)
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
@@ -2253,6 +2285,45 @@ mod tests {
         assert!(
             debug.contains("smtp_tls: Tls"),
             "the encryption mode shows: {debug}"
+        );
+    }
+
+    #[test]
+    fn secret_key_base_defaults_to_unset() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.secret_key_base, None,
+            "no signing secret unless configured"
+        );
+    }
+
+    #[test]
+    fn reads_custom_secret_key_base() {
+        let config = config_with(&[(SECRET_KEY_BASE_VAR, "  a-signing-secret  ")]);
+        assert_eq!(
+            config.secret_key_base.as_deref(),
+            Some("a-signing-secret"),
+            "the secret is trimmed"
+        );
+    }
+
+    #[test]
+    fn blank_secret_key_base_reads_as_unset() {
+        let config = config_with(&[(SECRET_KEY_BASE_VAR, "   ")]);
+        assert_eq!(config.secret_key_base, None, "a blank secret is no secret");
+    }
+
+    #[test]
+    fn debug_redacts_the_secret_key_base() {
+        let config = config_with(&[(SECRET_KEY_BASE_VAR, "a-signing-secret")]);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("a-signing-secret"),
+            "the signing secret must not leak: {debug}"
+        );
+        assert!(
+            debug.contains(r#"secret_key_base: Some("<redacted>")"#),
+            "the marker names the field: {debug}"
         );
     }
 
