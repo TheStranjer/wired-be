@@ -403,10 +403,11 @@ mod tests {
         /// its delete action and the table it points at.
         type ExpectedKey = (&'static str, &'static str, &'static str, &'static str);
 
-        /// The indexes the statuses migration creates on `statuses`: the
-        /// primary key, the uri lookup and the six the timeline and thread
-        /// queries read.
-        const STATUS_INDEXES: [&str; 8] = [
+        /// The indexes the statuses migrations create on `statuses`: the
+        /// primary key, the uri lookup, the six the timeline and thread
+        /// queries read, and the partial unique key that lets an account
+        /// reblog a given status once.
+        const STATUS_INDEXES: [&str; 9] = [
             "statuses_pkey",
             "statuses_uri_key",
             "statuses_user_id_idx",
@@ -415,11 +416,16 @@ mod tests {
             "statuses_reblog_of_id_idx",
             "statuses_visibility_idx",
             "statuses_quote_of_id_idx",
+            "statuses_user_id_reblog_of_id_key",
         ];
-        /// The two newest-first statuses indexes, partial on live rows so
-        /// tombstones drop out of them for free.
-        const PARTIAL_STATUS_INDEXES: [&str; 2] =
-            ["statuses_user_id_idx", "statuses_visibility_idx"];
+        /// The live-row-partial statuses indexes: the two newest-first
+        /// listings, so tombstones drop out of them for free, and the
+        /// unique reblog pair, so a withdrawn boost frees the pair again.
+        const PARTIAL_STATUS_INDEXES: [&str; 3] = [
+            "statuses_user_id_idx",
+            "statuses_visibility_idx",
+            "statuses_user_id_reblog_of_id_key",
+        ];
         /// The foreign keys the chats migration declares: table, constraint,
         /// `ON DELETE` action and target.
         const CHAT_FOREIGN_KEYS: [ExpectedKey; 6] = [
@@ -562,8 +568,8 @@ mod tests {
                 .collect()
         }
 
-        /// Every index the statuses migration creates, and the two newest-first
-        /// ones partial on live rows only.
+        /// Every index the statuses migrations create, the three partial on
+        /// live rows only, and the one live reblog pair per account unique.
         fn assert_statuses_indexes(rows: &[(String, String)]) {
             let names = index_names(rows);
             for expected in STATUS_INDEXES {
@@ -575,6 +581,10 @@ mod tests {
                     "{partial} is partial on live rows only"
                 );
             }
+            assert!(
+                index_definition(rows, "statuses_user_id_reblog_of_id_key").contains("UNIQUE"),
+                "the live reblog pair indexes unique, so an account reblogs a status once"
+            );
         }
 
         /// Every foreign key the chats migration declares, with its delete
@@ -682,10 +692,11 @@ mod tests {
             assert_eq!(row.0, 3, "all three extensions should be installed");
         }
 
-        /// The statuses migration creates the six indexes the timeline and
-        /// thread queries need — the two newest-first ones partial on
-        /// `deleted_at IS NULL`, so tombstones drop out of them for free —
-        /// and gives `media_attachments.status_id` its foreign key into the
+        /// The statuses migrations create every index the timeline, thread
+        /// and reblog queries need — three of them partial on
+        /// `deleted_at IS NULL`, so tombstones drop out of them for free,
+        /// and one of those keeps the live reblog pair unique — and gives
+        /// `media_attachments.status_id` its foreign key into the
         /// new table.
         #[tokio::test]
         async fn statuses_migration_indexes_statuses_and_links_media() {

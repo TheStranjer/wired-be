@@ -31,19 +31,32 @@
 //! [`get_by_id_including_deleted`] do not, because federation and moderation
 //! need to see them.
 //!
+//! Reblogs are the same table wearing the `Announce` role (decision 6):
+//! [`create_reblog`] writes a live reblog row with no text of its own, the
+//! original's conversation, and the activity uri `{BASE_URL}/activities/{id}`
+//! rather than the plain status's `/objects/{id}`; the partial unique index
+//! on `(user_id, reblog_of_id)` keeps one live reblog per pair, so a repeat
+//! restates the row instead of writing a second one. [`remove_reblog`]
+//! withdraws it — the same tombstone [`soft_delete`] writes, with the same
+//! counter steps — and [`reblogged_status_ids`] and [`reblogger_page`] serve
+//! the two reads: the batched `reblogged` flag of the status renderer and
+//! the `reblogged_by` account listing.
+//!
 //! Counts move by whole steps only, through [`insert`], [`soft_delete`] and
 //! [`bump_counter`], and are clamped at zero in SQL, so they can neither go
 //! negative nor be lost to a concurrent write.
 
+use std::collections::HashSet;
 use std::{fmt, str::FromStr};
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{hashtag, mention, user::User},
+    pagination::PageParams,
     util::{entities::extract_hashtags, format::text_to_html, id::new_id},
 };
 
@@ -210,6 +223,21 @@ pub struct Status {
     pub inserted_at: DateTime<Utc>,
     /// When the row last changed; refreshed by every update here.
     pub updated_at: DateTime<Utc>,
+}
+
+/// One entry of [`reblogger_page`]: the [`User`] behind a reblog row, led
+/// by that row's id.
+///
+/// The id is what the endpoint's keyset cursors and `Link` header carry —
+/// the reblog row's id, not the reblogger's — exactly as
+/// [`crate::models::favourite`] hands the like id over next to the account.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ReblogPageEntry {
+    /// Primary key of the reblog [`Status`] row behind this entry.
+    pub reblog_id: Uuid,
+    /// The account that reblogged.
+    #[sqlx(flatten)]
+    pub user: User,
 }
 
 /// What to insert: every `statuses` column a caller can decide up front.
@@ -425,6 +453,57 @@ const ANY_BY_ID_SQL: &str = "SELECT * FROM statuses WHERE id = $1";
 /// [`get_by_uri`]: one row by its `ActivityPub` id, tombstone or not —
 /// federation dedupes on this, and a deleted post's `uri` stays reserved.
 const BY_URI_SQL: &str = "SELECT * FROM statuses WHERE uri = $1";
+
+/// The `INSERT` behind [`create_reblog`]: a reblog row is decision 6's
+/// `Announce` wearing status clothing — no text of its own (the `content`,
+/// `raw_text`, `content_type` and `spoiler_text` column defaults empty it),
+/// the original's conversation, `local` set, and the `{BASE_URL}/activities/
+/// {id}` uri rather than a plain status's `/objects/{id}`. It rides the
+/// partial unique index on `(user_id, reblog_of_id)`: a repeat reblog
+/// inserts nothing, and `RETURNING *` answers exactly the insert that
+/// happened — which is what tells the caller a counter step is owed.
+const INSERT_REBLOG_SQL: &str = "INSERT INTO statuses (
+     id, uri, url, user_id, visibility, conversation_id, reblog_of_id, local
+) VALUES (
+     $1, $2, $3, $4, $5, $6, $7, true
+) ON CONFLICT (user_id, reblog_of_id) WHERE deleted_at IS NULL DO NOTHING
+ RETURNING *";
+
+/// [`create_reblog`]'s restatement arm: the caller's live reblog of one
+/// original — at most one row, because the partial unique index keeps it
+/// so, and a withdrawn (tombstoned) reblog is no row at all.
+const LIVE_REBLOG_SQL: &str = "SELECT * FROM statuses
+      WHERE user_id = $1 AND reblog_of_id = $2 AND deleted_at IS NULL";
+
+/// [`remove_reblog`]: the same tombstone [`soft_delete`] writes, keyed on
+/// the live `(user, original)` pair instead of the row id so the withdrawal
+/// is one statement. `RETURNING *` hands the caller the row that went,
+/// which is what the write hook reports and the counter steps run on; a
+/// pair that never reblogged (or already withdrew) matches nothing, which
+/// is what makes the write idempotent.
+const TOMBSTONE_REBLOG_SQL: &str = "UPDATE statuses
+      SET content = '',
+          raw_text = '',
+          spoiler_text = '',
+          deleted_at = now(),
+          updated_at = now()
+     WHERE user_id = $1 AND reblog_of_id = $2 AND deleted_at IS NULL
+   RETURNING *";
+
+/// [`reblogged_status_ids`]: which of a batch of originals the viewer has
+/// a live reblog of. Only the ids that *have* a row come back; the caller's
+/// flag is membership in that set.
+const REBLOGGED_IDS_SQL: &str = "SELECT reblog_of_id FROM statuses
+      WHERE user_id = $1 AND reblog_of_id = ANY($2) AND deleted_at IS NULL";
+
+/// [`reblogger_page`]: the accounts that reblogged one original, each
+/// entry led by the id of the reblog row behind it — the id the page keys
+/// on. The text stops where its one placeholder belongs, because that is
+/// where [`reblogger_page`] pushes its bind; the live-row filter and the
+/// keyset then run on the reblog row id `s.id`.
+const REBLOGGERS_PAGE_SQL: &str = "SELECT s.id AS reblog_id, u.* FROM statuses s
+     JOIN users u ON u.id = s.user_id
+      WHERE s.reblog_of_id = ";
 
 /// [`soft_delete`]: a live row becomes a tombstone once, which is what makes
 /// the counter steps of the same transaction run exactly once per status.
@@ -676,6 +755,185 @@ pub async fn soft_delete_with_reblogs(pool: &PgPool, id: Uuid) -> AppResult<Opti
 pub async fn bump_counter(pool: &PgPool, id: Uuid, counter: Counter, delta: i32) -> AppResult<()> {
     let mut conn = pool.acquire().await?;
     step_counter(&mut conn, id, counter, delta).await
+}
+
+/// Records `user`'s reblog of `original` at `visibility` and answers the
+/// reblog row with a flag saying whether this call wrote it.
+///
+/// The row is what decision 6 stores an `Announce` as: empty content, the
+/// requested `visibility`, `local` set, the original's
+/// [`conversation_id`](Status::conversation_id), and the
+/// `{base_url}/activities/{uuid}` uri (the row *is* the activity; a plain
+/// local status owns `/objects/{uuid}` instead) with the usual
+/// `{base_url}/notice/{uuid}` human url. `base_url` is the instance origin,
+/// i.e. [`Config::base_url`](crate::config::Config::base_url), which the
+/// model layer is handed rather than reading configuration itself.
+///
+/// A user reblogs a given status once: the write rides the partial unique
+/// index on `(user_id, reblog_of_id)` (`WHERE deleted_at IS NULL`), so a
+/// repeat after a live row exists — or after a withdrawal if the pair is
+/// reblogged again in between — inserts nothing, steps nothing, and answers
+/// the row that is already there with `false`. Only the insert that
+/// happened moves the counters, in the same transaction as the row: the
+/// original's `reblogs_count` and the reblogger's `statuses_count` (and
+/// `last_status_at`, which the author-count step only ever moves forward),
+/// exactly as [`insert`] does for the reblog rows federation imports.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError). [`AppError::NotFound`]
+/// is the one row this write cannot answer: a reblog some concurrent
+/// withdrawal tombstoned between the conflict and the restatement read.
+pub async fn create_reblog(
+    pool: &PgPool,
+    base_url: &str,
+    user: &User,
+    original: &Status,
+    visibility: Visibility,
+) -> AppResult<(Status, bool)> {
+    let mut tx = pool.begin().await?;
+    let id = new_id();
+    let written = sqlx::query_as::<_, Status>(INSERT_REBLOG_SQL)
+        .bind(id)
+        .bind(format!("{base_url}/activities/{id}"))
+        .bind(format!("{base_url}/notice/{id}"))
+        .bind(user.id)
+        .bind(visibility)
+        .bind(original.conversation_id)
+        .bind(original.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let reblog = match written {
+        Some(row) => {
+            count_new_post(&mut tx, &row).await?;
+            (row, true)
+        }
+        None => (live_reblog(&mut tx, user.id, original.id).await?, false),
+    };
+    tx.commit().await?;
+    Ok(reblog)
+}
+
+/// Withdraws `user_id`'s reblog of `original_id`, answering the tombstone
+/// of the reblog row, or `None` when the pair has no live reblog to take.
+///
+/// The withdrawal is [`soft_delete`]'s move — the row stays as a tombstone
+/// with its text cleared and its `uri` reserved — keyed on the
+/// `(user_id, reblog_of_id)` pair so the caller never names the row, and
+/// idempotent for the same reason: a pair that never reblogged (or already
+/// withdrew) matches no live row, steps nothing and is not an error. The
+/// counters step back in the same transaction the tombstone goes into: the
+/// reblogger's `statuses_count` and the original's `reblogs_count` (through
+/// the same uncount step `soft_delete` runs, which reads both off the row),
+/// and any pin of the reblog row goes with it as it would on a delete.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError), and the rollback leaves
+/// the pair exactly as it was: a reblog and its counter steps go together
+/// or not at all.
+pub async fn remove_reblog(
+    pool: &PgPool,
+    user_id: Uuid,
+    original_id: Uuid,
+) -> AppResult<Option<Status>> {
+    let mut tx = pool.begin().await?;
+    let Some(tombstone) = sqlx::query_as::<_, Status>(TOMBSTONE_REBLOG_SQL)
+        .bind(user_id)
+        .bind(original_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+    uncount_deleted(&mut tx, &tombstone).await?;
+    clear_pins(&mut tx, tombstone.id).await?;
+    tx.commit().await?;
+    Ok(Some(tombstone))
+}
+
+/// Which of `original_ids` `user_id` has a live reblog of — the batched
+/// `reblogged` read the status renderer runs once per page
+/// (`docs/ARCHITECTURE.md` decision 13).
+///
+/// The answer is the membership set of *original* ids, not of reblog row
+/// ids: a caller keys a row's flag to the status the reblog lands on, which
+/// for a reblog row on the page is its own original (the same rule the
+/// `favourited` flag follows). An id with no live reblog row is simply
+/// absent, and an empty `original_ids` asks the database nothing at all.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn reblogged_status_ids(
+    pool: &PgPool,
+    user_id: Uuid,
+    original_ids: &[Uuid],
+) -> AppResult<HashSet<Uuid>> {
+    if original_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows = sqlx::query_as::<_, (Uuid,)>(REBLOGGED_IDS_SQL)
+        .bind(user_id)
+        .bind(original_ids)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The accounts that reblogged `original_id`, newest reblog first and
+/// `page`'s `limit` at a time, each entry carrying the id of the reblog row
+/// behind the account (see [`ReblogPageEntry`]).
+///
+/// This is the read behind `GET /api/v1/statuses/{id}/reblogged_by`
+/// (Pleroma's `reblogged_by`, which walks the original object's
+/// `announcements` list): the page keys on the *reblog row* id, so the
+/// endpoint's `max_id`/`min_id`/`since_id` cursors and its `Link` header
+/// carry reblog row ids, not account ids. A tombstoned reblog is off the
+/// page — a withdrawn boost names no reblogger. Who may see the list is the
+/// endpoint's gate (the shared status visibility check), not this query's.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn reblogger_page(
+    pool: &PgPool,
+    original_id: Uuid,
+    page: PageParams,
+) -> AppResult<Vec<ReblogPageEntry>> {
+    let mut builder = QueryBuilder::<Postgres>::new(REBLOGGERS_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(original_id);
+    let _live: &mut _ = builder.push(" AND s.deleted_at IS NULL");
+    page.apply_keyset(&mut builder, "s.id");
+    let entries = builder
+        .build_query_as::<ReblogPageEntry>()
+        .fetch_all(pool)
+        .await?;
+    Ok(page.finish(entries))
+}
+
+/// Reads the restatement arm of [`create_reblog`]: the caller's live reblog
+/// row of `original_id`, which the conflict says exists — unless a
+/// concurrent withdrawal tombstoned it in the same window, which is this
+/// read's only way to answer `None`.
+async fn live_reblog(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    original_id: Uuid,
+) -> AppResult<Status> {
+    let existing = sqlx::query_as::<_, Status>(LIVE_REBLOG_SQL)
+        .bind(user_id)
+        .bind(original_id)
+        .fetch_optional(conn)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(existing)
 }
 
 /// Reads the conversation the replied-to status belongs to, `None` when this
@@ -2117,6 +2375,410 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "cascade on user_id removed the author's statuses"
+        );
+    }
+
+    /// `author`'s reblog of the status `original` through the reblog write,
+    /// asserting this call created the row — the state the idempotence tests
+    /// start from.
+    async fn reblog_it(pool: &PgPool, author: &User, original: &Status) -> Status {
+        let (reblog, created) = create_reblog(pool, BASE, author, original, Visibility::Public)
+            .await
+            .expect("a reblog of a stored status writes");
+        assert!(created, "the fixture pair had not reblogged yet");
+        reblog
+    }
+
+    /// `author` reblogs `original` through the write, for tests that only
+    /// need the row to exist.
+    async fn reblog_as(pool: &PgPool, author: &User, original: &Status) {
+        let reblog = reblog_it(pool, author, original).await;
+        assert_eq!(
+            reblog.reblog_of_id,
+            Some(original.id),
+            "the fixture row names its original"
+        );
+    }
+
+    /// The stored `reblogs_count` of status `id`, named the way the reblog
+    /// tests read it.
+    async fn reblog_count(pool: &PgPool, id: Uuid) -> i32 {
+        counter(pool, id, Counter::Reblogs).await
+    }
+
+    #[tokio::test]
+    async fn create_reblog_writes_the_activity_row_and_steps_both_counters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "worth boosting").await;
+        let thread_member = reply(&pool, &alice, &original, "an answer").await;
+
+        let (reblog, created) = create_reblog(&pool, BASE, &bob, &original, Visibility::Unlisted)
+            .await
+            .unwrap();
+
+        assert!(created, "the first call wrote the row");
+        assert_eq!(
+            reblog.uri,
+            format!("{BASE}/activities/{}", reblog.id),
+            "a reblog row is the Announce: its uri is the activity id, not an object id"
+        );
+        assert_eq!(
+            reblog.url,
+            Some(format!("{BASE}/notice/{}", reblog.id)),
+            "and the human url derives from the same id as any local row's"
+        );
+        assert_eq!(reblog.content, "", "a reblog carries no text of its own");
+        assert_eq!(reblog.raw_text, "", "not even as source");
+        assert_eq!(
+            reblog.visibility,
+            Visibility::Unlisted,
+            "the requested visibility is the stored one"
+        );
+        assert!(reblog.local, "a boost made here is local");
+        assert_eq!(
+            reblog.reblog_of_id,
+            Some(original.id),
+            "the row names what it boosts"
+        );
+        assert_eq!(
+            reblog.conversation_id, original.conversation_id,
+            "a boost joins the conversation of what it boosts"
+        );
+        assert_eq!(
+            reblog.conversation_id, thread_member.conversation_id,
+            "which is the same thread the original's answers share"
+        );
+
+        assert_eq!(
+            reblog_count(&pool, original.id).await,
+            1,
+            "the original counts one boost"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            1,
+            "and so does the reblogger"
+        );
+    }
+
+    #[tokio::test]
+    async fn reblogging_twice_is_one_row_and_one_count() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "boost me once").await;
+        let first = reblog_it(&pool, &bob, &original).await;
+
+        let (again, created) = create_reblog(&pool, BASE, &bob, &original, Visibility::Public)
+            .await
+            .expect("repeating a reblog is not an error");
+
+        assert!(!created, "the repeat wrote nothing");
+        assert_eq!(
+            again.id, first.id,
+            "and answers the row that is already there"
+        );
+        assert_eq!(
+            again.visibility, first.visibility,
+            "the restated row keeps the visibility of the write that made it"
+        );
+        assert_eq!(
+            reblog_count(&pool, original.id).await,
+            1,
+            "one boost, one count"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            1,
+            "and the reblogger counts it once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_reblog_leaves_the_pair_free_again() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "boost, unboost, boost").await;
+        let first = reblog_it(&pool, &bob, &original).await;
+
+        let tombstone = remove_reblog(&pool, bob.id, original.id)
+            .await
+            .unwrap()
+            .expect("the live reblog was there to withdraw");
+        assert_eq!(
+            tombstone.id, first.id,
+            "the withdrawal answers the row that went"
+        );
+        assert!(tombstone.deleted_at.is_some(), "and it is a tombstone");
+        assert_eq!(
+            tombstone.reblog_of_id,
+            Some(original.id),
+            "the tombstone still names what it boosted"
+        );
+
+        let (second, created) = create_reblog(&pool, BASE, &bob, &original, Visibility::Public)
+            .await
+            .expect("reblogging after a withdrawal is allowed");
+        assert!(
+            created,
+            "the partial index is free again once the row is gone"
+        );
+        assert_ne!(second.id, first.id, "and the new boost is a new row");
+        assert_eq!(
+            reblog_count(&pool, original.id).await,
+            1,
+            "the original counts the survivor"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            1,
+            "and bob's own count came back up through it"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reblog_steps_both_counters_back_exactly_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "unboost me").await;
+        reblog_as(&pool, &bob, &original).await;
+
+        assert!(
+            remove_reblog(&pool, bob.id, original.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the first withdrawal finds the row"
+        );
+        assert_eq!(
+            reblog_count(&pool, original.id).await,
+            0,
+            "the original stops counting it"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            0,
+            "and so does the reblogger"
+        );
+
+        assert!(
+            remove_reblog(&pool, bob.id, original.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the second finds nothing to withdraw"
+        );
+        assert!(
+            remove_reblog(&pool, alice.id, original.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "and the author never reblogged their own post"
+        );
+        assert!(
+            remove_reblog(&pool, bob.id, new_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown original is nothing to withdraw"
+        );
+        assert_eq!(
+            reblog_count(&pool, original.id).await,
+            0,
+            "no step moved twice"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            0,
+            "and no author-count step ran twice either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_original_takes_the_reblog_flag_with_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "gone boosted").await;
+        reblog_as(&pool, &bob, &original).await;
+
+        assert!(
+            soft_delete_with_reblogs(&pool, original.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the delete finds the live original"
+        );
+        assert_eq!(
+            reblogged_status_ids(&pool, bob.id, &[original.id])
+                .await
+                .unwrap(),
+            HashSet::new(),
+            "the tombstoned boost flags nothing any more"
+        );
+        assert_eq!(
+            reblog_count(&pool, original.id).await,
+            0,
+            "and the count went down with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reblogged_status_ids_answers_the_live_pairs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let first = post(&pool, &alice, "first").await;
+        let second = post(&pool, &alice, "second").await;
+        let third = post(&pool, &alice, "third").await;
+        reblog_as(&pool, &bob, &first).await;
+        reblog_as(&pool, &bob, &third).await;
+        reblog_as(&pool, &carol, &second).await;
+
+        let asked = [first.id, second.id, third.id, new_id()];
+        let bob_ids = reblogged_status_ids(&pool, bob.id, &asked).await.unwrap();
+        assert!(
+            bob_ids.contains(&first.id) && bob_ids.contains(&third.id),
+            "bob's two boosts"
+        );
+        assert!(
+            !bob_ids.contains(&second.id),
+            "and carol's is nobody else's flag"
+        );
+        assert_eq!(
+            reblogged_status_ids(&pool, carol.id, &asked).await.unwrap(),
+            reblogged_status_ids(&pool, carol.id, &[second.id, second.id])
+                .await
+                .unwrap(),
+            "a duplicated ask answers the one flagged original"
+        );
+        assert!(
+            reblogged_status_ids(&pool, alice.id, &asked)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the author boosted none of their own posts"
+        );
+        assert_eq!(
+            reblogged_status_ids(&pool, bob.id, &[]).await.unwrap(),
+            HashSet::new(),
+            "an empty ask is an empty set"
+        );
+
+        assert!(
+            remove_reblog(&pool, bob.id, first.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "bob withdraws one boost"
+        );
+        assert_eq!(
+            reblogged_status_ids(&pool, bob.id, &[first.id, third.id])
+                .await
+                .unwrap(),
+            HashSet::from([third.id]),
+            "and the flagged set shrinks with it"
+        );
+    }
+
+    /// The page params `query` names, the way the extractor makes them.
+    fn page(query: &str) -> PageParams {
+        PageParams::from_query(Some(query), crate::pagination::MAX_LIMIT)
+            .expect("the fixture page parses")
+    }
+
+    #[tokio::test]
+    async fn the_reblogger_page_walks_the_reblog_row_ids() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let original = post(&pool, &alice, "boosted by many").await;
+        let other = post(&pool, &alice, "boosted once").await;
+        let mut rebloggers = Vec::new();
+        for n in 0..3 {
+            let booster = user(&pool, &format!("booster{n}")).await;
+            reblog_as(&pool, &booster, &original).await;
+            rebloggers.push(booster);
+        }
+        let lonely = user(&pool, "lonely").await;
+        reblog_as(&pool, &lonely, &other).await;
+        let all: Vec<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT id FROM statuses WHERE reblog_of_id = $1 ORDER BY id DESC",
+        )
+        .bind(original.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id,)| id)
+        .collect();
+        assert_eq!(all.len(), 3, "three live boosts of the one original");
+        let entry_ids = |entries: &[ReblogPageEntry]| -> Vec<Uuid> {
+            entries.iter().map(|entry| entry.reblog_id).collect()
+        };
+
+        let first_page = reblogger_page(&pool, original.id, page("limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            entry_ids(&first_page),
+            vec![all[0], all[1]],
+            "the two newest boosts, keyed on the reblog row ids"
+        );
+        assert_eq!(
+            first_page[0].user.id, rebloggers[2].id,
+            "and each entry carries the account behind its boost"
+        );
+
+        let older = reblogger_page(&pool, original.id, page(&format!("max_id={}", all[1])))
+            .await
+            .unwrap();
+        assert_eq!(
+            entry_ids(&older),
+            vec![all[2]],
+            "max_id continues where the page ended, and `other`'s boost is on no page"
+        );
+
+        assert!(
+            reblogger_page(&pool, original.id, page(&format!("max_id={}", all[2])))
+                .await
+                .unwrap()
+                .is_empty(),
+            "past the oldest boost the page is empty"
+        );
+
+        let newer = reblogger_page(&pool, original.id, page(&format!("min_id={}", all[2])))
+            .await
+            .unwrap();
+        assert_eq!(
+            entry_ids(&newer),
+            vec![all[0], all[1]],
+            "min_id answers the newer page, newest-first after the flip"
+        );
+
+        assert!(
+            remove_reblog(&pool, rebloggers[1].id, original.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the middle booster withdraws"
+        );
+        let after = reblogger_page(&pool, original.id, page("")).await.unwrap();
+        assert_eq!(
+            entry_ids(&after),
+            vec![all[0], all[2]],
+            "a withdrawn boost leaves the page"
         );
     }
 }

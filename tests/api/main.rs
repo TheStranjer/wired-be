@@ -170,6 +170,10 @@ mod pins;
 /// The per-route rate limiter: mounted buckets, headers, and 429s.
 mod rate_limit;
 
+/// Reblogs over HTTP (`/api/v1/statuses/{id}/reblog`, its `…/unreblog`
+/// twin and the `…/reblogged_by` listing).
+mod reblogs;
+
 /// `GET /api/v1/accounts/relationships`.
 mod relationships;
 

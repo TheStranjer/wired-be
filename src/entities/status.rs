@@ -24,7 +24,7 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `reblogged` and `muted` (the reblog and thread-mute tables);
+//! `muted` (the thread-mute table);
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
 //! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
 //! (chats, bookmark folders); and `quote` (the quoting ticket, whose
@@ -36,6 +36,12 @@
 //! — one batched read per page, the viewer's id deciding membership; a
 //! reblog row takes its flag from its original, whose id is where the
 //! like lives.
+//! `reblogged` is filled by the reblogs ticket, from
+//! [`reblogged_status_ids`](crate::models::status::reblogged_status_ids)
+//! — the same shape of batched read and the same keying as `favourited`:
+//! a row is flagged by the id its boost lands on, which for a reblog row
+//! is its *original's*, so the outer entity of the viewer's own boost
+//! answers `reblogged: true` and so does the nested original.
 //! `bookmarked` is filled by the bookmarks ticket, from
 //! [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) — the same
 //! shape of batched read; a reblog row takes its flag from *its own* id,
@@ -198,6 +204,17 @@ pub struct StatusSource<'a> {
     /// `favourited` off the liked object — and `false` for an anonymous
     /// viewer, who has no rows.
     pub favourited: bool,
+    /// Whether the viewer reblogged this row: membership in the one
+    /// [`reblogged_status_ids`](crate::models::status::reblogged_status_ids)
+    /// read the batch runs for the page, keyed — exactly like
+    /// [`favourited`](Self::favourited) — to the id the boost lands on,
+    /// which for a reblog row is its *original's*. So the outer entity of
+    /// the viewer's own boost answers `reblogged: true`, as does the
+    /// original itself; `false` for an anonymous viewer, who has no rows.
+    /// A third plain `bool` in this struct would trip the denied
+    /// `struct_excessive_bools`, so this flag rides the same [`JsonBool`]
+    /// newtype [`Account`]'s flags do.
+    pub reblogged: JsonBool,
     /// Whether the viewer bookmarked this row: membership in the one
     /// [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) read
     /// the batch runs for the page. The renderer keys every row's flag to
@@ -303,8 +320,11 @@ pub struct Status {
     /// batched read answers it, `false` for an anonymous viewer and for a
     /// post they have not liked.
     pub favourited: JsonBool,
-    /// Whether the viewer reblogged this post; `false` until the same
-    /// ticket's batched read of the viewer's own reblogs lands.
+    /// Whether the viewer reblogged this post; the reblogs ticket's
+    /// batched read answers it, `false` for an anonymous viewer and for a
+    /// post they have not boosted. A reblog row carries the flag of its
+    /// original — the status its own boost landed on — so the outer entity
+    /// of the viewer's boost reads `reblogged: true`.
     pub reblogged: JsonBool,
     /// Whether the viewer muted this post's thread; `false` until the
     /// thread-mute ticket lands.
@@ -353,6 +373,7 @@ impl Status {
             tags,
             reactions,
             favourited,
+            reblogged,
             bookmarked,
             pinned_at,
             reblog,
@@ -389,7 +410,7 @@ impl Status {
             poll: None,
             edited_at: row.edited_at,
             favourited: JsonBool(favourited),
-            reblogged: JsonBool(false),
+            reblogged,
             muted: JsonBool(false),
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
@@ -684,6 +705,9 @@ mod tests {
         reactions: Vec<SummaryRow>,
         /// Whether the viewer favourited the row.
         favourited: bool,
+        /// Whether the viewer reblogged the row, in the same [`JsonBool`]
+        /// wrapper the source field carries (the row's boost flags it).
+        reblogged: JsonBool,
         /// Whether the viewer bookmarked the row.
         bookmarked: bool,
         /// When the viewer pinned the row, `None` unless it is pinned: the
@@ -702,6 +726,7 @@ mod tests {
                 tags: Vec::new(),
                 reactions: Vec::new(),
                 favourited: false,
+                reblogged: JsonBool(false),
                 bookmarked: false,
                 pinned_at: None,
             }
@@ -747,6 +772,15 @@ mod tests {
             }
         }
 
+        /// Sets [`reblogged`](Self::reblogged): the viewer's flag, which
+        /// the reblogs ticket's batched read would hand the renderer.
+        fn boosted(self) -> Self {
+            Self {
+                reblogged: JsonBool(true),
+                ..self
+            }
+        }
+
         /// Sets [`bookmarked`](Self::bookmarked): the viewer's flag, which
         /// the bookmarks ticket's batched read would hand the renderer.
         fn bookmarked(self) -> Self {
@@ -781,6 +815,7 @@ mod tests {
             tags: &parts.tags,
             reactions: &parts.reactions,
             favourited: parts.favourited,
+            reblogged: parts.reblogged.clone(),
             bookmarked: parts.bookmarked,
             pinned_at: parts.pinned_at,
             reblog: reblog.map(Box::new),
@@ -802,6 +837,7 @@ mod tests {
                 tags: &[],
                 reactions: &[],
                 favourited: false,
+                reblogged: JsonBool(false),
                 bookmarked: false,
                 pinned_at: None,
                 reblog: None,
@@ -892,9 +928,11 @@ mod tests {
         assert_eq!(value["card"], Value::Null, "cards are a later ticket");
         assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
         assert_eq!(value["edited_at"], Value::Null);
-        for flag in ["reblogged", "muted"] {
-            assert_eq!(value[flag], false, "{flag} is a later ticket");
-        }
+        assert_eq!(
+            value["reblogged"], false,
+            "a page whose reblogs read found nothing renders the flag false"
+        );
+        assert_eq!(value["muted"], false, "muted is a later ticket");
         assert_eq!(
             value["pinned"], false,
             "a page whose pins read found nothing renders the flag false"
@@ -918,6 +956,17 @@ mod tests {
         assert_eq!(
             value["favourited"], true,
             "the favourites batch's membership reaches the entity verbatim"
+        );
+    }
+
+    #[test]
+    fn the_viewers_reblog_lands_in_the_flag() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).boosted(), None);
+        assert_eq!(
+            value["reblogged"], true,
+            "the reblogs batch's membership reaches the entity verbatim"
         );
     }
 
