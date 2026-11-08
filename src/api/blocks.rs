@@ -302,4 +302,4 @@ fn page_link(base_url: &str, path: &str, entries: &[(Block, User)]) -> Option<St
 /// [`Block::ap_id`]: crate::models::block::Block::ap_id
 /// [`Block::blocker_id`]: crate::models::block::Block::blocker_id
 /// [`Block::blocked_id`]: crate::models::block::Block::blocked_id
-const fn after_block_changed(_state: &AppState, _block: &Block, _blocking: bool) {}
+pub(crate) const fn after_block_changed(_state: &AppState, _block: &Block, _blocking: bool) {}

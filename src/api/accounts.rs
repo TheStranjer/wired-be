@@ -2319,7 +2319,7 @@ async fn unfollow_account(
 /// forbids silencing it, so the ticket that queues the `Follow` / `Undo`
 /// delivery grows the body and the `async` together and leaves these two
 /// call sites alone.
-const fn after_follow_changed(
+pub(crate) const fn after_follow_changed(
     _state: &AppState,
     _follower: &User,
     _target: &User,

@@ -9,14 +9,16 @@
 //! adds one route: `frontend_configurations`, Pleroma's
 //! `UtilController.frontend_configurations/2`, and
 //! [`pleroma_account_settings`] adds the account utilities of the same
-//! controller: `aliases` and `move_account`. Do not call
+//! controller: `aliases` and `move_account`, and [`pleroma_import`] the
+//! CSV imports of `UserImportController`: `follow_import`,
+//! `blocks_import` and `mutes_import`. Do not call
 //! [`Router::fallback`] here: unmatched paths must reach the app-wide JSON
 //! fallback in [`crate::app`].
 
 use axum::Router;
 
 use crate::{
-    api::{mfa, misc, pleroma_account_settings},
+    api::{mfa, misc, pleroma_account_settings, pleroma_import},
     state::AppState,
 };
 
@@ -26,4 +28,5 @@ pub fn router() -> Router<AppState> {
         .nest("/accounts/mfa", mfa::router())
         .merge(misc::frontend_configurations_router())
         .merge(pleroma_account_settings::router())
+        .merge(pleroma_import::router())
 }

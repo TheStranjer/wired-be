@@ -151,6 +151,9 @@ mod pleroma_account_settings;
 /// The Pleroma account extensions merged at `/api/pleroma/accounts`.
 mod pleroma_accounts;
 
+/// CSV imports of follows, blocks and mutes (`/api/pleroma/*_import`).
+mod pleroma_import;
+
 /// The frontend settings store, mascot and preferred frontend.
 mod pleroma_settings;
 
