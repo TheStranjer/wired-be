@@ -6,7 +6,8 @@
 //! `…/{id}/followers` and `…/{id}/following` are the reads;
 //! `PATCH /api/v1/accounts/update_credentials`,
 //! `POST /api/v1/accounts/{id}/note`, `…/{id}/remove_from_followers`,
-//! `…/{id}/follow` and `…/{id}/unfollow` are the writes.
+//! `…/{id}/follow`, `…/{id}/unfollow` and `POST /api/v1/follows` are the
+//! writes.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
 //! `.relationships`, `.followers` and `.following`
@@ -234,6 +235,28 @@
 //! `Follow` or its `Undo`; the later ticket wires that into this module's
 //! `after_follow_changed` hook.
 //!
+//! `POST /api/v1/follows` is Pleroma's `AccountController.follow_by_uri`
+//! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`): the
+//! legacy Mastodon spelling of the follow write, keyed by handle instead of
+//! by id. Same gates as `…/{id}/follow` — [`AuthUser`] plus the
+//! `write:follows` / `follow` scope, the limiter's `relations_actions`
+//! bucket — and the same two optional toggles, arriving beside the required
+//! `uri` through [`ApiParams`]. The `uri` names the target three ways: an
+//! `acct` handle (`user@domain`, with or without the leading `@`), resolved
+//! by [`get_or_fetch_by_acct`], or an actor URL, resolved by
+//! [`get_or_fetch_by_ap_id`]; both answer from the stored rows first and
+//! reach for `WebFinger` and the
+//! actor fetch only for a handle this instance has never seen. What the
+//! fetch then does is exactly what `…/{id}/follow` does with its resolved
+//! account — the same [`follow::follow`] write, the same toggles, the same
+//! `after_follow_changed` hook and the same refusals (a target that resolves
+//! to no live account is the shared 404, following yourself the model's
+//! 422). The answer is the target's [`Account`] entity rendered for the
+//! caller — not the [`Relationship`] the id-keyed route answers — because
+//! this legacy endpoint returns the account it followed, with the caller's
+//! relationship embedded in `pleroma.relationship`. An absent, blank or
+//! `null` `uri` is Mastodon's 400 "Missing parameter: uri".
+//!
 //! `POST /api/v1/accounts` is open-mode registration: Pleroma's
 //! `AccountController.create` (`lib/pleroma/web/mastodon_api/controllers/
 //! account_controller.ex`) over `Registration.register_user`
@@ -292,6 +315,7 @@ use uuid::Uuid;
 use crate::{
     api::{
         helpers::{account_or_404, requested_ids},
+        pleroma_account_settings::looks_like_ap_id,
         pleroma_settings::{check_store_size, shallow_merge},
     },
     auth::{AppAuth, AuthUser, MaybeAuthUser, require_scope},
@@ -304,6 +328,10 @@ use crate::{
     extract::{
         ApiBody, ApiParams, flex, index_map_to_vec,
         multipart::{MultipartForm, UploadedFile, UploadedFiles as _, upload_body_limit},
+    },
+    federation::{
+        fetch_actor::{get_or_fetch_by_acct, get_or_fetch_by_ap_id},
+        webfinger_client::strip_finger_prefixes,
     },
     models::{
         account_note,
@@ -330,6 +358,10 @@ use crate::{
 /// The 400 body message when the `acct` query parameter is absent or blank
 /// (Mastodon's `ParameterMissing` wording).
 const MISSING_ACCT: &str = "Missing parameter: acct";
+
+/// The 400 body message when the `uri` parameter of `POST /api/v1/follows`
+/// is absent, blank or `null` (Mastodon's `ParameterMissing` wording).
+const MISSING_URI: &str = "Missing parameter: uri";
 
 /// The longest `comment` `POST /api/v1/accounts/{id}/note` accepts
 /// (Mastodon's `AccountNote` limit).
@@ -466,8 +498,9 @@ const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 ///
 /// `POST /accounts` runs in the limiter's `app_account_creation` bucket
 /// (Pleroma throttles registration there; see [`crate::rate_limit`]), so
-/// the whole `state` rides along for the middleware layer. The two follow
-/// routes run in `relations_actions`, the bucket Pleroma throttles every
+/// the whole `state` rides along for the middleware layer. The follow
+/// routes (`POST /accounts/{id}/follow`, `…/unfollow` and `POST /follows`)
+/// run in `relations_actions`, the bucket Pleroma throttles every
 /// relationship write through.
 ///
 /// [`DEFAULT_AVATAR_LIMIT_BYTES`]: crate::config::DEFAULT_AVATAR_LIMIT_BYTES
@@ -477,6 +510,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
             "/accounts",
             post(create_account)
                 .layer(crate::rate_limit::rate_limit(state, "app_account_creation")),
+        )
+        .route(
+            "/follows",
+            post(follow_by_uri).layer(crate::rate_limit::rate_limit(state, "relations_actions")),
         )
         .route("/accounts/verify_credentials", get(verify_credentials))
         .route(
@@ -2099,6 +2136,123 @@ async fn store_toggles(
     Ok(updated.unwrap_or(created))
 }
 
+/// The request parameters of `POST /api/v1/follows`: the required `uri`
+/// beside the same two per-follow [`toggles`](FollowParams) the id-keyed
+/// follow route reads, from the query string, a form body or a JSON body
+/// alike ([`ApiParams`], decision 10). `uri` is optional in the type only
+/// because its absence is the documented 400 the type cannot express (the
+/// [`LookupQuery`] pattern); the toggles are the documented optionals,
+/// each a [`flex::opt_bool`] so a form's `"1"` spells the same as JSON
+/// `true` and anything else is the extractor's 422.
+#[derive(Debug, Deserialize)]
+struct FollowByUriParams {
+    /// The account to follow: `user@domain`, `@user@domain` or an actor
+    /// URL, resolved by [`resolve_follow_target`].
+    #[serde(default)]
+    uri: Option<String>,
+    /// Mastodon's `reblogs`, the row's [`Follow::show_reblogs`] column.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    reblogs: Option<bool>,
+    /// Mastodon's `notify`, the row's [`Follow::notify`] column.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    notify: Option<bool>,
+}
+
+impl FollowByUriParams {
+    /// The toggles exactly as [`FollowParams::into_toggles`] reads them for
+    /// the id-keyed route: an absent one keeps what the row holds. Not a
+    /// `const fn` like that one, because this type owns the `uri` text.
+    fn into_toggles(self) -> FollowToggles {
+        FollowToggles {
+            show_reblogs: self.reblogs,
+            notify: self.notify,
+        }
+    }
+}
+
+/// `POST /api/v1/follows` — follow the account a `uri` names (Pleroma's
+/// `.follow_by_uri`) and answer its [`Account`] entity rendered for the
+/// caller, their [`Relationship`] embedded in `pleroma.relationship`.
+///
+/// The gates and the write are [`follow_account`]'s, applied to a target
+/// resolved from the parameter instead of the path: the scope check first,
+/// then the `uri` ([`MISSING_URI`] for an absent, blank or `null` one),
+/// then [`resolve_follow_target`], and the very same
+/// [`follow::follow`] + [`store_toggles`] sequence, the same log and the
+/// same [`after_follow_changed`] hook — so the self refusal, the block
+/// refusal and the locked-target request are the model's own answers.
+/// Where Pleroma's controller hands off to the relationship-rendering
+/// `follow` action, this legacy Mastodon endpoint answers the followed
+/// account itself (decision: the ticket pins the [`Account`] entity).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:follows | follow` check; [`AppError::BadRequest`] for a
+/// missing `uri`; [`AppError::NotFound`] when the `uri` resolves to no live
+/// account; [`AppError::Unprocessable`] with `"Can not follow yourself"`
+/// or the extractor's message when a toggle is not a boolean; the model's
+/// [`AppError::Forbidden`] block refusal. Any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn follow_by_uri(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiParams(params): ApiParams<FollowByUriParams>,
+) -> AppResult<Json<Account>> {
+    auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
+    let Some(uri) = params
+        .uri
+        .as_deref()
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty())
+    else {
+        return Err(AppError::BadRequest(MISSING_URI.to_owned()));
+    };
+    let target = resolve_follow_target(&state, uri).await?;
+    let toggles = params.into_toggles();
+    let created = follow::follow(&state.db, &state.config.base_url, &auth.0, &target).await?;
+    let stored = store_toggles(&state, created, toggles).await?;
+    debug!(
+        follow = %stored.id,
+        user = %auth.0.id,
+        target = %target.id,
+        granted = stored.state == FollowState::Accepted,
+        reblogs = stored.show_reblogs,
+        notifying = stored.notify,
+        "account followed by uri"
+    );
+    after_follow_changed(&state, &auth.0, &target, Some(&stored), true);
+    Ok(Json(render_account(&state, Some(&auth.0), &target).await?))
+}
+
+/// Resolves the `uri` parameter of [`follow_by_uri`] to the target row:
+/// an `http(s)` URL goes through [`get_or_fetch_by_ap_id`], anything else
+/// is an `acct` handle — with a leading `@` or `acct:` prefix stripped —
+/// through [`get_or_fetch_by_acct`]. Both answer from the stored rows
+/// first, so a local account or a mirror resolves without the network,
+/// and only an unseen handle reaches for `WebFinger` and the actor fetch.
+/// Whatever the fetchers refuse — an unresolvable handle, an unreachable
+/// or invalid actor, an unknown local URL — and a row that resolves but
+/// is deactivated is the same shared [`AppError::NotFound`] the id-keyed
+/// routes give through [`account_or_404`]; the fetcher's own reason is
+/// logged, never sent (decision 8).
+async fn resolve_follow_target(state: &AppState, uri: &str) -> AppResult<User> {
+    let fetched = if looks_like_ap_id(uri) {
+        get_or_fetch_by_ap_id(state, uri).await
+    } else {
+        get_or_fetch_by_acct(state, strip_finger_prefixes(uri)).await
+    };
+    let resolved = fetched.map_err(|err| {
+        debug!(%err, uri, "follow target could not be resolved");
+        AppError::NotFound
+    })?;
+    if resolved.is_active.get() {
+        Ok(resolved)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
 /// `POST /api/v1/accounts/{id}/unfollow` — withdraw the caller's follow of the
 /// account and answer their [`Relationship`] to it, `following: false` and
 /// `requested: false` afterwards.
@@ -3201,5 +3355,49 @@ mod tests {
             7,
             "exactly the ticket's seven keys, no `me`"
         );
+    }
+
+    /// Deserializes a `POST /api/v1/follows` parameter map, the way the
+    /// extractor hands form bodies over (every value a string).
+    fn follow_by_uri_params(pairs: &[(&str, &str)]) -> FollowByUriParams {
+        let map = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), json!(value)))
+            .collect::<Map<String, Value>>();
+        serde_json::from_value(Value::Object(map)).expect("the fixture params parse")
+    }
+
+    #[test]
+    fn follow_by_uri_keeps_only_the_toggles_the_request_named() {
+        let toggles = follow_by_uri_params(&[("uri", "@bob@test.example"), ("notify", "true")])
+            .into_toggles();
+        assert_eq!(
+            (toggles.show_reblogs, toggles.notify),
+            (None, Some(true)),
+            "the named `notify` moves, the absent `reblogs` keeps the row"
+        );
+        let bare = follow_by_uri_params(&[("uri", "bob")]).into_toggles();
+        assert!(bare.is_empty(), "a follow naming no toggle writes nothing");
+    }
+
+    #[test]
+    fn follow_by_uri_reads_the_uri_wherever_it_was_sent() {
+        let json: FollowByUriParams =
+            serde_json::from_str(r#"{"uri": "https://remote.example/users/bob"}"#)
+                .expect("a JSON body parses");
+        assert_eq!(
+            json.uri.as_deref(),
+            Some("https://remote.example/users/bob"),
+            "the JSON spelling"
+        );
+        let nulled = follow_by_uri_params(&[("uri", "")]);
+        assert_eq!(
+            nulled.uri.as_deref(),
+            Some(""),
+            "the form's empty string reads empty"
+        );
+        let absent: FollowByUriParams =
+            serde_json::from_str(r#"{"uri": null}"#).expect("a null parses");
+        assert_eq!(absent.uri, None, "and a JSON null is the absent one");
     }
 }
