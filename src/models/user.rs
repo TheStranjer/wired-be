@@ -29,6 +29,7 @@ use uuid::Uuid;
 use crate::{config::Config, error::AppResult, pagination::PageParams, util::id::new_id};
 
 pub mod mfa;
+pub mod notification_settings;
 pub mod register;
 
 /// `actor_type` a [`NewUser`] starts with: the `ActivityPub` default actor
@@ -200,6 +201,13 @@ pub struct User {
     /// Client settings the server only stores and round-trips
     /// (`pleroma.settings_store`): a JSON object.
     pub settings_store: Value,
+    /// Per-account notification flags: the jsonb blob parsed by
+    /// [`notification_settings::NotificationSettings`]
+    /// (`block_from_strangers`, `hide_notification_contents`), written by
+    /// `PUT /api/pleroma/notification_settings` and read by
+    /// [`maybe_notify`](crate::models::notification::maybe_notify) and the
+    /// account entity.
+    pub notification_settings: Value,
     /// Profile background image URL, if set (unlike the avatar and banner
     /// it has no instance default).
     pub background_image_url: Option<String>,
@@ -311,6 +319,7 @@ impl fmt::Debug for User {
             .field("language", &self.language)
             .field("tags", &self.tags)
             .field("settings_store", &self.settings_store)
+            .field("notification_settings", &self.notification_settings)
             .field("background_image_url", &self.background_image_url)
             .field("birthday", &self.birthday)
             .field("show_birthday", &self.show_birthday)
@@ -435,6 +444,10 @@ pub struct NewUser {
     pub tags: Vec<String>,
     /// Client settings blob; the empty JSON object by default.
     pub settings_store: Value,
+    /// Per-account notification flags; the all-off
+    /// [`notification_settings::NotificationSettings`] blob by default,
+    /// matching the column default.
+    pub notification_settings: Value,
     /// Profile background image URL.
     pub background_image_url: Option<String>,
     /// The account's birthday, if any.
@@ -532,6 +545,7 @@ impl fmt::Debug for NewUser {
             .field("language", &self.language)
             .field("tags", &self.tags)
             .field("settings_store", &self.settings_store)
+            .field("notification_settings", &self.notification_settings)
             .field("background_image_url", &self.background_image_url)
             .field("birthday", &self.birthday)
             .field("show_birthday", &self.show_birthday)
@@ -604,6 +618,7 @@ impl Default for NewUser {
             language: None,
             tags: Vec::new(),
             settings_store: json!({}),
+            notification_settings: notification_settings::NotificationSettings::default_value(),
             background_image_url: None,
             birthday: None,
             show_birthday: Flag::new(false),
@@ -673,13 +688,13 @@ const INSERT_SQL: &str = "INSERT INTO users (
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
      preferred_frontend, raw_fields, is_suggested, registration_reason,
-     password_reset_pending
+     password_reset_pending, notification_settings
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64
+     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65
 ) RETURNING *";
 
 /// Inserts `new_user` on `executor` — the pool or an open transaction —
@@ -765,6 +780,7 @@ where
         .bind(new_user.is_suggested)
         .bind(new_user.registration_reason.as_deref())
         .bind(new_user.password_reset_pending)
+        .bind(new_user.notification_settings.clone())
         .fetch_one(executor)
         .await?;
     Ok(user)
@@ -1766,6 +1782,11 @@ mod tests {
             json!({"enabled": false, "totp": {"secret": null, "confirmed": false}, "backup_codes": []}),
             "mfa_settings defaults to the migration's all-off blob"
         );
+        assert_eq!(
+            user.notification_settings,
+            notification_settings::NotificationSettings::default_value(),
+            "notification_settings defaults to the migration's all-off blob"
+        );
         assert!(
             user.preferred_frontend.is_none(),
             "an account that never picked a frontend has no preference"
@@ -2325,11 +2346,6 @@ mod tests {
             new.tags.is_empty() && new.also_known_as.is_empty(),
             "the array columns start empty"
         );
-        assert_eq!(
-            new.settings_store,
-            json!({}),
-            "the settings blob starts as an empty object"
-        );
         assert!(
             new.background_image_url.is_none()
                 && new.birthday.is_none()
@@ -2339,10 +2355,26 @@ mod tests {
                 && new.language.is_none(),
             "the nullable columns start NULL"
         );
+        assert_jsonb_defaults(&new);
+    }
+
+    /// The jsonb columns of a [`NewUser`], each at its column default:
+    /// the settings blob empty, the MFA and notification blobs all-off.
+    fn assert_jsonb_defaults(new: &NewUser) {
+        assert_eq!(
+            new.settings_store,
+            json!({}),
+            "the settings blob starts as an empty object"
+        );
         assert_eq!(
             new.mfa_settings,
             mfa::MfaSettings::default_value(),
             "the MFA blob starts at the migration's all-off default"
+        );
+        assert_eq!(
+            new.notification_settings,
+            notification_settings::NotificationSettings::default_value(),
+            "the notification flags start at the migration's all-off default"
         );
     }
 

@@ -718,8 +718,11 @@ async fn show_reveals_the_private_pleroma_state_to_the_owner() {
     );
     assert_eq!(
         body["pleroma"]["notification_settings"],
-        json!({}),
-        "the notification settings are a placeholder for now"
+        json!({
+            "block_from_strangers": false,
+            "hide_notification_contents": false,
+        }),
+        "the owner sees the all-off settings the account starts with"
     );
 }
 

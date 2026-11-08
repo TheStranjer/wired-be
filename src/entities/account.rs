@@ -40,8 +40,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    config::Config, entities::relationship::RelationshipMap, models::user::User,
-    services::media_proxy, util::time::mastodon_time,
+    config::Config,
+    entities::relationship::RelationshipMap,
+    models::user::{User, notification_settings::NotificationSettings},
+    services::media_proxy,
+    util::time::mastodon_time,
 };
 
 /// The `actor_type` value that makes the entity's `group` flag true.
@@ -265,8 +268,11 @@ pub struct PleromaMetadata {
     /// markers arrive with a later ticket, so it is always `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unread_notifications_count: Option<i32>,
-    /// `notification_settings`: own viewer only; `{}` until the
-    /// notification-settings ticket stores them.
+    /// `notification_settings`: own viewer only; the account's flags as
+    /// the canonical object `{"block_from_strangers": …,
+    /// "hide_notification_contents": …}` (Pleroma's
+    /// `maybe_put_notification_settings`, which renders the whole
+    /// `User.NotificationSetting` for the owner).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notification_settings: Option<Value>,
     /// `settings_store`: own viewer only; the stored blob, which the server
@@ -657,11 +663,12 @@ fn pleroma_metadata(user: &User, is_self: bool, relationship: Value) -> PleromaM
         deactivated: JsonBool(!user.is_active.get()),
         ap_id: user.ap_id.clone(),
         // Chat and the notification markers are not implemented here, so
-        // the owner sees zeroes and the empty settings placeholder; the
-        // tickets that add them fill these in.
+        // the owner sees zeroes and the chat token is the empty
+        // placeholders those tickets leave; the notification flags are
+        // the stored column, rendered in their canonical shape.
         unread_conversation_count: is_self.then_some(0),
         unread_notifications_count: is_self.then_some(0),
-        notification_settings: is_self.then(|| json!({})),
+        notification_settings: is_self.then(|| NotificationSettings::for_user(user).to_value()),
         settings_store: is_self.then(|| user.settings_store.clone()),
         chat_token: is_self.then_some(Value::Null),
         birthday: (is_self || user.show_birthday.get()).then(|| birthday_json(user)),
@@ -904,6 +911,7 @@ mod tests {
             language: None,
             tags: Vec::new(),
             settings_store: json!({}),
+            notification_settings: NotificationSettings::default_value(),
             mfa_settings: crate::models::user::mfa::MfaSettings::default_value(),
             background_image_url: None,
             birthday: None,
@@ -1250,7 +1258,10 @@ mod tests {
     }
 
     /// A local `alice` whose Pleroma columns are all set: profile tags, a
-    /// background image, a birthday and a stored client-settings blob.
+    /// background image, a birthday, a stored client-settings blob and a
+    /// `block_from_strangers` flag stored without its sibling key (which
+    /// the entity renders back at its default, proving the canonical
+    /// shape).
     fn alice_with_pleroma_profile() -> User {
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
         alice.local = Flag::new(true);
@@ -1258,6 +1269,7 @@ mod tests {
         alice.background_image_url = Some(format!("{BASE}/bg.png"));
         alice.birthday = NaiveDate::from_ymd_opt(1990, 1, 31);
         alice.settings_store = json!({"pleroma_fe": {"theme": "dark"}});
+        alice.notification_settings = json!({"block_from_strangers": true});
         alice
     }
 
@@ -1304,15 +1316,19 @@ mod tests {
                 "ap_id": format!("{BASE}/users/alice"),
                 "unread_conversation_count": 0,
                 "unread_notifications_count": 0,
-                "notification_settings": {},
+                "notification_settings": {
+                    "block_from_strangers": true,
+                    "hide_notification_contents": false,
+                },
                 "settings_store": {"pleroma_fe": {"theme": "dark"}},
                 "chat_token": null,
                 "birthday": "1990-01-31",
                 "show_birthday": false,
             }),
             "the owner's pleroma block: chat and notification counters are \
-             zeroes and empty placeholders until their tickets land, and \
-             the chat token is null"
+             zeroes until their tickets land, the chat token is null, and \
+             the notification flags render the stored column in its \
+             canonical shape"
         );
     }
 

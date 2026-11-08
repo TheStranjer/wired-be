@@ -137,6 +137,10 @@ mod mutes;
 /// NodeInfo (`/.well-known/nodeinfo` and `/nodeinfo/{version}`).
 mod nodeinfo;
 
+/// Pleroma's notification settings (`PUT /api/pleroma/notification_settings`)
+/// and the owner-only render of the flags.
+mod notification_settings;
+
 /// The flat notification API: `clear`, the dismissals, `destroy_multiple`
 /// and Pleroma's `read` (`/api/v1/notifications`, `/api/pleroma`).
 mod notifications;
