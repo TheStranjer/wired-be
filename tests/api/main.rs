@@ -51,6 +51,10 @@ mod authorized_fetch;
 /// The blocks endpoints (`block`, `unblock` and the blocks list).
 mod blocks;
 
+/// The bookmark writes and the bookmarks list over HTTP
+/// (`/api/v1/statuses/{id}/bookmark` and `GET /api/v1/bookmarks`).
+mod bookmarks;
+
 /// The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 twin).
 mod chats;
 
