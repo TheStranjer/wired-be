@@ -12,7 +12,9 @@
 //! the state listing `GET /api/v1/statuses/{id}/reblogged_by`, the bookmark
 //! writes `POST /api/v1/statuses/{id}/bookmark` and its `…/unbookmark`
 //! twin, the caller's own bookmarks list `GET /api/v1/bookmarks`, the pin
-//! writes `POST /api/v1/statuses/{id}/pin` and its `…/unpin` twin,
+//! writes `POST /api/v1/statuses/{id}/pin` and its `…/unpin` twin, the
+//! thread-mute writes `POST /api/v1/statuses/{id}/mute` and its
+//! `…/unmute` twin,
 //! `POST /api/v1/statuses/{id}/translate` and the write
 //! `DELETE /api/v1/statuses/{id}`.
 //!
@@ -21,7 +23,8 @@
 //! for the reads, `favourite` / `unfavourite` / `favourited_by` /
 //! `favourites` for the likes, `reblog` / `unreblog` / `reblogged_by`
 //! for the boosts, `bookmark` / `unbookmark` / `bookmarks`
-//! for the bookmarks, and `delete` — with
+//! for the bookmarks, `mute_conversation` / `unmute_conversation`
+//! for the thread mutes, and `delete` — with
 //! `Pleroma.Web.CommonAPI.delete/2`
 //! (`lib/pleroma/web/common_api.ex`, whose `repeat` / `unrepeat` stand
 //! behind the boosts) — for the writes. Those
@@ -222,6 +225,37 @@
 //! this module's `after_pin_changed` hook, the documented empty landing
 //! point like `after_favourite_changed`'s.
 //!
+//! # The thread-mute writes
+//!
+//! `POST …/mute` and `POST …/unmute` are Pleroma's `mute_conversation` and
+//! `unmute_conversation` (`StatusController` over `Pleroma.ThreadMute`,
+//! `lib/pleroma/thread_mute.ex`): a user token ([`AuthUser`]) with
+//! `write:mutes` (the grant Pleroma's `StatusController` pipeline names for
+//! exactly these two actions), both answering the [`Status`] entity as the
+//! caller sees it — `muted` true and `pleroma.thread_muted` true after the
+//! mute, both false after the withdrawal, since the row is re-read for the
+//! render and the renderer's batched thread-mute read now names the caller.
+//! The mute is a fact about the status's **thread** (its
+//! [`conversation_id`](crate::models::status::Status::conversation_id)),
+//! never about the named row alone, and it is stored by
+//! [`crate::models::conversation_mute`] — the same table the streaming
+//! socket filters on and the notification tickets suppress through.
+//!
+//! Behind the shared [`status_for_viewer_or_404`] gate stands the
+//! participation rule Mastodon requires of these routes: only an account
+//! that *is part of* the conversation may mute it — authored a status in it
+//! or mentioned in one ([`participates_in`](crate::models::conversation_mute::participates_in),
+//! the ticket's two-way query). A caller who is neither answers the same
+//! 404 `{"error":"Record not found"}` as an invisible status, so the route
+//! never tells a stranger what exists or who posts in a thread. `…/mute`
+//! applies the rule; `…/unmute` does not need it — an open thread withdraws
+//! to nothing, and [`unmute`](crate::models::conversation_mute::unmute)
+//! deletes whatever pair it is given, so both writes are idempotent: a
+//! repeat mute is one row and one 200, and a withdrawal that found nothing
+//! is the unchanged entity with 200. Neither write federates anything and
+//! neither rides a throttle bucket: a thread mute is the account's own
+//! private view choice, exactly like a bookmark.
+//!
 //! Neither favourite write federates anything yet: the federation ticket
 //! that sends the `Like` activity and its `Undo` wires into this module's
 //! `after_favourite_changed` hook, the documented empty landing point,
@@ -308,7 +342,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
-        block, bookmark,
+        block, bookmark, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
         mute, notification,
         pinned_status::{self, PinnedStatus},
@@ -318,7 +352,7 @@ use crate::{
     },
     oauth::scopes::{
         READ_BOOKMARKS, READ_FAVOURITES, READ_STATUSES, WRITE_ACCOUNTS, WRITE_BOOKMARKS,
-        WRITE_FAVOURITES, WRITE_STATUSES,
+        WRITE_FAVOURITES, WRITE_MUTES, WRITE_STATUSES,
     },
     pagination::{PageParams, link_header, set_link_header},
     services::{
@@ -412,14 +446,16 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
 ///
-/// `state` reaches the five status writes — the two favourite ones, the
-/// two reblog ones and `DELETE /api/v1/statuses/{id}` — which mount the
+/// `state` reaches the six status writes that mount the
 /// `statuses_actions` throttle bucket the way the reports route does (see
-/// [`crate::rate_limit`]). ride no bucket: the ticket pins the throttle for
-/// the like writes, the boost writes and the
-/// delete only, and a bookmark is a private per-account fact no client can
-/// hammer on anyone else's data with — which a pin is too, since
-/// `pin_refusal` admits only the caller's own statuses.
+/// [`crate::rate_limit`]): the two favourite ones, the two reblog ones and
+/// `DELETE /api/v1/statuses/{id}`. The other writes ride no bucket — the
+/// two thread-mute ones like the bookmark and pin ones do, because a
+/// thread mute is a private per-account view choice no client can hammer on
+/// anyone else's data with; the ticket pins the throttle for the like
+/// writes, the boost writes and the delete only, and a bookmark is a
+/// private per-account fact — which a pin is too, since `pin_refusal`
+/// admits only the caller's own statuses.
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/favourites", get(list_favourites))
@@ -454,6 +490,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/statuses/{id}/unbookmark", post(unbookmark_status))
         .route("/statuses/{id}/pin", post(pin_status))
         .route("/statuses/{id}/unpin", post(unpin_status))
+        .route("/statuses/{id}/mute", post(mute_conversation))
+        .route("/statuses/{id}/unmute", post(unmute_conversation))
         .route("/statuses/{id}/translate", post(translate_status))
 }
 
@@ -1382,6 +1420,90 @@ async fn unpin_status(
         );
         after_pin_changed(&state, &removed, false);
     }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `POST /api/v1/statuses/{id}/mute` — mute the thread the status `id`
+/// belongs to and answer that status as the caller sees it: `muted` true
+/// and `pleroma.thread_muted` true, because the row is re-read for the
+/// render and the renderer's batched thread-mute read now names the caller.
+///
+/// The status resolves through the shared [`status_for_viewer_or_404`], so
+/// a malformed, unknown, deleted or invisible id is the module's one 404 —
+/// Pleroma's `mute_conversation` renders its `:not_found` and `:visibility_error`
+/// arms alike. Behind that gate stands the participation rule this instance
+/// takes from Mastodon: the caller must have authored a status in the
+/// conversation or be mentioned in one, and [`participates_in`] answers for
+/// both halves in one read. A stranger to the thread gets the same 404 the
+/// invisible status gets — the route says nothing about threads the caller
+/// is not part of. The write
+/// ([`mute`](crate::models::conversation_mute::mute)) is idempotent on
+/// `(account, thread)`: a repeat mute is one row, the same flags and one
+/// 200. Nothing federates, and the route rides no throttle bucket.
+///
+/// [`participates_in`]: crate::models::conversation_mute::participates_in
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:mutes` check; [`AppError::NotFound`] for a malformed,
+/// unknown, deleted or invisible status, for a caller who is not part of
+/// the thread, for the row a delete took between the gate and the re-read,
+/// and for the one row the render cannot answer. Any database failure
+/// arrives through `?` as [`AppError::Database`].
+async fn mute_conversation(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_MUTES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if !conversation_mute::participates_in(&state.db, auth.0.id, row.conversation_id).await? {
+        return Err(AppError::NotFound);
+    }
+    conversation_mute::mute(&state.db, auth.0.id, row.conversation_id).await?;
+    debug!(
+        conversation = %row.conversation_id,
+        user = %auth.0.id,
+        "thread muted"
+    );
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `POST /api/v1/statuses/{id}/unmute` — withdraw the caller's mute of the
+/// thread the status `id` belongs to and answer that status as they see it:
+/// `muted` false and `pleroma.thread_muted` false, since the row is re-read
+/// for the render and the renderer's batched thread-mute read no longer
+/// names the thread.
+///
+/// The same [`status_for_viewer_or_404`] gate as [`mute_conversation`], and
+/// the same 404 for everything it hides; the participation rule is not
+/// re-asked here — Pleroma's `unmute_conversation` asks only visibility, and
+/// withdrawing a fact that cannot exist is harmless either way.
+/// [`unmute`](crate::models::conversation_mute::unmute) deletes whatever
+/// pair it is given and is content with none, so a mute that was never made
+/// (or already withdrawn) changes nothing and is the unchanged [`Status`]
+/// with 200.
+///
+/// # Errors
+///
+/// Those of [`mute_conversation`] minus the participation refusal: an
+/// account with no place in the thread can still withdraw a mute nobody
+/// else's call ever wrote. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn unmute_conversation(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_MUTES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    conversation_mute::unmute(&state.db, auth.0.id, row.conversation_id).await?;
+    debug!(
+        conversation = %row.conversation_id,
+        user = %auth.0.id,
+        "thread unmuted"
+    );
     current_entity(&state, &auth.0, row.id).await
 }
 
