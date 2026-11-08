@@ -968,12 +968,9 @@ impl Config {
             .map_err(ConfigError::InvalidBindAddr)?;
         let base_url_raw = required_var(&lookup, BASE_URL_VAR)?;
         let base_url = normalize_base_url(&base_url_raw)?;
-        let (instance_name, instance_description, contact_email, instance_languages) =
-            instance_profile(&lookup);
-        let (max_status_chars, max_media_attachments, max_poll_options, max_chat_message_chars) =
-            content_limits(&lookup)?;
-        let (max_media_description, max_display_name_chars, max_bio_chars, max_profile_fields) =
-            text_length_limits(&lookup)?;
+        let profile = instance_profile(&lookup);
+        let limits = content_limits(&lookup)?;
+        let text = text_length_limits(&lookup)?;
         let (max_image_pixels, max_report_comment, max_pinned_statuses) = cap_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
@@ -981,27 +978,25 @@ impl Config {
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
         let auth = auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
-        let (registrations_open, invites_enabled, search_gate, available_frontends) =
-            client_exposure(&lookup)?;
+        let exposure = client_exposure(&lookup)?;
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
-        let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
-            mailer_settings(&lookup, domain_of(&base_url))?;
+        let mailer = mailer_settings(&lookup, domain_of(&base_url))?;
         Ok(Self {
             database_url,
             bind_addr,
             base_url,
-            instance_name,
-            instance_description,
-            contact_email,
-            instance_languages,
-            max_status_chars,
-            max_media_attachments,
-            max_poll_options,
-            max_chat_message_chars,
-            max_media_description,
-            max_display_name_chars,
-            max_bio_chars,
-            max_profile_fields,
+            instance_name: profile.name,
+            instance_description: profile.description,
+            contact_email: profile.contact_email,
+            instance_languages: profile.languages,
+            max_status_chars: limits.status_chars,
+            max_media_attachments: limits.media_attachments,
+            max_poll_options: limits.poll_options,
+            max_chat_message_chars: limits.chat_message_chars,
+            max_media_description: text.media_description,
+            max_display_name_chars: text.display_name_chars,
+            max_bio_chars: text.bio_chars,
+            max_profile_fields: text.profile_fields,
             max_report_comment,
             max_image_pixels,
             max_pinned_statuses,
@@ -1020,20 +1015,20 @@ impl Config {
             mongooseim_enabled,
             captcha_enabled,
             healthcheck_enabled,
-            registrations_open,
-            invites_enabled,
-            search_statuses_unauthenticated: search_gate,
+            registrations_open: exposure.registrations_open,
+            invites_enabled: exposure.invites_enabled,
+            search_statuses_unauthenticated: exposure.search_statuses_unauthenticated,
             oauth_providers: auth.oauth_providers,
-            available_frontends,
+            available_frontends: exposure.available_frontends,
             job_concurrency,
             job_queues,
             streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
-            smtp_host,
-            smtp_port,
-            smtp_username,
-            smtp_password,
-            smtp_tls,
-            mail_from,
+            smtp_host: mailer.host,
+            smtp_port: mailer.port,
+            smtp_username: mailer.username,
+            smtp_password: mailer.password,
+            smtp_tls: mailer.tls,
+            mail_from: mailer.from,
             media_proxy: media_proxy_settings(&lookup)?,
             vapid: vapid_settings(&lookup),
             translation: translation_settings(&lookup)?,
@@ -1205,29 +1200,42 @@ fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
     Ok(format!("{}://{domain}", url.scheme()))
 }
 
-/// What [`instance_profile`] reads, in [`Config`] field order: the display
-/// name, the short description, the admin contact email and the content
-/// language codes. Grouped because each is a plain default-or-list and
-/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
-/// back in field order.
-fn instance_profile<F>(lookup: &F) -> (String, String, Option<String>, Vec<String>)
+/// What [`instance_profile`] reads: the four settings that describe the
+/// instance to the world, named by what they are and hung on the
+/// [`Config`] fields in [`Config::from_lookup`] (`INSTANCE_NAME`,
+/// `INSTANCE_DESCRIPTION`, `CONTACT_EMAIL`, `INSTANCE_LANGUAGES`).
+#[derive(Debug)]
+struct InstanceProfile {
+    /// The instance display name (`INSTANCE_NAME`).
+    name: String,
+    /// The short description (`INSTANCE_DESCRIPTION`).
+    description: String,
+    /// The admin contact email (`CONTACT_EMAIL`).
+    contact_email: Option<String>,
+    /// The content language codes (`INSTANCE_LANGUAGES`).
+    languages: Vec<String>,
+}
+
+/// Reads the four settings that describe the instance to the world.
+/// Grouped because each is a plain default-or-list and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md).
+fn instance_profile<F>(lookup: &F) -> InstanceProfile
 where
     F: Fn(&str) -> Option<String>,
 {
-    let instance_name =
-        lookup(INSTANCE_NAME_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_owned());
-    let instance_description =
+    let name = lookup(INSTANCE_NAME_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_NAME.to_owned());
+    let description =
         lookup(INSTANCE_DESCRIPTION_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_DESCRIPTION.to_owned());
     let contact_email = lookup(CONTACT_EMAIL_VAR).filter(|email| !email.is_empty());
-    let instance_languages = comma_list(
+    let languages = comma_list(
         &lookup(INSTANCE_LANGUAGES_VAR).unwrap_or_else(|| DEFAULT_INSTANCE_LANGUAGES.to_owned()),
     );
-    (
-        instance_name,
-        instance_description,
+    InstanceProfile {
+        name,
+        description,
         contact_email,
-        instance_languages,
-    )
+        languages,
+    }
 }
 
 /// Reads the two settings that shape the job worker: how many handlers a
@@ -1269,24 +1277,32 @@ where
     )
 }
 
-/// What [`mailer_settings`] reads, in [`Config`] field order: the relay
-/// host, the relay port, the login name and secret, the encryption mode and
-/// the sender address.
-type MailerSettings = (
-    Option<String>,
-    u16,
-    Option<String>,
-    Option<String>,
-    SmtpTls,
-    String,
-);
+/// What [`mailer_settings`] reads: the six settings that configure
+/// outbound mail, named by what they are and hung on the [`Config`] fields
+/// in [`Config::from_lookup`] (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
+/// `SMTP_PASSWORD`, `SMTP_TLS`, `MAIL_FROM`).
+#[derive(Debug)]
+struct MailerSettings {
+    /// The relay host; `None` means mail is disabled.
+    host: Option<String>,
+    /// The relay port.
+    port: u16,
+    /// The login name.
+    username: Option<String>,
+    /// The login secret.
+    password: Option<String>,
+    /// The encryption mode.
+    tls: SmtpTls,
+    /// The sender address.
+    from: String,
+}
 
 /// Reads the six settings that configure outbound mail: the relay host
 /// (unset means mail is disabled), the relay port, the login name and
 /// secret, the encryption mode and the sender address. Grouped because each
 /// is a plain default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md); the tuple comes back in field order. `domain` is the
-/// [`domain_of`] the default sender address is built from.
+/// (AGENTS.md). `domain` is the [`domain_of`] the default sender address is
+/// built from.
 ///
 /// # Errors
 ///
@@ -1310,14 +1326,14 @@ where
         .map(|from| from.trim().to_owned())
         .filter(|from| !from.is_empty())
         .unwrap_or_else(|| default_mail_from(domain));
-    Ok((
-        smtp_host,
-        smtp_port,
-        smtp_username,
-        smtp_password,
-        smtp_tls,
-        mail_from,
-    ))
+    Ok(MailerSettings {
+        host: smtp_host,
+        port: smtp_port,
+        username: smtp_username,
+        password: smtp_password,
+        tls: smtp_tls,
+        from: mail_from,
+    })
 }
 
 /// Reads `SMTP_PORT`: a whole number in the `u16` range,
@@ -1468,18 +1484,28 @@ where
     ))
 }
 
-/// The shape [`content_limits`] answers: the four plain numeric content
-/// limits in field order (status length, attachment count, poll options,
-/// chat message length); factored out because a bare fourfold tuple is
-/// Clippy's `type_complexity` fodder.
-type ContentLimits = (usize, usize, usize, usize);
+/// What [`content_limits`] reads: the four plain numeric content limits,
+/// named by what they cap and hung on the [`Config`] fields in
+/// [`Config::from_lookup`] (`MAX_STATUS_CHARS`, `MAX_MEDIA_ATTACHMENTS`,
+/// `MAX_POLL_OPTIONS`, `MAX_CHAT_MESSAGE_CHARS`).
+#[derive(Debug)]
+struct ContentLimits {
+    /// The maximum status length (`MAX_STATUS_CHARS`).
+    status_chars: usize,
+    /// The media attachment count (`MAX_MEDIA_ATTACHMENTS`).
+    media_attachments: usize,
+    /// The poll option count (`MAX_POLL_OPTIONS`).
+    poll_options: usize,
+    /// The chat message length (`MAX_CHAT_MESSAGE_CHARS`).
+    chat_message_chars: usize,
+}
 
 /// Reads the four plain numeric content limits: the maximum status length
 /// (`MAX_STATUS_CHARS`), the media attachment count
 /// (`MAX_MEDIA_ATTACHMENTS`), the poll option count (`MAX_POLL_OPTIONS`)
 /// and the chat message length (`MAX_CHAT_MESSAGE_CHARS`). Grouped because
 /// each is the same `number` read and [`Config::from_lookup`] has a size
-/// budget (AGENTS.md); the tuple comes back in field order.
+/// budget (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1489,20 +1515,20 @@ fn content_limits<F>(lookup: &F) -> Result<ContentLimits, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    Ok((
-        number(lookup, MAX_STATUS_CHARS_VAR, DEFAULT_MAX_STATUS_CHARS)?,
-        number(
+    Ok(ContentLimits {
+        status_chars: number(lookup, MAX_STATUS_CHARS_VAR, DEFAULT_MAX_STATUS_CHARS)?,
+        media_attachments: number(
             lookup,
             MAX_MEDIA_ATTACHMENTS_VAR,
             DEFAULT_MAX_MEDIA_ATTACHMENTS,
         )?,
-        number(lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?,
-        number(
+        poll_options: number(lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?,
+        chat_message_chars: number(
             lookup,
             MAX_CHAT_MESSAGE_CHARS_VAR,
             DEFAULT_MAX_CHAT_MESSAGE_CHARS,
         )?,
-    ))
+    })
 }
 
 /// The shape [`cap_limits`] answers: the three limits that sit outside the
@@ -1578,19 +1604,28 @@ where
     Ok(boolean(lookup, FEDERATION_ENABLED_VAR, DEFAULT_FEDERATION_ENABLED)?.into())
 }
 
-/// The shape [`text_length_limits`] answers: the four default-or-parse
-/// profile limits in field order (media description, display name, bio,
-/// profile-field count); factored out because a bare fourfold tuple is
-/// Clippy's `type_complexity` fodder.
-type TextLengthLimits = (usize, usize, usize, usize);
+/// What [`text_length_limits`] reads: the four default-or-parse profile
+/// limits, named by what they cap and hung on the [`Config`] fields in
+/// [`Config::from_lookup`] (`MAX_MEDIA_DESCRIPTION`,
+/// `MAX_DISPLAY_NAME_CHARS`, `MAX_BIO_CHARS`, `MAX_PROFILE_FIELDS`).
+#[derive(Debug)]
+struct TextLengthLimits {
+    /// The media attachment description length (`MAX_MEDIA_DESCRIPTION`).
+    media_description: usize,
+    /// The display name length (`MAX_DISPLAY_NAME_CHARS`).
+    display_name_chars: usize,
+    /// The profile bio length (`MAX_BIO_CHARS`).
+    bio_chars: usize,
+    /// The profile metadata field count (`MAX_PROFILE_FIELDS`).
+    profile_fields: usize,
+}
 
 /// Reads the four per-field profile limits that live beside the status
 /// ones: the media attachment description (`MAX_MEDIA_DESCRIPTION`), the
 /// display name (`MAX_DISPLAY_NAME_CHARS`), the profile bio
 /// (`MAX_BIO_CHARS`) and the profile metadata field count
 /// (`MAX_PROFILE_FIELDS`). Grouped because each is a plain default-or-parse
-/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
-/// comes back in field order.
+/// and [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1600,20 +1635,20 @@ fn text_length_limits<F>(lookup: &F) -> Result<TextLengthLimits, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    Ok((
-        number(
+    Ok(TextLengthLimits {
+        media_description: number(
             lookup,
             MAX_MEDIA_DESCRIPTION_VAR,
             DEFAULT_MAX_MEDIA_DESCRIPTION,
         )?,
-        number(
+        display_name_chars: number(
             lookup,
             MAX_DISPLAY_NAME_CHARS_VAR,
             DEFAULT_MAX_DISPLAY_NAME_CHARS,
         )?,
-        number(lookup, MAX_BIO_CHARS_VAR, DEFAULT_MAX_BIO_CHARS)?,
-        number(lookup, MAX_PROFILE_FIELDS_VAR, DEFAULT_MAX_PROFILE_FIELDS)?,
-    ))
+        bio_chars: number(lookup, MAX_BIO_CHARS_VAR, DEFAULT_MAX_BIO_CHARS)?,
+        profile_fields: number(lookup, MAX_PROFILE_FIELDS_VAR, DEFAULT_MAX_PROFILE_FIELDS)?,
+    })
 }
 
 /// The shape [`upload_settings`] answers: the per-request multipart limits
@@ -1647,11 +1682,25 @@ where
     ))
 }
 
-/// The shape [`client_exposure`] reads: the registrations-open toggle, the
-/// invites-enabled toggle, the unauthenticated status-search toggle and the
-/// pickable-frontend list, in [`Config`] field order; factored out because
-/// a mixed tuple of toggles and a list reads better by name.
-type ExposureSettings = (Toggle, Toggle, Toggle, Vec<String>);
+/// What [`client_exposure`] reads: the toggles that gate what the instance
+/// exposes to clients and the pickable-frontend list, named by what they
+/// are and hung on the [`Config`] fields in [`Config::from_lookup`]
+/// (`REGISTRATIONS_OPEN`, `INVITES_ENABLED`,
+/// `SEARCH_STATUSES_UNAUTHENTICATED`, `AVAILABLE_FRONTENDS`).
+#[derive(Debug)]
+struct ExposureSettings {
+    /// Whether new registrations are open (`REGISTRATIONS_OPEN`).
+    registrations_open: Toggle,
+    /// Whether invite tokens substitute for open registrations
+    /// (`INVITES_ENABLED`).
+    invites_enabled: Toggle,
+    /// Whether anonymous requests may search statuses at the combined
+    /// search (`SEARCH_STATUSES_UNAUTHENTICATED`).
+    search_statuses_unauthenticated: Toggle,
+    /// The frontends the settings endpoints let a user pick
+    /// (`AVAILABLE_FRONTENDS`).
+    available_frontends: Vec<String>,
+}
 
 /// Reads the settings that gate what the instance exposes to clients:
 /// whether new registrations are open (`NodeInfo`'s `openRegistrations`),
@@ -1660,7 +1709,7 @@ type ExposureSettings = (Toggle, Toggle, Toggle, Vec<String>);
 /// requests may search statuses at the combined search, and the frontends
 /// the settings endpoints let a user pick. Grouped because each is a plain
 /// default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md); the tuple comes back in field order.
+/// (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1683,12 +1732,12 @@ where
     let available_frontends = comma_list(
         &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
     );
-    Ok((
+    Ok(ExposureSettings {
         registrations_open,
         invites_enabled,
         search_statuses_unauthenticated,
         available_frontends,
-    ))
+    })
 }
 
 /// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login

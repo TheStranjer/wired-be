@@ -1,10 +1,11 @@
 //! Pleroma's account extensions under `/api/v1/pleroma`
-//! (`docs/ARCHITECTURE.md` decision 1): the subscription toggles and the
-//! caller's own unanswered follow asks.
+//! (`docs/ARCHITECTURE.md` decision 1): the subscription toggles, the
+//! caller's own unanswered follow asks, and one account's favourites list.
 //!
 //! The reference is Pleroma's `PleromaAPI.AccountController`
 //! (`lib/pleroma/web/pleroma_api/controllers/account_controller.ex`, the
-//! `subscribe` and `unsubscribe` actions) and `PleromaAPI.FollowRequestController`
+//! `subscribe`, `unsubscribe` and `favourites` actions) and
+//! `PleromaAPI.FollowRequestController`
 //! (`lib/pleroma/web/pleroma_api/controllers/follow_request_controller.ex`,
 //! the `outgoing` action). What a subscription *is* on this server stays
 //! behind [`crate::models::follow`]: Pleroma's `subscribe` sets the
@@ -13,7 +14,9 @@
 //! `subscribing` flags of [`Relationship`] are read from, so
 //! [`set_notify`] is the one write all three endpoints share.
 //!
-//! All three routes require a user token ([`AuthUser`]).
+//! The subscription routes and the outgoing listing require a user token
+//! ([`AuthUser`]); the favourites listing authenticates optionally
+//! ([`MaybeAuthUser`]).
 //!
 //! - `POST /api/v1/pleroma/accounts/{id}/subscribe` and `…/unsubscribe`
 //!   need either the `follow` root or `write:follows` (Pleroma's scopes plug
@@ -34,9 +37,27 @@
 //!   cursors are [`Follow::id`](crate::models::follow::Follow::id), as
 //!   Pleroma's are), with Pleroma's global page sizes (default 20, at most
 //!   40). The queue is the caller's own, so no privacy check is needed.
+//! - `GET /api/v1/pleroma/accounts/{id}/favourites` answers the statuses
+//!   account `id` favourited — newest favourite first, and only those the
+//!   viewer may still see ([`filter_visible`], the reach of Pleroma's
+//!   `blocking_user` narrowing). Auth is optional: a presented user token
+//!   must grant `read:favourites` (Pleroma's scopes plug with
+//!   `fallback: :proceed_unauthenticated`) and decides whose eyes narrow
+//!   the list. Privacy first: with `hide_favorites = true` on the target —
+//!   the default for every account — the answer is Pleroma's 403
+//!   `"Can't get favorites"` to everybody but the target themselves. It
+//!   pages exactly like the caller's own `GET /api/v1/favourites`:
+//!   [`PageParams`] keyset pagination over the *favourite row ids*
+//!   (Pleroma's global page sizes, default 20, at most 40), `Link` cursors
+//!   on those same like ids, and the pairs [`page_for_user`] already
+//!   dropped with their statuses.
 //!
 //! [`Relationship`]: crate::entities::relationship::Relationship
 //! [`set_notify`]: crate::models::follow::set_notify
+//! [`filter_visible`]: crate::models::status_visibility::filter_visible
+//! [`page_for_user`]: crate::models::favourite::page_for_user
+
+use std::collections::HashSet;
 
 use axum::{
     Json, Router,
@@ -45,18 +66,21 @@ use axum::{
     routing::{get, post},
 };
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     api::helpers::account_or_404,
-    auth::AuthUser,
+    auth::{AuthUser, MaybeAuthUser},
     entities::{
         account::{Account, AccountViewer},
         relationship::Relationship,
+        status::Status,
     },
     error::{AppError, AppResult},
-    models::{follow, user::User},
-    oauth::scopes::{FOLLOW, READ_FOLLOWS, WRITE_FOLLOWS},
+    models::{favourite, follow, status::Status as StatusRow, status_visibility, user::User},
+    oauth::scopes::{FOLLOW, READ_FAVOURITES, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
+    services::render_status::render_statuses,
     state::AppState,
 };
 
@@ -66,6 +90,11 @@ use crate::{
 /// relationship is what makes either action impossible.
 const NOT_FOLLOWING: &str = "Could not subscribe: You are not following this user";
 
+/// The refusal the favourites route answers when the target hides their
+/// favourites from the viewer: Pleroma's `AccountController.favourites`
+/// `hide_favorites` arm, in its exact (American-spelled) wording.
+const CANT_GET_FAVOURITES: &str = "Can't get favorites";
+
 /// The `Link` header's query parameters carry nothing but the cursor: the
 /// outgoing list has no filter to repeat on either link (the queue's
 /// constant, same rule).
@@ -74,6 +103,7 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// The `/api/v1/pleroma` account router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/pleroma/accounts/{id}/favourites", get(favourites))
         .route("/pleroma/accounts/{id}/subscribe", post(subscribe))
         .route("/pleroma/accounts/{id}/unsubscribe", post(unsubscribe))
         .route("/pleroma/outgoing_follow_requests", get(outgoing))
@@ -232,5 +262,93 @@ async fn relationship_for(
 fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) -> Option<String> {
     let newest = entries.first()?.follow_id.to_string();
     let oldest = entries.last()?.follow_id.to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+}
+
+/// `GET /api/v1/pleroma/accounts/{id}/favourites` — the statuses account
+/// `id` favourited, newest favourite first, one [`PageParams`] page at a
+/// time (default 20, at most 40) with the `Link` header over the *favourite
+/// row ids*, narrowed to what the viewer may see.
+///
+/// Auth is optional ([`MaybeAuthUser`], Pleroma's `read:favourites` plug
+/// with `fallback: :proceed_unauthenticated`): a presented user token must
+/// grant the scope, an anonymous request and an app-only token proceed as
+/// unauthenticated viewers. The target resolves through [`account_or_404`]
+/// — the malformed, unknown or deactivated id is Pleroma's shared 404 —
+/// and the target's `hide_favorites` flag then gates the read: hidden
+/// favourites are [`CANT_GET_FAVOURITES`] for everybody but the target
+/// reading their own list. Behind the gate the page is the caller's own
+/// favourites list read the other way round: [`page_for_user`] walks the
+/// target's like rows, [`filter_visible`] drops the statuses this viewer
+/// may not see (Pleroma's `blocking_user` recipients filter, restated over
+/// the relational model), and only the favourites that come back visible
+/// name the `Link` edges — the cursors key on the like, like the own list
+/// does. The entities render for the viewer, so `favourited` and friends
+/// carry *their* state, not the target's.
+///
+/// The `Link` header's path is the request's own [`OriginalUri`], not the
+/// [`axum::http::Uri`] the router hands a nested handler: axum strips the
+/// `/api/v1` prefix off the latter, and Pleroma links to `conn.request_path`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] from [`MaybeAuthUser`] for a presented token
+/// that does not resolve; [`AppError::Forbidden`] when a presented user
+/// token does not grant `read:favourites` or when the target hides their
+/// favourites from this viewer; [`AppError::NotFound`] when `id` is
+/// malformed, names no user or names a deactivated one;
+/// [`AppError::BadRequest`] from the page parameters for a malformed
+/// cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+///
+/// [`page_for_user`]: crate::models::favourite::page_for_user
+/// [`filter_visible`]: crate::models::status_visibility::filter_visible
+async fn favourites(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Status>>)> {
+    auth.require_user_scope(READ_FAVOURITES)?;
+    let target = account_or_404(&state, &id).await?;
+    let viewer = auth.0.as_ref();
+    let reading_own = viewer.is_some_and(|viewer| viewer.id == target.id);
+    if target.hide_favorites.get() && !reading_own {
+        return Err(AppError::Forbidden(CANT_GET_FAVOURITES.to_owned()));
+    }
+    let pairs = favourite::page_for_user(&state.db, target.id, page).await?;
+    let rows: Vec<StatusRow> = pairs.iter().map(|(_, row)| row.clone()).collect();
+    let visible = status_visibility::filter_visible(&state.db, rows, viewer).await?;
+    let visible_ids: HashSet<Uuid> = visible.iter().map(|row| row.id).collect();
+    let cursors: Vec<Uuid> = pairs
+        .iter()
+        .filter(|(favourite, _)| visible_ids.contains(&favourite.status_id))
+        .map(|(favourite, _)| favourite.id)
+        .collect();
+    debug!(
+        target = %target.id,
+        favourites = visible.len(),
+        "account favourites listed"
+    );
+    let mut headers = HeaderMap::new();
+    set_link_header(
+        &mut headers,
+        favourites_page_link(&state.config.base_url, uri.path(), &cursors).as_deref(),
+    )?;
+    Ok((
+        headers,
+        Json(render_statuses(&state, viewer, &visible).await?),
+    ))
+}
+
+/// The `Link` header value for a fetched page of one account's favourites:
+/// [`link_header`] over the first (newest) and last (oldest) *favourite row
+/// id* of the visible page — the shape `GET /api/v1/favourites` links in,
+/// keyed on the like rows like its cursors — and `None` for an empty page.
+fn favourites_page_link(base_url: &str, path: &str, cursors: &[Uuid]) -> Option<String> {
+    let newest = cursors.first()?.to_string();
+    let oldest = cursors.last()?.to_string();
     link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
