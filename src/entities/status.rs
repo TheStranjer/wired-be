@@ -24,14 +24,19 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `favourited`, `reblogged`, `muted`, `bookmarked`, `pinned` and
-//! `pleroma.pinned_at` (the favourite/reblog/mute/bookmark/pin tables);
+//! `reblogged`, `muted`, `bookmarked`, `pinned` and
+//! `pleroma.pinned_at` (the reblog/mute/bookmark/pin tables);
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
 //! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
 //! (chats, bookmark folders); and `quote` (the quoting ticket, whose
 //! original rows the service already batch-loads). `pleroma.emoji_reactions`
 //! is filled by the reactions ticket, from
 //! [`emoji_reaction::for_statuses`](crate::models::emoji_reaction::for_statuses).
+//! `favourited` is filled by the favourites ticket, from
+//! [`favourited_status_ids`](crate::models::favourite::favourited_status_ids)
+//! — one batched read per page, the viewer's id deciding membership; a
+//! reblog row takes its flag from its original, whose id is where the
+//! like lives.
 //!
 //! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
@@ -174,6 +179,13 @@ pub struct StatusSource<'a> {
     /// order; feeds `pleroma.emoji_reactions`. A row nobody reacted to (and a
     /// nested original nobody reacted to) comes in with the empty slice.
     pub reactions: &'a [SummaryRow],
+    /// Whether the viewer favourited this row: membership in the one
+    /// [`favourited_status_ids`](crate::models::favourite::favourited_status_ids)
+    /// read the batch runs for the page. The renderer keys a reblog row's
+    /// flag to its *original's* id — Pleroma's `Announce` arm computes
+    /// `favourited` off the liked object — and `false` for an anonymous
+    /// viewer, who has no rows.
+    pub favourited: bool,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -259,8 +271,9 @@ pub struct Status {
     /// `null` for an unedited post.
     #[serde(with = "crate::util::time::serde_mastodon_time::option")]
     pub edited_at: Option<DateTime<Utc>>,
-    /// Whether the viewer favourited this post; `false` until the
-    /// favourites ticket preloads them and passes them in.
+    /// Whether the viewer favourited this post; the favourites ticket's
+    /// batched read answers it, `false` for an anonymous viewer and for a
+    /// post they have not liked.
     pub favourited: JsonBool,
     /// Whether the viewer reblogged this post; `false` until the same
     /// ticket's batched read of the viewer's own reblogs lands.
@@ -308,6 +321,7 @@ impl Status {
             mentions,
             tags,
             reactions,
+            favourited,
             reblog,
         } = source;
         Self {
@@ -341,7 +355,7 @@ impl Status {
             card: None,
             poll: None,
             edited_at: row.edited_at,
-            favourited: JsonBool(false),
+            favourited: JsonBool(favourited),
             reblogged: JsonBool(false),
             muted: JsonBool(false),
             bookmarked: JsonBool(false),
@@ -633,6 +647,8 @@ mod tests {
         tags: Vec<Hashtag>,
         /// The row's emoji reactions.
         reactions: Vec<SummaryRow>,
+        /// Whether the viewer favourited the row.
+        favourited: bool,
     }
 
     impl<'a> Parts<'a> {
@@ -645,6 +661,7 @@ mod tests {
                 mentions: Vec::new(),
                 tags: Vec::new(),
                 reactions: Vec::new(),
+                favourited: false,
             }
         }
 
@@ -678,6 +695,15 @@ mod tests {
         fn reacted(self, reactions: Vec<SummaryRow>) -> Self {
             Self { reactions, ..self }
         }
+
+        /// Sets [`favourited`](Self::favourited): the viewer's flag, which
+        /// the favourites ticket's batched read would hand the renderer.
+        fn liked(self) -> Self {
+            Self {
+                favourited: true,
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -692,6 +718,7 @@ mod tests {
             mentions: &parts.mentions,
             tags: &parts.tags,
             reactions: &parts.reactions,
+            favourited: parts.favourited,
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -710,6 +737,7 @@ mod tests {
                 mentions: &[],
                 tags: &[],
                 reactions: &[],
+                favourited: false,
                 reblog: None,
             },
             None,
@@ -798,10 +826,25 @@ mod tests {
         assert_eq!(value["card"], Value::Null, "cards are a later ticket");
         assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
         assert_eq!(value["edited_at"], Value::Null);
-        for flag in ["favourited", "reblogged", "muted", "bookmarked", "pinned"] {
+        for flag in ["reblogged", "muted", "bookmarked", "pinned"] {
             assert_eq!(value[flag], false, "{flag} is a later ticket");
         }
+        assert_eq!(
+            value["favourited"], false,
+            "a page whose favourites read found nothing renders the flag false"
+        );
         assert_eq!(value["quote"], Value::Null, "quotes are a later ticket");
+    }
+
+    #[test]
+    fn the_viewers_favourite_lands_in_the_flag() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).liked(), None);
+        assert_eq!(
+            value["favourited"], true,
+            "the favourites batch's membership reaches the entity verbatim"
+        );
     }
 
     #[test]

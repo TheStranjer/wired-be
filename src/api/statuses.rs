@@ -1,20 +1,24 @@
-//! The status read endpoints: `GET /api/v1/statuses/{id}` and the batch
-//! lookup `GET /api/v1/statuses?id[]=a&id[]=b`
+//! The status endpoints: reads, favourite writes and the favourites
+//! listings, all over one shared status gate and page renderer
 //! (`docs/ARCHITECTURE.md` decision 1).
 //!
-//! The reference is Pleroma's `StatusController.show` and `.index`
-//! (`lib/pleroma/web/mastodon_api/controllers/status_controller.ex`), whose
-//! `with` blocks reduce to the same two moves: find the activity, ask
-//! `Visibility.visible_for_user?`, and either render it or answer
-//! `{:error, :not_found}`. Here finding and asking live in the shared
-//! [`status_for_viewer_or_404`], which every later
+//! The routes are the lookups `GET /api/v1/statuses/{id}` and the batch
+//! `GET /api/v1/statuses?id[]=a&id[]=b`, the favourite writes
+//! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
+//! the state listing `GET /api/v1/statuses/{id}/favourited_by`, and the
+//! caller's own favourites list `GET /api/v1/favourites`.
+//!
+//! The reference is Pleroma's `StatusController` (`lib/pleroma/web/
+//! mastodon_api/controllers/status_controller.ex`): `show` and `.index`
+//! for the reads, `favourite` / `unfavourite` / `favourited_by` /
+//! `favourites` for the likes. Those reduce to the same two moves per
+//! surface: find the status, ask `Visibility.visible_for_user?`, and
+//! either render it or answer `{:error, :not_found}`. Here finding and
+//! asking live in the shared [`status_for_viewer_or_404`], which every
 //! `/api/v1/statuses/{id}/...` route reuses, and rendering lives in the
 //! batched page renderer [`crate::services::render_status`].
 //!
-//! Both routes are read-side lookups of an already-stored post, so neither
-//! creates anything: the write endpoints (`POST /api/v1/statuses` and the
-//! per-status state changes) are their own tickets and join this module the
-//! same way.
+//! # The reads
 //!
 //! `GET /api/v1/statuses/{id}` is Pleroma's `show`: authentication is
 //! optional ([`MaybeAuthUser`], with `read:statuses` enforced on a
@@ -38,31 +42,86 @@
 //! are acted on — Pleroma's `limit = 100` over `Enum.take(ids, limit)`,
 //! which drops the rest silently rather than refusing the call.
 //!
-//! Neither route owes a 422: this ticket answers an unusable id with the
-//! show route's 404 and the batch route's silent skip, so there is no
-//! request this server can call invalid, and neither route pages (the batch
-//! is the requested ids, in order, capped at [`MAX_STATUS_IDS`]).
+//! # The favourite writes
+//!
+//! `POST …/favourite` and `POST …/unfavourite` are Pleroma's `favourite`
+//! and `unfavourite`: a user token ([`AuthUser`]) with `write:favourites`,
+//! both routes riding the `statuses_actions` throttle bucket like the
+//! reports route, and both answering the [`Status`] entity as the caller
+//! sees it — `favourited` true after a like, false after a withdrawal, and
+//! the stepped `favourites_count`, since the row is re-read for the render.
+//! Both writes ([`favourite::favourite`] / [`favourite::unfavourite`]) are
+//! idempotent on `(account, status)`: a repeat favourite counts once, and
+//! unfavouriting a status the caller never liked is the unchanged entity
+//! with 200. Favouriting a status the caller may not see is the shared
+//! 404, and a reblog's id favourites the *original* (Mastodon's behaviour,
+//! which is where Pleroma's `Like` lands too) while the answer stays the
+//! reblog entity.
+//!
+//! # The favourites listings
+//!
+//! `GET …/favourited_by` is Pleroma's `favourited_by`: optional auth
+//! (again `read:statuses` on a presented user token), the same
+//! [`status_for_viewer_or_404`] gate on the status, and the answer an
+//! array of [`Account`] entities — the accounts that favourited, newest
+//! like first — paged by [`PageParams`] keyed on the *favourite row id*
+//! (the `Link` cursors carry like ids, not account ids), 20 by default
+//! and 80 at most. The author's
+//! [`hide_favorites`](crate::models::user::User::hide_favorites) flag
+//! hides *their own* favourites list (the Mastodon rule); it never gates
+//! this endpoint.
+//!
+//! `GET /api/v1/favourites` is the caller's own list: [`AuthUser`] with
+//! `read:favourites`, the statuses they favourited newest-favourite
+//! first, [`PageParams`] again keyed on the favourite row id, and only
+//! the statuses still visible to them — the shared [`filter_visible`]
+//! step drops what a later block, a visibility change or a delete took
+//! out of their view (Pleroma folds the same narrowing into
+//! `ActivityPub.fetch_favourites`). A short page ends the walk, and the
+//! `Link` header speaks only of the entries that came back.
+//!
+//! Neither write federates anything yet: the federation ticket that sends
+//! the `Like` activity and its `Undo` wires into this module's
+//! `after_favourite_changed` hook, the documented empty landing point,
+//! exactly as the reactions' [`crate::api::emoji_reactions`] hook waits
+//! for its `EmojiReact`.
+//!
+//! What the reads owe no 422: this module answers an unusable id with the
+//! show route's 404 and the batch route's silent skip, and the only
+//! request shapes beyond those are the pagination cursors' 400.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
+//! [`filter_visible`]: crate::models::status_visibility::filter_visible
 //! [`Status`]: crate::entities::status::Status
+//! [`Account`]: crate::entities::account::Account
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::Uri,
-    routing::get,
+    extract::{OriginalUri, Path, State},
+    http::{HeaderMap, Uri},
+    routing::{get, post},
 };
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
     api::helpers::{requested_status_ids, status_for_viewer_or_404},
-    auth::MaybeAuthUser,
-    entities::status::Status,
+    auth::{AuthUser, MaybeAuthUser},
+    entities::{
+        account::{Account, AccountViewer},
+        status::Status,
+    },
     error::{AppError, AppResult},
-    models::{status, status_visibility},
-    oauth::scopes::READ_STATUSES,
+    models::{
+        favourite::{self, Favourite as FavouriteRow},
+        status::{self, Status as StatusRow},
+        status_visibility,
+        user::User,
+    },
+    oauth::scopes::{READ_FAVOURITES, READ_STATUSES, WRITE_FAVOURITES},
+    pagination::{PageParams, link_header, set_link_header},
     services::render_status::{render_status, render_statuses},
     state::AppState,
 };
@@ -71,11 +130,36 @@ use crate::{
 /// every id past it ignored rather than refused.
 pub const MAX_STATUS_IDS: usize = 100;
 
+/// Page size cap of `favourited_by`: the ticket pins 80, above
+/// [`crate::pagination::MAX_LIMIT`], with Pleroma's global 20 as the
+/// default the plain [`PageParams::from_query`] keeps.
+const FAVOURITED_BY_MAX_LIMIT: i64 = 80;
+
+/// The `Link` headers' query parameters carry nothing but the cursor:
+/// neither favourites listing has a filter to repeat on either link (the
+/// relationship listings' constant, same rule).
+const NO_EXTRA_QUERY: [(String, String); 0] = [];
+
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
-pub fn router() -> Router<AppState> {
+///
+/// `state` reaches the two favourite writes, which mount the
+/// `statuses_actions` throttle bucket the way the reports route does
+/// (see [`crate::rate_limit`]).
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
+        .route("/favourites", get(list_favourites))
         .route("/statuses/{id}", get(show_status))
         .route("/statuses", get(list_statuses))
+        .route(
+            "/statuses/{id}/favourite",
+            post(favourite_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
+        )
+        .route(
+            "/statuses/{id}/unfavourite",
+            post(unfavourite_status)
+                .layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
+        )
+        .route("/statuses/{id}/favourited_by", get(list_favourited_by))
 }
 
 /// `GET /api/v1/statuses/{id}` — the status `id` names, as the viewer
@@ -139,6 +223,227 @@ async fn list_statuses(
     Ok(Json(render_statuses(&state, viewer, &rows).await?))
 }
 
+/// `POST /api/v1/statuses/{id}/favourite` — favourite the status `id` and
+/// answer it as the caller sees it: `favourited` true and
+/// `favourites_count` stepped, because the row is re-read for the render
+/// and the renderer's batched favourites read now names the caller.
+///
+/// The status resolves through [`status_for_viewer_or_404`] — Pleroma's
+/// `CommonAPI.favorite` checks the post is visible to the actor before it
+/// builds the `Like`, and what the caller may not see is the same 404 as
+/// what does not exist. A reblog row favourites its *original*: Mastodon's
+/// behaviour for liking a boost, and the row's id — not the original's —
+/// is what the entity answers with. The write is idempotent, so a repeat
+/// favourite is one row, one count and one 200.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:favourites` check; [`AppError::NotFound`] for a
+/// malformed, unknown, deleted or invisible status, for the row a delete
+/// took between the gate and the re-read, and for the one row the render
+/// cannot answer; the bucket's 429 before the handler runs. Any database
+/// failure arrives through `?` as [`AppError::Database`].
+async fn favourite_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_FAVOURITES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    let liked_id = liked_status_id(&row);
+    if let Some(created) =
+        favourite::favourite(&state.db, &state.config.base_url, auth.0.id, liked_id).await?
+    {
+        debug!(
+            status = %liked_id,
+            user = %auth.0.id,
+            "status favourited"
+        );
+        after_favourite_changed(&state, &created, true);
+    }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `POST /api/v1/statuses/{id}/unfavourite` — withdraw the caller's
+/// favourite of the status `id` and answer it as they see it, `favourited`
+/// false and `favourites_count` stepped back.
+///
+/// The same gate and the same reblog mapping as [`favourite_status`], and
+/// [`favourite::unfavourite`] is content with nothing to delete: a
+/// withdrawal of a favourite that was never made (or already withdrawn)
+/// changes nothing and is the unchanged [`Status`] with 200, where
+/// Pleroma's `unfavorite` answers its error arm.
+///
+/// # Errors
+///
+/// Those of [`favourite_status`]. Any database failure arrives through
+/// `?` as [`AppError::Database`].
+async fn unfavourite_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_FAVOURITES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    let liked_id = liked_status_id(&row);
+    if let Some(removed) = favourite::unfavourite(&state.db, auth.0.id, liked_id).await? {
+        debug!(
+            status = %liked_id,
+            user = %auth.0.id,
+            "favourite withdrawn"
+        );
+        after_favourite_changed(&state, &removed, false);
+    }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `GET /api/v1/statuses/{id}/favourited_by` — the [`Account`] entities
+/// that favourited the status `id`, newest like first, one [`PageParams`]
+/// page at a time (20 by default, at most 80) with the `Link` header over
+/// the *favourite row ids*.
+///
+/// Auth is optional: a presented user token must grant `read:statuses`
+/// and decides whose view the accounts render for, an anonymous request
+/// sees the same list. The status resolves through
+/// [`status_for_viewer_or_404`], so an invisible post hides its favouriters
+/// behind the shared 404 — and the author's `hide_favorites` does *not*:
+/// that flag hides the author's own favourites list, not a list of who
+/// favourited a post of theirs (Mastodon's rule, and Pleroma's
+/// `favourited_by` never consults it).
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] when a presented user token lacks
+/// `read:statuses`; [`AppError::Unauthorized`] for a token that does not
+/// resolve; [`AppError::NotFound`] for a status this route may not answer;
+/// [`AppError::BadRequest`] from the page parameters for a malformed
+/// cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+async fn list_favourited_by(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
+    auth.require_user_scope(READ_STATUSES)?;
+    let page = PageParams::from_query(uri.query(), FAVOURITED_BY_MAX_LIMIT)?;
+    let row = status_for_viewer_or_404(&state, auth.0.as_ref(), &id).await?;
+    let entries = favourite::users_for_status(&state.db, row.id, page).await?;
+    debug!(
+        status = %row.id,
+        favouriters = entries.len(),
+        "status favouriters listed"
+    );
+    let ids: Vec<Uuid> = entries.iter().map(|entry| entry.favourite_id).collect();
+    let mut headers = HeaderMap::new();
+    set_link_header(
+        &mut headers,
+        page_link(&state.config.base_url, uri.path(), &ids).as_deref(),
+    )?;
+    // The list names no relationship of the viewer to the favouriters;
+    // Pleroma's `favourited_by` renders plain `show.json` accounts.
+    let viewer: AccountViewer<'_> = auth.0.as_ref();
+    let accounts = entries
+        .iter()
+        .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
+        .collect();
+    Ok((headers, Json(accounts)))
+}
+
+/// `GET /api/v1/favourites` — the statuses the caller favourited, newest
+/// favourite first, one [`PageParams`] page at a time with the `Link`
+/// header over the *favourite row ids*, and narrowed to what their eye
+/// still allows: [`filter_visible`] drops the posts a later block or a
+/// visibility change took out of their view, and the renderer answers the
+/// rest exactly as any other page.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] from [`AuthUser`] without a valid user
+/// token; [`AppError::Forbidden`] when the token does not grant
+/// `read:favourites`; [`AppError::BadRequest`] from the page parameters
+/// for a malformed cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+async fn list_favourites(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Status>>)> {
+    auth.require(READ_FAVOURITES)?;
+    let pairs = favourite::page_for_user(&state.db, auth.0.id, page).await?;
+    let rows: Vec<StatusRow> = pairs.iter().map(|(_, row)| row.clone()).collect();
+    let visible = status_visibility::filter_visible(&state.db, rows, Some(&auth.0)).await?;
+    let visible_ids: HashSet<Uuid> = visible.iter().map(|row| row.id).collect();
+    // The cursors key on the like, so they survive the visibility step:
+    // only favourites whose status came back visible name the page edges.
+    let cursors: Vec<Uuid> = pairs
+        .iter()
+        .filter(|(favourite, _)| visible_ids.contains(&favourite.status_id))
+        .map(|(favourite, _)| favourite.id)
+        .collect();
+    debug!(
+        user = %auth.0.id,
+        favourites = visible.len(),
+        "favourites listed"
+    );
+    let mut headers = HeaderMap::new();
+    set_link_header(
+        &mut headers,
+        page_link(&state.config.base_url, uri.path(), &cursors).as_deref(),
+    )?;
+    Ok((
+        headers,
+        Json(render_statuses(&state, Some(&auth.0), &visible).await?),
+    ))
+}
+
+/// The one status a write answers: the row `viewer` just changed —
+/// a reblog row still answers *itself* — re-read first so the render
+/// carries the counter the write stepped, then rendered for them.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] when the row is gone — deleted between the
+/// visibility gate and this re-read — and for the one row the renderer
+/// answers `None` for (a reblog whose original went away in the same
+/// window; [`crate::api::emoji_reactions`] answers it the same way); any
+/// database failure arrives through `?` as [`AppError::Database`].
+async fn current_entity(state: &AppState, viewer: &User, id: Uuid) -> AppResult<Json<Status>> {
+    let row = status::get_by_id(&state.db, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let entity = render_status(state, Some(viewer), &row)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(entity))
+}
+
+/// The `Link` header of a favourites page: [`link_header`] over the first
+/// (newest) and last (oldest) favourite id of the page, the follow lists'
+/// [`page_link`](crate::api::accounts) shape with the like id in place of
+/// the relationship id's. An empty page names no cursor and links nowhere.
+fn page_link(base_url: &str, path: &str, favourite_ids: &[Uuid]) -> Option<String> {
+    let newest = favourite_ids.first()?.to_string();
+    let oldest = favourite_ids.last()?.to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+}
+
+/// The status a favourite write lands on: `row` itself for a plain post,
+/// and its **original** for a reblog row — Mastodon's behaviour for liking
+/// a boost, mirrored here (and in the renderer's flag lookup, where the
+/// same rule keys `favourited`). The endpoint still answers the row the
+/// client named.
+const fn liked_status_id(row: &status::Status) -> Uuid {
+    match row.reblog_of_id {
+        Some(original) => original,
+        None => row.id,
+    }
+}
+
 /// The `visible` rows in the order `requested` names them, each id answered
 /// at most once: an id with no row here (unknown, deleted, invisible)
 /// contributes nothing, and one named twice contributes one entry, which is
@@ -147,6 +452,28 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
     let mut by_id: HashMap<Uuid, status::Status> =
         visible.into_iter().map(|row| (row.id, row)).collect();
     requested.iter().filter_map(|id| by_id.remove(id)).collect()
+}
+
+/// Post-write hook of both favourite routes: the federation ticket that
+/// sends the `Like` activity (and its `Undo`, when a favourite is
+/// withdrawn) wires the delivery in here — the activity to send is
+/// [`FavouriteRow::ap_id`], the pair it names is [`FavouriteRow::user_id`]
+/// and [`FavouriteRow::status_id`], and the queueing happens through
+/// `state` (decision 11). The notification ticket that tells the status's
+/// author lands in the same hook; Pleroma runs both through its
+/// `CommonAPI.favorite` pipeline.
+///
+/// `favouriting` states which way the write moved the fact: `true` for the
+/// favourite a `POST …/favourite` left behind — a repeat favourite never
+/// reaches this hook, since it changed nothing — and `false` for the
+/// `Undo` of the favourite a `POST …/unfavourite` removed. A withdrawal
+/// that found no row to remove never reaches it either.
+///
+/// Intentionally empty until then, like the reactions'
+/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed)
+/// and the blocks'
+/// [`after_block_changed`](crate::api::blocks::after_block_changed).
+const fn after_favourite_changed(_state: &AppState, _favourite: &FavouriteRow, _favouriting: bool) {
 }
 
 #[cfg(test)]
@@ -233,6 +560,54 @@ mod tests {
         assert!(
             in_requested_order(&requested, Vec::new()).is_empty(),
             "a request whose every id was skipped answers the empty page"
+        );
+    }
+
+    #[test]
+    fn the_link_pages_off_the_first_and_last_like_ids() {
+        let (newest, middle, oldest) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let link = page_link(
+            "https://host",
+            "/api/v1/favourites",
+            &[newest, middle, oldest],
+        )
+        .expect("a page with ids links");
+        assert_eq!(
+            link,
+            format!(
+                "<https://host/api/v1/favourites?max_id={oldest}>; rel=\"next\", \
+                 <https://host/api/v1/favourites?min_id={newest}>; rel=\"prev\""
+            ),
+            "next walks to the oldest like, prev back to the newest, and \
+             the middle id names nothing"
+        );
+    }
+
+    #[test]
+    fn an_empty_page_links_nowhere() {
+        assert_eq!(
+            page_link("https://host", "/api/v1/favourites", &[]),
+            None,
+            "no rows, no cursors, no Link header"
+        );
+    }
+
+    #[test]
+    fn a_reblog_like_is_keyed_to_its_target() {
+        // The mapping both writes hand the model: the reblog row's id is
+        // what the client named, the original's is where the like lives.
+        let (reblog, original) = (Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(
+            liked_status_id(&row(reblog)),
+            reblog,
+            "a plain post likes itself"
+        );
+        let mut boost = row(reblog);
+        boost.reblog_of_id = Some(original);
+        assert_eq!(
+            liked_status_id(&boost),
+            original,
+            "a boost is liked through its original"
         );
     }
 }

@@ -6,10 +6,11 @@
 //! `lib/pleroma/web/mastodon_api/views/status_view.ex`, with its
 //! `safe_render_many`): it takes the already-paged rows and loads
 //! everything they render from — authors, media attachments, mentions,
-//! hashtags, emoji reactions, reblogged originals and quoted originals —
-//! with a FIXED set of batched queries, one per part, each keyed by an id
-//! list (`WHERE … = ANY($1)`), never a query per row. The count does not
-//! grow with the page size: eight statement groups whatever the batch —
+//! hashtags, emoji reactions, favourites, reblogged originals and quoted
+//! originals — with a FIXED set of batched queries, one per part, each
+//! keyed by an id list (`WHERE … = ANY($1)`), never a query per row. The
+//! count does not grow with the page size: nine statement groups whatever
+//! the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -19,12 +20,16 @@
 //! 6. hashtags — one [`hashtag::for_statuses`];
 //! 7. emoji reactions — one [`emoji_reaction::for_statuses`], the viewer's
 //!    id riding along to answer each roll-up's `me`;
-//! 8. the viewer's relationships to the page's authors — the one fixed
+//! 8. the viewer's favourites of the page — one
+//!    [`favourite::favourited_status_ids`], run only for an authenticated
+//!    viewer; a reblog row takes its flag through its original's id, which
+//!    is where the like lives;
+//! 9. the viewer's relationships to the page's authors — the one fixed
 //!    [`Relationship::load_many`] set, run only for an authenticated viewer.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
-//! page of plain posts costs five queries, and a viewer adds the
-//! relationship set.
+//! page of plain posts costs five queries, and a viewer adds the favourite
+//! read and the relationship set.
 //!
 //! # Extension points
 //!
@@ -34,8 +39,6 @@
 //! already shows: one id list, one keyed map) and threading that map
 //! through the batch context into [`StatusSource`]:
 //!
-//! - `favourited`: one read of the favourites table, `WHERE user_id =
-//!   viewer AND status_id = ANY(…)`.
 //! - `reblogged`: one read of the viewer's own reblog rows keyed by
 //!   `reblog_of_id` (statuses the viewer reblogs, not just statuses on
 //!   the page).
@@ -81,6 +84,7 @@ use crate::{
     error::AppResult,
     models::{
         emoji_reaction::{self, ReactionSummary},
+        favourite,
         hashtag::{self, Hashtag},
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mention,
@@ -171,6 +175,10 @@ struct Batch<'a> {
     /// Emoji reactions, keyed by status, in the roll-up's order
     /// ([`emoji_reaction::for_statuses`]).
     reactions: HashMap<Uuid, Vec<ReactionSummary>>,
+    /// The statuses on the page (and their originals) the viewer has
+    /// favourited — one [`favourite::favourited_status_ids`] read keyed by
+    /// every rendered id; empty for an anonymous viewer, who has no rows.
+    favourites: HashSet<Uuid>,
     /// The viewer's relationships to the page's authors, keyed by account
     /// id; `None` for an anonymous viewer.
     relationships: Option<RelationshipMap>,
@@ -223,6 +231,7 @@ impl<'a> Batch<'a> {
             mentions: load_mentions(pool, &rendered_ids).await?,
             tags: load_tags(pool, &rendered_ids).await?,
             reactions: load_reactions(pool, &rendered_ids, viewer).await?,
+            favourites: load_favourites(pool, &rendered_ids, viewer).await?,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
         })
     }
@@ -258,8 +267,15 @@ impl<'a> Batch<'a> {
     /// nested entity. `None` when the row's author is not in the batch —
     /// the foreign keys make that unobservable in stored data, and a
     /// status with no author has no render.
+    ///
+    /// The `favourited` flag is membership in the loaded set, keyed to the
+    /// row's own id — except for a reblog row, which is flagged through the
+    /// *original's* id, the status the like actually lands on (Pleroma's
+    /// `Announce` arm computes `favourited` off the liked object). The
+    /// nested original is flagged from its own id in the same set.
     fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
+        let favourite_id = row.reblog_of_id.unwrap_or(row.id);
         let source = StatusSource {
             row,
             author,
@@ -270,6 +286,7 @@ impl<'a> Batch<'a> {
             mentions: self.mentions.get(&row.id).map_or(&[], Vec::as_slice),
             tags: self.tags.get(&row.id).map_or(&[], Vec::as_slice),
             reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
+            favourited: self.favourites.contains(&favourite_id),
             reblog,
         };
         Some(Status::from_source(
@@ -352,6 +369,21 @@ async fn load_reactions(
         return Ok(HashMap::new());
     }
     emoji_reaction::for_statuses(pool, ids, viewer.map(|who| who.id)).await
+}
+
+/// [`favourite::favourited_status_ids`]: one query for the viewer's likes
+/// among the page's ids (reblogged originals included, since that is
+/// where a reblog's like lives). An anonymous viewer has no rows to ask
+/// about, and the empty set makes every flag false — no query at all.
+async fn load_favourites(
+    pool: &PgPool,
+    ids: &[Uuid],
+    viewer: Option<&User>,
+) -> AppResult<HashSet<Uuid>> {
+    let Some(viewer) = viewer else {
+        return Ok(HashSet::new());
+    };
+    favourite::favourited_status_ids(pool, viewer.id, ids).await
 }
 
 /// The viewer's relationships to the page's authors, keyed by account id:
@@ -646,6 +678,15 @@ mod tests {
         assert_eq!(stored.emoji, emoji, "the fixture row names its emoji");
     }
 
+    /// Favourites `status_id` as `liker`, asserting the write created its
+    /// row — the state the flag test starts from.
+    async fn favourite_it(pool: &PgPool, liker: &User, status_id: Uuid) {
+        let created = favourite::favourite(pool, BASE, liker.id, status_id)
+            .await
+            .expect("the fixture favourite stores");
+        assert!(created.is_some(), "the fixture pair had not favourited yet");
+    }
+
     /// The reactions ticket's loader inside the fixed query set: one page of
     /// three rows — two posts and a reblog of one of them — renders every
     /// roll-up from the same call, `me` follows the viewer, and the nested
@@ -722,6 +763,77 @@ mod tests {
                 .map(|entries| entries.iter().all(|entry| entry["me"] == json!(false))),
             Some(true),
             "an anonymous render is nobody's `me`"
+        );
+    }
+
+    /// The favourites ticket's loader inside the fixed query set: one
+    /// batched read answers the `favourited` flag of a whole page — plain
+    /// rows, reblog rows (whose like lives on the original) and the nested
+    /// originals alike — and an anonymous page is nobody's favourite.
+    #[tokio::test]
+    async fn the_favourited_flag_follows_one_batched_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let liked = post(&pool, &bob, "liked").await;
+        let ignored = post(&pool, &bob, "ignored").await;
+        let original = post(&pool, &bob, "original").await;
+        let reblog = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original.id),
+                ..NewStatus::local(&alice, "")
+            },
+        )
+        .await
+        .expect("a reblog of a stored post inserts");
+        favourite_it(&pool, &alice, liked.id).await;
+        favourite_it(&pool, &alice, original.id).await;
+
+        let flag = |entity: &Status| {
+            serde_json::to_value(entity).expect("a rendered status serializes")["favourited"]
+                .clone()
+        };
+        let page = [liked.clone(), ignored.clone(), reblog.clone()];
+        let for_alice = render_statuses(&state, Some(&alice), &page)
+            .await
+            .expect("the page renders for alice");
+        assert_eq!(flag(&for_alice[0]), json!(true), "alice's own like shows");
+        assert_eq!(
+            flag(&for_alice[1]),
+            json!(false),
+            "and the unliked post does not"
+        );
+        let reblog_json = serde_json::to_value(&for_alice[2]).expect("the reblog serializes");
+        assert_eq!(
+            reblog_json["favourited"],
+            json!(true),
+            "the reblog row is flagged through its original, where the \
+             like lives"
+        );
+        assert_eq!(
+            reblog_json["reblog"]["favourited"],
+            json!(true),
+            "and the nested original carries its own flag"
+        );
+
+        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&liked))
+            .await
+            .expect("the post renders for bob");
+        assert_eq!(
+            flag(&for_bob[0]),
+            json!(false),
+            "alice's like is nobody else's flag"
+        );
+        let anonymous = render_statuses(&state, None, &page)
+            .await
+            .expect("the page renders anonymously");
+        assert!(
+            anonymous.iter().all(|entity| flag(entity) == json!(false)),
+            "an anonymous page is nobody's favourite"
         );
     }
 

@@ -24,8 +24,8 @@ use crate::{
 /// a fallback panics.
 ///
 /// `state` reaches [`accounts::router`], [`apps::router`],
-/// [`reports::router`] and [`search::router`], the merged routers whose
-/// routes mount the rate
+/// [`reports::router`], [`search::router`] and [`statuses::router`], the
+/// merged routers whose routes mount the rate
 /// limiter, and — as
 /// [`state.config`] — [`media::router`] and [`pleroma_settings::router`],
 /// whose upload routes carry their own body limit (see
@@ -57,7 +57,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(reports::router(state))
         .merge(scrobbles::router())
         .merge(search::router(state))
-        .merge(statuses::router())
+        .merge(statuses::router(state))
         .merge(streaming::router())
         .merge(tags::router())
         .nest("/pleroma", misc::util_router())
