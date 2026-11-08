@@ -38,7 +38,8 @@
 //! and `POST /api/v1/accounts`; WBE-135 `password_reset` on
 //! `POST /auth/password`; WBE-120 `statuses_actions` on
 //! `POST /api/v1/reports`, joined by WBE-80's `POST
-//! /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin (see
+//! /api/v1/statuses/{id}/favourite`, its `…/unfavourite` twin and WBE-79's
+//! `DELETE /api/v1/statuses/{id}` (see
 //! [`crate::api::statuses`]). WBE-115 adds `search` on the three account
 //! search routes (`GET /api/v1/accounts/search`, `GET /api/v1/search`
 //! and `GET /api/v2/search`, see [`crate::api::search`]). WBE-57 adds

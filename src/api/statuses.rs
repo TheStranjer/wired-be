@@ -1,21 +1,25 @@
-//! The status endpoints: reads, favourite writes, the favourites listings
-//! and translation, all over one shared status gate and page renderer
-//! (`docs/ARCHITECTURE.md` decision 1).
+//! The status endpoints: reads, favourite writes, the favourites listings,
+//! translation and the delete, all over one shared status gate and page
+//! renderer (`docs/ARCHITECTURE.md` decision 1).
 //!
 //! The routes are the lookups `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=a&id[]=b`, the favourite writes
 //! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
 //! the state listing `GET /api/v1/statuses/{id}/favourited_by`, the
-//! caller's own favourites list `GET /api/v1/favourites`, and
-//! `POST /api/v1/statuses/{id}/translate`.
+//! caller's own favourites list `GET /api/v1/favourites`,
+//! `POST /api/v1/statuses/{id}/translate` and the write
+//! `DELETE /api/v1/statuses/{id}`.
 //!
 //! The reference is Pleroma's `StatusController` (`lib/pleroma/web/
 //! mastodon_api/controllers/status_controller.ex`): `show` and `.index`
 //! for the reads, `favourite` / `unfavourite` / `favourited_by` /
-//! `favourites` for the likes. Those reduce to the same two moves per
-//! surface: find the status, ask `Visibility.visible_for_user?`, and
-//! either render it or answer `{:error, :not_found}`. Here finding and
-//! asking live in the shared [`status_for_viewer_or_404`], which every
+//! `favourites` for the likes, and `delete` — with
+//! `Pleroma.Web.CommonAPI.delete/2`
+//! (`lib/pleroma/web/common_api.ex`) behind it — for the write. Those
+//! reduce to the same two moves per surface: find the status, ask
+//! `Visibility.visible_for_user?`, and either render it or answer
+//! `{:error, :not_found}`. Here finding and asking live in the shared
+//! [`status_for_viewer_or_404`], which every
 //! `/api/v1/statuses/{id}/...` route reuses, and rendering lives in the
 //! batched page renderer [`crate::services::render_status`].
 //!
@@ -101,11 +105,41 @@
 //! configured, `"Translation service unavailable"` when the configured one
 //! fails.
 //!
+//! # The delete
+//!
+//! `DELETE /api/v1/statuses/{id}` is Pleroma's `delete`: a user token
+//! ([`AuthUser`]) with `write:statuses`, on the same `statuses_actions`
+//! bucket the favourite writes ride, and the same
+//! [`status_for_viewer_or_404`] gate in front of the row. Then Pleroma's
+//! ownership rule: only the author may delete their own post, while an
+//! admin or a moderator ([`is_admin`](crate::models::user::User::is_admin)
+//! or [`is_moderator`](crate::models::user::User::is_moderator) — its
+//! `messages_delete` privilege) may delete anybody's. The two refusals keep
+//! Pleroma's two bodies: the shared 404 for a status that is malformed,
+//! unknown, deleted or hidden from this caller, and a 403 that carries the
+//! same `"Record not found"` wording for one that is visible but somebody
+//! else's.
+//!
+//! The answer is the [`Status`] entity *as it was before the delete*, with
+//! the status's raw source text beside it under the top-level `text` key —
+//! Mastodon's "delete and redraw" payload, which is what Pleroma's
+//! `with_source: true` renders here. What the write leaves is the tombstone
+//! of that status and of every live reblog of it, all counters stepped down
+//! in one transaction ([`soft_delete_with_reblogs`]); the media attachment
+//! rows of the deleted statuses stay in the table, referenced by nothing
+//! live, until the cleanup job removes them.
+//!
+//! Nothing leaves this instance yet: the `Delete` activity, the
+//! `status_deleted` stream push and the notification cleanup all attach at
+//! this route's `after_status_deleted` hook, the documented empty landing
+//! point.
+//!
 //! What the reads owe no 422: this module answers an unusable id with the
 //! show route's 404 and the batch route's silent skip, and the only
 //! request shapes beyond those are the pagination cursors' 400.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
+//! [`soft_delete_with_reblogs`]: crate::models::status::soft_delete_with_reblogs
 //! [`filter_visible`]: crate::models::status_visibility::filter_visible
 //! [`Status`]: crate::entities::status::Status
 //! [`Account`]: crate::entities::account::Account
@@ -117,9 +151,9 @@ use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
     http::{HeaderMap, Uri},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -139,7 +173,7 @@ use crate::{
         status_visibility,
         user::User,
     },
-    oauth::scopes::{READ_FAVOURITES, READ_STATUSES, WRITE_FAVOURITES},
+    oauth::scopes::{READ_FAVOURITES, READ_STATUSES, WRITE_FAVOURITES, WRITE_STATUSES},
     pagination::{PageParams, link_header, set_link_header},
     services::{
         render_status::{render_status, render_statuses},
@@ -163,6 +197,14 @@ const UNAVAILABLE: &str = "Translation service unavailable";
 /// and the caller's account has no default of its own either.
 const DEFAULT_TARGET_LANGUAGE: &str = "en";
 
+/// The body of both of the delete route's refusals: Pleroma's
+/// `StatusController.delete` answers `{:error, :not_found}` for an activity it
+/// cannot find, and `CommonAPI.delete`'s ownership arm — the one that
+/// [`AppError::Forbidden`] status carries here — renders the same
+/// `"Record not found"` wording, so a probe cannot tell "not yours" from
+/// "not there".
+const RECORD_NOT_FOUND: &str = "Record not found";
+
 /// Page size cap of `favourited_by`: the ticket pins 80, above
 /// [`crate::pagination::MAX_LIMIT`], with Pleroma's global 20 as the
 /// default the plain [`PageParams::from_query`] keeps.
@@ -175,13 +217,17 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
 ///
-/// `state` reaches the two favourite writes, which mount the
-/// `statuses_actions` throttle bucket the way the reports route does
-/// (see [`crate::rate_limit`]).
+/// `state` reaches the three status writes — the two favourite ones and
+/// `DELETE /api/v1/statuses/{id}` — which mount the `statuses_actions`
+/// throttle bucket the way the reports route does (see [`crate::rate_limit`]).
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/favourites", get(list_favourites))
         .route("/statuses/{id}", get(show_status))
+        .route(
+            "/statuses/{id}",
+            delete(delete_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
+        )
         .route("/statuses", get(list_statuses))
         .route(
             "/statuses/{id}/favourite",
@@ -220,6 +266,94 @@ async fn show_status(
     let row = status_for_viewer_or_404(&state, viewer, &id).await?;
     let rendered = render_status(&state, viewer, &row).await?;
     Ok(Json(rendered.ok_or(AppError::NotFound)?))
+}
+
+/// `DELETE /api/v1/statuses/{id}` — delete the status `id` and answer the
+/// [`Status`] entity *as it was before the deletion*, with the status's raw
+/// source text beside it under the top-level `text` key (Mastodon's "delete
+/// and redraw").
+///
+/// The gate is the shared [`status_for_viewer_or_404`], so a malformed,
+/// unknown, already deleted or invisible id is this module's one 404 —
+/// Pleroma's `delete` finds no activity and answers `{:error, :not_found}`.
+/// Behind it stands Pleroma's ownership rule, [`may_delete`]: one's own post,
+/// or anything at all for staff. Somebody else's visible status is the same
+/// `"Record not found"` body under a 403.
+///
+/// The entity renders from the row the gate read, before
+/// [`soft_delete_with_reblogs`] turns that row and every live reblog of it
+/// into a tombstone; the whole write is one transaction, so a caller that
+/// gets a 200 never meets a half-deleted post. A status that another delete
+/// took between the gate and the write answers the 404, as does the one row
+/// the renderer cannot answer.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `write:statuses` check; [`AppError::NotFound`] for a malformed,
+/// unknown, deleted or invisible status, for one a concurrent delete reached
+/// first, and for the row the render cannot answer;
+/// [`AppError::Forbidden`] for a status that is visible but not the caller's;
+/// the bucket's 429 before this handler runs. Any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn delete_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<DeletedStatus>> {
+    auth.require(WRITE_STATUSES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if !may_delete(&auth.0, &row) {
+        return Err(AppError::Forbidden(RECORD_NOT_FOUND.to_owned()));
+    }
+    let entity = render_status(&state, Some(&auth.0), &row)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if status::soft_delete_with_reblogs(&state.db, row.id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+    debug!(
+        status = %row.id,
+        user = %auth.0.id,
+        staff = auth.0.is_admin.get() || auth.0.is_moderator.get(),
+        "status deleted"
+    );
+    after_status_deleted(&state, &row);
+    Ok(Json(DeletedStatus {
+        entity,
+        text: row.raw_text,
+    }))
+}
+
+/// Whether `caller` may delete `row`: its author may, and an admin or a
+/// moderator may delete anything — Pleroma's
+/// `User.privileged?(user, :messages_delete) || user.ap_id == object.data["actor"]`,
+/// whose `messages_delete` privilege the two role flags stand in for here.
+/// The rest of the gate (does the row exist, is it live, may this caller see
+/// it) is [`status_for_viewer_or_404`]'s, which is why a refusal is a 403 on
+/// top of the shared 404 rather than one indistinguishable answer.
+fn may_delete(caller: &User, row: &StatusRow) -> bool {
+    caller.id == row.user_id || caller.is_admin.get() || caller.is_moderator.get()
+}
+
+/// The answer of `DELETE /api/v1/statuses/{id}`: the [`Status`] entity as the
+/// caller saw it before the row became a tombstone, with the raw source text
+/// beside it under the top-level `text` key. That key is Mastodon's
+/// delete-and-redraw payload — Pleroma renders the same one from the object's
+/// `source` for this action (`with_source: true`) and never on a plain read,
+/// which is why it is this response's own shape rather than a field of the
+/// shared entity.
+#[derive(Debug, Serialize)]
+struct DeletedStatus {
+    /// The pre-delete entity, its keys at the top level of the response.
+    #[serde(flatten)]
+    entity: Status,
+    /// The status's stored source text ([`raw_text`](StatusRow::raw_text)) as
+    /// it was before the delete; empty for a reblog, which carries none.
+    text: String,
 }
 
 /// `GET /api/v1/statuses?id[]=a&id[]=b` (or `ids[]=`) — the [`Status`]
@@ -587,6 +721,26 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 /// [`after_block_changed`](crate::api::blocks::after_block_changed).
 const fn after_favourite_changed(_state: &AppState, _favourite: &FavouriteRow, _favouriting: bool) {
 }
+
+/// Post-write hook of the delete route: the federation ticket that sends the
+/// `Delete` activity (and, with it, the withdrawal of every reblog this delete
+/// took down), the streaming ticket that pushes `status_deleted` to the
+/// timelines that carried the post, and the notification ticket that clears the
+/// notifications it caused all wire in here, and the queueing happens through
+/// `state` (decision 11).
+///
+/// `status` is the row **as it was before the delete** — the delete clears the
+/// stored text, so this is the only copy of what the post said: its
+/// [`id`](StatusRow::id) and [`uri`](StatusRow::uri) name the object to
+/// withdraw, [`user_id`](StatusRow::user_id) is the actor that owns it, and
+/// [`reblog_of_id`](StatusRow::reblog_of_id) says whether the object was a
+/// boost whose original must stop counting it. Pleroma runs all three off the
+/// same `CommonAPI.delete` pipeline.
+///
+/// Intentionally empty until then, like [`after_favourite_changed`] above and
+/// the reactions'
+/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
+const fn after_status_deleted(_state: &AppState, _status: &StatusRow) {}
 
 #[cfg(test)]
 mod tests {

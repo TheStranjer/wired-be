@@ -24,9 +24,12 @@
 //!
 //! Deletion is soft: [`soft_delete`] keeps the row as a tombstone with its
 //! text cleared and its `uri` reserved (so a deleted remote post is never
-//! re-imported) and steps the counters back down. Everything that reads by id
-//! hides tombstones; [`get_by_uri`] and [`get_by_id_including_deleted`] do
-//! not, because federation and moderation need to see them.
+//! re-imported) and steps the counters back down. Deleting through the API
+//! takes the boosts with the post: [`soft_delete_with_reblogs`] tombstones the
+//! status and every live reblog of it in one transaction. Everything that
+//! reads by id hides tombstones; [`get_by_uri`] and
+//! [`get_by_id_including_deleted`] do not, because federation and moderation
+//! need to see them.
 //!
 //! Counts move by whole steps only, through [`insert`], [`soft_delete`] and
 //! [`bump_counter`], and are clamped at zero in SQL, so they can neither go
@@ -434,6 +437,18 @@ const SOFT_DELETE_SQL: &str = "UPDATE statuses
     WHERE id = $1 AND deleted_at IS NULL
   RETURNING *";
 
+/// [`soft_delete_with_reblogs`]: the same tombstone [`soft_delete`] writes,
+/// for every live reblog of `id` at once. `RETURNING *` brings those rows back
+/// so their own counters can be stepped down in the same transaction.
+const SOFT_DELETE_REBLOGS_SQL: &str = "UPDATE statuses
+      SET content = '',
+          raw_text = '',
+          spoiler_text = '',
+          deleted_at = now(),
+          updated_at = now()
+    WHERE reblog_of_id = $1 AND deleted_at IS NULL
+  RETURNING *";
+
 /// Inserts `new_status` and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4) and, for a local status, `uri` and
@@ -595,6 +610,44 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
     Ok(Some(tombstone))
 }
 
+/// Soft-deletes status `id` **and every reblog of it** in one transaction,
+/// answering `id`'s own tombstone.
+///
+/// A post that is gone takes its boosts with it, so no live row is left
+/// pointing at a tombstone: every reblog of `id` is tombstoned exactly as
+/// [`soft_delete`] would tombstone it, and each one's counters step down in
+/// the same transaction — its author's `statuses_count`, and above all
+/// [`reblogs_count`](Status::reblogs_count) of the status being deleted, which
+/// lands at zero.
+///
+/// Idempotent in the same shape as [`soft_delete`]: an id that is already a
+/// tombstone, and an unknown id, are answered `None` and move nothing —
+/// reblogs included, since an already deleted original has nothing left to
+/// take down.
+///
+/// The media attachments of the deleted rows are left alone: they keep their
+/// `status_id` and stay in the table, referenced by no live status, until the
+/// cleanup job that removes them exists.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError), and the rollback takes the
+/// half-written delete with it: a status and its reblogs are tombstoned
+/// together or not at all.
+pub async fn soft_delete_with_reblogs(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
+    let mut tx = pool.begin().await?;
+    let Some(tombstone) = mark_deleted(&mut tx, id).await? else {
+        return Ok(None);
+    };
+    uncount_deleted(&mut tx, &tombstone).await?;
+    for reblog in tombstone_reblogs(&mut tx, id).await? {
+        uncount_deleted(&mut tx, &reblog).await?;
+    }
+    tx.commit().await?;
+    Ok(Some(tombstone))
+}
+
 /// Adds `delta` to `counter` of status `id`, clamped at zero, and refreshes
 /// its `updated_at`. An unknown id matches no row and changes nothing.
 ///
@@ -737,6 +790,16 @@ async fn mark_deleted(conn: &mut PgConnection, id: Uuid) -> AppResult<Option<Sta
     Ok(tombstone)
 }
 
+/// Turns every live reblog of `id` into a tombstone on `conn`, answering the
+/// rows it turned so their counters can step down with them.
+async fn tombstone_reblogs(conn: &mut PgConnection, id: Uuid) -> AppResult<Vec<Status>> {
+    let reblogs = sqlx::query_as::<_, Status>(SOFT_DELETE_REBLOGS_SQL)
+        .bind(id)
+        .fetch_all(conn)
+        .await?;
+    Ok(reblogs)
+}
+
 /// Adds `delta` to one counter of status `id`, in SQL, so the value the row
 /// holds is what gets stepped and the result is never below zero.
 async fn step_counter(
@@ -777,6 +840,7 @@ mod tests {
         config::TEST_BASE_URL,
         error::AppError,
         models::{
+            media_attachment::{self, MediaAttachment, NewMediaAttachment},
             mention,
             user::{self, NewUser, insert as insert_user, local_ap_id},
         },
@@ -814,6 +878,37 @@ mod tests {
         )
         .await
         .expect("a reply to a stored status inserts")
+    }
+
+    /// `author`'s reblog of the status `original`, as its row.
+    async fn boost(pool: &PgPool, author: &User, original: Uuid) -> Status {
+        insert(
+            pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original),
+                ..NewStatus::local(author, "")
+            },
+        )
+        .await
+        .expect("a reblog of a stored status inserts")
+    }
+
+    /// One media attachment of `author` posted on `status`: the row a
+    /// deleted status leaves behind, referenced by nothing live.
+    async fn attach(pool: &PgPool, author: &User, status: Uuid) -> MediaAttachment {
+        media_attachment::insert(
+            pool,
+            &NewMediaAttachment {
+                user_id: Some(author.id),
+                status_id: Some(status),
+                url: format!("{BASE}/media/fixture.png"),
+                content_type: "image/png".to_owned(),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .expect("a fixture attachment inserts")
     }
 
     /// The row of user `id` as it stands now, for reading counters back.
@@ -1526,6 +1621,120 @@ mod tests {
             fresh_user(&pool, bob.id).await.statuses_count,
             0,
             "the booster stops counting it as their own"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_status_takes_every_reblog_of_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let original = post(&pool, &alice, "delete me").await;
+        let other = post(&pool, &carol, "someone else's post").await;
+        let mine = boost(&pool, &bob, original.id).await;
+        let theirs = boost(&pool, &carol, original.id).await;
+        // A post of `other` that survives: only reblogs of the deleted
+        // status are taken down, never the booster's unrelated rows.
+        let untouched = boost(&pool, &bob, other.id).await;
+        let attachment = attach(&pool, &alice, original.id).await;
+
+        let tombstone = soft_delete_with_reblogs(&pool, original.id)
+            .await
+            .unwrap()
+            .expect("the original was live");
+
+        assert_eq!(tombstone.id, original.id, "the answer is the status");
+        assert!(tombstone.deleted_at.is_some(), "and it is a tombstone");
+        assert_eq!(tombstone.content, "", "its text is cleared");
+        for reblog in [&mine, &theirs] {
+            assert!(
+                get_by_id(&pool, reblog.id).await.unwrap().is_none(),
+                "the reblog of the deleted status is gone from the API"
+            );
+            let stored = get_by_id_including_deleted(&pool, reblog.id)
+                .await
+                .unwrap()
+                .expect("but its row is still there");
+            assert!(stored.deleted_at.is_some(), "as a tombstone too");
+            assert_eq!(stored.content, "", "with its text cleared");
+        }
+        assert_eq!(
+            counter(&pool, original.id, Counter::Reblogs).await,
+            0,
+            "the deleted status counts no boosts any more"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            1,
+            "bob keeps his other boost and loses the one that went down"
+        );
+        assert_eq!(
+            fresh_user(&pool, carol.id).await.statuses_count,
+            1,
+            "and carol keeps her own post and loses hers"
+        );
+        assert_eq!(
+            get_by_id(&pool, untouched.id).await.unwrap(),
+            Some(untouched.clone()),
+            "a reblog of another status is nobody's business here"
+        );
+        assert!(
+            media_attachment::get_by_id(&pool, attachment.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the media row stays in the table for the cleanup job to find"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_twice_with_reblogs_moves_nothing_twice() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "already gone").await;
+        let mine = boost(&pool, &bob, original.id).await;
+
+        assert!(
+            soft_delete_with_reblogs(&pool, original.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the first delete finds a live row"
+        );
+        assert!(
+            soft_delete_with_reblogs(&pool, original.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the second one finds only the tombstone"
+        );
+        assert_eq!(
+            fresh_user(&pool, alice.id).await.statuses_count,
+            0,
+            "so the author is not stepped down twice"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.statuses_count,
+            0,
+            "and neither is the booster"
+        );
+        assert!(
+            soft_delete_with_reblogs(&pool, new_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown id is nothing to delete"
+        );
+        assert!(
+            get_by_id_including_deleted(&pool, mine.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "and the reblog row is still there, tombstoned once"
         );
     }
 
