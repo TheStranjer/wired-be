@@ -133,6 +133,9 @@ mod mutes;
 /// NodeInfo (`/.well-known/nodeinfo` and `/nodeinfo/{version}`).
 mod nodeinfo;
 
+/// The grouped v2 notification API (`/api/v2/notifications`).
+mod notifications_v2;
+
 /// The `/oauth` endpoints: the token, revoke and authorize flows.
 mod oauth;
 

@@ -4,7 +4,7 @@
 use axum::Router;
 
 use crate::{
-    api::{account_lists, chats, instance, media, search},
+    api::{account_lists, chats, instance, media, notifications_v2, search},
     state::AppState,
 };
 
@@ -19,7 +19,10 @@ use crate::{
 /// [`account_lists::v2_router`] contributes `GET /api/v2/suggestions`, the
 /// source-wrapped twin of that area's v1 listing. [`search::v2_router`]
 /// contributes `GET /api/v2/search`, the combined search whose accounts-only
-/// answer is this ticket's. Do not call [`Router::fallback`] here (or on
+/// answer is this ticket's. [`notifications_v2::router`] contributes the
+/// grouped notification API: `GET /api/v2/notifications` with its
+/// `unread_count`, `{group_key}`, `{group_key}/accounts` and
+/// `{group_key}/dismiss` companions. Do not call [`Router::fallback`] here (or on
 /// anything merged here): unmatched paths must reach the app-wide JSON
 /// fallback in [`crate::app`], which answers them with Pleroma's
 /// `api_not_implemented`, and merging two routers that each set a fallback
@@ -35,6 +38,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(account_lists::v2_router())
         .merge(instance::v2_router())
         .merge(media::router(&state.config))
+        .merge(notifications_v2::router())
         .merge(search::v2_router(state))
         .nest("/pleroma/chats", chats::v2_router())
 }

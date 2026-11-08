@@ -262,7 +262,7 @@ async fn each_post_bumps_the_version_it_answers() {
     assert_eq!(
         notes["notifications"]["pleroma"],
         json!({"unread_count": 0}),
-        "and its count is 0 until the notifications ticket fills it in"
+        "and its count is real now — zero because the account has no notifications"
     );
 
     let both = read_object(&app, &token, BOTH_QUERY).await;

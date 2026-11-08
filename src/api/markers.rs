@@ -84,7 +84,7 @@ async fn read_markers(
         user = %auth.0.id,
         "markers read"
     );
-    Ok(markers_response(rows))
+    markers_response(&state, rows).await
 }
 
 /// `POST /api/v1/markers` — upsert every position the body posted and answer
@@ -110,31 +110,30 @@ async fn write_markers(
         user = %auth.0.id,
         "markers upserted"
     );
-    Ok(markers_response(rows))
+    markers_response(&state, rows).await
 }
 
 /// Renders written and read rows alike as the response object: each row under
 /// its own timeline name, with that timeline's unread count in the `pleroma`
 /// half.
-fn markers_response(rows: Vec<MarkerRow>) -> Json<Markers> {
+async fn markers_response(state: &AppState, rows: Vec<MarkerRow>) -> AppResult<Json<Markers>> {
     let mut markers = Markers::new();
     for row in rows {
-        let _entry: Option<Marker> = markers.insert(
-            row.timeline.clone(),
-            Marker::from_row(&row, unread_count(&row)),
-        );
+        let count = unread_count(state, &row).await?;
+        let _entry: Option<Marker> =
+            markers.insert(row.timeline.clone(), Marker::from_row(&row, count));
     }
-    Json(markers)
+    Ok(Json(markers))
 }
 
 /// The `pleroma.unread_count` of `row`: notifications ask the model how far
-/// past the marker they run; every other timeline reports `0`, because `home`
-/// has no unread concept for Pleroma either.
-fn unread_count(row: &MarkerRow) -> i64 {
+/// past the marker their unseen undismissed rows run; every other timeline
+/// reports `0`, because `home` has no unread concept for Pleroma either.
+async fn unread_count(state: &AppState, row: &MarkerRow) -> AppResult<i64> {
     if row.timeline != marker::NOTIFICATIONS {
-        return 0;
+        return Ok(0);
     }
-    marker::unread_notifications_count(row.user_id, &row.last_read_id)
+    marker::unread_notifications_count(&state.db, row.user_id, &row.last_read_id).await
 }
 
 /// The query parameters of `GET /api/v1/markers`.

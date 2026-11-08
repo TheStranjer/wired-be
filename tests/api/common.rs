@@ -43,6 +43,7 @@ use wired_be::{
     http_client::HttpClient,
     mailer::MemoryTransport,
     models::{
+        notification::{self, NewNotification, Notification},
         oauth_app::{self, NewOauthApp},
         oauth_token::{self, NewToken},
         status::{self, NewStatus, Status, Visibility},
@@ -415,6 +416,74 @@ pub async fn create_status(
     status::insert(pool, &test_config().base_url, &new)
         .await
         .expect("status fixture inserts")
+}
+
+/// Inserts a notification of `recipient` caused by `actor`.
+///
+/// Straight through [`wired_be::models::notification`]: of
+/// `notification_type`, about `status_row` when the type names one, unseen
+/// and undismissed, with the module-computed group key — exactly like a
+/// notification a causing endpoint will create when those tickets land.
+/// Fixtures that need another state (`seen`, `dismissed`, a marker-like
+/// position) adjust the returned row's columns or the `markers` table
+/// themselves. A reaction carries an emoji too; use [`create_reaction`].
+///
+/// # Panics
+///
+/// If the insert fails, e.g. because the recipient, actor or status has no
+/// row in the test database.
+pub async fn create_notification(
+    pool: &PgPool,
+    recipient: &User,
+    actor: &User,
+    notification_type: &str,
+    status_row: Option<&Status>,
+) -> Notification {
+    notification::create(
+        pool,
+        &NewNotification {
+            user_id: recipient.id,
+            from_account_id: actor.id,
+            notification_type,
+            status_id: status_row.map(|found| found.id),
+            emoji: None,
+            report_id: None,
+        },
+    )
+    .await
+    .expect("notification fixture inserts")
+}
+
+/// Inserts a `pleroma:emoji_reaction` notification of `recipient` by
+/// `actor` about `status_row`, reacting with `emoji`.
+///
+/// [`create_notification`] for the one type that carries an extra part;
+/// the reaction's group key includes the emoji, so two emojis on one
+/// status are two groups.
+///
+/// # Panics
+///
+/// As [`create_notification`].
+pub async fn create_reaction(
+    pool: &PgPool,
+    recipient: &User,
+    actor: &User,
+    status_row: &Status,
+    emoji: &str,
+) -> Notification {
+    notification::create(
+        pool,
+        &NewNotification {
+            user_id: recipient.id,
+            from_account_id: actor.id,
+            notification_type: "pleroma:emoji_reaction",
+            status_id: Some(status_row.id),
+            emoji: Some(emoji),
+            report_id: None,
+        },
+    )
+    .await
+    .expect("reaction fixture inserts")
 }
 
 /// The redirect URI every app fixture registers.
