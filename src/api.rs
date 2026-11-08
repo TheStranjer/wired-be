@@ -68,6 +68,7 @@ pub mod password_reset;
 pub mod pleroma;
 pub mod pleroma_account_settings;
 pub mod pleroma_accounts;
+pub mod pleroma_import;
 pub mod pleroma_settings;
 pub mod reports;
 pub mod scrobbles;

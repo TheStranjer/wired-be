@@ -74,7 +74,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// ([`delivery::KIND_DELIVER`](federation::delivery::KIND_DELIVER)), the
 /// streaming reference-table sweep
 /// ([`KIND_CLEANUP`](streaming::hub::KIND_CLEANUP)), the mailer job
-/// ([`mailer::KIND_SEND`]) and the incoming-activity stub
+/// ([`mailer::KIND_SEND`]), the expired-mute sweep
+/// ([`mutes::KIND_EXPIRE`](jobs::mutes::KIND_EXPIRE)), the user-import
+/// jobs ([`imports::KIND_FOLLOWS`](jobs::imports::KIND_FOLLOWS),
+/// [`imports::KIND_BLOCKS`](jobs::imports::KIND_BLOCKS) and
+/// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)) and the
+/// incoming-activity stub
 /// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)), so
 /// the worker idles, sweeps, delivers, sends and drains received
 /// activities. The state's mail transport comes from
@@ -163,6 +168,9 @@ fn job_registry() -> JobRegistry {
     );
     registry.register(streaming::hub::KIND_CLEANUP, streaming::hub::handle_cleanup);
     registry.register(jobs::mutes::KIND_EXPIRE, jobs::mutes::handle_expire);
+    registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
+    registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
+    registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);
     registry.register(mailer::KIND_SEND, mailer::handle);
     registry.register(
         federation::dispatch::KIND_INCOMING,

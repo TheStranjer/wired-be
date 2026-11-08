@@ -19,6 +19,7 @@
 //! federation delivery and mailer job kinds. The sibling [`scheduler`] module
 //! is the producer side: it enqueues the recurring, cron-like jobs.
 
+pub mod imports;
 pub mod mutes;
 pub mod scheduler;
 
