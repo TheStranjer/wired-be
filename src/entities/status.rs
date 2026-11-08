@@ -24,8 +24,8 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `reblogged`, `muted`, `bookmarked`, `pinned` and
-//! `pleroma.pinned_at` (the reblog/mute/bookmark/pin tables);
+//! `reblogged`, `muted`, `pinned` and
+//! `pleroma.pinned_at` (the reblog/mute/pin tables);
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
 //! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
 //! (chats, bookmark folders); and `quote` (the quoting ticket, whose
@@ -37,6 +37,10 @@
 //! — one batched read per page, the viewer's id deciding membership; a
 //! reblog row takes its flag from its original, whose id is where the
 //! like lives.
+//! `bookmarked` is filled by the bookmarks ticket, from
+//! [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) — the same
+//! shape of batched read; a reblog row takes its flag from *its own* id,
+//! because a bookmark lands on the row its client named, not the original.
 //!
 //! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
@@ -143,7 +147,8 @@ pub struct PleromaMetadata {
     /// extension block only.
     pub quotes_count: i32,
     /// `bookmark_folder`: the viewer's folder for a bookmarked post; the
-    /// bookmarks ticket sets it, so it renders JSON `null` for now.
+    /// folders ticket files bookmarks and sets it, so it renders JSON
+    /// `null` for now.
     pub bookmark_folder: Option<Value>,
     /// `pinned_at`: when the account pinned this post to their profile;
     /// the pinning ticket fills it, so it renders `null` for now.
@@ -186,6 +191,13 @@ pub struct StatusSource<'a> {
     /// `favourited` off the liked object — and `false` for an anonymous
     /// viewer, who has no rows.
     pub favourited: bool,
+    /// Whether the viewer bookmarked this row: membership in the one
+    /// [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) read
+    /// the batch runs for the page. The renderer keys every row's flag to
+    /// its *own* id — a bookmark of a reblog id lands on the reblog row,
+    /// Pleroma's `Bookmark.create` taking the activity the client named —
+    /// and `false` for an anonymous viewer, who has no rows.
+    pub bookmarked: bool,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -281,8 +293,9 @@ pub struct Status {
     /// Whether the viewer muted this post's thread; `false` until the
     /// thread-mute ticket lands.
     pub muted: JsonBool,
-    /// Whether the viewer bookmarked this post; `false` until the
-    /// bookmarks ticket lands.
+    /// Whether the viewer bookmarked this post; the bookmarks ticket's
+    /// batched read answers it, `false` for an anonymous viewer and for a
+    /// post they have not bookmarked.
     pub bookmarked: JsonBool,
     /// Whether this post is pinned on its author's profile; `false` (and
     /// `pleroma.pinned_at` `null`) until the pinning ticket lands.
@@ -322,6 +335,7 @@ impl Status {
             tags,
             reactions,
             favourited,
+            bookmarked,
             reblog,
         } = source;
         Self {
@@ -358,7 +372,7 @@ impl Status {
             favourited: JsonBool(favourited),
             reblogged: JsonBool(false),
             muted: JsonBool(false),
-            bookmarked: JsonBool(false),
+            bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(false),
             quote: None,
             pleroma: pleroma_block(row, reply_author, reactions),
@@ -649,6 +663,8 @@ mod tests {
         reactions: Vec<SummaryRow>,
         /// Whether the viewer favourited the row.
         favourited: bool,
+        /// Whether the viewer bookmarked the row.
+        bookmarked: bool,
     }
 
     impl<'a> Parts<'a> {
@@ -662,6 +678,7 @@ mod tests {
                 tags: Vec::new(),
                 reactions: Vec::new(),
                 favourited: false,
+                bookmarked: false,
             }
         }
 
@@ -704,6 +721,15 @@ mod tests {
                 ..self
             }
         }
+
+        /// Sets [`bookmarked`](Self::bookmarked): the viewer's flag, which
+        /// the bookmarks ticket's batched read would hand the renderer.
+        fn bookmarked(self) -> Self {
+            Self {
+                bookmarked: true,
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -719,6 +745,7 @@ mod tests {
             tags: &parts.tags,
             reactions: &parts.reactions,
             favourited: parts.favourited,
+            bookmarked: parts.bookmarked,
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -738,6 +765,7 @@ mod tests {
                 tags: &[],
                 reactions: &[],
                 favourited: false,
+                bookmarked: false,
                 reblog: None,
             },
             None,
@@ -826,12 +854,16 @@ mod tests {
         assert_eq!(value["card"], Value::Null, "cards are a later ticket");
         assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
         assert_eq!(value["edited_at"], Value::Null);
-        for flag in ["reblogged", "muted", "bookmarked", "pinned"] {
+        for flag in ["reblogged", "muted", "pinned"] {
             assert_eq!(value[flag], false, "{flag} is a later ticket");
         }
         assert_eq!(
             value["favourited"], false,
             "a page whose favourites read found nothing renders the flag false"
+        );
+        assert_eq!(
+            value["bookmarked"], false,
+            "a page whose bookmarks read found nothing renders the flag false"
         );
         assert_eq!(value["quote"], Value::Null, "quotes are a later ticket");
     }
@@ -844,6 +876,33 @@ mod tests {
         assert_eq!(
             value["favourited"], true,
             "the favourites batch's membership reaches the entity verbatim"
+        );
+    }
+
+    #[test]
+    fn the_viewers_bookmark_lands_in_the_flag() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).bookmarked(), None);
+        assert_eq!(
+            value["bookmarked"], true,
+            "the bookmarks batch's membership reaches the entity verbatim"
+        );
+    }
+
+    #[test]
+    fn the_nested_render_keeps_the_viewers_bookmark_out_of_the_original() {
+        // The bookmarks read keys every row's flag to its own id, so a
+        // reblog the viewer bookmarked renders flagged while the nested
+        // original — which the client never named — does not.
+        let alice = base_user("alice");
+        let row = base_row();
+        let nested = render_nested(&row, &alice);
+        let value = render(&row, &Parts::of(&alice).bookmarked(), Some(nested));
+        assert_eq!(value["bookmarked"], true, "the named row is flagged");
+        assert_eq!(
+            value["reblog"]["bookmarked"], false,
+            "and the nested original is nobody's bookmark by itself"
         );
     }
 

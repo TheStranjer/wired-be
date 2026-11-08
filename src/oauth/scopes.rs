@@ -127,6 +127,15 @@ pub const READ_FAVOURITES: &str = "read:favourites";
 /// and its `…/unfavourite` twin (Mastodon's `write:favourites`).
 pub const WRITE_FAVOURITES: &str = "write:favourites";
 
+/// The read side of bookmarks: `GET /api/v1/bookmarks`, the list a client
+/// shows its user (Mastodon's `read:bookmarks`, Pleroma's grant on the
+/// `StatusController` `bookmarks` action).
+pub const READ_BOOKMARKS: &str = "read:bookmarks";
+/// The write side of bookmarks: `POST /api/v1/statuses/{id}/bookmark` and
+/// its `…/unbookmark` twin (Mastodon's `write:bookmarks`, Pleroma's grant
+/// on the `bookmark` and `unbookmark` actions).
+pub const WRITE_BOOKMARKS: &str = "write:bookmarks";
+
 /// The write side of reports: `POST /api/v1/reports`.
 ///
 /// Mastodon's `write:reports`, the scope Pleroma's `ReportController`

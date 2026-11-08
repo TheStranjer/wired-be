@@ -1,19 +1,22 @@
-//! The status endpoints: reads, favourite writes, the favourites listings,
-//! translation and the delete, all over one shared status gate and page
-//! renderer (`docs/ARCHITECTURE.md` decision 1).
+//! The status endpoints: reads, the favourite and bookmark writes and
+//! listings, translation and the delete, all over one shared status gate
+//! and page renderer (`docs/ARCHITECTURE.md` decision 1).
 //!
 //! The routes are the lookups `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=a&id[]=b`, the favourite writes
 //! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
 //! the state listing `GET /api/v1/statuses/{id}/favourited_by`, the
-//! caller's own favourites list `GET /api/v1/favourites`,
+//! caller's own favourites list `GET /api/v1/favourites`, the bookmark
+//! writes `POST /api/v1/statuses/{id}/bookmark` and its `…/unbookmark`
+//! twin, the caller's own bookmarks list `GET /api/v1/bookmarks`,
 //! `POST /api/v1/statuses/{id}/translate` and the write
 //! `DELETE /api/v1/statuses/{id}`.
 //!
 //! The reference is Pleroma's `StatusController` (`lib/pleroma/web/
 //! mastodon_api/controllers/status_controller.ex`): `show` and `.index`
 //! for the reads, `favourite` / `unfavourite` / `favourited_by` /
-//! `favourites` for the likes, and `delete` — with
+//! `favourites` for the likes, `bookmark` / `unbookmark` / `bookmarks`
+//! for the bookmarks, and `delete` — with
 //! `Pleroma.Web.CommonAPI.delete/2`
 //! (`lib/pleroma/web/common_api.ex`) behind it — for the write. Those
 //! reduce to the same two moves per surface: find the status, ask
@@ -85,11 +88,39 @@
 //! `ActivityPub.fetch_favourites`). A short page ends the walk, and the
 //! `Link` header speaks only of the entries that came back.
 //!
-//! Neither write federates anything yet: the federation ticket that sends
-//! the `Like` activity and its `Undo` wires into this module's
+//! # The bookmark writes and the bookmarks listing
+//!
+//! `POST …/bookmark` and `POST …/unbookmark` are Pleroma's `bookmark`
+//! and `unbookmark`: a user token ([`AuthUser`]) with `write:bookmarks`,
+//! both answering the [`Status`] entity as the caller sees it —
+//! `bookmarked` true after the write, false after the withdrawal, since
+//! the row is re-read for the render and the renderer's batched
+//! bookmarks read now names the caller. Both writes ([`bookmark::add`] /
+//! [`bookmark::remove`]) are idempotent on `(account, status)`: a repeat
+//! bookmark is one row and one 200, and withdrawing a bookmark the caller
+//! never made is the unchanged entity with 200. Bookmarking a status the
+//! caller may not see is the shared 404. Unlike a like, a bookmark of a
+//! reblog's id lands on *the reblog row itself* — Pleroma's
+//! `Bookmark.create` takes the activity the client named, and the flag
+//! renders off that same id. And unlike a like, a bookmark federates
+//! nothing: it is the account's own private note, Pleroma sends no
+//! activity for it, so these routes have no post-write hook to await.
+//!
+//! `GET /api/v1/bookmarks` is the caller's own list: [`AuthUser`] with
+//! `read:bookmarks`, the statuses they bookmarked newest-BOOKMARK first,
+//! [`PageParams`] again keyed on the bookmark row id (20 by default, 40
+//! at most), and only the statuses still visible to them — the same
+//! [`filter_visible`] step as the favourites listing. The optional
+//! `folder_id` query parameter is accepted and ignored until the folders
+//! ticket files bookmarks; [`bookmark::page_for_user`] already takes the
+//! filter for that wiring.
+//!
+//! Neither favourite write federates anything yet: the federation ticket
+//! that sends the `Like` activity and its `Undo` wires into this module's
 //! `after_favourite_changed` hook, the documented empty landing point,
 //! exactly as the reactions' [`crate::api::emoji_reactions`] hook waits
-//! for its `EmojiReact`.
+//! for its `EmojiReact`. The bookmark writes have no such hook to wait
+//! for — Pleroma's bookmark is a private row, never an activity.
 //!
 //! # The translation
 //!
@@ -168,12 +199,16 @@ use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
+        bookmark,
         favourite::{self, Favourite as FavouriteRow},
         status::{self, Status as StatusRow},
         status_visibility,
         user::User,
     },
-    oauth::scopes::{READ_FAVOURITES, READ_STATUSES, WRITE_FAVOURITES, WRITE_STATUSES},
+    oauth::scopes::{
+        READ_BOOKMARKS, READ_FAVOURITES, READ_STATUSES, WRITE_BOOKMARKS, WRITE_FAVOURITES,
+        WRITE_STATUSES,
+    },
     pagination::{PageParams, link_header, set_link_header},
     services::{
         render_status::{render_status, render_statuses},
@@ -211,8 +246,9 @@ const RECORD_NOT_FOUND: &str = "Record not found";
 const FAVOURITED_BY_MAX_LIMIT: i64 = 80;
 
 /// The `Link` headers' query parameters carry nothing but the cursor:
-/// neither favourites listing has a filter to repeat on either link (the
-/// relationship listings' constant, same rule).
+/// none of the favourites and bookmarks listings repeats a filter on
+/// either link (the relationship listings' constant, same rule) — the
+/// bookmarks listing's ignored `folder_id` least of all.
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
@@ -220,9 +256,14 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// `state` reaches the three status writes — the two favourite ones and
 /// `DELETE /api/v1/statuses/{id}` — which mount the `statuses_actions`
 /// throttle bucket the way the reports route does (see [`crate::rate_limit`]).
+/// The two bookmark writes and the bookmarks listing ride no bucket: the
+/// ticket pins the throttle for the like writes and the delete only, and
+/// a bookmark is a private per-account fact no client can hammer on
+/// anyone else's data with.
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/favourites", get(list_favourites))
+        .route("/bookmarks", get(list_bookmarks))
         .route("/statuses/{id}", get(show_status))
         .route(
             "/statuses/{id}",
@@ -239,6 +280,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
                 .layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
         )
         .route("/statuses/{id}/favourited_by", get(list_favourited_by))
+        .route("/statuses/{id}/bookmark", post(bookmark_status))
+        .route("/statuses/{id}/unbookmark", post(unbookmark_status))
         .route("/statuses/{id}/translate", post(translate_status))
 }
 
@@ -569,6 +612,131 @@ async fn list_favourites(
     ))
 }
 
+/// `POST /api/v1/statuses/{id}/bookmark` — bookmark the status `id` and
+/// answer it as the caller sees it: `bookmarked` true, because the row is
+/// re-read for the render and the renderer's batched bookmarks read now
+/// names the caller.
+///
+/// The status resolves through [`status_for_viewer_or_404`] — what the
+/// caller may not see is the same 404 as what does not exist. A reblog's
+/// id bookmarks *the reblog row itself* (see the [module docs](self)), and
+/// the write is idempotent, so a repeat bookmark is one row and one 200.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:bookmarks` check; [`AppError::NotFound`] for a
+/// malformed, unknown, deleted or invisible status, for the row a delete
+/// took between the gate and the re-read, and for the one row the render
+/// cannot answer. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn bookmark_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_BOOKMARKS)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if bookmark::add(&state.db, auth.0.id, row.id).await?.is_some() {
+        debug!(
+            status = %row.id,
+            user = %auth.0.id,
+            "status bookmarked"
+        );
+    }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `POST /api/v1/statuses/{id}/unbookmark` — withdraw the caller's
+/// bookmark of the status `id` and answer it as they see it, `bookmarked`
+/// false.
+///
+/// The same gate and the same row the bookmark write names, and
+/// [`bookmark::remove`] is content with nothing to delete: a withdrawal of
+/// a bookmark that was never made (or already withdrawn) changes nothing
+/// and is the unchanged [`Status`] with 200.
+///
+/// # Errors
+///
+/// Those of [`bookmark_status`]. Any database failure arrives through `?`
+/// as [`AppError::Database`].
+async fn unbookmark_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_BOOKMARKS)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if bookmark::remove(&state.db, auth.0.id, row.id)
+        .await?
+        .is_some()
+    {
+        debug!(
+            status = %row.id,
+            user = %auth.0.id,
+            "bookmark withdrawn"
+        );
+    }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `GET /api/v1/bookmarks` — the statuses the caller bookmarked, newest
+/// bookmark first, one [`PageParams`] page at a time (20 by default, 40 at
+/// most) with the `Link` header over the *bookmark row ids*, and narrowed
+/// to what their eye still allows: the same [`filter_visible`] step as
+/// [`list_favourites`].
+///
+/// The `folder_id` query parameter is accepted and ignored until the
+/// folders ticket files bookmarks: the walk asks for `None`, every
+/// bookmark there is. A malformed cursor is still the page extractor's
+/// 400; a malformed `folder_id` is nothing the extractor reads.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] from [`AuthUser`] without a valid user
+/// token; [`AppError::Forbidden`] when the token does not grant
+/// `read:bookmarks`; [`AppError::BadRequest`] from the page parameters
+/// for a malformed cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+async fn list_bookmarks(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Status>>)> {
+    auth.require(READ_BOOKMARKS)?;
+    // `Some(folder)` narrows the walk to one folder's bookmarks; until the
+    // folders ticket stores folder ids the endpoint hands `None` whatever
+    // the query names, so the parameter is accepted and ignored.
+    let folder_id = None;
+    let pairs = bookmark::page_for_user(&state.db, auth.0.id, page, folder_id).await?;
+    let rows: Vec<StatusRow> = pairs.iter().map(|(_, row)| row.clone()).collect();
+    let visible = status_visibility::filter_visible(&state.db, rows, Some(&auth.0)).await?;
+    let visible_ids: HashSet<Uuid> = visible.iter().map(|row| row.id).collect();
+    // The cursors key on the bookmark, so they survive the visibility
+    // step: only bookmarks whose status came back visible name the edges.
+    let cursors: Vec<Uuid> = pairs
+        .iter()
+        .filter(|(bookmark, _)| visible_ids.contains(&bookmark.status_id))
+        .map(|(bookmark, _)| bookmark.id)
+        .collect();
+    debug!(
+        user = %auth.0.id,
+        bookmarks = visible.len(),
+        "bookmarks listed"
+    );
+    let mut headers = HeaderMap::new();
+    set_link_header(
+        &mut headers,
+        page_link(&state.config.base_url, uri.path(), &cursors).as_deref(),
+    )?;
+    Ok((
+        headers,
+        Json(render_statuses(&state, Some(&auth.0), &visible).await?),
+    ))
+}
+
 /// `POST /api/v1/statuses/{id}/translate` — translate the status `id` into
 /// the body's `lang` and answer the [`Translation`] entity.
 ///
@@ -668,13 +836,14 @@ async fn current_entity(state: &AppState, viewer: &User, id: Uuid) -> AppResult<
     Ok(Json(entity))
 }
 
-/// The `Link` header of a favourites page: [`link_header`] over the first
-/// (newest) and last (oldest) favourite id of the page, the follow lists'
-/// [`page_link`](crate::api::accounts) shape with the like id in place of
-/// the relationship id's. An empty page names no cursor and links nowhere.
-fn page_link(base_url: &str, path: &str, favourite_ids: &[Uuid]) -> Option<String> {
-    let newest = favourite_ids.first()?.to_string();
-    let oldest = favourite_ids.last()?.to_string();
+/// The `Link` header of a favourites or bookmarks page: [`link_header`]
+/// over the first (newest) and last (oldest) like or bookmark row id of
+/// the page, the follow lists' [`page_link`](crate::api::accounts) shape
+/// with the row id in place of the relationship id's. An empty page names
+/// no cursor and links nowhere.
+fn page_link(base_url: &str, path: &str, entry_ids: &[Uuid]) -> Option<String> {
+    let newest = entry_ids.first()?.to_string();
+    let oldest = entry_ids.last()?.to_string();
     link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
