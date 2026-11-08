@@ -1,12 +1,13 @@
-//! The status endpoints: reads, favourite writes and the favourites
-//! listings, all over one shared status gate and page renderer
+//! The status endpoints: reads, favourite writes, the favourites listings
+//! and translation, all over one shared status gate and page renderer
 //! (`docs/ARCHITECTURE.md` decision 1).
 //!
 //! The routes are the lookups `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=a&id[]=b`, the favourite writes
 //! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
-//! the state listing `GET /api/v1/statuses/{id}/favourited_by`, and the
-//! caller's own favourites list `GET /api/v1/favourites`.
+//! the state listing `GET /api/v1/statuses/{id}/favourited_by`, the
+//! caller's own favourites list `GET /api/v1/favourites`, and
+//! `POST /api/v1/statuses/{id}/translate`.
 //!
 //! The reference is Pleroma's `StatusController` (`lib/pleroma/web/
 //! mastodon_api/controllers/status_controller.ex`): `show` and `.index`
@@ -86,6 +87,20 @@
 //! exactly as the reactions' [`crate::api::emoji_reactions`] hook waits
 //! for its `EmojiReact`.
 //!
+//! # The translation
+//!
+//! `POST /api/v1/statuses/{id}/translate` is Pleroma's `translate`: a user
+//! token with `read:statuses`, the same [`status_for_viewer_or_404`] gate (so
+//! a post the caller may not read is the shared 404, where Pleroma answers its
+//! visibility arm 404 too), and the body's `lang` as the target language —
+//! falling back to the caller's own `language` and then to `en`. Which
+//! provider that asks, and what its call looks like on the wire, is
+//! [`crate::services::translate`]'s business; this route adds only the gate,
+//! the answer's [`Translation`] entity and the two 503s an instance without a
+//! working provider owes: `"Translation is not enabled"` while none is
+//! configured, `"Translation service unavailable"` when the configured one
+//! fails.
+//!
 //! What the reads owe no 422: this module answers an unusable id with the
 //! show route's 404 and the batch route's silent skip, and the only
 //! request shapes beyond those are the pagination cursors' 400.
@@ -94,6 +109,7 @@
 //! [`filter_visible`]: crate::models::status_visibility::filter_visible
 //! [`Status`]: crate::entities::status::Status
 //! [`Account`]: crate::entities::account::Account
+//! [`Translation`]: crate::entities::translation::Translation
 
 use std::collections::{HashMap, HashSet};
 
@@ -103,7 +119,8 @@ use axum::{
     http::{HeaderMap, Uri},
     routing::{get, post},
 };
-use tracing::debug;
+use serde::Deserialize;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -112,8 +129,10 @@ use crate::{
     entities::{
         account::{Account, AccountViewer},
         status::Status,
+        translation::Translation,
     },
     error::{AppError, AppResult},
+    extract::ApiBody,
     models::{
         favourite::{self, Favourite as FavouriteRow},
         status::{self, Status as StatusRow},
@@ -122,13 +141,27 @@ use crate::{
     },
     oauth::scopes::{READ_FAVOURITES, READ_STATUSES, WRITE_FAVOURITES},
     pagination::{PageParams, link_header, set_link_header},
-    services::render_status::{render_status, render_statuses},
+    services::{
+        render_status::{render_status, render_statuses},
+        translate::Translator,
+    },
     state::AppState,
 };
 
 /// How many ids one batch lookup acts on: Pleroma's `index` `limit`, with
 /// every id past it ignored rather than refused.
 pub const MAX_STATUS_IDS: usize = 100;
+
+/// The 503 body of `POST …/translate` on an instance with no translation
+/// provider configured (Pleroma's "Translation service not configured", in
+/// the ticket's wording).
+const NOT_ENABLED: &str = "Translation is not enabled";
+/// The 503 body of `POST …/translate` when a configured provider did not
+/// answer, or answered an error: the reason goes to the log, never here.
+const UNAVAILABLE: &str = "Translation service unavailable";
+/// The language `POST …/translate` translates into when the body names none
+/// and the caller's account has no default of its own either.
+const DEFAULT_TARGET_LANGUAGE: &str = "en";
 
 /// Page size cap of `favourited_by`: the ticket pins 80, above
 /// [`crate::pagination::MAX_LIMIT`], with Pleroma's global 20 as the
@@ -160,6 +193,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
                 .layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
         )
         .route("/statuses/{id}/favourited_by", get(list_favourited_by))
+        .route("/statuses/{id}/translate", post(translate_status))
 }
 
 /// `GET /api/v1/statuses/{id}` — the status `id` names, as the viewer
@@ -401,6 +435,84 @@ async fn list_favourites(
     ))
 }
 
+/// `POST /api/v1/statuses/{id}/translate` — translate the status `id` into
+/// the body's `lang` and answer the [`Translation`] entity.
+///
+/// The status resolves through [`status_for_viewer_or_404`] like every other
+/// route keyed by id: Pleroma's `translate` refuses anything but a `public`
+/// or `unlisted` post, and here the visibility model's answer is the shared
+/// 404, so a private post translation cannot see is also a post that
+/// translation cannot say exists. What is translated is the status's HTML
+/// `content`, in the language the provider's own protocol offers for it, and
+/// the answer's `detected_source_language` is what the provider says the
+/// original was written in.
+///
+/// Without a configured provider the call cannot succeed: 503
+/// `{"error":"Translation is not enabled"}`. A provider that is configured
+/// but does not answer — transport failure, timeout, or a 4xx/5xx of its own —
+/// is 503 `{"error":"Translation service unavailable"}`, with the real reason
+/// in the log and never in the body.
+///
+/// [`Translation`]: crate::entities::translation::Translation
+async fn translate_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiBody(params): ApiBody<TranslateParams>,
+) -> AppResult<Json<Translation>> {
+    auth.require(READ_STATUSES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    let translator = Translator::from_config(&state.config, &state.http_client);
+    if translator.provider_name().is_none() {
+        return Err(AppError::ServiceUnavailable(NOT_ENABLED.to_owned()));
+    }
+    let target = target_language(params.lang.as_deref(), auth.0.language.as_deref());
+    let translated = translator
+        .translate(&row.content, row.language.as_deref(), &target)
+        .await
+        .map_err(|err| {
+            warn!(
+                %err,
+                status = %row.id,
+                target = %target,
+                "status translation failed"
+            );
+            AppError::ServiceUnavailable(UNAVAILABLE.to_owned())
+        })?;
+    debug!(
+        status = %row.id,
+        provider = translated.provider,
+        target = %target,
+        "status translated"
+    );
+    Ok(Json(Translation::for_status(&row, translated)))
+}
+
+/// The body of `POST /api/v1/statuses/{id}/translate`.
+#[derive(Debug, Deserialize)]
+struct TranslateParams {
+    /// The language to translate into; absent (or blank) asks for the
+    /// caller's own default — see [`target_language`].
+    #[serde(default)]
+    lang: Option<String>,
+}
+
+/// The language `POST …/translate` moves a status into: the body's `lang`,
+/// else the caller's account default — the `users.language` column the
+/// `Status` entity shows as `source.language` — else
+/// [`DEFAULT_TARGET_LANGUAGE`]. That is Pleroma's
+/// `Map.get(params, :lang) || user.language` with a fallback for the account
+/// that never named a language, since a blank target is no language to ask a
+/// provider for; a blank spelling of either is no language either.
+fn target_language(requested: Option<&str>, preferred: Option<&str>) -> String {
+    let asked = requested.map(str::trim).filter(|lang| !lang.is_empty());
+    let default = preferred.map(str::trim).filter(|lang| !lang.is_empty());
+    asked
+        .or(default)
+        .unwrap_or(DEFAULT_TARGET_LANGUAGE)
+        .to_owned()
+}
+
 /// The one status a write answers: the row `viewer` just changed —
 /// a reblog row still answers *itself* — re-read first so the render
 /// carries the counter the write stepped, then rendered for them.
@@ -479,6 +591,7 @@ const fn after_favourite_changed(_state: &AppState, _favourite: &FavouriteRow, _
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     use super::*;
@@ -609,5 +722,61 @@ mod tests {
             original,
             "a boost is liked through its original"
         );
+    }
+
+    /// The body of a translate request, as `ApiBody` would hand it over:
+    /// parsed from the JSON shape the extractor builds for either accepted
+    /// content type.
+    fn params(body: Value) -> TranslateParams {
+        serde_json::from_value(body).expect("the extractor's shape parses")
+    }
+
+    #[test]
+    fn the_body_carries_one_optional_target_language() {
+        assert_eq!(
+            params(json!({"lang": "de"})).lang.as_deref(),
+            Some("de"),
+            "the documented key"
+        );
+        assert_eq!(
+            params(json!({})).lang,
+            None,
+            "an empty body — which is also what an absent body and a bare              `lang=` form parameter stand for — names no language"
+        );
+    }
+
+    #[test]
+    fn the_asked_language_beats_the_account_default() {
+        assert_eq!(
+            target_language(Some("eo"), Some("de")),
+            "eo",
+            "the body's `lang` wins"
+        );
+        assert_eq!(
+            target_language(None, Some("de")),
+            "de",
+            "without it the caller's own default"
+        );
+        assert_eq!(
+            target_language(Some(" fr "), Some("de")),
+            "fr",
+            "and a padded spelling is trimmed, not rejected"
+        );
+    }
+
+    #[test]
+    fn english_is_the_last_resort() {
+        for (asked, preferred) in [
+            (None, None),
+            (Some(""), None),
+            (Some("   "), Some("")),
+            (None, Some("  ")),
+        ] {
+            assert_eq!(
+                target_language(asked, preferred),
+                "en",
+                "a blank is no language to ask a provider for, so `{asked:?}`                  with `{preferred:?}` falls back to English"
+            );
+        }
     }
 }

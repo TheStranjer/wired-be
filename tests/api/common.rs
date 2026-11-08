@@ -187,6 +187,7 @@ pub fn test_app_state(pool: PgPool, config: Config) -> AppState {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        translation_languages_cache: Arc::default(),
         rate_limiter: Arc::new(wired_be::rate_limit::RateLimiter::from_config(
             config.as_ref(),
         )),
@@ -208,6 +209,48 @@ pub fn test_app_with_config(pool: PgPool, config: Config) -> Router {
 /// The media proxy signing secret the tests use: 40 characters, safely
 /// past the 32-character minimum, and never a real secret.
 pub const MEDIA_PROXY_TEST_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The translation provider key the tests configure: never a real key, and
+/// sent only to a loopback mock of the provider.
+pub const TRANSLATION_TEST_KEY: &str = "test-translation-key";
+
+/// [`test_config`] with status translation pointed at the provider `api_url`
+/// names: `provider` is a `TRANSLATION_PROVIDER` value and `api_url` the
+/// mock's origin.
+///
+/// `None` for `api_url` leaves `TRANSLATION_API_URL` unset, the state no
+/// provider is usable in. A `deepl` provider is always keyed with
+/// [`TRANSLATION_TEST_KEY`], which that API requires and these tests never
+/// send anywhere real. The mock providers live on loopback, which is why this
+/// config keeps the SSRF guard off, and the rate limiter stays out of the way
+/// exactly as in [`test_config`].
+///
+/// # Panics
+///
+/// Never for the fixed values tests pass: every variable is valid.
+#[must_use]
+pub fn test_translation_config(provider: &str, api_url: Option<&str>) -> Config {
+    Config::from_lookup(|key| match key {
+        wired_be::config::DATABASE_URL_VAR => Some(wired_be::config::TEST_DATABASE_URL.to_owned()),
+        wired_be::config::BASE_URL_VAR => Some(wired_be::config::TEST_BASE_URL.to_owned()),
+        wired_be::config::HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
+        wired_be::config::RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
+        wired_be::config::TRANSLATION_PROVIDER_VAR => Some(provider.to_owned()),
+        wired_be::config::TRANSLATION_API_URL_VAR => api_url.map(str::to_owned),
+        wired_be::config::TRANSLATION_API_KEY_VAR => {
+            (provider == "deepl").then(|| TRANSLATION_TEST_KEY.to_owned())
+        }
+        _ => None,
+    })
+    .expect("the fixed translation test config is valid")
+}
+
+/// The application translating through `provider`, which reaches its API at
+/// `api_url`, served over `pool`: what the mock-provider tests of
+/// `translate.rs` are built with.
+pub fn test_translation_app(pool: PgPool, provider: &str, api_url: &str) -> Router {
+    test_app_with_config(pool, test_translation_config(provider, Some(api_url)))
+}
 
 /// [`test_config`] with the media proxy enabled and a proxied body capped
 /// at `max_bytes` bytes.

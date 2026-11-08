@@ -1149,6 +1149,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(RateLimiter::with_clock(limits, time)),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         };

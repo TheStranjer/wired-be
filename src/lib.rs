@@ -108,6 +108,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         http_client: HttpClient::from(config.as_ref()),
         uploader: UploaderBackend::from(config.as_ref()),
         instance_stats_cache: Arc::default(),
+        translation_languages_cache: Arc::default(),
         rate_limiter: Arc::new(rate_limit::RateLimiter::from_config(config.as_ref())),
         mailer: mailer::transport_from_config(&config),
     };
@@ -273,6 +274,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(mailer::MemoryTransport::new()),
         })

@@ -23,14 +23,16 @@
 //! unauthenticated callers may see remote instances at all.
 //!
 //! None of these endpoints needs authentication — Pleroma's controller
-//! `plug`s `skip_auth` — and none takes parameters. Of the `show` reads
-//! only the `stats` block is expensive across large tables, so it is
-//! cached in memory for [`STATS_TTL`] in the [`TimedCache`] on
-//! [`crate::state::AppState`]; rules, the contact account and the peer
-//! list are read fresh on every request and answer the moment they
-//! change.
+//! `plug`s `skip_auth` — and none takes parameters. Two of the reads cost
+//! more than a query: `show`'s `stats` block aggregates over large tables and
+//! is cached in memory for [`STATS_TTL`], and `translation_languages` asks a
+//! third-party provider for its language list and is cached for
+//! [`LANGUAGES_TTL`] — both in the [`TimedCache`] slot of the same
+//! [`crate::state::AppState`]. Rules, the contact account and the peer list
+//! are read fresh on every request and answer the moment they change.
 //!
 //! [`TimedCache`]: crate::util::cache::TimedCache
+//! [`LANGUAGES_TTL`]: crate::services::translate::LANGUAGES_TTL
 
 use axum::{Json, Router, extract::State, routing::get};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -49,7 +51,10 @@ use crate::{
         instance_rule::InstanceRule,
         user::{NOT_INSTANCE_ACTOR, User},
     },
-    services::instance_meta,
+    services::{
+        instance_meta,
+        translate::{Translator, languages_matrix},
+    },
     state::AppState,
     util::{cache::TimedCache, time::mastodon_time},
 };
@@ -148,11 +153,6 @@ const MAX_PINNED_STATUSES: usize = 5;
 /// Peer hosts `GET /api/v1/instance/peers` reports at most, the cap the
 /// listing answers with even on a far larger table.
 const PEER_LIMIT: i64 = 1_000;
-/// Whether a translation provider is configured; none is until the
-/// translation ticket lands, so `configuration.translation.enabled` and
-/// `GET /api/v1/instance/translation_languages` report that (Pleroma's
-/// `Pleroma.Language.Translation.configured?()`).
-const TRANSLATION_CONFIGURED: bool = false;
 
 /// The three counters of a Pleroma-compatible instance, read in one
 /// round trip and cached for [`STATS_TTL`].
@@ -380,13 +380,31 @@ async fn show_domain_blocks(State(state): State<AppState>) -> AppResult<Json<Vec
     ))
 }
 
-/// `GET /api/v1/instance/translation_languages` — the language pairs a
-/// translation provider offers. No provider is configured until the
-/// translation ticket lands, so the document stays the empty object
-/// Pleroma's `translation_languages.json` renders then. No
+/// `GET /api/v1/instance/translation_languages` — the language pairs the
+/// configured provider offers, `{"<source>": ["<target>", …], …}`.
+///
+/// The list comes from [`Translator::languages`], fetched at most once per
+/// [`LANGUAGES_TTL`] and kept in the [`TimedCache`] slot on
+/// [`crate::state::AppState`] — a third-party round trip is no business of a
+/// document clients read on every start-up. Only a list that actually arrived
+/// is cached: an empty answer is either no provider or one that refused, and
+/// neither should buy an hour of silence. With no provider configured (or one
+/// that will not answer its list) the document is the empty object Pleroma's
+/// `translation_languages.json` renders for an unconfigured instance. No
 /// authentication.
-async fn show_translation_languages() -> Json<Map<String, Value>> {
-    Json(Map::new())
+async fn show_translation_languages(State(state): State<AppState>) -> Json<Map<String, Value>> {
+    let now = Utc::now();
+    let pairs = if let Some(cached) = state.translation_languages_cache.get(now) {
+        cached
+    } else {
+        let translator = Translator::from_config(&state.config, &state.http_client);
+        let fresh = translator.languages().await;
+        if !fresh.is_empty() {
+            state.translation_languages_cache.insert(now, fresh.clone());
+        }
+        fresh
+    };
+    Json(languages_matrix(&pairs))
 }
 
 /// `GET /api/v1/instance/activity` — Mastodon's weekly activity stats.
@@ -1028,7 +1046,7 @@ impl ConfigurationV2 {
             statuses: StatusesConfiguration::for_config(config),
             media_attachments: MediaAttachmentsConfiguration::for_config(config),
             polls: PollsConfiguration::for_config(config),
-            translation: TranslationConfiguration::unconfigured(),
+            translation: TranslationConfiguration::for_config(config),
         }
     }
 }
@@ -1095,16 +1113,21 @@ impl AccountsConfigurationV2 {
 /// The v2 `configuration.translation` group.
 #[derive(Debug, Serialize)]
 struct TranslationConfiguration {
-    /// Whether a translation provider is configured; none is until the
-    /// translation ticket lands ([`TRANSLATION_CONFIGURED`]).
+    /// Whether a translation provider is configured, from
+    /// `TRANSLATION_PROVIDER` and its URL and key (Pleroma's
+    /// `Pleroma.Language.Translation.configured?()`).
     enabled: bool,
 }
 
 impl TranslationConfiguration {
-    /// The group of an instance with no translation provider.
-    const fn unconfigured() -> Self {
+    /// The group of the provider `config` configures: enabled exactly when
+    /// an instance built from those settings can talk to a provider (the same
+    /// rule [`Translator::from_config`] applies to pick a translator).
+    ///
+    /// [`Translator::from_config`]: crate::services::translate::Translator::from_config
+    const fn for_config(config: &Config) -> Self {
         Self {
-            enabled: TRANSLATION_CONFIGURED,
+            enabled: config.translation.is_configured(),
         }
     }
 }

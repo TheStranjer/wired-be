@@ -150,6 +150,16 @@ pub const MEDIA_PROXY_MAX_BYTES_VAR: &str = "MEDIA_PROXY_MAX_BYTES";
 /// Environment variable holding the comma-separated list of hosts the
 /// media proxy never proxies.
 pub const MEDIA_PROXY_BLACKLIST_VAR: &str = "MEDIA_PROXY_BLACKLIST";
+/// Environment variable holding which status-translation provider the
+/// instance uses: `none` (the default), `libretranslate` or `deepl`.
+pub const TRANSLATION_PROVIDER_VAR: &str = "TRANSLATION_PROVIDER";
+/// Environment variable holding the base URL of the configured translation
+/// provider's API (no trailing slash); a provider without it stays unused.
+pub const TRANSLATION_API_URL_VAR: &str = "TRANSLATION_API_URL";
+/// Environment variable holding the translation provider's API key (never
+/// logged; redacted in `Debug` output). `deepl` needs it, a
+/// keyless `libretranslate` server does not.
+pub const TRANSLATION_API_KEY_VAR: &str = "TRANSLATION_API_KEY";
 /// Environment variable holding whether outgoing actor `GET`s are signed
 /// with the instance actor's key (authorized-fetch mode on the peers).
 pub const SIGN_FETCHES_VAR: &str = "SIGN_FETCHES";
@@ -519,6 +529,91 @@ impl fmt::Debug for MediaProxyConfig {
     }
 }
 
+/// Which service translates statuses, the value of
+/// `TRANSLATION_PROVIDER` (Pleroma's `[:language, :translation, :provider]`).
+///
+/// The two remote providers are the ones
+/// [`crate::services::translate`] speaks; anything else is
+/// [`None`](Self::None), which is also the default, so an instance
+/// translates nothing until an operator points it at a server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TranslationProvider {
+    /// No provider: `POST /api/v1/statuses/{id}/translate` answers 503 and
+    /// the language matrix stays empty.
+    #[default]
+    None,
+    /// A `LibreTranslate` server (self-hosted or a hosted instance of it).
+    LibreTranslate,
+    /// The `DeepL` API.
+    DeepL,
+}
+
+impl TranslationProvider {
+    /// The provider a `TRANSLATION_PROVIDER` value names, case-insensitively
+    /// and trimmed; `None` for any other spelling.
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "libretranslate" => Some(Self::LibreTranslate),
+            "deepl" => Some(Self::DeepL),
+            _ => None,
+        }
+    }
+
+    /// Whether this name selects a provider at all
+    /// ([`None`](Self::None) selects none).
+    #[must_use]
+    pub const fn is_none(self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+/// Status-translation settings, from the three `TRANSLATION_*` variables.
+///
+/// [`crate::services::translate`] turns one of these into the translator the
+/// endpoints use. [`api_key`](Self::api_key) is secret material: the manual
+/// `Debug` impl below redacts it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TranslationConfig {
+    /// The provider to translate with, from `TRANSLATION_PROVIDER`;
+    /// [`None`](TranslationProvider::None) by default.
+    pub provider: TranslationProvider,
+    /// The provider's API base URL, from `TRANSLATION_API_URL` with any
+    /// trailing slash trimmed; `None` when unset.
+    pub api_url: Option<String>,
+    /// The provider's API key, from `TRANSLATION_API_KEY`; `None` when
+    /// unset. Redacted in `Debug` output like `Config`'s `database_url`.
+    pub api_key: Option<String>,
+}
+
+impl TranslationConfig {
+    /// Whether these settings name a provider the instance can actually
+    /// talk to: a provider other than [`None`](TranslationProvider::None),
+    /// an [`api_url`](Self::api_url) to reach it at, and — for
+    /// [`DeepL`](TranslationProvider::DeepL), whose API has no unauthenticated
+    /// mode — an [`api_key`](Self::api_key). This is what
+    /// `configuration.translation.enabled` of the v2 instance document
+    /// reports (Pleroma's `Translation.configured?()`).
+    #[must_use]
+    pub const fn is_configured(&self) -> bool {
+        if self.provider.is_none() || self.api_url.is_none() {
+            return false;
+        }
+        !matches!(self.provider, TranslationProvider::DeepL) || self.api_key.is_some()
+    }
+}
+
+/// Redacts [`api_key`](Self::api_key), which is provider credentials.
+impl fmt::Debug for TranslationConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TranslationConfig")
+            .field("provider", &self.provider)
+            .field("api_url", &self.api_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Rate limiter settings, from `RATE_LIMITS_ENABLED`, `RATE_LIMITS` and
 /// `TRUST_PROXY_HEADERS`.
 ///
@@ -736,6 +831,9 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
+    /// The status-translation settings, from the `TRANSLATION_*` variables
+    /// (see [`crate::services::translate`]).
+    pub translation: TranslationConfig,
     /// Whether outgoing actor `GET`s are HTTP-signed with the instance
     /// actor's key, from `SIGN_FETCHES` (see
     /// [`crate::federation::fetch_actor`]).
@@ -847,6 +945,7 @@ impl Config {
             smtp_tls,
             mail_from,
             media_proxy: media_proxy_settings(&lookup)?,
+            translation: translation_settings(&lookup)?,
             sign_fetches,
             authorized_fetch,
             federation_enabled: federation_enabled(&lookup)?,
@@ -965,6 +1064,11 @@ impl Config {
                 base_url: None,
                 max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
                 blacklist: Vec::new(),
+            },
+            translation: TranslationConfig {
+                provider: TranslationProvider::default(),
+                api_url: None,
+                api_key: None,
             },
             sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
@@ -1537,6 +1641,43 @@ where
     })
 }
 
+/// Reads the three settings that configure status translation
+/// (see [`crate::services::translate`]). Grouped because each is a plain
+/// default-or-parse and [`Config::from_lookup`] has a size budget (AGENTS.md).
+/// An unset or blank provider is [`TranslationProvider::None`], the default;
+/// a name that is not one of the three is a startup error, because it would
+/// silently leave the instance translating nothing.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidTranslationProvider`] when
+/// `TRANSLATION_PROVIDER` names no provider this instance speaks.
+fn translation_settings<F>(lookup: &F) -> Result<TranslationConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let raw = lookup(TRANSLATION_PROVIDER_VAR).unwrap_or_default();
+    let text = if raw.trim().is_empty() {
+        "none".to_owned()
+    } else {
+        raw
+    };
+    let provider = TranslationProvider::parse(&text).ok_or(
+        ConfigError::InvalidTranslationProvider(TRANSLATION_PROVIDER_VAR),
+    )?;
+    let api_url = lookup(TRANSLATION_API_URL_VAR)
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty());
+    let api_key = lookup(TRANSLATION_API_KEY_VAR)
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty());
+    Ok(TranslationConfig {
+        provider,
+        api_url,
+        api_key,
+    })
+}
+
 /// Reads the rate limiter settings (see [`crate::rate_limit`]): whether
 /// limited routes throttle at all, the bucket table — Pleroma's defaults
 /// with the `RATE_LIMITS` overrides merged in — and whether
@@ -1681,6 +1822,7 @@ impl fmt::Debug for Config {
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
             .field("media_proxy", &self.media_proxy)
+            .field("translation", &self.translation)
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
             .field("federation_enabled", &self.federation_enabled)
@@ -1709,6 +1851,9 @@ pub enum ConfigError {
     /// `SMTP_TLS` is not one of `starttls`, `tls` or `none`; the value is the
     /// variable name.
     InvalidSmtpTls(&'static str),
+    /// `TRANSLATION_PROVIDER` is not one of `none`, `libretranslate` or
+    /// `deepl`; the value is the variable name.
+    InvalidTranslationProvider(&'static str),
     /// The media proxy is enabled but its `MEDIA_PROXY_SECRET` is shorter
     /// than [`MIN_MEDIA_PROXY_SECRET_CHARS`] requires; the value is the
     /// variable name.
@@ -1737,6 +1882,10 @@ impl fmt::Display for ConfigError {
             Self::InvalidSmtpTls(var) => {
                 write!(f, "invalid {var}: expected one of starttls, tls or none")
             }
+            Self::InvalidTranslationProvider(var) => write!(
+                f,
+                "invalid {var}: expected one of none, libretranslate or deepl"
+            ),
             Self::ShortMediaProxySecret(var) => write!(
                 f,
                 "invalid {var}: expected at least {MIN_MEDIA_PROXY_SECRET_CHARS} characters"
@@ -1758,6 +1907,7 @@ impl Error for ConfigError {
             | Self::InvalidBoolean(_)
             | Self::InvalidOauthProviders(_)
             | Self::InvalidSmtpTls(_)
+            | Self::InvalidTranslationProvider(_)
             | Self::ShortMediaProxySecret(_)
             | Self::InvalidRateLimits(_) => None,
         }
@@ -3098,6 +3248,163 @@ mod tests {
         assert!(
             debug.contains("enabled: true"),
             "the enablement flag is visible: {debug}"
+        );
+    }
+
+    #[test]
+    fn translation_is_off_by_default() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.translation.provider,
+            TranslationProvider::None,
+            "no provider until the operator names one"
+        );
+        assert_eq!(config.translation.api_url, None, "no API URL by default");
+        assert_eq!(config.translation.api_key, None, "no API key by default");
+        assert!(
+            !config.translation.is_configured(),
+            "an unconfigured provider is reported as such"
+        );
+    }
+
+    #[test]
+    fn reads_custom_translation_settings() {
+        let config = config_with(&[
+            (TRANSLATION_PROVIDER_VAR, " LibreTranslate "),
+            (TRANSLATION_API_URL_VAR, " https://translate.example/ "),
+            (TRANSLATION_API_KEY_VAR, "  lt-key  "),
+        ]);
+        assert_eq!(
+            config.translation.provider,
+            TranslationProvider::LibreTranslate,
+            "the provider name is matched case-insensitively and trimmed"
+        );
+        assert_eq!(
+            config.translation.api_url.as_deref(),
+            Some("https://translate.example"),
+            "TRANSLATION_API_URL is trimmed and loses its trailing slash"
+        );
+        assert_eq!(
+            config.translation.api_key.as_deref(),
+            Some("lt-key"),
+            "TRANSLATION_API_KEY is trimmed"
+        );
+        assert!(
+            config.translation.is_configured(),
+            "a named provider with a URL is usable"
+        );
+    }
+
+    #[test]
+    fn translation_provider_accepts_every_spelling() {
+        for (value, provider) in [
+            ("none", TranslationProvider::None),
+            ("NONE", TranslationProvider::None),
+            ("", TranslationProvider::None),
+            ("   ", TranslationProvider::None),
+            ("libretranslate", TranslationProvider::LibreTranslate),
+            ("LibreTranslate", TranslationProvider::LibreTranslate),
+            ("deepl", TranslationProvider::DeepL),
+            ("DeepL", TranslationProvider::DeepL),
+        ] {
+            let config = config_with(&[(TRANSLATION_PROVIDER_VAR, value)]);
+            assert_eq!(
+                config.translation.provider, provider,
+                "`{value}` selects its provider"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_translation_provider_is_an_error() {
+        let err = try_config_with(&[(TRANSLATION_PROVIDER_VAR, "google")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidTranslationProvider(TRANSLATION_PROVIDER_VAR),
+            "error variant"
+        );
+        assert!(err.source().is_none(), "no source");
+        assert_eq!(
+            err.to_string(),
+            "invalid TRANSLATION_PROVIDER: expected one of none, libretranslate or deepl",
+            "message names the variable and its three values"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_a_url_or_key_is_not_configured() {
+        let urlless = config_with(&[(TRANSLATION_PROVIDER_VAR, "libretranslate")]);
+        assert!(
+            !urlless.translation.is_configured(),
+            "a provider with no server to talk to is unusable"
+        );
+        let keyless = config_with(&[
+            (TRANSLATION_PROVIDER_VAR, "deepl"),
+            (TRANSLATION_API_URL_VAR, "https://api.deepl.example"),
+        ]);
+        assert!(
+            !keyless.translation.is_configured(),
+            "DeepL has no unauthenticated mode, so its key is required"
+        );
+        let with_key = config_with(&[
+            (TRANSLATION_PROVIDER_VAR, "deepl"),
+            (TRANSLATION_API_URL_VAR, "https://api.deepl.example"),
+            (TRANSLATION_API_KEY_VAR, "dl-key"),
+        ]);
+        assert!(
+            with_key.translation.is_configured(),
+            "DeepL with URL and key is usable"
+        );
+        let hosted = config_with(&[
+            (TRANSLATION_PROVIDER_VAR, "libretranslate"),
+            (TRANSLATION_API_URL_VAR, "https://translate.example"),
+        ]);
+        assert!(
+            hosted.translation.is_configured(),
+            "LibreTranslate needs no key: a self-hosted server asks for none"
+        );
+    }
+
+    #[test]
+    fn empty_translation_url_and_key_are_unset() {
+        let config = config_with(&[
+            (TRANSLATION_PROVIDER_VAR, "deepl"),
+            (TRANSLATION_API_URL_VAR, "   "),
+            (TRANSLATION_API_KEY_VAR, ""),
+        ]);
+        assert_eq!(
+            config.translation.api_url, None,
+            "a blank URL reads as unset"
+        );
+        assert_eq!(
+            config.translation.api_key, None,
+            "a blank key reads as unset"
+        );
+        assert!(
+            !config.translation.is_configured(),
+            "so the provider stays unconfigured"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_the_translation_api_key() {
+        let config = config_with(&[
+            (TRANSLATION_PROVIDER_VAR, "deepl"),
+            (TRANSLATION_API_URL_VAR, "https://api.deepl.example"),
+            (TRANSLATION_API_KEY_VAR, "a-provider-secret-never-logged"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("a-provider-secret-never-logged"),
+            "the API key must not leak: {debug}"
+        );
+        assert!(
+            debug.contains("api_key: Some(\"<redacted>\")"),
+            "the redaction marker stands in: {debug}"
+        );
+        assert!(
+            debug.contains("provider: DeepL"),
+            "the provider itself is visible: {debug}"
         );
     }
 

@@ -12,6 +12,11 @@
 //! into signed proxy links (used by the [`entities`](crate::entities)
 //! builders) and serves those links over HTTP (its router is merged at
 //! the top level by [`crate::app`]).
+//!
+//! [`translate`] is the outbound half of status translation: which provider
+//! the instance talks to, what a translate call and a language list look like
+//! over there, and the sanitizer pass every provider answer goes through
+//! before an endpoint serves it.
 
 pub mod emoji_packs;
 pub mod instance_actor;
@@ -20,3 +25,4 @@ pub mod media_processing;
 pub mod media_proxy;
 pub mod mentions;
 pub mod render_status;
+pub mod translate;

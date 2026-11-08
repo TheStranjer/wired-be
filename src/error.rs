@@ -18,7 +18,9 @@
 //! wording for a deactivated account), "Something went wrong" for
 //! server-side failures, whose real cause is only written to the log, and
 //! 424/502 variants for upstreams this instance proxies to (see
-//! [`crate::services::media_proxy`]) whose detail is sent as-is.
+//! [`crate::services::media_proxy`]) whose detail is sent as-is, and a 503
+//! variant for a feature that is switched off or whose backing service does
+//! not answer (see [`crate::services::translate`]), likewise sent as-is.
 
 use std::{error::Error, fmt};
 
@@ -100,6 +102,12 @@ pub enum AppError {
     /// [`Self::BadGateway`], the federation-gateway error, its detail is
     /// a fixed client-safe message, sent as-is.
     UpstreamFailure(String),
+    /// A feature the endpoint would need is switched off, or the service
+    /// behind it is not answering (503 Service Unavailable): translation
+    /// with no provider configured, or a provider whose call failed (see
+    /// [`crate::services::translate`]). Like [`Self::UpstreamFailure`], its
+    /// detail is a fixed client-safe message, sent as-is.
+    ServiceUnavailable(String),
     /// The request is well formed but semantically invalid (422).
     Unprocessable(String),
     /// The caller exceeded its rate limit (429).
@@ -148,6 +156,7 @@ impl AppError {
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::FailedDependency(_) => StatusCode::FAILED_DEPENDENCY,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::UpstreamFailure(_) | Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -168,6 +177,7 @@ impl AppError {
             | Self::UnsupportedMediaType(detail)
             | Self::FailedDependency(detail)
             | Self::UpstreamFailure(detail)
+            | Self::ServiceUnavailable(detail)
             | Self::Unprocessable(detail)
             | Self::NotFoundMessage(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
@@ -208,6 +218,7 @@ impl fmt::Display for AppError {
             | Self::UnsupportedMediaType(detail)
             | Self::FailedDependency(detail)
             | Self::UpstreamFailure(detail)
+            | Self::ServiceUnavailable(detail)
             | Self::Unprocessable(detail)
             | Self::Internal(detail)
             | Self::BadGateway(detail)
@@ -240,6 +251,7 @@ impl Error for AppError {
             | Self::UnsupportedMediaType(_)
             | Self::FailedDependency(_)
             | Self::UpstreamFailure(_)
+            | Self::ServiceUnavailable(_)
             | Self::Unprocessable(_)
             | Self::RateLimited
             | Self::BadGateway(_)
@@ -362,6 +374,10 @@ mod tests {
                 "Unsupported media type",
             ),
             (AppError::UpstreamFailure("no route".to_owned()), "no route"),
+            (
+                AppError::ServiceUnavailable("Translation is not enabled".to_owned()),
+                "Translation is not enabled",
+            ),
             (AppError::Unprocessable("too long".to_owned()), "too long"),
             (AppError::RateLimited, RATE_LIMITED_MESSAGE),
             (AppError::BadGateway(SECRET.to_owned()), INTERNAL_MESSAGE),
@@ -473,6 +489,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_unavailable_sends_its_client_safe_detail() {
+        let (status, headers, body) =
+            render(AppError::ServiceUnavailable("no provider".to_owned())).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "503 status for a switched-off or failing service"
+        );
+        assert_eq!(
+            headers.get(CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json")),
+            "the 503 is JSON like every other error"
+        );
+        assert_eq!(
+            body,
+            json_body("no provider"),
+            "the 503 body is its own message, sent as-is"
+        );
+    }
+
+    #[tokio::test]
     async fn database_error_hides_its_detail() {
         let error = AppError::from(SqlxError::Protocol(SECRET.to_owned()));
         assert!(
@@ -535,6 +572,11 @@ mod tests {
             AppError::UpstreamFailure("upstream failed".to_owned()).to_string(),
             "upstream failed",
             "display of the proxy 502 states its client-safe detail"
+        );
+        assert_eq!(
+            AppError::ServiceUnavailable("Translation is not enabled".to_owned()).to_string(),
+            "Translation is not enabled",
+            "display of the 503 states its client-safe detail"
         );
         assert_eq!(
             AppError::forbidden_with_identifier("disabled", ACCOUNT_ID).to_string(),
