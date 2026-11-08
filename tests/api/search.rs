@@ -1,13 +1,16 @@
-//! Integration tests for the account-search endpoints (WBE-115):
-//! `GET /api/v1/accounts/search` (the flat account array), and
-//! `GET /api/v1/search` / `GET /api/v2/search` (the combined document,
-//! whose accounts arm is this ticket and whose `statuses` and `hashtags`
-//! lists are empty). The routes answer anonymously (Pleroma's
+//! Integration tests for the search endpoints (WBE-115, extended by
+//! WBE-128): `GET /api/v1/accounts/search` (the flat account array), and
+//! `GET /api/v1/search` / `GET /api/v2/search` (the combined document
+//! with all three arms live). The routes answer anonymously (Pleroma's
 //! `fallback: :proceed_unauthenticated`), demand `read:accounts` from a
 //! presented user token, normalise the query (leading `@`, case), page by
-//! `limit` (default 40, cap 80) and `offset`, restrict to the viewer's
-//! follows on `following=true`, and count into the limiter's `search`
-//! bucket.
+//! `limit` (the accounts' default 40 and cap 80, the statuses' and
+//! hashtags' default 20 and cap 40) and `offset`, restrict the account
+//! search to the viewer's follows on `following=true`, search statuses
+//! only for a viewer unless `SEARCH_STATUSES_UNAUTHENTICATED` is on,
+//! treat a `#`-leading query as a hashtag-only term, render hashtags as
+//! v1 name strings and v2 tag entities, and count into the limiter's
+//! `search` bucket.
 
 #![cfg(test)]
 
@@ -15,9 +18,15 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use axum::Router;
 use axum::http::StatusCode;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::models::{follow, user::User};
+use wired_be::config::Toggle;
+use wired_be::models::{
+    block, follow, hashtag,
+    mute::{self, MuteOptions},
+    status::{self, NewStatus, Visibility},
+    user::User,
+};
 
 use crate::common;
 
@@ -94,7 +103,22 @@ fn accounts_of(body: &Value) -> Vec<String> {
     listed_ids(&body["accounts"])
 }
 
-/// A search document answers exactly the three resource lists.
+/// The `statuses` array of a search document, as ids.
+fn statuses_of(body: &Value) -> Vec<String> {
+    listed_ids(&body["statuses"])
+}
+
+/// Whether the search document's `list` is empty, with the body shown on
+/// failure.
+fn assert_list_empty(body: &Value, list: &str, who: &str) {
+    assert!(
+        body[list].as_array().is_some_and(Vec::is_empty),
+        "`{list}` is empty for {who}: {body}"
+    );
+}
+
+/// A search document answers exactly the three resource lists, each as an
+/// array (which of them are filled is the case at hand).
 fn assert_document(body: &Value) {
     let mut keys: Vec<String> = body
         .as_object()
@@ -108,16 +132,38 @@ fn assert_document(body: &Value) {
         vec!["accounts", "hashtags", "statuses"],
         "exactly the three lists in every reply"
     );
-    assert!(
-        body["statuses"].as_array().is_some_and(Vec::is_empty),
-        "statuses are not searched yet: {}",
-        body["statuses"]
-    );
-    assert!(
-        body["hashtags"].as_array().is_some_and(Vec::is_empty),
-        "hashtags are not searched yet: {}",
-        body["hashtags"]
-    );
+    for list in ["accounts", "statuses", "hashtags"] {
+        assert!(body[list].is_array(), "`{list}` is an array: {body}");
+    }
+}
+
+/// Whether `id_list` strictly descends, as a newest-first page must.
+fn is_descending(id_list: &[String]) -> bool {
+    id_list.windows(2).all(|pair| match pair {
+        [newer, older] => newer > older,
+        _ => false,
+    })
+}
+
+/// The v1 `type=statuses` page for `query`, answered with `token`: the
+/// ids of its `statuses` list, in the order they arrived.
+async fn status_ids(app: &Router, token: &str, query: &str) -> Vec<String> {
+    let found = get(
+        app,
+        Some(token),
+        &format!("{V1_SEARCH}?q={query}&type=statuses"),
+    )
+    .await;
+    common::assert_answer(&found, StatusCode::OK, "the statuses arm");
+    statuses_of(&found.json_value())
+}
+
+/// A search document that answers with all three lists empty.
+fn assert_all_lists_empty(body: &Value, who: &str) {
+    assert_document(body);
+    for list in ["accounts", "statuses", "hashtags"] {
+        assert_list_empty(body, list, who);
+    }
 }
 
 /// The v1 accounts search answers prefix matches, anonymously, as
@@ -306,14 +352,14 @@ async fn accounts_search_excludes_blocks_and_deactivated() {
     let cursed = common::create_local_user(&pool, "banished").await;
     let blithe = common::create_local_user(&pool, "blithe").await;
     let gone = common::create_local_user(&pool, "blunder").await;
-    let bane_row = wired_be::models::block::block(&pool, BASE, &bane, &viewer)
+    let bane_row = block::block(&pool, BASE, &bane, &viewer)
         .await
         .expect("the first fixture blocks the viewer");
     assert_eq!(
         bane_row.blocked_id, viewer.id,
         "the first block is `banshee` on the viewer"
     );
-    let cursed_row = wired_be::models::block::block(&pool, BASE, &viewer, &cursed)
+    let cursed_row = block::block(&pool, BASE, &viewer, &cursed)
         .await
         .expect("the second fixture is blocked by the viewer");
     assert_eq!(
@@ -437,26 +483,79 @@ async fn v1_search_answers_the_accounts_document() {
     }
 }
 
-/// A `type` other than `accounts` answers the empty document — statuses
-/// and hashtags are searched by later tickets.
+/// An explicit `type` fills exactly that resource's list: the other two
+/// stay empty even when their data matches, and an unknown `type` fills
+/// nothing at all.
 #[tokio::test]
-async fn other_search_types_answer_empty_documents() {
+async fn an_explicit_type_fills_exactly_that_list() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
-    let _bob = common::create_local_user(&pool, "bob").await;
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let bobby = common::create_local_user(&pool, "bobby").await;
+    let _posted = common::create_status(&pool, &bobby, "brown fox bobby", Visibility::Public).await;
+    // The tag row comes from the name table itself: a post carrying
+    // `#brown` would also answer the *status* search for `brown`.
+    let _brown = hashtag::find_or_create(&pool, "#brown")
+        .await
+        .expect("the tag fixture stores")
+        .expect("brown is a usable name");
 
-    for kind in ["statuses", "hashtags", "potato"] {
-        for path in [V1_SEARCH, V2_SEARCH] {
-            let found = get(&app, None, &format!("{path}?q=bo&type={kind}")).await;
-            common::assert_answer(&found, StatusCode::OK, "a known resource is no error");
-            let body = found.json_value();
-            assert_document(&body);
-            assert!(
-                body["accounts"].as_array().is_some_and(Vec::is_empty),
-                "`type={kind}` searches no accounts"
-            );
-        }
+    let only_statuses = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q=brown&type=statuses"),
+    )
+    .await;
+    common::assert_answer(&only_statuses, StatusCode::OK, "the statuses arm");
+    let status_body = only_statuses.json_value();
+    assert_document(&status_body);
+    assert_eq!(
+        statuses_of(&status_body).len(),
+        1,
+        "the one matching status answers"
+    );
+    assert_list_empty(&status_body, "accounts", "type=statuses");
+    assert_list_empty(&status_body, "hashtags", "type=statuses");
+
+    // `bobby` names the account AND a status word, so the accounts arm
+    // proves the routing in the other direction.
+    let only_accounts = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q=bobby&type=accounts"),
+    )
+    .await;
+    let account_body = only_accounts.json_value();
+    assert_document(&account_body);
+    assert_eq!(
+        accounts_of(&account_body),
+        vec![bobby.id.to_string()],
+        "the account answers to its own name"
+    );
+    assert_list_empty(&account_body, "statuses", "type=accounts");
+    assert_list_empty(&account_body, "hashtags", "type=accounts");
+
+    let only_tags = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q=brown&type=hashtags"),
+    )
+    .await;
+    let tag_body = only_tags.json_value();
+    assert_document(&tag_body);
+    assert_eq!(
+        tag_body["hashtags"],
+        json!(["brown"]),
+        "the v1 hashtag arm answers plain names"
+    );
+    assert_list_empty(&tag_body, "accounts", "type=hashtags");
+    assert_list_empty(&tag_body, "statuses", "type=hashtags");
+
+    for path in [V1_SEARCH, V2_SEARCH] {
+        let none = get(&app, Some(&token), &format!("{path}?q=brown&type=potato")).await;
+        common::assert_answer(&none, StatusCode::OK, "an unknown type is no error");
+        assert_all_lists_empty(&none.json_value(), "type=potato");
     }
 }
 
@@ -546,4 +645,520 @@ async fn the_three_search_routes_share_the_search_bucket() {
         .await;
     common::assert_answer(&refused, StatusCode::TOO_MANY_REQUESTS, "the spent window");
     common::assert_error(&refused, THROTTLED, "the refusal body");
+}
+
+/// The `statuses` arm full-text searches the stored text: a word in the
+/// body or in the content warning answers its status, newest id first;
+/// reblog rows, tombstones and a query whose words no single post carries
+/// together answer nothing.
+#[tokio::test]
+async fn statuses_search_matches_body_and_warning_words() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let both =
+        common::create_status(&pool, &alice, "the quick brown fox", Visibility::Public).await;
+    let warned = status::insert(
+        &pool,
+        BASE,
+        &NewStatus {
+            spoiler_text: "fox warning".to_owned(),
+            ..NewStatus::local(&alice, "unrelated body")
+        },
+    )
+    .await
+    .expect("the warned fixture inserts");
+    let _slow = common::create_status(&pool, &bob, "a slow brown cat", Visibility::Public).await;
+    let reblog = status::insert(
+        &pool,
+        BASE,
+        &NewStatus {
+            reblog_of_id: Some(both.id),
+            ..NewStatus::local(&bob, "")
+        },
+    )
+    .await
+    .expect("the reblog fixture inserts");
+    let doomed = common::create_status(&pool, &alice, "doomed fox", Visibility::Public).await;
+    assert!(
+        status::soft_delete(&pool, doomed.id)
+            .await
+            .expect("the fixture delete runs")
+            .is_some(),
+        "one matching post is a tombstone now"
+    );
+
+    let ids = status_ids(&app, &token, "fox").await;
+    assert_eq!(
+        ids.len(),
+        2,
+        "the body match and the warning match, no reblog row, no tombstone: {ids:?}"
+    );
+    for id in [warned.id.to_string(), both.id.to_string()] {
+        assert!(ids.contains(&id), "the {id} answers: {ids:?}");
+    }
+    assert!(
+        !ids.contains(&reblog.id.to_string()),
+        "the reblog row itself is never in: {ids:?}"
+    );
+    assert!(is_descending(&ids), "newest id first: {ids:?}");
+}
+
+/// A matching status renders as a full [`Status`] entity in the list: the
+/// stored content and the author's entity ride along, and the conjunctive,
+/// unstemmed reading of `plainto_tsquery('simple', …)` holds over HTTP —
+/// words AND together, and a misspelled stem finds nothing.
+#[tokio::test]
+async fn statuses_search_ands_words_and_never_stems() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let alice = common::create_local_user(&pool, "alice").await;
+    let both =
+        common::create_status(&pool, &alice, "the quick brown fox", Visibility::Public).await;
+
+    let conjunct = status_ids(&app, &token, "quick%20fox").await;
+    assert_eq!(
+        conjunct,
+        vec![both.id.to_string()],
+        "only the post carrying every word matches"
+    );
+    assert!(
+        status_ids(&app, &token, "quickly").await.is_empty(),
+        "`simple` does not stem: `quickly` is not the word `quick`"
+    );
+
+    let body = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q=quick&type=statuses"),
+    )
+    .await;
+    common::assert_answer(&body, StatusCode::OK, "the single-word search");
+    let entity = &body.json_value()["statuses"][0];
+    assert_eq!(
+        entity["content"], "<p>the quick brown fox</p>",
+        "the arm renders full Status entities, not ids"
+    );
+    assert_eq!(entity["account"]["acct"], "alice", "the author rides along");
+}
+
+/// The `statuses` arm shows a viewer only what they may see: a private
+/// post answers its author and its author's accepted followers, and
+/// nobody else.
+#[tokio::test]
+async fn private_statuses_are_found_only_by_the_follower() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let alice_token = common::create_app_and_token(&pool, &alice, "read").await;
+    let bob_token = common::create_app_and_token(&pool, &bob, "read").await;
+    let carol_token = common::create_app_and_token(&pool, &carol, "read").await;
+    let edge = common::create_status(&pool, &alice, "followers keyword", Visibility::Private).await;
+    let open = common::create_status(&pool, &alice, "everyone keyword", Visibility::Public).await;
+    let edge_id = edge.id.to_string();
+    let open_id = open.id.to_string();
+
+    assert_eq!(
+        status_ids(&app, &carol_token, "keyword").await,
+        vec![open_id.clone()],
+        "a stranger searches only what is open to them"
+    );
+    assert_eq!(
+        status_ids(&app, &bob_token, "keyword").await,
+        vec![open_id.clone()],
+        "and a not-yet-follower finds no more"
+    );
+
+    follow_pair(&pool, &bob, &alice).await;
+    let followed = status_ids(&app, &bob_token, "keyword").await;
+    assert!(
+        followed.contains(&edge_id) && followed.contains(&open_id),
+        "the follower finds the private status too: {followed:?}"
+    );
+    assert!(
+        status_ids(&app, &alice_token, "keyword")
+            .await
+            .contains(&edge_id),
+        "and the author always finds their own"
+    );
+}
+
+/// Neither direction of a block, nor a mute, leaves an author in the
+/// blocking/muting viewer's `statuses` search; an unrelated viewer still
+/// finds everything public.
+#[tokio::test]
+async fn status_search_excludes_blocked_and_muted_authors() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (viewer, token) = fixture(&pool, "viewer", "read").await;
+    let (_bystander, other_token) = fixture(&pool, "bystander", "read").await;
+    let bane = common::create_local_user(&pool, "bane").await;
+    let muted = common::create_local_user(&pool, "mutedpal").await;
+    let blocked_post =
+        common::create_status(&pool, &bane, "keyword from bane", Visibility::Public).await;
+    let muted_post =
+        common::create_status(&pool, &muted, "keyword from the muted", Visibility::Public).await;
+    let edge = block::block(&pool, BASE, &viewer, &bane)
+        .await
+        .expect("the viewer blocks bane");
+    assert_eq!(edge.blocked_id, bane.id, "the fixture block landed");
+    let silence = mute::mute(&pool, &viewer, &muted, MuteOptions::default())
+        .await
+        .expect("the viewer mutes the pal");
+    assert_eq!(silence.muted_id, muted.id, "the fixture mute landed");
+
+    let mine = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q=keyword&type=statuses"),
+    )
+    .await;
+    assert_list_empty(
+        &mine.json_value(),
+        "statuses",
+        "the viewer's blocked and muted authors",
+    );
+
+    let theirs = get(
+        &app,
+        Some(&other_token),
+        &format!("{V1_SEARCH}?q=keyword&type=statuses"),
+    )
+    .await;
+    let ids = statuses_of(&theirs.json_value());
+    for visible in [blocked_post.id.to_string(), muted_post.id.to_string()] {
+        assert!(
+            ids.contains(&visible),
+            "someone else's block and mute hide nothing from a third account: {ids:?}"
+        );
+    }
+}
+
+/// `account_id` narrows the `statuses` arm to that one author, an id
+/// nobody posts with answers the empty page, and a value that is not an
+/// id is the shared 400.
+#[tokio::test]
+async fn status_search_account_id_narrows_the_author() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let hers = common::create_status(&pool, &alice, "keyword hers", Visibility::Public).await;
+    let _his = common::create_status(&pool, &bob, "keyword his", Visibility::Public).await;
+
+    let filtered = get(
+        &app,
+        Some(&token),
+        &format!(
+            "{V1_SEARCH}?q=keyword&type=statuses&account_id={}",
+            alice.id
+        ),
+    )
+    .await;
+    assert_eq!(
+        statuses_of(&filtered.json_value()),
+        vec![hers.id.to_string()],
+        "only that author's matching posts answer"
+    );
+
+    let nobody = get(
+        &app,
+        Some(&token),
+        &format!(
+            "{V1_SEARCH}?q=keyword&type=statuses&account_id={}",
+            uuid::Uuid::now_v7()
+        ),
+    )
+    .await;
+    common::assert_answer(&nobody, StatusCode::OK, "an unknown author is no error");
+    assert_list_empty(
+        &nobody.json_value(),
+        "statuses",
+        "an author with no matches",
+    );
+
+    for path in [ACCOUNTS_SEARCH, V1_SEARCH, V2_SEARCH] {
+        let junk = get(&app, Some(&token), &format!("{path}?q=bo&account_id=nope")).await;
+        common::assert_answer(
+            &junk,
+            StatusCode::BAD_REQUEST,
+            &format!("{path} bad account_id"),
+        );
+        common::assert_error(&junk, INVALID_ID, &format!("{path} bad account_id"));
+    }
+}
+
+/// The `statuses` arm pages newest-first with `limit` (default 20, cap 40),
+/// the `max_id`/`min_id` keyset cursors, and `offset`.
+#[tokio::test]
+async fn status_search_pages_by_limit_cursors_and_offset() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let alice = common::create_local_user(&pool, "alice").await;
+    for n in 0..5 {
+        let _posted = common::create_status(
+            &pool,
+            &alice,
+            &format!("paging keyword {n}"),
+            Visibility::Public,
+        )
+        .await;
+    }
+
+    let all = status_ids(&app, &token, "paging").await;
+    assert_eq!(all.len(), 5, "the whole page answers");
+    assert!(is_descending(&all), "`id DESC` throughout: {all:?}");
+
+    let first = status_ids(&app, &token, "paging&limit=2").await;
+    assert_eq!(first, all[..2], "limit cuts the page short");
+    let overcap = status_ids(&app, &token, "paging&limit=200").await;
+    assert_eq!(overcap, all, "the cap sizes the page, never errors");
+
+    let middle = all.get(2).expect("the five-strong page has a middle");
+    let older = status_ids(&app, &token, &format!("paging&max_id={middle}")).await;
+    assert_eq!(older, all[3..], "max_id answers the strictly older rows");
+    let newer = status_ids(&app, &token, &format!("paging&min_id={middle}")).await;
+    assert_eq!(
+        newer,
+        all[..2],
+        "min_id answers the newer rows, newest-first"
+    );
+
+    let stepped = status_ids(&app, &token, "paging&offset=2&limit=2").await;
+    assert_eq!(stepped, all[2..4], "offset walks the page");
+    assert!(
+        status_ids(&app, &token, "paging&offset=99")
+            .await
+            .is_empty(),
+        "an offset past the end answers nothing"
+    );
+}
+
+/// The hashtag arm is a name-prefix search that folds the typed `#` and
+/// the case; v1 answers plain name strings and v2 answers tag entities
+/// whose fresh `history` is the empty list.
+#[tokio::test]
+async fn hashtag_search_prefix_matches_v1_names_and_v2_tag_entities() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let _tagged =
+        common::create_status(&pool, &alice, "#alpha #alphabet #beta", Visibility::Public).await;
+
+    let v1 = get(&app, None, &format!("{V1_SEARCH}?q=alp&type=hashtags")).await;
+    common::assert_answer(&v1, StatusCode::OK, "the anonymous hashtag arm");
+    assert_eq!(
+        v1.json_value()["hashtags"],
+        json!(["alpha", "alphabet"]),
+        "v1 spells plain names, prefix-only and in name order"
+    );
+
+    let v2 = get(&app, None, &format!("{V2_SEARCH}?q=%23ALP&type=hashtags")).await;
+    common::assert_answer(&v2, StatusCode::OK, "the typed sigil and case fold");
+    assert_eq!(
+        v2.json_value()["hashtags"],
+        json!([
+            { "name": "alpha", "url": format!("{BASE}/tags/alpha"), "history": [] },
+            { "name": "alphabet", "url": format!("{BASE}/tags/alphabet"), "history": [] },
+        ]),
+        "v2 renders tag entities, the uncomputed history an empty list"
+    );
+
+    let none = get(&app, None, &format!("{V1_SEARCH}?q=zz&type=hashtags")).await;
+    assert_list_empty(&none.json_value(), "hashtags", "a prefix no tag carries");
+    let capped = get(
+        &app,
+        None,
+        &format!("{V1_SEARCH}?q=alp&type=hashtags&limit=1"),
+    )
+    .await;
+    assert_eq!(
+        capped.json_value()["hashtags"],
+        json!(["alpha"]),
+        "the page size cuts the name-ordered list"
+    );
+}
+
+/// With no `type`, one authenticated search fills all three lists at once
+/// from the one query.
+#[tokio::test]
+async fn untyped_search_fills_all_three_lists() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let united = common::create_local_user(&pool, "unitedfan").await;
+    let posted = common::create_status(&pool, &united, "united we stand", Visibility::Public).await;
+    // The tag row is stored directly, so exactly one status matches the word.
+    let _tag = hashtag::find_or_create(&pool, "#united")
+        .await
+        .expect("the tag fixture stores")
+        .expect("united is a usable name");
+
+    let found = get(&app, Some(&token), &format!("{V1_SEARCH}?q=united")).await;
+    common::assert_answer(&found, StatusCode::OK, "the combined search");
+    let body = found.json_value();
+    assert_document(&body);
+    assert_eq!(
+        accounts_of(&body),
+        vec![united.id.to_string()],
+        "the account arm carries the prefix match"
+    );
+    assert_eq!(
+        statuses_of(&body),
+        vec![posted.id.to_string()],
+        "the status arm carries the word match"
+    );
+    assert_eq!(
+        body["hashtags"],
+        json!(["united"]),
+        "the hashtag arm carries the name match"
+    );
+
+    let v2 = get(&app, Some(&token), &format!("{V2_SEARCH}?q=united")).await;
+    assert_eq!(
+        v2.json_value()["hashtags"],
+        json!([{ "name": "united", "url": format!("{BASE}/tags/united"), "history": [] }]),
+        "the same combined search, v2's hashtag spelling"
+    );
+    assert_eq!(
+        statuses_of(&v2.json_value()),
+        vec![posted.id.to_string()],
+        "statuses render identically on both versions"
+    );
+}
+
+/// A query that opens with `#` is a hashtag-only search term: untyped, it
+/// fills the hashtag list alone, whatever else in the corpus spells the
+/// same word.
+#[tokio::test]
+async fn a_hashtag_query_searches_hashtags_only() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let united = common::create_local_user(&pool, "unitedfan").await;
+    let _posted =
+        common::create_status(&pool, &united, "united we stand", Visibility::Public).await;
+    let _tagged = common::create_status(&pool, &united, "#united", Visibility::Public).await;
+
+    let found = get(&app, Some(&token), &format!("{V1_SEARCH}?q=%23united")).await;
+    common::assert_answer(&found, StatusCode::OK, "the sigil query");
+    let body = found.json_value();
+    assert_document(&body);
+    assert_eq!(
+        body["hashtags"],
+        json!(["united"]),
+        "the hashtag list answers the term"
+    );
+    assert_list_empty(&body, "accounts", "a `#`-query is hashtag-only");
+    assert_list_empty(&body, "statuses", "a `#`-query is hashtag-only");
+}
+
+/// The statuses gate: an anonymous request searches no statuses while
+/// `SEARCH_STATUSES_UNAUTHENTICATED` is off (the default) — the accounts
+/// and hashtag arms answer it fine — and once an operator turns the flag
+/// on, it finds the public text, with `public` still the ceiling.
+#[tokio::test]
+async fn anonymous_status_search_needs_the_config_flag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let keyworduser = common::create_local_user(&pool, "keyworduser").await;
+    let open = common::create_status(
+        &pool,
+        &keyworduser,
+        "keyword public post",
+        Visibility::Public,
+    )
+    .await;
+    let _kept = common::create_status(
+        &pool,
+        &keyworduser,
+        "keyword private post",
+        Visibility::Private,
+    )
+    .await;
+    // The tag row is stored directly, so exactly the two posts carry the
+    // word in their text and the hashtag arm still answers it.
+    let _tag = hashtag::find_or_create(&pool, "#keyword")
+        .await
+        .expect("the tag fixture stores")
+        .expect("keyword is a usable name");
+
+    let gated = get(&app, None, &format!("{V1_SEARCH}?q=keyword&type=statuses")).await;
+    common::assert_answer(
+        &gated,
+        StatusCode::OK,
+        "the gated arm is an answer, not an error",
+    );
+    assert_list_empty(&gated.json_value(), "statuses", "anonymous, flag off");
+    let untyped = get(&app, None, &format!("{V1_SEARCH}?q=keyword")).await;
+    let body = untyped.json_value();
+    assert_list_empty(&body, "statuses", "anonymous untyped, flag off");
+    assert_eq!(
+        body["hashtags"],
+        json!(["keyword"]),
+        "the ungated arms still answer the anonymous request"
+    );
+    assert_eq!(
+        accounts_of(&body),
+        vec![keyworduser.id.to_string()],
+        "accounts included"
+    );
+
+    let mut config = common::test_config();
+    config.search_statuses_unauthenticated = Toggle::new(true);
+    let open_app = common::test_app_with_config(pool.clone(), config);
+    let found = get(
+        &open_app,
+        None,
+        &format!("{V1_SEARCH}?q=keyword&type=statuses"),
+    )
+    .await;
+    common::assert_answer(&found, StatusCode::OK, "the flag opens the arm");
+    assert_eq!(
+        statuses_of(&found.json_value()),
+        vec![open.id.to_string()],
+        "public text answers, `public` and `unlisted` being the anonymous ceiling"
+    );
+}
+
+/// An absent, empty, whitespace or bare-`#` query fills no list for an
+/// authenticated viewer either — the new arms answer nothing, never the
+/// whole corpus.
+#[tokio::test]
+async fn an_empty_query_fills_no_list_anywhere() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    let alice = common::create_local_user(&pool, "alice").await;
+    let _posted = common::create_status(&pool, &alice, "corpus keyword", Visibility::Public).await;
+    let _tagged = common::create_status(&pool, &alice, "#corpus", Visibility::Public).await;
+
+    for query in ["", "q=", "q=%20%20", "q=%23"] {
+        for kind in ["&type=statuses", "&type=hashtags", ""] {
+            let found = get(&app, Some(&token), &format!("{V1_SEARCH}?{query}{kind}")).await;
+            common::assert_answer(&found, StatusCode::OK, "`{query:?}` is an answer");
+            assert_all_lists_empty(
+                &found.json_value(),
+                &format!("`{query:?}` with `{kind}` asked nothing"),
+            );
+        }
+    }
 }

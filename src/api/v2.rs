@@ -18,8 +18,9 @@ use crate::{
 /// `/instance` sub-resources stay v1-only.
 /// [`account_lists::v2_router`] contributes `GET /api/v2/suggestions`, the
 /// source-wrapped twin of that area's v1 listing. [`search::v2_router`]
-/// contributes `GET /api/v2/search`, the combined search whose accounts-only
-/// answer is this ticket's. Do not call [`Router::fallback`] here (or on
+/// contributes `GET /api/v2/search`, the combined search whose hashtag
+/// arm renders tag entities where v1 spells plain names. Do not call
+/// [`Router::fallback`] here (or on
 /// anything merged here): unmatched paths must reach the app-wide JSON
 /// fallback in [`crate::app`], which answers them with Pleroma's
 /// `api_not_implemented`, and merging two routers that each set a fallback

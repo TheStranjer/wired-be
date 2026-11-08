@@ -25,17 +25,21 @@ use crate::models::hashtag::Hashtag;
 ///
 /// Built by [`Tag::with_history`] it is instead the full form a tag endpoint
 /// answers with: the two keys plus `history`, and `following` when a viewer
-/// is present.
+/// is present. The combined search's v2 hashtag list is the full form with
+/// the `history` of a fresh week left empty, which still renders the key as
+/// `[]` — see [`history`](Self::history).
 #[derive(Debug, Serialize)]
 pub struct Tag {
     /// The tag name, as stored: lowercase, without the leading `#`.
     pub name: String,
     /// The instance's tag page for this name: `{base_url}/tags/{name}`.
     pub url: String,
-    /// The last seven days of usage, newest first; absent (`[]`) on the
-    /// status render, which only ever carries the two keys.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub history: Vec<TagHistory>,
+    /// The last seven days of usage, newest first; `None` (the status
+    /// render, [`Tag::new`] and [`Tag::from_hashtag`]) omits the key, and
+    /// `Some` — even an empty `Vec` — renders it, so the v2 hashtag search
+    /// can answer `"history": []`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<TagHistory>>,
     /// Whether the requesting user follows this tag; omitted when no viewer
     /// is present (the anonymous render has no following to state).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,14 +92,16 @@ impl Tag {
         Self {
             name: name.to_owned(),
             url: format!("{base_url}/tags/{name}"),
-            history: Vec::new(),
+            history: None,
             following: None,
         }
     }
 
     /// The full form a tag endpoint answers with: the two keys, the given
     /// `history` (newest first), and `following` — `Some` only when a viewer
-    /// is present, since an anonymous render omits the key entirely.
+    /// is present, since an anonymous render omits the key entirely. The
+    /// `history` key itself always renders here, an empty `Vec` as `[]`:
+    /// that is the shape the v2 combined search's hashtag list uses.
     #[must_use]
     pub fn with_history(
         base_url: &str,
@@ -106,7 +112,7 @@ impl Tag {
         Self {
             name: name.to_owned(),
             url: format!("{base_url}/tags/{name}"),
-            history,
+            history: Some(history),
             following,
         }
     }
@@ -203,6 +209,24 @@ mod tests {
         assert_eq!(
             value["history"][0]["uses"], "12",
             "history is rendered whether or not someone is watching"
+        );
+    }
+
+    /// The v2 combined search's hashtag shape: the full form with no usage
+    /// counts still carries the `history` key, as the empty list.
+    #[test]
+    fn an_empty_full_history_renders_as_the_empty_list() {
+        let value =
+            serde_json::to_value(Tag::with_history(TEST_BASE_URL, "rust", Vec::new(), None))
+                .unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "name": "rust",
+                "url": format!("{TEST_BASE_URL}/tags/rust"),
+                "history": [],
+            }),
+            "name, url and the empty history — the search render, no `following`"
         );
     }
 }
