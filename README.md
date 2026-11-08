@@ -20,7 +20,7 @@ All configuration comes from environment variables. For local development, copy 
 | `INSTANCE_DESCRIPTION` | no | `A Pleroma-compatible instance` | Short instance description |
 | `CONTACT_EMAIL` | no | | Admin contact email |
 | `INSTANCE_LANGUAGES` | no | `en` | Comma-separated content language codes |
-| `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status |
+| `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status; `POST /api/v1/statuses` counts them the way clients do (each bare URL is worth 23) and refuses a longer post with 422 `{"error":"The status is over the character limit"}` |
 | `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
 | `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
 | `MAX_CHAT_MESSAGE_CHARS` | no | `5000` | Maximum characters per chat message; longer posted content is refused with 400 |

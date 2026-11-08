@@ -11,8 +11,12 @@
 //! cross-cutting resident of the same home: it rewrites remote media URLs
 //! into signed proxy links (used by the [`entities`](crate::entities)
 //! builders) and serves those links over HTTP (its router is merged at
-//! the top level by [`crate::app`]).
+//! the top level by [`crate::app`]). [`create_status`] is the write side of
+//! the same idea: it decides what a `POST /api/v1/statuses` body means — its
+//! limits, its defaults, its refusals — from the request parameters alone, so
+//! the endpoint that stores the result never re-decides any of it.
 
+pub mod create_status;
 pub mod emoji_packs;
 pub mod instance_actor;
 pub mod instance_meta;
