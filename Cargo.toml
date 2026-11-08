@@ -116,6 +116,12 @@ tokio = { version = "1.53.2", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "limit", "request-id", "compression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Extended grapheme clusters for the reaction emoji check (`src/util/emoji.rs`):
+# one emoji is one cluster, and only the cluster rule can say that
+# a ZWJ family or a flag pair is a single reaction while two emojis side by
+# side are not. `graphemes(true)` is all the crate is used for, so the default
+# features stay on and nothing else is enabled.
+unicode-segmentation = "1.12.0"
 url = "2.5.8"
 uuid = { version = "1.28.0", features = ["v7", "serde"] }
 # Emoji pack archives (`src/services/emoji_packs.rs`): the `GET

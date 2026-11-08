@@ -24,13 +24,17 @@
 //! Pleroma's extension block; its batch loader is
 //! [`services::render_status`](crate::services::render_status).
 //! [`report`] renders the Mastodon `Report` entity from a
-//! [`models::report`](crate::models::report) row and the reported account.
+//! [`models::report`](crate::models::report) row and the reported account,
+//! [`emoji_reaction`] Pleroma's two emoji-reaction shapes: the entry of a
+//! status's `pleroma.emoji_reactions` array and the entry of its reactions
+//! endpoint.
 
 pub mod account;
 pub mod announcement;
 pub mod application;
 pub mod chat;
 pub mod custom_emoji;
+pub mod emoji_reaction;
 pub mod filter;
 pub mod list;
 pub mod marker;

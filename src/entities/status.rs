@@ -26,11 +26,14 @@
 //! loader in [`crate::services::render_status`] (see its module docs):
 //! `favourited`, `reblogged`, `muted`, `bookmarked`, `pinned` and
 //! `pleroma.pinned_at` (the favourite/reblog/mute/bookmark/pin tables);
-//! `card` (rich-media cards); `poll` (polls); `emojis` and
-//! `pleroma.emoji_reactions` (custom emojis and reactions); `quote` (the
-//! quoting ticket, whose original rows the service already batch-loads);
-//! and `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
-//! (chats, bookmark folders).
+//! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
+//! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
+//! (chats, bookmark folders); and `quote` (the quoting ticket, whose
+//! original rows the service already batch-loads). `pleroma.emoji_reactions`
+//! is filled by the reactions ticket, from
+//! [`emoji_reaction::for_statuses`](crate::models::emoji_reaction::for_statuses).
+//!
+//! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -40,14 +43,16 @@ use crate::{
     config::Config,
     entities::{
         account::{Account, AccountViewer, JsonBool},
+        emoji_reaction::ReactionSummary,
         media_attachment::MediaAttachment,
         mention::Mention,
         relationship::RelationshipMap,
         tag::Tag,
     },
     models::{
-        hashtag::Hashtag, media_attachment::MediaAttachment as AttachmentRow,
-        status::Status as StatusRow, user::User,
+        emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag,
+        media_attachment::MediaAttachment as AttachmentRow, status::Status as StatusRow,
+        user::User,
     },
     util::sanitize::strip_html,
 };
@@ -115,9 +120,12 @@ pub struct PleromaMetadata {
     /// `thread_muted`: whether the viewer muted this post's whole thread;
     /// the thread-mute ticket sets it, so it renders `false` for now.
     pub thread_muted: JsonBool,
-    /// `emoji_reactions`: the post's reactions; the reactions ticket
-    /// fills this, so it renders `[]` for now.
-    pub emoji_reactions: Vec<Value>,
+    /// `emoji_reactions`: the post's reactions, one entry per emoji in the
+    /// roll-up's order (the emoji's first reaction, then the emoji text),
+    /// empty for a post nobody reacted to. [`crate::services::render_status`]
+    /// batch-loads the whole page's share of them in one read of
+    /// [`emoji_reaction::for_statuses`](crate::models::emoji_reaction::for_statuses).
+    pub emoji_reactions: Vec<ReactionSummary>,
     /// `parent_visible`: whether the viewer may see the replied-to
     /// status. `true`: callers hand whole pages already narrowed by
     /// [`crate::models::status_visibility`], and the rows this crate's
@@ -162,6 +170,10 @@ pub struct StatusSource<'a> {
     pub mentions: &'a [User],
     /// The hashtags this row carries, in name order.
     pub tags: &'a [Hashtag],
+    /// This row's emoji reactions, one roll-up per emoji in the roll-up's
+    /// order; feeds `pleroma.emoji_reactions`. A row nobody reacted to (and a
+    /// nested original nobody reacted to) comes in with the empty slice.
+    pub reactions: &'a [SummaryRow],
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -295,6 +307,7 @@ impl Status {
             media,
             mentions,
             tags,
+            reactions,
             reblog,
         } = source;
         Self {
@@ -334,7 +347,7 @@ impl Status {
             bookmarked: JsonBool(false),
             pinned: JsonBool(false),
             quote: None,
-            pleroma: pleroma_block(row, reply_author),
+            pleroma: pleroma_block(row, reply_author, reactions),
         }
     }
 }
@@ -382,10 +395,14 @@ fn plain_text(row: &StatusRow) -> PlainText {
 }
 
 /// Builds the `pleroma` block of `row`, whose replied-to author is
-/// `reply_author` when the batch knew one; see [`PleromaMetadata`] for
-/// where each key comes from and which later tickets fill the
-/// placeholders.
-fn pleroma_block(row: &StatusRow, reply_author: Option<&User>) -> PleromaMetadata {
+/// `reply_author` when the batch knew one and whose reactions are
+/// `reactions` when the batch found any; see [`PleromaMetadata`] for where
+/// each key comes from and which later tickets fill the placeholders.
+fn pleroma_block(
+    row: &StatusRow,
+    reply_author: Option<&User>,
+    reactions: &[SummaryRow],
+) -> PleromaMetadata {
     PleromaMetadata {
         content: plain_text(row),
         spoiler_text: PlainText {
@@ -397,7 +414,7 @@ fn pleroma_block(row: &StatusRow, reply_author: Option<&User>) -> PleromaMetadat
         local: JsonBool(row.local),
         expires_at: row.expires_at,
         thread_muted: JsonBool(false),
-        emoji_reactions: Vec::new(),
+        emoji_reactions: reactions.iter().map(ReactionSummary::from_model).collect(),
         parent_visible: JsonBool(true),
         quotes_count: row.quotes_count,
         bookmark_folder: None,
@@ -421,6 +438,10 @@ mod tests {
     const BASE: &str = TEST_BASE_URL;
     /// The author's id, as stored.
     const AUTHOR_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
+    /// A second account id, for the reactor lists.
+    const REACTOR_ID: &str = "01934567-89ab-7cde-f012-3456789abcee";
+    /// A custom emoji's image URL, for the reaction entries.
+    const CAT_IMAGE: &str = "https://test.example/emoji/cats/cat.png";
     /// Every JSON key the entity must emit, sorted.
     const EXPECTED_KEYS: [&str; 31] = [
         "account",
@@ -597,7 +618,7 @@ mod tests {
     }
 
     /// The batch-loaded parts a test render supplies: whose row's author,
-    /// whose replied-to author, and the three per-status lists.
+    /// whose replied-to author, and the per-status lists.
     #[derive(Debug)]
     struct Parts<'a> {
         /// The row's author.
@@ -610,6 +631,8 @@ mod tests {
         mentions: Vec<User>,
         /// The row's hashtags.
         tags: Vec<Hashtag>,
+        /// The row's emoji reactions.
+        reactions: Vec<SummaryRow>,
     }
 
     impl<'a> Parts<'a> {
@@ -621,6 +644,7 @@ mod tests {
                 media: Vec::new(),
                 mentions: Vec::new(),
                 tags: Vec::new(),
+                reactions: Vec::new(),
             }
         }
 
@@ -649,6 +673,11 @@ mod tests {
         fn attached(self, media: Vec<AttachmentRow>) -> Self {
             Self { media, ..self }
         }
+
+        /// Sets [`reactions`](Self::reactions).
+        fn reacted(self, reactions: Vec<SummaryRow>) -> Self {
+            Self { reactions, ..self }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -662,6 +691,7 @@ mod tests {
             media: &parts.media,
             mentions: &parts.mentions,
             tags: &parts.tags,
+            reactions: &parts.reactions,
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -679,6 +709,7 @@ mod tests {
                 media: &[],
                 mentions: &[],
                 tags: &[],
+                reactions: &[],
                 reblog: None,
             },
             None,
@@ -786,11 +817,65 @@ mod tests {
         assert_eq!(pleroma["local"], true);
         assert_eq!(pleroma["expires_at"], Value::Null);
         assert_eq!(pleroma["thread_muted"], false);
-        assert_eq!(pleroma["emoji_reactions"], json!([]));
+        assert_eq!(
+            pleroma["emoji_reactions"],
+            json!([]),
+            "no reactions in the batch is the empty array"
+        );
         assert_eq!(pleroma["parent_visible"], true);
         assert_eq!(pleroma["quotes_count"], 0);
         assert_eq!(pleroma["bookmark_folder"], Value::Null);
         assert_eq!(pleroma["pinned_at"], Value::Null);
+    }
+
+    #[test]
+    fn the_pleroma_block_lists_the_reactions_the_batch_found() {
+        let alice = base_user("alice");
+        let bob = other_user("bob", REACTOR_ID);
+        let row = base_row();
+        let summaries = vec![
+            rollup("👍", 2, true, None, &[alice.id, bob.id]),
+            rollup(":cat:", 1, false, Some(CAT_IMAGE), &[bob.id]),
+        ];
+        let pleroma = render(&row, &Parts::of(&alice).reacted(summaries), None)["pleroma"].clone();
+        assert_eq!(
+            pleroma["emoji_reactions"],
+            json!([
+                {
+                    "name": "👍",
+                    "count": 2,
+                    "me": true,
+                    "url": null,
+                    "account_ids": [AUTHOR_ID, REACTOR_ID],
+                },
+                {
+                    "name": ":cat:",
+                    "count": 1,
+                    "me": false,
+                    "url": CAT_IMAGE,
+                    "account_ids": [REACTOR_ID],
+                },
+            ]),
+            "the roll-up reaches the wire in the batch's order, with the \
+             reactor ids as the hyphenated text clients know"
+        );
+    }
+
+    /// A model [`SummaryRow`] to render, in one line.
+    fn rollup(
+        name: &str,
+        count: i64,
+        me: bool,
+        url: Option<&str>,
+        account_ids: &[Uuid],
+    ) -> SummaryRow {
+        SummaryRow {
+            name: name.to_owned(),
+            count,
+            me,
+            url: url.map(str::to_owned),
+            account_ids: account_ids.to_vec(),
+        }
     }
 
     #[test]
