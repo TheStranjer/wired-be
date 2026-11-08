@@ -1168,6 +1168,55 @@ async fn a_local_mention_is_linked_stored_and_answered() {
     );
 }
 
+/// One post naming an account and a tag links both in the same content, in
+/// mention order and whatever case the text spelled the account in: a
+/// case-different `@BOB` still resolves to bob's stored row and profile URL,
+/// and the tag answers folded.
+#[tokio::test]
+async fn a_mention_and_a_hashtag_link_one_post_with_the_acct_in_any_case() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(&app, &token, json!({"status": "hi @BOB #tag"})).await;
+    let row = created_row(&pool, &value).await;
+
+    assert_eq!(
+        value["content"],
+        format!(
+            "<p>hi {} {}</p>",
+            mention_html(&bob.ap_id, "BOB"),
+            hashtag_html(TEST_BASE_URL, "tag"),
+        ),
+        "the case-different mention links to bob's profile URL (the `ap_id` \
+         fallback the fixture's row leaves it on) displayed as typed, and the \
+         tag links beside it"
+    );
+    assert_eq!(
+        mention_links(&pool, row.id).await,
+        vec![bob.id],
+        "the account the folded name finds is linked in `status_mentions`"
+    );
+    assert_eq!(
+        tag_links(&pool, row.id).await,
+        vec!["tag"],
+        "and the tag in `status_hashtags`"
+    );
+    assert_eq!(
+        value["mentions"],
+        json!([{ "id": bob.id.to_string(), "username": "bob",
+                 "url": bob.ap_id, "acct": "bob" }]),
+        "bob answers in the entity's `mentions`, by the entity's own spelling"
+    );
+    assert_eq!(
+        value["tags"],
+        json!([{ "name": "tag", "url": format!("{TEST_BASE_URL}/tags/tag") }]),
+        "and the tag in its `tags`"
+    );
+}
+
 /// Hashtags are extracted and deduplicated into one stored link each, linked
 /// at every spelling in the content, and answered in the entity's `tags`.
 #[tokio::test]
