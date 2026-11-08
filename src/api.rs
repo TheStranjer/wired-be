@@ -73,6 +73,7 @@ pub mod pleroma_account_settings;
 pub mod pleroma_accounts;
 pub mod pleroma_import;
 pub mod pleroma_settings;
+pub mod push;
 pub mod reports;
 pub mod scrobbles;
 pub mod search;

@@ -106,6 +106,14 @@ fn instance_version() -> String {
     )
 }
 
+/// The instance VAPID key the documents advertise: reading it seeds the
+/// pair if the test's database has none, exactly as the endpoints do.
+async fn instance_vapid_key(pool: &PgPool) -> String {
+    wired_be::services::vapid::vapid_public_key(pool)
+        .await
+        .expect("the instance VAPID key is readable")
+}
+
 /// The `configuration` block of the empty [`test_config`] document: the
 /// configured defaults beside the shipped constants.
 fn expected_configuration() -> Value {
@@ -135,7 +143,7 @@ fn expected_configuration() -> Value {
 
 /// The `pleroma` block of the empty [`test_config`] document: the shared
 /// capability lists beside Pleroma's shipped metadata.
-fn expected_pleroma() -> Value {
+fn expected_pleroma(vapid_key: &str) -> Value {
     json!({
         "metadata": {
             "account_activation_required": false,
@@ -168,14 +176,14 @@ fn expected_pleroma() -> Value {
             },
         },
         "stats": { "mau": 0 },
-        "vapid_public_key": null,
+        "vapid_public_key": vapid_key,
     })
 }
 
 /// The complete document an empty instance built on [`common::test_config`]
 /// serves: zeroed stats, no rules, no contact account, and every limit at
 /// its configured default or shipped constant.
-fn expected_document() -> Value {
+fn expected_document(vapid_key: &str) -> Value {
     json!({
         "uri": "test.example",
         "title": "Wired",
@@ -206,7 +214,7 @@ fn expected_document() -> Value {
         "banner_upload_limit": 4_000_000,
         "description_limit": 5000,
         "configuration": expected_configuration(),
-        "pleroma": expected_pleroma(),
+        "pleroma": expected_pleroma(vapid_key),
     })
 }
 
@@ -244,6 +252,7 @@ fn keys_of(value: &Value) -> Vec<&str> {
 async fn the_document_is_public_and_complete() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
+    let vapid_key = instance_vapid_key(&pool).await;
     let app = common::test_app(pool);
     let document = get_instance(&app).await;
     assert_eq!(
@@ -251,7 +260,20 @@ async fn the_document_is_public_and_complete() {
         TOP_KEYS,
         "the ticket's top-level key set"
     );
-    assert_eq!(document, expected_document(), "the whole document");
+    assert!(
+        !vapid_key.is_empty(),
+        "the seeded VAPID key is advertised, not blank"
+    );
+    assert_eq!(
+        document["pleroma"]["vapid_public_key"],
+        json!(vapid_key),
+        "the endpoint advertises the same key the reader does"
+    );
+    assert_eq!(
+        document,
+        expected_document(&vapid_key),
+        "the whole document"
+    );
     assert_eq!(
         document["pleroma"]["metadata"]["features"],
         json!(instance_meta::features()),
@@ -505,6 +527,7 @@ async fn identity_fields_mirror_the_config() {
 async fn limits_mirror_the_config() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
+    let vapid_key = instance_vapid_key(&pool).await;
     let app = common::test_app_with_config(pool, other_config());
     let document = get_instance(&app).await;
     assert_eq!(document["max_toot_chars"], 300, "MAX_STATUS_CHARS");
@@ -556,13 +579,13 @@ async fn limits_mirror_the_config() {
     ] {
         assert_eq!(
             document[key],
-            expected_document()[key],
+            expected_document(&vapid_key)[key],
             "{key} stays at its shipped constant"
         );
     }
     assert_eq!(
         document["pleroma"],
-        expected_pleroma(),
+        expected_pleroma(&vapid_key),
         "the whole pleroma block is config-independent here"
     );
 }
@@ -656,11 +679,11 @@ const V2_TOP_KEYS: [&str; 13] = [
 /// document: the three groups v1 shares, spelled via
 /// [`expected_configuration`] to prove they are identical, beside
 /// Mastodon 4's own groups.
-fn expected_v2_configuration() -> Value {
+fn expected_v2_configuration(vapid_key: &str) -> Value {
     let v1 = expected_configuration();
     json!({
         "urls": { "streaming": "wss://test.example", "status": null },
-        "vapid": { "public_key": "" },
+        "vapid": { "public_key": vapid_key },
         "accounts": { "max_featured_tags": 10, "max_pinned_statuses": 5 },
         "statuses": v1["statuses"].clone(),
         "media_attachments": v1["media_attachments"].clone(),
@@ -672,7 +695,7 @@ fn expected_v2_configuration() -> Value {
 
 /// The complete v2 document an empty instance built on
 /// [`common::test_config`] serves.
-fn expected_v2_document() -> Value {
+fn expected_v2_document(vapid_key: &str) -> Value {
     json!({
         "domain": "test.example",
         "title": "Wired",
@@ -682,7 +705,7 @@ fn expected_v2_document() -> Value {
         "usage": { "users": { "active_month": 0 } },
         "thumbnail": { "url": format!("{BASE}/images/thumbnail.jpg") },
         "languages": ["en"],
-        "configuration": expected_v2_configuration(),
+        "configuration": expected_v2_configuration(vapid_key),
         "registrations": {
             "enabled": true,
             "approval_required": false,
@@ -691,7 +714,7 @@ fn expected_v2_document() -> Value {
         },
         "contact": { "email": "", "account": null },
         "rules": [],
-        "pleroma": expected_pleroma(),
+        "pleroma": expected_pleroma(vapid_key),
     })
 }
 
@@ -702,6 +725,7 @@ fn expected_v2_document() -> Value {
 async fn the_v2_document_is_public_and_complete() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
+    let vapid_key = instance_vapid_key(&pool).await;
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/api/v2/instance")
         .bearer("not-a-real-token")
@@ -715,7 +739,11 @@ async fn the_v2_document_is_public_and_complete() {
     );
     let document = response.json_value();
     assert_eq!(keys_of(&document), V2_TOP_KEYS, "the ticket's v2 key set");
-    assert_eq!(document, expected_v2_document(), "the whole document");
+    assert_eq!(
+        document,
+        expected_v2_document(&vapid_key),
+        "the whole document"
+    );
     assert_eq!(
         document["pleroma"]["metadata"]["features"],
         json!(instance_meta::features()),

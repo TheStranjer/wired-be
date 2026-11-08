@@ -38,6 +38,14 @@ fn error_text(response: &common::TestResponse) -> String {
         .to_owned()
 }
 
+/// The instance VAPID key the entity's `vapid_key` carries, read straight
+/// from the service that also seeds the pair on first use.
+async fn instance_vapid_key(pool: &PgPool) -> String {
+    wired_be::services::vapid::vapid_public_key(pool)
+        .await
+        .expect("the instance VAPID key is readable")
+}
+
 /// The secret fields only the registration response carries.
 const SECRET_FIELDS: [&str; 3] = ["client_id", "client_secret", "client_secret_expires_at"];
 
@@ -128,9 +136,10 @@ async fn json_registration_returns_the_application_entity() {
         body["client_secret_expires_at"], 0,
         "these secrets never expire"
     );
-    assert!(
-        body["vapid_key"].is_null(),
-        "vapid_key stays null until the push ticket"
+    assert_eq!(
+        body["vapid_key"],
+        instance_vapid_key(&pool).await,
+        "vapid_key is the instance VAPID public key"
     );
     assert_eq!(body["scopes"], json!(["read", "write"]), "a scope list");
 
@@ -390,7 +399,11 @@ async fn verify_credentials_accepts_a_user_token() {
         body["redirect_uri"], "https://client.example/callback",
         "the stored redirect_uris"
     );
-    assert!(body["vapid_key"].is_null(), "vapid_key is null");
+    assert_eq!(
+        body["vapid_key"],
+        instance_vapid_key(&pool).await,
+        "verify_credentials carries the instance VAPID key too"
+    );
     assert_eq!(
         body["scopes"],
         json!(["read", "write"]),

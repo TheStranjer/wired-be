@@ -9,7 +9,8 @@
 //! unknown or malformed revocation id is one and the same 404 "Record
 //! not found" while the owner's `DELETE` answers 200 `{}` and really
 //! removes the row; `/api/v1/pleroma/apps` merges owned and tokened
-//! apps, deduplicated and newest first, under the seven pinned keys;
+//! apps, deduplicated and newest first, under the eight pinned keys (the
+//! VAPID public key among them, since push is always configured here);
 //! and every route answers 401 to an unauthenticated request.
 
 #![cfg(test)]
@@ -28,13 +29,14 @@ const APPS: &str = "/api/v1/pleroma/apps";
 /// Every JSON key a token entry must carry, sorted.
 const TOKEN_KEYS: [&str; 3] = ["app_name", "id", "valid_until"];
 /// Every JSON key an app entity must carry, sorted.
-const APP_KEYS: [&str; 7] = [
+const APP_KEYS: [&str; 8] = [
     "client_id",
     "client_secret",
     "id",
     "name",
     "redirect_uri",
     "trusted",
+    "vapid_key",
     "website",
 ];
 /// The redirect URI every [`common::create_app_named`] fixture stores.
@@ -238,12 +240,15 @@ async fn revoke_of_foreign_unknown_or_malformed_is_404() {
 
 /// `GET /api/v1/pleroma/apps` — the apps the caller owns or holds tokens
 /// for, deduplicated (the session app is both, the tokened app has two
-/// tokens), newest first, under exactly the seven pinned keys; foreign
+/// tokens), newest first, under exactly the eight pinned keys; foreign
 /// and untouched apps stay out.
 #[tokio::test]
 async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
+    let vapid_key = wired_be::services::vapid::vapid_public_key(&pool)
+        .await
+        .expect("the instance VAPID key is readable");
     let alice = session(&pool, "alice").await;
     let owned = common::create_app_named(&pool, "Owned", Some(&alice.user)).await;
     let tokened = common::create_app_named(&pool, "Tokened", None).await;
@@ -272,7 +277,12 @@ async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first() {
     );
     assert_eq!(names_of(&body), vec!["Tokened", "Owned", "Session"]);
     for entry in body.as_array().expect("array body") {
-        assert_eq!(keys_of(entry), APP_KEYS, "exactly the seven keys");
+        assert_eq!(keys_of(entry), APP_KEYS, "exactly the eight keys");
+        assert_eq!(
+            entry["vapid_key"],
+            json!(vapid_key),
+            "every entry advertises the instance VAPID key"
+        );
     }
     assert_eq!(body[0]["redirect_uri"], REDIRECT_URI, "as stored");
     assert_eq!(body[0]["client_id"], tokened.client_id, "the client id");

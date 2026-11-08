@@ -44,6 +44,7 @@ pub mod marker;
 pub mod media_attachment;
 pub mod mention;
 pub mod notification;
+pub mod push_subscription;
 pub mod relationship;
 pub mod report;
 pub mod scrobble;

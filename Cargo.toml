@@ -67,6 +67,14 @@ infer = "0.22.0"
 # default features (native-tls, pool, hostname, the sendmail and file
 # transports) stay off.
 lettre = { version = "0.11.23", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+# VAPID signing keys for Web Push (`src/services/vapid.rs`): the ES256
+# (P-256) key pair the instance generates and stores in `instance_secrets`
+# as PKCS#8 PEM beside its URL-safe base64 public point. `ecdsa` is the
+# signing scheme VAPID uses, `pkcs8` + `pem` the stored encoding, and
+# `getrandom` lets `Generate::try_generate` draw the secret from the
+# system CSPRNG (`rand` 0.8 above speaks the old `rand_core` these types
+# do not take).
+p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8", "pem", "getrandom"] }
 pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 # Markdown for `text/markdown` statuses (`src/util/format.rs`): only the pull
 # parser is used, so the default features (`html`, `getopts`,

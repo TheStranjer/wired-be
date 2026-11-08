@@ -54,6 +54,7 @@ use crate::{
     services::{
         instance_meta,
         translate::{Translator, languages_matrix},
+        vapid,
     },
     state::AppState,
     util::{cache::TimedCache, time::mastodon_time},
@@ -259,11 +260,13 @@ async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance
     };
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
+    let vapid_key = vapid::vapid_public_key(&state.db).await?;
     Ok(Json(Instance::build(
         &state.config,
         &counters,
         &rules,
         contact.as_ref(),
+        &vapid_key,
     )))
 }
 
@@ -306,10 +309,12 @@ async fn read_first_admin(pool: &PgPool) -> AppResult<Option<User>> {
 async fn show_instance_v2(State(state): State<AppState>) -> AppResult<Json<InstanceV2>> {
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
+    let vapid_key = vapid::vapid_public_key(&state.db).await?;
     Ok(Json(InstanceV2::build(
         &state.config,
         &rules,
         contact.as_ref(),
+        &vapid_key,
     )))
 }
 
@@ -510,16 +515,17 @@ struct Instance {
 
 impl Instance {
     /// The document for the instance `config` serves, with the cached
-    /// `stats` counters, the stored `rules` and `contact` as the account
-    /// to advertise.
+    /// `stats` counters, the stored `rules`, `contact` as the account to
+    /// advertise and the instance `vapid_key` in the push places.
     ///
-    /// Pure (decision 3): every value comes from one of the four inputs
+    /// Pure (decision 3): every value comes from one of the five inputs
     /// or a documented constant.
     fn build(
         config: &Config,
         stats: &InstanceStats,
         rules: &[InstanceRule],
         contact: Option<&User>,
+        vapid_key: &str,
     ) -> Self {
         Self {
             uri: config.domain().to_owned(),
@@ -548,7 +554,7 @@ impl Instance {
             banner_upload_limit: BANNER_UPLOAD_LIMIT,
             description_limit: DESCRIPTION_LIMIT,
             configuration: Configuration::for_config(config),
-            pleroma: PleromaBlock::pleroma(),
+            pleroma: PleromaBlock::pleroma(vapid_key),
         }
     }
 }
@@ -742,21 +748,21 @@ struct PleromaBlock {
     metadata: PleromaMetadata,
     /// The extra counters Pleroma reports here.
     stats: PleromaStats,
-    /// The VAPID key Web Push clients would need; no push sender exists,
-    /// so JSON `null` (Pleroma answers its configured key or `null`).
-    vapid_public_key: Value,
+    /// The instance VAPID public key Web Push clients need, the key
+    /// Pleroma answers from its own `:web_push_encryption` config.
+    vapid_public_key: String,
 }
 
 impl PleromaBlock {
     /// The block of a plain public instance: the shared capability lists,
-    /// no push key, and the zeroed extra counters.
-    fn pleroma() -> Self {
+    /// the instance's `vapid_public_key`, and the zeroed extra counters.
+    fn pleroma(vapid_public_key: &str) -> Self {
         Self {
             metadata: PleromaMetadata::build(),
             stats: PleromaStats {
                 mau: MONTHLY_ACTIVE_USERS,
             },
-            vapid_public_key: Value::Null,
+            vapid_public_key: vapid_public_key.to_owned(),
         }
     }
 }
@@ -944,12 +950,18 @@ struct InstanceV2 {
 
 impl InstanceV2 {
     /// The document for the instance `config` serves, with the stored
-    /// `rules` and `contact` as the account to advertise. The `usage`
-    /// counter needs no database read while no activity counter exists.
+    /// `rules`, `contact` as the account to advertise and the instance
+    /// `vapid_key` in the push places. The `usage` counter needs no
+    /// database read while no activity counter exists.
     ///
-    /// Pure (decision 3): every value comes from one of the three inputs
+    /// Pure (decision 3): every value comes from one of the four inputs
     /// or a documented constant.
-    fn build(config: &Config, rules: &[InstanceRule], contact: Option<&User>) -> Self {
+    fn build(
+        config: &Config,
+        rules: &[InstanceRule],
+        contact: Option<&User>,
+        vapid_key: &str,
+    ) -> Self {
         Self {
             domain: config.domain().to_owned(),
             title: config.instance_name.clone(),
@@ -959,11 +971,11 @@ impl InstanceV2 {
             usage: Usage::monthly(),
             thumbnail: Thumbnail::for_config(config),
             languages: config.instance_languages.clone(),
-            configuration: ConfigurationV2::for_config(config),
+            configuration: ConfigurationV2::for_config(config, vapid_key),
             registrations: RegistrationsV2::for_config(config),
             contact: Contact::build(config, contact),
             rules: rules.iter().map(Rule::from_model).collect(),
-            pleroma: PleromaBlock::pleroma(),
+            pleroma: PleromaBlock::pleroma(vapid_key),
         }
     }
 }
@@ -1035,13 +1047,13 @@ struct ConfigurationV2 {
 }
 
 impl ConfigurationV2 {
-    /// The block for the limits `config` configures; the shared v1
-    /// groups are reused whole, the Mastodon 4-only groups carry the
-    /// shipped constants.
-    fn for_config(config: &Config) -> Self {
+    /// The block for the limits `config` configures and the instance
+    /// `vapid_key`; the shared v1 groups are reused whole, the Mastodon
+    /// 4-only groups carry the shipped constants.
+    fn for_config(config: &Config, vapid_key: &str) -> Self {
         Self {
             urls: EndpointUrls::for_config(config),
-            vapid: Vapid::unsupported(),
+            vapid: Vapid::with_key(vapid_key),
             accounts: AccountsConfigurationV2::shipped(),
             statuses: StatusesConfiguration::for_config(config),
             media_attachments: MediaAttachmentsConfiguration::for_config(config),
@@ -1075,17 +1087,16 @@ impl EndpointUrls {
 /// The v2 `configuration.vapid` group.
 #[derive(Debug, Serialize)]
 struct Vapid {
-    /// The Web Push public key; no push sender exists, so the empty
-    /// string clients treat as "no push" (Pleroma answers its configured
-    /// key, which ships unset).
+    /// The instance Web Push public key, the one the push endpoints
+    /// hand out as `server_key` (see [`crate::services::vapid`]).
     public_key: String,
 }
 
 impl Vapid {
-    /// The group of an instance with no push sender.
-    const fn unsupported() -> Self {
+    /// The group advertising `public_key`.
+    fn with_key(public_key: &str) -> Self {
         Self {
-            public_key: String::new(),
+            public_key: public_key.to_owned(),
         }
     }
 }
@@ -1286,6 +1297,11 @@ mod tests {
 
     use super::*;
 
+    /// The VAPID public key the document builders are tested with: a
+    /// stand-in for the pair [`crate::services::vapid`] keeps in
+    /// `instance_secrets`; the endpoints read the real one.
+    const TEST_VAPID_KEY: &str = "BTESTvapidPUBLICkey_TEST";
+
     /// A fixed instant for the rules fixture rows; the timestamps are not
     /// part of the document, so any valid one works.
     fn stamped() -> DateTime<Utc> {
@@ -1313,7 +1329,7 @@ mod tests {
             statuses: 0,
             domains: 0,
         };
-        serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap()
+        serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY)).unwrap()
     }
 
     /// The sorted object keys of `value`, for key-set assertions.
@@ -1502,13 +1518,15 @@ mod tests {
         };
         let mut config = Config::for_tests();
         config.invites_enabled = Toggle::new(true);
-        let on = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
+        let on = serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
+            .unwrap();
         assert_eq!(
             on["invites_enabled"], true,
             "INVITES_ENABLED=true is advertised"
         );
         config.invites_enabled = Toggle::new(false);
-        let off = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
+        let off = serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
+            .unwrap();
         assert_eq!(off["invites_enabled"], false, "and the off state stays off");
     }
 
@@ -1571,8 +1589,8 @@ mod tests {
         assert_eq!(document["pleroma"]["stats"], json!({"mau": 0}));
         assert_eq!(
             document["pleroma"]["vapid_public_key"],
-            Value::Null,
-            "no push sender exists"
+            json!(TEST_VAPID_KEY),
+            "the pleroma block advertises the instance VAPID key"
         );
         let metadata = &document["pleroma"]["metadata"];
         assert_eq!(metadata["account_activation_required"], false);
@@ -1633,7 +1651,9 @@ mod tests {
             statuses: 11,
             domains: 3,
         };
-        let document = serde_json::to_value(Instance::build(&config, &stats, &[], None)).unwrap();
+        let document =
+            serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
+                .unwrap();
         assert_eq!(
             document["uri"], "snatter.example:4000",
             "the domain with port"
@@ -1696,14 +1716,14 @@ mod tests {
             statuses: 0,
             domains: 0,
         };
-        Instance::build(&config, &stats, rules, None)
+        Instance::build(&config, &stats, rules, None, TEST_VAPID_KEY)
     }
 
     /// The empty-instance v2 document on the test config: zeroed usage,
     /// no rules, no contact.
     fn empty_document_v2() -> Value {
         let config = Config::for_tests();
-        serde_json::to_value(InstanceV2::build(&config, &[], None)).unwrap()
+        serde_json::to_value(InstanceV2::build(&config, &[], None, TEST_VAPID_KEY)).unwrap()
     }
 
     #[test]
@@ -1807,8 +1827,8 @@ mod tests {
         );
         assert_eq!(
             document["configuration"]["vapid"],
-            json!({"public_key": ""}),
-            "no push sender exists"
+            json!({"public_key": TEST_VAPID_KEY}),
+            "the v2 configuration advertises the instance VAPID key"
         );
         assert_eq!(
             document["configuration"]["accounts"],
@@ -1861,7 +1881,8 @@ mod tests {
         config.max_poll_options = 12;
         config.upload_limits.max_file_bytes = 1_048_576;
         config.registrations_open = Toggle::new(false);
-        let document = serde_json::to_value(InstanceV2::build(&config, &[], None)).unwrap();
+        let document =
+            serde_json::to_value(InstanceV2::build(&config, &[], None, TEST_VAPID_KEY)).unwrap();
         assert_eq!(
             document["domain"], "snatter.example:4000",
             "the domain with port"

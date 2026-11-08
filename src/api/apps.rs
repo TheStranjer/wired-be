@@ -20,6 +20,10 @@
 //! 401 "Invalid credentials"; an unknown, expired or deactivated-owner
 //! token is the 401 "The access token is invalid".
 //!
+//! Both responses carry `vapid_key`, the instance Web Push public key
+//! (see [`crate::services::vapid`]) — the key push clients need before
+//! they can register a subscription.
+//!
 //! The response shape of both lives in
 //! [`crate::entities::application`].
 
@@ -37,6 +41,7 @@ use crate::{
     extract::ApiBody,
     models::oauth_app::{self, NewOauthApp},
     oauth::scopes::Scopes,
+    services::vapid,
     state::AppState,
 };
 
@@ -85,7 +90,10 @@ async fn create_app(
         },
     )
     .await?;
-    Ok(Json(Application::from_app(&app, true)))
+    // The VAPID read seeds the instance key pair on first use (see
+    // [`vapid::vapid_public_key`]).
+    let vapid_key = vapid::vapid_public_key(&state.db).await?;
+    Ok(Json(Application::from_app(&app, true, Some(&vapid_key))))
 }
 
 /// `GET /api/v1/apps/verify_credentials` — the application behind the
@@ -93,9 +101,13 @@ async fn create_app(
 ///
 /// [`AppAuth`] has already resolved the token to its issuing
 /// application (rejecting missing, unknown, expired or deactivated-owner
-/// tokens with a 401), so there is nothing left to fail here.
-async fn verify_credentials(AppAuth(app, _token): AppAuth) -> Json<Application> {
-    Json(Application::from_app(&app, false))
+/// tokens with a 401), so nothing can fail here but the VAPID read.
+async fn verify_credentials(
+    State(state): State<AppState>,
+    AppAuth(app, _token): AppAuth,
+) -> AppResult<Json<Application>> {
+    let vapid_key = vapid::vapid_public_key(&state.db).await?;
+    Ok(Json(Application::from_app(&app, false, Some(&vapid_key))))
 }
 
 /// The request parameters of `POST /api/v1/apps`.

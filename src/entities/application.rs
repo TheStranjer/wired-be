@@ -8,8 +8,11 @@
 //! with the same entity minus the secret fields
 //! (`client_id`, `client_secret`, `client_secret_expires_at`), which is
 //! what [`Application::from_app`] with `with_secret = false` leaves out
-//! of the JSON entirely. `vapid_key` is emitted as `null` both ways;
-//! the web-push ticket fills it in.
+//! of the JSON entirely. `vapid_key` is the instance VAPID public key
+//! every push client needs (see [`crate::services::vapid`]), passed in
+//! by both routes.
+//!
+//! [`crate::services::vapid`]: crate::services::vapid
 
 use serde::Serialize;
 
@@ -40,7 +43,9 @@ pub struct Application {
     /// `with_secret`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret_expires_at: Option<i64>,
-    /// Web-push public key; `null` until the push ticket fills it in.
+    /// The instance VAPID public key handed to [`Application::from_app`]
+    /// (see [`crate::services::vapid`]); `null` for a caller with no key
+    /// to advertise.
     pub vapid_key: Option<String>,
     /// The app's registered scopes as a list.
     pub scopes: Vec<String>,
@@ -52,8 +57,10 @@ impl Application {
     /// `with_secret` selects the registration shape: the credential
     /// fields are serialized; when it is `false` they are left out of
     /// the JSON entirely, which is the `verify_credentials` shape.
+    /// `vapid_key` is the instance's Web Push public key, put on both
+    /// shapes the way Pleroma's `show.json` puts it on the one view.
     #[must_use]
-    pub fn from_app(app: &OauthApp, with_secret: bool) -> Self {
+    pub fn from_app(app: &OauthApp, with_secret: bool, vapid_key: Option<&str>) -> Self {
         Self {
             id: app.id.to_string(),
             name: app.client_name.clone(),
@@ -62,7 +69,7 @@ impl Application {
             client_id: with_secret.then(|| app.client_id.clone()),
             client_secret: with_secret.then(|| app.client_secret.clone()),
             client_secret_expires_at: with_secret.then_some(NEVER_EXPIRES),
-            vapid_key: None,
+            vapid_key: vapid_key.map(str::to_owned),
             scopes: scope_list(&app.scopes),
         }
     }
@@ -106,7 +113,7 @@ mod tests {
     fn with_secret_renders_the_registration_entity() {
         let app = stored_app();
         let id = app.id.to_string();
-        let json = to_value(Application::from_app(&app, true)).unwrap();
+        let json = to_value(Application::from_app(&app, true, Some("vapid-pub"))).unwrap();
         assert_eq!(json["id"], json!(id), "the uuid as hyphenated text");
         assert_eq!(json["name"], "Entity", "client_name becomes name");
         assert!(json["website"].is_null(), "an unset website is null");
@@ -120,13 +127,16 @@ mod tests {
             "the client secret is handed back"
         );
         assert_eq!(json["client_secret_expires_at"], 0, "secrets do not expire");
-        assert!(json["vapid_key"].is_null(), "vapid_key is null for now");
+        assert_eq!(
+            json["vapid_key"], "vapid-pub",
+            "the instance VAPID public key is handed back"
+        );
         assert_eq!(json["scopes"], json!(["read", "write"]), "the scope list");
     }
 
     #[test]
     fn without_secret_the_credential_keys_are_absent() {
-        let json = to_value(Application::from_app(&stored_app(), false)).unwrap();
+        let json = to_value(Application::from_app(&stored_app(), false, Some("k"))).unwrap();
         let fields = json.as_object().expect("the entity is an object");
         for secret in ["client_id", "client_secret", "client_secret_expires_at"] {
             assert!(
@@ -142,9 +152,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unadvertised_push_key_renders_as_null() {
+        let json = to_value(Application::from_app(&stored_app(), true, None)).unwrap();
+        assert!(
+            json.as_object()
+                .expect("an object")
+                .contains_key("vapid_key"),
+            "the key is always present"
+        );
+        assert!(json["vapid_key"].is_null(), "and null without a key");
+    }
+
+    #[test]
     fn the_open_shape_equals_the_secret_shape_minus_the_secrets() {
         let app = stored_app();
-        let mut registration = to_value(Application::from_app(&app, true))
+        let mut registration = to_value(Application::from_app(&app, true, Some("vapid-pub")))
             .unwrap()
             .as_object()
             .expect("the entity is an object")
@@ -153,7 +175,7 @@ mod tests {
             let shown = registration.remove(secret);
             assert!(shown.is_some(), "the registration carries `{secret}`");
         }
-        let verified = to_value(Application::from_app(&app, false)).unwrap();
+        let verified = to_value(Application::from_app(&app, false, Some("vapid-pub"))).unwrap();
         assert_eq!(
             verified.as_object().expect("an object"),
             &registration,
@@ -167,7 +189,7 @@ mod tests {
             scopes: "read".to_owned(),
             ..stored_app()
         };
-        let json = to_value(Application::from_app(&app, false)).unwrap();
+        let json = to_value(Application::from_app(&app, false, Some("k"))).unwrap();
         assert_eq!(json["scopes"], json!(["read"]), "a lone scope");
     }
 
@@ -182,7 +204,7 @@ mod tests {
             website: Some("https://entity.example".to_owned()),
             ..stored_app()
         };
-        let json = to_value(Application::from_app(&app, true)).unwrap();
+        let json = to_value(Application::from_app(&app, true, Some("k"))).unwrap();
         assert_eq!(json["website"], "https://entity.example", "the homepage");
     }
 }

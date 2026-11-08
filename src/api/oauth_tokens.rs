@@ -18,11 +18,13 @@
 //!   404 `{"error":"Record not found"}` of decision 8 instead.
 //! - `GET /api/v1/pleroma/apps` — the applications the caller knows:
 //!   those they registered (`oauth_apps.user_id`) **or** hold a token
-//!   for, deduplicated, newest app first, rendered with the seven keys
+//!   for, deduplicated, newest app first, rendered with the eight keys
 //!   `id`, `name`, `website`, `redirect_uri`, `client_id`,
-//!   `client_secret` and `trusted` (Pleroma's
+//!   `client_secret`, `trusted` and `vapid_key` (Pleroma's
 //!   `MastodonAPI.AppView.show.json` plus the flag its admin view adds;
-//!   no `vapid_key` until the push ticket owns one).
+//!   `vapid_key` is the instance VAPID public key, which Pleroma's
+//!   `with_vapid_key` puts on the render once push is configured — it
+//!   always is here, see [`crate::services::vapid`]).
 //!
 //! All three routes require a user token ([`AuthUser`]); none demands a
 //! particular scope. The queries live in [`crate::models::oauth_token`]
@@ -42,6 +44,7 @@ use crate::{
     auth::AuthUser,
     error::{AppError, AppResult},
     models::{oauth_app, oauth_token},
+    services::vapid,
     state::AppState,
     util::id::parse_id,
 };
@@ -121,12 +124,17 @@ async fn list_apps(
     auth: AuthUser,
 ) -> AppResult<Json<Vec<PleromaApp>>> {
     let apps = oauth_app::list_for_user(&state.db, auth.0.id).await?;
+    let vapid_key = vapid::vapid_public_key(&state.db).await?;
     debug!(
         count = apps.len(),
         user = %auth.0.id,
         "pleroma apps listed"
     );
-    Ok(Json(apps.iter().map(PleromaApp::from_row).collect()))
+    Ok(Json(
+        apps.iter()
+            .map(|app| PleromaApp::from_row(app, &vapid_key))
+            .collect(),
+    ))
 }
 
 /// One entry of `GET /api/oauth_tokens`: exactly the three keys
@@ -154,9 +162,10 @@ impl TokenEntry {
     }
 }
 
-/// One entry of `GET /api/v1/pleroma/apps`: the seven keys Pleroma's
-/// `MastodonAPI.AppView.show.json` renders (extended with `trusted`),
-/// built from a stored [`oauth_app::OauthApp`].
+/// One entry of `GET /api/v1/pleroma/apps`: the keys Pleroma's
+/// `MastodonAPI.AppView.show.json` renders (extended with `trusted` and
+/// the configured `vapid_key`), built from a stored
+/// [`oauth_app::OauthApp`].
 #[derive(Debug, Serialize)]
 struct PleromaApp {
     /// The app's `UUIDv7` id as lowercase hyphenated text (decision 4).
@@ -173,11 +182,13 @@ struct PleromaApp {
     client_secret: String,
     /// Whether the app skips the authorization confirmation screen.
     trusted: bool,
+    /// The instance VAPID public key Pleroma's `with_vapid_key` adds.
+    vapid_key: String,
 }
 
 impl PleromaApp {
-    /// Renders one stored app row.
-    fn from_row(app: &oauth_app::OauthApp) -> Self {
+    /// Renders one stored app row with the instance `vapid_key`.
+    fn from_row(app: &oauth_app::OauthApp, vapid_key: &str) -> Self {
         Self {
             id: app.id.to_string(),
             name: app.client_name.clone(),
@@ -186,6 +197,7 @@ impl PleromaApp {
             client_id: app.client_id.clone(),
             client_secret: app.client_secret.clone(),
             trusted: app.trusted,
+            vapid_key: vapid_key.to_owned(),
         }
     }
 }
@@ -242,10 +254,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pleroma_app_carries_exactly_the_seven_pinned_keys() {
+    fn a_pleroma_app_carries_exactly_the_eight_pinned_keys() {
         let app = app_row();
         let id = app.id.to_string();
-        let json = serde_json::to_value(PleromaApp::from_row(&app)).unwrap();
+        let json = serde_json::to_value(PleromaApp::from_row(&app, "vapid-pub")).unwrap();
         assert_eq!(
             json,
             json!({
@@ -256,9 +268,10 @@ mod tests {
                 "client_id": "cid",
                 "client_secret": "csec",
                 "trusted": true,
+                "vapid_key": "vapid-pub",
             }),
             "client_name becomes name, redirect_uris becomes redirect_uri"
         );
-        assert_eq!(json.as_object().map(Map::len), Some(7), "no other keys");
+        assert_eq!(json.as_object().map(Map::len), Some(8), "no other keys");
     }
 }

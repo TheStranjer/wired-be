@@ -17,6 +17,10 @@
 //! the instance talks to, what a translate call and a language list look like
 //! over there, and the sanitizer pass every provider answer goes through
 //! before an endpoint serves it.
+//!
+//! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
+//! `instance_secrets`, generated on first use and overridable through the
+//! `VAPID_*` settings, of which the endpoints serve only the public half.
 
 pub mod emoji_packs;
 pub mod instance_actor;
@@ -26,3 +30,4 @@ pub mod media_proxy;
 pub mod mentions;
 pub mod render_status;
 pub mod translate;
+pub mod vapid;
