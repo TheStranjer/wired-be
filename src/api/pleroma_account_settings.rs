@@ -361,7 +361,9 @@ async fn resolve_move_target(state: &AppState, acct: &str) -> AppResult<User> {
 
 /// Whether `text` is given as an `ActivityPub` actor id rather than an
 /// `acct` handle: a case-insensitive `http://` or `https://` prefix.
-fn looks_like_ap_id(text: &str) -> bool {
+/// Shared with [`crate::api::accounts`]' `POST /api/v1/follows`, which
+/// splits its `uri` parameter the same way.
+pub(crate) fn looks_like_ap_id(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
 }

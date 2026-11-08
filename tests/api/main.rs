@@ -78,6 +78,10 @@ mod filters;
 /// Following and unfollowing an account (`/api/v1/accounts/{id}/follow`).
 mod follow_actions;
 
+/// The legacy follow write keyed by handle or actor URL
+/// (`POST /api/v1/follows`).
+mod follow_by_uri;
+
 /// The follower and following lists of an account.
 mod follow_lists;
 
