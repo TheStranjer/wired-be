@@ -54,6 +54,9 @@ pub const MAX_PROFILE_FIELDS_VAR: &str = "MAX_PROFILE_FIELDS";
 /// Environment variable holding the maximum length of a report's comment
 /// in characters.
 pub const MAX_REPORT_COMMENT_VAR: &str = "MAX_REPORT_COMMENT";
+/// Environment variable holding the number of statuses one account may pin
+/// to its profile.
+pub const MAX_PINNED_STATUSES_VAR: &str = "MAX_PINNED_STATUSES";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -229,6 +232,13 @@ pub const DEFAULT_MAX_PROFILE_FIELDS: usize = 4;
 /// (`Report`'s length validation); `POST /api/v1/reports` refuses a longer
 /// one with 422.
 pub const DEFAULT_MAX_REPORT_COMMENT: usize = 1_000;
+/// Pinned statuses per account used when `MAX_PINNED_STATUSES` is unset.
+///
+/// Pleroma's `[:instance, :max_pinned_statuses]` ships as one
+/// (`Pleroma.User.add_pinned_object_id/2` validates against it and
+/// `Pleroma.Web.CommonAPI.pin` refuses the pin past it), so a second pin is
+/// a 422 on an instance that never raised the limit.
+pub const DEFAULT_MAX_PINNED_STATUSES: usize = 1;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -722,6 +732,12 @@ pub struct Config {
     /// decodes larger with 422 "Image too large" (see
     /// [`crate::services::media_processing::analyze_image`]).
     pub max_image_pixels: usize,
+    /// How many statuses one account may pin to its profile, from
+    /// `MAX_PINNED_STATUSES`; `POST /api/v1/statuses/{id}/pin` refuses one
+    /// past it with 422
+    /// `{"error":"You have already pinned the maximum number of statuses"}`
+    /// (see [`crate::models::pinned_status`]).
+    pub max_pinned_statuses: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -887,7 +903,7 @@ impl Config {
             content_limits(&lookup)?;
         let (max_media_description, max_display_name_chars, max_bio_chars, max_profile_fields) =
             text_length_limits(&lookup)?;
-        let (max_image_pixels, max_report_comment) = cap_limits(&lookup)?;
+        let (max_image_pixels, max_report_comment, max_pinned_statuses) = cap_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
@@ -916,6 +932,7 @@ impl Config {
             max_profile_fields,
             max_report_comment,
             max_image_pixels,
+            max_pinned_statuses,
             upload_limits,
             avatar_limit_bytes,
             banner_limit_bytes,
@@ -1027,6 +1044,7 @@ impl Config {
             max_profile_fields: DEFAULT_MAX_PROFILE_FIELDS,
             max_report_comment: DEFAULT_MAX_REPORT_COMMENT,
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
+            max_pinned_statuses: DEFAULT_MAX_PINNED_STATUSES,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
@@ -1408,18 +1426,19 @@ where
     ))
 }
 
-/// The shape [`cap_limits`] answers: the two content caps that sit outside
-/// the text-length groups, in [`Config`] field order (an uploaded image's
-/// pixel count, then a report comment's character count); factored out
-/// because a bare pair of same-typed numbers reads better by name.
-type CapLimits = (usize, usize);
+/// The shape [`cap_limits`] answers: the three limits that sit outside the
+/// text-length groups, in [`Config`] field order (an uploaded image's pixel
+/// count, a report comment's character count, then the number of statuses
+/// one account may pin); factored out because a bare triple of same-typed
+/// numbers reads better by name.
+type CapLimits = (usize, usize, usize);
 
-/// Reads the two caps that bound one request's content beside the text
-/// limits: the pixel count an uploaded image may decode to
-/// (`MAX_IMAGE_PIXELS`) and the length of a report's `comment`
-/// (`MAX_REPORT_COMMENT`). Grouped because each is a plain default-or-parse
-/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
-/// comes back in field order.
+/// Reads the three caps that sit beside the text limits: the pixel count an
+/// uploaded image may decode to (`MAX_IMAGE_PIXELS`), the length of a
+/// report's `comment` (`MAX_REPORT_COMMENT`) and the number of statuses one
+/// account may pin to its profile (`MAX_PINNED_STATUSES`). Grouped because
+/// each is a plain default-or-parse and [`Config::from_lookup`] has a size
+/// budget (AGENTS.md); the tuple comes back in field order.
 ///
 /// # Errors
 ///
@@ -1432,6 +1451,7 @@ where
     Ok((
         number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
         number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
+        number(lookup, MAX_PINNED_STATUSES_VAR, DEFAULT_MAX_PINNED_STATUSES)?,
     ))
 }
 
@@ -1790,6 +1810,7 @@ impl fmt::Debug for Config {
             .field("max_profile_fields", &self.max_profile_fields)
             .field("max_report_comment", &self.max_report_comment)
             .field("max_image_pixels", &self.max_image_pixels)
+            .field("max_pinned_statuses", &self.max_pinned_statuses)
             .field("upload_limits", &self.upload_limits)
             .field("avatar_limit_bytes", &self.avatar_limit_bytes)
             .field("banner_limit_bytes", &self.banner_limit_bytes)
@@ -2493,6 +2514,25 @@ mod tests {
         assert!(
             debug.contains("max_report_comment: 140"),
             "the report comment limit is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The pinned-status count: Pleroma's one by default, the environment
+    /// overriding it, and `Debug` showing the value.
+    #[test]
+    fn reads_custom_max_pinned_statuses() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.max_pinned_statuses, 1,
+            "default MAX_PINNED_STATUSES"
+        );
+
+        let config = config_with(&[(MAX_PINNED_STATUSES_VAR, "5")]);
+        assert_eq!(config.max_pinned_statuses, 5, "custom MAX_PINNED_STATUSES");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_pinned_statuses: 5"),
+            "the pinned-status limit is visible in Debug output: {debug}"
         );
     }
 
@@ -3648,6 +3688,7 @@ mod tests {
             MAX_BIO_CHARS_VAR,
             MAX_PROFILE_FIELDS_VAR,
             MAX_REPORT_COMMENT_VAR,
+            MAX_PINNED_STATUSES_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             AVATAR_LIMIT_BYTES_VAR,

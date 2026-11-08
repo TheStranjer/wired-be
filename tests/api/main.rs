@@ -164,6 +164,9 @@ mod pleroma_import;
 /// The frontend settings store, mascot and preferred frontend.
 mod pleroma_settings;
 
+/// Pinned statuses (`/api/v1/statuses/{id}/pin` and its `…/unpin` twin).
+mod pins;
+
 /// The per-route rate limiter: mounted buckets, headers, and 429s.
 mod rate_limit;
 

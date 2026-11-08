@@ -6,11 +6,11 @@
 //! `lib/pleroma/web/mastodon_api/views/status_view.ex`, with its
 //! `safe_render_many`): it takes the already-paged rows and loads
 //! everything they render from — authors, media attachments, mentions,
-//! hashtags, emoji reactions, favourites, bookmarks, reblogged originals
-//! and quoted originals — with a FIXED set of batched queries, one per
-//! part, each keyed by an id list (`WHERE … = ANY($1)`), never a query per
-//! row. The count does not grow with the page size: ten statement groups
-//! whatever the batch —
+//! hashtags, emoji reactions, favourites, bookmarks, the viewer's own pins,
+//! reblogged originals and quoted originals — with a FIXED set of batched
+//! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
+//! never a query per row. The count does not grow with the page size:
+//! eleven statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -28,13 +28,18 @@
 //!    likewise only for an authenticated viewer; every row takes its flag
 //!    from its *own* id, because a bookmark of a reblog lands on the reblog
 //!    row itself;
-//! 10. the viewer's relationships to the page's authors — the one fixed
+//! 10. the viewer's pins among the page — one [`pinned_status::pinned_ids`],
+//!     likewise only for an authenticated viewer, and likewise keyed to
+//!     each row's *own* id: only a post of one's own can be pinned, so a
+//!     pin's author is its viewer. The same map answers `pinned` and
+//!     `pleroma.pinned_at`, which is why the two can never disagree;
+//! 11. the viewer's relationships to the page's authors — the one fixed
 //!     [`Relationship::load_many`] set, run only for an authenticated
 //!     viewer.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
-//! page of plain posts costs five queries, and a viewer adds the favourite
-//! and bookmark reads and the relationship set.
+//! page of plain posts costs five queries, and a viewer adds the favourite,
+//! bookmark and pin reads and the relationship set.
 //!
 //! # Extension points
 //!
@@ -50,8 +55,8 @@
 //! - `pleroma.bookmark_folder`: the folders ticket, one read keyed by
 //!   bookmark row; `bookmarked` itself is *already* filled by the
 //!   bookmarks ticket (step 9 above).
-//! - `pinned` and `pleroma.pinned_at`: the pins table, one read keyed by
-//!   status.
+//! - `pinned` and `pleroma.pinned_at`: *filled by the pinning ticket*
+//!   (step 10 above), from the one [`pinned_status::pinned_ids`] read.
 //! - `muted` and `pleroma.thread_muted`: one read of the viewer's muted
 //!   threads keyed by `conversation_id`.
 //! - `pleroma.direct_conversation_id`: the chat-participation ticket,
@@ -77,6 +82,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
@@ -94,7 +100,7 @@ use crate::{
         favourite,
         hashtag::{self, Hashtag},
         media_attachment::{self, MediaAttachment as AttachmentRow},
-        mention,
+        mention, pinned_status,
         status::{self, Status as StatusRow},
         user::{self, User},
     },
@@ -192,6 +198,14 @@ struct Batch<'a> {
     /// [`Batch::favourites`], membership is keyed to the row's own id: a
     /// bookmark of a reblog lands on the reblog row.
     bookmarks: HashSet<Uuid>,
+    /// The rows on the page the viewer has pinned to their own profile, and
+    /// when — one [`pinned_status::pinned_ids`] read keyed by every rendered
+    /// id; empty for an anonymous viewer, who has no rows. Keyed to the
+    /// row's own id like [`Batch::bookmarks`], because a pin is always a
+    /// post of the pinning account's own; the value is what
+    /// `pleroma.pinned_at` renders, so the flag and the stamp cannot
+    /// disagree.
+    pins: HashMap<Uuid, DateTime<Utc>>,
     /// The viewer's relationships to the page's authors, keyed by account
     /// id; `None` for an anonymous viewer.
     relationships: Option<RelationshipMap>,
@@ -246,6 +260,7 @@ impl<'a> Batch<'a> {
             reactions: load_reactions(pool, &rendered_ids, viewer).await?,
             favourites: load_favourites(pool, &rendered_ids, viewer).await?,
             bookmarks: load_bookmarks(pool, &rendered_ids, viewer).await?,
+            pins: load_pins(pool, &rendered_ids, viewer).await?,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
         })
     }
@@ -289,10 +304,14 @@ impl<'a> Batch<'a> {
     /// nested original is flagged from its own id in the same set. The
     /// `bookmarked` flag is membership in the bookmarks set keyed to the
     /// row's *own* id for every row: a bookmark of a reblog names the
-    /// reblog row and lives there (see [`crate::models::bookmark`]).
+    /// reblog row and lives there (see [`crate::models::bookmark`]). The
+    /// `pinned` flag and `pleroma.pinned_at` are the pins map read at the
+    /// row's *own* id too — only a post of the viewer's own can be pinned,
+    /// so one lookup answers both halves and they always agree.
     fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
         let favourite_id = row.reblog_of_id.unwrap_or(row.id);
+        let pinned_at = self.pins.get(&row.id).copied();
         let source = StatusSource {
             row,
             author,
@@ -305,6 +324,7 @@ impl<'a> Batch<'a> {
             reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
             favourited: self.favourites.contains(&favourite_id),
             bookmarked: self.bookmarks.contains(&row.id),
+            pinned_at,
             reblog,
         };
         Some(Status::from_source(
@@ -419,6 +439,23 @@ async fn load_bookmarks(
     bookmark::bookmarked_ids(pool, viewer.id, ids).await
 }
 
+/// [`pinned_status::pinned_ids`]: one query for the viewer's pins among the
+/// page's ids, keyed by status and carrying the moment each pin happened
+/// (the ids of reblogged originals ride along, since a render answers their
+/// flags too and one of them may be the viewer's own pinned post). An
+/// anonymous viewer has no rows to ask about, and the empty map makes every
+/// flag false and every stamp `null` — no query at all.
+async fn load_pins(
+    pool: &PgPool,
+    ids: &[Uuid],
+    viewer: Option<&User>,
+) -> AppResult<HashMap<Uuid, DateTime<Utc>>> {
+    let Some(viewer) = viewer else {
+        return Ok(HashMap::new());
+    };
+    pinned_status::pinned_ids(pool, viewer.id, ids).await
+}
+
 /// The viewer's relationships to the page's authors, keyed by account id:
 /// [`Relationship::load_many`] runs its own fixed set of queries once per
 /// page; an anonymous viewer has none to load, and an empty author list
@@ -459,6 +496,7 @@ mod tests {
             user::{NewUser, local_ap_id},
         },
         uploads::UploaderBackend,
+        util::time::mastodon_time,
     };
 
     /// The instance origin the fixtures post under.
@@ -950,6 +988,106 @@ mod tests {
         assert!(
             anonymous.iter().all(|entity| flag(entity) == json!(false)),
             "an anonymous page is nobody's bookmark"
+        );
+    }
+
+    /// Pins `status_id` as `who`, asserting the write created its row — the
+    /// state the pin flag test starts from.
+    async fn pin_it(pool: &PgPool, who: &User, status_id: Uuid) {
+        let created = pinned_status::pin(pool, who.id, status_id)
+            .await
+            .expect("the fixture pin stores");
+        assert!(created.is_some(), "the fixture pair had not pinned yet");
+    }
+
+    /// The pinning ticket's loader inside the fixed query set: one batched
+    /// read answers both the `pinned` flag and `pleroma.pinned_at` of a
+    /// whole page — and, like the bookmarks flag, keyed to each row's *own*
+    /// id, so a reblog of a pinned original renders unflagged while the
+    /// nested original carries the pin. An anonymous page is nobody's pin.
+    #[tokio::test]
+    async fn the_pinned_flag_and_stamp_follow_one_batched_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let own = post(&pool, &alice, "alice's own").await;
+        let second = post(&pool, &alice, "second").await;
+        let reblog = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(own.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .expect("a reblog of a stored post inserts");
+        pin_it(&pool, &alice, own.id).await;
+
+        let stamped = pinned_status::pinned_ids(&pool, alice.id, &[own.id])
+            .await
+            .expect("the pin reads")
+            .get(&own.id)
+            .copied()
+            .expect("alice pinned her own post");
+
+        let flags = |entity: &Status| {
+            let value = serde_json::to_value(entity).expect("a rendered status serializes");
+            (
+                value["pinned"].clone(),
+                value["pleroma"]["pinned_at"].clone(),
+            )
+        };
+        let page = [own.clone(), second.clone(), reblog.clone()];
+        let for_alice = render_statuses(&state, Some(&alice), &page)
+            .await
+            .expect("the page renders for alice");
+        assert_eq!(
+            flags(&for_alice[0]),
+            (json!(true), json!(mastodon_time(&stamped))),
+            "alice's pin shows in the flag and in the stamp together"
+        );
+        assert_eq!(
+            flags(&for_alice[1]),
+            (json!(false), json!(null)),
+            "the unpinned post carries neither"
+        );
+        let reblog_json = serde_json::to_value(&for_alice[2]).expect("the reblog serializes");
+        assert_eq!(
+            reblog_json["pinned"],
+            json!(false),
+            "bob's boost of her post is not alice's pin — a pin is keyed to \
+             the row its account owns"
+        );
+        assert_eq!(
+            reblog_json["reblog"]["pinned"],
+            json!(true),
+            "and the nested original carries the pin, from the same batch"
+        );
+        assert_eq!(
+            reblog_json["reblog"]["pleroma"]["pinned_at"],
+            json!(mastodon_time(&stamped)),
+            "with its stamp"
+        );
+
+        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&own))
+            .await
+            .expect("the post renders for bob");
+        assert_eq!(
+            flags(&for_bob[0]),
+            (json!(false), json!(null)),
+            "alice's pin is nobody else's flag"
+        );
+        let anonymous = render_statuses(&state, None, &page)
+            .await
+            .expect("the page renders anonymously");
+        assert!(
+            anonymous
+                .iter()
+                .all(|entity| flags(entity) == (json!(false), json!(null))),
+            "an anonymous page is nobody's pin"
         );
     }
 
