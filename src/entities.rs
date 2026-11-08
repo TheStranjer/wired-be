@@ -27,7 +27,8 @@
 //! [`models::report`](crate::models::report) row and the reported account,
 //! [`emoji_reaction`] Pleroma's two emoji-reaction shapes: the entry of a
 //! status's `pleroma.emoji_reactions` array and the entry of its reactions
-//! endpoint.
+//! endpoint. [`translation`] the Mastodon `Translation` entity, built from a
+//! [`crate::services::translate`] provider answer.
 
 pub mod account;
 pub mod announcement;
@@ -45,3 +46,4 @@ pub mod report;
 pub mod scrobble;
 pub mod status;
 pub mod tag;
+pub mod translation;

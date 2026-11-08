@@ -6,7 +6,8 @@ use sqlx::PgPool;
 
 use crate::{
     api::instance::InstanceStatsCache, config::Config, http_client::HttpClient,
-    mailer::MailTransport, rate_limit::RateLimiter, streaming::hub::Hub, uploads::UploaderBackend,
+    mailer::MailTransport, rate_limit::RateLimiter, services::translate::TranslationLanguagesCache,
+    streaming::hub::Hub, uploads::UploaderBackend,
 };
 
 /// State shared across all requests. Cheap to clone.
@@ -33,6 +34,13 @@ pub struct AppState {
     /// [`STATS_TTL`](crate::api::instance::STATS_TTL)). Construct it with
     /// `Arc::default()`, which applies the endpoint's TTL.
     pub instance_stats_cache: Arc<InstanceStatsCache>,
+    /// The in-memory cache behind
+    /// `GET /api/v1/instance/translation_languages`: the configured
+    /// provider's language pairs are refetched only after the window lapses
+    /// (see [`crate::util::cache::TimedCache`] and
+    /// [`LANGUAGES_TTL`](crate::services::translate::LANGUAGES_TTL)).
+    /// Construct it with `Arc::default()`, which applies that TTL.
+    pub translation_languages_cache: Arc<TranslationLanguagesCache>,
     /// The in-memory fixed-window rate limiter shared by every throttled
     /// route (see [`crate::rate_limit`]): one instance per process, so a
     /// bucket counts one budget across the routes that mount it. Build it

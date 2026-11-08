@@ -665,6 +665,7 @@ fn expected_v2_configuration() -> Value {
         "statuses": v1["statuses"].clone(),
         "media_attachments": v1["media_attachments"].clone(),
         "polls": v1["polls"].clone(),
+        // `common::test_config` names no translation provider.
         "translation": { "enabled": false },
     })
 }
@@ -994,8 +995,10 @@ async fn the_domain_blocks_endpoint_maps_policy_to_severities() {
 }
 
 /// `GET /api/v1/instance/translation_languages` answers the empty
-/// object: no translation provider is configured until the translation
-/// ticket lands. No authentication.
+/// object of [`common::test_config`], which configures no translation
+/// provider — the document Pleroma's `translation_languages.json` renders
+/// then. A configured provider's matrix, and its cache, are
+/// `translate::the_language_matrix_is_served_and_cached`. No authentication.
 #[tokio::test]
 async fn translation_languages_is_the_empty_object() {
     let db = common::test_db().await;
