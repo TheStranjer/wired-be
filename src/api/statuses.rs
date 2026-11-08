@@ -243,10 +243,11 @@
 //! rows of the deleted statuses stay in the table, referenced by nothing
 //! live, until the cleanup job removes them.
 //!
-//! Nothing leaves this instance yet: the `Delete` activity, the
-//! `status_deleted` stream push and the notification cleanup all attach at
-//! this route's `after_status_deleted` hook, the documented empty landing
-//! point.
+//! Nothing leaves this instance yet: the `Delete` activity and the
+//! `status_deleted` stream push still attach at this route's
+//! `after_status_deleted` hook, the documented landing point — where the
+//! notification ticket has wired the cleanup that takes the deleted
+//! status's notifications with it.
 //!
 //! What the reads owe no 422: this module answers an unusable id with the
 //! show route's 404 and the batch route's silent skip, and the only
@@ -285,6 +286,7 @@ use crate::{
     models::{
         bookmark,
         favourite::{self, Favourite as FavouriteRow},
+        notification,
         pinned_status::{self, PinnedStatus},
         status::{self, Status as StatusRow, Visibility},
         status_visibility,
@@ -496,7 +498,7 @@ async fn delete_status(
         staff = auth.0.is_admin.get() || auth.0.is_moderator.get(),
         "status deleted"
     );
-    after_status_deleted(&state, &row);
+    after_status_deleted(&state, &row).await;
     Ok(Json(DeletedStatus {
         entity,
         text: row.raw_text,
@@ -1422,12 +1424,15 @@ const fn after_reblog_changed(_state: &AppState, _reblog: &StatusRow, _rebloggin
 /// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
 const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: bool) {}
 
-/// Post-write hook of the delete route: the federation ticket that sends the
-/// `Delete` activity (and, with it, the withdrawal of every reblog this delete
-/// took down), the streaming ticket that pushes `status_deleted` to the
-/// timelines that carried the post, and the notification ticket that clears the
-/// notifications it caused all wire in here, and the queueing happens through
-/// `state` (decision 11).
+/// Post-write hook of the delete route: the notification cleanup that
+/// clears the notifications the status caused is wired in here (the
+/// tombstoned row never fires the schema's `ON DELETE CASCADE`, so
+/// [`notification::delete_for_status`] is what takes the favourites,
+/// boosts, reactions and mentions about it with it). The federation
+/// ticket that sends the `Delete` activity (and, with it, the withdrawal
+/// of every reblog this delete took down) and the streaming ticket that
+/// pushes `status_deleted` to the timelines that carried the post still
+/// land here, and the queueing will happen through `state` (decision 11).
 ///
 /// `status` is the row **as it was before the delete** — the delete clears the
 /// stored text, so this is the only copy of what the post said: its
@@ -1437,10 +1442,18 @@ const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: 
 /// boost whose original must stop counting it. Pleroma runs all three off the
 /// same `CommonAPI.delete` pipeline.
 ///
-/// Intentionally empty until then, like [`after_favourite_changed`] above and
-/// the reactions'
-/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
-const fn after_status_deleted(_state: &AppState, _status: &StatusRow) {}
+/// The cleanup is best-effort: the delete itself is already committed and
+/// must not answer a failure the client would retry against a gone
+/// status, so a cleanup that fails is logged, not returned.
+async fn after_status_deleted(state: &AppState, status: &StatusRow) {
+    if let Err(err) = notification::delete_for_status(&state.db, status.id).await {
+        warn!(
+            status = %status.id,
+            %err,
+            "notification cleanup after status deletion failed"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

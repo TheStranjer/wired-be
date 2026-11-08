@@ -5,7 +5,9 @@
 //! Like the other area routers this is a composition point: each feature
 //! module exposes a `router()` for its own subtree, and [`router`] nests
 //! it at the path Pleroma serves it on. [`mfa`] is the first; the rest of
-//! the `/api/pleroma` surface joins here the same way. Today [`misc`]
+//! the `/api/pleroma` surface joins here the same way. [`notifications`]
+//! adds the flat notification API's Pleroma half: `POST /notifications/read`
+//! (`PleromaAPI.NotificationController.mark_as_read`), and today [`misc`]
 //! adds one route: `frontend_configurations`, Pleroma's
 //! `UtilController.frontend_configurations/2`, and
 //! [`pleroma_account_settings`] adds the account utilities of the same
@@ -18,7 +20,7 @@
 use axum::Router;
 
 use crate::{
-    api::{mfa, misc, pleroma_account_settings, pleroma_import},
+    api::{mfa, misc, notifications, pleroma_account_settings, pleroma_import},
     state::AppState,
 };
 
@@ -26,6 +28,7 @@ use crate::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/accounts/mfa", mfa::router())
+        .nest("/notifications", notifications::pleroma_router())
         .merge(misc::frontend_configurations_router())
         .merge(pleroma_account_settings::router())
         .merge(pleroma_import::router())
