@@ -24,7 +24,6 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `muted` (the thread-mute table);
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
 //! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
 //! (chats, bookmark folders); and `quote` (the quoting ticket, whose
@@ -51,6 +50,13 @@
 //! read of the viewer's own pins per page; every row takes both from *its
 //! own* id, because only a post of one's own can be pinned, and the map's
 //! value is the moment the pin happened.
+//! `muted` and `pleroma.thread_muted` are filled by the thread-mute ticket,
+//! from
+//! [`muted_conversation_ids`](crate::models::conversation_mute::muted_conversation_ids)
+//! — one batched read of the viewer's muted threads per page; every row
+//! takes both flags from its *own* `conversation_id`, because a mute is a
+//! fact about the thread, not the post, so a reblog row and its nested
+//! original always carry the same pair.
 //!
 //! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
@@ -137,7 +143,10 @@ pub struct PleromaMetadata {
     #[serde(with = "crate::util::time::serde_mastodon_time::option")]
     pub expires_at: Option<DateTime<Utc>>,
     /// `thread_muted`: whether the viewer muted this post's whole thread;
-    /// the thread-mute ticket sets it, so it renders `false` for now.
+    /// the thread-mute ticket's batched
+    /// [`muted_conversation_ids`](crate::models::conversation_mute::muted_conversation_ids)
+    /// read answers it — the same fact as the top-level `muted`, keyed to
+    /// the row's `conversation_id`, so the two always agree.
     pub thread_muted: JsonBool,
     /// `emoji_reactions`: the post's reactions, one entry per emoji in the
     /// roll-up's order (the emoji's first reaction, then the emoji text),
@@ -231,6 +240,18 @@ pub struct StatusSource<'a> {
     /// is its value, which is why the two halves can never disagree; an
     /// anonymous viewer has no rows and so no stamp.
     pub pinned_at: Option<DateTime<Utc>>,
+    /// Whether the viewer muted this row's *thread*: membership in the one
+    /// [`muted_conversation_ids`](crate::models::conversation_mute::muted_conversation_ids)
+    /// read the batch runs for the page, keyed to the row's own
+    /// [`conversation_id`](StatusRow::conversation_id) — a mute is a fact
+    /// about the thread, not the post, so a reblog row and its nested
+    /// original carry the same pair. This answers both the entity's
+    /// `muted` and its `pleroma.thread_muted`, which is why the two can
+    /// never disagree; `false` for an anonymous viewer, who has no mutes.
+    /// A fourth plain `bool` in this struct would trip the denied
+    /// `struct_excessive_bools`, so this flag rides the same [`JsonBool`]
+    /// wrapper [`reblogged`](Self::reblogged) chose.
+    pub muted: JsonBool,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -326,8 +347,10 @@ pub struct Status {
     /// original — the status its own boost landed on — so the outer entity
     /// of the viewer's boost reads `reblogged: true`.
     pub reblogged: JsonBool,
-    /// Whether the viewer muted this post's thread; `false` until the
-    /// thread-mute ticket lands.
+    /// Whether the viewer muted this post's thread; the thread-mute
+    /// ticket's batched read answers it, keyed to the row's
+    /// `conversation_id`, `false` for an anonymous viewer and for a thread
+    /// they have not muted. `pleroma.thread_muted` is the same value.
     pub muted: JsonBool,
     /// Whether the viewer bookmarked this post; the bookmarks ticket's
     /// batched read answers it, `false` for an anonymous viewer and for a
@@ -376,6 +399,7 @@ impl Status {
             reblogged,
             bookmarked,
             pinned_at,
+            muted,
             reblog,
         } = source;
         Self {
@@ -411,11 +435,11 @@ impl Status {
             edited_at: row.edited_at,
             favourited: JsonBool(favourited),
             reblogged,
-            muted: JsonBool(false),
+            muted: muted.clone(),
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
             quote: None,
-            pleroma: pleroma_block(row, reply_author, reactions, pinned_at),
+            pleroma: pleroma_block(row, reply_author, reactions, pinned_at, muted),
         }
     }
 }
@@ -464,14 +488,17 @@ fn plain_text(row: &StatusRow) -> PlainText {
 
 /// Builds the `pleroma` block of `row`, whose replied-to author is
 /// `reply_author` when the batch knew one, whose reactions are `reactions`
-/// when the batch found any, and whose pin timestamp is `pinned_at` when the
-/// viewer pinned this row; see [`PleromaMetadata`] for where each key comes
-/// from and which later tickets fill the placeholders.
+/// when the batch found any, whose pin timestamp is `pinned_at` when the
+/// viewer pinned this row, and whose thread-mute flag is `muted` — the same
+/// [`JsonBool`] the entity's top-level `muted` carries, so the two halves of
+/// the fact can never disagree; see [`PleromaMetadata`] for where each key
+/// comes from and which later tickets fill the placeholders.
 fn pleroma_block(
     row: &StatusRow,
     reply_author: Option<&User>,
     reactions: &[SummaryRow],
     pinned_at: Option<DateTime<Utc>>,
+    muted: JsonBool,
 ) -> PleromaMetadata {
     PleromaMetadata {
         content: plain_text(row),
@@ -483,7 +510,7 @@ fn pleroma_block(
         in_reply_to_account_acct: reply_author.map(|author| author.nickname.clone()),
         local: JsonBool(row.local),
         expires_at: row.expires_at,
-        thread_muted: JsonBool(false),
+        thread_muted: muted,
         emoji_reactions: reactions.iter().map(ReactionSummary::from_model).collect(),
         parent_visible: JsonBool(true),
         quotes_count: row.quotes_count,
@@ -714,6 +741,10 @@ mod tests {
         /// When the viewer pinned the row, `None` unless it is pinned: the
         /// pin stamp the favourites-style batch would hand the renderer.
         pinned_at: Option<DateTime<Utc>>,
+        /// Whether the viewer muted the row's thread, in the same
+        /// [`JsonBool`] wrapper the source field carries (the batch's
+        /// thread-mute membership feeding both flags).
+        muted: JsonBool,
     }
 
     impl<'a> Parts<'a> {
@@ -730,6 +761,7 @@ mod tests {
                 reblogged: JsonBool(false),
                 bookmarked: false,
                 pinned_at: None,
+                muted: JsonBool(false),
             }
         }
 
@@ -801,6 +833,17 @@ mod tests {
                 ..self
             }
         }
+
+        /// Sets [`muted`](Self::muted): the viewer's thread mute, which the
+        /// thread-mute ticket's batched read would hand the renderer. One
+        /// membership answers both the top-level flag and
+        /// `pleroma.thread_muted`.
+        fn muted_thread(self) -> Self {
+            Self {
+                muted: JsonBool(true),
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -819,6 +862,7 @@ mod tests {
             reblogged: parts.reblogged.clone(),
             bookmarked: parts.bookmarked,
             pinned_at: parts.pinned_at,
+            muted: parts.muted.clone(),
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -841,6 +885,7 @@ mod tests {
                 reblogged: JsonBool(false),
                 bookmarked: false,
                 pinned_at: None,
+                muted: JsonBool(false),
                 reblog: None,
             },
             None,
@@ -933,7 +978,12 @@ mod tests {
             value["reblogged"], false,
             "a page whose reblogs read found nothing renders the flag false"
         );
-        assert_eq!(value["muted"], false, "muted is a later ticket");
+        assert_eq!(
+            value["muted"], false,
+            "a page whose thread-mutes read found nothing renders the flag \
+             false, and the extension block agrees — one membership feeds both"
+        );
+        assert_eq!(value["pleroma"]["thread_muted"], false);
         assert_eq!(
             value["pinned"], false,
             "a page whose pins read found nothing renders the flag false"
@@ -994,6 +1044,22 @@ mod tests {
         assert_eq!(
             value["pleroma"]["pinned_at"], "2024-01-31T12:34:56.789Z",
             "and the same read's timestamp reaches the pleroma block"
+        );
+    }
+
+    #[test]
+    fn the_viewers_thread_mute_lands_in_both_flags() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).muted_thread(), None);
+        assert_eq!(
+            value["muted"], true,
+            "the thread-mutes batch's membership reaches the entity verbatim"
+        );
+        assert_eq!(
+            value["pleroma"]["thread_muted"], true,
+            "and the same membership reaches the pleroma block — the two \
+             halves are one lookup"
         );
     }
 

@@ -206,6 +206,10 @@ mod streaming;
 /// Tags over HTTP (`/api/v1/tags/{name}`, `/api/v1/followed_tags`, trends).
 mod tags;
 
+/// Thread mutes over HTTP (`/api/v1/statuses/{id}/mute` and its `…/unmute`
+/// twin) and the `muted` / `pleroma.thread_muted` entity flags.
+mod thread_mutes;
+
 /// Status translation over HTTP (`POST /api/v1/statuses/{id}/translate` and
 /// the instance endpoints' translation half), against a mock provider.
 mod translate;
