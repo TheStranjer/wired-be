@@ -47,12 +47,17 @@ use wired_be::{
         oauth_app::{self, NewOauthApp},
         oauth_token::{self, NewToken},
         status::{self, NewStatus, Status, Visibility},
-        user::{Flag, NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
+        user::{
+            Flag, NewUser, User, followers, following, inbox, insert, local_ap_id, mfa, outbox,
+        },
     },
     state::AppState,
     test_db::TestDb,
     uploads::UploaderBackend,
-    util::password::hash_password,
+    util::{
+        password::hash_password,
+        totp::{self, hash_backup_code},
+    },
 };
 
 /// A private, fully migrated, empty test database: the slot pool fixture from
@@ -525,6 +530,40 @@ pub async fn create_deactivated_user_with_password(
     insert(pool, &new)
         .await
         .expect("deactivated local user fixture inserts")
+}
+
+/// Inserts a local [`User`] named `nickname` that can log in with
+/// `password`, has MFA enabled, and returns it beside its TOTP secret
+/// and `backup_code_count` issued backup-code plaintexts.
+///
+/// The state is written straight through [`wired_be::models::user::mfa`]:
+/// a confirmed TOTP secret (the switch flipped, exactly what
+/// `/api/pleroma/accounts/mfa/confirm/totp` leaves behind) plus the
+/// SHA-256 hashes of generated recovery codes. The plaintexts come back
+/// because the OAuth MFA tests submit them the way an authenticator app
+/// or a printed list would.
+///
+/// # Panics
+///
+/// If hashing, the insert or the settings save fails.
+pub async fn create_mfa_user_with_password(
+    pool: &PgPool,
+    nickname: &str,
+    password: &str,
+    backup_code_count: usize,
+) -> (User, String, Vec<String>) {
+    let user = create_user_with_password(pool, nickname, password).await;
+    let secret = totp::generate_secret();
+    let codes = totp::generate_backup_codes(backup_code_count);
+    let mut settings = mfa::MfaSettings::default();
+    settings.setup_totp(&secret);
+    settings.confirm_totp();
+    let hashes = codes.iter().map(|code| hash_backup_code(code)).collect();
+    settings.rotate_backup_codes(hashes);
+    mfa::save(pool, user.id, &settings)
+        .await
+        .expect("MFA settings save for fixtures");
+    (user, secret, codes)
 }
 
 /// Registers a test app and mints a user-bound bearer token, both

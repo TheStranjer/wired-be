@@ -133,7 +133,7 @@ pub fn render_oob(code: &str) -> String {
 
 /// Opens the document: doctype, `lang`, the given `title`, the inline
 /// style and the `<body>` tag.
-fn push_head(out: &mut String, lang: Option<&str>, title: &str) {
+pub(crate) fn push_head(out: &mut String, lang: Option<&str>, title: &str) {
     out.push_str("<!DOCTYPE html>\n<html lang=\"");
     push_escaped(
         out,
@@ -150,12 +150,12 @@ fn push_head(out: &mut String, lang: Option<&str>, title: &str) {
 }
 
 /// Closes the document.
-fn push_tail(out: &mut String) {
+pub(crate) fn push_tail(out: &mut String) {
     out.push_str("</body>\n</html>\n");
 }
 
 /// Appends the `alert-danger` error line, when there is a `message`.
-fn push_error(out: &mut String, message: Option<&str>) {
+pub(crate) fn push_error(out: &mut String, message: Option<&str>) {
     let Some(message) = message else {
         return;
     };
@@ -196,7 +196,7 @@ fn push_scope_checkbox(out: &mut String, scope: &str) {
 }
 
 /// Appends a labelled text or password input.
-fn push_field(out: &mut String, id: &str, name: &str, input_type: &str, label: &str) {
+pub(crate) fn push_field(out: &mut String, id: &str, name: &str, input_type: &str, label: &str) {
     out.push_str("<div class=\"input\">\n<label for=\"");
     push_escaped(out, id);
     out.push_str("\">");
@@ -222,7 +222,7 @@ fn push_actions(out: &mut String) {
 }
 
 /// Appends a hidden input carrying `value`.
-fn push_hidden(out: &mut String, name: &str, value: &str) {
+pub(crate) fn push_hidden(out: &mut String, name: &str, value: &str) {
     out.push_str("<input type=\"hidden\" name=\"");
     push_escaped(out, name);
     out.push_str("\" value=\"");
@@ -231,7 +231,7 @@ fn push_hidden(out: &mut String, name: &str, value: &str) {
 }
 
 /// Appends `value` HTML-escaped.
-fn push_escaped(out: &mut String, value: &str) {
+pub(crate) fn push_escaped(out: &mut String, value: &str) {
     out.push_str(&escape_html(value));
 }
 
