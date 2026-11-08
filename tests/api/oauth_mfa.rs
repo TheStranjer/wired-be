@@ -568,7 +568,7 @@ async fn a_recovery_code_works_exactly_once() {
 /// The challenge refuses what it cannot honour as one voice: an unknown
 /// or expired token, an absent code, an unsupported type, failed client
 /// authentication and a foreign application all answer 400 "Invalid
-/// code"; HTTP Basic authenticates like on the token endpoint.
+/// code".
 #[tokio::test]
 async fn the_challenge_refuses_everything_it_cannot_honour() {
     let db = common::test_db().await;
@@ -655,9 +655,21 @@ async fn the_challenge_refuses_everything_it_cannot_honour() {
         &post_challenge(&http, &stolen).await,
         "another app's credentials",
     );
+}
 
-    // HTTP Basic is the token endpoint's preferred credential form and
-    // authenticates here too.
+/// HTTP Basic is the token endpoint's preferred credential form and
+/// authenticates the challenge here too: a correctly keyed request passes
+/// and issues the deferred grant.
+#[tokio::test]
+async fn the_challenge_authenticates_the_client_with_http_basic() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let fix = mfa_account(&pool, "dave").await;
+    let app = common::create_app(&pool, "read").await;
+    let http = common::test_app(pool.clone());
+    let fresh = mfa_grant(&http, &app, "dave", "read").await;
+    let real = current_code(&fix.secret);
+
     let basic = common::TestRequest::post("/oauth/mfa/challenge")
         .header(
             "authorization",
@@ -735,11 +747,12 @@ async fn accounts_without_mfa_are_unaffected() {
     );
 }
 
-/// The full browser flow: a valid consent login from an MFA-enabled
-/// account redirects to the code page instead of issuing the code; the
-/// page round-trips every value escaped; a wrong code re-renders it with
-/// the flash line; the right one delivers the parked code — unused, the
-/// client's to redeem — exactly as a direct approval would.
+/// A valid consent login from an MFA-enabled account redirects to the
+/// code page instead of issuing the code: the detour parks the challenge
+/// and its Location round-trips every value escaped — the 43-char token,
+/// the delivery target, the urlencoded state, the client id and the
+/// approved scope — while nothing reaches the client yet. The page's own
+/// shape and its two verify arms are the next two tests.
 #[tokio::test]
 async fn the_authorize_flow_detours_through_the_mfa_page() {
     let db = common::test_db().await;
@@ -782,7 +795,8 @@ async fn the_authorize_flow_detours_through_the_mfa_page() {
         Some("read"),
         "and the approved scope"
     );
-    let (_challenge_id, authorization_id) = assert_challenge_stored(&pool, &token, &fix.user).await;
+    let (_challenge_id, _authorization_id) =
+        assert_challenge_stored(&pool, &token, &fix.user).await;
     assert_eq!(
         oauth_token::list_for_user(&pool, fix.user.id)
             .await
@@ -791,6 +805,22 @@ async fn the_authorize_flow_detours_through_the_mfa_page() {
         0,
         "no token and no client-visible code yet"
     );
+}
+
+/// The parked challenge answers with Pleroma's code page: HTML, not one
+/// byte cacheable, its title above a verify form that carries the
+/// challenge token and type.
+#[tokio::test]
+async fn the_mfa_page_renders_the_challenge_into_a_verify_form() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _fix = mfa_account(&pool, "gina").await;
+    let app = common::create_app(&pool, "read write").await;
+    let http = common::test_app(pool.clone());
+
+    let detour = post_authorize(&http, &authorize_form(&app, "gina", "read", Some("st&ate"))).await;
+    let location = detour.header("location").expect("a Location header");
+    let token = query_param(location, "mfa_token").expect("the challenge token rides along");
 
     let page = common::TestRequest::get(location).send(&http).await;
     assert_eq!(page.status, StatusCode::OK, "the code page renders");
@@ -821,6 +851,23 @@ async fn the_authorize_flow_detours_through_the_mfa_page() {
         html.contains("name=\"mfa[challenge_type]\" value=\"totp\">"),
         "as does the challenge type"
     );
+}
+
+/// A wrong code re-renders the form with the flash line and retires
+/// nothing; the right one redirects the parked code — unused, the
+/// client's to redeem — exactly as a direct approval would.
+#[tokio::test]
+async fn the_mfa_page_refuses_a_wrong_code_and_delivers_the_right_one() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let fix = mfa_account(&pool, "gina").await;
+    let app = common::create_app(&pool, "read write").await;
+    let http = common::test_app(pool.clone());
+
+    let detour = post_authorize(&http, &authorize_form(&app, "gina", "read", Some("st&ate"))).await;
+    let location = detour.header("location").expect("a Location header");
+    let token = query_param(location, "mfa_token").expect("the challenge token rides along");
+    let (_challenge_id, authorization_id) = assert_challenge_stored(&pool, &token, &fix.user).await;
 
     let real = current_code(&fix.secret);
     let failed = post_verify(

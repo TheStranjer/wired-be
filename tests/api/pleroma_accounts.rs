@@ -4,13 +4,18 @@
 //! `notifying` / `subscribing` flags of the answered `Relationship` and the
 //! `follows.notify` fact behind them, refused with the ticket's 422 wherever
 //! the caller has no accepted follow of the target, the shared 404 for every
-//! account miss), and `GET /api/v1/pleroma/outgoing_follow_requests` (the
+//! account miss), `GET /api/v1/pleroma/outgoing_follow_requests` (the
 //! caller's own pending asks as `Account` entities newest request first, with
 //! keyset pagination whose cursors are the `follows` row ids under Pleroma's
 //! global page sizes, and no `Link` header on an empty page); `AuthUser` in
-//! front of all three, `follow | write:follows` for the two writes and
+//! front of those three, `follow | write:follows` for the two writes and
 //! `read:follows` for the listing, and the page parser's 400 for a malformed
-//! cursor.
+//! cursor; and `GET /api/v1/pleroma/accounts/{id}/favourites` (the target's
+//! favourited statuses newest favourite first as `Status` entities, optional
+//! auth with `read:favourites` demanded of a presented user token, the
+//! `hide_favorites` 403 for every viewer but the target, the page narrowed
+//! to what the viewer may see, `Link` cursors keyed on the favourite row
+//! ids under Pleroma's default 20 and cap 40, and the shared 404).
 
 #![cfg(test)]
 
@@ -22,7 +27,9 @@ use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
     models::{
+        favourite,
         follow::{self, Follow, FollowState},
+        status::{self, Status, Visibility},
         user::{Flag, User, get_by_id},
     },
 };
@@ -49,6 +56,14 @@ const NO_WRITE_SCOPE: &str = r#"{"error":"Insufficient permissions: follow | wri
 const NO_READ_SCOPE: &str = r#"{"error":"Insufficient permissions: read:follows."}"#;
 /// The 422 body both subscription routes answer without an accepted follow.
 const NOT_FOLLOWING: &str = r#"{"error":"Could not subscribe: You are not following this user"}"#;
+/// The 403 body the favourites route answers when the target hides their
+/// favourites from the viewer — Pleroma's exact (American-spelled) wording.
+const HIDDEN_FAVOURITES: &str = r#"{"error":"Can't get favorites"}"#;
+/// The 403 body a presented token without `read:favourites` gets from the
+/// optional gate.
+const NO_FAV_SCOPE: &str = r#"{"error":"Insufficient permissions: read:favourites."}"#;
+/// The 400 body of a malformed pagination cursor.
+const BAD_ID: &str = r#"{"error":"Invalid id"}"#;
 
 /// One fixture request: the requested account's id as the entity shows it,
 /// next to the id of the `follows` row the page keys on.
@@ -709,9 +724,12 @@ async fn the_outgoing_default_page_is_twenty_and_the_cap_is_forty() {
     );
 }
 
-/// All three routes demand a user token: no token is the 401 "Invalid
-/// credentials", an invalid one the 401 "The access token is invalid", and an
-/// app-only credential the 403 — before any scope or id is ever looked at.
+/// The subscription routes and the outgoing listing demand a user token: no
+/// token is the 401 "Invalid credentials", an invalid one the 401 "The
+/// access token is invalid", and an app-only credential the 403 — before any
+/// scope or id is ever looked at. (The favourites route is the optional-auth
+/// exception, tested in
+/// `the_favourites_gate_demands_the_scope_of_a_presented_user_token`.)
 #[tokio::test]
 async fn every_route_requires_a_user_token() {
     let db = common::test_db().await;
@@ -931,5 +949,584 @@ async fn a_malformed_cursor_is_a_bad_request() {
         denied.status,
         StatusCode::UNAUTHORIZED,
         "the 401 comes before the 400"
+    );
+}
+
+/// The favourites route for account `{target}` — spelled exactly as handed,
+/// so the miss tests can feed garbage in the id segment.
+fn favourites_path(target: &str) -> String {
+    format!("/api/v1/pleroma/accounts/{target}/favourites")
+}
+
+/// `GET …/favourites{query}` as `token` (`None`: an anonymous request).
+async fn favourites(
+    app: &Router,
+    token: Option<&str>,
+    target: &str,
+    query: &str,
+) -> common::TestResponse {
+    let request = common::TestRequest::get(&format!("{}{query}", favourites_path(target)));
+    match token {
+        Some(found) => request.bearer(found).send(app).await,
+        None => request.send(app).await,
+    }
+}
+
+/// A local account that shares its favourites — `hide_favorites` off, the
+/// one difference from the default — with a token granting `scopes`.
+async fn open_account(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
+    let user = common::create_local_user_with(pool, nickname, |mut new| {
+        new.hide_favorites = Flag::new(false);
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(pool, &user, scopes).await;
+    (user, token)
+}
+
+/// A fresh local account named `nickname` with a bearer token granting
+/// `scopes`, for the viewers the favourites tests read the lists through.
+async fn viewer(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
+    let user = common::create_local_user(pool, nickname).await;
+    let token = common::create_app_and_token(pool, &user, scopes).await;
+    (user, token)
+}
+
+/// A `visibility` post by `author`.
+async fn post(pool: &PgPool, author: &User, visibility: Visibility, text: &str) -> Status {
+    common::create_status(pool, author, text, visibility).await
+}
+
+/// A public post by a fresh local author named `nickname`.
+async fn public_post_by(pool: &PgPool, nickname: &str) -> Status {
+    let author = common::create_local_user(pool, nickname).await;
+    post(pool, &author, Visibility::Public, "a public post").await
+}
+
+/// `who` favourites `status_id`, straight through the model. The write
+/// answers nothing: the like rows are read back newest-first through
+/// [`liked_pairs`], so no expectation depends on the write order.
+async fn like(pool: &PgPool, who: &User, status_id: Uuid) {
+    let created = favourite::favourite(pool, TEST_BASE_URL, who.id, status_id)
+        .await
+        .expect("the fixture favourite stores");
+    assert!(created.is_some(), "the fixture pair had not favourited yet");
+}
+
+/// `who`'s likes as `(like id, status id)` pairs, newest like first — the
+/// order the list answers in, read back from the table rather than from the
+/// order the fixtures were written in (decision 4).
+async fn liked_pairs(pool: &PgPool, who: &User) -> Vec<(Uuid, Uuid)> {
+    sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT f.id, f.status_id FROM favourites f \
+          WHERE f.user_id = $1 ORDER BY f.id DESC",
+    )
+    .bind(who.id)
+    .fetch_all(pool)
+    .await
+    .expect("the like rows read")
+}
+
+/// The ids of every entity of a `Status` array answer, in response order.
+fn listed_status_ids(body: &Value) -> Vec<String> {
+    body.as_array()
+        .expect("the listing is an array")
+        .iter()
+        .map(|status| status["id"].as_str().expect("a status id").to_owned())
+        .collect()
+}
+
+/// The status ids of `pairs`, newest first, keeping only those whose status
+/// is one of `visible` — the expectation a narrowed favourites page must
+/// answer.
+fn wanted_status_ids(pairs: &[(Uuid, Uuid)], visible: &[Uuid]) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(_, status_id)| visible.contains(status_id))
+        .map(|(_, status_id)| status_id.to_string())
+        .collect()
+}
+
+/// The `Link` header of a favourites page over the route path `path`,
+/// keyed on like row ids: `next` walks to the oldest visible like, `prev`
+/// back to the newest.
+fn expected_like_link(path: &str, newest: &Uuid, oldest: &Uuid) -> String {
+    format!(
+        "<{BASE}{path}?max_id={oldest}>; rel=\"next\", \
+         <{BASE}{path}?min_id={newest}>; rel=\"prev\""
+    )
+}
+
+/// The open account's favourites answer as `Status` entities, newest
+/// favourite first, with the `Link` header keyed on the favourite row ids —
+/// and the per-viewer flags render for whoever reads the list: `false` for
+/// a stranger who likes none of these, `true` on the target's own read.
+#[tokio::test]
+async fn the_favourites_list_answers_the_open_account_s_likes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (bob, bob_token) = open_account(&pool, "bob", "read:favourites").await;
+    let (_alice, alice_token) = viewer(&pool, "alice", "read:favourites").await;
+    let author = common::create_local_user(&pool, "author").await;
+    let mut statuses = Vec::new();
+    for n in 0..3 {
+        statuses.push(post(&pool, &author, Visibility::Public, &format!("post {n}")).await);
+    }
+    for status in &statuses {
+        like(&pool, &bob, status.id).await;
+    }
+    let all = liked_pairs(&pool, &bob).await;
+    let path = favourites_path(&bob.id.to_string());
+
+    let listed = favourites(&app, Some(&alice_token), &bob.id.to_string(), "").await;
+    common::assert_answer(&listed, StatusCode::OK, "an open list reads for a stranger");
+    assert_eq!(
+        listed.header("content-type"),
+        Some("application/json"),
+        "the entities are JSON"
+    );
+    let body = listed.json_value();
+    let want: Vec<String> = all
+        .iter()
+        .map(|(_, status_id)| status_id.to_string())
+        .collect();
+    assert_eq!(listed_status_ids(&body), want, "newest favourite first");
+    assert_eq!(
+        body[0]["account"]["id"],
+        author.id.to_string(),
+        "the entries are full status entities with their author"
+    );
+    assert!(
+        body.as_array()
+            .expect("the array")
+            .iter()
+            .all(|entry| entry["favourited"] == Value::Bool(false)),
+        "the flags answer the viewer, who favourited none of these"
+    );
+    assert_eq!(
+        listed.header("link"),
+        Some(expected_like_link(&path, &all[0].0, &all[2].0).as_str()),
+        "the Link cursors are like row ids, not status ids"
+    );
+
+    let own = favourites(&app, Some(&bob_token), &bob.id.to_string(), "").await;
+    common::assert_answer(&own, StatusCode::OK, "the target reads their own list");
+    assert!(
+        own.json_value()
+            .as_array()
+            .expect("the array")
+            .iter()
+            .all(|entry| entry["favourited"] == Value::Bool(true)),
+        "every entry is the target's own favourite"
+    );
+}
+
+/// `hide_favorites = true` — the default for every new account — is the
+/// ticket's exact 403 for every viewer but the target: another account,
+/// the anonymous request and an app-only token are all refused, while the
+/// target's own read answers the list, and an account that turned the flag
+/// off answers everybody.
+#[tokio::test]
+async fn hidden_favorites_refuse_everybody_but_the_target() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let carol = common::create_local_user(&pool, "carol").await;
+    assert!(
+        carol.hide_favorites.get(),
+        "a new account hides its favourites by default"
+    );
+    let carol_token = common::create_app_and_token(&pool, &carol, "read:favourites").await;
+    let (_alice, alice_token) = viewer(&pool, "alice", "read").await;
+    let app_only = common::create_app_only_token(&pool, "read").await;
+    let status = public_post_by(&pool, "author").await;
+    like(&pool, &carol, status.id).await;
+    let hidden = carol.id.to_string();
+
+    for token in [Some(alice_token.as_str()), None, Some(app_only.as_str())] {
+        let refused = favourites(&app, token, &hidden, "").await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            "hidden favourites refuse this viewer",
+        );
+        assert_eq!(refused.text(), HIDDEN_FAVOURITES, "the ticket's exact body");
+    }
+
+    let own = favourites(&app, Some(&carol_token), &hidden, "").await;
+    common::assert_answer(
+        &own,
+        StatusCode::OK,
+        "the target reads their own hidden list",
+    );
+    assert_eq!(
+        listed_status_ids(&own.json_value()),
+        vec![status.id.to_string()],
+        "and sees the like the stranger was refused"
+    );
+
+    let (bob, _) = open_account(&pool, "bob", "read").await;
+    assert!(
+        !bob.hide_favorites.get(),
+        "the fixture shares its favourites"
+    );
+    like(&pool, &bob, status.id).await;
+    let shared = favourites(&app, Some(&alice_token), &bob.id.to_string(), "").await;
+    common::assert_answer(
+        &shared,
+        StatusCode::OK,
+        "the same viewer reads an open list",
+    );
+    assert_eq!(
+        listed_status_ids(&shared.json_value()),
+        vec![status.id.to_string()],
+        "and gets the page"
+    );
+}
+
+/// The listed statuses are narrowed to what the viewer may see: the
+/// target's likes of a private post leave the stranger's page and reappear
+/// when the stranger follows the author, a tombstoned post leaves for
+/// everybody, and the `Link` edges are the likes that came back visible.
+#[tokio::test]
+async fn the_favourites_list_shows_only_what_the_viewer_may_see() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (bob, _) = open_account(&pool, "bob", "read").await;
+    let (alice, alice_token) = viewer(&pool, "alice", "read:favourites").await;
+    let author = common::create_local_user(&pool, "author").await;
+    let open = post(&pool, &author, Visibility::Public, "open").await;
+    let quiet = post(&pool, &author, Visibility::Unlisted, "quiet").await;
+    let secret = post(&pool, &author, Visibility::Private, "followers only").await;
+    let gone = post(&pool, &author, Visibility::Public, "about to go").await;
+    for status in [&open, &quiet, &secret, &gone] {
+        like(&pool, &bob, status.id).await;
+    }
+    let tombstone = status::soft_delete(&pool, gone.id)
+        .await
+        .expect("the delete runs")
+        .expect("the post was live");
+    assert!(tombstone.deleted_at.is_some(), "gone is a tombstone");
+    let all = liked_pairs(&pool, &bob).await;
+    let path = favourites_path(&bob.id.to_string());
+
+    let listed = favourites(&app, Some(&alice_token), &bob.id.to_string(), "").await;
+    common::assert_answer(&listed, StatusCode::OK, "the narrowed page answers");
+    let visible = [open.id, quiet.id];
+    let body = listed.json_value();
+    assert_eq!(
+        listed_status_ids(&body),
+        wanted_status_ids(&all, &visible),
+        "the private post and the tombstone are off a stranger's page"
+    );
+    let shown: Vec<Uuid> = all
+        .iter()
+        .filter(|(_, status_id)| visible.contains(status_id))
+        .map(|(like_id, _)| *like_id)
+        .collect();
+    assert_eq!(
+        listed.header("link"),
+        Some(expected_like_link(&path, &shown[0], &shown[1]).as_str()),
+        "only the visible likes name the page edges"
+    );
+
+    let following = follow::follow(&pool, TEST_BASE_URL, &alice, &author)
+        .await
+        .expect("alice follows the author");
+    assert_eq!(
+        following.state,
+        FollowState::Accepted,
+        "the unlocked author answers on the spot"
+    );
+    let after = favourites(&app, Some(&alice_token), &bob.id.to_string(), "").await;
+    let visible_now = [open.id, quiet.id, secret.id];
+    assert_eq!(
+        listed_status_ids(&after.json_value()),
+        wanted_status_ids(&all, &visible_now),
+        "the follower's page carries the private favourite too"
+    );
+
+    let anonymous = favourites(&app, None, &bob.id.to_string(), "").await;
+    assert_eq!(
+        listed_status_ids(&anonymous.json_value()),
+        wanted_status_ids(&all, &visible),
+        "and the anonymous viewer keeps the pre-follow narrowing"
+    );
+}
+
+/// The page walks the favourite row ids: a sized first page, the `max_id`
+/// continuation, the `min_id` page answered newest-first again, and the
+/// empty ends of the walk without a `Link` header.
+#[tokio::test]
+async fn the_favourites_list_pages_on_like_row_ids() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (bob, _) = open_account(&pool, "bob", "read").await;
+    let (_alice, token) = viewer(&pool, "alice", "read:favourites").await;
+    for n in 0..3 {
+        let status = public_post_by(&pool, &format!("author{n}")).await;
+        like(&pool, &bob, status.id).await;
+    }
+    let all = liked_pairs(&pool, &bob).await;
+    let target = bob.id.to_string();
+    let path = favourites_path(&target);
+
+    let first = favourites(&app, Some(&token), &target, "?limit=2").await;
+    common::assert_answer(&first, StatusCode::OK, "a sized page answers");
+    assert_eq!(
+        listed_status_ids(&first.json_value()),
+        vec![all[0].1.to_string(), all[1].1.to_string()],
+        "the two newest likes"
+    );
+    assert_eq!(
+        first.header("link"),
+        Some(expected_like_link(&path, &all[0].0, &all[1].0).as_str()),
+        "the cursors carry the page's own like ids"
+    );
+
+    let older = favourites(
+        &app,
+        Some(&token),
+        &target,
+        &format!("?max_id={}", all[1].0),
+    )
+    .await;
+    common::assert_answer(&older, StatusCode::OK, "the continuation answers");
+    assert_eq!(
+        listed_status_ids(&older.json_value()),
+        vec![all[2].1.to_string()],
+        "max_id walks to the older like, keyed on the like id"
+    );
+    assert_eq!(
+        older.header("link"),
+        Some(expected_like_link(&path, &all[2].0, &all[2].0).as_str()),
+        "a one-entry page edges itself"
+    );
+
+    let newer = favourites(
+        &app,
+        Some(&token),
+        &target,
+        &format!("?min_id={}", all[2].0),
+    )
+    .await;
+    assert_eq!(
+        listed_status_ids(&newer.json_value()),
+        vec![all[0].1.to_string(), all[1].1.to_string()],
+        "min_id answers the newer page, still newest-first"
+    );
+
+    let polled = favourites(
+        &app,
+        Some(&token),
+        &target,
+        &format!("?since_id={}", all[0].0),
+    )
+    .await;
+    common::assert_answer(&polled, StatusCode::OK, "polling past the head answers");
+    assert_eq!(polled.json_value(), json!([]), "with the empty array");
+    assert_eq!(polled.header("link"), None, "and no Link header");
+
+    let past = favourites(
+        &app,
+        Some(&token),
+        &target,
+        &format!("?max_id={}", all[2].0),
+    )
+    .await;
+    assert_eq!(
+        past.json_value(),
+        json!([]),
+        "walking off the end is the empty page"
+    );
+    assert_eq!(past.header("link"), None, "which links nowhere");
+}
+
+/// A malformed favourites cursor is the page parser's 400 with its message,
+/// and the extractor still runs first: a bad token alongside a bad cursor
+/// is the 401, not a silent anonymous read.
+#[tokio::test]
+async fn the_favourites_cursor_mistakes_answer_400_behind_the_401() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (bob, _) = open_account(&pool, "bob", "read").await;
+    let (_alice, token) = viewer(&pool, "alice", "read:favourites").await;
+    let target = bob.id.to_string();
+
+    for query in ["?max_id=nope", "?min_id=01890b9a-nope"] {
+        let refused = favourites(&app, Some(&token), &target, query).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::BAD_REQUEST,
+            &format!("`{query}` is refused"),
+        );
+        assert_eq!(refused.text(), BAD_ID, "the page parser's message");
+    }
+    let denied = favourites(&app, Some("bogus-token"), &target, "?max_id=nope").await;
+    common::assert_answer(
+        &denied,
+        StatusCode::UNAUTHORIZED,
+        "the 401 comes before the 400",
+    );
+    assert_eq!(denied.text(), INVALID_TOKEN, "AuthUser's invalid body");
+}
+
+/// Pleroma's global page sizes over the favourites walk: twenty rows by
+/// default, forty at most — even though every one of the forty-one seeded
+/// favourites is visible to the viewer.
+#[tokio::test]
+async fn the_favourites_default_page_is_twenty_and_the_cap_is_forty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (bob, _) = open_account(&pool, "bob", "read").await;
+    let (_alice, token) = viewer(&pool, "alice", "read:favourites").await;
+    let author = common::create_local_user(&pool, "author").await;
+    for n in 0..41 {
+        let status = post(&pool, &author, Visibility::Public, &format!("post {n}")).await;
+        like(&pool, &bob, status.id).await;
+    }
+    let target = bob.id.to_string();
+
+    let default = favourites(&app, Some(&token), &target, "").await;
+    common::assert_answer(&default, StatusCode::OK, "the default page answers");
+    assert_eq!(
+        listed_status_ids(&default.json_value()).len(),
+        20,
+        "Pleroma's default page"
+    );
+    let greedy = favourites(&app, Some(&token), &target, "?limit=100").await;
+    assert_eq!(
+        listed_status_ids(&greedy.json_value()).len(),
+        40,
+        "and the global cap, never more — 41 likes were seeded"
+    );
+    let between = favourites(&app, Some(&token), &target, "?limit=30").await;
+    assert_eq!(
+        listed_status_ids(&between.json_value()).len(),
+        30,
+        "a page under the cap goes through"
+    );
+}
+
+/// Every account miss on the favourites route is the same 404, whoever
+/// presents: an id that is not uuid text, an id that names no user, and a
+/// deactivated account — token or no token.
+#[tokio::test]
+async fn every_favourites_account_miss_is_the_same_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = viewer(&pool, "alice", "read:favourites").await;
+    let ghost = deactivated_user(&pool, "ghost").await;
+    let missing = Uuid::now_v7().to_string();
+
+    for target in [missing.as_str(), "not-an-id", &ghost.id.to_string()] {
+        for who in [Some(token.as_str()), None] {
+            let response = favourites(&app, who, target, "").await;
+            common::assert_answer(
+                &response,
+                StatusCode::NOT_FOUND,
+                &format!("`{target}` names no account"),
+            );
+            assert_eq!(response.text(), NOT_FOUND, "decision 8's 404 body");
+        }
+    }
+}
+
+/// The optional gate: no token and an app-only token read the open list as
+/// unauthenticated viewers; a presented *user* token must grant
+/// `read:favourites` — anything else is Pleroma's insufficient-permissions
+/// 403, checked before the account is ever looked at or its hidden-favourites
+/// flag consulted; and a token that does not resolve is the 401.
+#[tokio::test]
+async fn the_favourites_gate_demands_the_scope_of_a_presented_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (bob, _) = open_account(&pool, "bob", "read").await;
+    let (alice, _) = viewer(&pool, "alice", "read").await;
+    let status = public_post_by(&pool, "author").await;
+    like(&pool, &bob, status.id).await;
+    let target = bob.id.to_string();
+
+    let anonymous = favourites(&app, None, &target, "").await;
+    common::assert_answer(&anonymous, StatusCode::OK, "no token reads an open list");
+    assert_eq!(
+        anonymous.json_value()[0]["favourited"],
+        false,
+        "rendered for the anonymous eye"
+    );
+    let app_only = common::create_app_only_token(&pool, "read").await;
+    let headless = favourites(&app, Some(&app_only), &target, "").await;
+    common::assert_answer(
+        &headless,
+        StatusCode::OK,
+        "an app-only token proceeds unauthenticated",
+    );
+
+    for scopes in ["read", "read:favourites"] {
+        let good = common::create_app_and_token(&pool, &alice, scopes).await;
+        let listed = favourites(&app, Some(&good), &target, "").await;
+        common::assert_answer(
+            &listed,
+            StatusCode::OK,
+            &format!("`{scopes}` reads the list"),
+        );
+    }
+    for scopes in ["write", "write:favourites", "read:statuses"] {
+        let bad = common::create_app_and_token(&pool, &alice, scopes).await;
+        let refused = favourites(&app, Some(&bad), &target, "").await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            &format!("`{scopes}` does not read favourites"),
+        );
+        assert_eq!(
+            refused.text(),
+            NO_FAV_SCOPE,
+            "the denial names read:favourites"
+        );
+    }
+
+    // The scopes plug runs before `assign_account_by_id` and before the
+    // privacy arm: a scopeless probe stays on the scope refusal whether the
+    // account is missing or its favourites hidden.
+    let bad_token = common::create_app_and_token(&pool, &alice, "read:statuses").await;
+    let missing = Uuid::now_v7().to_string();
+    let probe = favourites(&app, Some(&bad_token), &missing, "").await;
+    common::assert_answer(
+        &probe,
+        StatusCode::FORBIDDEN,
+        "the scope gate precedes the 404",
+    );
+    assert_eq!(probe.text(), NO_FAV_SCOPE, "the scope refusal, not a 404");
+    let carol = common::create_local_user(&pool, "carol").await;
+    let hidden_probe = favourites(&app, Some(&bad_token), &carol.id.to_string(), "").await;
+    common::assert_answer(
+        &hidden_probe,
+        StatusCode::FORBIDDEN,
+        "the scope gate precedes privacy",
+    );
+    assert_eq!(
+        hidden_probe.text(),
+        NO_FAV_SCOPE,
+        "the scope refusal, not the privacy one"
+    );
+
+    let invalid = favourites(&app, Some("bogus-token"), &target, "").await;
+    common::assert_answer(
+        &invalid,
+        StatusCode::UNAUTHORIZED,
+        "a token that does not resolve",
+    );
+    assert_eq!(
+        invalid.text(),
+        INVALID_TOKEN,
+        "is the 401, never a silent anonymous read"
     );
 }
