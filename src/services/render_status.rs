@@ -6,10 +6,10 @@
 //! `lib/pleroma/web/mastodon_api/views/status_view.ex`, with its
 //! `safe_render_many`): it takes the already-paged rows and loads
 //! everything they render from — authors, media attachments, mentions,
-//! hashtags, reblogged originals and quoted originals — with a FIXED set
-//! of batched queries, one per part, each keyed by an id list
-//! (`WHERE … = ANY($1)`), never a query per row. The count does not grow
-//! with the page size: seven statement groups whatever the batch —
+//! hashtags, emoji reactions, reblogged originals and quoted originals —
+//! with a FIXED set of batched queries, one per part, each keyed by an id
+//! list (`WHERE … = ANY($1)`), never a query per row. The count does not
+//! grow with the page size: eight statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -17,11 +17,13 @@
 //! 4. media attachments — one [`media_attachment::for_statuses`];
 //! 5. mentions — one [`mention::for_statuses`];
 //! 6. hashtags — one [`hashtag::for_statuses`];
-//! 7. the viewer's relationships to the page's authors — the one fixed
+//! 7. emoji reactions — one [`emoji_reaction::for_statuses`], the viewer's
+//!    id riding along to answer each roll-up's `me`;
+//! 8. the viewer's relationships to the page's authors — the one fixed
 //!    [`Relationship::load_many`] set, run only for an authenticated viewer.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
-//! page of plain posts costs four queries, and a viewer adds the
+//! page of plain posts costs five queries, and a viewer adds the
 //! relationship set.
 //!
 //! # Extension points
@@ -49,8 +51,12 @@
 //! - `poll`: the polls tables, one read keyed by status id.
 //! - `emojis`: the custom emojis, one read keyed by the shortcodes the
 //!   content uses.
-//! - `pleroma.emoji_reactions`: the reactions table, one read keyed by
-//!   status id, grouped per emoji and user.
+//! - `pleroma.emoji_reactions`: *filled by the reactions ticket* (step 7
+//!   above); it renders the roll-up
+//!   [`emoji_reaction::for_statuses`] answers, capped at
+//!   [`MAX_SUMMARY_REACTORS`](crate::models::emoji_reaction::MAX_SUMMARY_REACTORS)
+//!   reactor ids per emoji. Reactions a viewer must not see are the
+//!   reactions endpoint's filter, not this renderer's.
 //! - `quote`: the quoted originals are *already* batch-loaded here
 //!   (step 2 above); the quoting ticket renders them into the entity —
 //!   one nested render, no new query — and decides its visibility.
@@ -74,6 +80,7 @@ use crate::{
     },
     error::AppResult,
     models::{
+        emoji_reaction::{self, ReactionSummary},
         hashtag::{self, Hashtag},
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mention,
@@ -161,6 +168,9 @@ struct Batch<'a> {
     mentions: HashMap<Uuid, Vec<User>>,
     /// Hashtags, keyed by status, in name order.
     tags: HashMap<Uuid, Vec<Hashtag>>,
+    /// Emoji reactions, keyed by status, in the roll-up's order
+    /// ([`emoji_reaction::for_statuses`]).
+    reactions: HashMap<Uuid, Vec<ReactionSummary>>,
     /// The viewer's relationships to the page's authors, keyed by account
     /// id; `None` for an anonymous viewer.
     relationships: Option<RelationshipMap>,
@@ -212,6 +222,7 @@ impl<'a> Batch<'a> {
             media: load_media(pool, &rendered_ids).await?,
             mentions: load_mentions(pool, &rendered_ids).await?,
             tags: load_tags(pool, &rendered_ids).await?,
+            reactions: load_reactions(pool, &rendered_ids, viewer).await?,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
         })
     }
@@ -258,6 +269,7 @@ impl<'a> Batch<'a> {
             media: self.media.get(&row.id).map_or(&[], Vec::as_slice),
             mentions: self.mentions.get(&row.id).map_or(&[], Vec::as_slice),
             tags: self.tags.get(&row.id).map_or(&[], Vec::as_slice),
+            reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
             reblog,
         };
         Some(Status::from_source(
@@ -328,6 +340,20 @@ async fn load_tags(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, Vec<H
     hashtag::for_statuses(pool, ids).await
 }
 
+/// [`emoji_reaction::for_statuses`]: one query for every reaction of the
+/// page, the viewer riding along only to answer each roll-up's `me` (an
+/// anonymous viewer has no id to pass, which makes every `me` false).
+async fn load_reactions(
+    pool: &PgPool,
+    ids: &[Uuid],
+    viewer: Option<&User>,
+) -> AppResult<HashMap<Uuid, Vec<ReactionSummary>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    emoji_reaction::for_statuses(pool, ids, viewer.map(|who| who.id)).await
+}
+
 /// The viewer's relationships to the page's authors, keyed by account id:
 /// [`Relationship::load_many`] runs its own fixed set of queries once per
 /// page; an anonymous viewer has none to load, and an empty author list
@@ -361,6 +387,7 @@ mod tests {
         http_client::HttpClient,
         mailer::MemoryTransport,
         models::{
+            emoji_reaction::{self, NewReaction},
             follow,
             media_attachment::NewMediaAttachment,
             status::{NewStatus, Visibility, insert, soft_delete},
@@ -371,6 +398,12 @@ mod tests {
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
+    /// A unicode emoji the reaction fixtures use.
+    const THUMB: &str = "👍";
+    /// A custom emoji's stored spelling, and the image recorded with it.
+    const CAT: &str = ":cat:";
+    /// [`CAT`]'s image URL.
+    const CAT_URL: &str = "https://test.example/emoji/cats/cat.png";
 
     /// The state under test: `pool` and the test config, with the
     /// collaborators the renderer never touches.
@@ -578,6 +611,117 @@ mod tests {
                      "url": format!("{BASE}/users/bob"), "acct": "bob" }]),
             "NewStatus::mentioned_user_ids linked bob, and the mention \
              loader brings him back"
+        );
+    }
+
+    /// The `pleroma.emoji_reactions` array of a rendered entity.
+    fn reactions(entity: &Status) -> Value {
+        serde_json::to_value(entity).expect("a rendered status serializes")["pleroma"]
+            ["emoji_reactions"]
+            .clone()
+    }
+
+    /// Reacts to `status` as `reactor` with `emoji`, whose custom image is
+    /// `url`. The model stores what it is handed; the endpoint is what
+    /// validates the emoji, so a batch test needs no `custom_emojis` row.
+    async fn react(
+        pool: &PgPool,
+        reactor: &User,
+        status: &StatusRow,
+        emoji: &str,
+        url: Option<&str>,
+    ) {
+        let stored = emoji_reaction::react(
+            pool,
+            BASE,
+            &NewReaction {
+                user_id: reactor.id,
+                status_id: status.id,
+                emoji,
+                url,
+            },
+        )
+        .await
+        .expect("the fixture reaction stores");
+        assert_eq!(stored.emoji, emoji, "the fixture row names its emoji");
+    }
+
+    /// The reactions ticket's loader inside the fixed query set: one page of
+    /// three rows — two posts and a reblog of one of them — renders every
+    /// roll-up from the same call, `me` follows the viewer, and the nested
+    /// original of a reblog carries its own reactions.
+    #[tokio::test]
+    async fn the_reactions_roll_up_in_the_render_batch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let first = post(&pool, &alice, "first").await;
+        let second = post(&pool, &alice, "second").await;
+        let reblog = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(second.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .expect("a reblog of a stored post inserts");
+        react(&pool, &alice, &first, THUMB, None).await;
+        react(&pool, &bob, &first, CAT, Some(CAT_URL)).await;
+        react(&pool, &bob, &second, THUMB, None).await;
+
+        let page = [first.clone(), reblog.clone()];
+        let for_bob = render_statuses(&state, Some(&bob), &page)
+            .await
+            .expect("the page renders for bob");
+        let reblog_json = serde_json::to_value(&for_bob[1]).expect("the reblog serializes");
+        assert!(
+            !reblog_json["reblog"].is_null(),
+            "the reblog row nests the original it reblogs"
+        );
+        assert_eq!(
+            reblog_json["reblog"]["pleroma"]["emoji_reactions"],
+            json!([{
+                "name": THUMB, "count": 1, "me": true,
+                "url": null, "account_ids": [bob.id.to_string()],
+            }]),
+            "the nested original's own roll-up, from the same batch"
+        );
+        assert_eq!(
+            reactions(&for_bob[0]),
+            json!([
+                {
+                    "name": THUMB,
+                    "count": 1,
+                    "me": false,
+                    "url": null,
+                    "account_ids": [alice.id.to_string()],
+                },
+                {
+                    "name": CAT,
+                    "count": 1,
+                    "me": true,
+                    "url": CAT_URL,
+                    "account_ids": [bob.id.to_string()],
+                },
+            ]),
+            "both of the first post's emojis, each flagged for the viewer \
+             who reacted with one of them"
+        );
+
+        let anonymous = render_statuses(&state, None, std::slice::from_ref(&first))
+            .await
+            .expect("the post renders anonymously");
+        assert_eq!(
+            serde_json::to_value(&anonymous[0]).expect("it serializes")["pleroma"]
+                ["emoji_reactions"]
+                .as_array()
+                .map(|entries| entries.iter().all(|entry| entry["me"] == json!(false))),
+            Some(true),
+            "an anonymous render is nobody's `me`"
         );
     }
 

@@ -63,6 +63,9 @@ mod domain_blocks;
 /// The emoji-pack endpoints of `src/api/emoji_packs.rs`.
 mod emoji_packs;
 
+/// Emoji reactions (`/api/v1/pleroma/statuses/{id}/reactions`).
+mod emoji_reactions;
+
 /// The endorsements endpoints (`/api/v1/endorsements`).
 mod endorsements;
 

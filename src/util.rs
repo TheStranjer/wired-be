@@ -6,10 +6,12 @@
 //! hashes from [`password`], random OAuth tokens from [`token`], the RSA key
 //! helpers in [`keys`], the TOTP and backup-code helpers in [`totp`], the HTML
 //! sanitizer in [`sanitize`], the content formatter in [`mod@format`], the
-//! mention/hashtag extraction and link builders in [`entities`] and the XML
-//! escaper in [`xml`]. Time-expiring in-memory values go through [`cache`].
+//! mention/hashtag extraction and link builders in [`entities`], what counts
+//! as one reaction emoji in [`emoji`] and the XML escaper in [`xml`].
+//! Time-expiring in-memory values go through [`cache`].
 
 pub mod cache;
+pub mod emoji;
 pub mod entities;
 pub mod format;
 pub mod id;
