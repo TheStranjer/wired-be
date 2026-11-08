@@ -523,6 +523,26 @@ pub async fn create_authorization(
     Ok(authorization)
 }
 
+/// Fetches the authorization stored with primary key `id`, exactly as
+/// stored: no expiry or `used` filter, [`consume_authorization`]'s gates
+/// stay the exchange's call. An unknown `id` is `None`.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_authorization_by_id(
+    pool: &PgPool,
+    id: Uuid,
+) -> AppResult<Option<OauthAuthorization>> {
+    let found =
+        sqlx::query_as::<_, OauthAuthorization>("SELECT * FROM oauth_authorizations WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(found)
+}
+
 /// Redeems the authorization code `code` for `app_id`, returning the row
 /// marked used, or `None`.
 ///
@@ -1182,6 +1202,44 @@ mod tests {
         assert!(
             authorization_unused(&pool, authorization.id).await,
             "the failed exchange left the row untouched"
+        );
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn get_authorization_by_id_reads_the_stored_row(pool: PgPool) {
+        let nick = insert_user(&pool, "nick").await;
+        let app = insert_app(&pool, "Byld").await;
+        let authorization = create_authorization(&pool, nick.id, app.id, "read write")
+            .await
+            .unwrap();
+
+        let found = get_authorization_by_id(&pool, authorization.id)
+            .await
+            .unwrap()
+            .expect("a stored code is found by its id");
+        assert_eq!(found.token, authorization.token, "the code round trips");
+        assert_eq!(found.user_id, nick.id, "the grantor round trips");
+        assert_eq!(found.app_id, app.id, "the app round trips");
+        assert_eq!(found.scopes, "read write", "the scopes round trip");
+        assert!(!found.used, "no filter is applied: the row comes as stored");
+
+        // An expired row still arrives; the validity gates belong to the
+        // caller, as everywhere in this module.
+        expire_authorization(&pool, authorization.id).await;
+        assert!(
+            get_authorization_by_id(&pool, authorization.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "expiry is the caller's call"
+        );
+
+        assert!(
+            get_authorization_by_id(&pool, new_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown id finds nothing"
         );
     }
 

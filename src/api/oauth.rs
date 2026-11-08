@@ -22,8 +22,12 @@
 //! password. Unknown apps, unknown users and wrong secrets or passwords
 //! all answer the same 400 "Invalid credentials" (Pleroma's way); a
 //! deactivated account instead gets its distinct 403
-//! "`account_is_disabled`", checked by `check_account_ready`, where the
-//! later approval/confirmation/MFA tickets join.
+//! "`account_is_disabled`", checked by `check_account_ready`. An
+//! MFA-enabled account gets its own 403 beside it (WBE-132, Pleroma's
+//! `handle_token_exchange_error({:mfa_required, user, auth, _})`): no
+//! token, but the `mfa_required` body carrying a five-minute
+//! `mfa_token` whose [`challenge`](mfa) endpoint then runs the second
+//! factor and answers the very token JSON.
 //!
 //! The endpoint serves `/oauth/token`, outside `/api` (decision 1), and
 //! [`crate::app`] merges this router at the top level. Per RFC 6749 §5.1
@@ -40,7 +44,8 @@
 //! carries the same no-store headers.
 //!
 //! The authorization-code half of `/oauth` — `GET`/`POST
-//! /oauth/authorize` — lives in [`authorize`].
+//! /oauth/authorize` — lives in [`authorize`]; the second factor both
+//! login halves defer to lives in [`mfa`].
 
 use std::{fmt, time::Duration};
 
@@ -48,10 +53,10 @@ use axum::{
     Json, Router,
     extract::State,
     http::{
-        HeaderMap, HeaderValue,
+        HeaderMap, HeaderValue, StatusCode,
         header::{AUTHORIZATION, CACHE_CONTROL, PRAGMA},
     },
-    response::{IntoResponse as _, Response},
+    response::{IntoResponse, Response},
     routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -73,6 +78,7 @@ use crate::{
 };
 
 pub mod authorize;
+pub mod mfa;
 
 /// The password grant type: account credentials in exchange for a
 /// user-bound token pair.
@@ -112,13 +118,14 @@ const NO_CACHE: &str = "no-cache";
 
 /// The `/oauth` router, merged at the top level of [`crate::app`]: the
 /// paths are fixed by OAuth (`/oauth/token`, `/oauth/revoke`,
-/// `/oauth/authorize` and the rest in later tickets), not nested under
-/// `/api`.
+/// `/oauth/authorize`, `/oauth/mfa` and the rest in later tickets), not
+/// nested under `/api`.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke))
         .merge(authorize::router())
+        .merge(mfa::router())
 }
 
 /// `POST /oauth/token` — exchange credentials for a bearer token pair.
@@ -130,7 +137,7 @@ async fn token(
     ApiBody(params): ApiBody<TokenParams>,
 ) -> Response {
     let response = match exchange(&state, &headers, params).await {
-        Ok(body) => body.into_response(),
+        Ok(reply) => reply.into_response(),
         Err(err) => err.into_response(),
     };
     no_cache_headers(response)
@@ -150,32 +157,69 @@ enum Grant {
 
 /// The token exchange, in order: the grant type, then per grant — the
 /// client application, the requested scopes, (for the password grant)
-/// the user's credentials and the account's readiness — and the minted
-/// token rendered.
+/// the user's credentials, the account's readiness and the MFA gate —
+/// and the answer rendered: the minted token pair, or the challenge a
+/// refused login gets in its place.
 async fn exchange(
     state: &AppState,
     headers: &HeaderMap,
     params: TokenParams,
-) -> AppResult<Json<TokenResponse>> {
+) -> AppResult<TokenReply> {
     match require_grant(&params)? {
         Grant::Password => password_grant(state, headers, &params).await,
         Grant::ClientCredentials => client_credentials_grant(state, headers, &params).await,
     }
 }
 
-/// The password grant: app, scopes, user login, account readiness, then
-/// the user-bound token pair.
+/// What a token exchange answers with when nothing failed: the minted
+/// pair, or — the Pleroma `{:mfa_required, user, auth, _}` path — the
+/// 403 challenge a password grant to an MFA-enabled account gets
+/// instead of a token.
+#[derive(Debug)]
+enum TokenReply {
+    /// 200: Pleroma's `token.json`.
+    Issued(Json<TokenResponse>),
+    /// 403: Pleroma's `mfa_response.json`.
+    MfaRequired(Json<MfaRequiredResponse>),
+}
+
+impl IntoResponse for TokenReply {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Issued(body) => body.into_response(),
+            Self::MfaRequired(body) => (StatusCode::FORBIDDEN, body).into_response(),
+        }
+    }
+}
+
+/// The password grant: app, scopes, user login, account readiness, the
+/// MFA gate, then the user-bound token pair. An MFA-enabled account
+/// gets no token: its grant's scopes are parked on a pending
+/// authorization, a five-minute challenge row links it, and the answer
+/// is the 403 `mfa_required` body (Pleroma's
+/// `handle_token_exchange_error({:mfa_required, user, auth, _})`).
 async fn password_grant(
     state: &AppState,
     headers: &HeaderMap,
     params: &TokenParams,
-) -> AppResult<Json<TokenResponse>> {
+) -> AppResult<TokenReply> {
     let app = validate_app(state, headers, params.body_credentials()).await?;
     let scopes = requested_scopes(params, &app)?;
     let user = authenticate_user(&state.db, params).await?;
     check_account_ready(&user)?;
+    if mfa::required(&user) {
+        let challenge = mfa::start_challenge(state, &user, &app, &scopes).await?;
+        return Ok(TokenReply::MfaRequired(Json(MfaRequiredResponse {
+            error: MFA_REQUIRED,
+            mfa_token: challenge,
+            supported_challenge_types: SUPPORTED_CHALLENGE_TYPES,
+        })));
+    }
     let token = issue_token(state, Some(&user), &app, scopes).await?;
-    Ok(Json(TokenResponse::new(token, Some(&user))))
+    Ok(TokenReply::Issued(Json(TokenResponse::new(
+        token,
+        Some(&user),
+    ))))
 }
 
 /// The `client_credentials` grant: the application authenticates itself
@@ -185,11 +229,33 @@ async fn client_credentials_grant(
     state: &AppState,
     headers: &HeaderMap,
     params: &TokenParams,
-) -> AppResult<Json<TokenResponse>> {
+) -> AppResult<TokenReply> {
     let app = validate_app(state, headers, params.body_credentials()).await?;
     let scopes = requested_scopes(params, &app)?;
     let token = issue_token(state, None, &app, scopes).await?;
-    Ok(Json(TokenResponse::new(token, None)))
+    Ok(TokenReply::Issued(Json(TokenResponse::new(token, None))))
+}
+
+/// 403 body message when the password grant meets an MFA-enabled
+/// account (Pleroma's `mfa_response.json` `error` value).
+const MFA_REQUIRED: &str = "mfa_required";
+/// The challenge types the 403 above advertises, comma-joined as
+/// Pleroma's `MFA.supported_methods` renders them — `totp` is the only
+/// method this server speaks.
+const SUPPORTED_CHALLENGE_TYPES: &str = "totp";
+
+/// The 403 body of a refused password grant: Pleroma's
+/// `MFAView.render("mfa_response.json")`, carrying the fresh challenge
+/// token a client takes to `POST /oauth/mfa/challenge` (or the browser
+/// to `/oauth/mfa`).
+#[derive(Debug, Serialize)]
+struct MfaRequiredResponse {
+    /// The machine-readable error, always [`MFA_REQUIRED`].
+    error: &'static str,
+    /// The 43-character `mfa_token` of the pending challenge.
+    mfa_token: String,
+    /// The challenge types this server accepts, [`SUPPORTED_CHALLENGE_TYPES`].
+    supported_challenge_types: &'static str,
 }
 
 /// The request parameters of `POST /oauth/token`.
@@ -365,8 +431,10 @@ async fn authenticate_user(pool: &PgPool, params: &TokenParams) -> AppResult<Use
 
 /// Whether an authenticated account may receive a token right now. Today
 /// that is the deactivated check alone (Pleroma's `User.account_status`,
-/// applied by `do_create_authorization`); the approval, confirmation and
-/// MFA checks join here in later tickets.
+/// applied by `do_create_authorization`); the approval and confirmation
+/// checks join here in later tickets. The MFA gate is not part of it: it
+/// answers something other than a plain refusal, so [`password_grant`]
+/// runs [`mfa::required`] beside this check.
 ///
 /// # Errors
 ///
@@ -931,6 +999,52 @@ mod tests {
             6,
             "exactly the app-only documented keys"
         );
+    }
+
+    #[test]
+    fn the_mfa_required_body_has_pleromas_challenge_shape() {
+        let json = serde_json::to_value(MfaRequiredResponse {
+            error: MFA_REQUIRED,
+            mfa_token: "challenge-token".to_owned(),
+            supported_challenge_types: SUPPORTED_CHALLENGE_TYPES,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "error": "mfa_required",
+                "mfa_token": "challenge-token",
+                "supported_challenge_types": "totp",
+            }),
+            "the three keys Pleroma's `mfa_response.json` renders"
+        );
+        assert_eq!(
+            json.as_object().expect("an object").len(),
+            3,
+            "no token keys leak into the challenge body"
+        );
+    }
+
+    #[test]
+    fn the_mfa_challenge_answer_is_a_403() {
+        let reply = TokenReply::MfaRequired(Json(MfaRequiredResponse {
+            error: MFA_REQUIRED,
+            mfa_token: "challenge-token".to_owned(),
+            supported_challenge_types: SUPPORTED_CHALLENGE_TYPES,
+        }));
+        let response = reply.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "Pleroma's forbidden challenge answer"
+        );
+    }
+
+    #[test]
+    fn an_issued_answer_still_carries_200() {
+        let reply = TokenReply::Issued(Json(TokenResponse::new(token_row(new_id(), "read"), None)));
+        let response = reply.into_response();
+        assert_eq!(response.status(), StatusCode::OK, "the grant succeeded");
     }
 
     #[test]

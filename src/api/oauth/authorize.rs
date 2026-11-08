@@ -15,7 +15,10 @@
 //! on success, mints a one-time authorization code through
 //! [`oauth_token::create_authorization`]. A bad login does not fail the
 //! request: the page re-renders with an error line at status 200, as
-//! Pleroma does.
+//! Pleroma does. An MFA-enabled login (WBE-132) mints the same
+//! authorization but hands out no code: the challenge [`mfa`] links to
+//! it takes the browser to `/oauth/mfa` instead, and the verification
+//! delivers the parked code from there.
 //!
 //! The success reply follows the client: the `urn:ietf:wg:oauth:2.0:oob`
 //! out-of-band URI gets an HTML page showing the code, anything else
@@ -48,13 +51,13 @@ use serde_json::Value;
 use sqlx::PgPool;
 use url::form_urlencoded;
 
-use super::NO_STORE;
+use super::{NO_STORE, mfa};
 use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams},
     models::{
         oauth_app::{self, OauthApp},
-        oauth_token,
+        oauth_token::{self, OauthAuthorization},
         user::{User, register},
     },
     oauth::{
@@ -162,7 +165,8 @@ async fn consent(state: &AppState, query: AuthorizeQuery) -> AppResult<String> {
 }
 
 /// The `POST` half in order: application, redirect URI, the denial
-/// short-circuit, scopes, the login — then mint the code and answer.
+/// short-circuit, scopes, the login — then the MFA detour or the minted
+/// code.
 async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResult<AuthorizeReply> {
     let attrs = form.authorization;
     let app = load_app(&state.db, attrs.client_id.as_deref()).await?;
@@ -174,6 +178,7 @@ async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResul
     let scopes = submitted_scopes(attrs.scope.as_ref());
     check_scopes_subset(&scopes, &app)?;
     match authenticate_attrs(&state.db, &attrs).await {
+        Some(user) if mfa::required(&user) => mfa_detour(state, &user, &app, &scopes, &attrs).await,
         Some(user) => grant_code(state, &user, &app, &scopes, &attrs.delivery()).await,
         None => Ok(AuthorizeReply::Page(consent_html(
             &app,
@@ -182,6 +187,41 @@ async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResul
             Some(INVALID_LOGIN),
         ))),
     }
+}
+
+/// The MFA detour of a valid login (Pleroma's
+/// `handle_create_authorization_error({:mfa_required, user, auth, _})`):
+/// the authorization is created exactly as a direct approval would, the
+/// challenge links it, and the browser goes to the code page instead of
+/// receiving the code.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`]; a redirect
+/// URI that cannot become a header value is a 400
+/// [`INVALID_REDIRECT_URI`].
+async fn mfa_detour(
+    state: &AppState,
+    user: &User,
+    app: &OauthApp,
+    scopes: &Scopes,
+    attrs: &AuthorizationAttrs,
+) -> AppResult<AuthorizeReply> {
+    let challenge = mfa::start_challenge(state, user, app, scopes).await?;
+    let scope_text = scopes.to_string();
+    let mut params: Vec<(&str, &str)> = vec![
+        ("mfa_token", challenge.as_str()),
+        ("client_id", app.client_id.as_str()),
+        ("scope", scope_text.as_str()),
+        (
+            "redirect_uri",
+            attrs.redirect_uri.as_deref().unwrap_or_default(),
+        ),
+    ];
+    if let Some(client_state) = attrs.state.as_deref() {
+        params.push(("state", client_state));
+    }
+    redirect_to(mfa::MFA_PATH, &params)
 }
 
 /// The request parameters of `GET /oauth/authorize`. Every field is
@@ -413,11 +453,9 @@ async fn authenticate_attrs(pool: &PgPool, attrs: &AuthorizationAttrs) -> Option
 }
 
 /// Mints the authorization code for the approved scopes and answers with
-/// it (Pleroma's `after_create_authorization`): the out-of-band page for
-/// the `urn:ietf:wg:oauth:2.0:oob` client, the 302 carrying `code` (and
-/// `state`) for every other registered URI. [`crate::api::oauth_external`]
-/// hands a returning provider login through here too, which is what makes
-/// its success answer *exactly* this one.
+/// it (Pleroma's `after_create_authorization`). An MFA-enabled account
+/// never gets here: [`authorize_submission`] parks the authorization
+/// through [`mfa::start_challenge`] and detours to the code page instead.
 ///
 /// # Errors
 ///
@@ -433,6 +471,24 @@ pub(crate) async fn grant_code(
 ) -> AppResult<AuthorizeReply> {
     let authorization =
         oauth_token::create_authorization(&state.db, user.id, app.id, &scopes.to_string()).await?;
+    deliver_code(&authorization, delivery)
+}
+
+/// The answer that hands a finished authorization's code to the client
+/// (Pleroma's `after_create_authorization`): the out-of-band page for
+/// the `urn:ietf:wg:oauth:2.0:oob` client, the 302 carrying `code` (and
+/// `state`) for every other URI. [`crate::api::oauth::mfa`] delivers
+/// through here too, which is what makes a completed MFA verification's
+/// answer *exactly* this one.
+///
+/// # Errors
+///
+/// A redirect URI that cannot become a header value is a 400
+/// [`INVALID_REDIRECT_URI`].
+pub(crate) fn deliver_code(
+    authorization: &OauthAuthorization,
+    delivery: &Delivery<'_>,
+) -> AppResult<AuthorizeReply> {
     if delivery.redirect_uri == OOB_REDIRECT_URI {
         return Ok(AuthorizeReply::Page(authorize_page::render_oob(
             &authorization.token,
