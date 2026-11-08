@@ -162,7 +162,8 @@ mod scrobbles;
 /// Account search (`/api/v1/accounts/search`, `/api/v1/search`, `/api/v2/search`).
 mod search;
 
-/// The status read endpoints (`GET /api/v1/statuses/{id}` and its batch form).
+/// The status endpoints: the reads (`GET /api/v1/statuses/{id}` and its
+/// batch form) and the write (`POST /api/v1/statuses`).
 mod statuses;
 
 /// The streaming WebSocket (`/api/v1/streaming`) over a real listener.

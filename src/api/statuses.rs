@@ -1,20 +1,29 @@
-//! The status read endpoints: `GET /api/v1/statuses/{id}` and the batch
-//! lookup `GET /api/v1/statuses?id[]=a&id[]=b`
+//! The status endpoints: `POST /api/v1/statuses`, the single read
+//! `GET /api/v1/statuses/{id}` and the batch lookup
+//! `GET /api/v1/statuses?id[]=a&id[]=b`
 //! (`docs/ARCHITECTURE.md` decision 1).
 //!
-//! The reference is Pleroma's `StatusController.show` and `.index`
-//! (`lib/pleroma/web/mastodon_api/controllers/status_controller.ex`), whose
-//! `with` blocks reduce to the same two moves: find the activity, ask
-//! `Visibility.visible_for_user?`, and either render it or answer
-//! `{:error, :not_found}`. Here finding and asking live in the shared
+//! The reference is Pleroma's `StatusController.create`, `.show` and
+//! `.index` (`lib/pleroma/web/mastodon_api/controllers/status_controller.ex`).
+//! The two reads reduce to the same two moves of their `with` blocks: find
+//! the activity, ask `Visibility.visible_for_user?`, and either render it or
+//! answer `{:error, :not_found}`. Here finding and asking live in the shared
 //! [`status_for_viewer_or_404`], which every later
 //! `/api/v1/statuses/{id}/...` route reuses, and rendering lives in the
 //! batched page renderer [`crate::services::render_status`].
 //!
-//! Both routes are read-side lookups of an already-stored post, so neither
-//! creates anything: the write endpoints (`POST /api/v1/statuses` and the
-//! per-status state changes) are their own tickets and join this module the
-//! same way.
+//! The write is the module's other half, and Pleroma's `create`: a user
+//! token granting `write:statuses` (its own scope, not the root) on the
+//! `statuses_actions` throttle, the body read through
+//! [`ApiBody`] so JSON and form parameters arrive the same way, and the
+//! whole decision — what the text says, who it mentions, what it tags, how
+//! visible it is and what the author's settings default to — delegated to
+//! [`crate::services::create_status`]. The handler adds nothing but the
+//! gate, the client behind the token and the JSON envelope, and a post that
+//! passes answers **200** with the [`Status`] entity rendered for its
+//! author. Everything a fresh status still owes the streaming sockets, the
+//! notifications and the wider federation hangs off that service's single
+//! documented hook, so this file never grows a second write path.
 //!
 //! `GET /api/v1/statuses/{id}` is Pleroma's `show`: authentication is
 //! optional ([`MaybeAuthUser`], with `read:statuses` enforced on a
@@ -38,13 +47,16 @@
 //! are acted on — Pleroma's `limit = 100` over `Enum.take(ids, limit)`,
 //! which drops the rest silently rather than refusing the call.
 //!
-//! Neither route owes a 422: this ticket answers an unusable id with the
-//! show route's 404 and the batch route's silent skip, so there is no
-//! request this server can call invalid, and neither route pages (the batch
-//! is the requested ids, in order, capped at [`MAX_STATUS_IDS`]).
+//! The two reads owe no 422: they answer an unusable id with the show
+//! route's 404 and the batch route's silent skip, so there is no request
+//! either can call invalid, and neither pages (the batch is the requested
+//! ids, in order, capped at [`MAX_STATUS_IDS`]). The write route does owe
+//! them: every refusal [`crate::services::create_status`] documents is its
+//! 422, on top of the extractor's 401 and the scope gate's 403.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //! [`Status`]: crate::entities::status::Status
+//! [`ApiBody`]: crate::extract::ApiBody
 
 use std::collections::HashMap;
 
@@ -52,18 +64,25 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::Uri,
-    routing::get,
+    routing::{get, post},
 };
 use uuid::Uuid;
 
 use crate::{
     api::helpers::{requested_status_ids, status_for_viewer_or_404},
-    auth::MaybeAuthUser,
+    auth::{AuthUser, MaybeAuthUser},
     entities::status::Status,
     error::{AppError, AppResult},
-    models::{status, status_visibility},
-    oauth::scopes::READ_STATUSES,
-    services::render_status::{render_status, render_statuses},
+    extract::ApiBody,
+    models::{
+        oauth_app::{self, OauthApp},
+        status, status_visibility,
+    },
+    oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
+    services::{
+        create_status::{self, CreateStatusParams},
+        render_status::{render_status, render_statuses},
+    },
     state::AppState,
 };
 
@@ -72,10 +91,49 @@ use crate::{
 pub const MAX_STATUS_IDS: usize = 100;
 
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
-pub fn router() -> Router<AppState> {
+///
+/// `state` is what lets the write route mount the `statuses_actions` rate
+/// limiter (see [`crate::rate_limit`]) — the bucket Pleroma's
+/// `@rate_limited_status_actions` puts `create` in, shared with
+/// [`crate::api::reports`] — while the two read routes stay unthrottled.
+pub fn router(state: &AppState) -> Router<AppState> {
+    let create =
+        post(create_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions"));
     Router::new()
         .route("/statuses/{id}", get(show_status))
-        .route("/statuses", get(list_statuses))
+        .route("/statuses", get(list_statuses).merge(create))
+}
+
+/// `POST /api/v1/statuses` — create the status the body describes and answer
+/// its [`Status`] entity as its author sees it.
+///
+/// The gate is Pleroma's pipeline for the `create` action:
+/// [`AuthUser`] then `write:statuses` then the `statuses_actions` throttle
+/// (mounted by [`router`]). Everything after that is
+/// [`create_status::create_status`]: the parameters, their defaults and
+/// their refusals, the render, the mentions and hashtags, the stored row and
+/// the post-write hook. The client behind the presenting token is looked up
+/// here because only the request knows it, and it travels to the service as
+/// the status's `application` pair.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:statuses` check; [`AppError::RateLimited`] from the
+/// bucket; whatever [`create_status::create_status`] refuses — 422 for an
+/// empty text, an over-long status, an over-long warning, an unknown
+/// `visibility` or an unknown `content_type` — plus its own database
+/// failures as [`AppError::Database`].
+async fn create_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<CreateStatusParams>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_STATUSES)?;
+    let app: Option<OauthApp> = oauth_app::get_by_id(&state.db, auth.1.app_id).await?;
+    Ok(Json(
+        create_status::create_status(&state, &auth.0, app.as_ref(), params).await?,
+    ))
 }
 
 /// `GET /api/v1/statuses/{id}` — the status `id` names, as the viewer

@@ -37,7 +37,10 @@
 //! `/oauth/authorize`, and `app_account_creation` on `POST /api/v1/apps`
 //! and `POST /api/v1/accounts`; WBE-135 `password_reset` on
 //! `POST /auth/password`; WBE-120 `statuses_actions` on
-//! `POST /api/v1/reports`. WBE-115 adds `search` on the three account
+//! `POST /api/v1/reports`, which WBE-76's `POST /api/v1/statuses` joins in
+//! that bucket — Pleroma's `@rate_limited_status_actions` keeps the status
+//! write and the report filing in one window. WBE-115 adds `search` on the
+//! three account
 //! search routes (`GET /api/v1/accounts/search`, `GET /api/v1/search`
 //! and `GET /api/v2/search`, see [`crate::api::search`]). WBE-57 adds
 //! `relations_actions` on `POST /api/v1/accounts/{id}/follow` and its

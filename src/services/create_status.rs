@@ -14,13 +14,19 @@
 //! [`status_length`], which charges each bare URL `URL_WEIGHT` characters the
 //! way Mastodon's `charactersReservedPerUrl` does where Pleroma counts the raw
 //! text; and the author's two defaults arrive as plain arguments to
-//! [`check_body`] rather than being read off a row, so nothing here touches a
-//! database and every rule is testable without one. The route that supplies
-//! those two values from the caller's row and stores what comes back is a
-//! later ticket (decision 15), as are the endpoint's remaining parameters:
-//! `media_ids`, `poll`, `in_reply_to_id` and `scheduled_at` join
-//! [`CreateStatusParams`] as extra `Option`s there, and until then a body that
-//! sends them is only a body whose known fields are checked here.
+//! [`check_body`] rather than being read off a row, so the whole ruleset is
+//! testable without a database. [`create_status`] is the database-facing
+//! half the endpoint calls: it supplies those two values from the caller's
+//! row, renders the checked text, resolves its mentions, stores the row and
+//! its mention and hashtag links through [`status::insert`], and answers the
+//! [`Status`] entity rendered for the author — Pleroma's `for: user`. The
+//! endpoint's remaining parameters — `media_ids`, `poll`, `in_reply_to_id`
+//! and `scheduled_at` — join [`CreateStatusParams`] as extra `Option`s with
+//! their own tickets (decision 15), and until then a body that sends them is
+//! only a body whose known fields are checked here.
+//!
+//! [`Status`]: crate::entities::status::Status
+//! [`status::insert`]: crate::models::status::insert
 //!
 //! Every refusal is an [`AppError::Unprocessable`] — a 422 whose body is
 //! `{"error":"…"}` (decision 8) — in Pleroma's or Mastodon's own wording,
@@ -29,13 +35,27 @@
 //! content_type` for a MIME type outside `CONTENT_TYPES`, and Rails'
 //! too-long sentence for a content warning or a language tag past its cap.
 
+use std::collections::HashMap;
+
 use serde::Deserialize;
+use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     config::Config,
+    entities::status::Status,
     error::{AppError, AppResult},
-    models::status::{DEFAULT_CONTENT_TYPE, Visibility},
-    util::format::status_length,
+    models::{
+        oauth_app::OauthApp,
+        status::{self, DEFAULT_CONTENT_TYPE, NewStatus, Visibility},
+        user::User,
+    },
+    services::{mentions::resolve_local_mentions, render_status::render_status},
+    state::AppState,
+    util::{
+        entities::{MentionRef, extract_hashtags, linkify_entities},
+        format::{render_content, status_length},
+    },
 };
 
 /// What one bare URL costs in a status: Mastodon's
@@ -268,11 +288,265 @@ fn checked_len<'a>(text: &'a str, max_chars: usize, what: &str) -> AppResult<&'a
     Ok(text)
 }
 
+/// What reading the checked text came to: the HTML to store, and the two
+/// entity lists that go with it in the order the text carries them.
+#[derive(Debug)]
+struct Entities {
+    /// The rendered, linkified HTML for the `content` column.
+    content: String,
+    /// The accounts the text @-mentioned, in mention order.
+    mentioned_user_ids: Vec<Uuid>,
+    /// The hashtags the text carries, as [`extract_hashtags`] folded them.
+    hashtags: Vec<String>,
+}
+
+/// Creates the status `params` describes as a local post by `user` and
+/// answers its [`Status`] entity as the author sees it.
+///
+/// Nothing is written before [`check_body`] has accepted the body: it
+/// supplies the author's own two defaults — the row's
+/// [`default_scope`](User::default_scope) and
+/// [`sensitive_default`](User::sensitive_default), Pleroma reads the same
+/// pair off the user — and [`create_status`] does the rest: the render and
+/// the entity lists (the private `read_entities` step below), the stored row
+/// with its mention and hashtag links and the author's moved counters
+/// ([`status::insert`]), and the render for the author. `app` — the client
+/// that issued the presenting
+/// token, `None` when the caller names none — is recorded as the post's
+/// `application` pair, Pleroma's `put_application`.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] for the body's own refusals, through
+/// [`check_body`]; [`AppError::Internal`] for the one row this function
+/// wrote that the renderer refuses to answer (unreachable for a fresh local
+/// post, which is neither a tombstone nor a reblog). Any database failure
+/// arrives through `?` as [`AppError::Database`].
+pub async fn create_status(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    params: CreateStatusParams,
+) -> AppResult<Status> {
+    let checked = check_body(
+        &state.config,
+        &user.default_scope,
+        user.sensitive_default.get(),
+        &params,
+    )?;
+    let entities = read_entities(state, &checked).await?;
+    let row = status::insert(
+        &state.db,
+        &state.config.base_url,
+        &new_status(user, app, &checked, &entities),
+    )
+    .await?;
+    debug!(
+        status = %row.id,
+        user = %user.id,
+        visibility = %row.visibility,
+        "status created"
+    );
+    let entity = render_status(state, Some(user), &row)
+        .await?
+        // Unreachable for what was written a moment ago — live, local and no
+        // reblog, so the renderer has nothing to drop it for — and a 500
+        // rather than a panic if it ever happens.
+        .ok_or_else(|| AppError::Internal(format!("the status {} did not render", row.id)))?;
+    after_status_created(state, &entity);
+    Ok(entity)
+}
+
+/// Reads the entities out of the checked text: the rendered HTML with every
+/// known `@-mention` and every hashtag linked, the mentioned accounts in
+/// mention order, and the hashtags as [`extract_hashtags`] folded them.
+///
+/// The lookup is [`resolve_local_mentions`], so a bare `@nick`, a
+/// `@nick@our-domain` and a mirrored `@nick@their.domain` this instance
+/// already stores are linked, while an unknown name stays the plain text it
+/// was written as. Both sides of the map are keyed case-folded, because the
+/// text spells the account however its author typed it and the link still
+/// carries that spelling.
+///
+/// # Errors
+///
+/// Any database failure behind the mention lookups arrives as
+/// [`AppError::Database`].
+async fn read_entities(state: &AppState, checked: &Checked<'_>) -> AppResult<Entities> {
+    let found = resolve_local_mentions(&state.db, &state.config, checked.text).await?;
+    let urls: HashMap<String, String> = found
+        .iter()
+        .map(|(mention, account)| (mention_key(mention), profile_url(account)))
+        .collect();
+    let link = |mention: &MentionRef| urls.get(&mention_key(mention)).cloned();
+    let html = render_content(checked.text, checked.content_type);
+    Ok(Entities {
+        content: linkify_entities(&html, &link, &state.config.base_url),
+        mentioned_user_ids: found.iter().map(|(_, account)| account.id).collect(),
+        hashtags: extract_hashtags(checked.text),
+    })
+}
+
+/// The URL a mention links to: the stored [`profile_url`](User::profile_url)
+/// that Pleroma's `Formatter.mention_from_user` prefers as `user.uri`, or the
+/// actor id every row is guaranteed to carry — the same fallback the
+/// [`Mention`](crate::entities::mention::Mention) entity renders.
+fn profile_url(user: &User) -> String {
+    user.profile_url
+        .clone()
+        .unwrap_or_else(|| user.ap_id.clone())
+}
+
+/// The lookup key of one mention: the account it names, case-folded — `nick`
+/// for a bare reference, `nick@domain` when the text spelled the domain out.
+fn mention_key(mention: &MentionRef) -> String {
+    mention.acct().to_lowercase()
+}
+
+/// The [`NewStatus`] of one checked body: a `local` post by `user` with its
+/// rendered content and source text, its warning and flags, the two entity
+/// lists [`status::insert`] links in its transaction, and the client `app`
+/// recorded as the post's application — Pleroma's `put_application`, which
+/// is what makes the entity's `application` block come back.
+fn new_status(
+    user: &User,
+    app: Option<&OauthApp>,
+    checked: &Checked<'_>,
+    entities: &Entities,
+) -> NewStatus {
+    NewStatus {
+        user_id: user.id,
+        content: entities.content.clone(),
+        raw_text: checked.text.to_owned(),
+        content_type: checked.content_type.to_owned(),
+        spoiler_text: checked.spoiler_text.to_owned(),
+        sensitive: checked.sensitive,
+        visibility: checked.visibility,
+        language: checked.language.map(str::to_owned),
+        mentioned_user_ids: entities.mentioned_user_ids.clone(),
+        hashtags: entities.hashtags.clone(),
+        local: true,
+        application_name: app.map(|found| found.client_name.clone()),
+        application_website: app.and_then(|found| found.website.clone()),
+        ..NewStatus::default()
+    }
+}
+
+/// The post-write hook of [`create_status`]: the tickets that let a fresh
+/// local status out of the database it was just written to — the streaming
+/// `update` broadcast to the author's and the mentioned users' sockets and
+/// to the public and hashtag timelines, the notifications for the mentions
+/// and the author's followers, and the federation of the `Create` activity
+/// through the job queue (see [`crate::models::job`], decision 11) — wire
+/// themselves in here, and only here.
+///
+/// Intentionally empty until then, like the reports'
+/// [`after_report_created`](crate::api::reports) hook: the write path owns
+/// the row and the render, and the entity it hands over is the one all three
+/// of those consumers are built from.
+const fn after_status_created(_state: &AppState, _status: &Status) {}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse as _, Response},
+    };
     use serde_json::{Value, json};
+    use sqlx::PgPool;
 
     use super::*;
+    use crate::{
+        config::TEST_BASE_URL,
+        http_client::HttpClient,
+        mailer::MemoryTransport,
+        models::user::{NewUser, insert as insert_user, local_ap_id},
+        uploads::UploaderBackend,
+        util::entities::{hashtag_html, mention_html},
+    };
+
+    /// The instance origin the fixtures post under.
+    const BASE: &str = TEST_BASE_URL;
+
+    /// The state under test: `pool` and the test config, with the
+    /// collaborators the service never touches.
+    fn state(pool: &PgPool) -> AppState {
+        let config = Arc::new(Config::for_tests());
+        AppState {
+            db: pool.clone(),
+            hub: crate::streaming::hub::Hub::new(pool),
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
+            mailer: Arc::new(MemoryTransport::new()),
+        }
+    }
+
+    /// A local user named `nickname`.
+    async fn user(pool: &PgPool, nickname: &str) -> User {
+        insert_user(
+            pool,
+            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
+        )
+        .await
+        .expect("the fixture user inserts")
+    }
+
+    /// A body carrying `text` as its only parameter.
+    fn posted(text: &str) -> CreateStatusParams {
+        CreateStatusParams {
+            status: Some(text.to_owned()),
+            ..CreateStatusParams::default()
+        }
+    }
+
+    /// The status and the `{"error": …}` body one refusal renders: what the
+    /// client sees, read off the response rather than the variant.
+    async fn wire(err: AppError) -> (StatusCode, Value) {
+        let response: Response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("an error body is collectable");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("errors are JSON"),
+        )
+    }
+
+    /// The one body every validation refusal owes: 422, `{"error": message}`.
+    fn refused(answer: &(StatusCode, Value), message: &str) {
+        assert_eq!(
+            answer.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the status a refusal answers with"
+        );
+        assert_eq!(
+            answer.1,
+            json!({ "error": message }),
+            "the body that refusal carries"
+        );
+    }
+
+    /// A plain post through the service, as `author` with no application.
+    async fn created(state: &AppState, author: &User, params: CreateStatusParams) -> Status {
+        create_status(state, author, None, params)
+            .await
+            .expect("the post creates")
+    }
+
+    /// The stored row of a rendered entity, live and unabridged.
+    async fn stored(pool: &PgPool, entity: &Status) -> status::Status {
+        let id = Uuid::parse_str(&entity.id).expect("the entity carries its id");
+        status::get_by_id(pool, id)
+            .await
+            .unwrap()
+            .expect("the created status is stored live")
+    }
 
     /// The parameters a JSON body deserializes to: the same
     /// `into_params::<CreateStatusParams>` call an [`ApiBody`] makes, so these
@@ -579,5 +853,355 @@ mod tests {
                  alias is refused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_plain_post_stores_every_column_the_body_decided() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "alice").await;
+
+        let entity = created(
+            &app_state,
+            &alice,
+            CreateStatusParams {
+                spoiler_text: Some("cats".to_owned()),
+                sensitive: Some(true),
+                visibility: Some("local".to_owned()),
+                language: Some("eo".to_owned()),
+                content_type: Some("text/markdown".to_owned()),
+                ..posted("  hello **world**  ")
+            },
+        )
+        .await;
+        let row = stored(pool, &entity).await;
+
+        assert_eq!(row.user_id, alice.id, "the author is the row's");
+        assert!(row.local, "a posted status is a local one");
+        assert_eq!(row.uri, format!("{BASE}/objects/{}", row.id));
+        assert_eq!(
+            row.url,
+            Some(format!("{BASE}/notice/{}", row.id)),
+            "and the human URL derives from the same id"
+        );
+        assert_eq!(
+            row.raw_text, "hello **world**",
+            "the source text is the trimmed one"
+        );
+        assert_eq!(
+            row.content, "<p>hello <strong>world</strong></p>",
+            "the content is the format rendered"
+        );
+        assert_eq!(row.content_type, "text/markdown");
+        assert_eq!(row.spoiler_text, "cats", "the warning is stored");
+        assert!(row.sensitive, "so is the flag");
+        assert_eq!(row.visibility, Visibility::Local, "and the scope");
+        assert_eq!(row.language.as_deref(), Some("eo"), "and the tag");
+        assert_eq!(row.conversation_id, row.id, "a root post is its own thread");
+        assert!(
+            row.application_name.is_none() && row.application_website.is_none(),
+            "no application is named, so the block stays empty"
+        );
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(value["id"], row.id.to_string(), "the entity is the row");
+        assert_eq!(value["uri"], row.uri, "with its object id");
+        assert_eq!(value["url"], json!(row.url), "and its human URL");
+        assert_eq!(value["content"], row.content, "and the render");
+        assert_eq!(value["visibility"], "local", "as stored, verbatim");
+        assert_eq!(value["sensitive"], true);
+        assert_eq!(value["spoiler_text"], "cats");
+        assert_eq!(value["language"], "eo");
+        assert_eq!(value["application"], Value::Null);
+        assert_eq!(value["account"]["acct"], "alice", "rendered as the author");
+        assert_eq!(
+            value["pleroma"]["content"],
+            json!({ "text/plain": "hello **world**" }),
+            "the source text answers in the Pleroma block"
+        );
+
+        let counted = crate::models::user::get_by_id(pool, alice.id)
+            .await
+            .unwrap()
+            .expect("the author exists");
+        assert_eq!(
+            counted.statuses_count, 1,
+            "the author counts the post they made"
+        );
+    }
+
+    #[tokio::test]
+    async fn mentions_and_hashtags_are_linked_stored_and_answered() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "linker").await;
+        let bob = user(pool, "bob").await;
+
+        let entity = created(
+            &app_state,
+            &alice,
+            posted("hi @BOB and @nobody, see #Rust #rust #123"),
+        )
+        .await;
+        let row = stored(pool, &entity).await;
+
+        assert_eq!(
+            entity.content,
+            format!(
+                "<p>hi {} and @nobody, see {} {} #123</p>",
+                mention_html(&bob.ap_id, "BOB"),
+                hashtag_html(BASE, "rust"),
+                hashtag_html(BASE, "rust"),
+            ),
+            "the known mention becomes its h-card in the written case, the \
+             unknown one stays text, the tag links in both spellings and the \
+             digits-only one is no tag"
+        );
+        assert_eq!(
+            row.raw_text, "hi @BOB and @nobody, see #Rust #rust #123",
+            "the source text keeps what was typed"
+        );
+
+        let mentioned: Vec<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT user_id FROM status_mentions WHERE status_id = $1 ORDER BY position",
+        )
+        .bind(row.id)
+        .fetch_all(pool)
+        .await
+        .expect("the mention links read")
+        .into_iter()
+        .map(|link| link.0)
+        .collect();
+        assert_eq!(
+            mentioned,
+            vec![bob.id],
+            "only the account this instance knows is linked"
+        );
+
+        let tagged: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT h.name FROM status_hashtags sh JOIN hashtags h ON h.id = sh.hashtag_id \
+              WHERE sh.status_id = $1 ORDER BY h.name",
+        )
+        .bind(row.id)
+        .fetch_all(pool)
+        .await
+        .expect("the tag links read")
+        .into_iter()
+        .map(|link| link.0)
+        .collect();
+        assert_eq!(tagged, vec!["rust"], "the tag is stored once, folded");
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "bob",
+                     "url": bob.ap_id, "acct": "bob" }]),
+            "the mentioned account answers in the entity"
+        );
+        assert_eq!(
+            value["tags"],
+            json!([{ "name": "rust", "url": format!("{BASE}/tags/rust") }]),
+            "and so does the tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_post_links_nothing_and_stores_no_entities() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "plain").await;
+
+        let entity = created(
+            &app_state,
+            &alice,
+            posted("just text, with an email a@b.c and a #123"),
+        )
+        .await;
+        let row = stored(pool, &entity).await;
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+
+        assert_eq!(
+            value["content"], "<p>just text, with an email a@b.c and a #123</p>",
+            "nothing in this text is an entity"
+        );
+        assert_eq!(value["mentions"], json!([]), "no mention, no entry");
+        assert_eq!(value["tags"], json!([]), "no tag, no entry");
+        let mentions: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM status_mentions WHERE status_id = $1")
+                .bind(row.id)
+                .fetch_one(pool)
+                .await
+                .expect("the mention links read");
+        let tags: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM status_hashtags WHERE status_id = $1")
+                .bind(row.id)
+                .fetch_one(pool)
+                .await
+                .expect("the tag links read");
+        assert_eq!(
+            (mentions.0, tags.0),
+            (0, 0),
+            "and neither link table gained a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_application_of_the_token_is_recorded_and_rendered() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "client-author").await;
+        let app = OauthApp {
+            id: Uuid::now_v7(),
+            client_name: "Wired Client".to_owned(),
+            redirect_uris: "https://client.example/callback".to_owned(),
+            scopes: "write:statuses".to_owned(),
+            website: Some("https://client.example".to_owned()),
+            client_id: "client-id".to_owned(),
+            client_secret: "client-secret".to_owned(),
+            trusted: false,
+            user_id: Some(alice.id),
+            inserted_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let entity = create_status(&app_state, &alice, Some(&app), posted("from a client"))
+            .await
+            .expect("the post creates");
+        let row = stored(pool, &entity).await;
+        assert_eq!(
+            row.application_name.as_deref(),
+            Some("Wired Client"),
+            "the client name is stored"
+        );
+        assert_eq!(
+            row.application_website.as_deref(),
+            Some("https://client.example"),
+            "and its website"
+        );
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["application"],
+            json!({ "name": "Wired Client", "website": "https://client.example" }),
+            "both answer as the entity's application block"
+        );
+
+        let nameless = created(&app_state, &alice, posted("no client at all")).await;
+        let bare = serde_json::to_value(&nameless).expect("the entity serializes");
+        assert_eq!(
+            bare["application"],
+            Value::Null,
+            "a post with no named client renders no block"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_body_writes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "refused-author").await;
+
+        let err = create_status(&app_state, &alice, None, CreateStatusParams::default())
+            .await
+            .expect_err("an absent text is refused");
+        refused(&wire(err).await, EMPTY_STATUS);
+        refused(
+            &wire(
+                create_status(
+                    &app_state,
+                    &alice,
+                    None,
+                    CreateStatusParams {
+                        visibility: Some("sideways".to_owned()),
+                        ..posted("hi")
+                    },
+                )
+                .await
+                .expect_err("an unknown scope is refused"),
+            )
+            .await,
+            INVALID_VISIBILITY,
+        );
+        refused(
+            &wire(
+                create_status(
+                    &app_state,
+                    &alice,
+                    None,
+                    CreateStatusParams {
+                        content_type: Some("text/rtf".to_owned()),
+                        ..posted("hi")
+                    },
+                )
+                .await
+                .expect_err("an unknown format is refused"),
+            )
+            .await,
+            INVALID_CONTENT_TYPE,
+        );
+
+        let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM statuses")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 0, "not one request above wrote a row");
+        let counted = crate::models::user::get_by_id(pool, alice.id)
+            .await
+            .unwrap()
+            .expect("the author exists");
+        assert_eq!(counted.statuses_count, 0, "and no count moved");
+    }
+
+    #[tokio::test]
+    async fn the_rich_formats_render_and_the_plain_one_escapes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "formatter").await;
+
+        let markdown = created(
+            &app_state,
+            &alice,
+            CreateStatusParams {
+                content_type: Some("text/markdown".to_owned()),
+                ..posted("a **bold** claim")
+            },
+        )
+        .await;
+        assert_eq!(
+            markdown.content, "<p>a <strong>bold</strong> claim</p>",
+            "markdown becomes the tag it means"
+        );
+
+        let html = created(
+            &app_state,
+            &alice,
+            CreateStatusParams {
+                content_type: Some("text/html".to_owned()),
+                ..posted("<p>marked up</p><script>steal()</script>")
+            },
+        )
+        .await;
+        assert_eq!(
+            html.content, "<p>marked up</p>",
+            "submitted HTML keeps the allowed tags and loses the script \
+             element with its text, as this instance's scrubber does"
+        );
+
+        let plain = created(
+            &app_state,
+            &alice,
+            posted("<script>steal()</script> & friends"),
+        )
+        .await;
+        assert_eq!(
+            plain.content, "<p>&lt;script&gt;steal()&lt;/script&gt; &amp; friends</p>",
+            "and plain text is escaped, so it can say those characters"
+        );
     }
 }
