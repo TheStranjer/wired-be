@@ -110,6 +110,9 @@ pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
 /// substitute for open registrations on `POST /api/v1/accounts`; the
 /// instance endpoints report it as `invites_enabled`.
 pub const INVITES_ENABLED_VAR: &str = "INVITES_ENABLED";
+/// Environment variable holding whether anonymous requests may search
+/// statuses at `GET /api/v1/search` and `GET /api/v2/search`.
+pub const SEARCH_STATUSES_UNAUTHENTICATED_VAR: &str = "SEARCH_STATUSES_UNAUTHENTICATED";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
@@ -339,6 +342,13 @@ pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
 /// while registrations are closed every registration attempt is refused —
 /// accepting invite tokens is an explicit operator decision.
 pub const DEFAULT_INVITES_ENABLED: bool = false;
+/// Unauthenticated status-search state used when
+/// `SEARCH_STATUSES_UNAUTHENTICATED` is unset: false.
+///
+/// While off, the combined search answers a request without a viewer with
+/// an empty `statuses` list: letting anonymous requests read the stored
+/// text is an explicit operator decision.
+pub const DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED: bool = false;
 /// The provider list used when `OAUTH_PROVIDERS` is unset: no external
 /// login provider is configured, so `GET /oauth/prepare_request` and the
 /// provider endpoints answer their errors for every name.
@@ -856,6 +866,14 @@ pub struct Config {
     /// [`crate::models::invite_token`]). The instance endpoints report the
     /// state as `invites_enabled`, `NodeInfo` as `invitesEnabled`.
     pub invites_enabled: Toggle,
+    /// Whether anonymous requests search statuses at the combined search,
+    /// from `SEARCH_STATUSES_UNAUTHENTICATED`: while off, `GET
+    /// /api/v1/search` and `GET /api/v2/search` answer a request without a
+    /// viewer with an empty `statuses` list, and the `statuses` and
+    /// `statuses`-side `account_id` parameters search nothing (see
+    /// [`crate::api::search`]). The account and hashtag searches are never
+    /// gated by this.
+    pub search_statuses_unauthenticated: Toggle,
     /// The external OAuth login providers, from `OAUTH_PROVIDERS`; empty
     /// when none is configured. Each one answers the `/oauth` provider
     /// endpoints under its own name (see [`crate::api::oauth_external`]).
@@ -963,7 +981,8 @@ impl Config {
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
         let auth = auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
-        let (registrations_open, invites_enabled, available_frontends) = client_exposure(&lookup)?;
+        let (registrations_open, invites_enabled, search_gate, available_frontends) =
+            client_exposure(&lookup)?;
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
         let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
             mailer_settings(&lookup, domain_of(&base_url))?;
@@ -1003,6 +1022,7 @@ impl Config {
             healthcheck_enabled,
             registrations_open,
             invites_enabled,
+            search_statuses_unauthenticated: search_gate,
             oauth_providers: auth.oauth_providers,
             available_frontends,
             job_concurrency,
@@ -1119,6 +1139,7 @@ impl Config {
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
             invites_enabled: Toggle::new(DEFAULT_INVITES_ENABLED),
+            search_statuses_unauthenticated: Toggle::new(DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED),
             oauth_providers: Vec::new(),
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
@@ -1627,23 +1648,25 @@ where
 }
 
 /// The shape [`client_exposure`] reads: the registrations-open toggle, the
-/// invites-enabled toggle and the pickable-frontend list, in [`Config`]
-/// field order; factored out because a mixed tuple of two toggles and a
-/// list reads better by name.
-type ExposureSettings = (Toggle, Toggle, Vec<String>);
+/// invites-enabled toggle, the unauthenticated status-search toggle and the
+/// pickable-frontend list, in [`Config`] field order; factored out because
+/// a mixed tuple of toggles and a list reads better by name.
+type ExposureSettings = (Toggle, Toggle, Toggle, Vec<String>);
 
 /// Reads the settings that gate what the instance exposes to clients:
 /// whether new registrations are open (`NodeInfo`'s `openRegistrations`),
 /// whether invite tokens substitute for open registrations
-/// (`invites_enabled` on the instance endpoints), and the frontends the
-/// settings endpoints let a user pick. Grouped because each is a plain
+/// (`invites_enabled` on the instance endpoints), whether anonymous
+/// requests may search statuses at the combined search, and the frontends
+/// the settings endpoints let a user pick. Grouped because each is a plain
 /// default-or-parse and [`Config::from_lookup`] has a size budget
 /// (AGENTS.md); the tuple comes back in field order.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidBoolean`] when `REGISTRATIONS_OPEN` or
-/// `INVITES_ENABLED` holds a value that is neither spelling.
+/// Returns [`ConfigError::InvalidBoolean`] when `REGISTRATIONS_OPEN`,
+/// `INVITES_ENABLED` or `SEARCH_STATUSES_UNAUTHENTICATED` holds a value
+/// that is neither spelling.
 fn client_exposure<F>(lookup: &F) -> Result<ExposureSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -1651,10 +1674,21 @@ where
     let registrations_open =
         boolean(lookup, REGISTRATIONS_OPEN_VAR, DEFAULT_REGISTRATIONS_OPEN)?.into();
     let invites_enabled = boolean(lookup, INVITES_ENABLED_VAR, DEFAULT_INVITES_ENABLED)?.into();
+    let search_statuses_unauthenticated = boolean(
+        lookup,
+        SEARCH_STATUSES_UNAUTHENTICATED_VAR,
+        DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED,
+    )?
+    .into();
     let available_frontends = comma_list(
         &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
     );
-    Ok((registrations_open, invites_enabled, available_frontends))
+    Ok((
+        registrations_open,
+        invites_enabled,
+        search_statuses_unauthenticated,
+        available_frontends,
+    ))
 }
 
 /// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login
@@ -1902,6 +1936,10 @@ impl fmt::Debug for Config {
             .field("healthcheck_enabled", &self.healthcheck_enabled)
             .field("registrations_open", &self.registrations_open)
             .field("invites_enabled", &self.invites_enabled)
+            .field(
+                "search_statuses_unauthenticated",
+                &self.search_statuses_unauthenticated,
+            )
             .field("oauth_providers", &self.oauth_providers)
             .field("available_frontends", &self.available_frontends)
             .field("job_concurrency", &self.job_concurrency)
@@ -2210,6 +2248,47 @@ mod tests {
         );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
+    }
+
+    /// The unauthenticated status-search toggle: off by default, the
+    /// environment turning it on, blank falling back, and junk refused.
+    #[test]
+    fn search_statuses_unauthenticated_defaults_off_and_reads_its_variable() {
+        assert!(
+            !config_with(&[]).search_statuses_unauthenticated.get(),
+            "anonymous requests search no statuses by default"
+        );
+        for value in ["true", "1", " TRUE "] {
+            let config = config_with(&[(SEARCH_STATUSES_UNAUTHENTICATED_VAR, value)]);
+            assert!(
+                config.search_statuses_unauthenticated.get(),
+                "`SEARCH_STATUSES_UNAUTHENTICATED={value:?}` turns it on"
+            );
+        }
+        for value in ["false", "0"] {
+            let config = config_with(&[(SEARCH_STATUSES_UNAUTHENTICATED_VAR, value)]);
+            assert!(
+                !config.search_statuses_unauthenticated.get(),
+                "`SEARCH_STATUSES_UNAUTHENTICATED={value:?}` keeps it off"
+            );
+        }
+        assert!(
+            !config_with(&[(SEARCH_STATUSES_UNAUTHENTICATED_VAR, "")])
+                .search_statuses_unauthenticated
+                .get(),
+            "an empty value applies the default"
+        );
+        let err = try_config_with(&[(SEARCH_STATUSES_UNAUTHENTICATED_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(SEARCH_STATUSES_UNAUTHENTICATED_VAR),
+            "a value that is neither spelling is refused"
+        );
+        let debug = format!("{:?}", config_with(&[]));
+        assert!(
+            debug.contains("search_statuses_unauthenticated: Toggle(false)"),
+            "the toggle is visible in Debug output: {debug}"
+        );
     }
 
     #[test]

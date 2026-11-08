@@ -52,6 +52,7 @@ pub mod relationship;
 pub mod report;
 pub mod scrobble;
 pub mod status;
+pub mod status_search;
 pub mod status_visibility;
 pub mod suggestion;
 pub mod user;
