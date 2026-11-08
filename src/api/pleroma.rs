@@ -9,7 +9,9 @@
 //! adds the flat notification API's Pleroma half: `POST /notifications/read`
 //! (`PleromaAPI.NotificationController.mark_as_read`), and today [`misc`]
 //! adds one route: `frontend_configurations`, Pleroma's
-//! `UtilController.frontend_configurations/2`, and
+//! `UtilController.frontend_configurations/2`, [`notification_settings`]
+//! the same controller's `update_notification_settings/2` at
+//! `PUT /notification_settings`, and
 //! [`pleroma_account_settings`] adds the account utilities of the same
 //! controller: `aliases` and `move_account`, and [`pleroma_import`] the
 //! CSV imports of `UserImportController`: `follow_import`,
@@ -20,7 +22,9 @@
 use axum::Router;
 
 use crate::{
-    api::{mfa, misc, notifications, pleroma_account_settings, pleroma_import},
+    api::{
+        mfa, misc, notification_settings, notifications, pleroma_account_settings, pleroma_import,
+    },
     state::AppState,
 };
 
@@ -30,6 +34,7 @@ pub fn router() -> Router<AppState> {
         .nest("/accounts/mfa", mfa::router())
         .nest("/notifications", notifications::pleroma_router())
         .merge(misc::frontend_configurations_router())
+        .merge(notification_settings::router())
         .merge(pleroma_account_settings::router())
         .merge(pleroma_import::router())
 }

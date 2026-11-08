@@ -1270,6 +1270,38 @@ mod tests {
             assert!(default.is_none(), "and nothing defaults to a frontend");
         }
 
+        /// The notification-settings migration (WBE-111) adds the one
+        /// column `PUT /api/pleroma/notification_settings` writes: a
+        /// `jsonb` `notification_settings` on `users`, `NOT NULL` and
+        /// defaulting to both flags `false` — the defaults of Pleroma's
+        /// `User.NotificationSetting` embedded schema, so every account
+        /// answers the settings before it ever touches them.
+        #[tokio::test]
+        async fn users_notification_settings_migration_adds_the_column() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let (data_type, is_nullable, default): (String, String, Option<String>) =
+                sqlx::query_as(
+                    "SELECT data_type, is_nullable, column_default
+                       FROM information_schema.columns
+                      WHERE table_schema = 'public'
+                        AND table_name = 'users'
+                        AND column_name = 'notification_settings'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(data_type, "jsonb", "the flags ride one jsonb blob");
+            assert_eq!(is_nullable, "NO", "every account answers them");
+            assert_eq!(
+                default.as_deref(),
+                Some(
+                    r#"'{"block_from_strangers": false, "hide_notification_contents": false}'::jsonb"#
+                ),
+                "both flags default to false: {default:?}"
+            );
+        }
+
         /// The suggestions migration (WBE-124) is the pair the suggestion
         /// endpoints read and write: an `is_suggested` flag on `users` that
         /// defaults to `false` (an account joins the pool only when an admin

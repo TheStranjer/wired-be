@@ -762,6 +762,7 @@ mod tests {
             language: None,
             tags: Vec::new(),
             settings_store: json!({}),
+            notification_settings: json!({}),
             mfa_settings: user::mfa::MfaSettings::default_value(),
             background_image_url: None,
             birthday: None,

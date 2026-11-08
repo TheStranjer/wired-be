@@ -2928,6 +2928,7 @@ mod tests {
             language: Some("pt-BR".to_owned()),
             tags: Vec::new(),
             settings_store: json!({"theme": "dark", "locale": "pt"}),
+            notification_settings: json!({}),
             background_image_url: None,
             birthday: Some(NaiveDate::from_ymd_opt(1990, 1, 31).expect("a real day")),
             show_birthday: Flag::new(false),

@@ -156,7 +156,8 @@ const FOLLOWING_IDS_SQL: &str = "SELECT followee_id FROM follows
      WHERE follower_id = $1 AND state = 'accepted'
   ORDER BY id";
 
-/// [`is_following`]: whether the pair has an accepted relationship.
+/// [`has_accepted_follow`] (and so [`is_following`]): whether the pair has
+/// an accepted relationship.
 const IS_FOLLOWING_SQL: &str = "SELECT EXISTS (
     SELECT 1 FROM follows
      WHERE follower_id = $1 AND followee_id = $2 AND state = 'accepted'
@@ -655,9 +656,28 @@ pub async fn following_ids(pool: &PgPool, follower_id: Uuid) -> AppResult<Vec<Uu
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn is_following(pool: &PgPool, follower: &User, target: &User) -> AppResult<bool> {
+    has_accepted_follow(pool, follower.id, target.id).await
+}
+
+/// Whether the account `follower_id` has an accepted follow of
+/// `target_id` — [`is_following`] keyed on ids, for callers that hold
+/// only the primary keys.
+///
+/// The notification path reads it that way: it knows the recipient and
+/// the actor ids without loading either row.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn has_accepted_follow(
+    pool: &PgPool,
+    follower_id: Uuid,
+    target_id: Uuid,
+) -> AppResult<bool> {
     let row = sqlx::query_as::<_, (bool,)>(IS_FOLLOWING_SQL)
-        .bind(follower.id)
-        .bind(target.id)
+        .bind(follower_id)
+        .bind(target_id)
         .fetch_one(pool)
         .await?;
     Ok(row.0)

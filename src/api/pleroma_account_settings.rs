@@ -549,6 +549,7 @@ mod tests {
             language: None,
             tags: Vec::new(),
             settings_store: json!({}),
+            notification_settings: json!({}),
             background_image_url: None,
             birthday: None,
             show_birthday: user::Flag::new(false),
