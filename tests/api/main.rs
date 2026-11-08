@@ -175,6 +175,10 @@ mod pleroma_settings;
 /// Pinned statuses (`/api/v1/statuses/{id}/pin` and its `…/unpin` twin).
 mod pins;
 
+/// Web Push subscriptions (`/api/v1/push/subscription`) and the VAPID key
+/// the app and instance responses advertise.
+mod push;
+
 /// The per-route rate limiter: mounted buckets, headers, and 429s.
 mod rate_limit;
 

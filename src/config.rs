@@ -153,6 +153,19 @@ pub const MEDIA_PROXY_MAX_BYTES_VAR: &str = "MEDIA_PROXY_MAX_BYTES";
 /// Environment variable holding the comma-separated list of hosts the
 /// media proxy never proxies.
 pub const MEDIA_PROXY_BLACKLIST_VAR: &str = "MEDIA_PROXY_BLACKLIST";
+/// Environment variable holding the instance's VAPID private key for Web
+/// Push, the ES256 signing key as PKCS#8 PEM.
+///
+/// When set it takes the pair stored in `instance_secrets` over at
+/// startup. Never logged; redacted in `Debug` output.
+pub const VAPID_PRIVATE_KEY_VAR: &str = "VAPID_PRIVATE_KEY";
+/// Environment variable holding the instance's VAPID public key, the
+/// URL-safe base64 of the uncompressed P-256 point.
+///
+/// The push endpoints advertise it as `server_key`; with no
+/// [`VAPID_PRIVATE_KEY_VAR`] beside it only the advertised half is
+/// overridden. Not secret: the instance endpoints publish it.
+pub const VAPID_PUBLIC_KEY_VAR: &str = "VAPID_PUBLIC_KEY";
 /// Environment variable holding which status-translation provider the
 /// instance uses: `none` (the default), `libretranslate` or `deepl`.
 pub const TRANSLATION_PROVIDER_VAR: &str = "TRANSLATION_PROVIDER";
@@ -578,6 +591,43 @@ impl TranslationProvider {
     }
 }
 
+/// VAPID key material for Web Push, from `VAPID_PRIVATE_KEY` and
+/// `VAPID_PUBLIC_KEY`.
+///
+/// The instance's ES256 key pair normally lives in the `instance_secrets`
+/// table, generated on first startup (see [`crate::services::vapid`]);
+/// these settings override that pair with the operator's own material
+/// instead. [`private_key`](Self::private_key) is secret: the manual
+/// `Debug` impl below redacts it. [`public_key`](Self::public_key) is the
+/// half every push client is handed as `server_key`, so it is no secret.
+///
+/// [`crate::services::vapid`]: crate::services::vapid
+#[derive(Clone, PartialEq, Eq)]
+pub struct VapidConfig {
+    /// The signing key as PKCS#8 PEM, from `VAPID_PRIVATE_KEY`; `None`
+    /// keeps the generated pair in `instance_secrets`. Redacted in
+    /// `Debug` output like `Config`'s `database_url`.
+    pub private_key: Option<String>,
+    /// The public point as URL-safe base64 (no padding), from
+    /// `VAPID_PUBLIC_KEY`; `None` means the public half is read from (or
+    /// derived from [`private_key`](Self::private_key)).
+    pub public_key: Option<String>,
+}
+
+/// Redacts [`private_key`](Self::private_key), which is signing key
+/// material; the public half shows.
+impl fmt::Debug for VapidConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VapidConfig")
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
 /// Status-translation settings, from the three `TRANSLATION_*` variables.
 ///
 /// [`crate::services::translate`] turns one of these into the translator the
@@ -847,6 +897,9 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
+    /// The VAPID key overrides, from `VAPID_PRIVATE_KEY` and
+    /// `VAPID_PUBLIC_KEY` (see [`crate::services::vapid`]).
+    pub vapid: VapidConfig,
     /// The status-translation settings, from the `TRANSLATION_*` variables
     /// (see [`crate::services::translate`]).
     pub translation: TranslationConfig,
@@ -962,6 +1015,7 @@ impl Config {
             smtp_tls,
             mail_from,
             media_proxy: media_proxy_settings(&lookup)?,
+            vapid: vapid_settings(&lookup),
             translation: translation_settings(&lookup)?,
             sign_fetches,
             authorized_fetch,
@@ -1082,6 +1136,10 @@ impl Config {
                 base_url: None,
                 max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
                 blacklist: Vec::new(),
+            },
+            vapid: VapidConfig {
+                private_key: None,
+                public_key: None,
             },
             translation: TranslationConfig {
                 provider: TranslationProvider::default(),
@@ -1661,6 +1719,22 @@ where
     })
 }
 
+/// Reads the two VAPID overrides, each trimmed, a blank standing for
+/// unset (the generated pair then stays in charge).
+fn vapid_settings<F>(lookup: &F) -> VapidConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    VapidConfig {
+        private_key: lookup(VAPID_PRIVATE_KEY_VAR)
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty()),
+        public_key: lookup(VAPID_PUBLIC_KEY_VAR)
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty()),
+    }
+}
+
 /// Reads the three settings that configure status translation
 /// (see [`crate::services::translate`]). Grouped because each is a plain
 /// default-or-parse and [`Config::from_lookup`] has a size budget (AGENTS.md).
@@ -1843,6 +1917,7 @@ impl fmt::Debug for Config {
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
             .field("media_proxy", &self.media_proxy)
+            .field("vapid", &self.vapid)
             .field("translation", &self.translation)
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
@@ -3423,6 +3498,66 @@ mod tests {
         assert!(
             !config.translation.is_configured(),
             "so the provider stays unconfigured"
+        );
+    }
+
+    #[test]
+    fn vapid_overrides_default_to_unset() {
+        let config = Config::for_tests();
+        assert_eq!(config.vapid.private_key, None, "default private key");
+        assert_eq!(config.vapid.public_key, None, "default public key");
+    }
+
+    #[test]
+    fn vapid_overrides_are_trimmed_and_blanks_unset() {
+        let set = config_with(&[
+            (VAPID_PRIVATE_KEY_VAR, "  PEM-BODY-WITH-SPACES  "),
+            (VAPID_PUBLIC_KEY_VAR, "  url-safe-public-key  "),
+        ]);
+        assert_eq!(
+            set.vapid.private_key.as_deref(),
+            Some("PEM-BODY-WITH-SPACES"),
+            "the private half reads trimmed"
+        );
+        assert_eq!(
+            set.vapid.public_key.as_deref(),
+            Some("url-safe-public-key"),
+            "the public half reads trimmed"
+        );
+        for (private, public) in [("   ", ""), ("", "  ")] {
+            let blank = config_with(&[
+                (VAPID_PRIVATE_KEY_VAR, private),
+                (VAPID_PUBLIC_KEY_VAR, public),
+            ]);
+            assert_eq!(
+                (
+                    blank.vapid.private_key.as_deref(),
+                    blank.vapid.public_key.as_deref()
+                ),
+                (None, None),
+                "blank overrides read as unset, keeping the generated pair"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_redacts_the_vapid_private_key() {
+        let config = config_with(&[
+            (VAPID_PRIVATE_KEY_VAR, "a-signing-secret-never-logged"),
+            (VAPID_PUBLIC_KEY_VAR, "the-advertised-public-half"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("a-signing-secret-never-logged"),
+            "the private key must not leak: {debug}"
+        );
+        assert!(
+            debug.contains("private_key: Some(\"<redacted>\")"),
+            "the redaction marker stands in: {debug}"
+        );
+        assert!(
+            debug.contains("public_key: Some(\"the-advertised-public-half\")"),
+            "the public half shows: {debug}"
         );
     }
 
