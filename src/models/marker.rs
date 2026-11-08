@@ -9,10 +9,12 @@
 //! adds one, so a client can tell how often its position moved.
 //!
 //! A marker names the newest entry its account has read by id *text* and
-//! nothing else: [`last_read_id`](Marker::last_read_id) is opaque here, never
-//! joined to [`statuses`](crate::models::status) or to the notifications table
-//! the notifications ticket adds, and it is stored verbatim up to
-//! `MAX_LAST_READ_ID_CHARS` characters — a longer one is cut, not refused.
+//! nothing else: [`last_read_id`](Marker::last_read_id) is stored verbatim
+//! up to `MAX_LAST_READ_ID_CHARS` characters — a longer one is cut, not
+//! refused — and only the `notifications` timeline ever reads through it,
+//! as [`unread_notifications_count`] compares it against
+//! [`notifications`](crate::models::notification) ids. It is never joined
+//! to [`statuses`](crate::models::status).
 //!
 //! Markers are strictly per account: [`get_many`] and [`upsert_many`] scope
 //! every read and write to `user_id`, so two accounts marking the same timeline
@@ -24,7 +26,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{
+    error::AppResult,
+    util::id::{new_id, parse_id},
+};
 
 /// The `home` timeline: the account's front page, the marker whose
 /// `pleroma.unread_count` is always `0` (see the API's
@@ -157,20 +162,35 @@ pub async fn upsert_many(
 /// the `pleroma.unread_count` a [`NOTIFICATIONS`] marker reports.
 ///
 /// Pleroma computes it in `Marker.unread_count_query`
-/// (`lib/pleroma/marker.ex`): the account's undismissed, unseen notifications
-/// created after the marker's position. Those rows live in the
-/// `notifications` table, which is this project's notifications ticket, so
-/// there is nothing to read from yet and this answers `0` for every marker.
-/// That ticket gives the function its `&PgPool` argument and an `async`
-/// `SELECT count(*)` over `notifications` — dropping the `const`, keeping the
-/// name and the two arguments here — and adds the `.await` in
-/// [`api::markers`], its only caller. The `home` timeline never asks and
-/// reports `0` on its own.
+/// (`lib/pleroma/marker.ex`): the account's undismissed, unseen
+/// notifications created after the marker's position — the same predicate
+/// `GET /api/v2/notifications/unread_count` answers with, without that
+/// endpoint's type filters and cap (see
+/// [`notification::unread_count`](crate::models::notification::unread_count)).
+/// A position that names no id — the empty default, or text that is not
+/// id — counts from the beginning of time, Pleroma's `restrict_after_marker`
+/// skipping its clause the same way.
 ///
-/// [`api::markers`]: crate::api::markers
-#[must_use]
-pub const fn unread_notifications_count(_user_id: Uuid, _last_read_id: &str) -> i64 {
-    0
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn unread_notifications_count(
+    pool: &PgPool,
+    user_id: Uuid,
+    last_read_id: &str,
+) -> AppResult<i64> {
+    let past = parse_id(last_read_id);
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM notifications
+          WHERE user_id = $1 AND NOT seen AND NOT dismissed
+            AND ($2::uuid IS NULL OR id > $2)",
+    )
+    .bind(user_id)
+    .bind(past)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 /// The pairs [`upsert_many`] writes, in the order they were given: each
@@ -459,44 +479,118 @@ mod tests {
         assert_eq!(left, 0, "and both of their markers with it");
     }
 
-    #[test]
-    fn unread_notifications_count_is_zero_until_notifications_land() {
+    /// Inserts one `follow` notification of `recipient` by `actor`.
+    async fn note(
+        pool: &PgPool,
+        recipient: &User,
+        actor: &User,
+    ) -> crate::models::notification::Notification {
+        use crate::models::notification::{self, NewNotification};
+        notification::create(
+            pool,
+            &NewNotification {
+                user_id: recipient.id,
+                from_account_id: actor.id,
+                notification_type: "follow",
+                status_id: None,
+                emoji: None,
+                report_id: None,
+            },
+        )
+        .await
+        .expect("the notification fixture inserts")
+    }
+
+    /// [`unread_notifications_count`], unwrapped for the assertions.
+    async fn count(pool: &PgPool, user_id: Uuid, last_read_id: &str) -> i64 {
+        unread_notifications_count(pool, user_id, last_read_id)
+            .await
+            .expect("the count reads")
+    }
+
+    #[tokio::test]
+    async fn the_marker_position_bounds_the_unread_notifications_count() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = user(pool, "alice").await;
+        let bob = user(pool, "bob").await;
+
         assert_eq!(
-            unread_notifications_count(Uuid::now_v7(), "0193abcd"),
+            count(pool, alice.id, "").await,
             0,
-            "with no notifications table to read, every marker reports 0"
+            "with no rows at all the position does not matter"
+        );
+
+        let older = note(pool, &alice, &bob).await;
+        let newer = note(pool, &alice, &bob).await;
+        assert_eq!(
+            count(pool, alice.id, "").await,
+            2,
+            "no position counts every unseen row"
+        );
+        assert_eq!(
+            count(pool, alice.id, "n-1").await,
+            2,
+            "text that names no id is no position, Pleroma's skipped clause"
+        );
+        assert_eq!(
+            count(pool, alice.id, &older.id.to_string()).await,
+            1,
+            "the marker itself is read; only newer rows count"
+        );
+        assert_eq!(
+            count(pool, alice.id, &newer.id.to_string()).await,
+            0,
+            "and a marker at the newest row has nothing left"
         );
     }
 
-    #[test]
-    fn marker_values_dedupes_last_wins_and_caps_each_position() {
-        let long = "y".repeat(MAX_LAST_READ_ID_CHARS + 5);
-        let values = marker_values(vec![
-            (HOME, "one"),
-            (NOTIFICATIONS, long.as_str()),
-            (HOME, "two"),
-        ]);
+    #[tokio::test]
+    async fn seen_and_dismissed_notifications_leave_the_unread_count() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = user(pool, "alice").await;
+        let bob = user(pool, "bob").await;
+        let older = note(pool, &alice, &bob).await;
+        let newer = note(pool, &alice, &bob).await;
+
+        let _seen = sqlx::query("UPDATE notifications SET seen = true WHERE id = $1")
+            .bind(newer.id)
+            .execute(pool)
+            .await
+            .expect("the seen flag lands");
         assert_eq!(
-            values
-                .iter()
-                .map(|(timeline, _)| *timeline)
-                .collect::<Vec<_>>(),
-            [HOME, NOTIFICATIONS],
-            "one entry per timeline, in the order first given"
+            count(pool, alice.id, "").await,
+            1,
+            "a seen row drops out of the count"
         );
-        assert_eq!(values.first().expect("home").1, "two", "the last value");
+
+        let _dismissed = sqlx::query("UPDATE notifications SET dismissed = true WHERE id = $1")
+            .bind(older.id)
+            .execute(pool)
+            .await
+            .expect("the dismissal lands");
         assert_eq!(
-            values.get(1).expect("notifications").1.chars().count(),
-            MAX_LAST_READ_ID_CHARS,
-            "the over-long position capped"
+            count(pool, alice.id, "").await,
+            0,
+            "and so does a dismissed one"
         );
     }
 
-    #[test]
-    fn capping_counts_characters_and_keeps_short_text_verbatim() {
-        assert_eq!(capped("0193abcd"), "0193abcd", "nothing to cut");
-        assert_eq!(capped(""), "", "including the empty position");
-        assert_eq!(capped("a…b"), "a…b", "multi-byte text below the cap");
-        assert_eq!(capped(&"z".repeat(400)).chars().count(), 255);
+    #[tokio::test]
+    async fn notifications_count_only_for_their_recipient() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = user(pool, "alice").await;
+        let bob = user(pool, "bob").await;
+        let _first = note(pool, &alice, &bob).await;
+        let _second = note(pool, &alice, &bob).await;
+
+        assert_eq!(
+            count(pool, bob.id, "").await,
+            0,
+            "the actor of alice's notifications has none of her own"
+        );
+        assert_eq!(count(pool, alice.id, "").await, 2, "alice holds both");
     }
 }
