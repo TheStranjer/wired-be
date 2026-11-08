@@ -6,11 +6,12 @@
 //! `lib/pleroma/web/mastodon_api/views/status_view.ex`, with its
 //! `safe_render_many`): it takes the already-paged rows and loads
 //! everything they render from — authors, media attachments, mentions,
-//! hashtags, emoji reactions, favourites, bookmarks, the viewer's own pins,
-//! reblogged originals and quoted originals — with a FIXED set of batched
+//! hashtags, emoji reactions, favourites, the viewer's own reblogs,
+//! bookmarks, the viewer's own pins, reblogged originals and quoted
+//! originals — with a FIXED set of batched
 //! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
 //! never a query per row. The count does not grow with the page size:
-//! eleven statement groups whatever the batch —
+//! twelve statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -24,22 +25,27 @@
 //!    [`favourite::favourited_status_ids`], run only for an authenticated
 //!    viewer; a reblog row takes its flag through its original's id, which
 //!    is where the like lives;
-//! 9. the viewer's bookmarks of the page — one [`bookmark::bookmarked_ids`],
-//!    likewise only for an authenticated viewer; every row takes its flag
-//!    from its *own* id, because a bookmark of a reblog lands on the reblog
-//!    row itself;
-//! 10. the viewer's pins among the page — one [`pinned_status::pinned_ids`],
+//! 9. the viewer's reblogs among the page — one
+//!    [`status::reblogged_status_ids`], likewise only for an authenticated
+//!    viewer, and likewise keyed to each row's *original's* id: the boost
+//!    lands on the original, so the outer entity of the viewer's own boost
+//!    renders `reblogged: true` together with the original it nests;
+//! 10. the viewer's bookmarks of the page — one [`bookmark::bookmarked_ids`],
+//!     likewise only for an authenticated viewer; every row takes its flag
+//!     from its *own* id, because a bookmark of a reblog lands on the reblog
+//!     row itself;
+//! 11. the viewer's pins among the page — one [`pinned_status::pinned_ids`],
 //!     likewise only for an authenticated viewer, and likewise keyed to
 //!     each row's *own* id: only a post of one's own can be pinned, so a
 //!     pin's author is its viewer. The same map answers `pinned` and
 //!     `pleroma.pinned_at`, which is why the two can never disagree;
-//! 11. the viewer's relationships to the page's authors — the one fixed
+//! 12. the viewer's relationships to the page's authors — the one fixed
 //!     [`Relationship::load_many`] set, run only for an authenticated
 //!     viewer.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
 //! page of plain posts costs five queries, and a viewer adds the favourite,
-//! bookmark and pin reads and the relationship set.
+//! reblog, bookmark and pin reads and the relationship set.
 //!
 //! # Extension points
 //!
@@ -49,14 +55,11 @@
 //! already shows: one id list, one keyed map) and threading that map
 //! through the batch context into [`StatusSource`]:
 //!
-//! - `reblogged`: one read of the viewer's own reblog rows keyed by
-//!   `reblog_of_id` (statuses the viewer reblogs, not just statuses on
-//!   the page).
 //! - `pleroma.bookmark_folder`: the folders ticket, one read keyed by
 //!   bookmark row; `bookmarked` itself is *already* filled by the
-//!   bookmarks ticket (step 9 above).
+//!   bookmarks ticket (step 10 above).
 //! - `pinned` and `pleroma.pinned_at`: *filled by the pinning ticket*
-//!   (step 10 above), from the one [`pinned_status::pinned_ids`] read.
+//!   (step 11 above), from the one [`pinned_status::pinned_ids`] read.
 //! - `muted` and `pleroma.thread_muted`: one read of the viewer's muted
 //!   threads keyed by `conversation_id`.
 //! - `pleroma.direct_conversation_id`: the chat-participation ticket,
@@ -90,6 +93,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     entities::{
+        account::JsonBool,
         relationship::{Relationship, RelationshipMap},
         status::{Status, StatusSource},
     },
@@ -192,6 +196,13 @@ struct Batch<'a> {
     /// favourited — one [`favourite::favourited_status_ids`] read keyed by
     /// every rendered id; empty for an anonymous viewer, who has no rows.
     favourites: HashSet<Uuid>,
+    /// The statuses on the page (and their originals) the viewer has
+    /// reblogged — one [`status::reblogged_status_ids`] read keyed by every
+    /// rendered id; empty for an anonymous viewer, who has no rows. Keyed
+    /// to the *original's* id like [`Batch::favourites`]: the boost lands
+    /// on the original, so a reblog row on the page is flagged through its
+    /// own [`reblog_of_id`](StatusRow::reblog_of_id).
+    reblogs: HashSet<Uuid>,
     /// The rows on the page the viewer has bookmarked — one
     /// [`bookmark::bookmarked_ids`] read keyed by every rendered id;
     /// empty for an anonymous viewer, who has no rows. Unlike
@@ -259,6 +270,7 @@ impl<'a> Batch<'a> {
             tags: load_tags(pool, &rendered_ids).await?,
             reactions: load_reactions(pool, &rendered_ids, viewer).await?,
             favourites: load_favourites(pool, &rendered_ids, viewer).await?,
+            reblogs: load_reblogs(pool, &rendered_ids, viewer).await?,
             bookmarks: load_bookmarks(pool, &rendered_ids, viewer).await?,
             pins: load_pins(pool, &rendered_ids, viewer).await?,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
@@ -302,6 +314,10 @@ impl<'a> Batch<'a> {
     /// *original's* id, the status the like actually lands on (Pleroma's
     /// `Announce` arm computes `favourited` off the liked object). The
     /// nested original is flagged from its own id in the same set. The
+    /// `reblogged` flag is membership in the reblogs set under the *same*
+    /// keying — a boost lands on the original, so the outer entity of the
+    /// viewer's own boost and the nested original both carry it (Pleroma's
+    /// `Announce` arm again). The
     /// `bookmarked` flag is membership in the bookmarks set keyed to the
     /// row's *own* id for every row: a bookmark of a reblog names the
     /// reblog row and lives there (see [`crate::models::bookmark`]). The
@@ -310,7 +326,7 @@ impl<'a> Batch<'a> {
     /// so one lookup answers both halves and they always agree.
     fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
-        let favourite_id = row.reblog_of_id.unwrap_or(row.id);
+        let subject_id = row.reblog_of_id.unwrap_or(row.id);
         let pinned_at = self.pins.get(&row.id).copied();
         let source = StatusSource {
             row,
@@ -322,7 +338,8 @@ impl<'a> Batch<'a> {
             mentions: self.mentions.get(&row.id).map_or(&[], Vec::as_slice),
             tags: self.tags.get(&row.id).map_or(&[], Vec::as_slice),
             reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
-            favourited: self.favourites.contains(&favourite_id),
+            favourited: self.favourites.contains(&subject_id),
+            reblogged: JsonBool(self.reblogs.contains(&subject_id)),
             bookmarked: self.bookmarks.contains(&row.id),
             pinned_at,
             reblog,
@@ -422,6 +439,23 @@ async fn load_favourites(
         return Ok(HashSet::new());
     };
     favourite::favourited_status_ids(pool, viewer.id, ids).await
+}
+
+/// [`status::reblogged_status_ids`]: one query for the originals among the
+/// page's ids the viewer has a live reblog of (reblogged originals
+/// included, since that is where a reblog's boost lives and a render
+/// answers the nested original's flag too). An anonymous viewer has no
+/// rows to ask about, and the empty set makes every flag false — no query
+/// at all.
+async fn load_reblogs(
+    pool: &PgPool,
+    ids: &[Uuid],
+    viewer: Option<&User>,
+) -> AppResult<HashSet<Uuid>> {
+    let Some(viewer) = viewer else {
+        return Ok(HashSet::new());
+    };
+    status::reblogged_status_ids(pool, viewer.id, ids).await
 }
 
 /// [`bookmark::bookmarked_ids`]: one query for the viewer's bookmarks
@@ -915,6 +949,74 @@ mod tests {
         assert!(
             anonymous.iter().all(|entity| flag(entity) == json!(false)),
             "an anonymous page is nobody's favourite"
+        );
+    }
+
+    /// The reblogs ticket's loader inside the fixed query set: one batched
+    /// read answers the `reblogged` flag of a whole page — the original the
+    /// viewer boosted, a plain post they left alone, and, keyed through the
+    /// original exactly like the favourites flag, the viewer's own reblog
+    /// row and the original nested in it. An anonymous page is nobody's
+    /// boost.
+    #[tokio::test]
+    async fn the_reblogged_flag_follows_one_batched_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let boosted = post(&pool, &bob, "boosted").await;
+        let ignored = post(&pool, &bob, "ignored").await;
+        let (reblog, created) =
+            status::create_reblog(&pool, BASE, &alice, &boosted, Visibility::Public)
+                .await
+                .expect("alice boosts bob's post");
+        assert!(created, "the boost is written by the reblog model");
+
+        let flag = |entity: &Status| {
+            serde_json::to_value(entity).expect("a rendered status serializes")["reblogged"].clone()
+        };
+        let page = [boosted.clone(), ignored.clone(), reblog.clone()];
+        let for_alice = render_statuses(&state, Some(&alice), &page)
+            .await
+            .expect("the page renders for alice");
+        assert_eq!(
+            flag(&for_alice[0]),
+            json!(true),
+            "alice's own boost flags the original"
+        );
+        assert_eq!(
+            flag(&for_alice[1]),
+            json!(false),
+            "and the unboosted post does not"
+        );
+        let reblog_json = serde_json::to_value(&for_alice[2]).expect("the reblog serializes");
+        assert_eq!(
+            reblog_json["reblogged"],
+            json!(true),
+            "the reblog row is flagged through its original, where the \
+             boost lives — the shape POST …/reblog answers with"
+        );
+        assert_eq!(
+            reblog_json["reblog"]["reblogged"],
+            json!(true),
+            "and the nested original carries its own flag"
+        );
+
+        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&boosted))
+            .await
+            .expect("the post renders for bob");
+        assert_eq!(
+            flag(&for_bob[0]),
+            json!(false),
+            "alice's boost is nobody else's flag"
+        );
+        let anonymous = render_statuses(&state, None, &page)
+            .await
+            .expect("the page renders anonymously");
+        assert!(
+            anonymous.iter().all(|entity| flag(entity) == json!(false)),
+            "an anonymous page is nobody's boost"
         );
     }
 
