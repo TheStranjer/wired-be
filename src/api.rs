@@ -61,6 +61,7 @@ pub mod mfa;
 pub mod misc;
 pub mod mutes;
 pub mod nodeinfo;
+pub mod notifications;
 pub mod notifications_v2;
 pub mod oauth;
 pub mod oauth_external;

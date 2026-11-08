@@ -183,7 +183,7 @@ pub async fn unread_notifications_count(
     let past = parse_id(last_read_id);
     let count = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM notifications
-          WHERE user_id = $1 AND NOT seen AND NOT dismissed
+          WHERE user_id = $1 AND NOT seen AND dismissed_at IS NULL
             AND ($2::uuid IS NULL OR id > $2)",
     )
     .bind(user_id)
@@ -565,7 +565,7 @@ mod tests {
             "a seen row drops out of the count"
         );
 
-        let _dismissed = sqlx::query("UPDATE notifications SET dismissed = true WHERE id = $1")
+        let _dismissed = sqlx::query("UPDATE notifications SET dismissed_at = now() WHERE id = $1")
             .bind(older.id)
             .execute(pool)
             .await
