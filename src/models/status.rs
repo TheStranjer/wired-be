@@ -449,6 +449,14 @@ const SOFT_DELETE_REBLOGS_SQL: &str = "UPDATE statuses
     WHERE reblog_of_id = $1 AND deleted_at IS NULL
   RETURNING *";
 
+/// [`soft_delete`] and [`soft_delete_with_reblogs`]: every account's pin of a
+/// status that has just become a tombstone goes with it. A pin is a promise
+/// that a profile can show the post, and a tombstone shows nowhere, so the
+/// row would name something no listing answers; this is the soft delete's
+/// share of what the foreign key's cascade does for a hard one (see
+/// [`crate::models::pinned_status`]).
+const CLEAR_PINS_SQL: &str = "DELETE FROM pinned_statuses WHERE status_id = $1";
+
 /// Inserts `new_status` and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4) and, for a local status, `uri` and
@@ -588,10 +596,12 @@ pub async fn newest_public_posts(
 
 /// Soft-deletes status `id`: the row stays, as a tombstone.
 ///
-/// Its text is cleared and its `uri` reserved, and the counters it fed step
+/// Its text is cleared and its `uri` reserved, the counters it fed step
 /// back down in the same transaction — its author's `statuses_count`, its
 /// parent's `replies_count` and, for a reblog, the original's
-/// `reblogs_count`.
+/// `reblogs_count` — and every account's pin of it is removed there too,
+/// the soft twin of the cascade a hard delete rides (see
+/// [`crate::models::pinned_status`]).
 ///
 /// Idempotent: a row that is already a tombstone, and an unknown id, are both
 /// answered `None` and move nothing.
@@ -606,6 +616,7 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
         return Ok(None);
     };
     uncount_deleted(&mut tx, &tombstone).await?;
+    clear_pins(&mut tx, id).await?;
     tx.commit().await?;
     Ok(Some(tombstone))
 }
@@ -641,8 +652,10 @@ pub async fn soft_delete_with_reblogs(pool: &PgPool, id: Uuid) -> AppResult<Opti
         return Ok(None);
     };
     uncount_deleted(&mut tx, &tombstone).await?;
+    clear_pins(&mut tx, id).await?;
     for reblog in tombstone_reblogs(&mut tx, id).await? {
         uncount_deleted(&mut tx, &reblog).await?;
+        clear_pins(&mut tx, reblog.id).await?;
     }
     tx.commit().await?;
     Ok(Some(tombstone))
@@ -788,6 +801,19 @@ async fn mark_deleted(conn: &mut PgConnection, id: Uuid) -> AppResult<Option<Sta
         .fetch_optional(conn)
         .await?;
     Ok(tombstone)
+}
+
+/// Removes every pin of the deleted status `id` on `conn`: the soft delete's
+/// counterpart of the cascade a hard delete rides, and what keeps
+/// [`count`](crate::models::pinned_status::count) counting only pins a
+/// profile can still show.
+async fn clear_pins(conn: &mut PgConnection, id: Uuid) -> AppResult<()> {
+    sqlx::query(CLEAR_PINS_SQL)
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map(drop)?;
+    Ok(())
 }
 
 /// Turns every live reblog of `id` into a tombstone on `conn`, answering the

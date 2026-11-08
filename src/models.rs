@@ -46,6 +46,7 @@ pub mod oauth_app;
 pub mod oauth_login_state;
 pub mod oauth_token;
 pub mod password_reset;
+pub mod pinned_status;
 pub mod relationship;
 pub mod report;
 pub mod scrobble;

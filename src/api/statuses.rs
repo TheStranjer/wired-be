@@ -1,4 +1,4 @@
-//! The status endpoints: reads, the favourite and bookmark writes and
+//! The status endpoints: reads, the favourite, bookmark and pin writes and
 //! listings, translation and the delete, all over one shared status gate
 //! and page renderer (`docs/ARCHITECTURE.md` decision 1).
 //!
@@ -8,7 +8,8 @@
 //! the state listing `GET /api/v1/statuses/{id}/favourited_by`, the
 //! caller's own favourites list `GET /api/v1/favourites`, the bookmark
 //! writes `POST /api/v1/statuses/{id}/bookmark` and its `…/unbookmark`
-//! twin, the caller's own bookmarks list `GET /api/v1/bookmarks`,
+//! twin, the caller's own bookmarks list `GET /api/v1/bookmarks`, the pin
+//! writes `POST /api/v1/statuses/{id}/pin` and its `…/unpin` twin,
 //! `POST /api/v1/statuses/{id}/translate` and the write
 //! `DELETE /api/v1/statuses/{id}`.
 //!
@@ -115,6 +116,43 @@
 //! ticket files bookmarks; [`bookmark::page_for_user`] already takes the
 //! filter for that wiring.
 //!
+//! # The pin writes
+//!
+//! `POST …/pin` and `POST …/unpin` are Pleroma's `pin` and `unpin`: a user
+//! token ([`AuthUser`]) with `write:accounts` (the scope Pleroma's
+//! `StatusController` pipeline names for these two actions, not
+//! `write:statuses`), both answering the [`Status`] entity as the caller
+//! sees it — `pinned` true and `pleroma.pinned_at` the moment of the write
+//! after a pin, both empty after a withdrawal, since the row is re-read for
+//! the render and the renderer's batched pins read now names the caller.
+//! Behind the shared [`status_for_viewer_or_404`] gate stand Pleroma's three
+//! refusals, in its order and with its bodies: a status of somebody else's
+//! is 422 `"Someone else's status cannot be pinned"`, a `private`, `direct`
+//! or `local` one is 422 `"Non-public status cannot be pinned"` (`public`
+//! and `unlisted` pass, as Pleroma's `Visibility.public?/1` admits exactly
+//! those two), and a reblog row is 422 `"Reblogs cannot be pinned"` —
+//! Pleroma refuses anything but a `Note`, `Article` or `Question` object,
+//! which here means a boost has no pin. One more limit is this instance's
+//! own: past [`max_pinned_statuses`](crate::config::Config::max_pinned_statuses)
+//! the write answers 422 `"You have already pinned the maximum number of
+//! statuses"`. A reply may be pinned (Pleroma allows it), anything the
+//! caller may not see is the shared 404 before any of these rules run, and
+//! re-pinning what is already pinned is the unchanged entity with 200 —
+//! Pleroma's `User.add_pinned_object_id/2` skips its limit check for a
+//! pin that is already there, and so does this route.
+//!
+//! `POST …/unpin` keeps Pleroma's two arms: the shared 404 for what the
+//! caller may not see, 422 `"Someone else's status cannot be unpinned"` for
+//! what they may see but do not own, and — unlike the pin — no visibility
+//! or reblog rule, because withdrawing a fact that cannot exist is
+//! harmless: [`pinned_status::unpin`] deletes nothing and the answer is the
+//! unchanged entity with 200.
+//!
+//! Neither pin write federates anything yet either: the federation ticket
+//! that announces the `Featured` collection's `Add` and `Remove` lands in
+//! this module's `after_pin_changed` hook, the documented empty landing
+//! point like `after_favourite_changed`'s.
+//!
 //! Neither favourite write federates anything yet: the federation ticket
 //! that sends the `Like` activity and its `Undo` wires into this module's
 //! `after_favourite_changed` hook, the documented empty landing point,
@@ -191,6 +229,7 @@ use uuid::Uuid;
 use crate::{
     api::helpers::{requested_status_ids, status_for_viewer_or_404},
     auth::{AuthUser, MaybeAuthUser},
+    config::Config,
     entities::{
         account::{Account, AccountViewer},
         status::Status,
@@ -201,13 +240,14 @@ use crate::{
     models::{
         bookmark,
         favourite::{self, Favourite as FavouriteRow},
-        status::{self, Status as StatusRow},
+        pinned_status::{self, PinnedStatus},
+        status::{self, Status as StatusRow, Visibility},
         status_visibility,
         user::User,
     },
     oauth::scopes::{
-        READ_BOOKMARKS, READ_FAVOURITES, READ_STATUSES, WRITE_BOOKMARKS, WRITE_FAVOURITES,
-        WRITE_STATUSES,
+        READ_BOOKMARKS, READ_FAVOURITES, READ_STATUSES, WRITE_ACCOUNTS, WRITE_BOOKMARKS,
+        WRITE_FAVOURITES, WRITE_STATUSES,
     },
     pagination::{PageParams, link_header, set_link_header},
     services::{
@@ -240,6 +280,30 @@ const DEFAULT_TARGET_LANGUAGE: &str = "en";
 /// "not there".
 const RECORD_NOT_FOUND: &str = "Record not found";
 
+/// The 422 body of `POST …/pin` for a status of somebody else's: Pleroma's
+/// `CommonAPI.pin` ownership arm (`{:error, :ownership_error}`), which its
+/// `StatusController.pin` renders in exactly these words.
+const NOT_YOURS: &str = "Someone else's status cannot be pinned";
+/// The 422 body of `POST …/unpin` for the same case, Pleroma's `unpin`
+/// ownership arm — the withdrawal is refused for the same reason the pin
+/// is, and a pin of somebody else's post cannot exist to begin with.
+const NOT_YOURS_UNPIN: &str = "Someone else's status cannot be unpinned";
+/// The 422 body of `POST …/pin` for a `private`, `direct` or `local`
+/// status: Pleroma's `{:error, :non_public_error}` arm, whose wording the
+/// ticket pins (its `Visibility.public?/1` admits `public` and `unlisted`
+/// and nothing else).
+const NOT_PUBLIC: &str = "Non-public status cannot be pinned";
+/// The 422 body of `POST …/pin` for a reblog row: Pleroma's
+/// `object_type_is_allowed_for_pin` admits an `Announce`'s object as
+/// little as a flag's, and the ticket gives the refusal its own words.
+/// A reply is allowed, as it is there.
+const NO_REBLOG: &str = "Reblogs cannot be pinned";
+/// The 422 body of `POST …/pin` past
+/// [`max_pinned_statuses`](crate::config::Config::max_pinned_statuses):
+/// Pleroma's `:pinned_statuses_limit_reached` arm, whose message its
+/// `User.add_pinned_object_id` carries verbatim.
+const PIN_LIMIT: &str = "You have already pinned the maximum number of statuses";
+
 /// Page size cap of `favourited_by`: the ticket pins 80, above
 /// [`crate::pagination::MAX_LIMIT`], with Pleroma's global 20 as the
 /// default the plain [`PageParams::from_query`] keeps.
@@ -256,10 +320,10 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// `state` reaches the three status writes — the two favourite ones and
 /// `DELETE /api/v1/statuses/{id}` — which mount the `statuses_actions`
 /// throttle bucket the way the reports route does (see [`crate::rate_limit`]).
-/// The two bookmark writes and the bookmarks listing ride no bucket: the
-/// ticket pins the throttle for the like writes and the delete only, and
-/// a bookmark is a private per-account fact no client can hammer on
-/// anyone else's data with.
+/// ride no bucket: the ticket pins the throttle for the like writes and the
+/// delete only, and a bookmark is a private per-account fact no client can
+/// hammer on anyone else's data with — which a pin is too, since
+/// `pin_refusal` admits only the caller's own statuses.
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/favourites", get(list_favourites))
@@ -282,6 +346,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/statuses/{id}/favourited_by", get(list_favourited_by))
         .route("/statuses/{id}/bookmark", post(bookmark_status))
         .route("/statuses/{id}/unbookmark", post(unbookmark_status))
+        .route("/statuses/{id}/pin", post(pin_status))
+        .route("/statuses/{id}/unpin", post(unpin_status))
         .route("/statuses/{id}/translate", post(translate_status))
 }
 
@@ -737,6 +803,139 @@ async fn list_bookmarks(
     ))
 }
 
+/// `POST /api/v1/statuses/{id}/pin` — pin the caller's own status `id` to
+/// their profile and answer it as they see it: `pinned` true and
+/// `pleroma.pinned_at` the moment of the write, because the row is re-read
+/// for the render and the renderer's batched pins read now names the caller.
+///
+/// The status resolves through [`status_for_viewer_or_404`] like every other
+/// route keyed by id — Pleroma's `CommonAPI.pin` asks
+/// `activity_visible_to_actor` first and answers its `:visibility_error`
+/// arm as a 404 — and [`pin_refusal`] then applies the three rules behind
+/// that gate, whose 422s are this route's own bodies. [`at_pin_limit`] is
+/// the last of them, weighed only for a pin that is not already there: a
+/// restatement is the unchanged entity with 200 even at the limit, which is
+/// what Pleroma's `User.add_pinned_object_id/2` does when the object is
+/// already in the map.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check; [`AppError::NotFound`] for a malformed,
+/// unknown, deleted or invisible status, for the row a delete took between
+/// the gate and the re-read, and for the one row the render cannot answer;
+/// [`AppError::Unprocessable`] for one of the four refusals. Any database
+/// failure arrives through `?` as [`AppError::Database`].
+async fn pin_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if let Some(refusal) = pin_refusal(auth.0.id, &row) {
+        return Err(AppError::Unprocessable(refusal.to_owned()));
+    }
+    let already_pinned = pinned_status::pinned_ids(&state.db, auth.0.id, &[row.id])
+        .await?
+        .contains_key(&row.id);
+    if !already_pinned && at_pin_limit(&state, auth.0.id).await? {
+        return Err(AppError::Unprocessable(PIN_LIMIT.to_owned()));
+    }
+    if let Some(pinned) = pinned_status::pin(&state.db, auth.0.id, row.id).await? {
+        debug!(
+            status = %row.id,
+            user = %auth.0.id,
+            "status pinned"
+        );
+        after_pin_changed(&state, &pinned, true);
+    }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// `POST /api/v1/statuses/{id}/unpin` — withdraw the caller's pin of the
+/// status `id` and answer it as they see it: `pinned` false and
+/// `pleroma.pinned_at` `null`, since the row is re-read for the render and
+/// the renderer's batched pins read no longer names it.
+///
+/// The same [`status_for_viewer_or_404`] gate, then Pleroma's one remaining
+/// rule — a pin is a fact about the *author's* profile, so somebody else's
+/// visible status is refused with its own body, [`NOT_YOURS_UNPIN`], the
+/// same rule [`pin_refusal`] applies under a different wording. What the
+/// unpin does **not** ask is the visibility or the reblog rule: neither can
+/// describe a stored pin, and Pleroma's `unpin` runs neither.
+/// [`pinned_status::unpin`] is content with nothing to delete, so a pin that
+/// was never made (or already withdrawn) changes nothing and is the
+/// unchanged [`Status`] with 200.
+///
+/// # Errors
+///
+/// Those of [`pin_status`] minus the refusals it does not run:
+/// [`AppError::Unprocessable`] only for a status the caller does not own.
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn unpin_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if row.user_id != auth.0.id {
+        return Err(AppError::Unprocessable(NOT_YOURS_UNPIN.to_owned()));
+    }
+    if let Some(removed) = pinned_status::unpin(&state.db, auth.0.id, row.id).await? {
+        debug!(
+            status = %row.id,
+            user = %auth.0.id,
+            "pin withdrawn"
+        );
+        after_pin_changed(&state, &removed, false);
+    }
+    current_entity(&state, &auth.0, row.id).await
+}
+
+/// Why `POST …/pin` refuses `row` for the account `caller_id`, in Pleroma's
+/// order and with its bodies: ownership first — a pin is a fact about the
+/// author's own profile (`activity_belongs_to_actor`) — then the visibility
+/// rule, whose `public` and `unlisted` are the only two [`Visibility`]
+/// values Pleroma's `Visibility.public?/1` admits, then the shape rule its
+/// `object_type_is_allowed_for_pin` serves by admitting a `Note`, an
+/// `Article` and a `Question` and no `Announce`, which here means a reblog
+/// row. `None` is the pass, and a reply passes: Pleroma pins one.
+///
+/// Whether `caller_id` may see `row` at all came before this, at
+/// [`status_for_viewer_or_404`] — the shared 404 Pleroma's
+/// `:visibility_error` arm renders — which is why an invisible post of
+/// somebody else's is never one of these 422s.
+fn pin_refusal(caller_id: Uuid, row: &StatusRow) -> Option<&'static str> {
+    if row.user_id != caller_id {
+        return Some(NOT_YOURS);
+    }
+    if !matches!(row.visibility, Visibility::Public | Visibility::Unlisted) {
+        return Some(NOT_PUBLIC);
+    }
+    if row.reblog_of_id.is_some() {
+        return Some(NO_REBLOG);
+    }
+    None
+}
+
+/// Whether `user_id` has already pinned as many statuses as this instance
+/// lets them: their [`count`](pinned_status::count) at or above
+/// [`max_pinned_statuses`](crate::config::Config::max_pinned_statuses),
+/// Pleroma's `[:instance, :max_pinned_statuses]`.
+async fn at_pin_limit(state: &AppState, user_id: Uuid) -> AppResult<bool> {
+    Ok(pinned_status::count(&state.db, user_id).await? >= pinned_limit(&state.config))
+}
+
+/// The configured pin limit as the `i64` the count read answers with. A
+/// limit too wide for `i64` is a limit nobody can reach, so it becomes the
+/// largest number the comparison can hold rather than a refusal of the
+/// configuration.
+fn pinned_limit(config: &Config) -> i64 {
+    i64::try_from(config.max_pinned_statuses).unwrap_or(i64::MAX)
+}
+
 /// `POST /api/v1/statuses/{id}/translate` — translate the status `id` into
 /// the body's `lang` and answer the [`Translation`] entity.
 ///
@@ -890,6 +1089,28 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 /// [`after_block_changed`](crate::api::blocks::after_block_changed).
 const fn after_favourite_changed(_state: &AppState, _favourite: &FavouriteRow, _favouriting: bool) {
 }
+
+/// Post-write hook of both pin routes: the federation ticket that adds the
+/// pin to its author's `Featured` collection — Pleroma's `Add`/`Remove`
+/// activities (`Builder.pin` and `Builder.unpin`, delivered with the object
+/// and withdrawn by its `Undo`) — wires the delivery in here, and the
+/// queueing happens through `state` (decision 11).
+///
+/// `pinned` is the row the write just stored or removed: its
+/// [`user_id`](PinnedStatus::user_id) names the actor whose collection moves
+/// and its [`status_id`](PinnedStatus::status_id) the post to add to or
+/// withdraw from it.
+///
+/// `pinning` states which way the write moved the fact: `true` for the pin a
+/// `POST …/pin` left behind — a repeat pin never reaches this hook, since it
+/// changed nothing — and `false` for the `Remove` of the pin a
+/// `POST …/unpin` withdrew. A withdrawal that found no pin to remove never
+/// reaches it either.
+///
+/// Intentionally empty until then, like [`after_favourite_changed`] above and
+/// the reactions'
+/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
+const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: bool) {}
 
 /// Post-write hook of the delete route: the federation ticket that sends the
 /// `Delete` activity (and, with it, the withdrawal of every reblog this delete
@@ -1101,5 +1322,89 @@ mod tests {
                 "a blank is no language to ask a provider for, so `{asked:?}`                  with `{preferred:?}` falls back to English"
             );
         }
+    }
+
+    /// `row(id)` as `author` wrote it, public: the row the pin gate asks
+    /// about, before a test narrows it to the case it names.
+    fn authored(id: Uuid, author: Uuid) -> status::Status {
+        let mut own = row(id);
+        own.user_id = author;
+        own
+    }
+
+    #[test]
+    fn your_own_public_or_unlisted_post_is_the_one_a_pin_admits() {
+        let owner = Uuid::now_v7();
+        let own = authored(Uuid::now_v7(), owner);
+        assert_eq!(pin_refusal(owner, &own), None, "a public post of yours");
+        let mut quiet = authored(Uuid::now_v7(), owner);
+        quiet.visibility = Visibility::Unlisted;
+        assert_eq!(pin_refusal(owner, &quiet), None, "and an unlisted one");
+    }
+
+    #[test]
+    fn a_post_that_is_not_public_has_no_pin() {
+        let owner = Uuid::now_v7();
+        for visibility in [Visibility::Private, Visibility::Direct, Visibility::Local] {
+            let mut hidden = authored(Uuid::now_v7(), owner);
+            hidden.visibility = visibility;
+            assert_eq!(
+                pin_refusal(owner, &hidden),
+                Some(NOT_PUBLIC),
+                "Pleroma's `Visibility.public?/1` admits neither `{visibility}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_is_asked_before_anything_else() {
+        // Somebody else's *private* status is refused as somebody else's: the
+        // visibility rule is the author's own business, and Pleroma's `pin`
+        // pipeline asks `activity_belongs_to_actor` first.
+        let (owner, caller) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut theirs = authored(Uuid::now_v7(), owner);
+        theirs.visibility = Visibility::Private;
+        assert_eq!(pin_refusal(caller, &theirs), Some(NOT_YOURS));
+        theirs.visibility = Visibility::Public;
+        assert_eq!(
+            pin_refusal(caller, &theirs),
+            Some(NOT_YOURS),
+            "and a visible post of theirs is still not yours to pin"
+        );
+    }
+
+    #[test]
+    fn a_reblog_has_no_pin_and_a_reply_still_has_one() {
+        let owner = Uuid::now_v7();
+        let mut boost = authored(Uuid::now_v7(), owner);
+        boost.reblog_of_id = Some(Uuid::now_v7());
+        assert_eq!(pin_refusal(owner, &boost), Some(NO_REBLOG));
+
+        // The shape rule comes after the visibility rule, and a reply is
+        // untouched by either: Pleroma pins one.
+        let mut hidden_boost = authored(Uuid::now_v7(), owner);
+        hidden_boost.visibility = Visibility::Direct;
+        hidden_boost.reblog_of_id = Some(Uuid::now_v7());
+        assert_eq!(pin_refusal(owner, &hidden_boost), Some(NOT_PUBLIC));
+
+        let mut answer = authored(Uuid::now_v7(), owner);
+        answer.in_reply_to_id = Some(Uuid::now_v7());
+        answer.in_reply_to_account_id = Some(Uuid::now_v7());
+        assert_eq!(pin_refusal(owner, &answer), None, "a reply is pinnable");
+    }
+
+    #[test]
+    fn the_pin_limit_reaches_the_count_read_in_its_own_type() {
+        let mut config = Config::for_tests();
+        assert_eq!(pinned_limit(&config), 1, "the shipped default");
+        config.max_pinned_statuses = 5;
+        assert_eq!(pinned_limit(&config), 5, "a configured number");
+        config.max_pinned_statuses = usize::MAX;
+        assert_eq!(
+            pinned_limit(&config),
+            i64::MAX,
+            "a limit too wide for the count's own type is no limit anyone \
+             can reach"
+        );
     }
 }

@@ -24,8 +24,7 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `reblogged`, `muted`, `pinned` and
-//! `pleroma.pinned_at` (the reblog/mute/pin tables);
+//! `reblogged` and `muted` (the reblog and thread-mute tables);
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
 //! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
 //! (chats, bookmark folders); and `quote` (the quoting ticket, whose
@@ -41,6 +40,11 @@
 //! [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) — the same
 //! shape of batched read; a reblog row takes its flag from *its own* id,
 //! because a bookmark lands on the row its client named, not the original.
+//! `pinned` and `pleroma.pinned_at` are filled by the pinning ticket, from
+//! [`pinned_ids`](crate::models::pinned_status::pinned_ids) — one batched
+//! read of the viewer's own pins per page; every row takes both from *its
+//! own* id, because only a post of one's own can be pinned, and the map's
+//! value is the moment the pin happened.
 //!
 //! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
@@ -150,8 +154,11 @@ pub struct PleromaMetadata {
     /// folders ticket files bookmarks and sets it, so it renders JSON
     /// `null` for now.
     pub bookmark_folder: Option<Value>,
-    /// `pinned_at`: when the account pinned this post to their profile;
-    /// the pinning ticket fills it, so it renders `null` for now.
+    /// `pinned_at`: when the viewer pinned this post to their own profile,
+    /// in the Mastodon time format (decision 5), or `null` — the value of
+    /// the same [`pinned_ids`](crate::models::pinned_status::pinned_ids)
+    /// read that answers [`Status::pinned`], which is why a post that
+    /// renders `pinned: true` always carries its pin's timestamp here too.
     #[serde(with = "crate::util::time::serde_mastodon_time::option")]
     pub pinned_at: Option<DateTime<Utc>>,
 }
@@ -198,6 +205,15 @@ pub struct StatusSource<'a> {
     /// Pleroma's `Bookmark.create` taking the activity the client named —
     /// and `false` for an anonymous viewer, who has no rows.
     pub bookmarked: bool,
+    /// When the viewer pinned this row to their own profile, `None` while
+    /// they have pinned nothing: the value of the one
+    /// [`pinned_ids`](crate::models::pinned_status::pinned_ids) read the
+    /// batch runs for the page, keyed to the row's *own* id — only a post
+    /// of one's own can be pinned, so there is no original to map through.
+    /// [`Status::pinned`] is this stamp's presence and `pleroma.pinned_at`
+    /// is its value, which is why the two halves can never disagree; an
+    /// anonymous viewer has no rows and so no stamp.
+    pub pinned_at: Option<DateTime<Utc>>,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -297,8 +313,10 @@ pub struct Status {
     /// batched read answers it, `false` for an anonymous viewer and for a
     /// post they have not bookmarked.
     pub bookmarked: JsonBool,
-    /// Whether this post is pinned on its author's profile; `false` (and
-    /// `pleroma.pinned_at` `null`) until the pinning ticket lands.
+    /// Whether the viewer pinned this post to their own profile; the
+    /// pinning ticket's batched read answers it, `false` for an anonymous
+    /// viewer, for a post they have not pinned, and — since a pin is
+    /// always the author's own act — for anybody else's post.
     pub pinned: JsonBool,
     /// The quoted status as a nested entity; `null` until the quoting
     /// ticket renders it — from the originals the service already
@@ -336,6 +354,7 @@ impl Status {
             reactions,
             favourited,
             bookmarked,
+            pinned_at,
             reblog,
         } = source;
         Self {
@@ -373,9 +392,9 @@ impl Status {
             reblogged: JsonBool(false),
             muted: JsonBool(false),
             bookmarked: JsonBool(bookmarked),
-            pinned: JsonBool(false),
+            pinned: JsonBool(pinned_at.is_some()),
             quote: None,
-            pleroma: pleroma_block(row, reply_author, reactions),
+            pleroma: pleroma_block(row, reply_author, reactions, pinned_at),
         }
     }
 }
@@ -423,13 +442,15 @@ fn plain_text(row: &StatusRow) -> PlainText {
 }
 
 /// Builds the `pleroma` block of `row`, whose replied-to author is
-/// `reply_author` when the batch knew one and whose reactions are
-/// `reactions` when the batch found any; see [`PleromaMetadata`] for where
-/// each key comes from and which later tickets fill the placeholders.
+/// `reply_author` when the batch knew one, whose reactions are `reactions`
+/// when the batch found any, and whose pin timestamp is `pinned_at` when the
+/// viewer pinned this row; see [`PleromaMetadata`] for where each key comes
+/// from and which later tickets fill the placeholders.
 fn pleroma_block(
     row: &StatusRow,
     reply_author: Option<&User>,
     reactions: &[SummaryRow],
+    pinned_at: Option<DateTime<Utc>>,
 ) -> PleromaMetadata {
     PleromaMetadata {
         content: plain_text(row),
@@ -446,7 +467,7 @@ fn pleroma_block(
         parent_visible: JsonBool(true),
         quotes_count: row.quotes_count,
         bookmark_folder: None,
-        pinned_at: None,
+        pinned_at,
     }
 }
 
@@ -665,6 +686,9 @@ mod tests {
         favourited: bool,
         /// Whether the viewer bookmarked the row.
         bookmarked: bool,
+        /// When the viewer pinned the row, `None` unless it is pinned: the
+        /// pin stamp the favourites-style batch would hand the renderer.
+        pinned_at: Option<DateTime<Utc>>,
     }
 
     impl<'a> Parts<'a> {
@@ -679,6 +703,7 @@ mod tests {
                 reactions: Vec::new(),
                 favourited: false,
                 bookmarked: false,
+                pinned_at: None,
             }
         }
 
@@ -730,6 +755,17 @@ mod tests {
                 ..self
             }
         }
+
+        /// Sets [`pinned_at`](Self::pinned_at): the viewer's own pin, which
+        /// the pinning ticket's batched read would hand the renderer. The
+        /// flag itself is membership in that same read, so it rides along
+        /// with the stamp.
+        fn pinned(self) -> Self {
+            Self {
+                pinned_at: Some(stamped()),
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -746,6 +782,7 @@ mod tests {
             reactions: &parts.reactions,
             favourited: parts.favourited,
             bookmarked: parts.bookmarked,
+            pinned_at: parts.pinned_at,
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -766,6 +803,7 @@ mod tests {
                 reactions: &[],
                 favourited: false,
                 bookmarked: false,
+                pinned_at: None,
                 reblog: None,
             },
             None,
@@ -854,9 +892,13 @@ mod tests {
         assert_eq!(value["card"], Value::Null, "cards are a later ticket");
         assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
         assert_eq!(value["edited_at"], Value::Null);
-        for flag in ["reblogged", "muted", "pinned"] {
+        for flag in ["reblogged", "muted"] {
             assert_eq!(value[flag], false, "{flag} is a later ticket");
         }
+        assert_eq!(
+            value["pinned"], false,
+            "a page whose pins read found nothing renders the flag false"
+        );
         assert_eq!(
             value["favourited"], false,
             "a page whose favourites read found nothing renders the flag false"
@@ -887,6 +929,34 @@ mod tests {
         assert_eq!(
             value["bookmarked"], true,
             "the bookmarks batch's membership reaches the entity verbatim"
+        );
+    }
+
+    #[test]
+    fn the_viewers_pin_lands_in_the_flag_and_the_stamp() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).pinned(), None);
+        assert_eq!(
+            value["pinned"], true,
+            "the pins batch's membership reaches the entity verbatim"
+        );
+        assert_eq!(
+            value["pleroma"]["pinned_at"], "2024-01-31T12:34:56.789Z",
+            "and the same read's timestamp reaches the pleroma block"
+        );
+    }
+
+    #[test]
+    fn an_unpinned_row_carries_no_stamp() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice), None);
+        assert_eq!(value["pinned"], false, "no pin in the batch");
+        assert_eq!(
+            value["pleroma"]["pinned_at"],
+            Value::Null,
+            "and so no timestamp either — the two always agree"
         );
     }
 
