@@ -115,6 +115,13 @@ pub const READ_STATUSES: &str = "read:statuses";
 /// (Pleroma's `write:statuses` on the marker `upsert` action).
 pub const WRITE_STATUSES: &str = "write:statuses";
 
+/// The read side of favourites: `GET /api/v1/favourites`, the list a
+/// client shows its user (Mastodon's `read:favourites`).
+pub const READ_FAVOURITES: &str = "read:favourites";
+/// The write side of favourites: `POST /api/v1/statuses/{id}/favourite`
+/// and its `…/unfavourite` twin (Mastodon's `write:favourites`).
+pub const WRITE_FAVOURITES: &str = "write:favourites";
+
 /// The write side of reports: `POST /api/v1/reports`.
 ///
 /// Mastodon's `write:reports`, the scope Pleroma's `ReportController`

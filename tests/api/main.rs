@@ -75,6 +75,9 @@ mod feeds;
 /// Filters over HTTP (`/api/v1/filters`).
 mod filters;
 
+/// Favourites (`/api/v1/statuses/{id}/favourite`, `…/favourited_by` and `/favourites`).
+mod favourites;
+
 /// Following and unfollowing an account (`/api/v1/accounts/{id}/follow`).
 mod follow_actions;
 
