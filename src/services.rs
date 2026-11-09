@@ -21,6 +21,11 @@
 //! its row inside the status's own transaction, and the `preview` dry run
 //! answers the would-be entity without writing anything.
 //!
+//! [`delete_status`] is the write side's twin: the one deletion — tombstone,
+//! counters and post-write hook — shared by `DELETE /api/v1/statuses/{id}`
+//! and the expiration jobs, so an expiring post leaves exactly what a
+//! hand-deleted one leaves.
+//!
 //! [`translate`] is the outbound half of status translation: which provider
 //! the instance talks to, what a translate call and a language list look like
 //! over there, and the sanitizer pass every provider answer goes through
@@ -36,6 +41,7 @@
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
 
 pub mod create_status;
+pub mod delete_status;
 pub mod emoji_packs;
 pub mod instance_actor;
 pub mod instance_meta;

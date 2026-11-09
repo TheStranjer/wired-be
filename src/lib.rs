@@ -183,6 +183,8 @@ fn job_registry() -> JobRegistry {
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);
     registry.register(jobs::deletion::KIND_DELETE, jobs::deletion::handle_delete);
+    registry.register(jobs::statuses::KIND_EXPIRE, jobs::statuses::handle_expire);
+    registry.register(jobs::statuses::KIND_SWEEP, jobs::statuses::handle_sweep);
     registry.register(mailer::KIND_SEND, mailer::handle);
     registry.register(
         federation::dispatch::KIND_INCOMING,

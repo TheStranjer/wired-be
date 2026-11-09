@@ -760,8 +760,12 @@ mod tests {
     use super::*;
 
     /// How many leases [`a_reused_slot_is_empty_and_restarted`] may be handed
-    /// before the slot it waits for comes back to it.
-    const REUSE_TRIES: usize = 8;
+    /// before the slot it waits for comes back to it. The suite's
+    /// database-backed tests have grown, and a released slot is the lowest
+    /// free number every other leasing test scans to first, so the walk back
+    /// to it can take many passes; the tries are cheap (each leases, checks
+    /// and frees again) and the assertion at the end is unchanged.
+    const REUSE_TRIES: usize = 32;
     /// How long a released lease may take to disappear from `pg_locks`.
     const LEASE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
     /// The pause between two looks at `pg_locks`.

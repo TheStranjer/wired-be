@@ -57,6 +57,9 @@ pub const MAX_REPORT_COMMENT_VAR: &str = "MAX_REPORT_COMMENT";
 /// Environment variable holding the number of statuses one account may pin
 /// to its profile.
 pub const MAX_PINNED_STATUSES_VAR: &str = "MAX_PINNED_STATUSES";
+/// Environment variable holding the shortest `expires_in` a status may ask
+/// for, in seconds.
+pub const MIN_EXPIRATION_SECS_VAR: &str = "MIN_EXPIRATION_SECS";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -281,6 +284,12 @@ pub const DEFAULT_MAX_REPORT_COMMENT: usize = 1_000;
 /// `Pleroma.Web.CommonAPI.pin` refuses the pin past it), so a second pin is
 /// a 422 on an instance that never raised the limit.
 pub const DEFAULT_MAX_PINNED_STATUSES: usize = 1;
+/// Shortest status expiration used when `MIN_EXPIRATION_SECS` is unset.
+///
+/// Pleroma's `:expiration, minimum_expiration_interval` ships as 600:
+/// `POST /api/v1/statuses` refuses a shorter `expires_in` with 422, so a
+/// client cannot schedule a purge faster than ten minutes out.
+pub const DEFAULT_MIN_EXPIRATION_SECS: usize = 600;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -658,7 +667,7 @@ impl TranslationProvider {
 /// half every push client is handed as `server_key`, so it is no secret.
 ///
 /// [`crate::services::vapid`]: crate::services::vapid
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct VapidConfig {
     /// The signing key as PKCS#8 PEM, from `VAPID_PRIVATE_KEY`; `None`
     /// keeps the generated pair in `instance_secrets`. Redacted in
@@ -844,6 +853,12 @@ pub struct Config {
     /// `{"error":"You have already pinned the maximum number of statuses"}`
     /// (see [`crate::models::pinned_status`]).
     pub max_pinned_statuses: usize,
+    /// Shortest `expires_in` a status create may ask for, in seconds, from
+    /// `MIN_EXPIRATION_SECS`; `POST /api/v1/statuses` refuses a shorter one
+    /// with 422 `{"error":"expires_in must be at least <n> seconds"}` and
+    /// stores the accepted span as the status's `expires_at` (see
+    /// [`crate::jobs::statuses`]).
+    pub min_expiration_secs: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -1036,7 +1051,8 @@ impl Config {
         let profile = instance_profile(&lookup);
         let limits = content_limits(&lookup)?;
         let text = text_length_limits(&lookup)?;
-        let (max_image_pixels, max_report_comment, max_pinned_statuses) = cap_limits(&lookup)?;
+        let (max_image_pixels, max_report_comment, max_pinned_statuses, min_expiration_secs) =
+            cap_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let (inbox_max_bytes, max_remote_mention_lookups) = inbox_and_mention_caps(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
@@ -1065,6 +1081,7 @@ impl Config {
             max_report_comment,
             max_image_pixels,
             max_pinned_statuses,
+            min_expiration_secs,
             upload_limits,
             avatar_limit_bytes,
             banner_limit_bytes,
@@ -1201,6 +1218,7 @@ impl Config {
             max_report_comment: DEFAULT_MAX_REPORT_COMMENT,
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             max_pinned_statuses: DEFAULT_MAX_PINNED_STATUSES,
+            min_expiration_secs: DEFAULT_MIN_EXPIRATION_SECS,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
@@ -1244,10 +1262,7 @@ impl Config {
                 max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
                 blacklist: Vec::new(),
             },
-            vapid: VapidConfig {
-                private_key: None,
-                public_key: None,
-            },
+            vapid: VapidConfig::default(),
             translation: TranslationConfig {
                 provider: TranslationProvider::default(),
                 api_url: None,
@@ -1687,19 +1702,21 @@ where
     })
 }
 
-/// The shape [`cap_limits`] answers: the three limits that sit outside the
+/// The shape [`cap_limits`] answers: the limits that sit outside the
 /// text-length groups, in [`Config`] field order (an uploaded image's pixel
-/// count, a report comment's character count, then the number of statuses
-/// one account may pin); factored out because a bare triple of same-typed
-/// numbers reads better by name.
-type CapLimits = (usize, usize, usize);
+/// count, a report comment's character count, the number of statuses one
+/// account may pin, then the shortest status expiration); factored out
+/// because a bare tuple of same-typed numbers reads better by name.
+type CapLimits = (usize, usize, usize, usize);
 
-/// Reads the three caps that sit beside the text limits: the pixel count an
+/// Reads the four caps that sit beside the text limits: the pixel count an
 /// uploaded image may decode to (`MAX_IMAGE_PIXELS`), the length of a
-/// report's `comment` (`MAX_REPORT_COMMENT`) and the number of statuses one
-/// account may pin to its profile (`MAX_PINNED_STATUSES`). Grouped because
-/// each is a plain default-or-parse and [`Config::from_lookup`] has a size
-/// budget (AGENTS.md); the tuple comes back in field order.
+/// report's `comment` (`MAX_REPORT_COMMENT`), the number of statuses one
+/// account may pin to its profile (`MAX_PINNED_STATUSES`) and the shortest
+/// `expires_in` a status create may ask for (`MIN_EXPIRATION_SECS`).
+/// Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
+/// back in field order.
 ///
 /// # Errors
 ///
@@ -1713,6 +1730,7 @@ where
         number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
         number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
         number(lookup, MAX_PINNED_STATUSES_VAR, DEFAULT_MAX_PINNED_STATUSES)?,
+        number(lookup, MIN_EXPIRATION_SECS_VAR, DEFAULT_MIN_EXPIRATION_SECS)?,
     ))
 }
 
@@ -2162,6 +2180,7 @@ impl fmt::Debug for Config {
             .field("max_report_comment", &self.max_report_comment)
             .field("max_image_pixels", &self.max_image_pixels)
             .field("max_pinned_statuses", &self.max_pinned_statuses)
+            .field("min_expiration_secs", &self.min_expiration_secs)
             .field("upload_limits", &self.upload_limits)
             .field("avatar_limit_bytes", &self.avatar_limit_bytes)
             .field("banner_limit_bytes", &self.banner_limit_bytes)
@@ -2949,6 +2968,28 @@ mod tests {
         assert!(
             debug.contains("max_pinned_statuses: 5"),
             "the pinned-status limit is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The shortest status expiration: Pleroma's 600 seconds by default,
+    /// the environment overriding it, and `Debug` showing the value.
+    #[test]
+    fn reads_custom_min_expiration_secs() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.min_expiration_secs, 600,
+            "default MIN_EXPIRATION_SECS"
+        );
+
+        let config = config_with(&[(MIN_EXPIRATION_SECS_VAR, "120")]);
+        assert_eq!(
+            config.min_expiration_secs, 120,
+            "custom MIN_EXPIRATION_SECS"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("min_expiration_secs: 120"),
+            "the expiration floor is visible in Debug output: {debug}"
         );
     }
 
@@ -4262,6 +4303,7 @@ mod tests {
             MAX_PROFILE_FIELDS_VAR,
             MAX_REPORT_COMMENT_VAR,
             MAX_PINNED_STATUSES_VAR,
+            MIN_EXPIRATION_SECS_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             AVATAR_LIMIT_BYTES_VAR,

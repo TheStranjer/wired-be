@@ -3,8 +3,9 @@
 //! `docs/ARCHITECTURE.md` decision 11 keeps background work in Postgres rows;
 //! this module is the producer of the rows that fire on a schedule. The
 //! [`periodic_jobs`] registry lists every recurring job (today the
-//! streaming hub's reference-table sweep, the mutes expiry sweep and the
-//! idempotency-key sweep; later tickets append one line per entry), and
+//! streaming hub's reference-table sweep, the mutes expiry sweep, the
+//! idempotency-key sweep and the status-expiry sweep; later tickets append
+//! one line per entry), and
 //! [`run`] ticks every ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
@@ -63,7 +64,12 @@ pub struct PeriodicJob {
 /// ([`KIND_CLEANUP`](super::idempotency::KIND_CLEANUP)), also once every ten
 /// minutes on the same queue: a pruned key is simply free to claim again, so
 /// the period only decides how long past the horizon a dead mapping keeps
-/// replaying.
+/// replaying — and the safety sweep of statuses whose `expires_at` has run
+/// out ([`statuses.expire_sweep`](super::statuses::KIND_SWEEP)),
+/// [`super::statuses::sweep_job`], on the same queue once every five minutes:
+/// the per-status [`statuses.expire`](super::statuses::KIND_EXPIRE) job is
+/// the scheduled delete proper, and this pass catches whatever a lost job
+/// row or a spent retry budget would otherwise leave posted forever.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -82,6 +88,7 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_secs(600),
         },
+        super::statuses::sweep_job(),
     ]
 }
 

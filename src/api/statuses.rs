@@ -60,7 +60,13 @@
 //! rendered for its author. Everything a fresh status still owes the
 //! streaming sockets, the notifications and the wider federation hangs off
 //! that service's single documented hook, so this file never grows a second
-//! write path.
+//! write path. The body may also carry Pleroma's `expires_in` (top-level
+//! only, whole seconds): the service turns an accepted span into the row's
+//! `expires_at`, and a post wearing one schedules its own delete — a
+//! [`statuses.expire`](crate::jobs::statuses::KIND_EXPIRE) job due at that
+//! instant, with the periodic
+//! [`statuses.expire_sweep`](crate::jobs::statuses::KIND_SWEEP) pass behind
+//! it (see [`crate::jobs::statuses`]).
 //!
 //! [`ApiParams`]: crate::extract::ApiParams
 //! [`IdempotencyPlug`]: crate::models::idempotency_key
@@ -338,8 +344,10 @@
 //! live, until the cleanup job removes them.
 //!
 //! Nothing leaves this instance yet: the `Delete` activity and the
-//! `status_deleted` stream push still attach at this route's
-//! `after_status_deleted` hook, the documented landing point — where the
+//! `status_deleted` stream push still attach at the deletion service's
+//! `after_status_deleted` hook
+//! ([`crate::services::delete_status`] — the same landing point the
+//! expiration jobs run through), where the
 //! notification ticket has wired the cleanup that takes the deleted
 //! status's notifications with it.
 //!
@@ -433,7 +441,7 @@ use crate::{
         block, bookmark, bookmark_folder, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
         media_attachment::{self, MediaAttachment as AttachmentRow},
-        mute, notification,
+        mute,
         oauth_app::{self, OauthApp},
         pinned_status::{self, PinnedStatus},
         status::{self, Status as StatusRow, Visibility},
@@ -646,7 +654,9 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// and the `write:statuses` check; [`AppError::RateLimited`] from the
 /// bucket; whatever [`create_status::create_status`] refuses — 422 for an
 /// empty text, an over-long status, an over-long warning, an unknown
-/// `visibility` or an unknown `content_type` — plus its own database
+/// `visibility`, an unknown `content_type` or an `expires_in` under the
+/// instance's floor or past the calendar — plus the extractor's own 422
+/// for an `expires_in` that is no integer — plus its own database
 /// failures as [`AppError::Database`]. A preview owes the same 422s:
 /// validation runs on it exactly as on a post.
 async fn create_status(
@@ -736,11 +746,12 @@ async fn show_status(
 /// `"Record not found"` body under a 403.
 ///
 /// The entity renders from the row the gate read, before
-/// [`soft_delete_with_reblogs`] turns that row and every live reblog of it
-/// into a tombstone; the whole write is one transaction, so a caller that
+/// [`crate::services::delete_status`] turns that row and every live reblog of
+/// it into a tombstone; the whole write is one transaction, so a caller that
 /// gets a 200 never meets a half-deleted post. A status that another delete
 /// took between the gate and the write answers the 404, as does the one row
-/// the renderer cannot answer.
+/// the renderer cannot answer. The expiration jobs run the same service —
+/// an expiring post leaves exactly what this route leaves.
 ///
 /// # Errors
 ///
@@ -764,19 +775,14 @@ async fn delete_status(
     let entity = render_status(&state, Some(&auth.0), &row)
         .await?
         .ok_or(AppError::NotFound)?;
-    if status::soft_delete_with_reblogs(&state.db, row.id)
-        .await?
-        .is_none()
-    {
+    if !crate::services::delete_status::delete_status(&state, &row).await? {
         return Err(AppError::NotFound);
     }
     debug!(
-        status = %row.id,
         user = %auth.0.id,
         staff = auth.0.is_admin.get() || auth.0.is_moderator.get(),
-        "status deleted"
+        "status deleted over HTTP"
     );
-    after_status_deleted(&state, &row).await;
     Ok(Json(DeletedStatus {
         entity,
         text: row.raw_text,
@@ -2266,37 +2272,6 @@ const fn after_reblog_changed(_state: &AppState, _reblog: &StatusRow, _rebloggin
 /// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
 const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: bool) {}
 
-/// Post-write hook of the delete route: the notification cleanup that
-/// clears the notifications the status caused is wired in here (the
-/// tombstoned row never fires the schema's `ON DELETE CASCADE`, so
-/// [`notification::delete_for_status`] is what takes the favourites,
-/// boosts, reactions and mentions about it with it). The federation
-/// ticket that sends the `Delete` activity (and, with it, the withdrawal
-/// of every reblog this delete took down) and the streaming ticket that
-/// pushes `status_deleted` to the timelines that carried the post still
-/// land here, and the queueing will happen through `state` (decision 11).
-///
-/// `status` is the row **as it was before the delete** — the delete clears the
-/// stored text, so this is the only copy of what the post said: its
-/// [`id`](StatusRow::id) and [`uri`](StatusRow::uri) name the object to
-/// withdraw, [`user_id`](StatusRow::user_id) is the actor that owns it, and
-/// [`reblog_of_id`](StatusRow::reblog_of_id) says whether the object was a
-/// boost whose original must stop counting it. Pleroma runs all three off the
-/// same `CommonAPI.delete` pipeline.
-///
-/// The cleanup is best-effort: the delete itself is already committed and
-/// must not answer a failure the client would retry against a gone
-/// status, so a cleanup that fails is logged, not returned.
-async fn after_status_deleted(state: &AppState, status: &StatusRow) {
-    if let Err(err) = notification::delete_for_status(&state.db, status.id).await {
-        warn!(
-            status = %status.id,
-            %err,
-            "notification cleanup after status deletion failed"
-        );
-    }
-}
-
 /// Post-write hook of the edit route: the federation ticket that sends the
 /// `Update` activity — Pleroma's `Builder.update` run through its
 /// `CommonAPI.update` pipeline, re-delivering the object to everybody the
@@ -2311,7 +2286,8 @@ async fn after_status_deleted(state: &AppState, status: &StatusRow) {
 /// clients redraw the post they already show.
 ///
 /// Intentionally empty until then, like [`after_favourite_changed`] above
-/// and the delete's [`after_status_deleted`].
+/// and the delete service's `after_status_deleted`
+/// ([`crate::services::delete_status`]).
 const fn after_status_edited(_state: &AppState, _status: &Status) {}
 
 #[cfg(test)]
