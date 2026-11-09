@@ -33,7 +33,18 @@
 //! both create arms run before they write (Pleroma's `ActivityDraft`
 //! reply arms and `get_to_and_cc`, which carry the parent's actor and
 //! addressed users into the reply's addressing without ever touching the
-//! text).
+//! text). `media_ids` has landed too: the post's attachments are the
+//! poster's own unposted uploads, named as decision 10's id-array, read by
+//! `checked_media` (which counts them against
+//! [`Config::max_media_attachments`] and refuses id text that is no id)
+//! and claimed by the status on the insert's own transaction through
+//! [`crate::models::status::insert`] over
+//! [`crate::models::media_attachment::attach_to_status`] — an id that names
+//! no row, somebody else's row or a row another status already holds is 422
+//! `Media not found`, and a body carrying at least one attachment may
+//! post with empty text (Pleroma's `attachments_from_ids` and
+//! `validate_character_limit`, with this instance's outright refusal
+//! where Pleroma silently drops).
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //!
@@ -43,9 +54,10 @@
 //! through [`render_status_fields`] — the function that turns checked text
 //! into its stored HTML, its mention links and its hashtags, and the reason
 //! an edit renders a post exactly the way a creation would. The edit's own
-//! `media_ids` parameter (which creation does not carry yet) resolves to the
-//! ids the author may attach, Pleroma's `attachments_from_ids` dropping the
-//! ids that name nothing;
+//! `media_ids` parameter resolves to the ids the author may attach,
+//! Pleroma's `attachments_from_ids` dropping the ids that name nothing —
+//! the edit wears an unusable id by leaving it out, where the create
+//! refuses it outright;
 //! [`crate::models::status_edit::update_status`] writes the whole edit as
 //! one transaction.
 //!
@@ -121,10 +133,22 @@ const MAX_LANGUAGE_CHARS: usize = 10;
 /// as this server's `post_formats`.
 const CONTENT_TYPES: [&str; 3] = ["text/plain", "text/html", "text/markdown"];
 
-/// 422 body for text that leaves nothing behind once trimmed: Pleroma's
-/// `validate_character_limit` wording, which an attachments-only post will be
-/// allowed to send once a later ticket adds `media_ids`.
+/// 422 body for text that leaves nothing behind once trimmed and no
+/// attachment stands beside it (Pleroma's `validate_character_limit` wording;
+/// a media-only post carries attachments and so is allowed to send it).
 const EMPTY_STATUS: &str = "Cannot post an empty status without attachments";
+
+/// 422 body for more submitted `media_ids` than
+/// [`Config::max_media_attachments`] (Pleroma's `validate_attachments_count`
+/// wording).
+const TOO_MANY_ATTACHMENTS: &str = "Too many attachments";
+
+/// 422 body for a submitted `media_ids` entry that is no id at all: it names
+/// no row the poster could claim, so it is [`MEDIA_NOT_FOUND`] with the rest
+/// of that gate's refusals.
+///
+/// [`MEDIA_NOT_FOUND`]: crate::models::media_attachment::MEDIA_NOT_FOUND
+const BAD_MEDIA_ID: &str = crate::models::media_attachment::MEDIA_NOT_FOUND;
 
 /// 422 body for text over the instance's limit (Pleroma's wording again).
 const OVER_LIMIT: &str = "The status is over the character limit";
@@ -151,8 +175,8 @@ const MAX_INHERITED_MENTIONS: usize = 20;
 ///
 /// Every field is an `Option` with a serde `default`, so a key the body omits
 /// or sends as `null` stays this module's decision instead of becoming a
-/// deserialization error; a later ticket joins the struct with `media_ids`,
-/// `poll` and `scheduled_at` as further `Option`s, the same
+/// deserialization error; a later ticket joins the struct with `poll` and
+/// `scheduled_at` as further `Option`s, the same
 /// way. The `sensitive` field is a [`flex`] boolean, so a form body's
 /// `sensitive=on` spells what a JSON body's `true` spells.
 ///
@@ -212,6 +236,22 @@ pub struct CreateStatusParams {
     /// post, Pleroma's own empty-string "no reply" arm.
     #[serde(default)]
     in_reply_to_id: Option<String>,
+    /// The ids of the poster's own unposted uploads this status carries,
+    /// in the order they want them to render — decision 10's id-array:
+    /// JSON's `["a","b"]` or the form's `media_ids[]=a&media_ids[]=b`,
+    /// both read as id text the way [`EditStatusParams`] takes them.
+    /// More than [`Config::max_media_attachments`] is 422 `Too many
+    /// attachments`; an entry that is no id, or an id that names no row
+    /// the poster owns and no status has claimed yet, is 422
+    /// `Media not found` — the write's own gate, through
+    /// [`crate::models::media_attachment::attach_to_status`]. With at
+    /// least one id here, an empty [`status`](Self::status) is a
+    /// media-only post rather than a refusal. Absent or null attaches
+    /// nothing.
+    ///
+    /// [`EditStatusParams`]: self::EditStatusParams
+    #[serde(default)]
+    media_ids: Option<Vec<String>>,
 }
 
 impl CreateStatusParams {
@@ -253,6 +293,12 @@ pub struct Checked<'a> {
     /// `expires_in`, or `None` when the body named no expiration — see
     /// `checked_expiration`.
     pub expires_at: Option<DateTime<Utc>>,
+    /// The submitted `media_ids` read as ids, deduplicated to their first
+    /// position and in the order the client sent them — empty when the body
+    /// named none. Whether each one is a row the poster may actually claim
+    /// is the write's decision, made atomically with the insert (see
+    /// [`crate::models::status::insert`]).
+    pub media_ids: Vec<Uuid>,
 }
 
 /// Checks a status body against the instance's limits and the author's two
@@ -267,25 +313,37 @@ pub struct Checked<'a> {
 /// lose to, except that a stored scope naming no [`Visibility`] falls back to
 /// [`Visibility::Public`] rather than failing somebody's post.
 ///
-/// The rules run in this order — the text (empty, then too long), the content
-/// warning, the language, the visibility, the content type, then the
-/// expiration — so a body that breaks several is refused for the first of
-/// them.
+/// The rules run in this order — the attachments (count, then id text), the
+/// text (empty without attachments, then too long), the content warning, the
+/// language, the visibility, the content type, then the expiration — so a
+/// body that breaks several is refused for the first of them, and a
+/// media-only post is read before its empty text can be refused, the way
+/// Pleroma's draft pipeline resolves attachments before it checks the
+/// payload. The attachment refusal an id the poster may not claim earns is
+/// not here — it is the write's, made on the database inside the status's
+/// own transaction (see [`crate::models::status::insert`]).
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with `EMPTY_STATUS`, `OVER_LIMIT`,
 /// `INVALID_VISIBILITY` or `INVALID_CONTENT_TYPE`, with Rails' too-long
-/// wording for a content warning or a language tag past its cap, and with
+/// wording for a content warning or a language tag past its cap, with
 /// `checked_expiration`'s refusal for an `expires_in` under the instance's
-/// floor or past the calendar.
+/// floor or past the calendar, and with `checked_media`'s refusals for
+/// more submitted `media_ids` than the instance allows or for an entry
+/// that is no id at all.
 pub fn check_body<'a>(
     config: &Config,
     default_scope: &str,
     default_sensitive: bool,
     params: &'a CreateStatusParams,
 ) -> AppResult<Checked<'a>> {
-    let text = check_text(config, params.status.as_deref().unwrap_or_default())?;
+    let media_ids = checked_media(config, params)?;
+    let text = check_text(
+        config,
+        params.status.as_deref().unwrap_or_default(),
+        !media_ids.is_empty(),
+    )?;
     let spoiler_text = checked_spoiler(params.spoiler_text.as_deref())?;
     let language = checked_language(params.language.as_deref())?;
     let visibility = checked_visibility(params.visibility.as_deref(), default_scope)?;
@@ -299,18 +357,56 @@ pub fn check_body<'a>(
         language,
         content_type,
         expires_at,
+        media_ids,
     })
 }
 
-/// The post text: trimmed, non-empty, and no longer than
-/// [`Config::max_status_chars`] measured with [`status_length`]'s weighting.
+/// The submitted `media_ids` read as ids: the whole body's refusals that
+/// need no database — more entries than [`Config::max_media_attachments`]
+/// is [`TOO_MANY_ATTACHMENTS`] (counted on the submission as sent, repeats
+/// and all, Pleroma's `validate_attachments_count` cap), and an entry that
+/// is no [`Uuid`] text names no row anybody could claim and is
+/// [`BAD_MEDIA_ID`]. The ids then collapse to their first positions, so the
+/// order the client asked for survives to the write unchanged.
+///
+/// Whether each surviving id names a row its poster may attach is the
+/// write's, made on the database as the status's own insert commits (see
+/// [`crate::models::status::insert`]).
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with [`EMPTY_STATUS`] or [`OVER_LIMIT`].
-fn check_text<'a>(config: &Config, text: &'a str) -> AppResult<&'a str> {
+/// [`AppError::Unprocessable`] with [`TOO_MANY_ATTACHMENTS`] or
+/// [`BAD_MEDIA_ID`].
+fn checked_media(config: &Config, params: &CreateStatusParams) -> AppResult<Vec<Uuid>> {
+    let Some(submitted) = params.media_ids.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if submitted.len() > config.max_media_attachments {
+        return Err(AppError::Unprocessable(TOO_MANY_ATTACHMENTS.to_owned()));
+    }
+    let mut ids: Vec<Uuid> = Vec::with_capacity(submitted.len());
+    for text in submitted {
+        let id = parse_id(text).ok_or_else(|| AppError::Unprocessable(BAD_MEDIA_ID.to_owned()))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// The post text: trimmed, no longer than [`Config::max_status_chars`]
+/// measured with [`status_length`]'s weighting, and — with no attachments
+/// posted beside it — not empty. A media-only post trims to nothing and
+/// still stands; Pleroma's `validate_character_limit` refuses `""` only
+/// over an empty attachment list.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`EMPTY_STATUS`] (empty text and
+/// `attachments` false) or [`OVER_LIMIT`].
+fn check_text<'a>(config: &Config, text: &'a str, attachments: bool) -> AppResult<&'a str> {
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && !attachments {
         return Err(AppError::Unprocessable(EMPTY_STATUS.to_owned()));
     }
     if status_length(trimmed, URL_WEIGHT) > config.max_status_chars {
@@ -460,11 +556,18 @@ pub struct RenderedFields {
 /// [`sensitive_default`](User::sensitive_default), Pleroma reads the same
 /// pair off the user — and [`create_status`] does the rest: the render and
 /// the entity lists (the [`render_status_fields`] step below), the stored row
-/// with its mention and hashtag links and the author's moved counters
-/// ([`status::insert`]), and the render for the author. `app` — the client
+/// with its mention and hashtag links, its claimed attachments and the
+/// author's moved counters ([`status::insert`]), and the render for the
+/// author. `app` — the client
 /// that issued the presenting
 /// token, `None` when the caller names none — is recorded as the post's
 /// `application` pair, Pleroma's `put_application`.
+///
+/// The body's `media_ids` ride the stored row: [`status::insert`] claims
+/// exactly the poster's own uploads no status has taken yet, on the insert's
+/// own transaction, each at its position in the submitted order, and one id
+/// the poster may not claim refuses the whole write (422 `Media not found`,
+/// the media model's gate — see [`crate::models::media_attachment`]).
 ///
 /// When the body names an `in_reply_to_id`, the shared `prepared_new_status`
 /// step resolves the parent before anything renders: an unanswerable parent
@@ -476,7 +579,9 @@ pub struct RenderedFields {
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] for the body's own refusals, through
-/// [`check_body`]; [`AppError::NotFound`] for an `in_reply_to_id` that names
+/// [`check_body`] — attachments included, both the
+/// [`Config::max_media_attachments`] cap and the write's `Media not found`
+/// gate — [`AppError::NotFound`] for an `in_reply_to_id` that names
 /// no status the poster may see; [`AppError::Internal`] for the one row this
 /// function wrote that the renderer refuses to answer (unreachable for a
 /// fresh local post, which is neither a tombstone nor a reblog). Any
@@ -824,9 +929,10 @@ fn mention_key(mention: &MentionRef) -> String {
 
 /// The [`NewStatus`] of one checked body: a `local` post by `user` with its
 /// rendered content and source text, its warning and flags, the two entity
-/// lists [`status::insert`] links in its transaction, and the client `app`
-/// recorded as the post's application — Pleroma's `put_application`, which
-/// is what makes the entity's `application` block come back.
+/// lists [`status::insert`] links in its transaction, the attachments
+/// [`status::insert`] claims on the same transaction with, and the client
+/// `app` recorded as the post's application — Pleroma's `put_application`,
+/// which is what makes the entity's `application` block come back.
 fn new_status(
     user: &User,
     app: Option<&OauthApp>,
@@ -845,6 +951,7 @@ fn new_status(
         expires_at: checked.expires_at,
         mentioned_user_ids: entities.mentioned_user_ids.clone(),
         hashtags: entities.hashtags.clone(),
+        media_ids: checked.media_ids.clone(),
         local: true,
         application_name: app.map(|found| found.client_name.clone()),
         application_website: app.and_then(|found| found.website.clone()),
@@ -1110,10 +1217,16 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // the stored `expires_at` rides along untouched (Pleroma's
         // `make_update_data` carries it forward the same way) — and never
         // its parent: an edit rewrites what was said in the thread it
-        // stands in, and `in_reply_to_id` is not an edit parameter.
+        // stands in, and `in_reply_to_id` is not an edit parameter. The
+        // edit's own `media_ids` ride [`status_edit::EditParams`] through
+        // [`crate::models::status_edit::update_status`]'s replacement arm,
+        // which drops what the author may not attach instead of refusing
+        // it, so the merge carries none and [`check_body`] never sees the
+        // create's attachment rules.
         preview: None,
         expires_in: None,
         in_reply_to_id: None,
+        media_ids: None,
     }
 }
 
@@ -1213,7 +1326,10 @@ mod tests {
         config::TEST_BASE_URL,
         http_client::HttpClient,
         mailer::MemoryTransport,
-        models::user::{NewUser, insert as insert_user, local_ap_id},
+        models::{
+            media_attachment::{self, NewMediaAttachment},
+            user::{NewUser, insert as insert_user, local_ap_id},
+        },
         uploads::UploaderBackend,
         util::entities::{hashtag_html, mention_html},
     };
@@ -2708,6 +2824,16 @@ mod tests {
                 INVALID_CONTENT_TYPE,
             ),
             (
+                json!({"status": "hi", "media_ids": ["not-an-id"], "preview": true}),
+                BAD_MEDIA_ID,
+            ),
+            (
+                json!({ "status": "hi",
+                        "media_ids": ["", "", "", "", ""],
+                        "preview": true, }),
+                TOO_MANY_ATTACHMENTS,
+            ),
+            (
                 json!({
                     "status": "hi",
                     "spoiler_text": "x".repeat(MAX_SPOILER_CHARS + 1),
@@ -3545,5 +3671,310 @@ mod tests {
             1,
             "and the parent counted it once"
         );
+    }
+
+    /// The media body: one unattached `image/png` upload by `owner`, as the
+    /// row a `media_ids` entry names.
+    async fn upload(pool: &PgPool, owner: &User) -> media_attachment::MediaAttachment {
+        media_attachment::insert(
+            pool,
+            &NewMediaAttachment {
+                user_id: Some(owner.id),
+                url: format!("{BASE}/media/fixture.png"),
+                content_type: "image/png".to_owned(),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .expect("a fixture upload inserts")
+    }
+
+    /// A post carrying `text` and `ids` as its `media_ids`, the ids as the
+    /// client spells them.
+    fn with_media(text: &str, ids: &[&str]) -> CreateStatusParams {
+        CreateStatusParams {
+            status: Some(text.to_owned()),
+            media_ids: Some(ids.iter().map(|id| (*id).to_owned()).collect()),
+            ..CreateStatusParams::default()
+        }
+    }
+
+    /// The stored media row, for the claims and rollbacks a test inspects.
+    async fn media_row(pool: &PgPool, id: Uuid) -> media_attachment::MediaAttachment {
+        media_attachment::get_by_id(pool, id)
+            .await
+            .unwrap()
+            .expect("the fixture upload is stored")
+    }
+
+    /// The ids an entity's `media_attachments` answers, in answer order.
+    fn attachment_ids(entity: &Status) -> Vec<String> {
+        entity
+            .media_attachments
+            .iter()
+            .map(|attachment| attachment.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_media_ids_parameter_deserializes_as_id_text() {
+        let absent = params(json!({"status": "hi"}));
+        assert_eq!(absent.media_ids, None, "no key says nothing about media");
+        let null = params(json!({"status": "hi", "media_ids": null}));
+        assert_eq!(null.media_ids, None, "a null is as absent as no key");
+        let list = params(json!({
+            "status": "hi",
+            "media_ids": ["01934567-89ab-7cde-f012-3456789abcde", "junk"],
+        }));
+        assert_eq!(
+            list.media_ids,
+            Some(vec![
+                "01934567-89ab-7cde-f012-3456789abcde".to_owned(),
+                "junk".to_owned(),
+            ]),
+            "decision 10's array arrives as id text, JSON or form alike —
+             the extractor folds `media_ids[]=a&media_ids[]=b` to the same list"
+        );
+    }
+
+    #[test]
+    fn checked_media_caps_the_submitted_ids_and_keeps_their_order() {
+        let a = Uuid::now_v7().to_string();
+        let b = Uuid::now_v7().to_string();
+
+        // The cap counts the submission as sent: five asked-for attachments
+        // are over the default limit of four, distinct ids or no.
+        let many: Vec<String> = (0..5).map(|_| Uuid::now_v7().to_string()).collect();
+        let strs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(rejection(&with_media("hi", &strs)), TOO_MANY_ATTACHMENTS);
+        let exact = with_media("hi", &strs[..4]);
+        assert_eq!(
+            accepted(&exact).media_ids.len(),
+            4,
+            "the limit itself is exactly attachable"
+        );
+
+        // An id submitted twice claims its row once, at its first position.
+        let twice = with_media("hi", &[a.as_str(), b.as_str(), a.as_str()]);
+        assert_eq!(
+            accepted(&twice).media_ids,
+            vec![
+                Uuid::parse_str(&a).expect("an id"),
+                Uuid::parse_str(&b).expect("an id"),
+            ],
+            "the order the client asked for survives, duplicates folded out"
+        );
+
+        // The cap reads the submission before the dedup, and off the
+        // instance's own number: five spellings of one id are still five
+        // asked-for attachments against a limit of two.
+        let mut tight = Config::for_tests();
+        tight.max_media_attachments = 2;
+        let five_same = with_media("hi", &[a.as_str(); 5]);
+        let err = check_body(&tight, "public", false, &five_same)
+            .expect_err("five entries under a limit of two is the refusal");
+        assert_eq!(err.to_string(), TOO_MANY_ATTACHMENTS);
+    }
+
+    #[test]
+    fn media_id_text_that_is_no_id_is_media_not_found() {
+        for spelling in ["not-an-id", "", "  "] {
+            let body = with_media("hi", &[spelling]);
+            assert_eq!(
+                rejection(&body),
+                BAD_MEDIA_ID,
+                "`{spelling}` names no row anybody could claim"
+            );
+        }
+        let mixed = with_media("hi", &[&Uuid::now_v7().to_string(), "nope"]);
+        assert_eq!(
+            rejection(&mixed),
+            BAD_MEDIA_ID,
+            "and one bad entry refuses the whole body"
+        );
+    }
+
+    #[test]
+    fn attachments_stand_in_for_a_missing_text() {
+        let one = Uuid::now_v7().to_string();
+
+        let media_only = with_media("   ", &[one.as_str()]);
+        let checked = accepted(&media_only);
+        assert_eq!(checked.text, "", "the trimmed nothing stands as the text");
+        assert_eq!(checked.media_ids.len(), 1, "beside its one attachment");
+
+        let nothing = with_media("   ", &[]);
+        assert_eq!(
+            rejection(&nothing),
+            EMPTY_STATUS,
+            "an empty attachment list is no attachment: the text still owes the post"
+        );
+
+        let bad = with_media("", &["not-an-id"]);
+        assert_eq!(
+            rejection(&bad),
+            BAD_MEDIA_ID,
+            "the media gate is read before the text it relaxes, Pleroma's pipeline order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_only_post_stores_the_row_and_claims_the_uploads_in_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "alice").await;
+        let first_upload = upload(pool, &alice).await;
+        let second_upload = upload(pool, &alice).await;
+
+        // Posted newest first: the order the client asks for, not the order
+        // the rows were minted in.
+        let entity = created(
+            &app_state,
+            &alice,
+            with_media(
+                "",
+                &[&second_upload.id.to_string(), &first_upload.id.to_string()],
+            ),
+        )
+        .await;
+        let row = stored(pool, &entity).await;
+        assert_eq!(row.raw_text, "", "the post says nothing");
+        assert_eq!(
+            attachment_ids(&entity),
+            vec![second_upload.id.to_string(), first_upload.id.to_string()],
+            "the entity answers the attachments in the requested order"
+        );
+
+        let second = media_row(pool, second_upload.id).await;
+        assert_eq!(
+            second.status_id,
+            Some(row.id),
+            "the newest upload went first"
+        );
+        assert_eq!(second.position, 0, "at position zero");
+        let first = media_row(pool, first_upload.id).await;
+        assert_eq!(first.status_id, Some(row.id), "and the oldest follows it");
+        assert_eq!(first.position, 1, "at the position the list gave it");
+    }
+
+    #[tokio::test]
+    async fn media_the_poster_cannot_claim_refuses_the_whole_post() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "alice").await;
+        let bob = user(pool, "bob").await;
+        let foreign = upload(pool, &bob).await;
+        let first_post = created(&app_state, &alice, posted("mine already stands")).await;
+        let first_id = Uuid::parse_str(&first_post.id).expect("an id");
+        let claimed = media_attachment::insert(
+            pool,
+            &NewMediaAttachment {
+                user_id: Some(alice.id),
+                status_id: Some(first_id),
+                url: format!("{BASE}/media/fixture.png"),
+                content_type: "image/png".to_owned(),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .expect("a fixture attachment inserts")
+        .id;
+
+        for (what, id) in [
+            ("somebody else's upload", foreign.id),
+            ("media a status already claims", claimed),
+            ("an id no row holds", Uuid::now_v7()),
+        ] {
+            let mine = upload(pool, &alice).await;
+            let body = with_media("hi", &[&mine.id.to_string(), &id.to_string()]);
+            let err = create_status(&app_state, &alice, None, body)
+                .await
+                .expect_err("the unclaimable id above refuses the post");
+            refused(&wire(err).await, BAD_MEDIA_ID);
+            let mut live = live_ids(pool).await;
+            assert_eq!(live.len(), 1, "{what}: the refused post wrote no row");
+            assert_eq!(live.pop().expect("the one live id"), first_id);
+            assert_eq!(
+                media_row(pool, mine.id).await.status_id,
+                None,
+                "{what}: and the claimable upload rode the rollback out with it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_visibility_can_carry_attachments() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "alice").await;
+
+        for name in ["public", "unlisted", "private", "direct", "local"] {
+            let mine = upload(pool, &alice).await;
+            let entity = create_status(
+                &app_state,
+                &alice,
+                None,
+                CreateStatusParams {
+                    visibility: Some(name.to_owned()),
+                    ..with_media("a picture with words", &[&mine.id.to_string()])
+                },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("`{name}` posts with media: {err}"));
+            assert_eq!(
+                entity.visibility, name,
+                "`{name}` stands as asked, attachments and all"
+            );
+            assert_eq!(
+                attachment_ids(&entity),
+                vec![mine.id.to_string()],
+                "`{name}` answers its attachment"
+            );
+            assert_eq!(
+                media_row(pool, mine.id).await.status_id,
+                Uuid::parse_str(&entity.id).ok(),
+                "`{name}` claimed the row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_create_restates_the_status_and_its_media() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "alice").await;
+        let mine = upload(pool, &alice).await;
+
+        let first = create_status_idempotent(
+            &app_state,
+            &alice,
+            None,
+            with_media("once", &[&mine.id.to_string()]),
+            "media-key",
+        )
+        .await
+        .expect("the keyed create posts");
+        let again = create_status_idempotent(
+            &app_state,
+            &alice,
+            None,
+            with_media("ignored", &[]),
+            "media-key",
+        )
+        .await
+        .expect("the replay answers");
+
+        assert_eq!(again.id, first.id, "one key, one status");
+        assert_eq!(
+            attachment_ids(&again),
+            attachment_ids(&first),
+            "and the replay restates its attachments"
+        );
+        assert_eq!(live_ids(pool).await.len(), 1, "no second row");
+        assert_eq!(media_row(pool, mine.id).await.position, 0, "claimed once");
     }
 }

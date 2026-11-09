@@ -72,7 +72,18 @@
 //! deleted or poster-invisible parent is the same 404 the show route
 //! answers, and a reblog row folds to its original) and inherits the
 //! thread, author link, capped visibility, fallback language and
-//! auto-mentions described in that module.
+//! auto-mentions described in that module. And `media_ids` — decision 10's
+//! id-array, JSON's `["a","b"]` or the form's `media_ids[]=a` — posts with
+//! attachments: at most [`Config::max_media_attachments`] of them (422
+//! `Too many attachments`), each one the poster's own upload no status has
+//! claimed (422 `Media not found` for an unknown, foreign or already-used
+//! id), claimed for the post on the insert's own transaction at the order
+//! the body asked for and answered back in the entity's
+//! `media_attachments`. A post that carries at least one attachment may
+//! leave its text empty, and attachments ride every visibility, `direct`
+//! included.
+//!
+//! [`Config::max_media_attachments`]: crate::config::Config::max_media_attachments
 //!
 //! [`ApiParams`]: crate::extract::ApiParams
 //! [`IdempotencyPlug`]: crate::models::idempotency_key
@@ -662,10 +673,12 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
 /// and the `write:statuses` check; [`AppError::RateLimited`] from the
 /// bucket; whatever [`create_status::create_status`] refuses — 422 for an
-/// empty text, an over-long status, an over-long warning, an unknown
-/// `visibility`, an unknown `content_type` or an `expires_in` under the
-/// instance's floor or past the calendar — plus the extractor's own 422
-/// for an `expires_in` that is no integer — plus its own database
+/// empty text over no attachments, an over-long status, an over-long
+/// warning, an unknown `visibility`, an unknown `content_type`, more
+/// `media_ids` than the instance's attachment limit, a `media_ids` entry
+/// the poster may not claim, or an `expires_in` under the instance's floor
+/// or past the calendar — plus the extractor's own 422 for an `expires_in`
+/// that is no integer — plus its own database
 /// failures as [`AppError::Database`]. An `in_reply_to_id` naming no
 /// status the poster may see — malformed, unknown, deleted or invisible —
 /// is the shared 404 `{"error":"Record not found"}`, exactly the show

@@ -21,7 +21,7 @@ All configuration comes from environment variables. For local development, copy 
 | `CONTACT_EMAIL` | no | | Admin contact email |
 | `INSTANCE_LANGUAGES` | no | `en` | Comma-separated content language codes |
 | `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status; `POST /api/v1/statuses` counts them the way clients do (each bare URL is worth 23) and refuses a longer post with 422 `{"error":"The status is over the character limit"}` |
-| `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
+| `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status; `POST /api/v1/statuses` refuses a body whose `media_ids` array is longer with 422 `{"error":"Too many attachments"}` |
 | `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
 | `MAX_CHAT_MESSAGE_CHARS` | no | `5000` | Maximum characters per chat message; longer posted content is refused with 400 |
 | `MAX_MEDIA_DESCRIPTION` | no | `1500` | Maximum characters in a media attachment's description (alt text); `PUT /api/v1/media/{id}` refuses longer values with 422 |

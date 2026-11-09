@@ -12,15 +12,17 @@
 //! [`status_id`](MediaAttachment::status_id) is a foreign key into
 //! `statuses` (added by the statuses migration) and cascades on a hard
 //! delete. [`attach_to_status`] is the only writer that claims media for a
-//! status after the fact, and it attaches exactly the rows the given user
-//! owns that no status has claimed yet.
+//! status after the fact: it attaches exactly the rows the given user owns
+//! that no status has claimed yet, each one at the position its id holds in
+//! the requested list, so the array a client posted is the order the status
+//! renders its attachments in.
 //!
 //! [`insert`] mints the primary key (`UUIDv7`, decision 4); everything
 //! else comes from a [`NewMediaAttachment`], whose
 //! [`Default`](NewMediaAttachment::default) mirrors the column defaults.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -250,15 +252,38 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<MediaAttachm
     Ok(attachments)
 }
 
+/// The 422 wording for a media id the endpoint refuses.
+///
+/// An id with no row, one that names somebody else's upload and one a
+/// status already claims are all the same answer, so a probe never learns
+/// which of the three a foreign id was.
+pub const MEDIA_NOT_FOUND: &str = "Media not found";
+
+/// The [`attach_to_status`] write: every id in `ids` whose row `user_id`
+/// owns and no status has claimed takes the position its id holds in the
+/// list. The ordinality is one-based, the column counts from zero, and an id
+/// submitted twice claims its row once — at its first position.
+const ATTACH_SQL: &str = "UPDATE media_attachments m
+      SET status_id = $2, position = v.position, updated_at = now()
+     FROM (
+        SELECT id, (MIN(ord) - 1)::int AS position
+          FROM UNNEST($1::uuid[]) WITH ORDINALITY AS t(id, ord)
+         GROUP BY id
+     ) v
+    WHERE m.id = v.id AND m.user_id = $3 AND m.status_id IS NULL";
+
 /// Attaches every row `ids` names that user `user_id` owns and that no
-/// status has claimed yet to `status_id`, reporting how many rows went.
+/// status has claimed yet to `status_id`, each one at the position its id
+/// holds in `ids`, reporting how many rows went.
 ///
 /// This is the ownership gate for posting media: rows belonging to
 /// another user (or with no user at all), rows already attached to any
 /// status and ids with no row are all left untouched, so a client can
 /// neither steal foreign media nor move media between statuses behind a
 /// status's back. Callers that must reject foreign ids outright compare
-/// the count against `ids.len()`.
+/// the count against `ids.len()` — see [`crate::models::status::insert_conn`],
+/// which claims a fresh post's media on its own transaction and answers a
+/// short count with [`MEDIA_NOT_FOUND`].
 ///
 /// `status_id` names a row of `statuses` (the foreign key the statuses
 /// migration added), so an unknown status fails the whole write rather
@@ -268,23 +293,22 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<MediaAttachm
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn attach_to_status(
-    pool: &PgPool,
+pub async fn attach_to_status<'e, E>(
+    executor: E,
     ids: &[Uuid],
     status_id: Uuid,
     user_id: Uuid,
-) -> AppResult<u64> {
+) -> AppResult<u64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let ids = ids.to_vec();
-    let updated = sqlx::query(
-        "UPDATE media_attachments
-            SET status_id = $2, updated_at = now()
-          WHERE id = ANY($1) AND user_id = $3 AND status_id IS NULL",
-    )
-    .bind(&ids)
-    .bind(status_id)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+    let updated = sqlx::query(ATTACH_SQL)
+        .bind(&ids)
+        .bind(status_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?;
     Ok(updated.rows_affected())
 }
 
@@ -831,6 +855,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(empty, 0, "no ids attach nothing");
+    }
+
+    /// The order the attach writes is the order the ids arrive in, not the
+    /// order the rows were uploaded in — and an id sent twice claims its row
+    /// once, at its first position.
+    #[tokio::test]
+    async fn attach_to_status_keeps_the_requested_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let first = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let second = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let third = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let posted = create_status(&pool, &alice).await;
+
+        let attached =
+            attach_to_status(&pool, &[third.id, first.id, third.id], posted.id, alice.id)
+                .await
+                .unwrap();
+        assert_eq!(attached, 2, "the repeated id claims its row once");
+        assert_eq!(fetch(&pool, third.id).await.position, 0);
+        assert_eq!(fetch(&pool, first.id).await.position, 1);
+        assert_eq!(
+            fetch(&pool, second.id).await.status_id,
+            None,
+            "an id the list never named stays unposted"
+        );
+
+        let rows = for_statuses(&pool, &[posted.id]).await.unwrap();
+        let order: Vec<Uuid> = rows
+            .get(&posted.id)
+            .expect("the status answers its attachments")
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            order,
+            vec![third.id, first.id],
+            "and the render order is the order the client asked for"
+        );
     }
 
     /// The foreign key this ticket added: `status_id` names a stored status,

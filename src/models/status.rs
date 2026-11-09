@@ -59,7 +59,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{hashtag, mention, user::User},
+    models::{hashtag, media_attachment, mention, user::User},
     pagination::PageParams,
     util::{entities::extract_hashtags, format::text_to_html, id::new_id},
 };
@@ -303,6 +303,13 @@ pub struct NewStatus {
     /// [`extract_hashtags`] of the text; a remote status's caller fills
     /// them from the activity's `tag` list.
     pub hashtags: Vec<String>,
+    /// Media the poster claims for this status, in the order they want them
+    /// to render: [`insert`] attaches these rows on its own transaction
+    /// through [`crate::models::media_attachment::attach_to_status`], each
+    /// one at its position in this list, and refuses the whole write when
+    /// any id names a row the poster may not claim (see
+    /// [`media_attachment::MEDIA_NOT_FOUND`]); empty in the default.
+    pub media_ids: Vec<Uuid>,
     /// Whether this instance owns the post; `false` in the default, as in
     /// [`NewUser`](crate::models::user::NewUser).
     pub local: bool,
@@ -342,6 +349,7 @@ impl Default for NewStatus {
             quote_of_id: None,
             mentioned_user_ids: Vec::new(),
             hashtags: Vec::new(),
+            media_ids: Vec::new(),
             local: false,
             application_name: None,
             application_website: None,
@@ -613,7 +621,11 @@ const CLEAR_PINS_SQL: &str = "DELETE FROM pinned_statuses WHERE status_id = $1";
 /// is linked to the new row (see [`crate::models::mention`]) and every
 /// usable tag in [`hashtags`](NewStatus::hashtags) is upserted and linked
 /// (see [`crate::models::hashtag`]), so a status and its mentions and tags
-/// appear together or not at all.
+/// appear together or not at all. The rows named by
+/// [`media_ids`](NewStatus::media_ids) are claimed for the new status in
+/// that same transaction, at their list positions
+/// (see [`crate::models::media_attachment`]); a media id the poster may not
+/// claim refuses the whole write.
 ///
 /// # Errors
 ///
@@ -622,7 +634,10 @@ const CLEAR_PINS_SQL: &str = "DELETE FROM pinned_statuses WHERE status_id = $1";
 /// remote status, a duplicate `uri`, an unknown author, parent or original,
 /// or an unknown mentioned account arrives as the not-null, unique or
 /// foreign-key violation the database reports — and the rollback takes the
-/// half-written status with it.
+/// half-written status with it. A media id the poster does not own, that no
+/// row holds or that another status already claims is
+/// [`AppError::Unprocessable`] — the same rollback, the same refusal the
+/// status endpoints answer the id with.
 pub async fn insert(pool: &PgPool, base_url: &str, new_status: &NewStatus) -> AppResult<Status> {
     let mut tx = pool.begin().await?;
     let status = insert_conn(&mut tx, base_url, new_status).await?;
@@ -650,10 +665,53 @@ pub async fn insert_conn(
 ) -> AppResult<Status> {
     let parent = parent_conversation(conn, new_status.in_reply_to_id).await?;
     let status = write_status(conn, base_url, new_status, parent).await?;
+    claim_media(conn, new_status, status.id).await?;
     mention::link_conn(conn, status.id, &new_status.mentioned_user_ids).await?;
     hashtag::link_names_conn(conn, status.id, &new_status.hashtags).await?;
     count_new_post(conn, &status).await?;
     Ok(status)
+}
+
+/// [`insert_conn`]'s media arm: the rows [`NewStatus::media_ids`] names are
+/// claimed for the just-written status on the same transaction, each one at
+/// the position its id holds in the list, through
+/// [`media_attachment::attach_to_status`].
+///
+/// The attach's own gate is the validation: an id with no row, one that
+/// names somebody else's upload and one a status already claims leave their
+/// row untouched, so a short count is a body that asked for media its poster
+/// may not post — refused with the 422 [`media_attachment::MEDIA_NOT_FOUND`]
+/// wording, and the caller's `?` takes the half-written status down with it.
+/// A media id that raced here (claimed between the body's read and this
+/// write) answers the same refusal. No ids is no query at all.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] for a count the poster's own unclaimed rows
+/// cannot fill; any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn claim_media(
+    conn: &mut PgConnection,
+    new_status: &NewStatus,
+    status_id: Uuid,
+) -> AppResult<()> {
+    if new_status.media_ids.is_empty() {
+        return Ok(());
+    }
+    let attached = media_attachment::attach_to_status(
+        &mut *conn,
+        &new_status.media_ids,
+        status_id,
+        new_status.user_id,
+    )
+    .await?;
+    let wanted = u64::try_from(new_status.media_ids.len()).unwrap_or(u64::MAX);
+    if attached != wanted {
+        return Err(AppError::Unprocessable(
+            media_attachment::MEDIA_NOT_FOUND.to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fetches the live status whose primary key is `id`, `None` when no row
@@ -3111,6 +3169,113 @@ mod tests {
             entry_ids(&after),
             vec![all[0], all[2]],
             "a withdrawn boost leaves the page"
+        );
+    }
+
+    /// A [`NewStatus`] by `author` carrying `media_ids` — the shape a local
+    /// post travels with when its body names attachments.
+    fn posting_with_media(author: &User, media_ids: Vec<Uuid>) -> NewStatus {
+        NewStatus {
+            media_ids,
+            ..NewStatus::local(author, "pictures ride along")
+        }
+    }
+
+    /// One unattached upload by `owner`, as the row `media_ids` names.
+    async fn upload(pool: &PgPool, owner: &User) -> MediaAttachment {
+        media_attachment::insert(
+            pool,
+            &NewMediaAttachment {
+                user_id: Some(owner.id),
+                url: format!("{BASE}/media/fixture.png"),
+                content_type: "image/png".to_owned(),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .expect("a fixture upload inserts")
+    }
+
+    /// The media arm of [`insert`]: the named rows the author owns and no
+    /// status has claimed are taken on the insert's own transaction, each
+    /// at the position its id holds in the list; one id the author may not
+    /// claim refuses the whole write — no status row, no half-claimed
+    /// media.
+    #[tokio::test]
+    async fn insert_claims_its_media_and_a_short_count_refuses_the_write() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let first = upload(&pool, &alice).await;
+        let second = upload(&pool, &alice).await;
+
+        let status = insert(
+            &pool,
+            BASE,
+            &posting_with_media(&alice, vec![second.id, first.id]),
+        )
+        .await
+        .expect("the author's own unposted media is claimable");
+        let rows = media_attachment::for_statuses(&pool, &[status.id])
+            .await
+            .unwrap();
+        let claimed = rows.get(&status.id).expect("the media came with it");
+        assert_eq!(
+            claimed.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![second.id, first.id],
+            "the render order is the order the list asked for"
+        );
+        assert_eq!(
+            claimed.iter().map(|row| row.position).collect::<Vec<_>>(),
+            vec![0, 1],
+            "and each row holds its list position"
+        );
+
+        let foreign = upload(&pool, &bob).await;
+        let live_before: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM statuses WHERE deleted_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let err = insert(
+            &pool,
+            BASE,
+            &posting_with_media(&alice, vec![first.id, foreign.id]),
+        )
+        .await
+        .expect_err("a foreign id refuses the write");
+        assert!(
+            matches!(&err, AppError::Unprocessable(message)
+                if message == media_attachment::MEDIA_NOT_FOUND),
+            "the refusal is the 422 `Media not found`"
+        );
+        let live_after: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM statuses WHERE deleted_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            live_after.0, live_before.0,
+            "the refused write rolled its own status row back"
+        );
+        assert_eq!(
+            media_attachment::get_by_id(&pool, first.id)
+                .await
+                .unwrap()
+                .expect("the row stays")
+                .status_id,
+            Some(status.id),
+            "the refused write moved the already-claimed row nowhere"
+        );
+        assert!(
+            media_attachment::get_by_id(&pool, foreign.id)
+                .await
+                .unwrap()
+                .expect("the row stays")
+                .status_id
+                .is_none(),
+            "and touched nothing else either"
         );
     }
 }
