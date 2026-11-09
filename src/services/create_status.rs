@@ -37,6 +37,19 @@
 //! [`crate::models::status_edit::update_status`] writes the whole edit as
 //! one transaction.
 //!
+//! Two more arms of `POST /api/v1/statuses` live here because they are
+//! decisions about the same body. [`create_status_idempotent`] is the
+//! `Idempotency-Key` arm: a claimed key answers the status it created
+//! without writing anything, and a fresh one claims its row inside the
+//! status's own transaction with `ON CONFLICT DO NOTHING`, so a race of two
+//! creates under one key leaves exactly one status (the loser rolls its
+//! write back and restates the winner — see
+//! [`crate::models::idempotency_key`]). [`preview_status`] is the `preview`
+//! arm: the whole `check_body`/`rendered_fields` pipeline runs, but
+//! nothing is written and no hook fires — the [`Status`] entity a create
+//! would have answered is built in memory from a minted id, `now()` and
+//! zero counters.
+//!
 //! [`Status`]: crate::entities::status::Status
 //! [`status::insert`]: crate::models::status::insert
 //!
@@ -49,15 +62,21 @@
 
 use std::collections::HashMap;
 
+use chrono::Utc;
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
     config::Config,
-    entities::status::Status,
+    entities::{
+        account::JsonBool,
+        status::{Status, StatusSource},
+    },
     error::{AppError, AppResult},
     models::{
+        hashtag::Hashtag,
+        idempotency_key,
         oauth_app::OauthApp,
         status::{self, DEFAULT_CONTENT_TYPE, NewStatus, Visibility},
         status_edit,
@@ -68,7 +87,7 @@ use crate::{
     util::{
         entities::{MentionRef, extract_hashtags, linkify_entities},
         format::{render_content, status_length},
-        id::parse_id,
+        id::{new_id, parse_id},
     },
 };
 
@@ -137,6 +156,27 @@ pub struct CreateStatusParams {
     /// absent.
     #[serde(default)]
     content_type: Option<String>,
+    /// Whether this is a preview: validate and render, answer the entity a
+    /// create would have, write nothing — see [`preview_status`]. Absent,
+    /// null and every [`flex`] false spelling are a real post.
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
+    preview: Option<bool>,
+}
+
+impl CreateStatusParams {
+    /// Whether this body asks for a preview ([`preview_status`]) rather
+    /// than a post: the submitted flag, `false` when the body leaves it
+    /// out, sends `null`, or spells any of the [`flex`] false forms. The
+    /// endpoint asks this before it decides which service arm to run; the
+    /// field itself plays no part in [`check_body`]'s validation.
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[must_use]
+    pub const fn previews(&self) -> bool {
+        matches!(self.preview, Some(true))
+    }
 }
 
 /// A checked status body: what [`check_body`] resolved, borrowed from the
@@ -355,6 +395,20 @@ pub async fn create_status(
         &new_status(user, app, &checked, &entities),
     )
     .await?;
+    created_entity(state, user, row).await
+}
+
+/// The shared tail of both create arms: the fresh row's log line, its
+/// [`Status`] entity as `user` — the author — sees it, and the
+/// [`after_status_created`] hook every consumer of a new post hangs off.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] for the one row this module wrote that the
+/// renderer refuses to answer (unreachable for a fresh local post, which is
+/// neither a tombstone nor a reblog); any database failure behind the render
+/// arrives through `?` as [`AppError::Database`].
+async fn created_entity(state: &AppState, user: &User, row: status::Status) -> AppResult<Status> {
     debug!(
         status = %row.id,
         user = %user.id,
@@ -369,6 +423,242 @@ pub async fn create_status(
         .ok_or_else(|| AppError::Internal(format!("the status {} did not render", row.id)))?;
     after_status_created(state, &entity);
     Ok(entity)
+}
+
+/// Creates the status `params` describes under the request's
+/// `Idempotency-Key`, or restates the one that key already created.
+///
+/// When the pair `(user, key)` already names a live status, that status's
+/// entity is the whole answer (200 for the endpoint as everywhere here):
+/// nothing is checked beyond the key, nothing is written, and no hook fires
+/// a second time. Otherwise the create runs exactly as [`create_status`]
+/// does, with one more statement on its transaction: the key is claimed
+/// around the freshly written status with `ON CONFLICT DO NOTHING` (see
+/// [`idempotency_key::claim`]), so two requests racing under one key
+/// serialize on that insert. The winner commits its own status; the loser
+/// finds the pair taken, rolls its write back without a trace and answers
+/// the winner's entity. The third arm — the pair is taken but its status has
+/// been deleted since — moves the key onto the fresh status
+/// ([`idempotency_key::reassign`]), because a dead post is not a
+/// replay-able answer.
+///
+/// # Errors
+///
+/// Those of [`create_status`], plus [`AppError::NotFound`] for the one row
+/// a replayed render cannot answer (a status deleted in the window between
+/// the key read and the render).
+pub async fn create_status_idempotent(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    params: CreateStatusParams,
+    key: &str,
+) -> AppResult<Status> {
+    if let Some(row) = idempotency_key::live_status(&state.db, user.id, key).await? {
+        debug!(
+            status = %row.id,
+            user = %user.id,
+            "status reposted from its idempotency key"
+        );
+        return replayed_entity(state, user, &row).await;
+    }
+    let checked = check_body(
+        &state.config,
+        &user.default_scope,
+        user.sensitive_default.get(),
+        &params,
+    )?;
+    let entities = render_status_fields(state, checked.text, checked.content_type).await?;
+    let mut tx = state.db.begin().await?;
+    let row = status::insert_conn(
+        &mut tx,
+        &state.config.base_url,
+        &new_status(user, app, &checked, &entities),
+    )
+    .await?;
+    if idempotency_key::claim(&mut tx, user.id, key, row.id).await? {
+        tx.commit().await?;
+        return created_entity(state, user, row).await;
+    }
+    // The pair is taken — by a create that raced this one, or by a status
+    // since deleted. Whichever, the re-read on this open transaction says
+    // which, because a skipped `DO NOTHING` only ever names committed rows.
+    if let Some(winner) = idempotency_key::live_status_conn(&mut tx, user.id, key).await? {
+        // Ours never happened: the racing create's row is the key's answer,
+        // and our uncommitted write goes back with this rollback.
+        discard(tx).await;
+        debug!(
+            status = %winner.id,
+            user = %user.id,
+            "status reposted from a raced idempotency key"
+        );
+        return replayed_entity(state, user, &winner).await;
+    }
+    idempotency_key::reassign(&mut tx, user.id, key, row.id).await?;
+    tx.commit().await?;
+    created_entity(state, user, row).await
+}
+
+/// Rolls back the transaction of a create that lost its key race, logging a
+/// rollback that failed: the answer the caller is about to return needs
+/// nothing of ours, and a connection that dies before its `ROLLBACK` takes
+/// the uncommitted write with it anyway.
+async fn discard(tx: sqlx::Transaction<'_, sqlx::Postgres>) {
+    if let Err(err) = tx.rollback().await {
+        warn!(
+            %err,
+            "idempotent status create could not roll its losing write back"
+        );
+    }
+}
+
+/// Renders an already-stored status — the key's answer — as `user`, its
+/// author, sees it: the create's render with no write and no hook behind it,
+/// and a status that vanished between the key read and here is the 404.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] for a row the renderer cannot answer; any
+/// database failure arrives through `?` as [`AppError::Database`].
+async fn replayed_entity(state: &AppState, user: &User, row: &status::Status) -> AppResult<Status> {
+    render_status(state, Some(user), row)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+/// Builds the [`Status`] entity `params` describes **without writing
+/// anything**.
+///
+/// Every check [`create_status`] runs, the same render with its mentions
+/// resolved and its tags extracted, and an entity whose `id` is a freshly
+/// minted `UUIDv7` (decision 4), whose `created_at` is now and whose
+/// counters are zero — Pleroma's `preview` parameter, whose
+/// `ActivityPub.create(changes, true)` answers the draft activity and
+/// persists none of it.
+///
+/// Nothing touches `statuses`, `status_mentions` or the hashtag tables, no
+/// counter moves, no key is claimed and `after_status_created` never
+/// fires. The one read the preview does perform is the mention lookup —
+/// [`render_status_fields`]'s own, network fetch of an unknown remote
+/// account included, since the rendered content is only honest if the
+/// mention links are.
+///
+/// # Errors
+///
+/// Those of [`create_status`]'s checks and render: every refusal
+/// [`check_body`] owes the submitted body arrives unchanged, so a preview
+/// that would not post is refused exactly as the post would be.
+pub async fn preview_status(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    params: &CreateStatusParams,
+) -> AppResult<Status> {
+    let checked = check_body(
+        &state.config,
+        &user.default_scope,
+        user.sensitive_default.get(),
+        params,
+    )?;
+    let found = resolve_mentions(state, checked.text).await?;
+    let fields = rendered_fields(state, checked.text, checked.content_type, &found);
+    let mentioned: Vec<User> = found.into_iter().map(|(_, account)| account).collect();
+    let tags = preview_tags(&fields.hashtags);
+    let row = preview_row(state, user, app, &checked, &fields);
+    debug!(
+        status = %row.id,
+        user = %user.id,
+        "status previewed"
+    );
+    Ok(Status::from_source(
+        StatusSource {
+            row: &row,
+            author: user,
+            reply_author: None,
+            media: &[],
+            mentions: &mentioned,
+            tags: &tags,
+            reactions: &[],
+            favourited: false,
+            reblogged: JsonBool(false),
+            bookmarked: false,
+            bookmark_folder: None,
+            pinned_at: None,
+            muted: JsonBool(false),
+            reblog: None,
+        },
+        Some(user),
+        None,
+        &state.config,
+    ))
+}
+
+/// The `tags` entries a preview renders: one per usable name
+/// [`extract_hashtags`] folded, deduplicated and in the name order
+/// [`crate::models::hashtag::for_statuses`] reads stored tags back in. The
+/// rows are fabricated — no `hashtags` row is written for a preview — and
+/// only the name the entity renders off them is meaningful.
+fn preview_tags(names: &[String]) -> Vec<Hashtag> {
+    let created_at = Utc::now();
+    let mut unique: Vec<String> = names.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    unique
+        .into_iter()
+        .map(|name| Hashtag {
+            id: new_id(),
+            name,
+            inserted_at: created_at,
+        })
+        .collect()
+}
+
+/// The in-memory row a preview renders: a fresh id with the `uri`, `url` and
+/// `conversation_id` [`status::insert`] would derive from it (decision 6),
+/// every column the checked body decided, zero counters, no links to any
+/// other status and `now()` for both timestamps. It is the row a create of
+/// this body would have stored — except that it will never be stored.
+fn preview_row(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    checked: &Checked<'_>,
+    fields: &RenderedFields,
+) -> status::Status {
+    let id = new_id();
+    let now = Utc::now();
+    let base = state.config.base_url.as_str();
+    status::Status {
+        id,
+        uri: format!("{base}/objects/{id}"),
+        url: Some(format!("{base}/notice/{id}")),
+        user_id: user.id,
+        content: fields.content.clone(),
+        raw_text: checked.text.to_owned(),
+        content_type: checked.content_type.to_owned(),
+        spoiler_text: checked.spoiler_text.to_owned(),
+        sensitive: checked.sensitive,
+        visibility: checked.visibility,
+        language: checked.language.map(str::to_owned),
+        in_reply_to_id: None,
+        in_reply_to_account_id: None,
+        in_reply_to_ap_id: None,
+        conversation_id: id,
+        reblog_of_id: None,
+        quote_of_id: None,
+        local: true,
+        application_name: app.map(|found| found.client_name.clone()),
+        application_website: app.and_then(|found| found.website.clone()),
+        replies_count: 0,
+        reblogs_count: 0,
+        favourites_count: 0,
+        quotes_count: 0,
+        edited_at: None,
+        deleted_at: None,
+        expires_at: None,
+        inserted_at: now,
+        updated_at: now,
+    }
 }
 
 /// Renders one status text the way this instance stores it.
@@ -400,17 +690,32 @@ pub async fn render_status_fields(
     content_type: &str,
 ) -> AppResult<RenderedFields> {
     let found = resolve_mentions(state, text).await?;
+    Ok(rendered_fields(state, text, content_type, &found))
+}
+
+/// The pure half of [`render_status_fields`]: the same HTML, the same
+/// mentioned ids and the same tags, for mentions a caller has already
+/// resolved. [`preview_status`] keeps the resolved rows beside the fields
+/// (its entity renders the mentioned accounts themselves), so the split is
+/// the preview's, not the create's — for `create_status` and `edit_status`
+/// this is the step [`render_status_fields`] runs after its lookup.
+fn rendered_fields(
+    state: &AppState,
+    text: &str,
+    content_type: &str,
+    found: &[(MentionRef, User)],
+) -> RenderedFields {
     let urls: HashMap<String, String> = found
         .iter()
         .map(|(mention, account)| (mention_key(mention), profile_url(account)))
         .collect();
     let link = |mention: &MentionRef| urls.get(&mention_key(mention)).cloned();
     let html = render_content(text, content_type);
-    Ok(RenderedFields {
+    RenderedFields {
         content: linkify_entities(&html, &link, &state.config.base_url),
         mentioned_user_ids: found.iter().map(|(_, account)| account.id).collect(),
         hashtags: extract_hashtags(text),
-    })
+    }
 }
 
 /// The URL a mention links to: the stored [`profile_url`](User::profile_url)
@@ -521,6 +826,9 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         visibility: Some(row.visibility.as_str().to_owned()),
         language: params.language.clone().or_else(|| row.language.clone()),
         content_type: kept(params.content_type.clone(), || row.content_type.clone()),
+        // An edit is never a preview and never replays: the create's two
+        // decision parameters have no part in this merge.
+        preview: None,
     }
 }
 
@@ -1384,8 +1692,8 @@ mod tests {
             client_secret: "client-secret".to_owned(),
             trusted: false,
             user_id: Some(alice.id),
-            inserted_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            inserted_at: Utc::now(),
+            updated_at: Utc::now(),
         };
 
         let entity = create_status(&app_state, &alice, Some(&app), posted("from a client"))
@@ -1737,5 +2045,401 @@ mod tests {
             .expect("the fixture post is stored");
         assert_eq!(stored.content, "<p>untouched</p>", "or moved the row");
         assert!(stored.edited_at.is_none(), "or stamped it either");
+    }
+
+    // ────────────  the Idempotency-Key and preview arms  ────────────
+
+    /// How many `idempotency_keys` rows the database holds: one per create
+    /// that claimed a key, none for a replay or a preview.
+    async fn key_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_keys")
+            .fetch_one(pool)
+            .await
+            .expect("the count reads")
+    }
+
+    /// The ids of every live status in the database, sorted: what a replay
+    /// leaves untouched and a fresh create grows by exactly one.
+    async fn live_ids(pool: &PgPool) -> Vec<Uuid> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM statuses WHERE deleted_at IS NULL ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("the ids read")
+    }
+
+    /// A post through the idempotency arm, as `author` under `key`.
+    async fn keyed(state: &AppState, author: &User, text: &str, key: &str) -> Status {
+        create_status_idempotent(state, author, None, posted(text), key)
+            .await
+            .expect("the keyed post creates")
+    }
+
+    /// Claim `key` for `status_id` outside any create — the row a racing
+    /// request would have committed before this test's create looks.
+    async fn claimed_for(pool: &PgPool, author: &User, key: &str, status_id: Uuid) {
+        let mut tx = pool.begin().await.expect("a transaction opens");
+        let claimed = idempotency_key::claim(&mut tx, author.id, key, status_id)
+            .await
+            .expect("the claim runs");
+        assert!(claimed, "the fixture pair was free");
+        tx.commit().await.expect("the claim commits");
+    }
+
+    /// A plain stored post, written straight through the model: the test's
+    /// stand-in for a create whose key was claimed in an earlier life.
+    async fn stored_post(pool: &PgPool, author: &User, text: &str) -> status::Status {
+        status::insert(pool, BASE, &NewStatus::local(author, text))
+            .await
+            .expect("the fixture post inserts")
+    }
+
+    #[tokio::test]
+    async fn the_same_key_replays_the_status_it_created() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "keyed-once").await;
+
+        let first = keyed(&app_state, &alice, "keyed once", "k1").await;
+        let second = keyed(&app_state, &alice, "a different second body", "k1").await;
+
+        assert_eq!(
+            first.id, second.id,
+            "one key, one status, the same id answered twice"
+        );
+        assert_eq!(
+            second.content, "<p>keyed once</p>",
+            "the replay restates the status the key created — the second \
+             body is not even looked at"
+        );
+        assert_eq!(
+            live_ids(pool).await,
+            vec![Uuid::parse_str(&first.id).expect("the entity carries its id")],
+            "and exactly one row was ever written"
+        );
+        assert_eq!(key_rows(pool).await, 1, "one claim stands");
+        let counted = crate::models::user::get_by_id(pool, alice.id)
+            .await
+            .unwrap()
+            .expect("the author exists");
+        assert_eq!(counted.statuses_count, 1, "counted once");
+    }
+
+    #[tokio::test]
+    async fn different_keys_create_their_own_statuses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "keyed-twice").await;
+
+        let first = keyed(&app_state, &alice, "one", "k1").await;
+        let second = keyed(&app_state, &alice, "two", "k2").await;
+
+        assert_ne!(first.id, second.id, "two keys are two posts");
+        assert_eq!(live_ids(pool).await.len(), 2, "and two rows stand");
+        assert_eq!(key_rows(pool).await, 2, "each with its own claim");
+    }
+
+    #[tokio::test]
+    async fn one_key_belongs_to_its_author_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "sharp").await;
+        let bob = user(pool, "echo").await;
+
+        let mine = keyed(&app_state, &alice, "alice's", "shared").await;
+        let theirs = keyed(&app_state, &bob, "bob's", "shared").await;
+
+        assert_ne!(
+            mine.id, theirs.id,
+            "the same key text is one key per account"
+        );
+        let again = keyed(&app_state, &alice, "ignored", "shared").await;
+        assert_eq!(again.id, mine.id, "and each account replays its own status");
+        assert_eq!(key_rows(pool).await, 2, "two claims, one per pair");
+    }
+
+    #[tokio::test]
+    async fn a_key_claimed_by_another_writer_answers_its_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "late").await;
+        let winner = stored_post(pool, &alice, "the winner").await;
+        claimed_for(pool, &alice, "k1", winner.id).await;
+
+        let replay = keyed(&app_state, &alice, "the loser's body", "k1").await;
+
+        assert_eq!(
+            replay.id,
+            winner.id.to_string(),
+            "the committed claim is the key's answer"
+        );
+        assert_eq!(
+            live_ids(pool).await,
+            vec![winner.id],
+            "and the losing body created nothing of its own"
+        );
+        assert_eq!(key_rows(pool).await, 1, "the claim stands alone");
+    }
+
+    /// Two creates under one fresh key, driven concurrently from one task:
+    /// whichever arm the second request takes — pre-read replay or the
+    /// mid-transaction `ON CONFLICT` loss — exactly one status stands and
+    /// both callers answer it with the same id.
+    #[tokio::test]
+    async fn two_creates_racing_under_one_key_leave_one_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = user(pool, "racer").await;
+        let fixture = Arc::new((state(pool), alice));
+
+        let (first, second) = tokio::join!(
+            create_status_idempotent(&fixture.0, &fixture.1, None, posted("race one"), "k1"),
+            create_status_idempotent(&fixture.0, &fixture.1, None, posted("race two"), "k1"),
+        );
+        let one = first.expect("the first racer creates or replays");
+        let two = second.expect("the second racer creates or replays");
+
+        assert_eq!(
+            one.id, two.id,
+            "both callers are answered by the one status the key made"
+        );
+        assert_eq!(
+            live_ids(pool).await,
+            vec![Uuid::parse_str(&one.id).expect("an id")]
+        );
+        assert_eq!(key_rows(pool).await, 1, "one claim");
+        let counted = crate::models::user::get_by_id(pool, fixture.1.id)
+            .await
+            .unwrap()
+            .expect("the author exists");
+        assert_eq!(
+            counted.statuses_count, 1,
+            "the loser's rolled-back write counted nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_whose_status_was_deleted_creates_afresh() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "repeater").await;
+        let doomed = keyed(&app_state, &alice, "post and delete me", "k1").await;
+        let doomed_id = Uuid::parse_str(&doomed.id).expect("the entity carries its id");
+        let tombstone = status::soft_delete(pool, doomed_id)
+            .await
+            .expect("the delete runs")
+            .expect("the row was live");
+        assert!(
+            tombstone.deleted_at.is_some(),
+            "the mapped row is gone from the API"
+        );
+
+        let fresh = keyed(&app_state, &alice, "the next one", "k1").await;
+        let fresh_id = Uuid::parse_str(&fresh.id).expect("the entity carries its id");
+
+        assert_ne!(
+            fresh.id, doomed.id,
+            "a deleted status is no replay-able answer"
+        );
+        assert_eq!(
+            live_ids(pool).await,
+            vec![fresh_id],
+            "the fresh post is the only live row — and it moved the stale \
+             claim instead of colliding with it"
+        );
+        assert_eq!(key_rows(pool).await, 1, "still one mapping for the pair");
+        let restated = keyed(&app_state, &alice, "ignored", "k1").await;
+        assert_eq!(
+            restated.id, fresh.id,
+            "and the moved key now replays afresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_builds_the_whole_entity() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "looker").await;
+        let bob = user(pool, "bob").await;
+
+        let entity = preview_status(
+            &app_state,
+            &alice,
+            None,
+            &params(json!({
+                "status": "hi @bob and @nobody, see #Rust #rust",
+                "preview": true,
+            })),
+        )
+        .await
+        .expect("the preview builds");
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        let id = Uuid::parse_str(&entity.id).expect("the preview carries its id");
+
+        assert!(!id.is_nil(), "a freshly minted id");
+        assert_eq!(value["id"], id.to_string());
+        assert_eq!(
+            value["uri"],
+            format!("{BASE}/objects/{id}"),
+            "the urls a create of this body would derive"
+        );
+        assert_eq!(value["url"], json!(format!("{BASE}/notice/{id}")));
+        assert_eq!(
+            value["content"],
+            format!(
+                "<p>hi {} and @nobody, see {} {}</p>",
+                mention_html(&bob.ap_id, "bob"),
+                hashtag_html(BASE, "rust"),
+                hashtag_html(BASE, "rust"),
+            ),
+            "the same render the create stores, mentions and tags linkified"
+        );
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "bob",
+                     "url": bob.ap_id, "acct": "bob" }]),
+            "the mentioned account is resolved into the entity"
+        );
+        assert_eq!(
+            value["tags"],
+            json!([{ "name": "rust", "url": format!("{BASE}/tags/rust") }]),
+            "and the tag once, folded, as the stored render answers it"
+        );
+        let age = (Utc::now() - entity.created_at).num_seconds();
+        assert!((0..120).contains(&age), "created now: {age}s ago");
+        assert_eq!(value["reblogs_count"], 0);
+        assert_eq!(value["favourites_count"], 0);
+        assert_eq!(value["replies_count"], 0);
+        assert_eq!(value["pleroma"]["quotes_count"], 0);
+        assert_eq!(value["account"]["acct"], "looker", "rendered as its author");
+        assert_eq!(
+            value["pleroma"]["content"],
+            json!({ "text/plain": "hi @bob and @nobody, see #Rust #rust" }),
+            "the source text beside the render"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_writes_no_row_anywhere() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "look-but-dont").await;
+        let bob = user(pool, "bob").await;
+
+        let entity = preview_status(
+            &app_state,
+            &alice,
+            None,
+            &params(json!({
+                "status": "hi @bob, see #Rust",
+                "preview": true,
+            })),
+        )
+        .await
+        .expect("the preview builds");
+        let id = Uuid::parse_str(&entity.id).expect("the preview carries its id");
+
+        assert!(live_ids(pool).await.is_empty(), "no status was written");
+        assert_eq!(key_rows(pool).await, 0, "no key was claimed");
+        let mentions: (i64,) = sqlx::query_as("SELECT count(*) FROM status_mentions")
+            .fetch_one(pool)
+            .await
+            .expect("the mention count reads");
+        let tags: (i64,) = sqlx::query_as("SELECT count(*) FROM hashtags")
+            .fetch_one(pool)
+            .await
+            .expect("the tag count reads");
+        let tag_links: (i64,) = sqlx::query_as("SELECT count(*) FROM status_hashtags")
+            .fetch_one(pool)
+            .await
+            .expect("the tag link count reads");
+        assert_eq!(
+            (mentions.0, tags.0, tag_links.0),
+            (0, 0, 0),
+            "no mention link, no tag row and no tag link were written — \
+             the mentions and tags the entity answers are resolved, not stored"
+        );
+        let counted = crate::models::user::get_by_id(pool, alice.id)
+            .await
+            .unwrap()
+            .expect("the author exists");
+        assert_eq!(counted.statuses_count, 0, "no count moved");
+        assert!(
+            status::get_by_id(pool, id).await.unwrap().is_none(),
+            "and the previewed id names no row"
+        );
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "bob",
+                     "url": bob.ap_id, "acct": "bob" }]),
+            "the entity resolves the mention although nothing links it"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_previews_of_one_body_are_two_fresh_ids() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "twice-seen").await;
+        let asked = params(json!({"status": "same words", "preview": "true"}));
+
+        let first = preview_status(&app_state, &alice, None, &asked)
+            .await
+            .expect("the first preview builds");
+        let second = preview_status(&app_state, &alice, None, &asked)
+            .await
+            .expect("the second preview builds");
+
+        assert_ne!(first.id, second.id, "every preview mints its own id");
+        assert_eq!(first.content, second.content, "and the same render");
+        assert!(live_ids(pool).await.is_empty(), "and neither wrote");
+    }
+
+    #[tokio::test]
+    async fn a_preview_refuses_what_a_creation_refuses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "wishful").await;
+
+        for (value, message) in [
+            (json!({"status": "  ", "preview": true}), EMPTY_STATUS),
+            (
+                json!({"status": "hi", "visibility": "sideways", "preview": true}),
+                INVALID_VISIBILITY,
+            ),
+            (
+                json!({"status": "hi", "content_type": "text/rtf", "preview": true}),
+                INVALID_CONTENT_TYPE,
+            ),
+            (
+                json!({
+                    "status": "hi",
+                    "spoiler_text": "x".repeat(MAX_SPOILER_CHARS + 1),
+                    "preview": true,
+                }),
+                "Validation failed: Spoiler text is too long (maximum is 200 characters)",
+            ),
+        ] {
+            let err = preview_status(&app_state, &alice, None, &params(value))
+                .await
+                .expect_err("the body above is refused like any post");
+            refused(&wire(err).await, message);
+        }
+        assert!(
+            live_ids(pool).await.is_empty(),
+            "not one refused preview wrote a row"
+        );
+        assert_eq!(key_rows(pool).await, 0, "or claimed a key");
     }
 }

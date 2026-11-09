@@ -3,9 +3,9 @@
 //! `docs/ARCHITECTURE.md` decision 11 keeps background work in Postgres rows;
 //! this module is the producer of the rows that fire on a schedule. The
 //! [`periodic_jobs`] registry lists every recurring job (today the
-//! streaming hub's reference-table sweep and the mutes expiry sweep; later
-//! tickets append one line per entry), and [`run`] ticks every ten seconds,
-//! enqueueing each registry job with the
+//! streaming hub's reference-table sweep, the mutes expiry sweep and the
+//! idempotency-key sweep; later tickets append one line per entry), and
+//! [`run`] ticks every ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
 //! for the same period, so the queue's deduplication index (see
@@ -55,10 +55,15 @@ pub struct PeriodicJob {
 /// ([`KIND_CLEANUP`](crate::streaming::hub::KIND_CLEANUP)), run on
 /// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND) once a minute so no
 /// spill-over row outlives its [`PAYLOAD_TTL`](crate::streaming::hub::PAYLOAD_TTL)
-/// by more than a tick, and the sweep of mutes whose duration has run out
+/// by more than a tick, the sweep of mutes whose duration has run out
 /// ([`KIND_EXPIRE`](super::mutes::KIND_EXPIRE)) on the same queue once every ten
 /// minutes — every read of that table already treats a lapsed mute as absent, so
-/// the period only decides how long its row stays on the books.
+/// the period only decides how long its row stays on the books — and the sweep
+/// of `Idempotency-Key` mappings older than 24 hours
+/// ([`KIND_CLEANUP`](super::idempotency::KIND_CLEANUP)), also once every ten
+/// minutes on the same queue: a pruned key is simply free to claim again, so
+/// the period only decides how long past the horizon a dead mapping keeps
+/// replaying.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -69,6 +74,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
         },
         PeriodicJob {
             kind: super::mutes::KIND_EXPIRE,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_secs(600),
+        },
+        PeriodicJob {
+            kind: super::idempotency::KIND_CLEANUP,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_secs(600),
         },
