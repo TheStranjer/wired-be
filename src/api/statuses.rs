@@ -16,8 +16,11 @@
 //! writes `POST /api/v1/statuses/{id}/pin` and its `…/unpin` twin, the
 //! thread-mute writes `POST /api/v1/statuses/{id}/mute` and its
 //! `…/unmute` twin,
-//! `POST /api/v1/statuses/{id}/translate` and the write
-//! `DELETE /api/v1/statuses/{id}`.
+//! `POST /api/v1/statuses/{id}/translate`, the write
+//! `DELETE /api/v1/statuses/{id}`, the edit write
+//! `PUT /api/v1/statuses/{id}`, the version listing
+//! `GET /api/v1/statuses/{id}/history` and the source read
+//! `GET /api/v1/statuses/{id}/source`.
 //!
 //! The reference is Pleroma's `StatusController` (`lib/pleroma/web/
 //! mastodon_api/controllers/status_controller.ex`): `create` for the new
@@ -328,12 +331,59 @@
 //! notification ticket has wired the cleanup that takes the deleted
 //! status's notifications with it.
 //!
+//! # The edit, its history and its source
+//!
+//! `PUT /api/v1/statuses/{id}` is Pleroma's `update`
+//! (`StatusController.update` over `CommonAPI.update`, whose
+//! `make_update_data` re-drafts the post from the submitted parameters on
+//! top of the stored object): a user token with `write:statuses`, the
+//! shared [`status_for_viewer_or_404`] gate first — the malformed, unknown,
+//! deleted and invisible are the module's one 404 — and then the ownership
+//! rules, in Pleroma's order: only the author's own **local** post is
+//! editable (a mirrored remote post is nobody's to rewrite here, and
+//! Pleroma's `Create`-type arm admits no reblog row as its subject), which
+//! this route answers with the 403 twin of the `"Record not found"` body
+//! the delete route makes; the reblog of one's own post is the edit's one
+//! 422, `"Cannot edit a reblog"`, because a boost carries no text of its
+//! own to revise. The body — `status`, `spoiler_text`, `sensitive`,
+//! `language`, `content_type`, `media_ids` — is merged over the stored row
+//! by [`crate::services::create_status::edit_status`] and pushed through
+//! the creation's own checks and render (the shared
+//! [`render_status_fields`](crate::services::create_status::render_status_fields)),
+//! so only the parameters the body presents change and every refusal is
+//! the one creation would have answered the submitted value with. The
+//! write ([`status_edit::update_status`]) is one transaction that records
+//! the superseded version — only when the content, warning, sensitive flag
+//! or media actually changed, so an edit of nothing writes no revision and
+//! marks nothing — stamps `edited_at`, and replaces the post's mentions,
+//! hashtags and attachments. The answer is the [`Status`] entity as the
+//! author sees the edited post, `edited_at` set. The `Update` activity and
+//! the `status.update` stream push await this route's
+//! `after_status_edited` hook, the documented landing point.
+//!
+//! `GET /api/v1/statuses/{id}/history` is Pleroma's `show_history`:
+//! optional auth (`read:statuses` on a presented user token), the same
+//! status gate, and the answer the [`StatusEdit`]
+//! array — the superseded versions oldest-authored-first with the current
+//! one last, each carrying its content, warning, flag, author, media, and
+//! the empty `emojis` and `poll` placeholders the status renderer still
+//! answers. A status nobody edited is the one-element array of its current
+//! version.
+//!
+//! `GET /api/v1/statuses/{id}/source` is Pleroma's `show_source` with the
+//! author-only gate this ticket pins: a user token with `read:statuses`,
+//! the shared status gate, 403 `"Record not found"` for a visible post of
+//! somebody else's, and the answer `{"id", "text", "spoiler_text",
+//! "content_type"}` — the stored raw source text and the type it was
+//! written in, which is how a client re-edits a post without its HTML.
+//!
 //! What the reads owe no 422: this module answers an unusable id with the
 //! show route's 404 and the batch route's silent skip, and the only
 //! request shapes beyond those are the pagination cursors' 400. The create
-//! route does owe them: every refusal [`crate::services::create_status`]
-//! documents is its 422, on top of the extractor's 401 and the scope gate's
-//! 403.
+//! and the edit route do owe them: every refusal
+//! [`crate::services::create_status`] documents is their 422 — plus the
+//! edit's own `"Cannot edit a reblog"` — on top of the extractor's 401 and
+//! the scope gate's 403.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //! [`soft_delete_with_reblogs`]: crate::models::status::soft_delete_with_reblogs
@@ -349,7 +399,7 @@ use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
     http::{HeaderMap, Uri},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -361,7 +411,9 @@ use crate::{
     config::Config,
     entities::{
         account::{Account, AccountViewer, JsonBool},
+        media_attachment::MediaAttachment,
         status::Status,
+        status_edit::{StatusEdit, StatusEditSource},
         translation::Translation,
     },
     error::{AppError, AppResult},
@@ -369,12 +421,13 @@ use crate::{
     models::{
         block, bookmark, bookmark_folder, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
+        media_attachment::{self, MediaAttachment as AttachmentRow},
         mute, notification,
         oauth_app::{self, OauthApp},
         pinned_status::{self, PinnedStatus},
         status::{self, Status as StatusRow, Visibility},
-        status_visibility,
-        user::User,
+        status_edit, status_visibility,
+        user::{self, User},
     },
     oauth::scopes::{
         READ_BOOKMARKS, READ_FAVOURITES, READ_STATUSES, WRITE_ACCOUNTS, WRITE_BOOKMARKS,
@@ -382,7 +435,7 @@ use crate::{
     },
     pagination::{PageParams, link_header, set_link_header},
     services::{
-        create_status::{self, CreateStatusParams},
+        create_status::{self, CreateStatusParams, EditStatusParams},
         render_status::{render_status, render_statuses},
         translate::Translator,
     },
@@ -418,13 +471,22 @@ const UNAVAILABLE: &str = "Translation service unavailable";
 /// and the caller's account has no default of its own either.
 const DEFAULT_TARGET_LANGUAGE: &str = "en";
 
-/// The body of both of the delete route's refusals: Pleroma's
-/// `StatusController.delete` answers `{:error, :not_found}` for an activity it
-/// cannot find, and `CommonAPI.delete`'s ownership arm — the one that
-/// [`AppError::Forbidden`] status carries here — renders the same
+/// The body of the delete, edit and source routes' ownership refusals:
+/// Pleroma's `StatusController.delete` answers `{:error, :not_found}` for
+/// an activity it cannot find, and `CommonAPI.delete`'s ownership arm — the
+/// one that [`AppError::Forbidden`] status carries here — renders the same
 /// `"Record not found"` wording, so a probe cannot tell "not yours" from
-/// "not there".
+/// "not there". The edit and the source read keep that twin deliberately:
+/// Pleroma's `update` refuses a status that is not the caller's own (and a
+/// remote one, whose author never is) through the same body, and the
+/// ticket pins it for `PUT` and `GET …/source` alike.
 const RECORD_NOT_FOUND: &str = "Record not found";
+
+/// The 422 body of `PUT /api/v1/statuses/{id}` for a reblog row: Pleroma's
+/// `update` asks `activity.data["type"] == "Create"` before anything else
+/// (the ticket's 422 with its own words), and decision 6's boost carries no
+/// text of its own — there is nothing to revise, only a post to un-boost.
+const CANNOT_EDIT_REBLOG: &str = "Cannot edit a reblog";
 
 /// The 422 body of `POST …/pin` for a status of somebody else's: Pleroma's
 /// `CommonAPI.pin` ownership arm (`{:error, :ownership_error}`), which its
@@ -486,13 +548,19 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// anyone else's data with; the tickets pin the throttle for the create
 /// write, the like writes, the boost writes and the delete only, and a
 /// bookmark is a private per-account fact — which a pin is too, since
-/// `pin_refusal` admits only the caller's own statuses.
+/// `pin_refusal` admits only the caller's own statuses. The edit write is
+/// the same kind of own-post-only change (`edit_refusal` admits nothing but
+/// the caller's local posts, and the history and source reads behind it are
+/// plain reads), and its ticket pins no bucket for it either.
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/favourites", get(list_favourites))
         .route("/bookmarks", get(list_bookmarks))
         .route("/statuses/{id}", get(show_status))
+        .route("/statuses/{id}", put(edit_status))
         .route("/statuses/{id}/context", get(get_status_context))
+        .route("/statuses/{id}/history", get(get_status_history))
+        .route("/statuses/{id}/source", get(get_status_source))
         .route(
             "/statuses/{id}",
             delete(delete_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
@@ -674,6 +742,233 @@ struct DeletedStatus {
     /// The status's stored source text ([`raw_text`](StatusRow::raw_text)) as
     /// it was before the delete; empty for a reblog, which carries none.
     text: String,
+}
+
+/// `PUT /api/v1/statuses/{id}` — edit the status `id` and answer the
+/// [`Status`] entity as its author now sees it, `edited_at` set when the
+/// edit superseded a version.
+///
+/// The gate is the shared [`status_for_viewer_or_404`] and then
+/// [`edit_refusal`]: the author's own local post only (403 `"Record not
+/// found"` for anything else that is visible), and never a reblog row
+/// (422 [`CANNOT_EDIT_REBLOG`]). What the body presents,
+/// [`create_status::edit_status`] merges over the stored row and runs
+/// through the creation's own checks and render — so every 422 is the one
+/// creation answers the submitted value with — and one transaction records
+/// the superseded version, writes the new state and replaces the post's
+/// mentions, hashtags and attachments.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:statuses` check; [`AppError::NotFound`] for a malformed,
+/// unknown, deleted or invisible status, and for one a delete took between
+/// the gate and the write; [`AppError::Forbidden`] for a visible status
+/// that is not the caller's own or not local; [`AppError::Unprocessable`]
+/// for the reblog row and for every merged-body refusal
+/// [`create_status::edit_status`] documents. Any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn edit_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiBody(params): ApiBody<EditStatusParams>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_STATUSES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if let Some(refusal) = edit_refusal(auth.0.id, &row) {
+        return Err(refusal);
+    }
+    let entity = create_status::edit_status(&state, &auth.0, &row, params)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    after_status_edited(&state, &entity);
+    Ok(Json(entity))
+}
+
+/// Why `PUT /api/v1/statuses/{id}` refuses `row` for the account
+/// `caller_id`, or `None` to let the edit through: behind the shared
+/// visibility gate (which already answered the invisible, the unknown and
+/// the deleted with the 404) stand Pleroma's ownership arms — the post must
+/// be the caller's own (`own_status`) and this instance's own copy of it,
+/// since a mirrored remote row belongs to its origin's `Object.edit`
+/// pipeline and not to here — and its type arm: a reblog row is not a
+/// `Create`, and decision 6 gives it no text of its own to revise. The two
+/// refusals keep their ticket's bodies: the 403 twin of the shared
+/// `"Record not found"` wording for the ownership one (so the route never
+/// says whose post it thinks this is, nor that a remote one exists), the
+/// 422 for the reblog.
+fn edit_refusal(caller_id: Uuid, row: &StatusRow) -> Option<AppError> {
+    if !row.local || row.user_id != caller_id {
+        return Some(AppError::Forbidden(RECORD_NOT_FOUND.to_owned()));
+    }
+    row.reblog_of_id
+        .is_some()
+        .then(|| AppError::Unprocessable(CANNOT_EDIT_REBLOG.to_owned()))
+}
+
+/// `GET /api/v1/statuses/{id}/history` — every version of the status `id`,
+/// oldest authored first and the CURRENT one last, as the viewer behind an
+/// optional token may see it.
+///
+/// The gate is the show route's ([`status_for_viewer_or_404`], with
+/// `read:statuses` on a presented user token); Pleroma's `show_history`
+/// renders the object's `state` list plus the live object the same way, a
+/// never-edited status as the one-element array. The superseded versions
+/// come from [`status_edit::list_for_status`], the live row supplies the
+/// last one — its `edited_at` the moment that version was authored, its
+/// creation time before any edit — and the author's [`Account`] entity,
+/// rendered as this viewer sees them, names every element. The media each
+/// version wore resolves in one batch read ([`history_attachments`]); ids
+/// whose attachment row is gone render nothing beside the ones still
+/// stored.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] when a presented user token lacks
+/// `read:statuses`; [`AppError::Unauthorized`] from the extractor for a
+/// token that does not resolve; [`AppError::NotFound`] for a malformed,
+/// unknown, deleted or invisible status, and for the author an account
+/// purge left behind (a foreign key the revisions keep, the live row's
+/// author this read cannot render without). Any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn get_status_history(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<StatusEdit>>> {
+    auth.require_user_scope(READ_STATUSES)?;
+    let viewer = auth.0.as_ref();
+    let row = status_for_viewer_or_404(&state, viewer, &id).await?;
+    let revisions = status_edit::list_for_status(&state.db, row.id).await?;
+    let author = user::get_by_id(&state.db, row.user_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let worn = media_attachment::for_statuses(&state.db, &[row.id]).await?;
+    let current: Vec<Uuid> = worn
+        .get(&row.id)
+        .map(|rows| rows.iter().map(|attachment| attachment.id).collect())
+        .unwrap_or_default();
+    let attachments = history_attachments(&state, &revisions, &current).await?;
+    let mut history = Vec::with_capacity(revisions.len() + 1);
+    for revision in &revisions {
+        history.push(StatusEdit::from_source(StatusEditSource {
+            content: &revision.content,
+            spoiler_text: &revision.spoiler_text,
+            sensitive: revision.sensitive,
+            created_at: revision.created_at,
+            account: Account::from_user_for(viewer, &author, &state.config, None),
+            media: media_entities(&revision.media_ids, &attachments, &state.config),
+        }));
+    }
+    history.push(StatusEdit::from_source(StatusEditSource {
+        content: &row.content,
+        spoiler_text: &row.spoiler_text,
+        sensitive: row.sensitive,
+        created_at: row.edited_at.unwrap_or(row.inserted_at),
+        account: Account::from_user_for(viewer, &author, &state.config, None),
+        media: media_entities(&current, &attachments, &state.config),
+    }));
+    debug!(
+        status = %row.id,
+        versions = history.len(),
+        "status history read"
+    );
+    Ok(Json(history))
+}
+
+/// Every attachment one history answer may render: the ids the revisions
+/// name plus the ones the live post wears, read in one batch and keyed by
+/// id ([`media_attachment::get_many`]). An id whose row has since been
+/// deleted is simply absent, and the entry that named it renders one
+/// attachment fewer.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn history_attachments(
+    state: &AppState,
+    revisions: &[status_edit::StatusEdit],
+    current: &[Uuid],
+) -> AppResult<HashMap<Uuid, AttachmentRow>> {
+    let asked: Vec<Uuid> = revisions
+        .iter()
+        .flat_map(|revision| revision.media_ids.iter().copied())
+        .chain(current.iter().copied())
+        .collect();
+    if asked.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = media_attachment::get_many(&state.db, &asked).await?;
+    Ok(rows.into_iter().map(|found| (found.id, found)).collect())
+}
+
+/// The `media_attachments` array of one history entry: `ids` in their
+/// stored order, each answered by its batched row, and an id the batch
+/// could not answer contributing nothing.
+fn media_entities(
+    ids: &[Uuid],
+    by_id: &HashMap<Uuid, AttachmentRow>,
+    config: &Config,
+) -> Vec<MediaAttachment> {
+    ids.iter()
+        .filter_map(|id| by_id.get(id))
+        .map(|row| MediaAttachment::from_model(row, config))
+        .collect()
+}
+
+/// `GET /api/v1/statuses/{id}/source` — the source text behind the status
+/// `id`, for its author alone.
+///
+/// The gate is the shared [`status_for_viewer_or_404`] (so the malformed,
+/// unknown, deleted and invisible are the module's one 404) and then
+/// ownership: Pleroma's `show_source` asks only visibility, and the ticket
+/// sharpens that to author-only — a stranger may read a public post's HTML
+/// but never its source, and the 403 keeps the `"Record not found"` body
+/// the delete and the edit use for the same refusal.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `read:statuses` check; [`AppError::NotFound`] for a malformed,
+/// unknown, deleted or invisible status; [`AppError::Forbidden`] for a
+/// visible status that is not the caller's own. Any database failure
+/// arrives through `?` as [`AppError::Database`].
+async fn get_status_source(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<SourceBody>> {
+    auth.require(READ_STATUSES)?;
+    let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
+    if row.user_id != auth.0.id {
+        return Err(AppError::Forbidden(RECORD_NOT_FOUND.to_owned()));
+    }
+    Ok(Json(SourceBody {
+        id: row.id.to_string(),
+        text: row.raw_text,
+        spoiler_text: row.spoiler_text,
+        content_type: row.content_type,
+    }))
+}
+
+/// The answer of `GET /api/v1/statuses/{id}/source`: the status's stored
+/// source text beside the warning and the `MIME` type that text was
+/// written in — Pleroma's `source.json` shape
+/// (`StatusView.render("source.json")`), whose `content_type` key
+/// Mastodon's own answer lacks and the ticket pins. It carries no render:
+/// what the client reads here is exactly what an edit sends back.
+#[derive(Debug, Serialize)]
+struct SourceBody {
+    /// The status id as the hyphenated lowercase `UUIDv7` string
+    /// (decision 4).
+    id: String,
+    /// The stored source text ([`raw_text`](StatusRow::raw_text)).
+    text: String,
+    /// The stored content warning; `""` when there is none.
+    spoiler_text: String,
+    /// The `MIME` type [`text`](Self::text) was written in.
+    content_type: String,
 }
 
 /// `GET /api/v1/statuses?id[]=a&id[]=b` (or `ids[]=`) — the [`Status`]
@@ -1935,6 +2230,23 @@ async fn after_status_deleted(state: &AppState, status: &StatusRow) {
     }
 }
 
+/// Post-write hook of the edit route: the federation ticket that sends the
+/// `Update` activity — Pleroma's `Builder.update` run through its
+/// `CommonAPI.update` pipeline, re-delivering the object to everybody the
+/// original `Create` reached — and the streaming ticket that pushes the
+/// edited status to `status.update` wire themselves in here, and the
+/// queueing will happen through `state` (decision 11).
+///
+/// `status` is the [`Status`] entity as the author saw the post right after
+/// the write — the new version, with the revision the write recorded behind
+/// it and the `edited_at` stamp beside it — which is what both consumers
+/// ship: the activity carries the re-rendered object, the stream push lets
+/// clients redraw the post they already show.
+///
+/// Intentionally empty until then, like [`after_favourite_changed`] above
+/// and the delete's [`after_status_deleted`].
+const fn after_status_edited(_state: &AppState, _status: &Status) {}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -2290,6 +2602,68 @@ mod tests {
         assert!(
             !is_silenced(&foreign, viewer, &silenced),
             "an author nobody silenced stays"
+        );
+    }
+
+    /// The 403 `PUT …` answers for a status that is visible but not the
+    /// caller's own local post: the shared `"Record not found"` wording.
+    fn forbidden(refusal: Option<AppError>) -> bool {
+        matches!(
+            refusal,
+            Some(AppError::Forbidden(message)) if message == RECORD_NOT_FOUND
+        )
+    }
+
+    /// The 422 `PUT …` answers for a reblog row of the caller's own.
+    fn reblog_refused(refusal: Option<AppError>) -> bool {
+        matches!(
+            refusal,
+            Some(AppError::Unprocessable(message)) if message == CANNOT_EDIT_REBLOG
+        )
+    }
+
+    #[test]
+    fn your_own_local_post_is_the_one_an_edit_admits() {
+        let owner = Uuid::now_v7();
+        assert!(
+            edit_refusal(owner, &authored(Uuid::now_v7(), owner)).is_none(),
+            "a local post of yours is editable"
+        );
+        let mut answer = authored(Uuid::now_v7(), owner);
+        answer.in_reply_to_id = Some(Uuid::now_v7());
+        assert!(
+            edit_refusal(owner, &answer).is_none(),
+            "and so is a reply of yours"
+        );
+    }
+
+    #[test]
+    fn a_foreign_or_remote_post_is_forbidden_in_the_shared_wording() {
+        let (owner, caller) = (Uuid::now_v7(), Uuid::now_v7());
+        assert!(
+            forbidden(edit_refusal(caller, &authored(Uuid::now_v7(), owner))),
+            "a visible post of somebody else's is the 403 twin of the 404"
+        );
+        let mut mirrored = authored(Uuid::now_v7(), caller);
+        mirrored.local = false;
+        assert!(
+            forbidden(edit_refusal(caller, &mirrored)),
+            "a row this instance does not own is nobody's to edit here"
+        );
+    }
+
+    #[test]
+    fn a_reblog_refuses_the_edit_with_its_own_words_after_ownership() {
+        let owner = Uuid::now_v7();
+        let mut boost = authored(Uuid::now_v7(), owner);
+        boost.reblog_of_id = Some(Uuid::now_v7());
+        assert!(
+            reblog_refused(edit_refusal(owner, &boost)),
+            "your own boost has no text of its own to revise"
+        );
+        assert!(
+            forbidden(edit_refusal(Uuid::now_v7(), &boost)),
+            "and somebody else's boost is not yours before it is a boost"
         );
     }
 }

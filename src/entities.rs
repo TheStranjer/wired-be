@@ -32,7 +32,9 @@
 //! around it. [`translation`] the Mastodon `Translation` entity, built from a
 //! [`crate::services::translate`] provider answer. [`bookmark_folder`]
 //! Pleroma's `BookmarkFolder` entity, whose `emoji_url` the endpoint
-//! resolves from `custom_emojis` before the pure render.
+//! resolves from `custom_emojis` before the pure render. [`status_edit`] one
+//! element of the `GET /api/v1/statuses/{id}/history` answer: a status
+//! version, superseded or current.
 
 pub mod account;
 pub mod announcement;
@@ -52,5 +54,6 @@ pub mod relationship;
 pub mod report;
 pub mod scrobble;
 pub mod status;
+pub mod status_edit;
 pub mod tag;
 pub mod translation;

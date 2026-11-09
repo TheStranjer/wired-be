@@ -213,6 +213,10 @@ mod scrobbles;
 /// `/api/v2/search` with their accounts, statuses and hashtag arms).
 mod search;
 
+/// Status edit endpoints over HTTP (`PUT /api/v1/statuses/{id}`, its
+/// `…/history` and `…/source` twins).
+mod status_edits;
+
 /// The status endpoints: the reads (`GET /api/v1/statuses/{id}` and its
 /// batch form) and the write (`POST /api/v1/statuses`).
 mod statuses;
