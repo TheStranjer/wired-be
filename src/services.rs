@@ -18,6 +18,11 @@
 //! over there, and the sanitizer pass every provider answer goes through
 //! before an endpoint serves it.
 //!
+//! [`timeline`] is the read side every status timeline shares: the one
+//! parametrized query builder that composes a source, the request's filters,
+//! the viewer's block/mute/domain-block/thread-mute exclusions and the
+//! visibility clause into a single keyset-paged statement.
+//!
 //! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
@@ -29,5 +34,6 @@ pub mod media_processing;
 pub mod media_proxy;
 pub mod mentions;
 pub mod render_status;
+pub mod timeline;
 pub mod translate;
 pub mod vapid;
