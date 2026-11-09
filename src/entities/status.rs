@@ -25,9 +25,13 @@
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
-//! `pleroma.direct_conversation_id` / `pleroma.bookmark_folder`
-//! (chats, bookmark folders); and `quote` (the quoting ticket, whose
-//! original rows the service already batch-loads). `pleroma.emoji_reactions`
+//! `pleroma.direct_conversation_id` (chats); and `quote` (the quoting
+//! ticket, whose original rows the service already batch-loads).
+//! `pleroma.bookmark_folder` is filled by the folders ticket, from
+//! [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders) —
+//! the one read that also answers `bookmarked`: a bookmarked row renders
+//! its bookmark's folder id, an unfiled or un-bookmarked row `null`.
+//! `pleroma.emoji_reactions`
 //! is filled by the reactions ticket, from
 //! [`emoji_reaction::for_statuses`](crate::models::emoji_reaction::for_statuses).
 //! `favourited` is filled by the favourites ticket, from
@@ -42,8 +46,8 @@
 //! is its *original's*, so the outer entity of the viewer's own boost
 //! answers `reblogged: true` and so does the nested original.
 //! `bookmarked` is filled by the bookmarks ticket, from
-//! [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) — the same
-//! shape of batched read; a reblog row takes its flag from *its own* id,
+//! [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders) — the
+//! same shape of batched read; a reblog row takes its flag from *its own* id,
 //! because a bookmark lands on the row its client named, not the original.
 //! `pinned` and `pleroma.pinned_at` are filled by the pinning ticket, from
 //! [`pinned_ids`](crate::models::pinned_status::pinned_ids) — one batched
@@ -63,6 +67,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::{
     config::Config,
@@ -165,10 +170,13 @@ pub struct PleromaMetadata {
     /// Pleroma emits it at the top level as well; here it belongs to the
     /// extension block only.
     pub quotes_count: i32,
-    /// `bookmark_folder`: the viewer's folder for a bookmarked post; the
-    /// folders ticket files bookmarks and sets it, so it renders JSON
-    /// `null` for now.
-    pub bookmark_folder: Option<Value>,
+    /// `bookmark_folder`: the id of the folder the viewer's bookmark of
+    /// this post is filed in, as the hyphenated lowercase `UUIDv7` text
+    /// (decision 4), or `null` — the value of the same
+    /// [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders)
+    /// read that answers [`Status::bookmarked`] (the folders ticket),
+    /// which is why only a bookmarked post can ever carry a folder here.
+    pub bookmark_folder: Option<String>,
     /// `pinned_at`: when the viewer pinned this post to their own profile,
     /// in the Mastodon time format (decision 5), or `null` — the value of
     /// the same [`pinned_ids`](crate::models::pinned_status::pinned_ids)
@@ -225,12 +233,20 @@ pub struct StatusSource<'a> {
     /// newtype [`Account`]'s flags do.
     pub reblogged: JsonBool,
     /// Whether the viewer bookmarked this row: membership in the one
-    /// [`bookmarked_ids`](crate::models::bookmark::bookmarked_ids) read
-    /// the batch runs for the page. The renderer keys every row's flag to
+    /// [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders)
+    /// read the batch runs for the page. The renderer keys every row's flag to
     /// its *own* id — a bookmark of a reblog id lands on the reblog row,
     /// Pleroma's `Bookmark.create` taking the activity the client named —
     /// and `false` for an anonymous viewer, who has no rows.
     pub bookmarked: bool,
+    /// Which of the viewer's folders this row's bookmark is filed in, `None`
+    /// for an unfiled bookmark or no bookmark at all: the value of that same
+    /// [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders)
+    /// read entry, keyed to the row's *own* id like
+    /// [`bookmarked`](Self::bookmarked) — one read answers both, so the flag
+    /// and the folder can never disagree. Feeds
+    /// [`pleroma.bookmark_folder`](PleromaMetadata::bookmark_folder).
+    pub bookmark_folder: Option<Uuid>,
     /// When the viewer pinned this row to their own profile, `None` while
     /// they have pinned nothing: the value of the one
     /// [`pinned_ids`](crate::models::pinned_status::pinned_ids) read the
@@ -398,6 +414,7 @@ impl Status {
             favourited,
             reblogged,
             bookmarked,
+            bookmark_folder,
             pinned_at,
             muted,
             reblog,
@@ -439,7 +456,16 @@ impl Status {
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
             quote: None,
-            pleroma: pleroma_block(row, reply_author, reactions, pinned_at, muted),
+            pleroma: pleroma_block(
+                row,
+                reply_author,
+                reactions,
+                BlockViewer {
+                    pinned_at,
+                    muted,
+                    bookmark_folder,
+                },
+            ),
         }
     }
 }
@@ -486,20 +512,41 @@ fn plain_text(row: &StatusRow) -> PlainText {
     PlainText { text_plain: text }
 }
 
+/// The three viewer facts the `pleroma` block renders, grouped because
+/// there are more than [`pleroma_block`] could take beside the row, its
+/// replied-to author and its reactions (decision 14's five-argument limit).
+///
+/// Each is the batch's one read per fact, keyed to the row: [`StatusSource`]'s
+/// `pinned_at`, `muted` and `bookmark_folder`.
+#[derive(Debug)]
+struct BlockViewer {
+    /// When the viewer pinned the row, `None` while they have pinned
+    /// nothing.
+    pinned_at: Option<DateTime<Utc>>,
+    /// Whether the viewer muted the row's thread — the same [`JsonBool`] the
+    /// entity's top-level `muted` carries, so the two halves never disagree.
+    muted: JsonBool,
+    /// The folder the viewer's bookmark files the row in, `None` when the
+    /// bookmark is unfiled or there is none.
+    bookmark_folder: Option<Uuid>,
+}
+
 /// Builds the `pleroma` block of `row`, whose replied-to author is
 /// `reply_author` when the batch knew one, whose reactions are `reactions`
-/// when the batch found any, whose pin timestamp is `pinned_at` when the
-/// viewer pinned this row, and whose thread-mute flag is `muted` — the same
-/// [`JsonBool`] the entity's top-level `muted` carries, so the two halves of
-/// the fact can never disagree; see [`PleromaMetadata`] for where each key
-/// comes from and which later tickets fill the placeholders.
+/// when the batch found any, and whose pin stamp, thread-mute flag and
+/// bookmark folder are `viewer`'s three facts — see [`PleromaMetadata`] for
+/// where each key comes from and which later tickets fill the placeholders.
 fn pleroma_block(
     row: &StatusRow,
     reply_author: Option<&User>,
     reactions: &[SummaryRow],
-    pinned_at: Option<DateTime<Utc>>,
-    muted: JsonBool,
+    viewer: BlockViewer,
 ) -> PleromaMetadata {
+    let BlockViewer {
+        pinned_at,
+        muted,
+        bookmark_folder,
+    } = viewer;
     PleromaMetadata {
         content: plain_text(row),
         spoiler_text: PlainText {
@@ -514,7 +561,7 @@ fn pleroma_block(
         emoji_reactions: reactions.iter().map(ReactionSummary::from_model).collect(),
         parent_visible: JsonBool(true),
         quotes_count: row.quotes_count,
-        bookmark_folder: None,
+        bookmark_folder: bookmark_folder.map(|id| id.to_string()),
         pinned_at,
     }
 }
@@ -739,6 +786,10 @@ mod tests {
         reblogged: JsonBool,
         /// Whether the viewer bookmarked the row.
         bookmarked: bool,
+        /// The folder the viewer's bookmark files the row in, `None` for an
+        /// unfiled bookmark or none at all — the folder the bookmarks-and-
+        /// folder batch read would hand the renderer.
+        bookmark_folder: Option<Uuid>,
         /// When the viewer pinned the row, `None` unless it is pinned: the
         /// pin stamp the favourites-style batch would hand the renderer.
         pinned_at: Option<DateTime<Utc>>,
@@ -761,6 +812,7 @@ mod tests {
                 favourited: false,
                 reblogged: JsonBool(false),
                 bookmarked: false,
+                bookmark_folder: None,
                 pinned_at: None,
                 muted: JsonBool(false),
             }
@@ -824,6 +876,17 @@ mod tests {
             }
         }
 
+        /// Sets [`bookmark_folder`](Self::bookmark_folder) (and the
+        /// bookmark it rides): the folder the folders ticket's batched read
+        /// would hand the renderer for a filed bookmark.
+        fn filed_in(self, folder: Uuid) -> Self {
+            Self {
+                bookmarked: true,
+                bookmark_folder: Some(folder),
+                ..self
+            }
+        }
+
         /// Sets [`pinned_at`](Self::pinned_at): the viewer's own pin, which
         /// the pinning ticket's batched read would hand the renderer. The
         /// flag itself is membership in that same read, so it rides along
@@ -862,6 +925,7 @@ mod tests {
             favourited: parts.favourited,
             reblogged: parts.reblogged.clone(),
             bookmarked: parts.bookmarked,
+            bookmark_folder: parts.bookmark_folder,
             pinned_at: parts.pinned_at,
             muted: parts.muted.clone(),
             reblog: reblog.map(Box::new),
@@ -885,6 +949,7 @@ mod tests {
                 favourited: false,
                 reblogged: JsonBool(false),
                 bookmarked: false,
+                bookmark_folder: None,
                 pinned_at: None,
                 muted: JsonBool(false),
                 reblog: None,
@@ -1030,6 +1095,26 @@ mod tests {
         assert_eq!(
             value["bookmarked"], true,
             "the bookmarks batch's membership reaches the entity verbatim"
+        );
+        assert_eq!(
+            value["pleroma"]["bookmark_folder"],
+            Value::Null,
+            "an unfiled bookmark carries no folder"
+        );
+    }
+
+    #[test]
+    fn a_filed_bookmark_lands_in_the_folder_key_too() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let folder = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+        let value = render(&row, &Parts::of(&alice).filed_in(folder), None);
+        assert_eq!(value["bookmarked"], true, "the file is a bookmark");
+        assert_eq!(
+            value["pleroma"]["bookmark_folder"],
+            folder.to_string(),
+            "and the folder the same read names reaches the pleroma block \
+             as the hyphenated id (decision 4)"
         );
     }
 

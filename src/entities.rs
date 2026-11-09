@@ -30,11 +30,14 @@
 //! endpoint. [`notification`] one entry of the v2 grouped-notifications
 //! answer and the `{accounts, statuses, notification_groups}` envelope
 //! around it. [`translation`] the Mastodon `Translation` entity, built from a
-//! [`crate::services::translate`] provider answer.
+//! [`crate::services::translate`] provider answer. [`bookmark_folder`]
+//! Pleroma's `BookmarkFolder` entity, whose `emoji_url` the endpoint
+//! resolves from `custom_emojis` before the pure render.
 
 pub mod account;
 pub mod announcement;
 pub mod application;
+pub mod bookmark_folder;
 pub mod chat;
 pub mod custom_emoji;
 pub mod emoji_reaction;

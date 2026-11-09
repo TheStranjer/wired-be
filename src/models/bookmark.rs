@@ -14,8 +14,8 @@
 //! Both writes are idempotent on the unique key, the same pair of moves
 //! [`crate::models::emoji_reaction`] and [`crate::models::favourite`]
 //! make: bookmarking twice is one row that keeps its id and its place in
-//! every page, and removing a bookmark that is not there (or no longer is)
-//! deletes nothing.
+//! every page (its folder is restated to what the new write names), and
+//! removing a bookmark that is not there (or no longer is) deletes nothing.
 //!
 //! What a bookmark may *name* is the caller's gate: the endpoint resolves
 //! the status through
@@ -26,21 +26,25 @@
 //!
 //! The two reads match the two surfaces the entity and the endpoints need,
 //! both batched (`docs/ARCHITECTURE.md` decision 13):
-//! [`bookmarked_ids`] answers the viewer's `bookmarked` flag for a whole
-//! page of statuses in one statement, and [`page_for_user`] pages the
-//! statuses behind one account's bookmarks for `GET /api/v1/bookmarks`.
+//! [`bookmarked_folders`] answers the viewer's `bookmarked` flag and each
+//! bookmark's folder for a whole page of statuses in one statement, and
+//! [`page_for_user`] pages the statuses behind one account's bookmarks for
+//! `GET /api/v1/bookmarks`.
 //! Both key on the *bookmark row id* — the `UUIDv7` the client's cursors
 //! and `Link` header walk, not the joined row's.
 //!
-//! [`Bookmark::folder_id`] awaits the folders ticket: until that migration
-//! adds the foreign key nothing stores a folder here, and [`page_for_user`]
-//! filters on the id it is given so the endpoint can wire the `folder_id`
-//! query parameter straight in.
+//! [`Bookmark::folder_id`] is filed by the folders ticket: the write takes
+//! the folder it names (a repeat **restates** it, so a re-bookmark with a
+//! different folder moves the row), [`bookmarked_folders`] answers the
+//! viewer's `bookmarked` flag *and* each bookmark's folder in one read, and
+//! [`page_for_user`] filters on the id it is given so the endpoint can wire
+//! the `folder_id` query parameter straight in.
 //!
 //! Deleting a user or a status takes its bookmarks through the foreign
-//! key's cascade.
+//! key's cascade; deleting the *folder* a bookmark is filed in keeps the
+//! bookmark and frees the column (`ON DELETE SET NULL`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -53,13 +57,15 @@ use crate::{
     util::id::new_id,
 };
 
-/// [`add`]: the write, idempotent on `(user_id, status_id)`. A pair that
-/// already bookmarked keeps its row and returns no row at all —
-/// `RETURNING *` answers exactly the insert that happened, which is what
-/// tells the caller a fresh bookmark landed.
-const ADD_SQL: &str = "INSERT INTO bookmarks (id, user_id, status_id)
-     VALUES ($1, $2, $3)
-ON CONFLICT (user_id, status_id) DO NOTHING
+/// [`add`]: the write, idempotent on `(user_id, status_id)` in its row,
+/// restating in its folder. A pair that already bookmarked keeps its row —
+/// same id, same `inserted_at` — and takes the folder the new write names,
+/// `NULL` when it names none: exactly Pleroma's `Bookmark.create`
+/// `on_conflict: [set: [folder_id: …]]`. `RETURNING *` answers the row
+/// either way.
+const ADD_SQL: &str = "INSERT INTO bookmarks (id, user_id, status_id, folder_id)
+     VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, status_id) DO UPDATE SET folder_id = EXCLUDED.folder_id
 RETURNING *";
 
 /// [`remove`]: one account's bookmark of one status; a pair that never
@@ -69,10 +75,11 @@ const REMOVE_SQL: &str = "DELETE FROM bookmarks
       WHERE user_id = $1 AND status_id = $2
    RETURNING *";
 
-/// [`bookmarked_ids`]: which of a batch of statuses the viewer bookmarked.
-/// Only the ids that *have* a row come back; the caller's flag is
-/// membership in that set.
-const FLAGGED_IDS_SQL: &str = "SELECT status_id FROM bookmarks
+/// [`bookmarked_folders`]: the viewer's bookmarks of a batch of statuses,
+/// each with the folder it is filed in. Only statuses that *have* a row
+/// come back; the caller's flag is membership in the map's keys, and
+/// `pleroma.bookmark_folder` is its value.
+const FLAGGED_IDS_SQL: &str = "SELECT status_id, folder_id FROM bookmarks
      WHERE user_id = $1 AND status_id = ANY($2)";
 
 /// [`page_for_user`]: one account's bookmarks, the full [`Bookmark`] row
@@ -98,36 +105,48 @@ pub struct Bookmark {
     /// The bookmarked status (for a reblog id, the reblog row itself — see
     /// the [module docs](self)).
     pub status_id: Uuid,
-    /// The bookmark's folder, if it is filed in one. `NULL` until the
-    /// folders ticket creates `bookmark_folders` and wires the writes;
-    /// this instance's clients cannot name a folder before then.
+    /// The bookmark's folder, if it is filed in one — the row
+    /// [`crate::models::bookmark_folder`] names, freed back to `NULL` when
+    /// that folder is deleted.
     pub folder_id: Option<Uuid>,
     /// When the bookmark was made; a repeat keeps this, since it keeps the
     /// row.
     pub inserted_at: DateTime<Utc>,
 }
 
-/// Records `user_id` bookmarking `status_id` and returns the new row, or
-/// `None` when the pair already held the bookmark.
+/// Records `user_id` bookmarking `status_id`, filed in `folder_id` when one
+/// is named, and returns the resulting row.
 ///
-/// The write is idempotent on the table's unique key: a pair that already
-/// bookmarked keeps its row exactly as it is — same id, same `inserted_at`
-/// — and answers `None`, so the caller can tell a bookmark from a
-/// restatement. Nothing else moves: a bookmark has no stored counter and
-/// federates nothing.
+/// The write is idempotent *on the pair* in the table's unique key: a pair
+/// that already bookmarked keeps its row — same id, same `inserted_at` —
+/// and takes the new write's folder, `NULL` when it names none. That is
+/// Pleroma's `Bookmark.create` `on_conflict: [set: [folder_id: …]]`: a
+/// re-bookmark with a different folder **moves** the bookmark, and one
+/// with no folder frees it. Nothing else moves: a bookmark has no stored
+/// counter and federates nothing.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, constraint, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError). The two foreign keys
-/// are the failures reachable here: an unknown `user_id` or `status_id`.
-pub async fn add(pool: &PgPool, user_id: Uuid, status_id: Uuid) -> AppResult<Option<Bookmark>> {
-    Ok(sqlx::query_as::<_, Bookmark>(ADD_SQL)
+/// [`AppError::Database`](crate::error::AppError). The three foreign keys
+/// are the failures reachable here: an unknown `user_id`, `status_id` or
+/// `folder_id`. A folder that exists but belongs to another account is not
+/// one of them — the endpoint's ownership check refuses that with a 404
+/// before the write.
+pub async fn add(
+    pool: &PgPool,
+    user_id: Uuid,
+    status_id: Uuid,
+    folder_id: Option<Uuid>,
+) -> AppResult<Bookmark> {
+    let row = sqlx::query_as::<_, Bookmark>(ADD_SQL)
         .bind(new_id())
         .bind(user_id)
         .bind(status_id)
-        .fetch_optional(pool)
-        .await?)
+        .bind(folder_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
 }
 
 /// Removes `user_id`'s bookmark of `status_id`, reporting the row that
@@ -174,34 +193,36 @@ pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64>
     Ok(deleted.rows_affected())
 }
 
-/// Which of `status_ids` `user_id` has bookmarked — the batched
-/// `bookmarked` read the status renderer runs once per page
-/// (`docs/ARCHITECTURE.md` decision 13).
+/// Which of `status_ids` `user_id` has bookmarked, and the folder each of
+/// those bookmarks is filed in — the one batched read behind both the
+/// status renderer's `bookmarked` flag and its `pleroma.bookmark_folder`.
 ///
-/// The answer is the membership set, not a per-status flag list: an id
-/// with no row is simply absent, and an empty `status_ids` asks the
+/// (`docs/ARCHITECTURE.md` decision 13.) The answer is keyed by status id,
+/// not a per-status flag list: an id
+/// with no row is simply absent (not bookmarked), a present key with a
+/// `None` value is an unfiled bookmark, and an empty `status_ids` asks the
 /// database nothing at all. Unlike the favourites flag, a reblog row's
 /// bookmark is keyed to *its own* id — the row the client named is where
-/// [`add`] stored it.
+/// [`add`] stored it, and the folder rides that same row.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn bookmarked_ids(
+pub async fn bookmarked_folders(
     pool: &PgPool,
     user_id: Uuid,
     status_ids: &[Uuid],
-) -> AppResult<HashSet<Uuid>> {
+) -> AppResult<HashMap<Uuid, Option<Uuid>>> {
     if status_ids.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
-    let rows = sqlx::query_as::<_, (Uuid,)>(FLAGGED_IDS_SQL)
+    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(FLAGGED_IDS_SQL)
         .bind(user_id)
         .bind(status_ids)
         .fetch_all(pool)
         .await?;
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    Ok(rows.into_iter().collect())
 }
 
 /// `user_id`'s bookmarked statuses, newest bookmark first and `page`'s
@@ -220,9 +241,9 @@ pub async fn bookmarked_ids(
 /// not this one's.
 ///
 /// `folder_id` narrows the walk to one folder's bookmarks; `None` asks for
-/// all of them. Until the folders ticket stores folder ids the narrow arm
-/// answers the empty page for any folder it names, and the endpoint hands
-/// `None` whatever its caller asks for.
+/// all of them. A folder id nothing is filed under — unknown, foreign, or
+/// simply empty — answers the empty page rather than an error. The id
+/// needs no existence check: it only ever filters the caller's own rows.
 ///
 /// [`filter_visible`]: crate::models::status_visibility::filter_visible
 ///
@@ -279,8 +300,11 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         error::AppError,
-        models::status::{NewStatus, insert, soft_delete},
-        models::user::{NewUser, User, insert as insert_user, local_ap_id},
+        models::{
+            bookmark_folder,
+            status::{NewStatus, insert, soft_delete},
+            user::{NewUser, User, insert as insert_user, local_ap_id},
+        },
         pagination::MAX_LIMIT,
     };
 
@@ -311,13 +335,23 @@ mod tests {
         post(pool, &user(pool, nickname).await).await.id
     }
 
-    /// Bookmarks `status_id` as `who`, asserting the write created a row
-    /// (a test that needs the no-op arm calls [`add`] itself).
+    /// Bookmarks `status_id` as `who`, unfiled (a test that needs the row
+    /// or a folder calls [`add`] itself).
     async fn bookmark_as(pool: &PgPool, who: &User, status_id: Uuid) {
-        let created = add(pool, who.id, status_id)
+        let _filed = add(pool, who.id, status_id, None)
             .await
             .expect("the fixture bookmark stores");
-        assert!(created.is_some(), "the fixture pair had not bookmarked yet");
+    }
+
+    /// A folder named `name` owned by `who`, for the filing fixtures.
+    async fn folder_named(
+        pool: &PgPool,
+        who: &User,
+        name: &str,
+    ) -> bookmark_folder::BookmarkFolder {
+        bookmark_folder::create(pool, who.id, name, None)
+            .await
+            .expect("the fixture folder creates")
     }
 
     /// Every stored bookmark as `(id, user_id, status_id)`, newest id
@@ -330,20 +364,6 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("the table reads")
-    }
-
-    /// Files `bookmark_id` into `folder`, the way the folders ticket's
-    /// write will: until that migration adds the foreign key the column
-    /// holds any uuid, and only the model's narrow read interprets it.
-    async fn file_in_folder(pool: &PgPool, bookmark_id: Uuid, folder: Uuid) {
-        let filed = sqlx::query("UPDATE bookmarks SET folder_id = $2 WHERE id = $1")
-            .bind(bookmark_id)
-            .bind(folder)
-            .execute(pool)
-            .await
-            .expect("the fixture filing runs")
-            .rows_affected();
-        assert_eq!(filed, 1, "the bookmark row was there to file");
     }
 
     /// Page params built from a query string, the way the extractor makes
@@ -381,31 +401,85 @@ mod tests {
         let alice = user(&pool, "alice").await;
         let status_id = post_by(&pool, "bob").await;
 
-        let created = add(&pool, alice.id, status_id)
+        let created = add(&pool, alice.id, status_id, None)
             .await
-            .expect("the first bookmark stores")
-            .expect("the pair had nothing to keep");
+            .expect("the first bookmark stores");
 
         assert_eq!(created.user_id, alice.id, "who bookmarked");
         assert_eq!(created.status_id, status_id, "what they bookmarked");
-        assert_eq!(
-            created.folder_id, None,
-            "nothing files a bookmark until the folders ticket"
-        );
+        assert_eq!(created.folder_id, None, "no folder was named");
         assert!(
             created.id.get_version_num() == 7,
             "the id is a uuidv7 (decision 4)"
         );
 
-        let again = add(&pool, alice.id, status_id)
+        let again = add(&pool, alice.id, status_id, None)
             .await
             .expect("repeating a bookmark is not an error");
 
-        assert!(again.is_none(), "the repeat created no row");
+        assert_eq!(again.id, created.id, "the repeat restates the same row");
+        assert_eq!(
+            again.inserted_at, created.inserted_at,
+            "and keeps the moment of the first write"
+        );
         assert_eq!(
             stored(&pool).await,
             vec![(created.id, alice.id, status_id)],
             "still one row in the table, and it kept its id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeat_moves_the_bookmark_to_the_folder_it_names() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let status_id = post_by(&pool, "bob").await;
+        let first = folder_named(&pool, &alice, "first").await;
+        let second = folder_named(&pool, &alice, "second").await;
+
+        let filed = add(&pool, alice.id, status_id, Some(first.id))
+            .await
+            .expect("the filed bookmark stores");
+        assert_eq!(filed.folder_id, Some(first.id), "filed where named");
+
+        let moved = add(&pool, alice.id, status_id, Some(second.id))
+            .await
+            .expect("the move runs");
+        assert_eq!(moved.id, filed.id, "one row, moved not rewritten");
+        assert_eq!(
+            moved.folder_id,
+            Some(second.id),
+            "and it is in the new folder"
+        );
+
+        // Pleroma's on_conflict names the folder whatever the request
+        // carries: a re-bookmark without one frees the row.
+        let freed = add(&pool, alice.id, status_id, None)
+            .await
+            .expect("the refiling without a folder runs");
+        assert_eq!(freed.id, filed.id, "still the same single row");
+        assert_eq!(freed.folder_id, None, "and the folder is gone");
+        assert_eq!(
+            stored(&pool).await,
+            vec![(filed.id, alice.id, status_id)],
+            "the whole walk wrote one row"
+        );
+    }
+
+    #[tokio::test]
+    async fn filing_into_a_folder_that_does_not_exist_fails() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let status_id = post_by(&pool, "bob").await;
+
+        let err = add(&pool, alice.id, status_id, Some(Uuid::now_v7()))
+            .await
+            .expect_err("a folder that does not exist cannot hold a bookmark");
+        assert!(
+            matches!(err, AppError::Database(_)),
+            "the foreign key refuses, not a silent no-op: {err}"
         );
     }
 
@@ -415,10 +489,9 @@ mod tests {
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let status_id = post_by(&pool, "bob").await;
-        let created = add(&pool, alice.id, status_id)
+        let created = add(&pool, alice.id, status_id, None)
             .await
-            .expect("the fixture bookmark stores")
-            .expect("the pair had nothing to keep");
+            .expect("the fixture bookmark stores");
 
         let removed = remove(&pool, alice.id, status_id)
             .await
@@ -450,23 +523,33 @@ mod tests {
         bookmark_as(&pool, &bob, first.id).await;
         bookmark_as(&pool, &alice, second.id).await;
 
-        let flagged = bookmarked_ids(&pool, alice.id, &[first.id, second.id])
+        let first_folder = folder_named(&pool, &alice, "shelved").await;
+        let _filed = add(&pool, alice.id, first.id, Some(first_folder.id))
+            .await
+            .expect("the refiling runs");
+
+        let flagged = bookmarked_folders(&pool, alice.id, &[first.id, second.id])
             .await
             .expect("the flags read");
-        assert!(flagged.contains(&first.id), "alice bookmarked the first");
-        assert!(flagged.contains(&second.id), "and the second");
+        assert_eq!(
+            flagged,
+            [(first.id, Some(first_folder.id)), (second.id, None)]
+                .into_iter()
+                .collect(),
+            "alice bookmarked both — the first filed, the second free"
+        );
         assert!(
-            !bookmarked_ids(&pool, bob.id, &[first.id, second.id])
+            !bookmarked_folders(&pool, bob.id, &[first.id, second.id])
                 .await
                 .expect("bob's flags read")
-                .contains(&second.id),
+                .contains_key(&second.id),
             "but bob only bookmarked the first"
         );
         assert_eq!(
-            bookmarked_ids(&pool, alice.id, &[Uuid::now_v7()])
+            bookmarked_folders(&pool, alice.id, &[Uuid::now_v7()])
                 .await
                 .expect("an unbookmarked id reads"),
-            HashSet::new(),
+            HashMap::new(),
             "an id with no row is simply absent"
         );
     }
@@ -478,10 +561,10 @@ mod tests {
         let alice = user(&pool, "alice").await;
 
         assert_eq!(
-            bookmarked_ids(&pool, alice.id, &[])
+            bookmarked_folders(&pool, alice.id, &[])
                 .await
                 .expect("the empty read runs"),
-            HashSet::new(),
+            HashMap::new(),
             "an empty page flags nothing, and the loader skips the query"
         );
     }
@@ -573,20 +656,15 @@ mod tests {
         let first = post(&pool, &bob).await;
         let second = post(&pool, &bob).await;
         let third = post(&pool, &bob).await;
-        let kept = add(&pool, alice.id, first.id)
+        let folder = folder_named(&pool, &alice, "shelved").await;
+        let kept = add(&pool, alice.id, first.id, Some(folder.id))
             .await
-            .expect("the fixture bookmark stores")
-            .expect("the pair had nothing to keep");
+            .expect("the fixture bookmark stores");
         bookmark_as(&pool, &alice, second.id).await;
         bookmark_as(&pool, &alice, third.id).await;
-        let folder = Uuid::now_v7();
-        file_in_folder(&pool, kept.id, folder).await;
-        // The fixture filing above set the column the row was read without.
-        let mut kept = kept;
-        kept.folder_id = Some(folder);
 
         let all_statuses = vec![third.id, second.id, first.id];
-        let filed = page_for_user(&pool, alice.id, page(""), Some(folder))
+        let filed = page_for_user(&pool, alice.id, page(""), Some(folder.id))
             .await
             .expect("the folder page reads");
         assert_eq!(
@@ -728,7 +806,7 @@ mod tests {
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
 
-        let err = add(&pool, alice.id, Uuid::now_v7())
+        let err = add(&pool, alice.id, Uuid::now_v7(), None)
             .await
             .expect_err("a status that does not exist cannot be bookmarked");
         assert!(

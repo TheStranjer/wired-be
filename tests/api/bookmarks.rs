@@ -15,8 +15,15 @@
 //! `GET /api/v1/bookmarks` is the caller's own list under `read:bookmarks`:
 //! statuses newest-BOOKMARK first, [`PageParams`] (20 by default, 40 at
 //! most) keyed on the bookmark row id, and narrowed to what the caller may
-//! still see. The optional `folder_id` query parameter is accepted and
-//! ignored until the folders ticket files bookmarks.
+//! still see. The optional `folder_id` query parameter narrows the list to
+//! one folder's bookmarks (the folders ticket, WBE-88): a folder holding
+//! none of the caller's rows — unknown or another account's — answers the
+//! empty page, and a malformed id is the cursor's 400.
+//!
+//! The writes file bookmarks too: `POST …/bookmark` takes a `folder_id`
+//! that must name one of the caller's folders (else the shared 404), a
+//! re-bookmark with a different folder moves the row, and the Status
+//! entity's `pleroma.bookmark_folder` renders the id or `null`.
 //!
 //! [`Status`]: wired_be::entities::status::Status
 
@@ -29,6 +36,7 @@ use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
     models::{
+        bookmark_folder,
         status::{self, NewStatus, Visibility},
         user::User,
     },
@@ -506,56 +514,269 @@ async fn the_bookmarks_list_drops_the_invisible_and_the_deleted() {
     );
 }
 
+/// A folder named `name` owned by `owner`, seeded through the model — the
+/// filing fixtures need the row, not the HTTP round trip the folder file
+/// covers.
+async fn folder_of(pool: &PgPool, owner: &User, name: &str) -> bookmark_folder::BookmarkFolder {
+    bookmark_folder::create(pool, owner.id, name, None)
+        .await
+        .expect("the fixture folder creates")
+}
+
+/// The stored `folder_id` of `user_id`'s single bookmark row.
+async fn filed_folder(pool: &PgPool, user_id: Uuid) -> Option<Uuid> {
+    sqlx::query_as::<_, (Option<Uuid>,)>("SELECT folder_id FROM bookmarks WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("the one row reads")
+        .0
+}
+
+/// `POST …/bookmark` for status `id`, filing it in `folder_id` (a JSON
+/// body, decision 10's usual spelling).
+async fn bookmark_into(
+    app: &Router,
+    token: &str,
+    id: &str,
+    folder_id: &str,
+) -> common::TestResponse {
+    common::TestRequest::post(&format!("/api/v1/statuses/{id}/bookmark"))
+        .bearer(token)
+        .json(&serde_json::json!({"folder_id": folder_id}))
+        .send(app)
+        .await
+}
+
 #[tokio::test]
-async fn the_folder_id_param_is_accepted_and_ignored() {
+async fn a_filed_bookmark_moves_frees_and_renders_its_folder() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
-    let (_alice, token) = bookmarker(&pool, "alice").await;
+    let (alice, token) = bookmarker(&pool, "alice").await;
     let status = post_by(&pool, "bob").await;
-    let kept = bookmarked(&app, &token, &status.id.to_string()).await;
-    assert_eq!(kept["bookmarked"], true, "the fixture bookmark stored");
-    let bookmark_id: (Uuid,) = sqlx::query_as("SELECT id FROM bookmarks")
-        .fetch_one(&pool)
-        .await
-        .expect("the row reads");
+    let id = status.id.to_string();
+    let first = folder_of(&pool, &alice, "first").await;
+    let second = folder_of(&pool, &alice, "second").await;
 
-    // Any spelling is accepted: a folder no bookmark is filed in yet names
-    // nothing to drop. The folders ticket wires the filter in.
+    // The write files the row and the answered entity carries the folder —
+    // the same read fills every other surface.
+    let filed = common::TestRequest::post(&format!(
+        "/api/v1/statuses/{id}/bookmark?folder_id={}",
+        first.id
+    ))
+    .bearer(&token)
+    .send(&app)
+    .await;
+    common::assert_answer(&filed, StatusCode::OK, "the query filing stores");
+    assert_eq!(
+        filed.json_value()["pleroma"]["bookmark_folder"],
+        first.id.to_string(),
+        "pleroma.bookmark_folder is the folder id"
+    );
+    assert_eq!(
+        filed_folder(&pool, alice.id).await,
+        Some(first.id),
+        "the row filed"
+    );
+
+    let moved = bookmark_into(&app, &token, &id, &second.id.to_string()).await;
+    common::assert_answer(&moved, StatusCode::OK, "the re-bookmark moves");
+    assert_eq!(
+        moved.json_value()["pleroma"]["bookmark_folder"],
+        second.id.to_string(),
+        "a re-bookmark with a different folder moves it"
+    );
+    assert_eq!(
+        filed_folder(&pool, alice.id).await,
+        Some(second.id),
+        "same row, new folder"
+    );
+
+    // A re-bookmark that names no folder frees the row (Pleroma's
+    // on_conflict restates the folder the request carries).
+    let freed = bookmarked(&app, &token, &id).await;
+    assert_eq!(
+        freed["pleroma"]["bookmark_folder"],
+        Value::Null,
+        "and the freed bookmark renders no folder"
+    );
+    assert_eq!(filed_folder(&pool, alice.id).await, None, "back to unfiled");
+
+    // The flag and the folder are one read: only the bookmarker sees the
+    // folder, and an un-bookmarked row carries neither.
+    let _refiled = bookmark_into(&app, &token, &id, &first.id.to_string()).await;
+    let shown = show(&app, Some(&token), &id).await.json_value();
+    assert_eq!(shown["bookmarked"], true, "the flag for its bookmarker");
+    assert_eq!(
+        shown["pleroma"]["bookmark_folder"],
+        first.id.to_string(),
+        "and the folder from the same batched read"
+    );
+    let anonymous = show(&app, None, &id).await.json_value();
+    assert_eq!(
+        anonymous["bookmarked"], false,
+        "an anonymous viewer has no bookmark"
+    );
+    assert_eq!(
+        anonymous["pleroma"]["bookmark_folder"],
+        Value::Null,
+        "and no folder"
+    );
+    let (_viewer, viewer_token) = fixture(&pool, "viewer", "read").await;
+    let foreign = show(&app, Some(&viewer_token), &id).await.json_value();
+    assert_eq!(
+        foreign["pleroma"]["bookmark_folder"],
+        Value::Null,
+        "alice's folder is nobody else's key"
+    );
+}
+
+#[tokio::test]
+async fn a_folder_the_caller_cannot_name_is_the_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = bookmarker(&pool, "alice").await;
+    let status = post_by(&pool, "bob").await;
+    let id = status.id.to_string();
+    let (mallory, _mallory_token) = fixture(&pool, "mallory", "write:bookmarks read").await;
+    let his = folder_of(&pool, &mallory, "his").await;
+
+    for folder_id in [
+        his.id.to_string(),
+        UNKNOWN_ID.to_owned(),
+        "not-a-uuid".to_owned(),
+    ] {
+        let refused = bookmark_into(&app, &token, &id, &folder_id).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::NOT_FOUND,
+            "an unknown, foreign or malformed folder id",
+        );
+        common::assert_error(&refused, NOT_FOUND, "the one 404 wording");
+    }
+    assert_eq!(
+        row_count(&pool).await,
+        0,
+        "and nothing was bookmarked behind a refused folder"
+    );
+
+    // A withdrawal is folder-blind: it removes the row however filed.
+    let _filed = bookmark_into(
+        &app,
+        &token,
+        &id,
+        &folder_of(&pool, &alice, "shelf").await.id.to_string(),
+    )
+    .await;
+    let gone = unbookmark_route(&app, &token, &id).await;
+    common::assert_answer(&gone, StatusCode::OK, "unbookmarking a filed bookmark runs");
+    assert_eq!(row_count(&pool).await, 0, "and the filed row went");
+}
+
+#[tokio::test]
+async fn the_bookmarks_list_filters_by_folder() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = bookmarker(&pool, "alice").await;
+    let shelved = folder_of(&pool, &alice, "shelved").await;
+    let later = folder_of(&pool, &alice, "later").await;
+    let author = common::create_local_user(&pool, "author").await;
+    let first = post(&pool, &author).await;
+    let second = post(&pool, &author).await;
+    let third = post(&pool, &author).await;
+    let fourth = post(&pool, &author).await;
+    let _filed_first =
+        bookmark_into(&app, &token, &first.id.to_string(), &shelved.id.to_string()).await;
+    let _filed_second = bookmark_into(
+        &app,
+        &token,
+        &second.id.to_string(),
+        &shelved.id.to_string(),
+    )
+    .await;
+    let _filed_third =
+        bookmark_into(&app, &token, &third.id.to_string(), &later.id.to_string()).await;
+    bookmark_ok(&app, &token, &fourth.id.to_string()).await; // unfiled
+    let all = bookmark_ids(&pool, alice.id).await;
+
+    let page = bookmarks(&app, &token, &format!("folder_id={}", shelved.id)).await;
+    common::assert_answer(&page, StatusCode::OK, "the folder page answers");
+    let body = page.json_value();
+    assert_eq!(
+        status_ids(&body),
+        vec![second.id.to_string(), first.id.to_string()],
+        "the shelved bookmarks only, newest bookmark first"
+    );
+    assert!(
+        body.as_array()
+            .expect("an array")
+            .iter()
+            .all(|entry| entry["pleroma"]["bookmark_folder"] == shelved.id.to_string()),
+        "every entry of the narrowed page renders the folder it was asked for"
+    );
+    assert_bookmark_keyed_link(page.header("link"), "/api/v1/bookmarks", all[2], all[3]);
+
+    let other = bookmarks(&app, &token, &format!("folder_id={}", later.id)).await;
+    assert_eq!(
+        status_ids(&other.json_value()),
+        vec![third.id.to_string()],
+        "the other folder answers its own bookmark"
+    );
+
+    let everything = bookmarks(&app, &token, "").await;
+    assert_eq!(
+        status_ids(&everything.json_value()).len(),
+        4,
+        "no folder named is the whole list, filed or not"
+    );
+    let blank = bookmarks(&app, &token, "folder_id=").await;
+    common::assert_answer(
+        &blank,
+        StatusCode::OK,
+        "an empty folder_id asks for nothing",
+    );
+    assert_eq!(
+        status_ids(&blank.json_value()).len(),
+        4,
+        "and the list is the whole list"
+    );
+}
+
+/// Well-formed ids that hold none of the caller's bookmarks — unknown,
+/// another account's — answer the empty page; a malformed `folder_id` is
+/// the page cursor's own 400.
+#[tokio::test]
+async fn a_folder_holding_narrowed_nothing_or_a_malformed_id_narrows_the_list() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = bookmarker(&pool, "alice").await;
+    let kept = folder_of(&pool, &alice, "kept").await;
+    let author = common::create_local_user(&pool, "author").await;
+    let status = post(&pool, &author).await;
+    let _filed = bookmark_into(&app, &token, &status.id.to_string(), &kept.id.to_string()).await;
+
+    let mallory = common::create_local_user(&pool, "mallory").await;
+    let his_folder = folder_of(&pool, &mallory, "his").await;
     for query in [
         format!("folder_id={}", Uuid::now_v7()),
-        "folder_id=not-a-uuid".to_owned(),
-        "folder_id=".to_owned(),
+        format!("folder_id={}", his_folder.id),
+        // The caller's OWN empty folder: well-formed, holds nothing.
+        format!("folder_id={}", folder_of(&pool, &alice, "empty").await.id),
     ] {
-        let page = bookmarks(&app, &token, &query).await;
-        common::assert_answer(&page, StatusCode::OK, "the parameter is accepted");
+        let empty = bookmarks(&app, &token, &query).await;
+        common::assert_answer(&empty, StatusCode::OK, "a folder holding nothing");
         assert_eq!(
-            status_ids(&page.json_value()),
-            vec![status.id.to_string()],
-            "`{query}` filters nothing: the list is the whole list"
+            empty.json_value().as_array().map(Vec::len),
+            Some(0),
+            "answers the empty page: `{query}`"
         );
+        assert_eq!(empty.header("link"), None, "which links nowhere");
     }
-
-    // Even a bookmark filed into a folder — the column the folders ticket
-    // will write, readable today — stays on the unfiltered page: the
-    // listing asks the model for `None` until that ticket wires it.
-    let folder = Uuid::now_v7();
-    let _filed = sqlx::query("UPDATE bookmarks SET folder_id = $2 WHERE id = $1")
-        .bind(bookmark_id.0)
-        .bind(folder)
-        .execute(&pool)
-        .await
-        .expect("the fixture filing runs");
-    let plain = bookmarks(&app, &token, "").await;
-    assert_eq!(
-        status_ids(&plain.json_value()),
-        vec![status.id.to_string()],
-        "a filed bookmark is on the folderless list too"
-    );
-    let named = bookmarks(&app, &token, &format!("folder_id={folder}")).await;
-    assert_eq!(
-        status_ids(&named.json_value()),
-        vec![status.id.to_string()],
-        "and its own folder id does not narrow the page yet"
-    );
+    let malformed = bookmarks(&app, &token, "folder_id=not-a-uuid").await;
+    common::assert_answer(&malformed, StatusCode::BAD_REQUEST, "a malformed folder id");
+    common::assert_error(&malformed, BAD_ID, "is the cursor's own 400");
 }

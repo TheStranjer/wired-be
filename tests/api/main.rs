@@ -169,6 +169,9 @@ mod pleroma_account_settings;
 /// The Pleroma account extensions merged at `/api/pleroma/accounts`.
 mod pleroma_accounts;
 
+/// Bookmark folders (`/api/v1/pleroma/bookmark_folders`) over HTTP.
+mod pleroma_bookmark_folders;
+
 /// CSV imports of follows, blocks and mutes (`/api/pleroma/*_import`).
 mod pleroma_import;
 
