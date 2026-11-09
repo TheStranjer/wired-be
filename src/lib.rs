@@ -173,6 +173,10 @@ fn job_registry() -> JobRegistry {
     );
     registry.register(streaming::hub::KIND_CLEANUP, streaming::hub::handle_cleanup);
     registry.register(jobs::mutes::KIND_EXPIRE, jobs::mutes::handle_expire);
+    registry.register(
+        jobs::maintenance::KIND_NOTIFICATIONS,
+        jobs::maintenance::handle_notifications,
+    );
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);

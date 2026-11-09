@@ -21,6 +21,7 @@
 
 pub mod deletion;
 pub mod imports;
+pub mod maintenance;
 pub mod mutes;
 pub mod scheduler;
 
