@@ -50,7 +50,7 @@ use crate::{
         status::{self, DEFAULT_CONTENT_TYPE, NewStatus, Visibility},
         user::User,
     },
-    services::{mentions::resolve_local_mentions, render_status::render_status},
+    services::{mentions::resolve_mentions, render_status::render_status},
     state::AppState,
     util::{
         entities::{MentionRef, extract_hashtags, linkify_entities},
@@ -361,19 +361,22 @@ pub async fn create_status(
 /// known `@-mention` and every hashtag linked, the mentioned accounts in
 /// mention order, and the hashtags as [`extract_hashtags`] folded them.
 ///
-/// The lookup is [`resolve_local_mentions`], so a bare `@nick`, a
-/// `@nick@our-domain` and a mirrored `@nick@their.domain` this instance
-/// already stores are linked, while an unknown name stays the plain text it
-/// was written as. Both sides of the map are keyed case-folded, because the
-/// text spells the account however its author typed it and the link still
-/// carries that spelling.
+/// The lookup is [`resolve_mentions`], so a bare `@nick`, a
+/// `@nick@our-domain` and a mirrored `@nick@their.domain` are linked from
+/// the stored rows, an unknown `@nick@their.domain` is fetched over the
+/// network (under that function's shared budget and per-status cap, see
+/// [`crate::services::mentions`]) and linked when it answers, while what
+/// stays unknown remains the plain text it was written as. Both sides of
+/// the map are keyed case-folded, because the text spells the account
+/// however its author typed it and the link still carries that spelling.
 ///
 /// # Errors
 ///
 /// Any database failure behind the mention lookups arrives as
-/// [`AppError::Database`].
+/// [`AppError::Database`]. A remote lookup's own failures are not errors:
+/// those mentions just stay plain text.
 async fn read_entities(state: &AppState, checked: &Checked<'_>) -> AppResult<Entities> {
-    let found = resolve_local_mentions(&state.db, &state.config, checked.text).await?;
+    let found = resolve_mentions(state, checked.text).await?;
     let urls: HashMap<String, String> = found
         .iter()
         .map(|(mention, account)| (mention_key(mention), profile_url(account)))
@@ -451,11 +454,15 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{
-        http::StatusCode,
+        Router,
+        extract::{Path, Query, State},
+        http::{StatusCode, header::CONTENT_TYPE},
         response::{IntoResponse as _, Response},
+        routing::get,
     };
     use serde_json::{Value, json};
     use sqlx::PgPool;
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
     use crate::{
@@ -1005,6 +1012,167 @@ mod tests {
             value["tags"],
             json!([{ "name": "rust", "url": format!("{BASE}/tags/rust") }]),
             "and so does the tag"
+        );
+    }
+
+    /// The mock remote peer's `WebFinger` answer: any `acct:` handle gets a
+    /// JRD whose self link points at this peer's own `/users/{nick}`.
+    async fn mock_webfinger(
+        State(base): State<String>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Response {
+        let nick = params
+            .get("resource")
+            .and_then(|resource| resource.strip_prefix("acct:"))
+            .and_then(|handle| handle.split_once('@').map(|(nick, _)| nick))
+            .unwrap_or("alice");
+        let jrd = json!({
+            "subject": format!("acct:{nick}@mock.example"),
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("{base}/users/{nick}"),
+            }],
+        });
+        ([(CONTENT_TYPE, "application/jrd+json")], jrd.to_string()).into_response()
+    }
+
+    /// The mock remote peer's actor document: self-identifying, named for
+    /// the path segment.
+    async fn mock_actor(State(base): State<String>, Path(nick): Path<String>) -> Response {
+        let id = format!("{base}/users/{nick}");
+        let document = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Person",
+            "id": id,
+            "preferredUsername": nick,
+            "name": "Mock",
+            "inbox": format!("{id}/inbox"),
+            "publicKey": {
+                "id": format!("{id}#main-key"),
+                "owner": id,
+                "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n",
+            },
+        });
+        (
+            [(CONTENT_TYPE, "application/activity+json")],
+            document.to_string(),
+        )
+            .into_response()
+    }
+
+    /// Serve the mock remote peer; answer with its origin and the task to
+    /// abort when the test is done.
+    async fn mock_peer() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/.well-known/webfinger", get(mock_webfinger))
+            .route("/users/{nick}", get(mock_actor))
+            .with_state(base.clone());
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                tracing::debug!("mock peer stopped: {err}");
+            }
+        });
+        (base, server)
+    }
+
+    /// A remote mention fetched from the mock peer is linked into
+    /// `status_mentions` and linkified in the HTML with its remote profile
+    /// URL. The fetch itself (`WebFinger` + actor, budget and cap) is
+    /// [`resolve_mentions`]'s tested behaviour; the loopback mock answers
+    /// on `127.0.0.1`, so the posted spelling is the mirror's own handle
+    /// (decision 7) and the mention resolves from the row the fetch stored.
+    #[tokio::test]
+    async fn a_resolved_remote_mention_is_stored_and_rendered() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "remote-author").await;
+        let (base, server) = mock_peer().await;
+
+        let fetched = crate::services::mentions::resolve_mentions_with_base(
+            &app_state,
+            "hi @alice@mock.example",
+            Some(&base),
+        )
+        .await
+        .expect("the mock peer resolves")
+        .pop()
+        .expect("the remote mention resolved");
+        server.abort();
+        assert_eq!(fetched.1.nickname, "alice@127.0.0.1", "mirror handle");
+
+        let entity = created(
+            &app_state,
+            &alice,
+            posted(&format!("hi @{}!", fetched.1.nickname)),
+        )
+        .await;
+        let row = stored(pool, &entity).await;
+
+        assert_eq!(
+            entity.content,
+            format!("<p>hi {}!</p>", mention_html(&fetched.1.ap_id, "alice")),
+            "the remote mention is linkified to its actor URL"
+        );
+        let mentioned: Vec<Uuid> = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT user_id FROM status_mentions WHERE status_id = $1 ORDER BY position",
+        )
+        .bind(row.id)
+        .fetch_all(pool)
+        .await
+        .expect("the mention links read")
+        .into_iter()
+        .map(|link| link.0)
+        .collect();
+        assert_eq!(
+            mentioned,
+            vec![fetched.1.id],
+            "the remote mirror is linked in status_mentions"
+        );
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": fetched.1.id.to_string(), "username": "alice",
+                     "url": fetched.1.ap_id, "acct": "alice@127.0.0.1" }]),
+            "and answered in the entity"
+        );
+    }
+
+    /// A mention of a domain that cannot be reached at all (`.invalid`
+    /// never resolves) leaves the mention as plain text, resolves the
+    /// known mentions beside it, and the status is created as always.
+    #[tokio::test]
+    async fn a_status_mentioning_an_unreachable_domain_still_creates() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "patient-author").await;
+        let bob = user(pool, "known-bob").await;
+
+        let entity = created(
+            &app_state,
+            &alice,
+            posted("hi @ghost@nowhere.invalid and @known-bob"),
+        )
+        .await;
+
+        assert_eq!(
+            entity.content,
+            format!(
+                "<p>hi @ghost@nowhere.invalid and {}</p>",
+                mention_html(&bob.ap_id, "known-bob")
+            ),
+            "the unreachable mention stays exactly as written"
+        );
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "known-bob",
+                     "url": bob.ap_id, "acct": "known-bob" }]),
+            "only the reachable account is answered"
         );
     }
 

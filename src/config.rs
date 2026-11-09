@@ -73,6 +73,9 @@ pub const BANNER_LIMIT_BYTES_VAR: &str = "BANNER_LIMIT_BYTES";
 /// Environment variable holding the maximum size of one inbound
 /// `ActivityPub` inbox request body, in bytes.
 pub const INBOX_MAX_BYTES_VAR: &str = "INBOX_MAX_BYTES";
+/// Environment variable holding how many unknown-remote `@nick@domain`
+/// mentions one status may look up over the network.
+pub const MAX_REMOTE_MENTION_LOOKUPS_VAR: &str = "MAX_REMOTE_MENTION_LOOKUPS";
 /// Environment variable holding whether outbound HTTP may reach private
 /// hosts (disabling the SSRF guard).
 pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
@@ -302,6 +305,10 @@ pub const DEFAULT_BANNER_LIMIT_BYTES: usize = 4_000_000;
 /// inbox authentication extractor caps one inbound `ActivityPub` `POST`
 /// body at (see [`crate::federation::inbox_auth`]).
 pub const DEFAULT_INBOX_MAX_BYTES: usize = 1_048_576;
+/// Remote mention lookups used when `MAX_REMOTE_MENTION_LOOKUPS` is unset:
+/// the 10 unknown-remote mentions one status may resolve over the network
+/// (see [`crate::services::mentions`]).
+pub const DEFAULT_MAX_REMOTE_MENTION_LOOKUPS: usize = 10;
 /// Image pixel count used when `MAX_IMAGE_PIXELS` is unset.
 ///
 /// The 40 megapixels the media ticket fixes. `POST /api/v1/media` and
@@ -852,6 +859,11 @@ pub struct Config {
     /// from `INBOX_MAX_BYTES`; the `SignedActivity` extractor answers a
     /// larger body 413 (see [`crate::federation::inbox_auth`]).
     pub inbox_max_bytes: usize,
+    /// How many unknown-remote `@nick@domain` mentions one status may look
+    /// up over the network, from `MAX_REMOTE_MENTION_LOOKUPS`; further
+    /// mentions of a single status stay plain text (see
+    /// [`crate::services::mentions::resolve_mentions`]).
+    pub max_remote_mention_lookups: usize,
     /// Directory uploaded files are stored in, from `UPLOADS_DIR`.
     pub uploads_dir: PathBuf,
     /// Directory emoji packs are stored in, from `EMOJI_DIR`: one
@@ -1018,11 +1030,7 @@ impl Config {
         F: Fn(&str) -> Option<String>,
     {
         let database_url = required_var(&lookup, DATABASE_URL_VAR)?;
-        let bind_addr = lookup(BIND_ADDR_VAR)
-            .as_deref()
-            .unwrap_or(DEFAULT_BIND_ADDR)
-            .parse()
-            .map_err(ConfigError::InvalidBindAddr)?;
+        let bind_addr = listen_addr(&lookup)?;
         let base_url_raw = required_var(&lookup, BASE_URL_VAR)?;
         let base_url = normalize_base_url(&base_url_raw)?;
         let profile = instance_profile(&lookup);
@@ -1030,7 +1038,7 @@ impl Config {
         let text = text_length_limits(&lookup)?;
         let (max_image_pixels, max_report_comment, max_pinned_statuses) = cap_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
-        let inbox_max_bytes = number(&lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?;
+        let (inbox_max_bytes, max_remote_mention_lookups) = inbox_and_mention_caps(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
         let auth = auth_settings(&lookup)?;
@@ -1061,6 +1069,7 @@ impl Config {
             avatar_limit_bytes,
             banner_limit_bytes,
             inbox_max_bytes,
+            max_remote_mention_lookups,
             uploads_dir,
             emoji_dir,
             media_base_url,
@@ -1199,6 +1208,7 @@ impl Config {
             avatar_limit_bytes: DEFAULT_AVATAR_LIMIT_BYTES,
             banner_limit_bytes: DEFAULT_BANNER_LIMIT_BYTES,
             inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
+            max_remote_mention_lookups: DEFAULT_MAX_REMOTE_MENTION_LOOKUPS,
             uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
             emoji_dir: PathBuf::from(DEFAULT_EMOJI_DIR),
             media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
@@ -1356,6 +1366,51 @@ where
         STREAMING_PING_INTERVAL_SECS_VAR,
         DEFAULT_STREAMING_PING_INTERVAL_SECS,
     )
+}
+
+/// Reads the two caps that bound how much of the network one request may
+/// ask for: the byte size of one inbound `ActivityPub` inbox body
+/// (`INBOX_MAX_BYTES`) and the number of unknown-remote mentions one
+/// status may look up (`MAX_REMOTE_MENTION_LOOKUPS`,
+/// [`DEFAULT_MAX_REMOTE_MENTION_LOOKUPS`] when unset). Grouped because
+/// [`Config::from_lookup`] has a size budget (AGENTS.md) and each is the
+/// same `number` read; the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when either variable holds a
+/// value that is not a whole number.
+fn inbox_and_mention_caps<F>(lookup: &F) -> Result<(usize, usize), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        number(lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?,
+        number(
+            lookup,
+            MAX_REMOTE_MENTION_LOOKUPS_VAR,
+            DEFAULT_MAX_REMOTE_MENTION_LOOKUPS,
+        )?,
+    ))
+}
+
+/// Reads `BIND_ADDR`: the address the HTTP server listens on,
+/// [`DEFAULT_BIND_ADDR`] when unset. Factored out of
+/// [`Config::from_lookup`], which has a size budget (AGENTS.md).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBindAddr`] when the value is not a socket
+/// address.
+fn listen_addr<F>(lookup: &F) -> Result<SocketAddr, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(BIND_ADDR_VAR)
+        .as_deref()
+        .unwrap_or(DEFAULT_BIND_ADDR)
+        .parse()
+        .map_err(ConfigError::InvalidBindAddr)
 }
 
 /// What [`mailer_settings`] reads: the six settings that configure
@@ -2111,6 +2166,10 @@ impl fmt::Debug for Config {
             .field("avatar_limit_bytes", &self.avatar_limit_bytes)
             .field("banner_limit_bytes", &self.banner_limit_bytes)
             .field("inbox_max_bytes", &self.inbox_max_bytes)
+            .field(
+                "max_remote_mention_lookups",
+                &self.max_remote_mention_lookups,
+            )
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
             .field("emoji_dir", &self.emoji_dir)
@@ -2969,6 +3028,40 @@ mod tests {
         assert!(
             debug.contains("inbox_max_bytes: 1024"),
             "the inbox body cap is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn max_remote_mention_lookups_defaults_to_ten() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.max_remote_mention_lookups, 10,
+            "default MAX_REMOTE_MENTION_LOOKUPS is ten"
+        );
+        assert_eq!(
+            Config::for_tests().max_remote_mention_lookups,
+            10,
+            "the test config keeps the default, so mention tests see it too"
+        );
+    }
+
+    #[test]
+    fn reads_custom_max_remote_mention_lookups() {
+        let config = config_with(&[(MAX_REMOTE_MENTION_LOOKUPS_VAR, "3")]);
+        assert_eq!(
+            config.max_remote_mention_lookups, 3,
+            "custom MAX_REMOTE_MENTION_LOOKUPS"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_remote_mention_lookups: 3"),
+            "the remote mention cap is visible in Debug output: {debug}"
+        );
+        let err = try_config_with(&[(MAX_REMOTE_MENTION_LOOKUPS_VAR, "plenty")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNumber(MAX_REMOTE_MENTION_LOOKUPS_VAR),
+            "a non-number cap is refused"
         );
     }
 
@@ -4174,6 +4267,7 @@ mod tests {
             AVATAR_LIMIT_BYTES_VAR,
             BANNER_LIMIT_BYTES_VAR,
             INBOX_MAX_BYTES_VAR,
+            MAX_REMOTE_MENTION_LOOKUPS_VAR,
             MIN_PASSWORD_LENGTH_VAR,
             OAUTH_TOKEN_TTL_SECS_VAR,
             PASSWORD_RESET_TTL_SECS_VAR,
