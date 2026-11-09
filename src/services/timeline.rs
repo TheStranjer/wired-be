@@ -33,12 +33,8 @@
 //! filter names and defaults are Pleroma's, the ticket body is
 //! authoritative.
 //!
-//! Two deliberate absences:
+//! One deliberate absence:
 //!
-//! - There is no `List` source here: the lists ticket owns the
-//!   `List { list_id }` variant and the `list_members` SQL with it, and adds
-//!   them to this builder. Nothing in this module answers with
-//!   `unimplemented` or an artificial internal error in the meantime.
 //! - This module does not render. [`fetch`](TimelineQuery::fetch) answers
 //!   [`Status`] model rows;
 //!   the timelines' endpoint helper turns them into entities with
@@ -89,25 +85,25 @@ const ACCEPTED_FOLLOW_STATE: &str = " AND f.state = 'accepted'";
 /// Which set of statuses a timeline answers from — the `from` half of Pleroma's
 /// `fetch_activities` recipients / `fetch_public_activities` split.
 ///
-/// The visibility an answered row must carry per source: `Home` and
-/// `Account` defer entirely to [`push_visibility_clause`]; `Public` is
+/// The visibility an answered row must carry per source: [`Self::Home`],
+/// [`Self::Account`] and [`Self::List`] defer entirely to
+/// [`push_visibility_clause`]; `Public` is
 /// `public` (plus `local` for an authenticated local viewer — `unlisted`
 /// posts stay out of the public timeline, as in Mastodon/Pleroma) and
 /// `Hashtag` is `public` only; `Direct` is `direct` rows the viewer is a
 /// party to, the audience [`push_visibility_clause`] already restricts to
 /// the author and the mentioned accounts.
-///
-/// There is deliberately no `List` variant yet (see the [module
-/// docs](self)): the lists ticket defines it together with the
-/// `list_members` SQL behind it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimelineSource {
     /// The viewer's following timeline: statuses the viewer authored, plus
     /// statuses by accounts the viewer has an **accepted** follow of —
     /// a reblog row among them only while that follow still has
     /// `show_reblogs` (Mastodon's `reblogs` toggle, see
-    /// [`crate::models::follow`]). An anonymous request has nobody to
-    /// follow, and [`fetch`](TimelineQuery::fetch) answers it the empty
+    /// [`crate::models::follow`]). Members of the viewer's `exclusive`
+    /// lists are pulled back out of it: no home row comes from an account
+    /// the viewer keeps on an exclusive list, unless the row's author is
+    /// the viewer. An anonymous request has nobody to follow, and
+    /// [`fetch`](TimelineQuery::fetch) answers it the empty
     /// page without touching the database.
     Home,
     /// The instance-wide public timeline: `public` statuses, and `local`
@@ -141,6 +137,33 @@ pub enum TimelineSource {
     Account {
         /// The author every row of this timeline is written by.
         user_id: Uuid,
+    },
+    /// One list's timeline: every row authored by an account of the list's
+    /// `list_members` — membership alone is enough, a follow of the member
+    /// is not required — reblog rows by members included, each row still
+    /// judged by [`push_visibility_clause`] (a member's `private` post
+    /// reaches a viewer who follows them, and only such a viewer).
+    ///
+    /// Replies are then narrowed by the list row's stored
+    /// [`replies_policy`](crate::models::list::List::replies_policy),
+    /// judged — as [`ReplyVisibility`] judges — by the reply's stored
+    /// target and its @-mentions:
+    ///
+    /// - `list`: a reply survives only when it answers or @-mentions a
+    ///   member, or the viewer;
+    /// - `followed`: also when it answers or @-mentions an account the
+    ///   viewer has an **accepted** follow of;
+    /// - `none`: no reply survives at all; only non-replies remain.
+    ///
+    /// Like [`Self::Home`] and [`Self::Direct`], an anonymous request has
+    /// no viewer whose list, blocks or policy could judge the page, and
+    /// [`fetch`](TimelineQuery::fetch) answers it the empty page without
+    /// touching the database; the route that fills this source is never
+    /// anonymous either.
+    List {
+        /// The `lists` row whose members fill this timeline and whose
+        /// `replies_policy` narrows its replies.
+        list_id: Uuid,
     },
 }
 
@@ -267,7 +290,8 @@ impl TimelineFilters {
 #[derive(Debug)]
 pub struct TimelineQuery {
     /// The account asking, or `None` for an anonymous request: it decides
-    /// whose follows fill [`TimelineSource::Home`], whose visibility
+    /// whose follows fill [`TimelineSource::Home`], whose replies survive
+    /// [`TimelineSource::List`]'s `replies_policy`, whose visibility
     /// [`push_visibility_clause`] answers for, whose exclusions apply, and
     /// which `local` rows appear on [`TimelineSource::Public`].
     pub viewer: Option<User>,
@@ -291,16 +315,17 @@ impl TimelineQuery {
     /// back flipped).
     ///
     /// The only page that never reaches the database is the impossible one:
-    /// [`TimelineSource::Home`] or [`TimelineSource::Direct`] for an
-    /// anonymous request — there is nobody to follow and no conversation to
-    /// be a party of.
+    /// [`TimelineSource::Home`], [`TimelineSource::Direct`] or
+    /// [`TimelineSource::List`] for an anonymous request — there is nobody
+    /// to follow, no conversation to be a party of, and no viewer whose
+    /// list could answer.
     ///
     /// # Errors
     ///
     /// Any database failure (connection, encoding) arrives as
     /// [`AppError::Database`](crate::error::AppError).
     pub async fn fetch(&self, pool: &PgPool) -> AppResult<Vec<Status>> {
-        if self.anonymous_followers_only() {
+        if self.anonymous_impossible_page() {
             return Ok(Vec::new());
         }
         let viewer = self.viewer.as_ref();
@@ -319,9 +344,12 @@ impl TimelineQuery {
     /// Whether this is the impossible page [`fetch`](Self::fetch) answers
     /// without asking the database: a viewer-relative source behind an
     /// anonymous request.
-    const fn anonymous_followers_only(&self) -> bool {
+    const fn anonymous_impossible_page(&self) -> bool {
         self.viewer.is_none()
-            && matches!(self.source, TimelineSource::Home | TimelineSource::Direct)
+            && matches!(
+                self.source,
+                TimelineSource::Home | TimelineSource::Direct | TimelineSource::List { .. }
+            )
     }
 }
 
@@ -343,15 +371,18 @@ fn push_source(
         TimelineSource::Account { user_id } => {
             let _authored: &mut _ = builder.push(" AND s.user_id = ").push_bind(*user_id);
         }
+        TimelineSource::List { list_id } => push_list(builder, *list_id, viewer),
     }
 }
 
 /// Appends the `Home` predicate: the viewer's own rows (their reblogs
 /// included), plus rows by accounts the viewer has an **accepted** follow
-/// of — and a reblog row only while that follow shows reblogs. Without a
-/// viewer the source is already answered empty by [`TimelineQuery::fetch`];
-/// the `AND false` arm is the belt to that brace, so the predicate can
-/// never widen to "everything" when the caller forgot it.
+/// of — and a reblog row only while that follow shows reblogs — and then
+/// [`push_exclusive_list_exclusion`] takes the members of the viewer's
+/// `exclusive` lists back out. Without a viewer the source is already
+/// answered empty by [`TimelineQuery::fetch`]; the `AND false` arm is the
+/// belt to that brace, so the predicate can never widen to "everything"
+/// when the caller forgot it.
 fn push_home(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>) {
     let Some(viewer_id) = viewer.map(|user| user.id) else {
         let _nothing: &mut _ = builder.push(" AND false");
@@ -365,6 +396,30 @@ fn push_home(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>) {
         .push(" AND f.followee_id = s.user_id")
         .push(ACCEPTED_FOLLOW_STATE)
         .push(" AND (s.reblog_of_id IS NULL OR f.show_reblogs)))");
+    push_exclusive_list_exclusion(builder, viewer_id);
+}
+
+/// Appends the `exclusive` list exclusion (Mastodon's `FeedManager` rule,
+/// which Pleroma reaches by addressing an exclusive list's posts away from
+/// the home timeline): neither a row of a member of one of the viewer's
+/// `exclusive` lists nor a reblog **of** a member's row may ride the home
+/// timeline — the member's own boosts of other accounts go with them, the
+/// way [`push_author_edge_exclusion`] sweeps blocked authors' whole
+/// presence — while the viewer's own rows were never in question: an
+/// account that lists itself keeps its place in its own home.
+fn push_exclusive_list_exclusion(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
+    let _exclusive: &mut _ = builder
+        .push(" AND (s.user_id = ")
+        .push_bind(viewer_id)
+        .push(
+            " OR NOT EXISTS (SELECT 1 FROM list_members lm \
+               JOIN lists l ON l.id = lm.list_id \
+               WHERE l.user_id = ",
+        )
+        .push_bind(viewer_id)
+        .push(" AND l.exclusive AND (lm.user_id = s.user_id OR lm.user_id = ")
+        .push(REBLOG_AUTHOR_SQL)
+        .push(")))");
 }
 
 /// Appends the `Public` predicate: `public` rows, and `local` rows as well
@@ -414,6 +469,100 @@ fn push_hashtag(
             .push_bind(name.clone())
             .push(")");
     }
+}
+
+/// Appends the `List` predicate: rows whose own author is a member of
+/// `list_id`'s `list_members` — membership alone, no follow read — reblog
+/// rows by members included (their author is the member who boosted; the
+/// original's author needs no membership to ride a member's boost).
+/// [`push_visibility_clause`] and [`crate::models::status`] then judge
+/// every member row like any other read's, and [`TimelineQuery`]'s
+/// moderation arms hide members the viewer put away.
+///
+/// Replies are left to [`push_list_replies_policy`], which reads the same
+/// list's stored `replies_policy` in the statement — the one source for
+/// every list, so no second round trip decides the page.
+///
+/// Reference: Pleroma's `Pleroma.Web.TimelineFilter.ListTimeline` behind
+/// the list action of `timeline_controller.ex` (the ticket body's
+/// `list`/`followed`/`none` spellings are authoritative).
+fn push_list(builder: &mut QueryBuilder<Postgres>, list_id: Uuid, viewer: Option<&User>) {
+    let _member: &mut _ = builder
+        .push(" AND EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = ")
+        .push_bind(list_id)
+        .push(" AND lm.user_id = s.user_id)");
+    push_list_replies_policy(builder, list_id, viewer);
+}
+
+/// Opens the `replies_policy` group and runs its arms: a non-reply always
+/// survives; under `none` no reply does; otherwise a reply survives when
+/// [`push_list_member_replies`] answers it to a member, or — with a viewer
+/// — [`push_list_self_arms`] answers it to the viewer and, under
+/// `followed`, [`push_list_followed_replies`] answers it to a viewer's
+/// accepted follow. Without a viewer (a page [`fetch`](TimelineQuery::fetch)
+/// already answers empty) only the member arm reads.
+fn push_list_replies_policy(
+    builder: &mut QueryBuilder<Postgres>,
+    list_id: Uuid,
+    viewer: Option<&User>,
+) {
+    let _open: &mut _ = builder
+        .push(" AND (s.in_reply_to_id IS NULL OR ((SELECT lp.replies_policy FROM lists lp WHERE lp.id = ")
+        .push_bind(list_id)
+        .push(") <> 'none' AND (");
+    push_list_member_replies(builder, list_id);
+    if let Some(viewer_id) = viewer.map(|user| user.id) {
+        push_list_self_arms(builder, viewer_id);
+        push_list_followed_replies(builder, list_id, viewer_id);
+    }
+    let _close: &mut _ = builder.push(")))");
+}
+
+/// The `list` arm — shared by every live policy: a reply addressed to a
+/// member survives, whether it answers them (`in_reply_to_account_id`) or
+/// @-mentions them (the same reading of "addressed to" as
+/// [`push_reply_visibility`] gives).
+fn push_list_member_replies(builder: &mut QueryBuilder<Postgres>, list_id: Uuid) {
+    let _member: &mut _ = builder
+        .push(" EXISTS (SELECT 1 FROM list_members lm WHERE lm.list_id = ")
+        .push_bind(list_id)
+        .push(" AND (lm.user_id = s.in_reply_to_account_id OR EXISTS (SELECT 1 FROM status_mentions sm WHERE sm.status_id = s.id AND sm.user_id = lm.user_id)))");
+}
+
+/// The viewer's own arm, live under both `list` and `followed`: a reply
+/// answering or @-mentioning the viewer survives on the strength of being
+/// addressed to the reader, whoever else the policy counts (Mastodon reads
+/// the current account next to the members in `list` and next to the
+/// followed accounts in `followed`).
+fn push_list_self_arms(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
+    let _self_arm: &mut _ = builder
+        .push(" OR (s.in_reply_to_account_id = ")
+        .push_bind(viewer_id)
+        .push(" OR EXISTS (SELECT 1 FROM status_mentions sv WHERE sv.status_id = s.id AND sv.user_id = ")
+        .push_bind(viewer_id)
+        .push("))");
+}
+
+/// The `followed` policy's extra arm: a reply answering or @-mentioning an
+/// account the viewer has an **accepted** follow of survives too — the
+/// same arms [`push_following_arms`] builds for [`ReplyVisibility::Following`],
+/// hung behind a read of this list's own policy so the `list` policy never
+/// sees them.
+fn push_list_followed_replies(
+    builder: &mut QueryBuilder<Postgres>,
+    list_id: Uuid,
+    viewer_id: Uuid,
+) {
+    let _followed: &mut _ = builder
+        .push(" OR ((SELECT fp.replies_policy FROM lists fp WHERE fp.id = ")
+        .push_bind(list_id)
+        .push(") = 'followed' AND (EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = ")
+        .push_bind(viewer_id)
+        .push(" AND f.followee_id = s.in_reply_to_account_id")
+        .push(ACCEPTED_FOLLOW_STATE)
+        .push(") OR EXISTS (SELECT 1 FROM status_mentions sf JOIN follows mf ON mf.follower_id = ")
+        .push_bind(viewer_id)
+        .push(" AND mf.followee_id = sf.user_id AND mf.state = 'accepted' WHERE sf.status_id = s.id)))");
 }
 
 /// Appends the `reply_visibility` group for `visibility`, judged by the
@@ -544,6 +693,7 @@ mod tests {
         config::TEST_BASE_URL,
         models::{
             block, conversation_mute, domain_block, follow,
+            list::{self, List, ListChanges, NewList},
             mute::{self, MuteOptions},
             pinned_status,
             status::{self, NewStatus, soft_delete},
@@ -708,6 +858,53 @@ mod tests {
         .await
         .expect("the mute lapses");
         assert_eq!(lapsed.rows_affected(), 1, "the fixture mute was there");
+    }
+
+    /// Creates `owner`'s list titled `circle` with `policy` as its replies
+    /// policy and `exclusive` as its exclusiveness.
+    async fn owned_list(pool: &PgPool, owner: &User, policy: &str, exclusive: bool) -> List {
+        list::create(
+            pool,
+            owner.id,
+            &NewList {
+                title: "circle".to_owned(),
+                replies_policy: policy.to_owned(),
+                exclusive,
+            },
+        )
+        .await
+        .expect("the fixture list creates")
+    }
+
+    /// Adds `member` to `list` through the model's own write (the API's
+    /// follow rule is [`crate::api::lists`]'s business, not membership's).
+    async fn add_member(pool: &PgPool, list: &List, member: &User) {
+        let added = list::add_members(pool, list.id, &[member.id])
+            .await
+            .expect("the fixture membership adds");
+        assert_eq!(added, 1, "exactly one membership went in");
+    }
+
+    /// Rewrites the list's stored replies policy, the same write the API's
+    /// `PUT` performs.
+    async fn set_policy(pool: &PgPool, owner: &User, list: &List, policy: &str) {
+        let rewritten = list::update(
+            pool,
+            owner.id,
+            list.id,
+            &ListChanges {
+                title: None,
+                replies_policy: Some(policy.to_owned()),
+                exclusive: None,
+            },
+        )
+        .await
+        .expect("the policy update succeeds")
+        .expect("the fixture list exists");
+        assert_eq!(
+            rewritten.replies_policy, policy,
+            "the stored policy now reads `{policy}`"
+        );
     }
 
     /// The whole-table page: no cursors and a limit above every fixture
@@ -1145,6 +1342,294 @@ mod tests {
             for_author,
             newest_first(&[&public, &unlisted, &private, &dm, &bob_reply]),
             "the author sees all of their own rows"
+        );
+    }
+
+    /// `List` answers rows authored by members — no follow read: a followed
+    /// non-member stays out, a member's `private` post stays out only for
+    /// the visibility clause's reason, a member's boost rides in (its
+    /// author is the member), and the list's own owner is off the page
+    /// unless they added themselves. An anonymous list fetches the empty
+    /// page without a query.
+    #[tokio::test]
+    async fn list_answers_member_posts_without_follows_including_member_reblogs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let dave = local(&pool, "dave").await;
+        let carol_follow = follow::follow(&pool, BASE, &alice, &carol)
+            .await
+            .expect("alice follows carol");
+        assert_eq!(
+            carol_follow.state,
+            follow::FollowState::Accepted,
+            "the fixture follow is granted"
+        );
+        let circle = owned_list(&pool, &alice, "list", false).await;
+        add_member(&pool, &circle, &bob).await;
+        let bob_public = post(&pool, &bob, Visibility::Public, "member public").await;
+        let _bob_private = post(&pool, &bob, Visibility::Private, "member private").await;
+        let carol_public = post(&pool, &carol, Visibility::Public, "followed non-member").await;
+        let dave_public = post(&pool, &dave, Visibility::Public, "boosted original").await;
+        let alice_own = post(&pool, &alice, Visibility::Public, "owner's own post").await;
+        let bob_reblog = reblog(&pool, &bob, &dave_public).await;
+
+        let page = page_ids(
+            &pool,
+            &timeline(Some(alice), TimelineSource::List { list_id: circle.id }),
+        )
+        .await;
+        assert_eq!(
+            page,
+            newest_first(&[&bob_public, &bob_reblog]),
+            "the member's post and the member's boost ride the list; the followed \
+             non-member's post, the owner's own post and the un-followed member's private \
+             row (by the visibility clause) do not"
+        );
+        assert!(
+            !page.contains(&carol_public.id) && !page.contains(&alice_own.id),
+            "membership, not follow or ownership, is what fills the list"
+        );
+        let anonymous = page_ids(
+            &pool,
+            &timeline(None, TimelineSource::List { list_id: circle.id }),
+        )
+        .await;
+        assert!(
+            anonymous.is_empty(),
+            "an anonymous list page is the empty page"
+        );
+    }
+
+    /// The list page lives by the standard filters and exclusions like
+    /// every other timeline: the viewer's mute clears the member off it,
+    /// `with_muted` brings the rows back, and `only_media` narrows the
+    /// kept rows to the attached ones.
+    #[tokio::test]
+    async fn list_pages_honour_mutes_and_only_media() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let circle = owned_list(&pool, &alice, "list", false).await;
+        add_member(&pool, &circle, &bob).await;
+        let plain = post(&pool, &bob, Visibility::Public, "plain member").await;
+        let pictured = post(&pool, &bob, Visibility::Public, "pictured member").await;
+        attach_media(&pool, pictured.id).await;
+        let muted = mute::mute(&pool, &alice, &bob, MuteOptions::default())
+            .await
+            .expect("alice mutes bob");
+        assert_eq!(muted.muted_id, bob.id, "the mute is live");
+
+        let list_source = || TimelineSource::List { list_id: circle.id };
+        let hidden = page_ids(
+            &pool,
+            &timeline(Some(as_viewer(&pool, &alice).await), list_source()),
+        )
+        .await;
+        assert!(hidden.is_empty(), "the muted member leaves the list page");
+        let shown = page_ids(
+            &pool,
+            &filtered(
+                Some(as_viewer(&pool, &alice).await),
+                list_source(),
+                TimelineFilters {
+                    with_muted: Flag::new(true),
+                    ..TimelineFilters::default()
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            shown,
+            newest_first(&[&plain, &pictured]),
+            "with_muted lifts the viewer's own exclusion"
+        );
+        let media = page_ids(
+            &pool,
+            &filtered(
+                Some(alice),
+                list_source(),
+                TimelineFilters {
+                    with_muted: Flag::new(true),
+                    only_media: Flag::new(true),
+                    ..TimelineFilters::default()
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            media,
+            newest_first(&[&pictured]),
+            "only_media keeps the attached row"
+        );
+    }
+
+    /// The `replies_policy` matrix of one list: `list` keeps only replies
+    /// answering or @-mentioning a member or the viewer, `followed` also
+    /// those answering or @-mentioning an accepted follow, and `none`
+    /// drops every reply — a root never falls to the policy, and the
+    /// non-members' roots that the replies answer stay off the page
+    /// because membership, not the thread, fills it.
+    #[tokio::test]
+    async fn list_replies_policy_selects_whom_a_reply_may_answer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let dave = local(&pool, "dave").await;
+        let eve = local(&pool, "eve").await;
+        let dave_follow = follow::follow(&pool, BASE, &alice, &dave)
+            .await
+            .expect("alice follows dave");
+        assert_eq!(
+            dave_follow.state,
+            follow::FollowState::Accepted,
+            "the fixture follow is granted"
+        );
+        let circle = owned_list(&pool, &alice, "list", false).await;
+        add_member(&pool, &circle, &bob).await;
+        add_member(&pool, &circle, &carol).await;
+        let carol_root = post(&pool, &carol, Visibility::Public, "member root").await;
+        let dave_root = post(&pool, &dave, Visibility::Public, "followed root").await;
+        let eve_root = post(&pool, &eve, Visibility::Public, "stranger root").await;
+        let alice_root = post(&pool, &alice, Visibility::Public, "viewer root").await;
+        let bob_root = post(&pool, &bob, Visibility::Public, "member root post").await;
+        let to_member = reply(&pool, &bob, &carol_root, &[], "bob to carol").await;
+        let to_followed = reply(&pool, &bob, &dave_root, &[], "bob to dave").await;
+        let _to_stranger = reply(&pool, &bob, &eve_root, &[], "bob to eve").await;
+        let to_viewer = reply(&pool, &bob, &alice_root, &[], "bob to alice").await;
+        let mentions_member = reply(&pool, &bob, &eve_root, &[&carol], "bob cc carol").await;
+        let mentions_followed = reply(&pool, &bob, &eve_root, &[&dave], "bob cc dave").await;
+
+        let circle_id = circle.id;
+        let page = |viewer: User| {
+            filtered(
+                Some(viewer),
+                TimelineSource::List { list_id: circle_id },
+                TimelineFilters::default(),
+            )
+        };
+
+        let under_list = page_ids(&pool, &page(as_viewer(&pool, &alice).await)).await;
+        assert_eq!(
+            under_list,
+            newest_first(&[
+                &bob_root,
+                &carol_root,
+                &to_member,
+                &to_viewer,
+                &mentions_member
+            ]),
+            "`list` keeps roots and the replies answering or mentioning a member or the viewer"
+        );
+
+        set_policy(&pool, &alice, &circle, "followed").await;
+        let under_followed = page_ids(&pool, &page(as_viewer(&pool, &alice).await)).await;
+        assert_eq!(
+            under_followed,
+            newest_first(&[
+                &bob_root,
+                &carol_root,
+                &to_member,
+                &to_viewer,
+                &mentions_member,
+                &to_followed,
+                &mentions_followed
+            ]),
+            "`followed` adds the replies answering or mentioning an accepted follow"
+        );
+
+        set_policy(&pool, &alice, &circle, "none").await;
+        let under_none = page_ids(&pool, &page(alice)).await;
+        assert_eq!(
+            under_none,
+            newest_first(&[&bob_root, &carol_root]),
+            "`none` is no replies at all"
+        );
+    }
+
+    /// An `exclusive` list takes its members back out of the viewer's
+    /// `Home`: the member's posts, the member's own boosts, and even a
+    /// stranger's boost **of** the member's post go, while a member of a
+    /// non-exclusive list stays and the viewer's own rows are never in
+    /// question — an account that lists itself keeps its place in its own
+    /// home.
+    #[tokio::test]
+    async fn an_exclusive_list_removes_its_members_from_home() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let dave = local(&pool, "dave").await;
+        for followed in [&bob, &carol, &dave] {
+            let granted = follow::follow(&pool, BASE, &alice, followed)
+                .await
+                .expect("alice follows the fixture accounts");
+            assert_eq!(
+                granted.state,
+                follow::FollowState::Accepted,
+                "every fixture account is open"
+            );
+        }
+        let open = owned_list(&pool, &alice, "list", false).await;
+        add_member(&pool, &open, &carol).await;
+        let exclusive = owned_list(&pool, &alice, "list", true).await;
+        add_member(&pool, &exclusive, &bob).await;
+        add_member(&pool, &exclusive, &alice).await;
+        let alice_own = post(&pool, &alice, Visibility::Public, "own post").await;
+        let bob_post = post(&pool, &bob, Visibility::Public, "exclusive member").await;
+        let carol_post = post(&pool, &carol, Visibility::Public, "open list member").await;
+        let dave_post = post(&pool, &dave, Visibility::Public, "plain follow").await;
+        let bob_boost = reblog(&pool, &bob, &dave_post).await;
+        let dave_boost = reblog(&pool, &dave, &bob_post).await;
+
+        let home = page_ids(
+            &pool,
+            &timeline(Some(as_viewer(&pool, &alice).await), TimelineSource::Home),
+        )
+        .await;
+        assert_eq!(
+            home,
+            newest_first(&[&alice_own, &carol_post, &dave_post]),
+            "the exclusive member's rows are gone, her boost with them, and the viewer's \
+             self-membership exempts her own post"
+        );
+        assert!(
+            !home.contains(&bob_boost.id) && !home.contains(&dave_boost.id),
+            "the member's boost and even the stranger's boost of the member's post stay out"
+        );
+
+        let relaxed = list::update(
+            &pool,
+            alice.id,
+            exclusive.id,
+            &ListChanges {
+                title: None,
+                replies_policy: None,
+                exclusive: Some(false),
+            },
+        )
+        .await
+        .expect("the flag update succeeds")
+        .expect("the fixture list exists");
+        assert!(!relaxed.exclusive, "the list is no longer exclusive");
+        let open_home = page_ids(&pool, &timeline(Some(alice), TimelineSource::Home)).await;
+        assert_eq!(
+            open_home,
+            newest_first(&[
+                &alice_own,
+                &bob_post,
+                &carol_post,
+                &dave_post,
+                &bob_boost,
+                &dave_boost
+            ]),
+            "with exclusivity off, every followed row rides home again"
         );
     }
 

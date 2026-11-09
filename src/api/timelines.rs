@@ -29,10 +29,21 @@
 //! `with_muted=true`, and the `Link` header works exactly as on the tag
 //! route.
 //!
+//! `GET /api/v1/timelines/list/{list_id}` (WBE-105) answers one of the
+//! caller's lists: statuses authored by its members — membership alone,
+//! no follow required — reblog rows by members included, replies narrowed
+//! by the list's stored `replies_policy` (see
+//! [`TimelineSource::List`]). Auth is required ([`AuthUser`] with
+//! `read:lists`, Pleroma's scopes plug on the `list` action), and a list
+//! that is malformed, unknown or someone else's is one and the same 404
+//! "Record not found". `only_media` and `with_muted` narrow the page like
+//! they do everywhere else, and the `Link` header works exactly as on the
+//! other routes.
+//!
 //! Reference: `lib/pleroma/web/mastodon_api/controllers/timeline_controller.ex`
-//! (`hashtag/2`, `hashtag_fetching/3` and `direct/2`); the ticket body is
-//! authoritative. The later timeline routes (home, public, list) join this
-//! module and reuse `timeline_response`.
+//! (`hashtag/2`, `hashtag_fetching/3`, `direct/2` and `list/2`); the
+//! ticket body is authoritative. The later timeline routes (home, public)
+//! join this module and reuse `timeline_response`.
 
 use axum::{
     Json, Router,
@@ -41,22 +52,25 @@ use axum::{
     routing::get,
 };
 use url::form_urlencoded;
+use uuid::Uuid;
 
 use crate::{
     auth::{AuthUser, MaybeAuthUser},
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
     models::{
+        list,
         status::{Status as StatusRow, Visibility},
         user::{Flag, User},
     },
-    oauth::scopes::READ_STATUSES,
+    oauth::scopes::{READ_LISTS, READ_STATUSES},
     pagination::{PageParams, link_header, set_link_header},
     services::{
         render_status::render_statuses,
         timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     },
     state::AppState,
+    util::id::parse_id,
 };
 
 /// The `/api/v1/timelines` router, merged into [`crate::api::v1`].
@@ -64,6 +78,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/timelines/tag/{tag}", get(tag_timeline))
         .route("/timelines/direct", get(direct_timeline))
+        .route("/timelines/list/{list_id}", get(list_timeline))
 }
 
 /// `GET /api/v1/timelines/tag/{tag}` — the `public` statuses carrying `tag`,
@@ -256,6 +271,110 @@ impl DirectParams {
     }
 }
 
+/// `GET /api/v1/timelines/list/{list_id}` — the statuses authored by one
+/// of the caller's lists' members (membership alone, no follow required),
+/// replies narrowed by the list's stored `replies_policy`, newest first,
+/// one [`PageParams`] keyset page at a time (`limit` defaults to 20 and
+/// caps at 40). Auth is required ([`AuthUser`], Pleroma's user
+/// requirement on the `list` action): no token is its 401 "Invalid
+/// credentials", an app-only token the 403 "This API requires an
+/// authenticated user", and a user token must grant `read:lists`
+/// ([`AuthUser::require`]) — Pleroma's scopes plug for this action,
+/// unlike the other timelines, asks the list scope, not `read:statuses`.
+///
+/// The `Link` header's path is the request's own [`OriginalUri`], not the
+/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// prefix off the latter, and Pleroma links to `conn.request_path`.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] from [`AuthUser::require`] when the token lacks
+/// `read:lists`; [`AppError::NotFound`] when `list_id` is malformed, names
+/// no list or names another account's (see [`owned_list_id`], Pleroma
+/// answering a foreign `fetch_activities` list with its generic 404);
+/// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor.
+/// Any database failure arrives through `?` as [`AppError::Database`], and
+/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`AppError::Internal`].
+async fn list_timeline(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(raw_id): Path<String>,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
+    auth.require(READ_LISTS)?;
+    let list_id = owned_list_id(&state, auth.0.id, &raw_id).await?;
+    let query = ListParams::parse(uri.query()).into_timeline(list_id, auth.0, page);
+    timeline_response(&state, &query, &uri).await
+}
+
+/// Resolves the `{list_id}` path segment to the id of a list `viewer_id`
+/// owns: [`parse_id`]'s malformed spelling, an unknown id and a foreign
+/// list are one and the same [`AppError::NotFound`] — Pleroma's
+/// `FallbackController` answer, and the same rule every list route in
+/// [`crate::api::lists`] lives by.
+async fn owned_list_id(state: &AppState, viewer_id: Uuid, raw: &str) -> AppResult<Uuid> {
+    let Some(list_id) = parse_id(raw) else {
+        return Err(AppError::NotFound);
+    };
+    if list::get_owned(&state.db, viewer_id, list_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+    Ok(list_id)
+}
+
+/// The list timeline's request parameters beyond the [`PageParams`] page
+/// and the path id: the two toggles the ticket names. The booleans are
+/// [`Flag`]s because that is what this repository models every boolean
+/// with (see [`crate::models::user`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ListParams {
+    /// `only_media`: keep only statuses carrying an attachment.
+    only_media: Flag,
+    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
+    /// `with_muted`, default `false`).
+    with_muted: Flag,
+}
+
+impl ListParams {
+    /// Reads the parameters out of a raw query string (what [`Uri::query`]
+    /// returns, percent-decoding and all); the cursors and `limit` are
+    /// [`PageParams`]'s to read and every other key is never looked at.
+    fn parse(query: Option<&str>) -> Self {
+        let mut found = Self::default();
+        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            match key.as_ref() {
+                "only_media" => found.only_media = Flag::new(is_true(&value)),
+                "with_muted" => found.with_muted = Flag::new(is_true(&value)),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// Assembles the [`TimelineQuery`] the request asks for:
+    /// [`TimelineSource::List`] of `list_id` as `viewer` — who is always
+    /// present because the route requires authentication, and whose list
+    /// `list_id` names because [`owned_list_id`] proved it — with the two
+    /// toggles set from the query.
+    fn into_timeline(self, list_id: Uuid, viewer: User, page: PageParams) -> TimelineQuery {
+        TimelineQuery {
+            viewer: Some(viewer),
+            source: TimelineSource::List { list_id },
+            filters: TimelineFilters {
+                only_media: self.only_media,
+                with_muted: self.with_muted,
+                ..TimelineFilters::default()
+            },
+            page,
+        }
+    }
+}
+
 /// The shared response shape of every `/api/v1/timelines/*` endpoint:
 /// [`fetch`](TimelineQuery::fetch) `query`, [`render_statuses`] the page for
 /// its viewer, and answer the newest-first [`StatusEntity`] array with the
@@ -263,7 +382,7 @@ impl DirectParams {
 /// fetched rows' ids (Pleroma's `add_link_headers`). An empty page carries
 /// no `Link` header at all.
 ///
-/// The direct route and the home, public and list routes the later
+/// The direct and list routes and the home and public routes the later
 /// tickets add build their [`TimelineQuery`] the same way [`tag_timeline`]
 /// does and hand it here; the rendering, cursors and headers never get
 /// restated.
@@ -489,6 +608,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_list_reads_only_only_media_and_with_muted() {
+        let on = ListParams::parse(Some("only_media=true&with_muted=1&limit=5&max_id=abc"));
+        assert!(on.only_media.get(), "`only_media=true` is on");
+        assert!(on.with_muted.get(), "`with_muted=1` is on too");
+        let off = ListParams::parse(Some("only_media=yes&with_muted=false"));
+        assert!(
+            !off.only_media.get() && !off.with_muted.get(),
+            "`yes` is not true and the last occurrence wins"
+        );
+        assert_eq!(
+            ListParams::parse(Some("local=true&min_id=7")),
+            ListParams::default(),
+            "foreign keys and the page keys are not looked at"
+        );
+        assert_eq!(
+            ListParams::parse(None),
+            ListParams::default(),
+            "no query is everything off"
+        );
+    }
+
     /// A database-backed [`User`] for [`DirectParams::into_timeline`],
     /// which owns its viewer and so cannot be built from a literal.
     async fn fixture_user() -> (crate::test_db::TestDb, User) {
@@ -532,6 +673,48 @@ mod tests {
             query.filters.with_muted,
             Flag::new(true),
             "the one filter rides from the query string"
+        );
+        assert_eq!(query.page, page, "the page is threaded through");
+    }
+
+    #[tokio::test]
+    async fn the_list_query_names_the_owned_list_and_its_two_toggles() {
+        let (_db, alice) = fixture_user().await;
+        let alice_id = alice.id;
+        let list_id = Uuid::now_v7();
+        let page = PageParams {
+            max_id: None,
+            min_id: None,
+            since_id: None,
+            limit: 20,
+            offset: None,
+        };
+        let query = ListParams {
+            only_media: Flag::new(true),
+            with_muted: Flag::new(false),
+        }
+        .into_timeline(list_id, alice, page);
+        assert_eq!(
+            query.source,
+            TimelineSource::List { list_id },
+            "the query is built over the proven-owned list"
+        );
+        assert!(
+            query
+                .viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.id == alice_id),
+            "the query owns the authenticated viewer"
+        );
+        assert_eq!(
+            query.filters.only_media,
+            Flag::new(true),
+            "`only_media` rides from the query string"
+        );
+        assert_eq!(
+            query.filters.with_muted,
+            Flag::new(false),
+            "`with_muted` defaults to off"
         );
         assert_eq!(query.page, page, "the page is threaded through");
     }
