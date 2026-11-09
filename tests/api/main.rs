@@ -222,6 +222,10 @@ mod tags;
 /// twin) and the `muted` / `pleroma.thread_muted` entity flags.
 mod thread_mutes;
 
+/// Status timelines over HTTP (`/api/v1/timelines/*`): the tag timeline's
+/// selection, filters, cursors and auth.
+mod timelines;
+
 /// Status translation over HTTP (`POST /api/v1/statuses/{id}/translate` and
 /// the instance endpoints' translation half), against a mock provider.
 mod translate;
