@@ -112,7 +112,7 @@ const EXPAND_PARTIAL_AVATARS: &str = "partial_avatars";
 /// The `Link` header's query parameters carry nothing but the cursor: the
 /// listing's filters are not repeated on either link, as in no other paged
 /// listing here (the relationship listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
+pub(crate) const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v2` grouped-notifications router, merged into
 /// [`crate::api::v2`].
@@ -130,7 +130,7 @@ pub fn router() -> Router<AppState> {
 /// Mastodon clients and forms both send, like the markers' timeline names.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum StringList {
+pub(crate) enum StringList {
     /// A lone name.
     Single(String),
     /// A list of names.
@@ -139,7 +139,7 @@ enum StringList {
 
 impl StringList {
     /// The names, borrowed, in the order sent.
-    fn names(&self) -> Vec<&str> {
+    pub(crate) fn names(&self) -> Vec<&str> {
         match self {
             Self::Single(name) => vec![name.as_str()],
             Self::Multiple(names) => names.iter().map(String::as_str).collect(),
@@ -148,7 +148,7 @@ impl StringList {
 }
 
 /// The names behind an optional list parameter, none when it was absent.
-fn names_of(list: Option<&StringList>) -> Vec<&str> {
+pub(crate) fn names_of(list: Option<&StringList>) -> Vec<&str> {
     list.map_or_else(Vec::new, StringList::names)
 }
 
@@ -243,7 +243,10 @@ impl UnreadCountParams {
 ///
 /// [`AppError::NotFound`] through [`account_or_404`] when the text names no
 /// readable account.
-async fn account_filter(state: &AppState, account_id: Option<&str>) -> AppResult<Option<Uuid>> {
+pub(crate) async fn account_filter(
+    state: &AppState,
+    account_id: Option<&str>,
+) -> AppResult<Option<Uuid>> {
     match account_id {
         None => Ok(None),
         Some(text) => account_or_404(state, text)
