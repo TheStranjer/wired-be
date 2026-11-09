@@ -3,8 +3,9 @@
 //! `docs/ARCHITECTURE.md` decision 11 keeps background work in Postgres rows;
 //! this module is the producer of the rows that fire on a schedule. The
 //! [`periodic_jobs`] registry lists every recurring job (today the
-//! streaming hub's reference-table sweep, the mutes expiry sweep and the
-//! daily dismissed-notification sweep; later tickets append one line per
+//! streaming hub's reference-table sweep, the mutes expiry sweep, the daily
+//! dismissed-notification sweep and the hourly OAuth/MFA/password-reset
+//! token sweep; later tickets append one line per
 //! entry), and [`run`] ticks every ten seconds,
 //! enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
@@ -63,7 +64,11 @@ pub struct PeriodicJob {
 /// of notifications dismissed beyond their retention
 /// ([`KIND_NOTIFICATIONS`](super::maintenance::KIND_NOTIFICATIONS)) sits on the
 /// same queue too: dismissal already hides those rows from every read, so a
-/// day is only how long the storage lives on after them.
+/// day is only how long the storage lives on after them. The hourly sweep of
+/// dead OAuth, MFA and password-reset tokens
+/// ([`KIND_TOKENS`](super::maintenance::KIND_TOKENS)) shares the queue: the
+/// validity lookups already refuse those rows, so the period only decides how
+/// long the storage lives on after them.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -81,6 +86,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             kind: super::maintenance::KIND_NOTIFICATIONS,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_hours(24),
+        },
+        PeriodicJob {
+            kind: super::maintenance::KIND_TOKENS,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_secs(3_600),
         },
     ]
 }
