@@ -294,8 +294,7 @@ fn page_link(base_url: &str, path: &str, entries: &[(Block, User)]) -> Option<St
 /// decides what that means for the queue.
 ///
 /// Intentionally empty until then, like the follow model's
-/// [`blocked_between`](crate::models::follow) hook and the follow requests'
-/// [`after_follow_request_resolved`](crate::api::follow_requests): Pleroma's
+/// [`blocked_between`](crate::models::follow) hook: Pleroma's
 /// `CommonAPI.block` / `CommonAPI.unblock` deliver their activities inline,
 /// and this server's delivery queue is a later ticket.
 ///

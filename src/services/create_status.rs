@@ -85,7 +85,7 @@ use crate::{
         status_edit,
         user::User,
     },
-    services::{mentions::resolve_mentions, render_status::render_status},
+    services::{mentions::resolve_mentions, notify, render_status::render_status},
     state::AppState,
     util::{
         entities::{MentionRef, extract_hashtags, linkify_entities},
@@ -494,7 +494,7 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
         // reblog, so the renderer has nothing to drop it for — and a 500
         // rather than a panic if it ever happens.
         .ok_or_else(|| AppError::Internal(format!("the status {} did not render", row.id)))?;
-    after_status_created(state, &entity);
+    after_status_created(state, &row).await;
     Ok(entity)
 }
 
@@ -838,18 +838,25 @@ fn new_status(
 }
 
 /// The post-write hook of [`create_status`]: the tickets that let a fresh
-/// local status out of the database it was just written to — the streaming
-/// `update` broadcast to the author's and the mentioned users' sockets and
-/// to the public and hashtag timelines, the notifications for the mentions
-/// and the author's followers, and the federation of the `Create` activity
+/// local status out of the database it was just written to — the mention
+/// notifications for the mentioned accounts and the replied-to author
+/// (landed from [`notify::on_mention`], Pleroma's `Create` notification
+/// arm), the streaming `update` broadcast to the author's and the mentioned
+/// users' sockets and to the public and hashtag timelines, the follower
+/// `status` notifications, and the federation of the `Create` activity
 /// through the job queue (see [`crate::models::job`], decision 11) — wire
 /// themselves in here, and only here.
 ///
-/// Intentionally empty until then, like the reports'
-/// [`after_report_created`](crate::api::reports) hook: the write path owns
-/// the row and the render, and the entity it hands over is the one all three
-/// of those consumers are built from.
-const fn after_status_created(_state: &AppState, _status: &Status) {}
+/// `status` is the stored row: the id the tellings name, the author they
+/// do not tell, and the `reblog_of_id` that keeps a boost row out of the
+/// mention arm. The two consumers still waiting (streaming and
+/// federation) need the rendered entity too and will grow this one call's
+/// signature when they land.
+///
+/// [`notify::on_mention`]: crate::services::notify::on_mention
+async fn after_status_created(state: &AppState, status: &status::Status) {
+    notify::on_mention(state, status).await;
+}
 
 /// The body of `PUT /api/v1/statuses/{id}`, as the client wrote it.
 ///

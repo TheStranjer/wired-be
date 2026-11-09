@@ -4,8 +4,9 @@
 //! render of the own-view Account, and the auth and scope gates.
 //!
 //! The suppression `block_from_strangers` applies when a notification is
-//! created (`maybe_notify`) has no HTTP call site yet, so its coverage
-//! lives with the model: `src/models/notification.rs`.
+//! created (`maybe_notify`) is covered at the model (`src/models/notification.rs`)
+//! and end to end in `notification_generation.rs`, whose actions now run
+//! through it.
 
 #![cfg(test)]
 

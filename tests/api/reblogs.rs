@@ -24,8 +24,9 @@
 //! count, and a withdrawal with nothing to withdraw moves nothing.
 //!
 //! Nothing federates yet: the `Announce` and its `Undo` attach at the
-//! module's `after_reblog_changed` hook, so no notification or delivery is
-//! asserted here.
+//! module's `after_reblog_changed` hook, so no delivery is asserted here.
+//! The boost notification that hook now also sends is the notification
+//! generation area's (`notification_generation.rs`), not this file's.
 //!
 //! [`Status`]: wired_be::entities::status::Status
 //! [`Account`]: wired_be::entities::account::Account

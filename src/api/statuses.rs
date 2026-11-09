@@ -191,11 +191,11 @@
 //! newest boost first, paged by [`PageParams`] keyed on the *reblog row
 //! id* (the `Link` cursors carry boost ids, not account ids).
 //!
-//! Neither reblog write federates anything yet: the federation ticket
-//! that sends the `Announce` activity and its `Undo`, and the
-//! notification ticket that tells the original's author, wire into this
-//! module's `after_reblog_changed` hook — the documented empty landing
-//! point, exactly as `after_favourite_changed`'s awaits its `Like`.
+//! A boost tells the original's author — the `after_reblog_changed` hook
+//! lands [`crate::services::notify`]'s reblog telling (and its withdrawal),
+//! Pleroma's `Announce` notification riding the same pipeline. What the
+//! write does not do yet is federate: the federation ticket that sends the
+//! `Announce` activity and its `Undo` lands in the same hook.
 //!
 //! # The bookmark writes and the bookmarks listing
 //!
@@ -265,7 +265,7 @@
 //! Neither pin write federates anything yet either: the federation ticket
 //! that announces the `Featured` collection's `Add` and `Remove` lands in
 //! this module's `after_pin_changed` hook, the documented empty landing
-//! point like `after_favourite_changed`'s.
+//! point it still is.
 //!
 //! # The thread-mute writes
 //!
@@ -298,11 +298,13 @@
 //! neither rides a throttle bucket: a thread mute is the account's own
 //! private view choice, exactly like a bookmark.
 //!
-//! Neither favourite write federates anything yet: the federation ticket
-//! that sends the `Like` activity and its `Undo` wires into this module's
-//! `after_favourite_changed` hook, the documented empty landing point,
-//! exactly as the reactions' [`crate::api::emoji_reactions`] hook waits
-//! for its `EmojiReact`. The bookmark writes have no such hook to wait
+//! A favourite tells the status's author — the `after_favourite_changed`
+//! hook lands [`crate::services::notify`]'s favourite telling (and its
+//! withdrawal), Pleroma's `Like` notification riding the same pipeline.
+//! What the write does not do yet is federate: the federation ticket that
+//! sends the `Like` activity and its `Undo` lands in the same hook, as the
+//! reactions' [`crate::api::emoji_reactions`] hook still waits for its
+//! `EmojiReact`. The bookmark writes have no such hook to wait
 //! for — Pleroma's bookmark is a private row, never an activity.
 //!
 //! # The translation
@@ -455,6 +457,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         create_status::{self, CreateStatusParams, EditStatusParams},
+        notify,
         render_status::{render_status, render_statuses},
         translate::Translator,
     },
@@ -1284,7 +1287,7 @@ async fn favourite_status(
             user = %auth.0.id,
             "status favourited"
         );
-        after_favourite_changed(&state, &created, true);
+        after_favourite_changed(&state, &created, true).await;
     }
     current_entity(&state, &auth.0, row.id).await
 }
@@ -1317,7 +1320,7 @@ async fn unfavourite_status(
             user = %auth.0.id,
             "favourite withdrawn"
         );
-        after_favourite_changed(&state, &removed, false);
+        after_favourite_changed(&state, &removed, false).await;
     }
     current_entity(&state, &auth.0, row.id).await
 }
@@ -1485,7 +1488,7 @@ async fn reblog_status(
             visibility = visibility.as_str(),
             "status reblogged"
         );
-        after_reblog_changed(&state, &reblog, true);
+        after_reblog_changed(&state, &reblog, true).await;
     }
     current_entity(&state, &auth.0, reblog.id).await
 }
@@ -1522,7 +1525,7 @@ async fn unreblog_status(
             user = %auth.0.id,
             "reblog withdrawn"
         );
-        after_reblog_changed(&state, &removed, false);
+        after_reblog_changed(&state, &removed, false).await;
     }
     current_entity(&state, &auth.0, original_id).await
 }
@@ -2202,26 +2205,25 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
     requested.iter().filter_map(|id| by_id.remove(id)).collect()
 }
 
-/// Post-write hook of both favourite routes: the federation ticket that
-/// sends the `Like` activity (and its `Undo`, when a favourite is
-/// withdrawn) wires the delivery in here — the activity to send is
-/// [`FavouriteRow::ap_id`], the pair it names is [`FavouriteRow::user_id`]
-/// and [`FavouriteRow::status_id`], and the queueing happens through
-/// `state` (decision 11). The notification ticket that tells the status's
-/// author lands in the same hook; Pleroma runs both through its
-/// `CommonAPI.favorite` pipeline.
+/// Post-write hook of both favourite routes: the favourite telling of the
+/// status's author — and its withdrawal, when a favourite is undone — runs
+/// through here, landed from [`notify::on_favourite`] (Pleroma's
+/// `CommonAPI.favorite` pipeline runs the same pair). The federation ticket
+/// that sends the `Like` activity (and its `Undo`) wires its delivery into
+/// the same body: the activity to send is [`FavouriteRow::ap_id`], the pair
+/// it names is [`FavouriteRow::user_id`] and [`FavouriteRow::status_id`],
+/// and the queueing happens through `state` (decision 11).
 ///
 /// `favouriting` states which way the write moved the fact: `true` for the
 /// favourite a `POST …/favourite` left behind — a repeat favourite never
-/// reaches this hook, since it changed nothing — and `false` for the
-/// `Undo` of the favourite a `POST …/unfavourite` removed. A withdrawal
-/// that found no row to remove never reaches it either.
+/// reaches this hook, since it changed nothing, which is why one like
+/// tells once — and `false` for the `Undo` of the favourite a
+/// `POST …/unfavourite` removed. A withdrawal that found no row to remove
+/// never reaches it either.
 ///
-/// Intentionally empty until then, like the reactions'
-/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed)
-/// and the blocks'
-/// [`after_block_changed`](crate::api::blocks::after_block_changed).
-const fn after_favourite_changed(_state: &AppState, _favourite: &FavouriteRow, _favouriting: bool) {
+/// [`notify::on_favourite`]: crate::services::notify::on_favourite
+async fn after_favourite_changed(state: &AppState, favourite: &FavouriteRow, favouriting: bool) {
+    notify::on_favourite(state, favourite, favouriting).await;
 }
 
 /// Post-write hook of both reblog routes: the federation ticket that sends
@@ -2232,23 +2234,23 @@ const fn after_favourite_changed(_state: &AppState, _favourite: &FavouriteRow, _
 /// row's [`user_id`](StatusRow::user_id) and its
 /// [`reblog_of_id`](StatusRow::reblog_of_id), and the queueing happens
 /// through `state` (decision 11).
-/// The notification ticket that tells the original's author — Pleroma's
-/// `Announce` notification rides the same `CommonAPI.repeat` pipeline —
-/// lands in the same hook.
+/// The telling of the original's author — Pleroma's `Announce`
+/// notification rides the same `CommonAPI.repeat` pipeline — lands in the
+/// same body, from [`notify::on_reblog`].
 ///
 /// `reblog` is the row the write just created or tombstoned: on the
 /// withdrawal it is the tombstone, whose `uri` the `Undo` must name.
 ///
 /// `reblogging` states which way the write moved the fact: `true` for the
 /// reblog a `POST …/reblog` left behind — a repeat reblog never reaches
-/// this hook, since it changed nothing — and `false` for the `Undo` of the
-/// reblog a `POST …/unreblog` removed. A withdrawal that found no row to
-/// remove never reaches it either.
+/// this hook, since it changed nothing, which is why one boost tells once —
+/// and `false` for the `Undo` of the reblog a `POST …/unreblog` removed. A
+/// withdrawal that found no row to remove never reaches it either.
 ///
-/// Intentionally empty until then, like [`after_favourite_changed`] above,
-/// the pins' [`after_pin_changed`] below and the reactions'
-/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
-const fn after_reblog_changed(_state: &AppState, _reblog: &StatusRow, _reblogging: bool) {}
+/// [`notify::on_reblog`]: crate::services::notify::on_reblog
+async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, reblogging: bool) {
+    notify::on_reblog(state, reblog, reblogging).await;
+}
 
 /// Post-write hook of both pin routes: the federation ticket that adds the
 /// pin to its author's `Featured` collection — Pleroma's `Add`/`Remove`
@@ -2267,8 +2269,7 @@ const fn after_reblog_changed(_state: &AppState, _reblog: &StatusRow, _rebloggin
 /// `POST …/unpin` withdrew. A withdrawal that found no pin to remove never
 /// reaches it either.
 ///
-/// Intentionally empty until then, like [`after_favourite_changed`] above and
-/// the reactions'
+/// Intentionally empty until then, like the reactions'
 /// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
 const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: bool) {}
 
@@ -2285,9 +2286,9 @@ const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: 
 /// ship: the activity carries the re-rendered object, the stream push lets
 /// clients redraw the post they already show.
 ///
-/// Intentionally empty until then, like [`after_favourite_changed`] above
-/// and the delete service's `after_status_deleted`
-/// ([`crate::services::delete_status`]).
+/// Intentionally empty until then, like the pins' [`after_pin_changed`]
+/// above and the reactions'
+/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
 const fn after_status_edited(_state: &AppState, _status: &Status) {}
 
 #[cfg(test)]

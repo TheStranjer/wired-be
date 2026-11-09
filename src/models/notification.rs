@@ -27,8 +27,13 @@
 //! show it, [`page_for_user`] the flat listing under the client filters
 //! and the mute exclusions, [`dismiss`] / [`dismiss_all`] / [`dismiss_ids`]
 //! the three dismissal shapes, [`mark_read_through_id`] the read marking
-//! Pleroma's `set_read_up_to` performs, and [`delete_for_status`] the
-//! cleanup that takes a deleted status's notifications with it.
+//! Pleroma's `set_read_up_to` performs, [`delete_for_status`] the
+//! cleanup that takes a deleted status's notifications with it,
+//! [`already_notified`] the deduplication read [`crate::services::notify`]
+//! asks before telling a recipient the same fact twice, and
+//! [`delete_matching`] the withdrawal write that takes one telling back —
+//! a favourited post un-favourited, a boost withdrawn, a follow request
+//! granted.
 //!
 //! Dismissal is soft: the writes stamp [`dismissed_at`](Notification::dismissed_at)
 //! and every read hides the stamped rows rather than deleting them. Every
@@ -63,6 +68,10 @@ pub const TYPE_EMOJI_REACTION: &str = "pleroma:emoji_reaction";
 /// stranger's *follow* needs the recipient to follow them back first,
 /// which is precisely what an incoming request is not.
 pub const TYPE_FOLLOW_REQUEST: &str = "follow_request";
+/// The follow type: an accepted follow of the recipient. Ungrouped.
+pub const TYPE_FOLLOW: &str = "follow";
+/// The mention type: a status that names its recipient. Ungrouped.
+pub const TYPE_MENTION: &str = "mention";
 
 /// The types the grouped API merges across notifications.
 ///
@@ -278,6 +287,38 @@ async fn withholds_stranger(pool: &PgPool, new: &NewNotification<'_>) -> AppResu
     Ok(!followed)
 }
 
+/// Whether `user_id` already holds a live (undismissed) notification of
+/// `notification_type` caused by `from_account_id`.
+///
+/// The deduplication read Pleroma's `recently_followed` skip is: a fact the
+/// recipient was already told about is not told again, and the repeated
+/// write that reaches here — a second `POST …/follow` of the same pair,
+/// whose row [`follow::follow`] found already open — is what makes it
+/// necessary. A dismissed row does not count: the recipient cleared that
+/// telling, so a fresh event may tell again.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn already_notified(
+    pool: &PgPool,
+    user_id: Uuid,
+    from_account_id: Uuid,
+    notification_type: &str,
+) -> AppResult<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM notifications \
+          WHERE user_id = $1 AND from_account_id = $2 AND type = $3 \
+            AND dismissed_at IS NULL)",
+    )
+    .bind(user_id)
+    .bind(from_account_id)
+    .bind(notification_type)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
 /// The stored notification `id` of `user_id`, whatever its state.
 ///
 /// Pleroma's `Notification.get/2`, which only asks who the row belongs
@@ -412,6 +453,41 @@ pub async fn delete_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<u64>
         .bind(status_id)
         .execute(pool)
         .await?;
+    Ok(outcome.rows_affected())
+}
+
+/// Removes every notification naming exactly this recipient, actor, type
+/// and status, returning how many rows went.
+///
+/// The withdrawal read and write [`crate::services::notify`] pairs with
+/// [`maybe_notify`]: the undo of a favourite or a reblog takes back the
+/// telling it caused, and the grant of a follow request takes back the
+/// `follow_request` row the request told with. `status_id` matches by
+/// `IS NOT DISTINCT FROM`, so `None` names the status-less rows — a
+/// follow or a request — rather than everything. Dismissed rows go like
+/// live ones: a withdrawal retires the telling whatever its state.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn delete_matching(
+    pool: &PgPool,
+    user_id: Uuid,
+    from_account_id: Uuid,
+    notification_type: &str,
+    status_id: Option<Uuid>,
+) -> AppResult<u64> {
+    let outcome = sqlx::query(
+        "DELETE FROM notifications \
+          WHERE user_id = $1 AND from_account_id = $2 AND type = $3 \
+            AND status_id IS NOT DISTINCT FROM $4",
+    )
+    .bind(user_id)
+    .bind(from_account_id)
+    .bind(notification_type)
+    .bind(status_id)
+    .execute(pool)
+    .await?;
     Ok(outcome.rows_affected())
 }
 
@@ -1328,6 +1404,108 @@ mod tests {
                 .expect("the repeat runs"),
             0,
             "cleaning twice changes nothing and is not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_notified_answers_only_live_tellings_of_one_actor_and_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (recipient, actor, _) = trio(pool).await;
+        let other = solo(pool, "dup-other").await;
+        assert!(
+            !already_notified(pool, recipient, actor, "follow")
+                .await
+                .expect("the read runs"),
+            "a fresh recipient has been told nothing"
+        );
+
+        let row = note(pool, recipient, actor, "follow", None).await;
+        assert!(
+            already_notified(pool, recipient, actor, "follow")
+                .await
+                .expect("the read runs"),
+            "the live telling counts"
+        );
+        assert!(
+            !already_notified(pool, recipient, actor, "favourite")
+                .await
+                .expect("the read runs"),
+            "another type was never told"
+        );
+        assert!(
+            !already_notified(pool, recipient, other.id, "follow")
+                .await
+                .expect("the read runs"),
+            "one actor's telling does not speak for another's"
+        );
+
+        let _dismissed = dismiss(pool, recipient, row.id)
+            .await
+            .expect("the dismissal runs");
+        assert!(
+            !already_notified(pool, recipient, actor, "follow")
+                .await
+                .expect("the repeat read runs"),
+            "a dismissed row does not hold the next telling back"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_matching_takes_one_telling_and_leaves_the_rest() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (recipient, actor, status_id) = trio(pool).await;
+        let carol = solo(pool, "matching-carol").await;
+        let favourite = note(pool, recipient, actor, "favourite", Some(status_id)).await;
+        let foreign = note(pool, carol.id, actor, "favourite", Some(status_id)).await;
+        let request = note(pool, recipient, actor, TYPE_FOLLOW_REQUEST, None).await;
+        let request_with_status =
+            note(pool, recipient, actor, TYPE_FOLLOW_REQUEST, Some(status_id)).await;
+
+        let gone = delete_matching(pool, recipient, actor, "favourite", Some(status_id))
+            .await
+            .expect("the withdrawal runs");
+        assert_eq!(gone, 1, "exactly the recipient's own telling went");
+        assert!(
+            get(pool, recipient, favourite.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "and it reads as nothing"
+        );
+        assert!(
+            get(pool, carol.id, foreign.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "the same telling of another recipient stays"
+        );
+        assert!(
+            get(pool, recipient, request.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "a status-less row is not this status's telling"
+        );
+
+        let went = delete_matching(pool, recipient, actor, TYPE_FOLLOW_REQUEST, None)
+            .await
+            .expect("the request withdrawal runs");
+        assert_eq!(went, 1, "the `None` status matches the status-less row");
+        assert!(
+            get(pool, recipient, request_with_status.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "and the `None` matched NULL only, never a row that names a status"
+        );
+        assert_eq!(
+            delete_matching(pool, recipient, actor, "favourite", Some(status_id))
+                .await
+                .expect("the repeat runs"),
+            0,
+            "withdrawing twice changes nothing and is not an error"
         );
     }
 

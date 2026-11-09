@@ -28,10 +28,12 @@
 //!   the caller's [`Relationship`] to the requester — `followed_by: true`
 //!   after an authorization, `false` after a rejection.
 //!
-//! Answering is also the moment federation will owe the requester an
-//! `Accept` or `Reject` activity; that is the federation ticket's job, and
-//! both routes call this module's `after_follow_request_resolved` hook as
-//! its documented empty landing point.
+//! Answering is also the moment the resolver's own inbox is updated — an
+//! `authorize` replaces the request's `follow_request` notification with a
+//! `follow` one through this module's `after_follow_request_resolved` hook
+//! (see [`crate::services::notify`]) — and the moment federation will owe
+//! the requester an `Accept` or `Reject` activity; that is the federation
+//! ticket's job, and it lands in the same hook.
 //!
 //! [`follow::accept`]: crate::models::follow::accept
 //! [`follow::reject`]: crate::models::follow::reject
@@ -58,6 +60,7 @@ use crate::{
     },
     oauth::scopes::{FOLLOW, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
+    services::notify,
     state::AppState,
     util::id::parse_id,
 };
@@ -147,7 +150,7 @@ async fn authorize(
         user = %auth.0.id,
         "follow request authorized"
     );
-    after_follow_request_resolved(&state, &auth.0, &granted, true);
+    after_follow_request_resolved(&state, &auth.0, &granted, true).await;
     answered_relationship(&state, auth.0.id, granted.follower_id).await
 }
 
@@ -172,7 +175,7 @@ async fn reject(
         user = %auth.0.id,
         "follow request rejected"
     );
-    after_follow_request_resolved(&state, &auth.0, &removed, false);
+    after_follow_request_resolved(&state, &auth.0, &removed, false).await;
     answered_relationship(&state, auth.0.id, removed.follower_id).await
 }
 
@@ -230,21 +233,19 @@ fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) ->
     link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
-/// Post-resolution hook of both answer routes: the federation ticket that
-/// sends `Accept` / `Reject` activities for answered follows wires the
-/// delivery in here — the `Follow` activity to answer is
+/// Post-resolution hook of both answer routes: the notification telling the
+/// [`notify`] module owns runs through here — an
+/// accepted request replaces its `follow_request` telling with a `follow`
+/// one, a rejection says nothing new — and the federation ticket that sends
+/// `Accept` / `Reject` activities for answered follows wires its delivery
+/// into the same body: the `Follow` activity to answer is
 /// [`Follow::ap_id`], its sender [`Follow::follower_id`], and the queueing
 /// happens through `state` (decision 11).
-///
-/// Intentionally empty until then, like the follow model's
-/// [`blocked_between`](crate::models::follow) hook: Pleroma's
-/// `CommonAPI.accept_follow_request` / `reject_follow_request` deliver
-/// their activities inline, and this server's delivery queue is a later
-/// ticket.
-const fn after_follow_request_resolved(
-    _state: &AppState,
-    _resolver: &User,
-    _request: &Follow,
-    _granted: bool,
+async fn after_follow_request_resolved(
+    state: &AppState,
+    resolver: &User,
+    request: &Follow,
+    granted: bool,
 ) {
+    notify::on_follow_request_resolved(state, resolver, request, granted).await;
 }

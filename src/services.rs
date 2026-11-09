@@ -26,6 +26,13 @@
 //! and the expiration jobs, so an expiring post leaves exactly what a
 //! hand-deleted one leaves.
 //!
+//! [`notify`] is the write side of the notification inbox: the five tellings
+//! the action hooks land — follow, follow request, mention, reblog,
+//! favourite — decided by one set of rules (local recipients, no
+//! self-notifications, every insert through the skip rules of
+//! [`notification::maybe_notify`](crate::models::notification::maybe_notify))
+//! and their withdrawals, so the hooks themselves stay one call long.
+//!
 //! [`translate`] is the outbound half of status translation: which provider
 //! the instance talks to, what a translate call and a language list look like
 //! over there, and the sanitizer pass every provider answer goes through
@@ -48,6 +55,7 @@ pub mod instance_meta;
 pub mod media_processing;
 pub mod media_proxy;
 pub mod mentions;
+pub mod notify;
 pub mod render_status;
 pub mod timeline;
 pub mod translate;
