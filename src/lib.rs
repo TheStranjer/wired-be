@@ -181,6 +181,7 @@ fn job_registry() -> JobRegistry {
         jobs::maintenance::KIND_TOKENS,
         jobs::maintenance::handle_tokens,
     );
+    registry.register(jobs::maintenance::KIND_JOBS, jobs::maintenance::handle_jobs);
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);

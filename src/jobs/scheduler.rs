@@ -4,8 +4,8 @@
 //! this module is the producer of the rows that fire on a schedule. The
 //! [`periodic_jobs`] registry lists every recurring job (today the
 //! streaming hub's reference-table sweep, the mutes expiry sweep, the daily
-//! dismissed-notification sweep and the hourly OAuth/MFA/password-reset
-//! token sweep; later tickets append one line per
+//! dismissed-notification sweep, the hourly OAuth/MFA/password-reset
+//! token sweep and the daily jobs-table prune; later tickets append one line per
 //! entry), and [`run`] ticks every ten seconds,
 //! enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
@@ -68,7 +68,11 @@ pub struct PeriodicJob {
 /// dead OAuth, MFA and password-reset tokens
 /// ([`KIND_TOKENS`](super::maintenance::KIND_TOKENS)) shares the queue: the
 /// validity lookups already refuse those rows, so the period only decides how
-/// long the storage lives on after them.
+/// long the storage lives on after them. The daily prune of terminal queue
+/// rows and replay-guard rows
+/// ([`KIND_JOBS`](super::maintenance::KIND_JOBS)) shares it too: a job that
+/// ended a week ago and an activity redelivered after its window are pure
+/// bookkeeping, so the period only decides how long their storage lives on.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -91,6 +95,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             kind: super::maintenance::KIND_TOKENS,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_secs(3_600),
+        },
+        PeriodicJob {
+            kind: super::maintenance::KIND_JOBS,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_hours(24),
         },
     ]
 }
