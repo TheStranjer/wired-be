@@ -1,17 +1,34 @@
-//! Flat notifications over HTTP: the Mastodon v1 dismissal routes and
-//! Pleroma's `read`, on top of the rows owned by
+//! Flat notifications over HTTP: the Mastodon v1 listing and read, the
+//! v1 dismissal routes and Pleroma's `read`, on top of the rows owned by
 //! [`crate::models::notification`] (decision 3).
 //!
 //! The reference is Pleroma's `NotificationController`
 //! (`lib/pleroma/web/mastodon_api/controllers/notification_controller.ex`,
-//! the `clear`, `dismiss_via_body` and `destroy_multiple` actions) and its
-//! `PleromaAPI.NotificationController.mark_as_read`
-//! (`lib/pleroma/web/pleroma_api/controllers/notification_controller.ex`).
+//! the `index`, `show`, `clear`, `dismiss_via_body` and `destroy_multiple`
+//! actions) and its `PleromaAPI.NotificationController.mark_as_read`
+//! (`lib/pleroma/web/pleroma_api/controllers/notification_controller.ex`),
+//! with the listing's row scope from `Pleroma.Notification.for_user_query`
+//! (`lib/pleroma/notification.ex`).
 //! Where Pleroma hard-deletes the rows, dismissal here is soft: it stamps
 //! [`dismissed_at`](NotificationRow::dismissed_at), and every read — the
 //! grouped v2 listings and these routes' own writes — hides the stamped
 //! rows, which is what the client observes either way.
 //!
+//! - `GET /api/v1/notifications` — one [`PageParams`] page (default 20,
+//!   at most 40) of the caller's notifications, newest first, rendered as
+//!   notification entities with the `Link` header keyed on the page's row
+//!   ids. `types[]` restricts and `exclude_types[]` removes (the Pleroma/
+//!   Mastodon alias `include_types[]` feeds `types[]` when that is absent;
+//!   a type string no row carries simply matches nothing, it is not an
+//!   error), and `account_id` keeps one actor's rows. Dismissed rows and
+//!   rows of deactivated actors never appear; with `with_muted` left
+//!   false the caller's muted actors, muted threads, blocked actors and
+//!   blocked domains are hidden too — and Pleroma's `with_muted` never
+//!   uncovers blocks. The `pleroma.is_seen` flag rides on the row's
+//!   `seen` flag.
+//! - `GET /api/v1/notifications/{id}` — the one notification, owner
+//!   only; a dismissed, foreign, unknown or malformed id is the shared
+//!   404 `{"error":"Record not found"}`.
 //! - `POST /api/v1/notifications/clear` dismisses all of the caller's
 //!   undismissed notifications and answers `{}` (Pleroma's `Notification.clear`,
 //!   soft).
@@ -39,18 +56,20 @@
 //!   max_id"}`; a `max_id` that is not id text is the pagination wording's
 //!   400 `"Invalid id"`.
 //!
-//! Every route is authenticated ([`AuthUser`]) and requires
-//! `write:notifications` — all five change state. The deleted-status
-//! cleanup that keeps these listings honest runs off the delete route's
-//! `after_status_deleted` hook in [`crate::api::statuses`].
+//! Every route is authenticated ([`AuthUser`]); the two reads require
+//! `read:notifications` and the five write routes `write:notifications`.
+//! The deleted-status cleanup that keeps these listings honest runs off
+//! the delete route's `after_status_deleted` hook in
+//! [`crate::api::statuses`].
 
 use std::collections::HashMap;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{OriginalUri, Path, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
-    routing::{delete, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -58,6 +77,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
+    api::notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -65,14 +85,17 @@ use crate::{
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
-    extract::{ApiBody, ApiParams},
+    extract::{ApiBody, ApiParams, flex},
     models::{
-        notification::{self, Notification as NotificationRow},
+        notification::{
+            self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
+        },
         status::{self, Status as StatusRow},
         status_visibility,
         user::{self, User},
     },
-    oauth::scopes::WRITE_NOTIFICATIONS,
+    oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
+    pagination::{PageParams, link_header, set_link_header},
     services::render_status::render_statuses,
     state::AppState,
     util::id::parse_id,
@@ -86,9 +109,12 @@ const MISSING_ID_OR_MAX_ID: &str = "Missing parameter: id or max_id";
 /// [`crate::pagination`] for the same failure.
 const INVALID_ID: &str = "Invalid id";
 
-/// The `/api/v1` dismissal router, merged into [`crate::api::v1`].
+/// The `/api/v1` notifications router, merged into [`crate::api::v1`]:
+/// the flat listing and read and the dismissal routes.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/notifications", get(list))
+        .route("/notifications/{id}", get(show))
         .route("/notifications/clear", post(clear))
         .route("/notifications/dismiss", post(dismiss_via_body))
         .route("/notifications/{id}/dismiss", post(dismiss))
@@ -104,6 +130,156 @@ pub fn pleroma_router() -> Router<AppState> {
 /// The `{}` answer of the dismissal routes (Pleroma's `json(conn, %{})`).
 fn empty_body() -> Json<Value> {
     Json(Value::Object(Map::new()))
+}
+
+/// `GET /api/v1/notifications` — one [`PageParams`] page of the caller's
+/// notifications, newest row first, as the rendered entities with the
+/// `Link` header keyed on the page's first and last row ids.
+///
+/// Pleroma's `index`, whose `for_user_query` scope (dismissed and
+/// deactivated-actor rows out) [`notification::page_for_user`] carries;
+/// `with_muted` decides what else hides there. The page's actors and
+/// statuses are batched once into the render (see
+/// [`render_notifications`]).
+///
+/// # Errors
+///
+/// [`Unauthorized`](crate::error::AppError::Unauthorized) /
+/// [`Forbidden`](crate::error::AppError::Forbidden) from [`AuthUser`] and
+/// the `read:notifications` check;
+/// [`BadRequest`](crate::error::AppError::BadRequest) from [`PageParams`]
+/// for a malformed cursor;
+/// [`Unprocessable`](crate::error::AppError::Unprocessable) for a
+/// `with_muted` that is not a boolean;
+/// [`NotFound`](crate::error::AppError::NotFound) for an `account_id`
+/// naming no readable account. Any database failure arrives through `?` as
+/// [`Database`](crate::error::AppError::Database), and
+/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`Internal`](crate::error::AppError::Internal).
+async fn list(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+    ApiParams(params): ApiParams<ListParams>,
+) -> AppResult<(HeaderMap, Json<Vec<NotificationEntity>>)> {
+    auth.require(READ_NOTIFICATIONS)?;
+    let mut filters = params.type_filters();
+    filters.account_id = account_filter(&state, params.account_id.as_deref()).await?;
+    let rows = notification::page_for_user(
+        &state.db,
+        &FlatPageParams {
+            user_id: auth.0.id,
+            filters,
+            with_muted: params.muted_visible(),
+            page,
+        },
+    )
+    .await?;
+    debug!(
+        count = rows.len(),
+        user = %auth.0.id,
+        "notifications listed"
+    );
+    let entities = render_notifications(&state, &auth.0, &rows).await?;
+    let mut headers = HeaderMap::new();
+    set_link_header(
+        &mut headers,
+        page_link(&state.config.base_url, uri.path(), &rows).as_deref(),
+    )?;
+    Ok((headers, Json(entities)))
+}
+
+/// `GET /api/v1/notifications/{id}` — the caller's live notification `id`
+/// as one rendered entity.
+///
+/// Pleroma's `show` asks only who owns the row; this keeps the listing's
+/// scope, so the dismissed and the deactivated-actor's row read as the 404
+/// the client already sees for an unknown id — and a malformed one, all
+/// indistinguishable.
+///
+/// # Errors
+///
+/// The auth errors of [`list`];
+/// [`NotFound`](crate::error::AppError::NotFound) as described.
+async fn show(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<NotificationEntity>> {
+    auth.require(READ_NOTIFICATIONS)?;
+    let Some(id) = parse_id(&id) else {
+        return Err(AppError::NotFound);
+    };
+    let row = notification::get_visible(&state.db, auth.0.id, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    debug!(
+        notification = %id,
+        user = %auth.0.id,
+        "notification read"
+    );
+    let entities = render_notifications(&state, &auth.0, std::slice::from_ref(&row)).await?;
+    entities
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or(AppError::NotFound)
+}
+
+/// The `Link` header value for one fetched page: [`link_header`] over the
+/// first (newest) and last (oldest) row's id — the cursors the listing
+/// walks on — and `None` for an empty page.
+fn page_link(base_url: &str, path: &str, rows: &[NotificationRow]) -> Option<String> {
+    let newest = rows.first()?.id.to_string();
+    let oldest = rows.last()?.id.to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+}
+
+/// `GET /api/v1/notifications`' non-cursor parameters ([`ApiParams`],
+/// decision 10; the cursors and `limit` ride on [`PageParams`]).
+#[derive(Debug, Deserialize)]
+struct ListParams {
+    /// `types[]`: keep only these notification types.
+    #[serde(default)]
+    types: Option<StringList>,
+    /// `include_types[]`: the alias of `types[]`, consulted only when
+    /// that is absent (Pleroma's `put_new("types", …)`).
+    #[serde(default)]
+    include_types: Option<StringList>,
+    /// `exclude_types[]`: drop these notification types.
+    #[serde(default)]
+    exclude_types: Option<StringList>,
+    /// `account_id`: only notifications caused by this account.
+    #[serde(default)]
+    account_id: Option<String>,
+    /// `with_muted`: whether the caller's mutes (actor and thread) hide
+    /// nothing; absent means `false`, Pleroma's `Map.get(:with_muted, false)`.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    with_muted: Option<bool>,
+}
+
+impl ListParams {
+    /// The kept type names: `types[]` when it came, else the
+    /// `include_types[]` alias, and neither means no restriction.
+    fn kept_types(&self) -> Vec<&str> {
+        names_of(self.types.as_ref().or(self.include_types.as_ref()))
+    }
+
+    /// The `types[]` / `exclude_types[]` half of the read filters; the
+    /// account half arrives through [`account_filter`].
+    fn type_filters(&self) -> NotificationFilters<'_> {
+        NotificationFilters {
+            types: self.kept_types(),
+            exclude_types: names_of(self.exclude_types.as_ref()),
+            account_id: None,
+        }
+    }
+
+    /// Whether muted causes stay in the page.
+    fn muted_visible(&self) -> bool {
+        self.with_muted.unwrap_or_default()
+    }
 }
 
 /// `POST /api/v1/notifications/clear` — dismiss all of the caller's
@@ -613,5 +789,63 @@ mod tests {
             matches!(err, AppError::BadRequest(_)),
             "which is a 400, not {err}"
         );
+    }
+
+    #[test]
+    fn the_listing_types_prefer_the_name_and_fall_back_to_the_alias() {
+        let both: ListParams = params(json!({
+            "types": ["favourite", "mention"],
+            "include_types": "follow",
+            "exclude_types": ["reblog"],
+        }));
+        let filters = both.type_filters();
+        assert_eq!(
+            filters.types,
+            ["favourite", "mention"],
+            "`types[]` wins when both arrive, Pleroma's put_new rule"
+        );
+        assert_eq!(
+            filters.exclude_types,
+            ["reblog"],
+            "the exclusion is its own list"
+        );
+
+        let aliased: ListParams = params(json!({"include_types": "follow"}));
+        assert_eq!(
+            aliased.type_filters().types,
+            ["follow"],
+            "the alias fills in when `types[]` is absent"
+        );
+
+        let neither: ListParams = params(json!({}));
+        let open = neither.type_filters();
+        assert!(
+            open.types.is_empty() && open.exclude_types.is_empty(),
+            "absent names keep everything open"
+        );
+        assert!(!neither.muted_visible(), "with_muted defaults to false");
+    }
+
+    #[test]
+    fn the_listing_reads_with_muted_in_its_client_spellings() {
+        for spelling in ["true", "1", "yes"] {
+            let asked: ListParams = params(json!({"with_muted": spelling}));
+            assert!(
+                asked.muted_visible(),
+                "`with_muted={spelling}` asks to keep the muted rows"
+            );
+        }
+        for spelling in ["false", "0"] {
+            let asked: ListParams = params(json!({"with_muted": spelling}));
+            assert!(!asked.muted_visible(), "`with_muted={spelling}` hides them");
+        }
+        for spelling in ["maybe", "2"] {
+            let err = crate::extract::into_params::<ListParams>(json!({"with_muted": spelling}))
+                .expect_err(&format!("`{spelling}` is no boolean"));
+            assert!(
+                matches!(err, AppError::Unprocessable(_)),
+                "which is a 422, not {err}"
+            );
+        }
     }
 }
