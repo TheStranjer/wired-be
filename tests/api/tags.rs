@@ -820,7 +820,11 @@ async fn a_followed_tag_counts_uses_as_they_come() {
 }
 
 /// Followed tags stay out of the Home timeline: the ticket pins that this
-/// API change has no timeline effect (Pleroma's rule, not Mastodon's).
+/// API change has no timeline effect (Pleroma's rule, not Mastodon's). The
+/// home route (WBE-100) now answers, so the pin reads through it: a
+/// stranger's post carrying a tag the viewer follows — a post the tag
+/// timeline would show — stays off the empty home page, which answers only
+/// the viewer's own rows.
 #[tokio::test]
 async fn following_a_tag_does_not_reach_the_home_timeline() {
     let db = common::test_db().await;
@@ -834,14 +838,24 @@ async fn following_a_tag_does_not_reach_the_home_timeline() {
         .await
         .expect("the fixture follow writes");
     assert_eq!(new, 1, "the fixture follow is new");
+    let carol = common::create_local_user(&pool, "carol").await;
+    let tagged = common::create_status(&pool, &carol, "a #quiet post", Visibility::Public).await;
+    assert_eq!(tagged.user_id, carol.id, "the stranger's post is seeded");
+    let own = common::create_status(&pool, &alice, "alice's own talk", Visibility::Public).await;
     let token = common::create_app_and_token(&pool, &alice, "read").await;
     let app = common::test_app(pool);
 
     let response = get(&app, &token, "/api/v1/timelines/home").await;
+    assert_eq!(response.status, StatusCode::OK, "the home route answers");
+    let page = response.json::<Vec<Value>>();
+    let ids: Vec<&str> = page
+        .iter()
+        .filter_map(|status| status["id"].as_str())
+        .collect();
     assert_eq!(
-        response.status,
-        StatusCode::NOT_FOUND,
-        "the Home timeline is not routed yet at all, and nothing here routes \
-         followed tags into it"
+        ids,
+        [own.id.to_string().as_str()],
+        "the followed tag's stranger post never joins the home page, which \
+         answers the viewer's own rows only"
     );
 }
