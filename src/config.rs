@@ -108,8 +108,10 @@ pub const REGISTRATIONS_OPEN_VAR: &str = "REGISTRATIONS_OPEN";
 /// instance endpoints report it as `invites_enabled`.
 pub const INVITES_ENABLED_VAR: &str = "INVITES_ENABLED";
 /// Environment variable holding the application-wide HMAC signing secret
-/// (`SECRET_KEY_BASE` in Pleroma's config); unset by default, so anything
-/// that signs links refuses while it is missing.
+/// (`SECRET_KEY_BASE` in Pleroma's config).
+///
+/// When unset or blank, [`serve`](crate::serve) generates a random one per
+/// boot and warns, so links minted earlier stop validating after a restart.
 pub const SECRET_KEY_BASE_VAR: &str = "SECRET_KEY_BASE";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
@@ -737,12 +739,13 @@ pub struct Config {
     /// The `From:` address every sent email carries, from `MAIL_FROM`;
     /// `noreply@<instance domain>` by default.
     pub mail_from: String,
-    /// The application-wide HMAC signing secret, from `SECRET_KEY_BASE`
-    /// (Pleroma's `:pleroma, Pleroma.Web.Endpoint` `secret_key_base`);
-    /// `None` (the default) makes every page that verifies a signed link
-    /// refuse every token (see
-    /// [`crate::api::html_pages::unsubscribe_user_id`]). Secret material:
-    /// the manual `Debug` impl below redacts it.
+    /// The HMAC-SHA256 secret this instance signs its mail-unsubscribe
+    /// links with, from `SECRET_KEY_BASE` (Pleroma's `:pleroma,
+    /// Pleroma.Web.Endpoint` `secret_key_base`); `None` when the variable
+    /// is unset or blank, in which case [`serve`](crate::serve) generates
+    /// a random one per boot and warns, so links minted earlier stop
+    /// validating after a restart. Secret material: the manual `Debug`
+    /// impl below redacts it.
     pub secret_key_base: Option<String>,
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
@@ -811,7 +814,7 @@ impl Config {
         let (job_concurrency, job_queues) = job_worker(&lookup)?;
         let (smtp_host, smtp_port, smtp_username, smtp_password, smtp_tls, mail_from) =
             mailer_settings(&lookup, domain_of(&base_url))?;
-        let secret_key_base = signing_secret(&lookup);
+        let secret_key_base = secret_key_base(&lookup);
         Ok(Self {
             database_url,
             bind_addr,
@@ -1181,11 +1184,10 @@ fn default_mail_from(domain: &str) -> String {
 }
 
 /// Reads `SECRET_KEY_BASE`: the trimmed signing secret, `None` when the
-/// variable is unset or blank (the default — nothing that verifies a
-/// signed link accepts anything then). Grouped because each is a plain
-/// default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md).
-fn signing_secret<F>(lookup: &F) -> Option<String>
+/// variable is unset or blank, in which case [`serve`](crate::serve)
+/// fills the field with a secret generated for the boot. Read through its
+/// own fn because [`Config::from_lookup`] has a size budget (AGENTS.md).
+fn secret_key_base<F>(lookup: &F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
 {

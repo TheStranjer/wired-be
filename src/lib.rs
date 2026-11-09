@@ -33,11 +33,11 @@ use axum::{
 };
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     api::media_files,
-    config::Config,
+    config::{Config, SECRET_KEY_BASE_VAR},
     error::AppError,
     http_client::HttpClient,
     jobs::{JobRegistry, Worker, scheduler},
@@ -45,6 +45,7 @@ use crate::{
     state::AppState,
     streaming::hub::Hub,
     uploads::UploaderBackend,
+    util::token::{CREDENTIAL_BYTES, random_token},
 };
 
 /// The migrations embedded from `migrations/`, applied by [`run_migrations`].
@@ -79,7 +80,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// the worker idles, sweeps, delivers, sends and drains received
 /// activities. The state's mail transport comes from
 /// [`mailer::transport_from_config`]: the SMTP relay when `SMTP_HOST` is
-/// set, the disabled stand-in while it is not. Alongside it, a spawned
+/// set, the disabled stand-in while it is not. An unset or blank
+/// `SECRET_KEY_BASE` is filled with a fresh random signing secret for this
+/// boot (with one warning in the log), so mail-unsubscribe links minted by
+/// an earlier boot stop validating after a restart. Alongside it, a spawned
 /// [`scheduler::run`] task enqueues the [`scheduler::periodic_jobs`]
 /// recurring jobs, and a spawned
 /// [`run_pg_listener`](streaming::hub::run_pg_listener) task mirrors the
@@ -94,7 +98,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let db = PgPoolOptions::new().connect(&config.database_url).await?;
     run_migrations(&db).await?;
     info!("database migrations applied");
-    let config = Arc::new(config);
+    let config = Arc::new(with_generated_secret_key_base(config));
     let emoji_count =
         emoji_packs::sync_custom_emojis(&db, &config.base_url, &config.emoji_dir).await?;
     info!(emoji_count, "emoji packs synced into custom_emojis");
@@ -150,6 +154,31 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .0;
     Ok(outcome?)
+}
+
+/// Returns `config` with its [`Config::secret_key_base`] filled: the mail
+/// signing secret this instance runs on.
+///
+/// A configured secret passes through untouched. When the field is `None`
+/// — `SECRET_KEY_BASE` unset or blank — the one [`Config::from_lookup`]
+/// read is a deterministic function of the environment (AGENTS.md), so
+/// the generation lives here at the boot path: a fresh [`random_token`]
+/// over [`CREDENTIAL_BYTES`] becomes this boot's secret and one `warn!`
+/// (without its value) says so, meaning links minted by an earlier boot
+/// stop validating after a restart.
+///
+/// [`random_token`]: crate::util::token::random_token
+/// [`CREDENTIAL_BYTES`]: crate::util::token::CREDENTIAL_BYTES
+fn with_generated_secret_key_base(mut config: Config) -> Config {
+    if config.secret_key_base.is_none() {
+        warn!(
+            var = SECRET_KEY_BASE_VAR,
+            "no signing secret configured; generated an ephemeral one for this boot, \
+             mail-unsubscribe links minted by an earlier boot stop validating"
+        );
+        config.secret_key_base = Some(random_token(CREDENTIAL_BYTES));
+    }
+    config
 }
 
 /// The [`JobRegistry`] the [`serve`] worker runs: every job kind this
@@ -328,6 +357,30 @@ mod tests {
             r#"{"error":"Not implemented"}"#,
             "unrouted path under /api is Pleroma's api_not_implemented"
         );
+    }
+
+    /// A configured `SECRET_KEY_BASE` passes through the boot helper
+    /// untouched.
+    #[test]
+    fn with_generated_secret_key_base_keeps_a_configured_secret() {
+        let mut config = test_config();
+        config.secret_key_base = Some("a-signing-secret".to_owned());
+        let config = with_generated_secret_key_base(config);
+        assert_eq!(
+            config.secret_key_base.as_deref(),
+            Some("a-signing-secret"),
+            "a set secret is kept verbatim"
+        );
+    }
+
+    /// An unset secret becomes a generated one: `Some` and non-empty.
+    #[test]
+    fn with_generated_secret_key_base_fills_an_unset_secret() {
+        let mut config = test_config();
+        config.secret_key_base = None;
+        let config = with_generated_secret_key_base(config);
+        let secret = config.secret_key_base.expect("the unset secret is filled");
+        assert!(!secret.is_empty(), "the generated secret is non-empty");
     }
 
     /// Migration tests, run against a slot of the pooled fixture in
