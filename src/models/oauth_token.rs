@@ -512,6 +512,44 @@ where
     Ok(deleted.rows_affected())
 }
 
+/// The `DELETE` behind [`delete_all_for_user_except`]: every token of the
+/// user except the row `keep_id` names.
+const DELETE_ALL_FOR_USER_EXCEPT_SQL: &str =
+    "DELETE FROM oauth_tokens WHERE user_id = $1 AND id <> $2";
+
+/// Deletes all tokens belonging to user `user_id` except the row
+/// `keep_id`, reporting how many went.
+///
+/// This is the revocation `POST /api/pleroma/change_password` runs —
+/// Pleroma's `Token.Revoke.all_for_user`, minus the credential the request
+/// itself authenticated with, which must keep working after the password
+/// change.
+///
+/// `keep_id` names no user-bound row (a foreign id, an app-only token)
+/// and everything of the user still goes, so the `<>` can only spare the
+/// caller's own credential. Runs on the caller's executor (or any
+/// transaction), so the password write and the revocation land together.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user_except<'e, E>(
+    executor: E,
+    user_id: Uuid,
+    keep_id: Uuid,
+) -> AppResult<u64>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_EXCEPT_SQL)
+        .bind(user_id)
+        .bind(keep_id)
+        .execute(executor)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 /// The `INSERT` behind [`create_authorization`]: the code is minted by
 /// the caller of the statement, its ten-minute lifetime is computed
 /// from the bound interval by the database clock, and `RETURNING *`
@@ -1433,5 +1471,62 @@ mod tests {
             "the own row goes"
         );
         assert_eq!(token_rows(&pool, mine.id).await, 0, "gone for good");
+    }
+
+    /// `delete_all_for_user_except`: every token of the user goes but the
+    /// kept row, and neither a foreign user's nor an app-only token is
+    /// ever touched, however the keep id is spelled.
+    #[tokio::test]
+    async fn delete_all_for_user_except_spares_the_kept_row_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let grace = insert_user(&pool, "grace").await;
+        let heidi = insert_user(&pool, "heidi").await;
+        let app = insert_app(&pool, "Rotate").await;
+        let keeper = create_token(&pool, &new_token(Some(grace.id), app.id))
+            .await
+            .unwrap();
+        let other = create_token(&pool, &new_token(Some(grace.id), app.id))
+            .await
+            .unwrap();
+        let theirs = create_token(&pool, &new_token(Some(heidi.id), app.id))
+            .await
+            .unwrap();
+        let app_only = create_token(&pool, &new_token(None, app.id)).await.unwrap();
+
+        let revoked = delete_all_for_user_except(&pool, grace.id, keeper.id)
+            .await
+            .unwrap();
+        assert_eq!(revoked, 1, "only grace's second token went");
+        assert_eq!(
+            token_rows(&pool, keeper.id).await,
+            1,
+            "the kept row survives"
+        );
+        assert_eq!(
+            token_rows(&pool, other.id).await,
+            0,
+            "the other one is gone"
+        );
+        assert_eq!(token_rows(&pool, theirs.id).await, 1, "heidi keeps hers");
+        assert_eq!(
+            token_rows(&pool, app_only.id).await,
+            1,
+            "app-only rows are nobody's"
+        );
+
+        let unknown = new_id();
+        assert_eq!(
+            delete_all_for_user_except(&pool, grace.id, unknown)
+                .await
+                .unwrap(),
+            1,
+            "a keep id of no user-bound row spares nothing"
+        );
+        assert_eq!(
+            token_rows(&pool, keeper.id).await,
+            0,
+            "and the whole set goes"
+        );
     }
 }

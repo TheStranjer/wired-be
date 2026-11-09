@@ -413,6 +413,33 @@ pub async fn delete_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<u64>
     Ok(outcome.rows_affected())
 }
 
+/// The `DELETE` behind [`delete_all_for_user`]: every notification naming
+/// the account, recipient or actor.
+const DELETE_ALL_FOR_USER_SQL: &str =
+    "DELETE FROM notifications WHERE user_id = $1 OR from_account_id = $1";
+
+/// Removes every notification that names user `user_id`: the notification
+/// step of the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
+///
+/// Both sides go — the account's own inbox and the entries the account
+/// caused as actor — because both foreign keys point at the account
+/// (Pleroma's user delete cascades them with the row): an entry whose
+/// actor has just been purged says nothing anyone can still render.
+///
+/// Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 /// The client filters every filtered read shares: which types to show,
 /// which to hide, and which single actor's notifications to keep. All
 /// three are open at their absence.

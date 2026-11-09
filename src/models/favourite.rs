@@ -202,6 +202,30 @@ pub async fn unfavourite(
     Ok(removed)
 }
 
+/// The `DELETE` behind [`delete_all_for_user`]: the account's own likes.
+const DELETE_ALL_FOR_USER_SQL: &str = "DELETE FROM favourites WHERE user_id = $1";
+
+/// Removes every favourite made by user `user_id`: the favourite step of
+/// the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
+///
+/// Favourites *of* the account's statuses are other accounts' rows and
+/// stay; their targets are tombstones by the time this runs, and every
+/// favourites read filters those out (`src/models/status_visibility.rs`).
+///
+/// Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 /// Which of `status_ids` `user_id` has favourited — the batched `favourited`
 /// read the status renderer runs once per page (`docs/ARCHITECTURE.md`
 /// decision 13).

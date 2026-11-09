@@ -421,6 +421,35 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<bool> {
     Ok(deleted.rows_affected() > 0)
 }
 
+/// The `DELETE` behind [`delete_all_for_user`]: the account's uploads and
+/// the attachment rows of its statuses (the statuses survive as
+/// tombstones, so no cascade reaches their media).
+const DELETE_ALL_FOR_USER_SQL: &str = "DELETE FROM media_attachments
+      WHERE user_id = $1
+         OR status_id IN (SELECT id FROM statuses WHERE user_id = $1)";
+
+/// Removes every media row belonging to user `user_id`: the media step of
+/// the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
+///
+/// Both shapes go — uploaded by the account (`user_id`) or attached to a
+/// status it authored (`status_id`). Only the rows go; the stored files
+/// are the upload layer's, and unattached media of a deleted account
+/// leaves no URL anyone can mint.
+///
+/// Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::{Error as SqlxError, PgPool};

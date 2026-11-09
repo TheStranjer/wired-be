@@ -150,6 +150,30 @@ pub async fn remove(pool: &PgPool, user_id: Uuid, status_id: Uuid) -> AppResult<
         .await?)
 }
 
+/// The `DELETE` behind [`delete_all_for_user`]: the account's own marks.
+const DELETE_ALL_FOR_USER_SQL: &str = "DELETE FROM bookmarks WHERE user_id = $1";
+
+/// Removes every bookmark made by user `user_id`: the bookmark step of the
+/// [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
+///
+/// Bookmarks are never another account's record of this one (a bookmark
+/// points at a status, not at its author's row), so the account's own rows
+/// are all there is to take, and no counter follows them.
+///
+/// Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 /// Which of `status_ids` `user_id` has bookmarked — the batched
 /// `bookmarked` read the status renderer runs once per page
 /// (`docs/ARCHITECTURE.md` decision 13).

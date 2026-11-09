@@ -13,9 +13,10 @@
 //! the same controller's `update_notification_settings/2` at
 //! `PUT /notification_settings`, and
 //! [`pleroma_account_settings`] adds the account utilities of the same
-//! controller: `aliases` and `move_account`, and [`pleroma_import`] the
-//! CSV imports of `UserImportController`: `follow_import`,
-//! `blocks_import` and `mutes_import`. Do not call
+//! controller: `aliases`, `move_account`, `change_password`,
+//! `change_email`, `delete_account` and `disable_account`, and
+//! [`pleroma_import`] the CSV imports of `UserImportController`:
+//! `follow_import`, `blocks_import` and `mutes_import`. Do not call
 //! [`Router::fallback`] here: unmatched paths must reach the app-wide JSON
 //! fallback in [`crate::app`].
 

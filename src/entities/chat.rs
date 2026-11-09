@@ -380,6 +380,7 @@ mod tests {
             preferred_frontend: None,
             is_suggested: Flag::new(false),
             password_reset_pending: Flag::new(false),
+            deleted_at: None,
         }
     }
 

@@ -857,6 +857,62 @@ pub async fn soft_delete_with_reblogs(pool: &PgPool, id: Uuid) -> AppResult<Opti
     Ok(Some(tombstone))
 }
 
+/// How many rows one pass of [`soft_delete_all_for_user`] tombstones: the
+/// account-deletion job's batch size, small enough to keep every statement
+/// short and large enough that most accounts tombstone in one pass.
+const SOFT_DELETE_BATCH: i64 = 100;
+
+/// The `UPDATE` behind [`soft_delete_all_for_user`]: the tombstone
+/// [`soft_delete`] writes, applied to at most [`SOFT_DELETE_BATCH`] of the
+/// account's live rows per pass, oldest id first.
+const SOFT_DELETE_BATCH_FOR_USER_SQL: &str = "UPDATE statuses
+       SET content = '',
+           raw_text = '',
+           spoiler_text = '',
+           deleted_at = now(),
+           updated_at = now()
+     WHERE id IN (
+         SELECT id FROM statuses
+          WHERE user_id = $1 AND deleted_at IS NULL
+          ORDER BY id
+          LIMIT $2
+     )";
+
+/// Soft-deletes every status authored by user `user_id`: the status step of
+/// the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
+///
+/// `SOFT_DELETE_BATCH` rows per statement, repeated until a pass
+/// tombstones nothing — the loop ends however many posts the account left,
+/// and a rerun over an already tombstoned set is a no-op, so the job can
+/// retry the step safely. Returns the total number of rows the passes
+/// tombstoned.
+///
+/// What the per-status [`soft_delete`] does around the tombstone — counter
+/// steps and pin clearing — is deliberately left out: the author's row is
+/// purged and deactivated by the same job, so its denormalised counters
+/// describe nothing anyone will read, and a pin of a tombstone renders
+/// nowhere, exactly like the tombstone itself.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn soft_delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let mut total = 0_u64;
+    loop {
+        let tombstoned = sqlx::query(SOFT_DELETE_BATCH_FOR_USER_SQL)
+            .bind(user_id)
+            .bind(SOFT_DELETE_BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        if tombstoned == 0 {
+            return Ok(total);
+        }
+        total += tombstoned;
+    }
+}
+
 /// Adds `delta` to `counter` of status `id`, clamped at zero, and refreshes
 /// its `updated_at`. An unknown id matches no row and changes nothing.
 ///

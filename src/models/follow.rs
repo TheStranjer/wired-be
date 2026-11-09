@@ -421,6 +421,36 @@ pub async fn unfollow(pool: &PgPool, follower: &User, target: &User) -> AppResul
     Ok(true)
 }
 
+/// The `DELETE` behind [`delete_all_for_user`]: every relationship naming
+/// the account, either side.
+const DELETE_ALL_FOR_USER_SQL: &str =
+    "DELETE FROM follows WHERE follower_id = $1 OR followee_id = $1";
+
+/// Removes every follow relationship that names user `user_id`: the
+/// account-deletion job's follow step.
+///
+/// Both sides go — the rows where the account is the follower and the
+/// rows where it is the followee, in any state — Pleroma's per-follower
+/// and per-followed `unfollow` loop of `User.perform(:delete)` cut down to
+/// the one statement the departing account needs. The denormalised
+/// counters of the peers are left alone: Pleroma's purge deactivates the
+/// account first, so no listing still reads them, and one clamped step per
+/// row would cost a query per relationship to fix a number nobody shows.
+///
+/// Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 /// Removes `follower_id`'s accepted follow of `user_id` — the followed
 /// account, the row's [`Follow::followee_id`] — and returns the removed
 /// relationship, `None` when the account had no such follower to remove.

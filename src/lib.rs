@@ -79,7 +79,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// ([`mutes::KIND_EXPIRE`](jobs::mutes::KIND_EXPIRE)), the user-import
 /// jobs ([`imports::KIND_FOLLOWS`](jobs::imports::KIND_FOLLOWS),
 /// [`imports::KIND_BLOCKS`](jobs::imports::KIND_BLOCKS) and
-/// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)) and the
+/// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)), the account
+/// deletion job ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE))
+/// and the
 /// incoming-activity stub
 /// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)), so
 /// the worker idles, sweeps, delivers, sends and drains received
@@ -174,6 +176,7 @@ fn job_registry() -> JobRegistry {
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);
+    registry.register(jobs::deletion::KIND_DELETE, jobs::deletion::handle_delete);
     registry.register(mailer::KIND_SEND, mailer::handle);
     registry.register(
         federation::dispatch::KIND_INCOMING,
