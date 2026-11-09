@@ -1,5 +1,6 @@
-//! The status endpoints over HTTP: the reads `GET /api/v1/statuses/{id}` and
-//! the batch `GET /api/v1/statuses?id[]=…` (WBE-77), the thread read
+//! The status endpoints over HTTP: the write `POST /api/v1/statuses` (WBE-76),
+//! the reads `GET /api/v1/statuses/{id}` and the batch
+//! `GET /api/v1/statuses?id[]=…` (WBE-77), the thread read
 //! `GET /api/v1/statuses/{id}/context` (WBE-78) and the write
 //! `DELETE /api/v1/statuses/{id}` (WBE-79).
 //!
@@ -34,10 +35,22 @@
 //! came back in the answer. The named status itself never appears in either
 //! arm, and a status this caller may not see is the shared 404.
 //!
-//! Both routes run Pleroma's optional-auth pipeline: no token proceeds, a
+//! Both reads run Pleroma's optional-auth pipeline: no token proceeds, a
 //! presented user token must carry `read:statuses` (403 for one that does
 //! not, even on a public post), an app-only token proceeds unauthenticated,
 //! and a token that does not resolve is the extractor's 401.
+//!
+//! `POST /api/v1/statuses` (WBE-76) is Pleroma's `create` and runs the strict
+//! pipeline — `AuthUser` plus `write:statuses` plus the
+//! `statuses_actions` throttle — and the ticket's own refusals: 422 for a
+//! post with nothing to say, one over `MAX_STATUS_CHARS` (counted with every
+//! URL at 23 characters), an unknown `visibility` or `content_type`, an
+//! over-long `spoiler_text` or `language`. What passes is stored as a `local`
+//! row with its mentions in `status_mentions` and its tags in
+//! `status_hashtags`, the posting client recorded as its application, the
+//! author's `statuses_count` stepped, and the whole thing answered as the
+//! `Status` entity the author themselves sees — from a JSON or a form body
+//! alike.
 //!
 //! `DELETE /api/v1/statuses/{id}` (WBE-79) is Pleroma's `delete`: a user
 //! token with `write:statuses`, on the same `statuses_actions` bucket the
@@ -63,10 +76,17 @@ use wired_be::{
     models::{
         block,
         follow::{self, FollowState},
+        hashtag,
         media_attachment::{self, NewMediaAttachment},
+        mention,
         mute::{self, MuteOptions},
+        oauth_app::{self, NewOauthApp},
         status::{self, NewStatus, Status, Visibility},
         user::{self, Flag, NewUser, User},
+    },
+    util::{
+        entities::{hashtag_html, mention_html},
+        format::status_length,
     },
 };
 
@@ -80,12 +100,13 @@ const NO_SCOPE: &str = "Insufficient permissions: read:statuses.";
 const INVALID_TOKEN: &str = "The access token is invalid";
 /// The scope both read routes ask a presented user token for.
 const SCOPES: &str = "read:statuses";
-/// The scope the delete route asks a user token for.
+/// The scope the write routes — `POST /api/v1/statuses` and the delete — ask
+/// a user token for.
 const WRITE: &str = "write:statuses";
 /// [`WRITE`] beside `read:statuses`: what a delete test's token carries when
 /// the test also reads the status back through the show route.
 const WRITE_AND_READ: &str = "write:statuses read:statuses";
-/// The 403 body the scope gate renders for a user token without it.
+/// The 403 body the scope gate renders for a user token without [`WRITE`].
 const NO_WRITE: &str = "Insufficient permissions: write:statuses.";
 /// The 401 body `AuthUser` renders when the request carries no token at all.
 const NO_TOKEN: &str = "Invalid credentials";
@@ -1694,4 +1715,881 @@ async fn the_context_route_runs_the_optional_read_statuses_gate() {
             who,
         );
     }
+}
+
+// ────────────────────────────  POST /api/v1/statuses  ────────────────────────
+
+/// The route every creation test posts to.
+const STATUSES: &str = "/api/v1/statuses";
+/// 422 body for a post with nothing to say (Pleroma's
+/// `validate_character_limit`).
+const EMPTY_STATUS: &str = "Cannot post an empty status without attachments";
+/// 422 body for a post over `MAX_STATUS_CHARS`.
+const OVER_LIMIT: &str = "The status is over the character limit";
+/// 422 body for a `visibility` outside the five names.
+const BAD_VISIBILITY: &str = "Invalid visibility";
+/// 422 body for a `content_type` outside the three advertised formats.
+const BAD_CONTENT_TYPE: &str = "Invalid content_type";
+
+/// `POST /api/v1/statuses` with the JSON `body` as `token` (`None`: no
+/// credential at all).
+async fn publish(app: &Router, token: Option<&str>, body: Value) -> common::TestResponse {
+    let request = common::TestRequest::post(STATUSES).json(&body);
+    match token {
+        Some(found) => request.bearer(found).send(app).await,
+        None => request.send(app).await,
+    }
+}
+
+/// A creation, asserted 200, answered as JSON.
+async fn posted(app: &Router, token: &str, body: Value) -> Value {
+    let response = publish(app, Some(token), body).await;
+    common::assert_answer(&response, StatusCode::OK, "a post that passes");
+    response.json_value()
+}
+
+/// The id a creation answered with, as the row's own `UUIDv7` text.
+fn id_of(value: &Value) -> Uuid {
+    let text = value["id"].as_str().expect("the entity carries its id");
+    Uuid::parse_str(text).expect("the entity id is an id")
+}
+
+/// The stored row behind a creation's answer. A refusal never reaches this:
+/// no answer, no id, nothing stored.
+async fn created_row(pool: &PgPool, value: &Value) -> Status {
+    status::get_by_id(pool, id_of(value))
+        .await
+        .unwrap()
+        .expect("the created status is stored live")
+}
+
+/// How many statuses this database holds: what a refusal never adds to and
+/// every post adds exactly one to.
+async fn stored_count(pool: &PgPool) -> i64 {
+    sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM statuses")
+        .fetch_one(pool)
+        .await
+        .expect("the count reads")
+        .0
+}
+
+/// The account `id` as it stands now, for the counters a post moves.
+async fn author_now(pool: &PgPool, id: Uuid) -> User {
+    user::get_by_id(pool, id)
+        .await
+        .unwrap()
+        .expect("the author exists")
+}
+
+/// The `status_mentions` links of one status, as the mention model reads
+/// them, in position order.
+async fn mention_links(pool: &PgPool, id: Uuid) -> Vec<Uuid> {
+    let links = mention::for_statuses(pool, std::slice::from_ref(&id))
+        .await
+        .expect("the mention links read");
+    links
+        .get(&id)
+        .map(|users| users.iter().map(|account| account.id).collect())
+        .unwrap_or_default()
+}
+
+/// The names `status_hashtags` links to one status, as the hashtag model
+/// reads them, in name order.
+async fn tag_links(pool: &PgPool, id: Uuid) -> Vec<String> {
+    let links = hashtag::for_statuses(pool, std::slice::from_ref(&id))
+        .await
+        .expect("the tag links read");
+    links
+        .get(&id)
+        .map(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// A minimal post is created, answered as the [`Status`] entity and stored
+/// as the row that entity describes — local, public, its urls derived from
+/// its own minted id.
+#[tokio::test]
+async fn a_minimal_post_creates_the_status_it_answers() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(&app, &token, json!({"status": "hello fediverse"})).await;
+    let row = created_row(&pool, &value).await;
+
+    assert_eq!(value["id"], row.id.to_string(), "the entity is the row");
+    assert_eq!(
+        value["uri"],
+        format!("{TEST_BASE_URL}/objects/{}", row.id),
+        "a local status owns this instance's object id (decision 6)"
+    );
+    assert_eq!(
+        value["url"],
+        json!(format!("{TEST_BASE_URL}/notice/{}", row.id)),
+        "and the human URL derived from the same id"
+    );
+    assert_eq!(value["content"], "<p>hello fediverse</p>", "rendered HTML");
+    assert_eq!(
+        value["pleroma"]["content"],
+        json!({ "text/plain": "hello fediverse" }),
+        "the source text the author wrote"
+    );
+    assert_eq!(value["visibility"], "public", "the default scope");
+    assert_eq!(value["sensitive"], false, "the default flag");
+    assert_eq!(value["spoiler_text"], "", "no content warning");
+    assert_eq!(value["language"], Value::Null, "no stated language");
+    assert_eq!(value["in_reply_to_id"], Value::Null, "a root post");
+    assert_eq!(value["reblog"], Value::Null, "and not a reblog");
+    assert_eq!(value["mentions"], json!([]), "nothing mentioned");
+    assert_eq!(value["tags"], json!([]), "nothing tagged");
+    assert_eq!(value["media_attachments"], json!([]), "nothing attached");
+    assert_eq!(value["reblogs_count"], 0, "every counter starts at zero");
+    assert_eq!(value["favourites_count"], 0, "all four of them");
+    assert_eq!(value["replies_count"], 0, "including replies");
+    assert_eq!(value["pleroma"]["quotes_count"], 0, "and quotes");
+    assert_eq!(value["account"]["acct"], "alice", "rendered as its author");
+    assert_eq!(value["pleroma"]["local"], true, "a posted status is local");
+    assert_eq!(
+        value["pleroma"]["conversation_id"],
+        row.conversation_id.to_string(),
+        "a root status is its own conversation"
+    );
+    assert_eq!(
+        (
+            row.user_id,
+            row.raw_text.as_str(),
+            row.content_type.as_str(),
+            row.visibility,
+        ),
+        (
+            alice.id,
+            "hello fediverse",
+            "text/plain",
+            Visibility::Public
+        ),
+        "and the row holds what the body said"
+    );
+}
+
+/// The author's `statuses_count` moves with every post that passes, and not
+/// with the ones that do not.
+#[tokio::test]
+async fn a_post_counts_for_its_author_and_a_refusal_does_not() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        0,
+        "a fresh account has not posted"
+    );
+    let first = posted(&app, &token, json!({"status": "one"})).await;
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        1,
+        "the first post is counted"
+    );
+    let second = posted(&app, &token, json!({"status": "two"})).await;
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        2,
+        "and the second is counted on top of it"
+    );
+    assert_ne!(
+        id_of(&first),
+        id_of(&second),
+        "two posts are two rows, each its own id"
+    );
+
+    let refused = publish(&app, Some(token.as_str()), json!({"status": "   "})).await;
+    common::assert_answer(&refused, StatusCode::UNPROCESSABLE_ENTITY, "a blank post");
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        2,
+        "a refusal counts nothing"
+    );
+    assert_eq!(
+        stored_count(&pool).await,
+        2,
+        "and stores no row, not even a tombstone"
+    );
+    assert!(
+        author_now(&pool, alice.id).await.last_status_at.is_some(),
+        "and the author knows when they last posted"
+    );
+}
+
+/// All five visibilities round trip, `local` answering its own name exactly
+/// as Pleroma's renderer emits it.
+#[tokio::test]
+async fn every_visibility_is_stored_and_answered() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    for name in ["public", "unlisted", "private", "direct", "local"] {
+        let value = posted(
+            &app,
+            &token,
+            json!({"status": "said it", "visibility": name}),
+        )
+        .await;
+        assert_eq!(value["visibility"], name, "the entity answers {name}");
+        assert_eq!(
+            value["content"], "<p>said it</p>",
+            "the same text in every scope, {name}"
+        );
+        assert_eq!(
+            created_row(&pool, &value).await.visibility.as_str(),
+            name,
+            "and the row stores {name}"
+        );
+    }
+}
+
+/// The account's own settings are the defaults: its `default_scope` decides
+/// the visibility and its `sensitive_default` the flag, until the body names
+/// either.
+#[tokio::test]
+async fn the_author_s_settings_are_the_default_visibility_and_flag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let shy = common::create_local_user_with(&pool, "shy", |new| NewUser {
+        default_scope: "private".to_owned(),
+        sensitive_default: Flag::new(true),
+        ..new
+    })
+    .await;
+    let shy_token = common::create_app_and_token(&pool, &shy, WRITE).await;
+    let (_open, open_token) = user_with_token(&pool, "open", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let own = posted(&app, &shy_token, json!({"status": "as I always post"})).await;
+    assert_eq!(
+        own["visibility"], "private",
+        "the account's default_scope decides a bare post"
+    );
+    assert_eq!(own["sensitive"], true, "and its sensitive_default flags it");
+
+    let chosen = posted(
+        &app,
+        &shy_token,
+        json!({"status": "otherwise", "visibility": "unlisted", "sensitive": false}),
+    )
+    .await;
+    assert_eq!(chosen["visibility"], "unlisted", "and the body wins");
+    assert_eq!(
+        chosen["sensitive"], false,
+        "including against a `true` default"
+    );
+
+    let plain = posted(&app, &open_token, json!({"status": "stock account"})).await;
+    assert_eq!(
+        plain["visibility"], "public",
+        "an account on the stock default posts public"
+    );
+    assert_eq!(plain["sensitive"], false, "and never sensitive");
+}
+
+/// The three advertised content types render their own way: markdown
+/// becomes the markup it means, submitted HTML is reduced to the allowlist,
+/// and plain text is escaped so it can say those characters at all.
+#[tokio::test]
+async fn each_content_type_renders_in_its_own_format() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let markdown = posted(
+        &app,
+        &token,
+        json!({"status": "a **bold** claim", "content_type": "text/markdown"}),
+    )
+    .await;
+    assert_eq!(
+        markdown["content"], "<p>a <strong>bold</strong> claim</p>",
+        "markdown bold becomes <strong>"
+    );
+    assert_eq!(
+        markdown["pleroma"]["content"],
+        json!({ "text/plain": "a **bold** claim" }),
+        "while the source stays what was typed"
+    );
+
+    let html = posted(
+        &app,
+        &token,
+        json!({"status": "<b>rich</b><script>steal()</script>", "content_type": "text/html"}),
+    )
+    .await;
+    assert_eq!(
+        html["content"], "<b>rich</b>",
+        "the allowed tag survives, the script element goes with its text"
+    );
+
+    let plain = posted(&app, &token, json!({"status": "<b>rich</b>"})).await;
+    assert_eq!(
+        plain["content"], "<p>&lt;b&gt;rich&lt;/b&gt;</p>",
+        "no content_type is plain text, and plain text is escaped"
+    );
+    assert_eq!(
+        created_row(&pool, &plain).await.content_type,
+        "text/plain",
+        "and is stored as such"
+    );
+}
+
+/// The name and website of the app behind the token are stored as the
+/// status's application and answer in the entity's `application` block;
+/// an app that has no website answers that key as null.
+#[tokio::test]
+async fn the_application_behind_the_token_is_recorded() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, stock_token) = user_with_token(&pool, "alice", WRITE).await;
+    let client = common::create_app_named(&pool, "Wired Client", Some(&alice)).await;
+    let named_token = common::create_token(&pool, &alice, &client, WRITE).await;
+    // The same registration the fixture does, plus the one column it leaves
+    // out: an app that names its homepage.
+    let sited = oauth_app::create(
+        &pool,
+        &NewOauthApp {
+            client_name: "Sited Client".to_owned(),
+            redirect_uris: "https://client.example/callback".to_owned(),
+            scopes: WRITE.to_owned(),
+            website: Some("https://client.example".to_owned()),
+            user_id: Some(alice.id),
+        },
+    )
+    .await
+    .expect("the website-carrying app registers");
+    let sited_token = common::create_token(&pool, &alice, &sited, WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let stock = posted(
+        &app,
+        &stock_token,
+        json!({"status": "from the fixture app"}),
+    )
+    .await;
+    assert_eq!(
+        stock["application"],
+        json!({ "name": "Test Client", "website": Value::Null }),
+        "the token's app is named, and a website it does not have is null"
+    );
+
+    let value = posted(
+        &app,
+        &named_token.token,
+        json!({"status": "from a named client"}),
+    )
+    .await;
+    assert_eq!(
+        value["application"],
+        json!({ "name": "Wired Client", "website": Value::Null }),
+        "the entity answers the client that posted"
+    );
+    let row = created_row(&pool, &value).await;
+    assert_eq!(
+        (
+            row.application_name.as_deref(),
+            row.application_website.as_deref(),
+        ),
+        (Some("Wired Client"), None),
+        "and the row stores its name, and no website"
+    );
+
+    let with_site = posted(
+        &app,
+        &sited_token.token,
+        json!({"status": "from a client with a homepage"}),
+    )
+    .await;
+    assert_eq!(
+        with_site["application"],
+        json!({ "name": "Sited Client", "website": "https://client.example" }),
+        "a client that names a homepage answers both"
+    );
+    let sited_row = created_row(&pool, &with_site).await;
+    assert_eq!(
+        (
+            sited_row.application_name.as_deref(),
+            sited_row.application_website.as_deref(),
+        ),
+        (Some("Sited Client"), Some("https://client.example")),
+        "and the row stores the pair"
+    );
+}
+
+/// A mention of a local account becomes its `h-card` anchor in the content,
+/// a row in `status_mentions`, and an entry in the entity's `mentions`; an
+/// unknown name is left as the text it was written as.
+#[tokio::test]
+async fn a_local_mention_is_linked_stored_and_answered() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(&app, &token, json!({"status": "hi @bob, and @nobody"})).await;
+    let row = created_row(&pool, &value).await;
+
+    assert_eq!(
+        value["content"],
+        format!("<p>hi {}, and @nobody</p>", mention_html(&bob.ap_id, "bob")),
+        "the known account becomes its h-card, the unknown one stays text"
+    );
+    assert_eq!(
+        mention_links(&pool, row.id).await,
+        vec![bob.id],
+        "exactly the account this instance knows is linked in status_mentions"
+    );
+    assert_eq!(
+        value["mentions"],
+        json!([{ "id": bob.id.to_string(), "username": "bob",
+                 "url": bob.ap_id, "acct": "bob" }]),
+        "and it answers in the entity's `mentions`"
+    );
+}
+
+/// One post naming an account and a tag links both in the same content, in
+/// mention order and whatever case the text spelled the account in: a
+/// case-different `@BOB` still resolves to bob's stored row and profile URL,
+/// and the tag answers folded.
+#[tokio::test]
+async fn a_mention_and_a_hashtag_link_one_post_with_the_acct_in_any_case() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(&app, &token, json!({"status": "hi @BOB #tag"})).await;
+    let row = created_row(&pool, &value).await;
+
+    assert_eq!(
+        value["content"],
+        format!(
+            "<p>hi {} {}</p>",
+            mention_html(&bob.ap_id, "BOB"),
+            hashtag_html(TEST_BASE_URL, "tag"),
+        ),
+        "the case-different mention links to bob's profile URL (the `ap_id` \
+         fallback the fixture's row leaves it on) displayed as typed, and the \
+         tag links beside it"
+    );
+    assert_eq!(
+        mention_links(&pool, row.id).await,
+        vec![bob.id],
+        "the account the folded name finds is linked in `status_mentions`"
+    );
+    assert_eq!(
+        tag_links(&pool, row.id).await,
+        vec!["tag"],
+        "and the tag in `status_hashtags`"
+    );
+    assert_eq!(
+        value["mentions"],
+        json!([{ "id": bob.id.to_string(), "username": "bob",
+                 "url": bob.ap_id, "acct": "bob" }]),
+        "bob answers in the entity's `mentions`, by the entity's own spelling"
+    );
+    assert_eq!(
+        value["tags"],
+        json!([{ "name": "tag", "url": format!("{TEST_BASE_URL}/tags/tag") }]),
+        "and the tag in its `tags`"
+    );
+}
+
+/// Hashtags are extracted and deduplicated into one stored link each, linked
+/// at every spelling in the content, and answered in the entity's `tags`.
+#[tokio::test]
+async fn hashtags_are_stored_linked_and_answered() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "hello #Rust and #rust, also #123"}),
+    )
+    .await;
+    let row = created_row(&pool, &value).await;
+
+    assert_eq!(
+        tag_links(&pool, row.id).await,
+        vec!["rust"],
+        "one stored tag for both spellings, folded to lowercase, and #123 is \
+         no tag at all"
+    );
+    assert_eq!(
+        value["tags"],
+        json!([{ "name": "rust", "url": format!("{TEST_BASE_URL}/tags/rust") }]),
+        "the tag answers in the entity's `tags`"
+    );
+    assert_eq!(
+        value["content"],
+        format!(
+            "<p>hello {tag} and {tag}, also #123</p>",
+            tag = hashtag_html(TEST_BASE_URL, "rust")
+        ),
+        "and every spelling of it is linked in the content"
+    );
+}
+
+/// The length limit is `MAX_STATUS_CHARS` counted by `status_length`, which
+/// charges every bare URL 23 characters: a text the raw count would refuse
+/// posts, and one the weighted count refuses does not.
+#[tokio::test]
+async fn the_length_limit_charges_every_url_twenty_three_characters() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let mut config = common::test_config();
+    config.max_status_chars = 25;
+    let app = common::test_app_with_config(pool.clone(), config);
+
+    let url = "https://example.com/a/path/longer/than/twenty-three";
+    assert!(
+        url.chars().count() > 25,
+        "the fixture URL is on its own past the cap this test sets"
+    );
+
+    let text = format!("x {url}");
+    let value = posted(&app, &token, json!({"status": &text})).await;
+    assert_eq!(
+        value["pleroma"]["content"],
+        json!({ "text/plain": text }),
+        "2 characters plus one URL weighted at 23 is the 25 this instance \
+         allows, so the post is stored with the text as written"
+    );
+
+    let over = format!("{url} tail");
+    refused(&app, &token, json!({"status": over}), OVER_LIMIT).await;
+    assert_eq!(
+        stored_count(&pool).await,
+        1,
+        "23 + 5 is over the same limit, and nothing was written for it"
+    );
+}
+
+/// The same charge at the production default of `MAX_STATUS_CHARS`: two
+/// hundred long bare URLs — ten thousand raw characters — weigh 200 × 23
+/// plus their separators and post, while three hundred of the same URLs are
+/// the 422. The pair is what proves the limit is measured by that weighting,
+/// not by the length the body has as written.
+#[tokio::test]
+async fn the_default_limit_charges_each_url_its_weight_not_its_length() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+    assert_eq!(
+        common::test_config().max_status_chars,
+        5000,
+        "this test posts under the default limit, not a shrunk one"
+    );
+
+    let url = "https://example.com/a/very/long/path?query=string";
+    let fit = vec![url; 200].join(" ");
+    let over = vec![url; 300].join(" ");
+    assert!(
+        fit.chars().count() > 5000 && over.chars().count() > 5000,
+        "both bodies are far more than 5000 characters as written: {} and {}",
+        fit.chars().count(),
+        over.chars().count()
+    );
+    assert!(
+        status_length(&fit, 23) < 200 * 24 && status_length(&over, 23) > 5000,
+        "the first measures well under 200 × 24 and so fits, the second's \
+         300 charges alone pass the cap"
+    );
+
+    let value = posted(&app, &token, json!({"status": &fit})).await;
+    assert_eq!(
+        created_row(&pool, &value).await.raw_text,
+        fit,
+        "two hundred URLs post, and the row holds every one verbatim"
+    );
+
+    refused(&app, &token, json!({"status": over}), OVER_LIMIT).await;
+    assert_eq!(
+        stored_count(&pool).await,
+        1,
+        "three hundred of the same URLs are refused, and wrote nothing"
+    );
+}
+
+/// A post with nothing to say — no `status`, an empty one, a blank one — is
+/// 422 in the wording Pleroma uses for an empty payload, and writes nothing.
+#[tokio::test]
+async fn an_empty_status_is_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    for body in [
+        json!({}),
+        json!({"status": ""}),
+        json!({"status": "   "}),
+        json!({"status": "\n\t \n"}),
+        json!({"status": "  ", "spoiler_text": "a warning is no text"}),
+    ] {
+        let response = publish(&app, Some(token.as_str()), body.clone()).await;
+        common::assert_answer(&response, StatusCode::UNPROCESSABLE_ENTITY, "an empty post");
+        common::assert_error(&response, EMPTY_STATUS, &format!("the body `{body}`"));
+    }
+    assert_eq!(stored_count(&pool).await, 0, "and nothing was written");
+}
+
+/// The 422 matrix over HTTP: one probe per refusal the endpoint owes — an
+/// unknown `visibility`, an unknown `content_type` (down to Pleroma's own
+/// `text/x-markdown` alias), a `spoiler_text` one character past 200, a
+/// `language` one past 10 and a `status` that is only whitespace — each 422
+/// in its own wording, and none of them reaches the database.
+#[tokio::test]
+async fn the_422_matrix_refuses_each_bad_parameter_in_its_own_wording() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    for (body, message) in [
+        (
+            json!({"status": "hi", "visibility": "bogus"}),
+            BAD_VISIBILITY,
+        ),
+        (
+            json!({"status": "hi", "content_type": "text/x-markdown"}),
+            BAD_CONTENT_TYPE,
+        ),
+        (
+            json!({"status": "hi", "spoiler_text": "x".repeat(201)}),
+            "Validation failed: Spoiler text is too long (maximum is 200 characters)",
+        ),
+        (
+            json!({"status": "hi", "language": "a".repeat(11)}),
+            "Validation failed: Language is too long (maximum is 10 characters)",
+        ),
+        (json!({"status": "   \t\n  "}), EMPTY_STATUS),
+    ] {
+        let response = publish(&app, Some(token.as_str()), body.clone()).await;
+        common::assert_answer(
+            &response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("the refusal for `{body}`"),
+        );
+        common::assert_error(&response, message, &format!("the wording for `{body}`"));
+    }
+
+    assert_eq!(stored_count(&pool).await, 0, "not one of them wrote a row");
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        0,
+        "and none of them counted for the author"
+    );
+}
+
+/// A refusal: the same post, asserted 422 with `message`, then dropped.
+async fn refused(app: &Router, token: &str, body: Value, message: &str) {
+    let response = publish(app, Some(token), body).await;
+    common::assert_answer(
+        &response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused post",
+    );
+    common::assert_error(&response, message, "the refusal wording");
+}
+
+/// A form body creates exactly what the same keys would as JSON, with the
+/// string spellings of booleans and defaults accepted (decision 10).
+#[tokio::test]
+async fn a_form_body_posts_like_the_json_one() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let response = common::TestRequest::post(STATUSES)
+        .bearer(&token)
+        .form(&[
+            ("status", "posted from a form"),
+            ("visibility", "unlisted"),
+            ("sensitive", "true"),
+            ("spoiler_text", "news"),
+            ("language", "nl"),
+        ])
+        .send(&app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "a form post");
+    let value = response.json_value();
+    let row = created_row(&pool, &value).await;
+
+    assert_eq!(value["content"], "<p>posted from a form</p>", "the text");
+    assert_eq!(value["visibility"], "unlisted", "the scope");
+    assert_eq!(value["sensitive"], true, "a form `true` is the flag on");
+    assert_eq!(value["spoiler_text"], "news", "the content warning");
+    assert_eq!(value["language"], "nl", "and the language tag");
+    assert_eq!(
+        (
+            row.raw_text.as_str(),
+            row.visibility,
+            row.sensitive,
+            row.spoiler_text.as_str(),
+            row.language.as_deref(),
+        ),
+        (
+            "posted from a form",
+            Visibility::Unlisted,
+            true,
+            "news",
+            Some("nl")
+        ),
+        "stored exactly as the JSON body would have stored it"
+    );
+
+    let off = common::TestRequest::post(STATUSES)
+        .bearer(&token)
+        .form(&[("status", "flag off"), ("sensitive", "0")])
+        .send(&app)
+        .await;
+    common::assert_answer(&off, StatusCode::OK, "the second form post");
+    assert_eq!(
+        off.json_value()["sensitive"],
+        false,
+        "`0` is the flag off, whatever the account defaults to"
+    );
+}
+
+/// The write route runs the whole `AuthUser` + `write:statuses` pipeline: no
+/// credential and an unresolvable one are the 401s, a token that names no
+/// user and one without the scope are the 403s, and none of them posts.
+#[tokio::test]
+async fn the_route_needs_a_user_token_that_writes_statuses() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (reader, reader_token) = user_with_token(&pool, "reader", "read:statuses").await;
+    let (_writer, writer_token) = user_with_token(&pool, "writer", WRITE).await;
+    let ownerless = common::create_app_only_token(&pool, WRITE).await;
+    let app = common::test_app(pool.clone());
+    let body = json!({"status": "who is speaking"});
+
+    let anonymous = publish(&app, None, body.clone()).await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "no credential");
+    common::assert_error(&anonymous, NO_TOKEN, "no credential");
+
+    let unknown = publish(&app, Some("token-that-was-never-minted"), body.clone()).await;
+    common::assert_answer(&unknown, StatusCode::UNAUTHORIZED, "an unknown token");
+    common::assert_error(&unknown, INVALID_TOKEN, "an unknown token");
+
+    let narrow = publish(&app, Some(reader_token.as_str()), body.clone()).await;
+    common::assert_answer(&narrow, StatusCode::FORBIDDEN, "a token without the scope");
+    common::assert_error(&narrow, NO_WRITE, "a token without the scope");
+
+    let app_only = publish(&app, Some(ownerless.as_str()), body.clone()).await;
+    common::assert_answer(&app_only, StatusCode::FORBIDDEN, "an app-only token");
+    common::assert_error(&app_only, USER_REQUIRED, "an app-only token");
+
+    assert_eq!(stored_count(&pool).await, 0, "not one refusal wrote a row");
+    assert_eq!(
+        author_now(&pool, reader.id).await.statuses_count,
+        0,
+        "and the near-enough token gained nothing"
+    );
+
+    let granted = posted(&app, &writer_token, body).await;
+    assert_eq!(
+        granted["account"]["acct"], "writer",
+        "the scope does post, as its own author"
+    );
+}
+
+/// The route is in the `statuses_actions` bucket Pleroma throttles status
+/// writes through: the request past the budget is refused before the
+/// service runs, so nothing is posted and nothing is counted.
+#[tokio::test]
+async fn the_route_spends_the_statuses_actions_bucket() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app_with_config(
+        pool.clone(),
+        common::test_config_with_rate_limits("statuses_actions=2:600"),
+    );
+
+    for spent in 0..2 {
+        let response = publish(&app, Some(token.as_str()), json!({"status": "counted"})).await;
+        common::assert_answer(&response, StatusCode::OK, "a request inside the budget");
+        assert_eq!(
+            response.header("x-ratelimit-limit"),
+            Some("2"),
+            "the bucket's budget"
+        );
+        assert_eq!(
+            response.header("x-ratelimit-remaining"),
+            Some(if spent == 0 { "1" } else { "0" }),
+            "the window counts down"
+        );
+    }
+
+    let throttled = publish(&app, Some(token.as_str()), json!({"status": "throttled"})).await;
+    common::assert_answer(&throttled, StatusCode::TOO_MANY_REQUESTS, "over the budget");
+    common::assert_error(&throttled, "Throttled", "over the budget");
+    assert_eq!(
+        stored_count(&pool).await,
+        2,
+        "the third request never reached the service"
+    );
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        2,
+        "and so the author counts two posts, not three"
+    );
+}
+
+/// The batch read and the write share the `/statuses` path without either
+/// losing its gate: the throttled `POST` is a 401 with no credential while
+/// the unthrottled `GET` still answers the anonymous `[]` it always did.
+#[tokio::test]
+async fn the_write_route_does_not_leak_onto_the_read_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app_with_config(
+        pool.clone(),
+        common::test_config_with_rate_limits("statuses_actions=1:600"),
+    );
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+
+    let read = batch(&app, None, "").await;
+    common::assert_answer(&read, StatusCode::OK, "the anonymous batch");
+    assert_eq!(
+        read.header("x-ratelimit-limit"),
+        None,
+        "and it carries no throttle headers"
+    );
+
+    let first = publish(&app, Some(token.as_str()), json!({"status": "one"})).await;
+    common::assert_answer(&first, StatusCode::OK, "the first post of the window");
+    let second = publish(&app, Some(token.as_str()), json!({"status": "two"})).await;
+    common::assert_answer(&second, StatusCode::TOO_MANY_REQUESTS, "the second");
+    let read_again = batch(&app, None, "").await;
+    common::assert_answer(
+        &read_again,
+        StatusCode::OK,
+        "the batch is still unthrottled",
+    );
+    assert_eq!(
+        read_again.json_value(),
+        json!([]),
+        "and the visible ids it answers are unchanged by the throttle"
+    );
 }

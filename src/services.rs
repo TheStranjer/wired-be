@@ -13,6 +13,11 @@
 //! builders) and serves those links over HTTP (its router is merged at
 //! the top level by [`crate::app`]).
 //!
+//! [`create_status`] is the write side of the same idea: it decides what a
+//! `POST /api/v1/statuses` body means — its limits, its defaults, its
+//! refusals — from the request parameters alone, so the endpoint that stores
+//! the result never re-decides any of it.
+//!
 //! [`translate`] is the outbound half of status translation: which provider
 //! the instance talks to, what a translate call and a language list look like
 //! over there, and the sanitizer pass every provider answer goes through
@@ -27,6 +32,7 @@
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
 
+pub mod create_status;
 pub mod emoji_packs;
 pub mod instance_actor;
 pub mod instance_meta;

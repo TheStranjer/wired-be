@@ -1,8 +1,9 @@
-//! The status endpoints: reads, the favourite, reblog, bookmark and pin
-//! writes and listings, translation and the delete
-//! (`docs/ARCHITECTURE.md` decision 1), all over one shared status gate.
+//! The status endpoints: create, the reads, the state changes and listings,
+//! translation and the delete, all over one shared status gate
+//! (`docs/ARCHITECTURE.md` decision 1).
 //!
-//! The routes are the lookups `GET /api/v1/statuses/{id}` and the batch
+//! The routes are the write `POST /api/v1/statuses`, the lookups
+//! `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=a&id[]=b`, the thread read
 //! `GET /api/v1/statuses/{id}/context`, the favourite writes
 //! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
@@ -19,21 +20,35 @@
 //! `DELETE /api/v1/statuses/{id}`.
 //!
 //! The reference is Pleroma's `StatusController` (`lib/pleroma/web/
-//! mastodon_api/controllers/status_controller.ex`): `show` and `.index`
-//! for the reads, `favourite` / `unfavourite` / `favourited_by` /
-//! `favourites` for the likes, `reblog` / `unreblog` / `reblogged_by`
-//! for the boosts, `bookmark` / `unbookmark` / `bookmarks`
-//! for the bookmarks, `mute_conversation` / `unmute_conversation`
-//! for the thread mutes, and `delete` — with
-//! `Pleroma.Web.CommonAPI.delete/2`
+//! mastodon_api/controllers/status_controller.ex`): `create` for the new
+//! post, `show` and `.index` for the reads, `favourite` / `unfavourite` /
+//! `favourited_by` / `favourites` for the likes, `reblog` / `unreblog` /
+//! `reblogged_by` for the boosts, `bookmark` / `unbookmark` / `bookmarks`
+//! for the bookmarks, `mute_conversation` / `unmute_conversation` for the
+//! thread mutes, and `delete` — with `Pleroma.Web.CommonAPI.delete/2`
 //! (`lib/pleroma/web/common_api.ex`, whose `repeat` / `unrepeat` stand
-//! behind the boosts) — for the writes. Those
-//! reduce to the same two moves per surface: find the status, ask
+//! behind the boosts) — for the writes. Those, `create` apart, reduce to
+//! the same two moves per surface: find the status, ask
 //! `Visibility.visible_for_user?`, and either render it or answer
 //! `{:error, :not_found}`. Here finding and asking live in the shared
 //! [`status_for_viewer_or_404`], which every
 //! `/api/v1/statuses/{id}/...` route reuses, and rendering lives in the
 //! batched page renderer [`crate::services::render_status`].
+//!
+//! # The create
+//!
+//! `POST /api/v1/statuses` is the module's other half, and Pleroma's
+//! `create`: a user token granting `write:statuses` (its own scope, not the
+//! root) on the `statuses_actions` throttle, the body read through
+//! [`ApiBody`] so JSON and form parameters arrive the same way, and the
+//! whole decision — what the text says, who it mentions, what it tags, how
+//! visible it is and what the author's settings default to — delegated to
+//! [`crate::services::create_status`]. The handler adds nothing but the
+//! gate, the client behind the token and the JSON envelope, and a post that
+//! passes answers **200** with the [`Status`] entity rendered for its
+//! author. Everything a fresh status still owes the streaming sockets, the
+//! notifications and the wider federation hangs off that service's single
+//! documented hook, so this file never grows a second write path.
 //!
 //! # The reads
 //!
@@ -315,7 +330,10 @@
 //!
 //! What the reads owe no 422: this module answers an unusable id with the
 //! show route's 404 and the batch route's silent skip, and the only
-//! request shapes beyond those are the pagination cursors' 400.
+//! request shapes beyond those are the pagination cursors' 400. The create
+//! route does owe them: every refusal [`crate::services::create_status`]
+//! documents is its 422, on top of the extractor's 401 and the scope gate's
+//! 403.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //! [`soft_delete_with_reblogs`]: crate::models::status::soft_delete_with_reblogs
@@ -323,6 +341,7 @@
 //! [`Status`]: crate::entities::status::Status
 //! [`Account`]: crate::entities::account::Account
 //! [`Translation`]: crate::entities::translation::Translation
+//! [`ApiBody`]: crate::extract::ApiBody
 
 use std::collections::{HashMap, HashSet};
 
@@ -351,6 +370,7 @@ use crate::{
         block, bookmark, bookmark_folder, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
         mute, notification,
+        oauth_app::{self, OauthApp},
         pinned_status::{self, PinnedStatus},
         status::{self, Status as StatusRow, Visibility},
         status_visibility,
@@ -362,6 +382,7 @@ use crate::{
     },
     pagination::{PageParams, link_header, set_link_header},
     services::{
+        create_status::{self, CreateStatusParams},
         render_status::{render_status, render_statuses},
         translate::Translator,
     },
@@ -454,16 +475,18 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
 ///
-/// `state` reaches the six status writes that mount the
+/// `state` reaches the seven status writes that mount the
 /// `statuses_actions` throttle bucket the way the reports route does (see
-/// [`crate::rate_limit`]): the two favourite ones, the two reblog ones and
-/// `DELETE /api/v1/statuses/{id}`. The other writes ride no bucket — the
-/// two thread-mute ones like the bookmark and pin ones do, because a
+/// [`crate::rate_limit`]): the create one, the two favourite ones, the two
+/// reblog ones and `DELETE /api/v1/statuses/{id}` — Pleroma's
+/// `@rate_limited_status_actions` keeps the new post, those state changes
+/// and the report filing in one window. The other writes ride no bucket —
+/// the two thread-mute ones like the bookmark and pin ones do, because a
 /// thread mute is a private per-account view choice no client can hammer on
-/// anyone else's data with; the ticket pins the throttle for the like
-/// writes, the boost writes and the delete only, and a bookmark is a
-/// private per-account fact — which a pin is too, since `pin_refusal`
-/// admits only the caller's own statuses.
+/// anyone else's data with; the tickets pin the throttle for the create
+/// write, the like writes, the boost writes and the delete only, and a
+/// bookmark is a private per-account fact — which a pin is too, since
+/// `pin_refusal` admits only the caller's own statuses.
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/favourites", get(list_favourites))
@@ -475,6 +498,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
             delete(delete_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
         )
         .route("/statuses", get(list_statuses))
+        .route(
+            "/statuses",
+            post(create_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
+        )
         .route(
             "/statuses/{id}/favourite",
             post(favourite_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
@@ -501,6 +528,38 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/statuses/{id}/mute", post(mute_conversation))
         .route("/statuses/{id}/unmute", post(unmute_conversation))
         .route("/statuses/{id}/translate", post(translate_status))
+}
+
+/// `POST /api/v1/statuses` — create the status the body describes and answer
+/// its [`Status`] entity as its author sees it.
+///
+/// The gate is Pleroma's pipeline for the `create` action:
+/// [`AuthUser`] then `write:statuses` then the `statuses_actions` throttle
+/// (mounted by [`router`]). Everything after that is
+/// [`create_status::create_status`]: the parameters, their defaults and
+/// their refusals, the render, the mentions and hashtags, the stored row and
+/// the post-write hook. The client behind the presenting token is looked up
+/// here because only the request knows it, and it travels to the service as
+/// the status's `application` pair.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:statuses` check; [`AppError::RateLimited`] from the
+/// bucket; whatever [`create_status::create_status`] refuses — 422 for an
+/// empty text, an over-long status, an over-long warning, an unknown
+/// `visibility` or an unknown `content_type` — plus its own database
+/// failures as [`AppError::Database`].
+async fn create_status(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<CreateStatusParams>,
+) -> AppResult<Json<Status>> {
+    auth.require(WRITE_STATUSES)?;
+    let app: Option<OauthApp> = oauth_app::get_by_id(&state.db, auth.1.app_id).await?;
+    Ok(Json(
+        create_status::create_status(&state, &auth.0, app.as_ref(), params).await?,
+    ))
 }
 
 /// `GET /api/v1/statuses/{id}` — the status `id` names, as the viewer
