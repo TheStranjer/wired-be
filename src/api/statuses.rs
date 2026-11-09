@@ -66,7 +66,13 @@
 //! [`statuses.expire`](crate::jobs::statuses::KIND_EXPIRE) job due at that
 //! instant, with the periodic
 //! [`statuses.expire_sweep`](crate::jobs::statuses::KIND_SWEEP) pass behind
-//! it (see [`crate::jobs::statuses`]).
+//! it (see [`crate::jobs::statuses`]). And `in_reply_to_id` makes the post
+//! an answer to a stored status: the service reads the parent with this
+//! route's own [`status_for_viewer_or_404`] rules (so a malformed, unknown,
+//! deleted or poster-invisible parent is the same 404 the show route
+//! answers, and a reblog row folds to its original) and inherits the
+//! thread, author link, capped visibility, fallback language and
+//! auto-mentions described in that module.
 //!
 //! [`ApiParams`]: crate::extract::ApiParams
 //! [`IdempotencyPlug`]: crate::models::idempotency_key
@@ -660,7 +666,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// `visibility`, an unknown `content_type` or an `expires_in` under the
 /// instance's floor or past the calendar — plus the extractor's own 422
 /// for an `expires_in` that is no integer — plus its own database
-/// failures as [`AppError::Database`]. A preview owes the same 422s:
+/// failures as [`AppError::Database`]. An `in_reply_to_id` naming no
+/// status the poster may see — malformed, unknown, deleted or invisible —
+/// is the shared 404 `{"error":"Record not found"}`, exactly the show
+/// route's answer for the same id. A preview owes the same 422s:
 /// validation runs on it exactly as on a post.
 async fn create_status(
     State(state): State<AppState>,

@@ -20,10 +20,22 @@
 //! row, renders the checked text, resolves its mentions, stores the row and
 //! its mention and hashtag links through [`status::insert`], and answers the
 //! [`Status`] entity rendered for the author — Pleroma's `for: user`. The
-//! endpoint's remaining parameters — `poll`, `in_reply_to_id` and
-//! `scheduled_at` — join [`CreateStatusParams`] as extra `Option`s with
-//! their own tickets (decision 15), and until then a body that sends them is
-//! only a body whose known fields are checked here.
+//! endpoint's remaining parameters — `poll` and `scheduled_at` — join
+//! [`CreateStatusParams`] as extra `Option`s with their own tickets
+//! (decision 15), and until then a body that sends them is only a body
+//! whose known fields are checked here. `in_reply_to_id` has landed: a
+//! body that names a parent posts into that parent's thread, and every
+//! reply rule — the parent read through the same viewer-visibility rules
+//! as [`status_for_viewer_or_404`] with a reblog row folded to its
+//! original, the inherited thread id, author link, audience cap and
+//! fallback language, and the auto-mentions of the parent's author and
+//! the accounts the parent mentioned — is the `prepared_new_status` step
+//! both create arms run before they write (Pleroma's `ActivityDraft`
+//! reply arms and `get_to_and_cc`, which carry the parent's actor and
+//! addressed users into the reply's addressing without ever touching the
+//! text).
+//!
+//! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //!
 //! The module is also the shared half of `PUT /api/v1/statuses/{id}`:
 //! [`edit_status`] merges the edit body over the stored row, pushes the
@@ -79,10 +91,10 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         hashtag::Hashtag,
-        idempotency_key,
+        idempotency_key, mention,
         oauth_app::OauthApp,
         status::{self, DEFAULT_CONTENT_TYPE, NewStatus, Visibility},
-        status_edit,
+        status_edit, status_visibility,
         user::User,
     },
     services::{mentions::resolve_mentions, notify, render_status::render_status},
@@ -129,12 +141,18 @@ const INVALID_CONTENT_TYPE: &str = "Invalid content_type";
 /// mistake, not a very distant expiry.
 const EXPIRATION_TOO_LARGE: &str = "expires_in is too large";
 
+/// Most accounts one reply may auto-mention off its parent: the parent's
+/// author beside the accounts the parent itself @-mentioned, deduplicated
+/// and without the replier (see `inherited_mentions`). The body's own
+/// text mentions do not count against this cap — the author wrote them.
+const MAX_INHERITED_MENTIONS: usize = 20;
+
 /// The body of `POST /api/v1/statuses`, as the client wrote it.
 ///
 /// Every field is an `Option` with a serde `default`, so a key the body omits
 /// or sends as `null` stays this module's decision instead of becoming a
 /// deserialization error; a later ticket joins the struct with `media_ids`,
-/// `poll`, `in_reply_to_id` and `scheduled_at` as further `Option`s, the same
+/// `poll` and `scheduled_at` as further `Option`s, the same
 /// way. The `sensitive` field is a [`flex`] boolean, so a form body's
 /// `sensitive=on` spells what a JSON body's `true` spells.
 ///
@@ -183,6 +201,17 @@ pub struct CreateStatusParams {
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_i64")]
     expires_in: Option<i64>,
+    /// The status this one answers, as id text. A named parent is read
+    /// with the same viewer-visibility rules as the show route's shared
+    /// gate, so a malformed, unknown, deleted or poster-invisible parent
+    /// is the shared 404, and a reblog row folds to the original it
+    /// boosts; the reply then carries the parent's thread id, author
+    /// link, audience cap and fallback language, and auto-mentions the
+    /// parent's author and the accounts the parent mentioned — the post
+    /// text itself is never modified. Absent, null or empty is a root
+    /// post, Pleroma's own empty-string "no reply" arm.
+    #[serde(default)]
+    in_reply_to_id: Option<String>,
 }
 
 impl CreateStatusParams {
@@ -437,32 +466,29 @@ pub struct RenderedFields {
 /// token, `None` when the caller names none — is recorded as the post's
 /// `application` pair, Pleroma's `put_application`.
 ///
+/// When the body names an `in_reply_to_id`, the shared `prepared_new_status`
+/// step resolves the parent before anything renders: an unanswerable parent
+/// is the shared 404, and an answerable one lends the row its thread, author
+/// link, capped audience, fallback language and auto-mentions (Pleroma's
+/// `ActivityDraft` reply arms), with the parent's own `replies_count`
+/// stepped by [`status::insert`].
+///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] for the body's own refusals, through
-/// [`check_body`]; [`AppError::Internal`] for the one row this function
-/// wrote that the renderer refuses to answer (unreachable for a fresh local
-/// post, which is neither a tombstone nor a reblog). Any database failure
-/// arrives through `?` as [`AppError::Database`].
+/// [`check_body`]; [`AppError::NotFound`] for an `in_reply_to_id` that names
+/// no status the poster may see; [`AppError::Internal`] for the one row this
+/// function wrote that the renderer refuses to answer (unreachable for a
+/// fresh local post, which is neither a tombstone nor a reblog). Any
+/// database failure arrives through `?` as [`AppError::Database`].
 pub async fn create_status(
     state: &AppState,
     user: &User,
     app: Option<&OauthApp>,
     params: CreateStatusParams,
 ) -> AppResult<Status> {
-    let checked = check_body(
-        &state.config,
-        &user.default_scope,
-        user.sensitive_default.get(),
-        &params,
-    )?;
-    let entities = render_status_fields(state, checked.text, checked.content_type).await?;
-    let row = status::insert(
-        &state.db,
-        &state.config.base_url,
-        &new_status(user, app, &checked, &entities),
-    )
-    .await?;
+    let new = prepared_new_status(state, user, app, &params).await?;
+    let row = status::insert(&state.db, &state.config.base_url, &new).await?;
     created_entity(state, user, row).await
 }
 
@@ -535,20 +561,9 @@ pub async fn create_status_idempotent(
         );
         return replayed_entity(state, user, &row).await;
     }
-    let checked = check_body(
-        &state.config,
-        &user.default_scope,
-        user.sensitive_default.get(),
-        &params,
-    )?;
-    let entities = render_status_fields(state, checked.text, checked.content_type).await?;
+    let new = prepared_new_status(state, user, app, &params).await?;
     let mut tx = state.db.begin().await?;
-    let row = status::insert_conn(
-        &mut tx,
-        &state.config.base_url,
-        &new_status(user, app, &checked, &entities),
-    )
-    .await?;
+    let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
     if idempotency_key::claim(&mut tx, user.id, key, row.id).await? {
         tx.commit().await?;
         return created_entity(state, user, row).await;
@@ -837,6 +852,188 @@ fn new_status(
     }
 }
 
+/// The shared pre-write half of both create arms: [`check_body`] over the
+/// body, the reply's parent when the body names one, the render through
+/// [`render_status_fields`], and the [`NewStatus`] to store with every reply
+/// decision already applied — the parent's id, author and thread, the
+/// [`inherited_visibility`] audience, the parent's language where the body
+/// named none, and the parent's author and mentions auto-linked after the
+/// accounts the text itself mentioned (`status_mentions` only; the text is
+/// not modified and no mention span is inserted).
+///
+/// The parent read happens before the render, like Pleroma's `ActivityDraft`
+/// pipeline, where the `in_reply_to` arm runs before `content`: a body with
+/// a bad parent and a long text is answered for its parent, but only after
+/// [`check_body`] has owed the body its own 422s.
+///
+/// # Errors
+///
+/// Those of [`check_body`] and [`render_status_fields`], plus
+/// [`AppError::NotFound`] through [`reply_parent`] for an `in_reply_to_id`
+/// naming no status the poster may see, plus any database failure behind the
+/// parent's mention read as [`AppError::Database`].
+async fn prepared_new_status(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    params: &CreateStatusParams,
+) -> AppResult<NewStatus> {
+    let checked = check_body(
+        &state.config,
+        &user.default_scope,
+        user.sensitive_default.get(),
+        params,
+    )?;
+    let parent = reply_parent(state, user, params).await?;
+    let entities = render_status_fields(state, checked.text, checked.content_type).await?;
+    let mut new = new_status(user, app, &checked, &entities);
+    if let Some(parent) = parent {
+        let inherited = inherited_mentions(
+            parent.user_id,
+            &parent_mentioned_ids(state, parent.id).await?,
+            user.id,
+        );
+        new.visibility = inherited_visibility(
+            parent.visibility,
+            params.visibility.is_some(),
+            new.visibility,
+        );
+        if new.language.is_none() {
+            new.language = parent.language.clone();
+        }
+        new.in_reply_to_id = Some(parent.id);
+        new.in_reply_to_account_id = Some(parent.user_id);
+        new.conversation_id = Some(parent.conversation_id);
+        new.mentioned_user_ids = merged_mentions(&new.mentioned_user_ids, &inherited);
+    }
+    Ok(new)
+}
+
+/// The status the body's `in_reply_to_id` names, read with exactly the
+/// [`crate::api::helpers::status_for_viewer_or_404`] rules run against the
+/// poster: a malformed, unknown, deleted or poster-invisible parent is the
+/// shared [`AppError::NotFound`], so a probe through a reply never learns
+/// that somebody's private post exists. A reblog row folds to the original
+/// it boosts — Pleroma's `in_reply_to` arm accepts an `Announce` id and the
+/// reply lands on the object under it — and the fold needs no second
+/// visibility pass because the walk behind [`status_visibility::can_view`]
+/// admits a reblog only when its original is admitted too. `None` when the
+/// body named no parent at all, or named the empty string: Pleroma's own
+/// "not a reply" spelling.
+async fn reply_parent(
+    state: &AppState,
+    poster: &User,
+    params: &CreateStatusParams,
+) -> AppResult<Option<status::Status>> {
+    let Some(text) = params
+        .in_reply_to_id
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(id) = parse_id(text) else {
+        return Err(AppError::NotFound);
+    };
+    let Some(row) = status::get_by_id(&state.db, id).await? else {
+        return Err(AppError::NotFound);
+    };
+    if !status_visibility::can_view(&state.db, &row, Some(poster)).await? {
+        return Err(AppError::NotFound);
+    }
+    let Some(original_id) = row.reblog_of_id else {
+        return Ok(Some(row));
+    };
+    let original = status::get_by_id(&state.db, original_id).await?;
+    original.map(Some).ok_or(AppError::NotFound)
+}
+
+/// The accounts the parent itself @-mentions, in mention order: the set
+/// Pleroma's `get_to_and_cc` carries into a reply's addressing, which here
+/// becomes the extra `status_mentions` links the reply stores.
+async fn parent_mentioned_ids(state: &AppState, parent_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let links = mention::for_statuses(&state.db, &[parent_id]).await?;
+    Ok(links.get(&parent_id).map_or_else(Vec::new, |users| {
+        users.iter().map(|account| account.id).collect()
+    }))
+}
+
+/// The accounts a reply auto-mentions off its parent: its author first, then
+/// the accounts the parent mentioned — the replier never (nobody mentions
+/// themselves into their own reply), every account once, at most
+/// [`MAX_INHERITED_MENTIONS`] in all. These are link rows only: the status
+/// text is not modified and no mention span is inserted.
+fn inherited_mentions(parent_author: Uuid, parent_mentions: &[Uuid], replier: Uuid) -> Vec<Uuid> {
+    let mut inherited: Vec<Uuid> = Vec::new();
+    for id in std::iter::once(parent_author).chain(parent_mentions.iter().copied()) {
+        if id != replier && !inherited.contains(&id) {
+            inherited.push(id);
+        }
+    }
+    inherited.truncate(MAX_INHERITED_MENTIONS);
+    inherited
+}
+
+/// The body's own mentions in text order with the auto-mentions appended:
+/// an account the text already mentioned keeps its place and is not linked
+/// a second time.
+fn merged_mentions(own: &[Uuid], inherited: &[Uuid]) -> Vec<Uuid> {
+    let mut merged: Vec<Uuid> = own.to_vec();
+    for &id in inherited {
+        if !merged.contains(&id) {
+            merged.push(id);
+        }
+    }
+    merged
+}
+
+/// The audience a reply lands in, from the parent's visibility, whether the
+/// body *submitted* a `visibility` of its own, and what [`check_body`]
+/// decided (the submitted name, or the author's default scope):
+///
+/// - a `direct` parent forces `direct`, whoever the body asked for;
+/// - under a `private` parent, a submitted `public` or `unlisted` comes down
+///   to `private`; every other submitted scope stands as asked — Pleroma's
+///   own rules keep a submitted `public` under an `unlisted` parent, and
+///   `check_body` has already refused any submitted name outside the five;
+/// - a body that submitted nothing posts to its author's default scope, but
+///   never wider than the parent it answers.
+fn inherited_visibility(parent: Visibility, submitted: bool, chosen: Visibility) -> Visibility {
+    if parent == Visibility::Direct {
+        return Visibility::Direct;
+    }
+    if !submitted {
+        return narrower_visibility(chosen, parent);
+    }
+    if parent == Visibility::Private && matches!(chosen, Visibility::Public | Visibility::Unlisted)
+    {
+        return Visibility::Private;
+    }
+    chosen
+}
+
+/// The narrower of two visibilities, by [`visibility_width`].
+const fn narrower_visibility(chosen: Visibility, cap: Visibility) -> Visibility {
+    if visibility_width(chosen) <= visibility_width(cap) {
+        chosen
+    } else {
+        cap
+    }
+}
+
+/// How wide a visibility's audience is, for the reply cap: `direct` reaches
+/// the fewest eyes and `public` the most. `local` sits between the federated
+/// scopes and `private` — everybody on this instance, nobody off it.
+const fn visibility_width(visibility: Visibility) -> u8 {
+    match visibility {
+        Visibility::Direct => 0,
+        Visibility::Private => 1,
+        Visibility::Local => 2,
+        Visibility::Unlisted => 3,
+        Visibility::Public => 4,
+    }
+}
+
 /// The post-write hook of [`create_status`]: the tickets that let a fresh
 /// local status out of the database it was just written to — the mention
 /// notifications for the mentioned accounts and the replied-to author
@@ -911,9 +1108,12 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // decision parameters have no part in this merge. An edit never
         // moves the expiry either — `expires_in` is a creation parameter,
         // the stored `expires_at` rides along untouched (Pleroma's
-        // `make_update_data` carries it forward the same way).
+        // `make_update_data` carries it forward the same way) — and never
+        // its parent: an edit rewrites what was said in the thread it
+        // stands in, and `in_reply_to_id` is not an edit parameter.
         preview: None,
         expires_in: None,
+        in_reply_to_id: None,
     }
 }
 
@@ -2632,5 +2832,718 @@ mod tests {
                 "`{value}` is no integer and must not deserialize"
             );
         }
+    }
+
+    /// The `status_mentions` links of one stored status, in position order.
+    async fn mention_ids(pool: &PgPool, status_id: Uuid) -> Vec<Uuid> {
+        sqlx::query_as::<_, (Uuid,)>(
+            "SELECT user_id FROM status_mentions WHERE status_id = $1 ORDER BY position",
+        )
+        .bind(status_id)
+        .fetch_all(pool)
+        .await
+        .expect("the mention links read")
+        .into_iter()
+        .map(|link| link.0)
+        .collect()
+    }
+
+    /// The live row behind a status id, for the counters and links a reply
+    /// moved on its parent.
+    async fn parent_row(pool: &PgPool, id: Uuid) -> status::Status {
+        status::get_by_id(pool, id)
+            .await
+            .unwrap()
+            .expect("the parent is stored live")
+    }
+
+    /// A body answering the status `parent_id`, with `text` as its post.
+    fn replying(text: &str, parent_id: Uuid) -> CreateStatusParams {
+        CreateStatusParams {
+            in_reply_to_id: Some(parent_id.to_string()),
+            ..posted(text)
+        }
+    }
+
+    /// The `{"error": …}` body of the shared 404, plus its status code:
+    /// what an unanswerable reply parent owes the client.
+    async fn missed(err: AppError) {
+        let (code, body) = wire(err).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "the parent miss is a 404");
+        assert_eq!(
+            body,
+            json!({ "error": "Record not found" }),
+            "the shared body"
+        );
+    }
+
+    /// A plain stored post written straight through the model — the fixture
+    /// parent a service test replies to.
+    async fn plain_post(pool: &PgPool, author: &User, text: &str) -> status::Status {
+        status::insert(pool, BASE, &NewStatus::local(author, text))
+            .await
+            .expect("the fixture post inserts")
+    }
+
+    // ─────────────────────────  replies (in_reply_to_id)  ─────────────────────────
+
+    /// The parameter arrives as id text or not at all: absent, null and the
+    /// form body's plain string all deserialize into the optional field.
+    #[test]
+    fn the_reply_parameter_deserializes_as_id_text() {
+        let absent = params(json!({"status": "hi"}));
+        assert_eq!(
+            absent.in_reply_to_id, None,
+            "no key is a root post's parameter"
+        );
+        let null = params(json!({"status": "hi", "in_reply_to_id": null}));
+        assert_eq!(null.in_reply_to_id, None, "a null is as absent as no key");
+        let one = params(json!({
+            "status": "hi",
+            "in_reply_to_id": "01934567-89ab-7cde-f012-3456789abcde",
+        }));
+        assert_eq!(
+            one.in_reply_to_id.as_deref(),
+            Some("01934567-89ab-7cde-f012-3456789abcde"),
+            "id text is stored as written"
+        );
+    }
+
+    /// The whole visibility matrix of the reply inheritance rule: a
+    /// `direct` parent forces `direct`; under a `private` parent a
+    /// submitted `public` or `unlisted` comes down while every other
+    /// submitted scope stands; a submitted scope under a wider parent
+    /// stands untouched; and an unsubmitted one is the author's default
+    /// capped at the parent's width, never wider.
+    #[test]
+    fn the_inherited_visibility_matrix_is_exact() {
+        for parent in Visibility::ALL {
+            assert_eq!(
+                inherited_visibility(Visibility::Direct, true, parent),
+                Visibility::Direct,
+                "a direct parent forces direct whatever was asked for"
+            );
+            assert_eq!(
+                inherited_visibility(Visibility::Direct, false, parent),
+                Visibility::Direct,
+                "and whatever the author defaults to"
+            );
+        }
+        for chosen in [Visibility::Public, Visibility::Unlisted] {
+            assert_eq!(
+                inherited_visibility(Visibility::Private, true, chosen),
+                Visibility::Private,
+                "a submitted `{chosen}` under a private parent comes down"
+            );
+        }
+        for (chosen, kept) in [
+            (Visibility::Private, Visibility::Private),
+            (Visibility::Direct, Visibility::Direct),
+            (Visibility::Local, Visibility::Local),
+        ] {
+            assert_eq!(
+                inherited_visibility(Visibility::Private, true, chosen),
+                kept,
+                "every other submitted scope under a private parent stands"
+            );
+        }
+        assert_eq!(
+            inherited_visibility(Visibility::Unlisted, true, Visibility::Public),
+            Visibility::Public,
+            "Pleroma keeps a submitted public under an unlisted parent"
+        );
+        assert_eq!(
+            inherited_visibility(Visibility::Public, true, Visibility::Private),
+            Visibility::Private,
+            "a narrower submitted scope is never widened by a public parent"
+        );
+        assert_eq!(
+            inherited_visibility(Visibility::Local, true, Visibility::Unlisted),
+            Visibility::Unlisted,
+            "a submitted scope under a local parent stands as asked"
+        );
+        // Unsubmitted: the default `chosen` capped at the parent's width.
+        for (parent, chosen, expected) in [
+            (Visibility::Public, Visibility::Local, Visibility::Local),
+            (Visibility::Public, Visibility::Public, Visibility::Public),
+            (Visibility::Public, Visibility::Private, Visibility::Private),
+            (
+                Visibility::Unlisted,
+                Visibility::Public,
+                Visibility::Unlisted,
+            ),
+            (Visibility::Private, Visibility::Public, Visibility::Private),
+            (Visibility::Private, Visibility::Local, Visibility::Private),
+            (Visibility::Local, Visibility::Public, Visibility::Local),
+            (Visibility::Local, Visibility::Private, Visibility::Private),
+            (
+                Visibility::Unlisted,
+                Visibility::Private,
+                Visibility::Private,
+            ),
+        ] {
+            assert_eq!(
+                inherited_visibility(parent, false, chosen),
+                expected,
+                "a default `{chosen}` replying to `{parent}` is capped to \
+                 `{expected}`, never wider than the parent"
+            );
+        }
+    }
+
+    /// The pure half of the auto-mention rule: the parent's author leads,
+    /// duplicates fold to their first place, the replier never appears, and
+    /// the inherited set is capped.
+    #[test]
+    fn inherited_mentions_lead_with_the_author_and_drop_the_rest() {
+        let author = Uuid::now_v7();
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let replier = Uuid::now_v7();
+        assert_eq!(
+            inherited_mentions(author, &[first, second], replier),
+            vec![author, first, second],
+            "the parent's author leads, then its mentions in order"
+        );
+        assert_eq!(
+            inherited_mentions(author, &[author, first, first, second], second),
+            vec![author, first],
+            "duplicates fold to the first place and the replier drops out"
+        );
+        assert_eq!(
+            inherited_mentions(author, &[first, author], author),
+            vec![first],
+            "an author replying to their own post is never auto-mentioned, \
+             even where the parent mentioned them"
+        );
+        let crowd: Vec<Uuid> = (0..25).map(|_| Uuid::now_v7()).collect();
+        let inherited = inherited_mentions(author, &crowd, replier);
+        assert_eq!(
+            inherited.len(),
+            MAX_INHERITED_MENTIONS,
+            "author plus 25 mentions is capped at {MAX_INHERITED_MENTIONS}"
+        );
+        assert_eq!(inherited[0], author, "and the author leads the cap");
+        assert_eq!(
+            &inherited[1..],
+            &crowd[..MAX_INHERITED_MENTIONS - 1],
+            "the first accounts in order win the rest"
+        );
+    }
+
+    /// The body's own mentions lead and keep their places; the inherited
+    /// ones join behind them, each account linked once however both sides
+    /// name it.
+    #[test]
+    fn the_bodies_own_mentions_lead_the_merge() {
+        let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        assert_eq!(merged_mentions(&[b], &[a, b, c]), vec![b, a, c]);
+        assert_eq!(merged_mentions(&[], &[a]), vec![a]);
+        assert_eq!(
+            merged_mentions(&[a, b], &[]),
+            vec![a, b],
+            "no parent add nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_stores_its_parents_fields_counts_and_language() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "replier").await;
+        let bob = user(pool, "bob").await;
+        let parent = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                language: Some("eo".to_owned()),
+                ..posted("the parent")
+            },
+        )
+        .await;
+        let parent_id = Uuid::parse_str(&parent.id).expect("the entity carries its id");
+
+        let answer = created(&app_state, &alice, replying("right back", parent_id)).await;
+        let row = stored(pool, &answer).await;
+
+        assert_eq!(
+            row.in_reply_to_id,
+            Some(parent_id),
+            "the reply names its parent"
+        );
+        assert_eq!(
+            row.in_reply_to_account_id,
+            Some(bob.id),
+            "and the parent's author"
+        );
+        assert_eq!(
+            row.conversation_id, parent_id,
+            "a reply joins the root's own thread"
+        );
+        assert_eq!(
+            row.language.as_deref(),
+            Some("eo"),
+            "an absent language falls back to the parent's tag"
+        );
+        assert_eq!(row.raw_text, "right back", "the text is not modified");
+        assert_eq!(
+            row.content, "<p>right back</p>",
+            "no mention span is inserted into the render"
+        );
+        assert_eq!(
+            mention_ids(pool, row.id).await,
+            vec![bob.id],
+            "the parent's author joins status_mentions alone"
+        );
+
+        let counted = parent_row(pool, parent_id).await;
+        assert_eq!(counted.replies_count, 1, "the parent counts the reply");
+
+        let value = serde_json::to_value(&answer).expect("the entity serializes");
+        assert_eq!(value["in_reply_to_id"], parent_id.to_string());
+        assert_eq!(value["in_reply_to_account_id"], bob.id.to_string());
+        assert_eq!(value["pleroma"]["in_reply_to_account_acct"], "bob");
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "bob",
+                     "url": bob.ap_id, "acct": "bob" }]),
+            "the auto-mention answers in the entity"
+        );
+    }
+
+    /// A submitted language beats the parent's; a parent with no tag
+    /// inherits nothing.
+    #[tokio::test]
+    async fn a_submitted_language_beats_the_parent_s() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "tagged").await;
+        let bob = user(pool, "bob").await;
+        let tagged = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                language: Some("eo".to_owned()),
+                ..posted("saluton")
+            },
+        )
+        .await;
+        let tagged_id = Uuid::parse_str(&tagged.id).expect("an id");
+        let mut body = replying("danke", tagged_id);
+        body.language = Some("de".to_owned());
+        let overridden = created(&app_state, &alice, body).await;
+        assert_eq!(
+            overridden.language.as_deref(),
+            Some("de"),
+            "the submitted tag wins over the parent's"
+        );
+
+        let plain = plain_post(pool, &bob, "no tag here").await;
+        let rootless = created(&app_state, &alice, replying("nor this", plain.id)).await;
+        assert_eq!(
+            rootless.language, None,
+            "a parent with no tag leaves the reply tagless"
+        );
+    }
+
+    /// The parent's mentions ride along after its author, deduplicated
+    /// against the reply's own text mentions — and a self-reply mentions
+    /// nobody.
+    #[tokio::test]
+    async fn a_reply_inherits_the_parent_s_mentions_deduplicated() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "replier").await;
+        let bob = user(pool, "bob").await;
+        let carol = user(pool, "carol").await;
+        let dave = user(pool, "dave").await;
+
+        let parent = created(&app_state, &bob, posted("@carol and @dave, hi")).await;
+        let parent_id = Uuid::parse_str(&parent.id).expect("an id");
+        let answer = created(&app_state, &alice, replying("sure @CAROL", parent_id)).await;
+        let row = stored(pool, &answer).await;
+
+        assert_eq!(
+            mention_ids(pool, row.id).await,
+            vec![carol.id, bob.id, dave.id],
+            "the text's own mention leads, then the parent's author, then \
+             the parent's mentions — with the account both sides name \
+             linked once"
+        );
+
+        let mine = created(&app_state, &alice, posted("my own @dave")).await;
+        let mine_id = Uuid::parse_str(&mine.id).expect("an id");
+        let self_reply = created(&app_state, &alice, replying("to myself", mine_id)).await;
+        let self_row = stored(pool, &self_reply).await;
+        assert_eq!(
+            mention_ids(pool, self_row.id).await,
+            vec![dave.id],
+            "the replier never joins their own auto-mentions, only the \
+             accounts the parent mentioned that are not them"
+        );
+        assert_eq!(
+            self_row.in_reply_to_account_id,
+            Some(alice.id),
+            "while the reply link itself still names the author"
+        );
+    }
+
+    /// Twenty-five accounts on the parent's side is more than the cap: the
+    /// author leads, the first nineteen follow in order, and the tail is
+    /// simply not linked. A crowd member the reply text mentions itself
+    /// stays — the body's own mentions do not count against the cap.
+    #[tokio::test]
+    async fn the_inherited_mentions_are_capped_at_twenty() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "replier").await;
+        let bob = user(pool, "bob").await;
+        let mut crowd: Vec<User> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for n in 1..=25_u32 {
+            let nick = format!("member{n:02}");
+            names.push(format!("@{nick}"));
+            crowd.push(user(pool, &nick).await);
+        }
+        let crowd_ids: Vec<Uuid> = crowd.iter().map(|found| found.id).collect();
+        let parent = created(&app_state, &bob, posted(&names.join(" "))).await;
+        let parent_id = Uuid::parse_str(&parent.id).expect("an id");
+        assert_eq!(
+            mention_ids(pool, parent_id).await,
+            crowd_ids,
+            "the fixture parent really mentions all twenty-five"
+        );
+
+        let last = crowd_ids[24];
+        let answer = created(
+            &app_state,
+            &alice,
+            replying(&format!("noted @{}", crowd[24].nickname), parent_id),
+        )
+        .await;
+        let row = stored(pool, &answer).await;
+
+        let links = mention_ids(pool, row.id).await;
+        let mut expected: Vec<Uuid> = vec![last, bob.id];
+        expected.extend(crowd_ids[..MAX_INHERITED_MENTIONS - 1].iter().copied());
+        assert_eq!(
+            links, expected,
+            "the body's own mention leads, then the capped inheritage — \
+             author first, its nineteen first mentions in order"
+        );
+        for dropped in &crowd_ids[MAX_INHERITED_MENTIONS - 1..24] {
+            assert!(
+                !links.contains(dropped),
+                "the parent's tail past the cap is not linked"
+            );
+        }
+    }
+
+    /// The service-level legs of the visibility inheritance rules the pure
+    /// matrix pins: a submitted `public` coming down under a `private`
+    /// parent, an unsubmitted default capped the same way, a `direct`
+    /// parent forcing `direct`, and a requested `public` standing
+    /// untouched under an `unlisted` parent.
+    #[tokio::test]
+    async fn a_reply_s_audience_follows_its_parent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "wide").await;
+        let bob = user(pool, "bob").await;
+
+        let private_parent = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                visibility: Some("private".to_owned()),
+                ..posted("hush")
+            },
+        )
+        .await;
+        let private_id = Uuid::parse_str(&private_parent.id).expect("an id");
+        let mut requested = replying("reply", private_id);
+        requested.visibility = Some("public".to_owned());
+        let downgraded = created(&app_state, &bob, requested).await;
+        assert_eq!(
+            downgraded.visibility, "private",
+            "a submitted public under a private parent comes down"
+        );
+
+        let unsubmitted = created(&app_state, &bob, replying("reply", private_id)).await;
+        assert_eq!(
+            unsubmitted.visibility, "private",
+            "a public default under a private parent is capped to private"
+        );
+
+        let direct_parent = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                visibility: Some("direct".to_owned()),
+                ..posted("secret")
+            },
+        )
+        .await;
+        let direct_id = Uuid::parse_str(&direct_parent.id).expect("an id");
+        let mut asked_wide = replying("reply", direct_id);
+        asked_wide.visibility = Some("public".to_owned());
+        let forced = created(&app_state, &bob, asked_wide).await;
+        assert_eq!(
+            forced.visibility, "direct",
+            "a direct parent forces direct whatever was asked for"
+        );
+
+        let unlisted_parent = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                visibility: Some("unlisted".to_owned()),
+                ..posted("quiet")
+            },
+        )
+        .await;
+        let unlisted_id = Uuid::parse_str(&unlisted_parent.id).expect("an id");
+        let mut kept_wide = replying("reply", unlisted_id);
+        kept_wide.visibility = Some("public".to_owned());
+        let standing = created(&app_state, &alice, kept_wide).await;
+        assert_eq!(
+            standing.visibility, "public",
+            "an unlisted parent keeps a requested public as requested"
+        );
+    }
+
+    /// A reply to a reblog row answers the boosted original: the ids, the
+    /// thread and the counted reply all land on the original, not on the
+    /// boost row the id named.
+    #[tokio::test]
+    async fn a_reply_to_a_reblog_answers_the_original() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "replier").await;
+        let bob = user(pool, "original-author").await;
+        let carol = user(pool, "booster").await;
+        let original = created(&app_state, &bob, posted("the original")).await;
+        let original_id = Uuid::parse_str(&original.id).expect("an id");
+        let reblog = status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original_id),
+                ..NewStatus::local(&carol, "")
+            },
+        )
+        .await
+        .expect("a reblog row inserts");
+
+        let answer = created(&app_state, &alice, replying("reacting", reblog.id)).await;
+        let row = stored(pool, &answer).await;
+
+        assert_eq!(
+            row.in_reply_to_id,
+            Some(original_id),
+            "the reply targets the reblogged original"
+        );
+        assert_eq!(
+            row.in_reply_to_account_id,
+            Some(bob.id),
+            "and the original's author, not the booster"
+        );
+        assert_eq!(row.conversation_id, original_id, "the original's thread");
+        assert_eq!(
+            mention_ids(pool, row.id).await,
+            vec![bob.id],
+            "the auto-mention names the original's author"
+        );
+
+        let reblog_after = parent_row(pool, reblog.id).await;
+        assert_eq!(
+            reblog_after.replies_count, 0,
+            "the boost row does not count the reply"
+        );
+        let original_after = parent_row(pool, original_id).await;
+        assert_eq!(
+            original_after.replies_count, 1,
+            "the original gains the reply"
+        );
+    }
+
+    /// Everything that cannot answer — malformed text, an id that names no
+    /// row, a tombstone, a post the poster may not see, and a reblog whose
+    /// original went away — is the one shared 404, and none of it writes.
+    /// The empty string, Pleroma's own no-reply spelling, is not among
+    /// them: it posts a root status.
+    #[tokio::test]
+    async fn an_unanswerable_parent_is_the_shared_not_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "stranger").await;
+        let bob = user(pool, "bob").await;
+
+        let gone = plain_post(pool, &bob, "doomed").await;
+        let tombstone = status::soft_delete(pool, gone.id)
+            .await
+            .expect("the delete runs")
+            .expect("the row was live");
+        assert!(tombstone.deleted_at.is_some(), "the parent is a tombstone");
+        let hidden = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                visibility: Some("private".to_owned()),
+                ..posted("not for you")
+            },
+        )
+        .await;
+        let hidden_id = Uuid::parse_str(&hidden.id).expect("an id");
+        let stranded_reblog = status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(gone.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .expect("a reblog of a tombstone's id inserts");
+
+        let misses: Vec<CreateStatusParams> = vec![
+            {
+                let mut body = posted("hi");
+                body.in_reply_to_id = Some("not-an-id".to_owned());
+                body
+            },
+            replying("hi", Uuid::now_v7()),
+            replying("hi", gone.id),
+            replying("hi", hidden_id),
+            replying("hi", stranded_reblog.id),
+        ];
+        let before = live_ids(pool).await;
+        for params in misses {
+            let err = create_status(&app_state, &alice, None, params)
+                .await
+                .expect_err("the parent above cannot be answered");
+            missed(err).await;
+        }
+        assert_eq!(
+            live_ids(pool).await,
+            before,
+            "not one refused reply wrote a row"
+        );
+
+        let root = created(
+            &app_state,
+            &alice,
+            CreateStatusParams {
+                in_reply_to_id: Some("  ".to_owned()),
+                ..posted("a root after all")
+            },
+        )
+        .await;
+        let row = stored(pool, &root).await;
+        assert!(
+            row.in_reply_to_id.is_none() && row.in_reply_to_account_id.is_none(),
+            "a blank parent parameter is no reply at all"
+        );
+        assert_eq!(
+            row.conversation_id, row.id,
+            "and the post is its own thread"
+        );
+        assert_eq!(
+            live_ids(pool).await.len(),
+            before.len() + 1,
+            "and the blank is the only row the whole test wrote"
+        );
+    }
+
+    /// Three levels deep: every answer joins the root's conversation and
+    /// steps the parent it answers, whatever else the thread holds.
+    #[tokio::test]
+    async fn a_thread_shares_one_conversation_across_three_levels() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "first").await;
+        let bob = user(pool, "bob").await;
+        let carol = user(pool, "carol").await;
+
+        let root = created(&app_state, &alice, posted("root")).await;
+        let root_id = Uuid::parse_str(&root.id).expect("an id");
+        let second = created(&app_state, &bob, replying("second", root_id)).await;
+        let second_id = Uuid::parse_str(&second.id).expect("an id");
+        let third = created(&app_state, &carol, replying("third", second_id)).await;
+
+        let second_row = stored(pool, &second).await;
+        let third_row = stored(pool, &third).await;
+        assert_eq!(second_row.conversation_id, root_id, "the first reply");
+        assert_eq!(third_row.conversation_id, root_id, "the second reply");
+
+        let root_row = parent_row(pool, root_id).await;
+        assert_eq!(
+            root_row.replies_count, 1,
+            "the root counts its direct reply"
+        );
+        let second_after = parent_row(pool, second_id).await;
+        assert_eq!(
+            second_after.replies_count, 1,
+            "the middle row counts the one under it"
+        );
+        assert_eq!(
+            third_row.in_reply_to_id,
+            Some(second_id),
+            "and each level answers the row directly above it"
+        );
+    }
+
+    /// The keyed arm shares the create's whole pre-write half, so a reply
+    /// posts under an `Idempotency-Key` exactly as it would without one —
+    /// and a replay restates it without counting the parent twice.
+    #[tokio::test]
+    async fn a_keyed_reply_replies_and_replays() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "keyer").await;
+        let bob = user(pool, "bob").await;
+        let parent = plain_post(pool, &bob, "keyable").await;
+
+        let first =
+            create_status_idempotent(&app_state, &alice, None, replying("keyed", parent.id), "k1")
+                .await
+                .expect("the keyed reply creates");
+        assert_eq!(
+            first.in_reply_to_id,
+            Some(parent.id.to_string()),
+            "the entity answers its parent"
+        );
+        let row = status::get_by_id(pool, Uuid::parse_str(&first.id).expect("an id"))
+            .await
+            .unwrap()
+            .expect("the reply is stored");
+        assert_eq!(row.in_reply_to_account_id, Some(bob.id));
+        assert_eq!(row.conversation_id, parent.conversation_id);
+        assert_eq!(parent_row(pool, parent.id).await.replies_count, 1);
+
+        let again = create_status_idempotent(
+            &app_state,
+            &alice,
+            None,
+            replying("ignored", parent.id),
+            "k1",
+        )
+        .await
+        .expect("the replay answers");
+        assert_eq!(again.id, first.id, "one key, one reply");
+        assert_eq!(
+            parent_row(pool, parent.id).await.replies_count,
+            1,
+            "and the parent counted it once"
+        );
     }
 }
