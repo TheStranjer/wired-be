@@ -30,10 +30,12 @@
 //!    viewer, and likewise keyed to each row's *original's* id: the boost
 //!    lands on the original, so the outer entity of the viewer's own boost
 //!    renders `reblogged: true` together with the original it nests;
-//! 10. the viewer's bookmarks of the page — one [`bookmark::bookmarked_ids`],
+//! 10. the viewer's bookmarks of the page — one [`bookmark::bookmarked_folders`],
 //!     likewise only for an authenticated viewer; every row takes its flag
 //!     from its *own* id, because a bookmark of a reblog lands on the reblog
-//!     row itself;
+//!     row itself. The same map's value is the folder that bookmark is filed
+//!     in, which is what answers `pleroma.bookmark_folder` — so the flag and
+//!     the folder can never disagree;
 //! 11. the viewer's pins among the page — one [`pinned_status::pinned_ids`],
 //!     likewise only for an authenticated viewer, and likewise keyed to
 //!     each row's *own* id: only a post of one's own can be pinned, so a
@@ -62,9 +64,10 @@
 //! already shows: one id list, one keyed map) and threading that map
 //! through the batch context into [`StatusSource`]:
 //!
-//! - `pleroma.bookmark_folder`: the folders ticket, one read keyed by
-//!   bookmark row; `bookmarked` itself is *already* filled by the
-//!   bookmarks ticket (step 10 above).
+//! - `pleroma.bookmark_folder`: *filled by the folders ticket* (step 10
+//!   above); the folders ticket's [`bookmark::bookmarked_folders`] read
+//!   answers it off the same statement that answers `bookmarked`, which is
+//!   already filled by the bookmarks ticket.
 //! - `pinned` and `pleroma.pinned_at`: *filled by the pinning ticket*
 //!   (step 11 above), from the one [`pinned_status::pinned_ids`] read.
 //! - `muted` and `pleroma.thread_muted`: *filled by the thread-mute
@@ -214,12 +217,13 @@ struct Batch<'a> {
     /// on the original, so a reblog row on the page is flagged through its
     /// own [`reblog_of_id`](StatusRow::reblog_of_id).
     reblogs: HashSet<Uuid>,
-    /// The rows on the page the viewer has bookmarked — one
-    /// [`bookmark::bookmarked_ids`] read keyed by every rendered id;
-    /// empty for an anonymous viewer, who has no rows. Unlike
-    /// [`Batch::favourites`], membership is keyed to the row's own id: a
-    /// bookmark of a reblog lands on the reblog row.
-    bookmarks: HashSet<Uuid>,
+    /// The rows on the page the viewer has bookmarked, each with the
+    /// folder that bookmark is filed in — one [`bookmark::bookmarked_folders`]
+    /// read keyed by every rendered id; empty for an anonymous viewer, who
+    /// has no rows. Unlike [`Batch::favourites`], membership is keyed to the
+    /// row's own id: a bookmark of a reblog lands on the reblog row — and so
+    /// does the folder riding on it.
+    bookmarks: HashMap<Uuid, Option<Uuid>>,
     /// The rows on the page the viewer has pinned to their own profile, and
     /// when — one [`pinned_status::pinned_ids`] read keyed by every rendered
     /// id; empty for an anonymous viewer, who has no rows. Keyed to the
@@ -345,9 +349,11 @@ impl<'a> Batch<'a> {
     /// keying — a boost lands on the original, so the outer entity of the
     /// viewer's own boost and the nested original both carry it (Pleroma's
     /// `Announce` arm again). The
-    /// `bookmarked` flag is membership in the bookmarks set keyed to the
+    /// `bookmarked` flag is membership in the bookmarks map keyed to the
     /// row's *own* id for every row: a bookmark of a reblog names the
-    /// reblog row and lives there (see [`crate::models::bookmark`]). The
+    /// reblog row and lives there (see [`crate::models::bookmark`]), and
+    /// `pleroma.bookmark_folder` is that same entry's folder — one read,
+    /// which is why the flag and the folder cannot disagree. The
     /// `pinned` flag and `pleroma.pinned_at` are the pins map read at the
     /// row's *own* id too — only a post of the viewer's own can be pinned,
     /// so one lookup answers both halves and they always agree. The
@@ -359,6 +365,9 @@ impl<'a> Batch<'a> {
         let author = self.users.get(&row.user_id)?;
         let subject_id = row.reblog_of_id.unwrap_or(row.id);
         let pinned_at = self.pins.get(&row.id).copied();
+        // One map lookup answers both halves of the bookmark fact: the
+        // flag is membership in the read, the folder its value.
+        let bookmark = self.bookmarks.get(&row.id);
         let source = StatusSource {
             row,
             author,
@@ -371,7 +380,8 @@ impl<'a> Batch<'a> {
             reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
             favourited: self.favourites.contains(&subject_id),
             reblogged: JsonBool(self.reblogs.contains(&subject_id)),
-            bookmarked: self.bookmarks.contains(&row.id),
+            bookmarked: bookmark.is_some(),
+            bookmark_folder: bookmark.copied().flatten(),
             pinned_at,
             muted: JsonBool(self.thread_mutes.contains(&row.conversation_id)),
             reblog,
@@ -490,19 +500,21 @@ async fn load_reblogs(
     status::reblogged_status_ids(pool, viewer.id, ids).await
 }
 
-/// [`bookmark::bookmarked_ids`]: one query for the viewer's bookmarks
-/// among the page's ids (reblogged originals included, since a render
-/// answers their flags too). An anonymous viewer has no rows to ask
-/// about, and the empty set makes every flag false — no query at all.
+/// [`bookmark::bookmarked_folders`]: one query for the viewer's bookmarks
+/// among the page's ids, each carrying the folder it is filed in (the ids
+/// of reblogged originals ride along, since a render answers their flags too
+/// and one of them may be bookmarked). An anonymous viewer has no rows to
+/// ask about, and the empty map makes every flag false and every folder
+/// `null` — no query at all.
 async fn load_bookmarks(
     pool: &PgPool,
     ids: &[Uuid],
     viewer: Option<&User>,
-) -> AppResult<HashSet<Uuid>> {
+) -> AppResult<HashMap<Uuid, Option<Uuid>>> {
     let Some(viewer) = viewer else {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     };
-    bookmark::bookmarked_ids(pool, viewer.id, ids).await
+    bookmark::bookmarked_folders(pool, viewer.id, ids).await
 }
 
 /// [`pinned_status::pinned_ids`]: one query for the viewer's pins among the
@@ -572,6 +584,7 @@ mod tests {
         http_client::HttpClient,
         mailer::MemoryTransport,
         models::{
+            bookmark_folder,
             emoji_reaction::{self, NewReaction},
             follow,
             media_attachment::NewMediaAttachment,
@@ -842,13 +855,21 @@ mod tests {
         assert!(created.is_some(), "the fixture pair had not favourited yet");
     }
 
-    /// Bookmarks `status_id` as `who`, asserting the write created its
-    /// row — the state the bookmark flag test starts from.
+    /// Bookmarks `status_id` as `who`, unfiled — the state the bookmark
+    /// flag test starts from.
     async fn bookmark_it(pool: &PgPool, who: &User, status_id: Uuid) {
-        let created = bookmark::add(pool, who.id, status_id)
+        let _filed = bookmark::add(pool, who.id, status_id, None)
             .await
             .expect("the fixture bookmark stores");
-        assert!(created.is_some(), "the fixture pair had not bookmarked yet");
+    }
+
+    /// Files a fresh bookmark of `status_id` by `who` in `folder` — the
+    /// state the `pleroma.bookmark_folder` test starts from.
+    async fn bookmark_in(pool: &PgPool, who: &User, status_id: Uuid, folder: Uuid) {
+        let filed = bookmark::add(pool, who.id, status_id, Some(folder))
+            .await
+            .expect("the fixture bookmark files");
+        assert_eq!(filed.folder_id, Some(folder), "the row filed as asked");
     }
 
     /// The reactions ticket's loader inside the fixed query set: one page of
@@ -1139,6 +1160,71 @@ mod tests {
         assert!(
             anonymous.iter().all(|entity| flag(entity) == json!(false)),
             "an anonymous page is nobody's bookmark"
+        );
+    }
+
+    /// The folders ticket's half of the bookmarks read inside the fixed
+    /// query set: one batched statement answers both the `bookmarked` flag
+    /// and `pleroma.bookmark_folder` — a filed bookmark renders its folder
+    /// id, an unfiled one and a foreign viewer render `null`, and, like the
+    /// flag, the folder is keyed to the row's *own* id, so the original
+    /// nested in a boost carries only its own bookmark's folder.
+    #[tokio::test]
+    async fn the_bookmark_folder_rides_the_batched_bookmark_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let folder = bookmark_folder::create(&pool, alice.id, "shelved", None)
+            .await
+            .expect("the fixture folder creates");
+        let filed = post(&pool, &bob, "filed").await;
+        let unfiled = post(&pool, &bob, "unfiled").await;
+        bookmark_in(&pool, &alice, filed.id, folder.id).await;
+        bookmark_it(&pool, &alice, unfiled.id).await;
+
+        let folder_of = |entity: &Status| {
+            serde_json::to_value(entity).expect("a rendered status serializes")["pleroma"]
+                ["bookmark_folder"]
+                .clone()
+        };
+        let page = [filed.clone(), unfiled.clone()];
+        let for_alice = render_statuses(&state, Some(&alice), &page)
+            .await
+            .expect("the page renders for alice");
+        assert_eq!(
+            folder_of(&for_alice[0]),
+            json!(folder.id.to_string()),
+            "the filed bookmark renders its folder id"
+        );
+        assert_eq!(
+            folder_of(&for_alice[1]),
+            Value::Null,
+            "the unfiled bookmark renders null while staying bookmarked"
+        );
+        assert_eq!(
+            serde_json::to_value(&for_alice[1]).expect("it serializes")["bookmarked"],
+            json!(true),
+            "and the flag and the folder come from the one read"
+        );
+
+        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&filed))
+            .await
+            .expect("the post renders for bob");
+        assert_eq!(
+            folder_of(&for_bob[0]),
+            Value::Null,
+            "alice's folder is nobody else's key"
+        );
+        let anonymous = render_statuses(&state, None, &page)
+            .await
+            .expect("the page renders anonymously");
+        assert!(
+            anonymous
+                .iter()
+                .all(|entity| folder_of(entity) == Value::Null),
+            "an anonymous page carries nobody's folder"
         );
     }
 

@@ -282,10 +282,9 @@ mod tests {
 
     /// `who` bookmarks `status_id`.
     async fn marks(pool: &PgPool, who: &User, status_id: Uuid) {
-        let _added = bookmark::add(pool, who.id, status_id)
+        let _added = bookmark::add(pool, who.id, status_id, None)
             .await
-            .expect("the bookmark write")
-            .expect("the bookmark is created");
+            .expect("the bookmark write succeeds");
     }
 
     /// A `follow` notification of `recipient` caused by `actor`, answering

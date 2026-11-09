@@ -168,14 +168,20 @@
 //! both answering the [`Status`] entity as the caller sees it —
 //! `bookmarked` true after the write, false after the withdrawal, since
 //! the row is re-read for the render and the renderer's batched
-//! bookmarks read now names the caller. Both writes ([`bookmark::add`] /
+//! bookmarks read now names the caller. The bookmark write also takes a
+//! `folder_id` (body or query): it must name one of the caller's folders
+//! ([`crate::models::bookmark_folder`]) or the write is the shared 404,
+//! and since [`bookmark::add`] restates the folder on a repeat,
+//! re-bookmarking with a different folder *moves* the bookmark — and one
+//! naming no folder frees it. Both writes ([`bookmark::add`] /
 //! [`bookmark::remove`]) are idempotent on `(account, status)`: a repeat
 //! bookmark is one row and one 200, and withdrawing a bookmark the caller
 //! never made is the unchanged entity with 200. Bookmarking a status the
 //! caller may not see is the shared 404. Unlike a like, a bookmark of a
 //! reblog's id lands on *the reblog row itself* — Pleroma's
 //! `Bookmark.create` takes the activity the client named, and the flag
-//! renders off that same id. And unlike a like, a bookmark federates
+//! renders off that same id, the folder with it
+//! (`pleroma.bookmark_folder`). And unlike a like, a bookmark federates
 //! nothing: it is the account's own private note, Pleroma sends no
 //! activity for it, so these routes have no post-write hook to await.
 //!
@@ -184,9 +190,9 @@
 //! [`PageParams`] again keyed on the bookmark row id (20 by default, 40
 //! at most), and only the statuses still visible to them — the same
 //! [`filter_visible`] step as the favourites listing. The optional
-//! `folder_id` query parameter is accepted and ignored until the folders
-//! ticket files bookmarks; [`bookmark::page_for_user`] already takes the
-//! filter for that wiring.
+//! `folder_id` query parameter narrows the list to that folder's
+//! bookmarks ([`bookmark::page_for_user`]); a folder that names none of
+//! the caller's rows answers the empty page.
 //!
 //! # The pin writes
 //!
@@ -340,9 +346,9 @@ use crate::{
         translation::Translation,
     },
     error::{AppError, AppResult},
-    extract::ApiBody,
+    extract::{ApiBody, ApiParams},
     models::{
-        block, bookmark, conversation_mute,
+        block, bookmark, bookmark_folder, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
         mute, notification,
         pinned_status::{self, PinnedStatus},
@@ -360,6 +366,7 @@ use crate::{
         translate::Translator,
     },
     state::AppState,
+    util::id::parse_id,
 };
 
 /// How many ids one batch lookup acts on: Pleroma's `index` `limit`, with
@@ -441,7 +448,8 @@ const FAVOURITED_BY_MAX_LIMIT: i64 = 80;
 /// The `Link` headers' query parameters carry nothing but the cursor:
 /// none of the favourites and bookmarks listings repeats a filter on
 /// either link (the relationship listings' constant, same rule) — the
-/// bookmarks listing's ignored `folder_id` least of all.
+/// bookmarks listing's `folder_id` is not repeated either, the cursors
+/// alone pick up the walk where the page left it.
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
@@ -1153,6 +1161,26 @@ struct ReblogParams {
     visibility: Option<String>,
 }
 
+/// The body or query of `POST /api/v1/statuses/{id}/bookmark`.
+#[derive(Debug, Deserialize)]
+struct BookmarkParams {
+    /// The folder to file the bookmark in; it must name one of the caller's
+    /// folders or the write is the shared 404 — see [`requested_folder`].
+    /// Absent (or JSON `null`) files the bookmark in no folder, which on a
+    /// repeat frees it from whichever folder held it.
+    #[serde(default)]
+    folder_id: Option<String>,
+}
+
+/// The query of `GET /api/v1/bookmarks`.
+#[derive(Debug, Deserialize)]
+struct BookmarksQuery {
+    /// Narrow the page to one folder's bookmarks; absent (or malformed) asks
+    /// for everything — see [`list_bookmarks`].
+    #[serde(default)]
+    folder_id: Option<String>,
+}
+
 /// The [`Visibility`] `POST …/reblog` boosts at: the body's `visibility`,
 /// or `public` when it names none. Only `public`, `unlisted` and `private`
 /// are boost visibilities — the ticket's trim of Pleroma's
@@ -1210,36 +1238,98 @@ const fn not_rebloggable(original: &StatusRow) -> bool {
 /// `POST /api/v1/statuses/{id}/bookmark` — bookmark the status `id` and
 /// answer it as the caller sees it: `bookmarked` true, because the row is
 /// re-read for the render and the renderer's batched bookmarks read now
-/// names the caller.
+/// names the caller. A `folder_id` (body or query) files the bookmark in
+/// that folder, and `pleroma.bookmark_folder` renders it back.
 ///
 /// The status resolves through [`status_for_viewer_or_404`] — what the
-/// caller may not see is the same 404 as what does not exist. A reblog's
-/// id bookmarks *the reblog row itself* (see the [module docs](self)), and
-/// the write is idempotent, so a repeat bookmark is one row and one 200.
+/// caller may not see is the same 404 as what does not exist; a `folder_id`
+/// that is not the caller's own is the same 404 ([`requested_folder`]). A
+/// reblog's id bookmarks *the reblog row itself* (see the [module docs](self)),
+/// and the write is idempotent on the pair, so a repeat bookmark is one row
+/// and one 200 — its folder restated to whatever the repeat names.
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
 /// and the `write:bookmarks` check; [`AppError::NotFound`] for a
 /// malformed, unknown, deleted or invisible status, for the row a delete
-/// took between the gate and the re-read, and for the one row the render
-/// cannot answer. Any database failure arrives through `?` as
-/// [`AppError::Database`].
+/// took between the gate and the re-read, for the one row the render cannot
+/// answer, and for a `folder_id` that is malformed, unknown or foreign. Any
+/// database failure arrives through `?` as [`AppError::Database`].
 async fn bookmark_status(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(id): Path<String>,
+    ApiParams(params): ApiParams<BookmarkParams>,
 ) -> AppResult<Json<Status>> {
     auth.require(WRITE_BOOKMARKS)?;
     let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
-    if bookmark::add(&state.db, auth.0.id, row.id).await?.is_some() {
-        debug!(
-            status = %row.id,
-            user = %auth.0.id,
-            "status bookmarked"
-        );
-    }
+    // A `folder_id` must name the caller's own folder: an unknown or foreign
+    // id is the same 404 the status gate gives, and nothing is written. No
+    // `folder_id` files the bookmark in no folder — and, since the write is
+    // an upsert on the folder too, re-bookmarking with a different folder
+    // moves it (or, with none, frees it).
+    let folder_id = requested_folder(&state, auth.0.id, params.folder_id.as_deref()).await?;
+    let bookmark = bookmark::add(&state.db, auth.0.id, row.id, folder_id).await?;
+    debug!(
+        status = %row.id,
+        user = %auth.0.id,
+        folder = bookmark.folder_id.is_some(),
+        "status bookmarked"
+    );
     current_entity(&state, &auth.0, row.id).await
+}
+
+/// The folder `GET /api/v1/bookmarks` filters by: absent or empty names no
+/// folder (the whole list, the `folder_id=` spelling clients leave behind),
+/// a well-formed id is the filter whatever it names — an unknown or foreign
+/// folder holds none of the caller's bookmarks, and the narrowed walk
+/// answers the empty page — and a malformed one is the page cursor's own
+/// 400.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] with `"Invalid id"` for a `folder_id` that is
+/// present and not an id.
+fn folder_filter(text: Option<&str>) -> AppResult<Option<Uuid>> {
+    match text {
+        None | Some("") => Ok(None),
+        Some(id) => parse_id(id)
+            .map(Some)
+            .ok_or_else(|| AppError::BadRequest("Invalid id".to_owned())),
+    }
+}
+
+/// The `folder_id` a bookmark write names, resolved to the caller's folder:
+/// absent (or JSON `null`, which the extractor reads as absent) is no
+/// folder; a present id must parse and must be a folder this `user_id`
+/// owns, or the whole write is the shared 404 — Pleroma's
+/// `BookmarkFolder.belongs_to_user?` check demotes a folder it cannot name
+/// to no folder; the ticket sharpens that silence into the 404, so a client
+/// can tell a filed bookmark from one that quietly was not.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] for a malformed, unknown or foreign folder id; any
+/// database failure arrives through `?` as [`AppError::Database`].
+async fn requested_folder(
+    state: &AppState,
+    user_id: Uuid,
+    folder_id: Option<&str>,
+) -> AppResult<Option<Uuid>> {
+    let Some(text) = folder_id else {
+        return Ok(None);
+    };
+    let Some(id) = parse_id(text) else {
+        return Err(AppError::NotFound);
+    };
+    if bookmark_folder::get_owned(&state.db, user_id, id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+    Ok(Some(id))
 }
 
 /// `POST /api/v1/statuses/{id}/unbookmark` — withdraw the caller's
@@ -1281,17 +1371,22 @@ async fn unbookmark_status(
 /// to what their eye still allows: the same [`filter_visible`] step as
 /// [`list_favourites`].
 ///
-/// The `folder_id` query parameter is accepted and ignored until the
-/// folders ticket files bookmarks: the walk asks for `None`, every
-/// bookmark there is. A malformed cursor is still the page extractor's
-/// 400; a malformed `folder_id` is nothing the extractor reads.
+/// The `folder_id` query parameter narrows the walk to one folder
+/// ([`bookmark::page_for_user`]'s filter): the walk asks for `None` when no
+/// folder is named, and for a *present* id it asks for that folder's
+/// bookmarks alone. An id that is well formed but names nothing — unknown,
+/// or another account's folder — matches none of the caller's rows and
+/// answers the empty page; an empty `folder_id=` asks for nothing and is
+/// the same as absent. A malformed folder id is the same 400 a malformed
+/// cursor gets.
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] from [`AuthUser`] without a valid user
 /// token; [`AppError::Forbidden`] when the token does not grant
 /// `read:bookmarks`; [`AppError::BadRequest`] from the page parameters
-/// for a malformed cursor. Any database failure arrives through `?` as
+/// for a malformed cursor or from [`folder_filter`] for a malformed
+/// `folder_id`. Any database failure arrives through `?` as
 /// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
 /// that is not header-safe as [`AppError::Internal`].
 async fn list_bookmarks(
@@ -1299,12 +1394,10 @@ async fn list_bookmarks(
     auth: AuthUser,
     page: PageParams,
     OriginalUri(uri): OriginalUri,
+    ApiParams(query): ApiParams<BookmarksQuery>,
 ) -> AppResult<(HeaderMap, Json<Vec<Status>>)> {
     auth.require(READ_BOOKMARKS)?;
-    // `Some(folder)` narrows the walk to one folder's bookmarks; until the
-    // folders ticket stores folder ids the endpoint hands `None` whatever
-    // the query names, so the parameter is accepted and ignored.
-    let folder_id = None;
+    let folder_id = folder_filter(query.folder_id.as_deref())?;
     let pairs = bookmark::page_for_user(&state.db, auth.0.id, page, folder_id).await?;
     let rows: Vec<StatusRow> = pairs.iter().map(|(_, row)| row.clone()).collect();
     let visible = status_visibility::filter_visible(&state.db, rows, Some(&auth.0)).await?;
