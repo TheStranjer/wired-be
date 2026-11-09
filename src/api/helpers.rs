@@ -4,19 +4,29 @@
 //! Small request-level glue that several endpoints need and that belongs
 //! neither inside one area's module nor in [`crate::util`] (which knows no
 //! HTTP): resolving client-supplied ids to rows with exactly the error the
-//! endpoint owes the client, and reading the `id[]` array a batch endpoint
-//! is keyed on, and more as later tickets need it.
+//! endpoint owes the client, reading the `id[]` array a batch endpoint
+//! is keyed on, answering one [`TimelineQuery`] page as a status listing
+//! ([`timeline_response`], with the `Link` header and the filter-parameter
+//! readers the timeline routes and the account status listing share), and
+//! more as later tickets need it.
 
+use axum::{
+    Json,
+    http::{HeaderMap, Uri},
+};
 use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
+    entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
     models::{
-        status::{self, Status},
+        status::{self, Status, Visibility},
         status_visibility,
         user::{self, User},
     },
+    pagination::{link_header, set_link_header},
+    services::{render_status::render_statuses, timeline::TimelineQuery},
     state::AppState,
     util::id::parse_id,
 };
@@ -150,6 +160,122 @@ pub async fn status_for_viewer_or_404(
     }
 }
 
+/// The pagination keys the `Link` header replaces with its own cursors: the
+/// three id cursors and `offset`, the cursors [`PageParams`] reads
+/// (`limit` is a page size, not a cursor, and stays).
+///
+/// [`PageParams`]: crate::pagination::PageParams
+const CURSOR_KEYS: [&str; 4] = ["max_id", "min_id", "since_id", "offset"];
+
+/// The shared answer of every status-timeline page: one fetched, rendered
+/// and linked [`TimelineQuery`].
+///
+/// [`fetch`](TimelineQuery::fetch) `query`, [`render_statuses`] the rows for
+/// its viewer, and answer the newest-first [`StatusEntity`] array with the
+/// `Link` header this module's own page cursor derives from the request's
+/// `uri` and the fetched rows' ids (Pleroma's `add_link_headers`). An empty
+/// page carries no `Link` header at all.
+///
+/// Every route that reads a [`TimelineQuery`] — the `/api/v1/timelines/*`
+/// endpoints and an account's status listing — builds its query and hands it
+/// here, so the rendering, cursors and headers are stated once. A route with
+/// its own order or its own header rule (the pinned profile page) fetches
+/// and renders through the same two services and simply writes no `Link`.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`], and
+/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`AppError::Internal`].
+///
+/// [`render_statuses`]: crate::services::render_status::render_statuses
+pub async fn timeline_response(
+    state: &AppState,
+    query: &TimelineQuery,
+    uri: &Uri,
+) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
+    let rows = query.fetch(&state.db).await?;
+    let link = page_link(state, uri, &rows);
+    let statuses = render_statuses(state, query.viewer.as_ref(), &rows).await?;
+    let mut headers = HeaderMap::new();
+    set_link_header(&mut headers, link.as_deref())?;
+    Ok((headers, Json(statuses)))
+}
+
+/// The `Link` header value for one fetched page: [`link_header`] over the
+/// first (newest) and last (oldest) row's id — the same
+/// [`add_link_headers`](crate::pagination::link_header) cursors every other
+/// listing here writes — with the request's own parameters repeated per
+/// Pleroma's `build_pagination_fields`, and `None` for an empty page.
+fn page_link(state: &AppState, uri: &Uri, rows: &[Status]) -> Option<String> {
+    let newest = rows.first()?.id.to_string();
+    let oldest = rows.last()?.id.to_string();
+    link_header(
+        &state.config.base_url,
+        uri.path(),
+        &link_query(uri.query()),
+        &newest,
+        &oldest,
+    )
+}
+
+/// The query parameters a page's `Link` targets repeat: the request's own
+/// pairs with the four cursors [`PageParams`] reads ([`CURSOR_KEYS`])
+/// dropped — each link carries its own, and the next page starts where this
+/// one ended. Every other parameter, `limit` included, rides on both links
+/// exactly as it arrived, so a followed link re-asks the same filtered
+/// timeline.
+///
+/// [`PageParams`]: crate::pagination::PageParams
+fn link_query(query: Option<&str>) -> Vec<(String, String)> {
+    form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .filter(|(key, _value)| !CURSOR_KEYS.contains(&key.as_ref()))
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// A request's tag name in the spelling the `hashtags` column stores.
+///
+/// Trimmed, leading `#`s dropped, lowercased (see
+/// `crate::models::hashtag::normalize_name`, from which this differs only
+/// in not capping the length — a name over the storage bound can be no
+/// stored tag, and a timeline answers such a lookup the empty page rather
+/// than an error). `None` when nothing usable is left.
+#[must_use]
+pub fn normalize_tag(raw: &str) -> Option<String> {
+    let stripped = raw.trim().trim_start_matches('#').trim();
+    (!stripped.is_empty()).then(|| stripped.to_lowercase())
+}
+
+/// Appends `raw` to `list` as [`normalize_tag`] spells it; a name that
+/// normalizes to nothing is dropped, Pleroma's `Enum.filter(& &1)` — an
+/// empty `any[]` entry widens the match with nothing.
+pub fn push_tag(list: &mut Vec<String>, raw: &str) {
+    if let Some(tag) = normalize_tag(raw) {
+        list.push(tag);
+    }
+}
+
+/// Appends `raw` to `list` when it spells one of the five stored
+/// visibilities ([`Visibility`]'s `FromStr`, the verbatim lowercase
+/// spellings clients send); anything else is ignored, narrowing nothing.
+pub fn push_visibility(list: &mut Vec<Visibility>, raw: &str) {
+    if let Ok(visibility) = raw.trim().parse::<Visibility>() {
+        list.push(visibility);
+    }
+}
+
+/// Whether a query parameter's text spells a true boolean.
+///
+/// `true` or `1`, trimmed and matched case-insensitively — the same reading
+/// [`crate::api::search`] gives its flags; anything else (absent, empty,
+/// `false`, junk) is `false`.
+#[must_use]
+pub fn is_true(text: &str) -> bool {
+    let text = text.trim();
+    text.eq_ignore_ascii_case("true") || text == "1"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +400,65 @@ mod tests {
             status_parsed(None),
             Vec::<String>::new(),
             "no query at all is the empty list, not an error"
+        );
+    }
+
+    #[test]
+    fn the_link_repeats_the_filters_and_drops_the_cursors() {
+        let extras = link_query(Some(
+            "any[]=a&local=1&limit=2&max_id=old&min_id=new&since_id=s&offset=3",
+        ));
+        assert_eq!(
+            extras,
+            vec![
+                ("any[]".to_owned(), "a".to_owned()),
+                ("local".to_owned(), "1".to_owned()),
+                ("limit".to_owned(), "2".to_owned()),
+            ],
+            "filters and `limit` ride on, the cursors and `offset` do not"
+        );
+        assert!(link_query(None).is_empty(), "no query repeats nothing");
+    }
+
+    #[test]
+    fn normalize_tag_lowercases_strips_hash_and_rejects_nothing_usable() {
+        assert_eq!(normalize_tag("#Foo").as_deref(), Some("foo"));
+        assert_eq!(normalize_tag("##Bar ").as_deref(), Some("bar"));
+        assert_eq!(normalize_tag(" Café ").as_deref(), Some("café"));
+        assert_eq!(normalize_tag("#").as_deref(), None, "a lone `#` is empty");
+        assert_eq!(
+            normalize_tag("  #  ").as_deref(),
+            None,
+            "whitespace is empty"
+        );
+        let mut names = Vec::new();
+        push_tag(&mut names, "#One");
+        push_tag(&mut names, "");
+        push_tag(&mut names, "two");
+        assert_eq!(
+            names,
+            ["one", "two"],
+            "`push_tag` keeps the usable names in order and drops the rest"
+        );
+    }
+
+    #[test]
+    fn the_shared_readers_spell_true_and_a_stored_visibility() {
+        for text in ["true", "1", "TRUE", " true "] {
+            assert!(is_true(text), "`{text}` spells true");
+        }
+        for text in ["", " ", "false", "0", "yes"] {
+            assert!(!is_true(text), "`{text}` is not true here");
+        }
+        let mut kept = Vec::new();
+        push_visibility(&mut kept, " public ");
+        push_visibility(&mut kept, "Public");
+        push_visibility(&mut kept, "direct");
+        push_visibility(&mut kept, "nonsense");
+        assert_eq!(
+            kept,
+            vec![Visibility::Public, Visibility::Direct],
+            "the verbatim spellings count, a capitalization and junk do not"
         );
     }
 }

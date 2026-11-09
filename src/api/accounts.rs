@@ -3,14 +3,15 @@
 //!
 //! `GET /api/v1/accounts/verify_credentials`, `GET /api/v1/accounts/{id}`,
 //! `…/lookup`, `…/relationships` and the relationship listings
-//! `…/{id}/followers` and `…/{id}/following` are the reads;
+//! `…/{id}/followers` and `…/{id}/following`, with the account's status
+//! listing `…/{id}/statuses`, are the reads;
 //! `PATCH /api/v1/accounts/update_credentials`,
 //! `POST /api/v1/accounts/{id}/note`, `…/{id}/remove_from_followers`,
 //! `…/{id}/follow`, `…/{id}/unfollow` and `POST /api/v1/follows` are the
 //! writes.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
-//! `.relationships`, `.followers` and `.following`
+//! `.relationships`, `.followers`, `.following` and `.statuses`
 //! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`)
 //! are the reference.
 //!
@@ -161,6 +162,26 @@
 //! never hide the list — while a locked account's lists stay visible,
 //! pending requests excluded, to any viewer.
 //!
+//! `statuses` is the account's posting history, Pleroma's `.statuses` over
+//! `ActivityPub.fetch_user_activities/3`: the same [`MaybeAuthUser`] gate
+//! with `read:statuses` instead, the same [`PageParams`] page, and the rows
+//! of [`TimelineSource::Account`] read through the shared
+//! [`crate::services::timeline`] builder and rendered by the same helper the
+//! `/api/v1/timelines/*` routes answer with (see
+//! [`timeline_response`]), so the
+//! page is the account's own posts *and its reblogs* — each row still judged
+//! by the viewer's visibility, and the viewer's own exclusions unless
+//! `with_muted`. `pinned`, `only_media`, `exclude_replies`,
+//! `exclude_reblogs`, `tagged` and `exclude_visibilities[]` narrow it as
+//! Pleroma's `statuses_operation` reads them, `pinned` also taking the page
+//! off the pagination keys and dropping the `Link` header with it. A
+//! malformed, unknown or deactivated id is the shared 404; a viewer the
+//! account blocked sees the empty list; and while `RESTRICT_UNAUTHENTICATED`
+//! names the account's profile half (`profiles_local` for a local account,
+//! `profiles_remote` for a mirror) an unauthenticated request is the 403
+//! `{"error":"This API requires an authenticated user"}` — see
+//! [`Config::restricts`].
+//!
 //! `lookup` resolves its `acct` parameter through
 //! [`get_by_acct`](crate::models::user::get_by_acct): a stored nickname,
 //! case-insensitively, with this instance's own domain stripped for local
@@ -310,11 +331,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tracing::{debug, warn};
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
     api::{
-        helpers::{account_or_404, requested_ids},
+        helpers::{
+            account_or_404, is_true, normalize_tag, push_visibility, requested_ids,
+            timeline_response,
+        },
         pleroma_account_settings::looks_like_ap_id,
         pleroma_settings::{check_store_size, shallow_merge},
     },
@@ -323,6 +348,7 @@ use crate::{
     entities::{
         account::{Account, AccountViewer, local_url},
         relationship::{Relationship, RelationshipMap},
+        status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
     extract::{
@@ -339,13 +365,21 @@ use crate::{
         invite_token::{self, InviteToken},
         oauth_app::OauthApp,
         oauth_token::{self, NewToken, OauthToken},
+        pinned_status,
+        status::{Status as StatusRow, Visibility},
         user::{
             self, DEFAULT_ACTOR_TYPE, Flag, PleromaPrefs, ProfileFields, User,
             register::{RegisterParams, create_local_user},
         },
     },
-    oauth::scopes::{FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
+    oauth::scopes::{
+        FOLLOW, READ_ACCOUNTS, READ_FOLLOWS, READ_STATUSES, WRITE_ACCOUNTS, WRITE_FOLLOWS,
+    },
     pagination::{PageParams, link_header, set_link_header},
+    services::{
+        render_status::render_statuses,
+        timeline::{TimelineFilters, TimelineQuery, TimelineSource},
+    },
     state::AppState,
     uploads,
     util::{
@@ -465,6 +499,20 @@ const ACCEPTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif",
 /// scrobbles listing's constant, same rule).
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
+/// The 403 body `GET /api/v1/accounts/{id}/statuses` answers an anonymous
+/// request while the instance keeps the account's profile area restricted
+/// (Pleroma's `EnsureAuthenticatedPlug` wording, the one [`crate::auth`]
+/// renders for an app-only token and [`crate::api::feeds`] for its feeds).
+const USER_REQUIRED: &str = "This API requires an authenticated user";
+
+/// The `RESTRICT_UNAUTHENTICATED` area of this instance's own accounts'
+/// profile reads (Pleroma's `profiles: %{local: …}`).
+const PROFILES_LOCAL: &str = "profiles_local";
+
+/// The [`PROFILES_LOCAL`] twin for a mirrored account of another instance
+/// (Pleroma's `profiles: %{remote: …}`).
+const PROFILES_REMOTE: &str = "profiles_remote";
+
 /// `token_type` of the registration answer: issued tokens are bearer
 /// credentials, as on `/oauth/token` (see [`crate::api::oauth`]).
 const TOKEN_TYPE_BEARER: &str = "Bearer";
@@ -474,7 +522,6 @@ const TOKEN_TYPE_BEARER: &str = "Bearer";
 /// 2.10 `create` action has no such string (closed registrations there route
 /// to invite tokens), so this endpoint's ticket pins this wording.
 const REGISTRATIONS_CLOSED: &str = "Registration is disabled";
-
 /// The 400 body message `POST /api/v1/accounts` answers while
 /// `REGISTRATIONS_OPEN` is false and `INVITES_ENABLED` is true and the
 /// submitted invite `token` is absent, unknown, spent, expired or
@@ -524,6 +571,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/accounts/lookup", get(lookup_account))
         .route("/accounts/{id}/followers", get(list_followers))
         .route("/accounts/{id}/following", get(list_following))
+        .route("/accounts/{id}/statuses", get(list_statuses))
         .route("/accounts/{id}/note", post(set_note))
         .route(
             "/accounts/{id}/follow",
@@ -2402,6 +2450,255 @@ async fn list_following(
     page_response(&state, viewer, &entries, uri.path()).await
 }
 
+/// `GET /api/v1/accounts/{id}/statuses` — one account's posting history as
+/// a page of [`StatusEntity`] rows, newest first: the statuses it authored
+/// and its own reblogs — Pleroma's `statuses` action over
+/// `ActivityPub.fetch_user_activities/3`, which reads `Create` and
+/// `Announce` alike, so `exclude_reblogs` (not Mastodon's default-off
+/// `with_reblogs`) is what takes the boosts out. Auth is optional
+/// ([`MaybeAuthUser`] with `read:statuses` enforced on a presented user
+/// token, Pleroma's scopes plug with `fallback: :proceed_unauthenticated`),
+/// and the page every viewer reaches is judged row by row by
+/// [`push_visibility_clause`]: a stranger (or an anonymous request) sees
+/// `public` and `unlisted`, a follower adds `private`, a mentioned party
+/// adds `direct`, and the account behind the token sees everything of its
+/// own. An account that blocked the viewer answers the empty list — the
+/// visibility clause's rule, not a check of its own — and a malformed,
+/// unknown or deactivated id is the shared 404.
+///
+/// The read is [`TimelineSource::Account`] over the shared
+/// [`crate::services::timeline`] builder, narrowed by the request's filters
+/// ([`StatusesParams`]) and answered by [`timeline_response`], so its
+/// `Link` header repeats the filters and drops the cursors exactly as the
+/// `/api/v1/timelines/*` routes do. `pinned=true` is the one exception: it
+/// ignores the pagination keys, answers the account's whole pinned set in
+/// the order its profile features it (newest pin first) and sends no `Link`
+/// header at all.
+///
+/// While `RESTRICT_UNAUTHENTICATED` names the account's profile area —
+/// `profiles_local` for this instance's own, `profiles_remote` for a mirror
+/// — an unauthenticated request is the 403 [`USER_REQUIRED`]; a presented
+/// user token is never refused for it (see [`require_profile_read`]).
+///
+/// The `Link` header's path is the request's own [`OriginalUri`], not the
+/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// prefix off the latter, and Pleroma links to `conn.request_path`.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] from [`MaybeAuthUser::require_user_scope`] when
+/// the authenticated token lacks `read:statuses`, and from
+/// [`require_profile_read`] for a restricted area behind an anonymous
+/// request; [`AppError::Unauthorized`] from the extractor for an invalid
+/// token; [`AppError::NotFound`] for a malformed, unknown or deactivated
+/// account id; [`AppError::BadRequest`] from [`PageParams`] for a malformed
+/// cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+///
+/// [`push_visibility_clause`]: crate::models::status_visibility::push_visibility_clause
+/// [`set_link_header`]: crate::pagination::set_link_header
+async fn list_statuses(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
+    auth.require_user_scope(READ_STATUSES)?;
+    let target = account_or_404(&state, &id).await?;
+    let viewer = auth.0;
+    require_profile_read(&state.config, viewer.as_ref(), &target)?;
+    let query = StatusesParams::parse(uri.query()).into_timeline(target.id, viewer, page);
+    if query.filters.pinned_only.get() {
+        pinned_response(&state, &query, target.id).await
+    } else {
+        timeline_response(&state, &query, &uri).await
+    }
+}
+
+/// The `RESTRICT_UNAUTHENTICATED` gate of the account's status listing: an
+/// authenticated request always passes — the restriction is about the
+/// anonymous reader, as Pleroma's `visible_for` is — while an anonymous one
+/// is the 403 [`USER_REQUIRED`] when this instance keeps the account's
+/// profile area closed to it (see [`profile_area`] and
+/// [`Config::restricts`]).
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] as described.
+fn require_profile_read(config: &Config, viewer: Option<&User>, target: &User) -> AppResult<()> {
+    if viewer.is_some() || !config.restricts(profile_area(target)) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(USER_REQUIRED.to_owned()))
+}
+
+/// The `RESTRICT_UNAUTHENTICATED` profile half `target` belongs to:
+/// [`PROFILES_LOCAL`] when this instance authored the account,
+/// [`PROFILES_REMOTE`] when it only mirrors it — decision 7's `local` column
+/// is the whole test.
+const fn profile_area(target: &User) -> &'static str {
+    if target.local.get() {
+        PROFILES_LOCAL
+    } else {
+        PROFILES_REMOTE
+    }
+}
+
+/// The non-cursor query parameters of `GET /api/v1/accounts/{id}/statuses`:
+/// Pleroma's `statuses_operation` — the five booleans, the one tag name and
+/// the repeated visibility exclusion — every one a no-op in its [`Default`]
+/// spelling, the cursors and `limit` belonging to [`PageParams`]. The
+/// booleans are [`Flag`]s because that is what this repository models every
+/// boolean with (see [`crate::models::user`]). `only_reblogs`, which
+/// Pleroma's own spec lists beside these, is not a parameter of this
+/// endpoint's ticket and is never read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StatusesParams {
+    /// `pinned`: only the account's pinned statuses, in pin order, off the
+    /// pagination keys.
+    pinned: Flag,
+    /// `only_media`: keep only statuses carrying an attachment.
+    only_media: Flag,
+    /// `exclude_replies`: drop rows that answer another status.
+    exclude_replies: Flag,
+    /// `exclude_reblogs`: drop the account's reblog rows.
+    exclude_reblogs: Flag,
+    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
+    /// `with_muted`, default `false`).
+    with_muted: Flag,
+    /// `tagged`: keep only statuses carrying this tag, in the spelling the
+    /// `hashtags` column stores; see [`tagged_name`] for the value a request
+    /// that names nothing usable gets. `None` when the parameter is absent.
+    tagged: Option<String>,
+    /// `exclude_visibilities[]`: drop rows whose visibility is one of these;
+    /// names that are not one of the five stored spellings are ignored.
+    exclude_visibilities: Vec<Visibility>,
+}
+
+impl StatusesParams {
+    /// Reads the parameters out of a raw query string (what `Uri::query`
+    /// returns, percent-decoding and all), the same reading the timeline
+    /// routes give: booleans through [`is_true`], `exclude_visibilities` in
+    /// both the bracketed and the bare spelling through [`push_visibility`],
+    /// `tagged` through [`tagged_name`]. The last occurrence of a key wins;
+    /// an unrelated key is never looked at.
+    fn parse(query: Option<&str>) -> Self {
+        let mut found = Self::default();
+        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            match key.as_ref() {
+                "pinned" => found.pinned = Flag::new(is_true(&value)),
+                "only_media" => found.only_media = Flag::new(is_true(&value)),
+                "exclude_replies" => found.exclude_replies = Flag::new(is_true(&value)),
+                "exclude_reblogs" => found.exclude_reblogs = Flag::new(is_true(&value)),
+                "with_muted" => found.with_muted = Flag::new(is_true(&value)),
+                "tagged" => found.tagged = Some(tagged_name(&value)),
+                "exclude_visibilities" | "exclude_visibilities[]" => {
+                    push_visibility(&mut found.exclude_visibilities, &value);
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// Assembles the [`TimelineQuery`] the request asks for:
+    /// [`TimelineSource::Account`] of `user_id` as `viewer` (`None` for an
+    /// anonymous read), narrowed by these parameters and paged by `page` —
+    /// except under `pinned`, which reads the whole pinned set on a page of
+    /// its own (see [`every_pin`]).
+    fn into_timeline(self, user_id: Uuid, viewer: Option<User>, page: PageParams) -> TimelineQuery {
+        let pinned = self.pinned;
+        TimelineQuery {
+            viewer,
+            source: TimelineSource::Account { user_id },
+            filters: TimelineFilters {
+                only_media: self.only_media,
+                exclude_replies: self.exclude_replies,
+                exclude_reblogs: self.exclude_reblogs,
+                with_muted: self.with_muted,
+                tagged: self.tagged,
+                exclude_visibilities: self.exclude_visibilities,
+                pinned_only: pinned,
+                ..TimelineFilters::default()
+            },
+            page: if pinned.get() { every_pin() } else { page },
+        }
+    }
+}
+
+/// The `tagged` parameter in the spelling the `hashtags` column stores (see
+/// [`normalize_tag`]). A value that leaves nothing usable — `tagged=`,
+/// `tagged=%23` — becomes the empty name, which no stored tag can carry:
+/// such a request is answered the empty page, not the unfiltered one.
+fn tagged_name(raw: &str) -> String {
+    normalize_tag(raw).unwrap_or_default()
+}
+
+/// The page `pinned` reads: every pin of the account, with no cursor and no
+/// limit. The pagination keys are ignored because the set they would page
+/// through is already bounded by [`max_pinned_statuses`] — the whole
+/// profile's featured list is one page (see
+/// [`list_for_user`](crate::models::pinned_status::list_for_user), the
+/// model read this mirrors).
+///
+/// [`max_pinned_statuses`]: Config::max_pinned_statuses
+const fn every_pin() -> PageParams {
+    PageParams {
+        max_id: None,
+        min_id: None,
+        since_id: None,
+        limit: i64::MAX,
+        offset: None,
+    }
+}
+
+/// The `pinned` answer: the account's pins in the order its profile
+/// features them — newest pin first, no `Link` header, because there is no
+/// older page of a list that never pages (Pleroma's `pinned` branch adds
+/// its restriction to the same fetch, so the request's other filters still
+/// apply).
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn pinned_response(
+    state: &AppState,
+    query: &TimelineQuery,
+    user_id: Uuid,
+) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
+    let rows = query.fetch(&state.db).await?;
+    let rows = ordered_by_pin(state, user_id, rows).await?;
+    let statuses = render_statuses(state, query.viewer.as_ref(), &rows).await?;
+    Ok((HeaderMap::new(), Json(statuses)))
+}
+
+/// `rows` in the account's pin order:
+/// [`pinned_ids`](crate::models::pinned_status::pinned_ids) reads each row's
+/// pin time and the sort applies the order
+/// [`crate::models::pinned_status`]'s `LIST_SQL` states — newest pin first,
+/// the status id breaking a same-instant tie. A row with no pin (the query
+/// cannot answer one, but the comparator does not assume it) sorts by that
+/// same id order, so the sort stays total.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn ordered_by_pin(
+    state: &AppState,
+    user_id: Uuid,
+    mut rows: Vec<StatusRow>,
+) -> AppResult<Vec<StatusRow>> {
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let pins = pinned_status::pinned_ids(&state.db, user_id, &ids).await?;
+    rows.sort_by(|a, b| match (pins.get(&a.id), pins.get(&b.id)) {
+        (Some(a_at), Some(b_at)) if a_at != b_at => b_at.cmp(a_at),
+        _ => b.id.cmp(&a.id),
+    });
+    Ok(rows)
+}
+
 /// Renders `found` for `viewer` (who may be `None`), preloading the
 /// viewer's relationship to the account when there is one to embed: a
 /// viewer who is not the account itself, answered by a single-target
@@ -3401,5 +3698,268 @@ mod tests {
         let absent: FollowByUriParams =
             serde_json::from_str(r#"{"uri": null}"#).expect("a null parses");
         assert_eq!(absent.uri, None, "and a JSON null is the absent one");
+    }
+    /// The parsed status-listing parameters, from a raw query string.
+    fn statuses_parsed(query: &str) -> StatusesParams {
+        StatusesParams::parse(Some(query))
+    }
+
+    /// A page cursor of `n`, the request's half of [`PageParams`] the
+    /// listing hands its query.
+    fn page_of(limit: i64) -> PageParams {
+        PageParams {
+            max_id: Some(Uuid::now_v7()),
+            min_id: None,
+            since_id: None,
+            limit,
+            offset: None,
+        }
+    }
+
+    /// The local and the remote account the area and gate tests read.
+    async fn local_and_remote() -> (crate::test_db::TestDb, User, User) {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let local = user::insert(
+            db.pool(),
+            &user::NewUser::local(
+                "alice",
+                &user::local_ap_id(crate::config::TEST_BASE_URL, "alice"),
+            ),
+        )
+        .await
+        .expect("the local fixture inserts");
+        let remote = user::insert(
+            db.pool(),
+            &user::NewUser {
+                nickname: "bob@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/bob".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+        (db, local, remote)
+    }
+
+    /// The config restricting exactly the areas in `areas`.
+    fn config_restricting(areas: &[&str]) -> Config {
+        let mut config = Config::for_tests();
+        config.restrict_unauthenticated = areas.iter().map(|area| (*area).to_owned()).collect();
+        config
+    }
+
+    #[test]
+    fn the_status_params_read_their_flags_and_ignore_the_rest() {
+        let on = statuses_parsed(
+            "pinned=true&only_media=1&exclude_replies=TRUE&exclude_reblogs=yes\
+             &with_muted=true&limit=5&max_id=abc&since_id=def",
+        );
+        assert!(on.pinned.get(), "`pinned=true`");
+        assert!(on.only_media.get(), "`only_media=1`");
+        assert!(
+            on.exclude_replies.get(),
+            "`exclude_replies` is case-insensitive"
+        );
+        assert!(!on.exclude_reblogs.get(), "`yes` is not true here");
+        assert!(on.with_muted.get(), "`with_muted=true`");
+        assert_eq!(on.tagged, None, "no `tagged` names no tag");
+        assert_eq!(
+            on.exclude_visibilities,
+            Vec::new(),
+            "the page keys are `PageParams`' and were not looked at"
+        );
+        assert_eq!(
+            statuses_parsed(""),
+            StatusesParams::default(),
+            "an empty query narrows nothing"
+        );
+        let off = statuses_parsed("pinned=false&only_media=&with_muted=0");
+        assert!(
+            !off.pinned.get() && !off.only_media.get() && !off.with_muted.get(),
+            "`false`, empty and `0` are all off"
+        );
+        let last = statuses_parsed("pinned=true&pinned=false");
+        assert!(!last.pinned.get(), "the last occurrence wins");
+    }
+
+    #[test]
+    fn the_status_params_read_the_tag_and_the_visibility_exclusions() {
+        assert_eq!(
+            statuses_parsed("tagged=%23Rust").tagged.as_deref(),
+            Some("rust"),
+            "`#` is stripped and the name lowercased"
+        );
+        assert_eq!(
+            statuses_parsed("tagged=").tagged.as_deref(),
+            Some(""),
+            "an empty `tagged` names no stored tag, so it matches nothing"
+        );
+        assert_eq!(
+            statuses_parsed("tagged=%23").tagged.as_deref(),
+            Some(""),
+            "and so does a lone `#`"
+        );
+        let excluded = statuses_parsed(
+            "exclude_visibilities[]=public&exclude_visibilities=Private&exclude_visibilities[]=direct",
+        );
+        assert_eq!(
+            excluded.exclude_visibilities,
+            vec![Visibility::Public, Visibility::Direct],
+            "both spellings fill the one list and a capitalization names nothing"
+        );
+    }
+
+    /// The query a plain request builds: the account's own timeline with the
+    /// request's filters and the request's page.
+    #[tokio::test]
+    async fn the_status_query_is_the_accounts_own_timeline() {
+        let (_db, alice, _bob) = local_and_remote().await;
+        let alice_id = alice.id;
+        let page = page_of(7);
+        let query =
+            statuses_parsed("only_media=true&exclude_reblogs=1&tagged=rust&with_muted=true")
+                .into_timeline(alice_id, Some(alice), page);
+        assert_eq!(
+            query.source,
+            TimelineSource::Account { user_id: alice_id },
+            "the read is the account's own timeline"
+        );
+        assert_eq!(query.page, page, "the request's page is threaded through");
+        assert_eq!(
+            query.filters.only_media,
+            Flag::new(true),
+            "`only_media` rides from the query string"
+        );
+        assert_eq!(
+            query.filters.exclude_reblogs,
+            Flag::new(true),
+            "so does `exclude_reblogs`, which is what takes the boosts out"
+        );
+        assert_eq!(
+            query.filters.with_muted,
+            Flag::new(true),
+            "and the viewer's own exclusions can be lifted"
+        );
+        assert_eq!(
+            query.filters.tagged.as_deref(),
+            Some("rust"),
+            "and the `tagged` name narrows to that tag"
+        );
+        assert!(
+            !query.filters.pinned_only.get() && !query.filters.exclude_replies.get(),
+            "what the request never asked for stays off"
+        );
+        assert!(
+            query
+                .viewer
+                .as_ref()
+                .is_some_and(|viewer| viewer.id == alice_id),
+            "the query owns the authenticated viewer"
+        );
+    }
+
+    /// `pinned` pages the whole featured set instead of the request's page:
+    /// the pagination keys are ignored, and the pin filter is what the
+    /// fetch runs on.
+    #[tokio::test]
+    async fn the_pinned_query_reads_every_pin_off_the_request_page() {
+        let (_db, alice, _bob) = local_and_remote().await;
+        let page = page_of(2);
+        let query = statuses_parsed("pinned=1&only_media=true").into_timeline(alice.id, None, page);
+        assert!(
+            query.filters.pinned_only.get(),
+            "`pinned` is the author's-pin filter"
+        );
+        assert_eq!(
+            query.filters.only_media,
+            Flag::new(true),
+            "the other filters still apply"
+        );
+        assert!(query.viewer.is_none(), "an anonymous request has no viewer");
+        assert_eq!(
+            query.page,
+            every_pin(),
+            "the request's cursors and limit are ignored"
+        );
+        assert_eq!(
+            (query.page.limit, query.page.max_id, query.page.offset),
+            (i64::MAX, None, None),
+            "that page is the whole set, uncursored"
+        );
+    }
+
+    #[test]
+    fn every_pin_is_the_uncursored_whole_set() {
+        let page = every_pin();
+        assert_eq!(page.limit, i64::MAX, "no page of the featured list");
+        assert_eq!(
+            (page.max_id, page.min_id, page.since_id, page.offset),
+            (None, None, None, None),
+            "and no cursor either"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_profile_area_follows_the_local_column() {
+        let (_db, alice, bob) = local_and_remote().await;
+        assert_eq!(profile_area(&alice), PROFILES_LOCAL, "a local account");
+        assert_eq!(
+            profile_area(&bob),
+            PROFILES_REMOTE,
+            "a mirror is the other half"
+        );
+    }
+
+    /// The `RESTRICT_UNAUTHENTICATED` gate: only an anonymous request to a
+    /// restricted half is refused, and the two halves are independent.
+    #[tokio::test]
+    async fn restricted_areas_refuse_anonymous_reads_of_their_own_half() {
+        let (_db, alice, bob) = local_and_remote().await;
+        let open = Config::for_tests();
+        assert!(
+            require_profile_read(&open, None, &alice).is_ok(),
+            "a public instance answers the anonymous request"
+        );
+        let locals = config_restricting(&[PROFILES_LOCAL]);
+        let refused =
+            require_profile_read(&locals, None, &alice).expect_err("a closed local profile");
+        assert_eq!(
+            refused.to_string(),
+            USER_REQUIRED,
+            "the refusal is Pleroma's authenticated-user wording"
+        );
+        assert!(
+            require_profile_read(&locals, None, &bob).is_ok(),
+            "`profiles_local` says nothing about a mirror"
+        );
+        let remotes = config_restricting(&[PROFILES_REMOTE]);
+        assert!(
+            require_profile_read(&remotes, None, &bob).is_err(),
+            "the other half closes on its own name"
+        );
+        assert!(
+            require_profile_read(&remotes, Some(&alice), &bob).is_ok(),
+            "a presented user token is never refused for the restriction"
+        );
+        assert!(
+            require_profile_read(&locals, Some(&bob), &alice).is_ok(),
+            "whatever account it belongs to"
+        );
+    }
+
+    #[test]
+    fn tagged_names_are_stored_spellings_or_nothing_at_all() {
+        assert_eq!(
+            tagged_name("#Rust"),
+            "rust",
+            "the written spelling normalizes"
+        );
+        assert_eq!(tagged_name(""), "", "an empty value names no tag");
+        assert_eq!(
+            tagged_name(" ## "),
+            "",
+            "and so does whitespace around a `#`"
+        );
     }
 }

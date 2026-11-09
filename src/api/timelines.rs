@@ -1,7 +1,7 @@
 //! The `/api/v1/timelines/*` status timelines, each one the
 //! [`TimelineQuery`] of [`crate::services::timeline`] rendered as a page.
 //!
-//! The endpoints share one helper, `timeline_response`, which fetches,
+//! The endpoints share one helper, [`timeline_response`], which fetches,
 //! renders and links the page; the routes differ only in what they ask the
 //! builder for.
 //!
@@ -58,32 +58,30 @@
 //! Reference: `lib/pleroma/web/mastodon_api/controllers/timeline_controller.ex`
 //! (`hashtag/2`, `hashtag_fetching/3`, `direct/2`, `list/2` and `home/2`);
 //! the ticket body is authoritative. The later public route joins this
-//! module and reuses `timeline_response`.
+//! module and reuses [`timeline_response`].
 
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
-    http::{HeaderMap, Uri},
+    http::HeaderMap,
     routing::get,
 };
 use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
+    api::helpers::{is_true, normalize_tag, push_tag, push_visibility, timeline_response},
     auth::{AuthUser, MaybeAuthUser},
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
     models::{
         list,
-        status::{Status as StatusRow, Visibility},
+        status::Visibility,
         user::{Flag, User},
     },
     oauth::scopes::{READ_LISTS, READ_STATUSES},
-    pagination::{PageParams, link_header, set_link_header},
-    services::{
-        render_status::render_statuses,
-        timeline::{ReplyVisibility, TimelineFilters, TimelineQuery, TimelineSource},
-    },
+    pagination::PageParams,
+    services::timeline::{ReplyVisibility, TimelineFilters, TimelineQuery, TimelineSource},
     state::AppState,
     util::id::parse_id,
 };
@@ -105,7 +103,7 @@ pub fn router() -> Router<AppState> {
 /// and an invalid token is the extractor's 401.
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
-/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// `Uri` the router hands a nested handler: axum strips the `/api/v1`
 /// prefix off the latter, and Pleroma links to `conn.request_path`.
 ///
 /// # Errors
@@ -114,7 +112,7 @@ pub fn router() -> Router<AppState> {
 /// the presented user token lacks `read:statuses`; [`AppError::NotFound`]
 /// for a path tag that normalizes to nothing; [`AppError::BadRequest`] from
 /// [`PageParams`] for a malformed cursor. Any database failure arrives
-/// through `?` as [`AppError::Database`], and [`set_link_header`] reports a
+/// through `?` as [`AppError::Database`], and [`set_link_header`](crate::pagination::set_link_header) reports a
 /// `Link` value that is not header-safe as [`AppError::Internal`].
 async fn tag_timeline(
     State(state): State<AppState>,
@@ -161,7 +159,7 @@ struct TagParams {
 
 impl TagParams {
     /// Reads the parameters out of a raw query string (what
-    /// [`Uri::query`] returns, percent-decoding and all). Every array key
+    /// `Uri::query` returns, percent-decoding and all). Every array key
     /// is read in both the bracketed spelling Mastodon clients send and the
     /// bare one Pleroma's `Plug` accepts (`any` and `any[]` fill the same
     /// list, in occurrence order); a value that normalizes to nothing is
@@ -224,7 +222,7 @@ impl TagParams {
 /// ([`AuthUser::require`]).
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
-/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// `Uri` the router hands a nested handler: axum strips the `/api/v1`
 /// prefix off the latter, and Pleroma links to `conn.request_path`.
 ///
 /// # Errors
@@ -232,7 +230,7 @@ impl TagParams {
 /// [`AppError::Forbidden`] from [`AuthUser::require`] when the token lacks
 /// `read:statuses`; [`AppError::BadRequest`] from [`PageParams`] for a
 /// malformed cursor. Any database failure arrives through `?` as
-/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// [`AppError::Database`], and [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value
 /// that is not header-safe as [`AppError::Internal`].
 async fn direct_timeline(
     State(state): State<AppState>,
@@ -257,7 +255,7 @@ struct DirectParams {
 }
 
 impl DirectParams {
-    /// Reads the parameters out of a raw query string (what [`Uri::query`]
+    /// Reads the parameters out of a raw query string (what `Uri::query`
     /// returns, percent-decoding and all); the cursors and `limit` are
     /// [`PageParams`]'s to read and every other key is never looked at.
     fn parse(query: Option<&str>) -> Self {
@@ -299,7 +297,7 @@ impl DirectParams {
 /// unlike the other timelines, asks the list scope, not `read:statuses`.
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
-/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// `Uri` the router hands a nested handler: axum strips the `/api/v1`
 /// prefix off the latter, and Pleroma links to `conn.request_path`.
 ///
 /// # Errors
@@ -310,7 +308,7 @@ impl DirectParams {
 /// answering a foreign `fetch_activities` list with its generic 404);
 /// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor.
 /// Any database failure arrives through `?` as [`AppError::Database`], and
-/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value that is not header-safe as
 /// [`AppError::Internal`].
 async fn list_timeline(
     State(state): State<AppState>,
@@ -357,7 +355,7 @@ struct ListParams {
 }
 
 impl ListParams {
-    /// Reads the parameters out of a raw query string (what [`Uri::query`]
+    /// Reads the parameters out of a raw query string (what `Uri::query`
     /// returns, percent-decoding and all); the cursors and `limit` are
     /// [`PageParams`]'s to read and every other key is never looked at.
     fn parse(query: Option<&str>) -> Self {
@@ -406,7 +404,7 @@ const REPLY_VISIBILITY_INVALID: &str =
 /// must grant `read:statuses` ([`AuthUser::require`]).
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
-/// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
+/// `Uri` the router hands a nested handler: axum strips the `/api/v1`
 /// prefix off the latter, and Pleroma links to `conn.request_path`.
 ///
 /// # Errors
@@ -416,7 +414,7 @@ const REPLY_VISIBILITY_INVALID: &str =
 /// for a `reply_visibility` outside `following` and `self`;
 /// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor.
 /// Any database failure arrives through `?` as [`AppError::Database`], and
-/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value that is not header-safe as
 /// [`AppError::Internal`].
 async fn home_timeline(
     State(state): State<AppState>,
@@ -457,7 +455,7 @@ struct HomeParams {
 }
 
 impl HomeParams {
-    /// Reads the parameters out of a raw query string (what [`Uri::query`]
+    /// Reads the parameters out of a raw query string (what `Uri::query`
     /// returns, percent-decoding and all), reading the shared toggles as
     /// [`TagParams::parse`] does — `exclude_visibilities` in both the
     /// bracketed and the bare spelling — and mapping `reply_visibility`
@@ -527,103 +525,6 @@ fn parse_reply_visibility(text: &str) -> AppResult<ReplyVisibility> {
     }
 }
 
-/// The shared response shape of every `/api/v1/timelines/*` endpoint:
-/// [`fetch`](TimelineQuery::fetch) `query`, [`render_statuses`] the page for
-/// its viewer, and answer the newest-first [`StatusEntity`] array with the
-/// `Link` header [`page_link`] derives from the request's own `uri` and the
-/// fetched rows' ids (Pleroma's `add_link_headers`). An empty page carries
-/// no `Link` header at all.
-///
-/// The tag, direct, list and home routes and the public route the later
-/// ticket adds build their [`TimelineQuery`] the same way [`tag_timeline`]
-/// does and hand it here; the rendering, cursors and headers never get
-/// restated.
-async fn timeline_response(
-    state: &AppState,
-    query: &TimelineQuery,
-    uri: &Uri,
-) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
-    let rows = query.fetch(&state.db).await?;
-    let link = page_link(state, uri, &rows);
-    let statuses = render_statuses(state, query.viewer.as_ref(), &rows).await?;
-    let mut headers = HeaderMap::new();
-    set_link_header(&mut headers, link.as_deref())?;
-    Ok((headers, Json(statuses)))
-}
-
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — the same
-/// [`add_link_headers`](crate::pagination::link_header) cursors every other
-/// listing here writes — with the request's own parameters repeated per
-/// Pleroma's `build_pagination_fields`, and `None` for an empty page.
-fn page_link(state: &AppState, uri: &Uri, rows: &[StatusRow]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(
-        &state.config.base_url,
-        uri.path(),
-        &link_query(uri.query()),
-        &newest,
-        &oldest,
-    )
-}
-
-/// The query parameters a page's `Link` targets repeat: the request's own
-/// pairs with the four cursors [`PageParams`] reads ([`CURSOR_KEYS`])
-/// dropped — each link carries its own, and the next page starts where this
-/// one ended. Every other parameter, `limit` included, rides on both links
-/// exactly as it arrived, so a followed link re-asks the same filtered
-/// timeline.
-fn link_query(query: Option<&str>) -> Vec<(String, String)> {
-    form_urlencoded::parse(query.unwrap_or_default().as_bytes())
-        .filter(|(key, _value)| !CURSOR_KEYS.contains(&key.as_ref()))
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect()
-}
-
-/// The pagination keys the `Link` header replaces with its own cursors: the
-/// three id cursors and `offset`, the cursors [`PageParams`] reads
-/// (`limit` is a page size, not a cursor, and stays).
-const CURSOR_KEYS: [&str; 4] = ["max_id", "min_id", "since_id", "offset"];
-
-/// A tag name as the request writes it, in the spelling the `hashtags`
-/// column stores: trimmed, leading `#`s dropped, lowercased (see
-/// [`crate::models::hashtag::normalize_name`], from which this differs only
-/// in not capping the length — a name over the storage bound can be no
-/// stored tag, and the timeline answers such a lookup the empty page rather
-/// than an error). `None` when nothing usable is left: the endpoint's 404.
-fn normalize_tag(raw: &str) -> Option<String> {
-    let stripped = raw.trim().trim_start_matches('#').trim();
-    (!stripped.is_empty()).then(|| stripped.to_lowercase())
-}
-
-/// Appends `raw` to `list` as [`normalize_tag`] spells it; a name that
-/// normalizes to nothing is dropped, Pleroma's `Enum.filter(& &1)` — an
-/// empty `any[]` entry widens the match with nothing.
-fn push_tag(list: &mut Vec<String>, raw: &str) {
-    if let Some(tag) = normalize_tag(raw) {
-        list.push(tag);
-    }
-}
-
-/// Appends `raw` to `list` when it spells one of the five stored
-/// visibilities ([`Visibility`]'s `FromStr`, the verbatim lowercase
-/// spellings clients send); anything else is ignored, narrowing nothing.
-fn push_visibility(list: &mut Vec<Visibility>, raw: &str) {
-    if let Ok(visibility) = raw.trim().parse::<Visibility>() {
-        list.push(visibility);
-    }
-}
-
-/// Whether a query parameter's text spells a true boolean: `true` or `1`,
-/// trimmed and matched case-insensitively — the same reading
-/// [`crate::api::search`] gives its flags; anything else (absent, empty,
-/// `false`, junk) is `false`.
-fn is_true(text: &str) -> bool {
-    let text = text.trim();
-    text.eq_ignore_ascii_case("true") || text == "1"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,19 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tag_lowercases_strips_hash_and_rejects_nothing_usable() {
-        assert_eq!(normalize_tag("#Foo").as_deref(), Some("foo"));
-        assert_eq!(normalize_tag("##Bar ").as_deref(), Some("bar"));
-        assert_eq!(normalize_tag(" Café ").as_deref(), Some("café"));
-        assert_eq!(normalize_tag("#").as_deref(), None, "a lone `#` is empty");
-        assert_eq!(
-            normalize_tag("  #  ").as_deref(),
-            None,
-            "whitespace is empty"
-        );
-    }
-
-    #[test]
     fn the_path_tag_leads_the_any_list() {
         let query = parsed("any[]=bar").into_timeline(
             "foo".to_owned(),
@@ -718,23 +606,6 @@ mod tests {
         assert_eq!(names, ["foo", "bar"], "the path tag rides with `any[]`");
         assert!(all.is_empty() && none.is_empty(), "nothing else was asked");
         assert!(query.viewer.is_none(), "an anonymous query has no viewer");
-    }
-
-    #[test]
-    fn the_link_repeats_the_filters_and_drops_the_cursors() {
-        let extras = link_query(Some(
-            "any[]=a&local=1&limit=2&max_id=old&min_id=new&since_id=s&offset=3",
-        ));
-        assert_eq!(
-            extras,
-            vec![
-                ("any[]".to_owned(), "a".to_owned()),
-                ("local".to_owned(), "1".to_owned()),
-                ("limit".to_owned(), "2".to_owned()),
-            ],
-            "filters and `limit` ride on, the cursors and `offset` do not"
-        );
-        assert!(link_query(None).is_empty(), "no query repeats nothing");
     }
 
     #[test]

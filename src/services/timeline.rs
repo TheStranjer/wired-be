@@ -11,7 +11,8 @@
 //! - what the request narrows them by: [`TimelineFilters`] (the Pleroma
 //!   timeline parameters: `local_only`, `remote_only`, `only_media`,
 //!   `with_muted`, `visibility` exclusions, `reply_visibility`,
-//!   `exclude_replies`, `exclude_reblogs`, `instance`, `pinned_only`);
+//!   `exclude_replies`, `exclude_reblogs`, `instance`, `pinned_only`,
+//!   `tagged`);
 //! - what the viewer asked to never see again: the viewer's blocks,
 //!   unexpired mutes, domain blocks and thread mutes — always applied unless
 //!   `with_muted` is set;
@@ -229,6 +230,14 @@ pub struct TimelineFilters {
     /// Keep only statuses their own author pinned (see
     /// [`crate::models::pinned_status`]).
     pub pinned_only: Flag,
+    /// Keep only statuses carrying this tag, by stored name (lowercase and
+    /// without the leading `#`, see [`crate::models::hashtag`]) — the
+    /// account timeline's `tagged` parameter, Pleroma's `statuses` action
+    /// reading it as `tag`. `None` filters nothing; a name no row of
+    /// `hashtags` carries answers the empty page. Unlike
+    /// [`TimelineSource::Hashtag`] this narrows whatever the source already
+    /// selected and never adds a visibility of its own.
+    pub tagged: Option<String>,
 }
 
 impl TimelineFilters {
@@ -275,6 +284,14 @@ impl TimelineFilters {
                 " AND EXISTS (SELECT 1 FROM pinned_statuses ps \
                    WHERE ps.status_id = s.id AND ps.user_id = s.user_id)",
             );
+        }
+        if let Some(tag) = &self.tagged {
+            let _tagged: &mut _ = builder
+                .push(" AND EXISTS (")
+                .push(TAG_JOIN_SQL)
+                .push(" AND h.name = ")
+                .push_bind(tag.clone())
+                .push(")");
         }
         if let Some(reply_visibility) = self.reply_visibility {
             push_reply_visibility(builder, reply_visibility, viewer);
@@ -1797,6 +1814,69 @@ mod tests {
             combined,
             newest_first(&[&both]),
             "the two compose with AND: a pinned post with media answers both filters"
+        );
+    }
+
+    /// `tagged` narrows whatever rows the source selected to those carrying
+    /// one stored tag name and adds no visibility of its own (unlike
+    /// [`TimelineSource::Hashtag`], which is `public` only): a follower
+    /// still reaches the author's `private` post, an anonymous request does
+    /// not, and a name no row carries answers the empty page.
+    #[tokio::test]
+    async fn tagged_narrows_the_source_without_adding_visibility() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let alice_follow = follow::follow(&pool, BASE, &alice, &bob)
+            .await
+            .expect("alice follows open bob");
+        assert_eq!(
+            alice_follow.state,
+            follow::FollowState::Accepted,
+            "bob is unlocked, so the follow is granted"
+        );
+        let bob_id = bob.id;
+        let account = move || TimelineSource::Account { user_id: bob_id };
+        let rust_public = post(&pool, &bob, Visibility::Public, "public #Rust").await;
+        let rust_private = post(&pool, &bob, Visibility::Private, "private #rust").await;
+        let untagged = post(&pool, &bob, Visibility::Public, "no tag at all").await;
+        let other_tag = post(&pool, &bob, Visibility::Public, "public #elixir").await;
+        let tagged = |name: &str| TimelineFilters {
+            tagged: Some(name.to_owned()),
+            ..TimelineFilters::default()
+        };
+
+        let for_alice = page_ids(
+            &pool,
+            &filtered(
+                Some(as_viewer(&pool, &alice).await),
+                account(),
+                tagged("rust"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            for_alice,
+            newest_first(&[&rust_public, &rust_private]),
+            "a follower reaches both of the author's `#rust` rows, private included"
+        );
+        let anonymous = page_ids(&pool, &filtered(None, account(), tagged("rust"))).await;
+        assert_eq!(
+            anonymous,
+            newest_first(&[&rust_public]),
+            "the anonymous tagged page is the public row only"
+        );
+        let uncarried = page_ids(&pool, &filtered(None, account(), tagged("haskell"))).await;
+        assert!(
+            uncarried.is_empty(),
+            "a tag no row carries answers the empty page"
+        );
+        let control = page_ids(&pool, &timeline(None, account())).await;
+        assert_eq!(
+            control,
+            newest_first(&[&rust_public, &untagged, &other_tag]),
+            "without the filter the author's other public rows are there"
         );
     }
 
