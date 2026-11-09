@@ -20,6 +20,7 @@
 //! is the producer side: it enqueues the recurring, cron-like jobs.
 
 pub mod deletion;
+pub mod idempotency;
 pub mod imports;
 pub mod mutes;
 pub mod scheduler;

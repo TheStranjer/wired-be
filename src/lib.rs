@@ -76,8 +76,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// streaming reference-table sweep
 /// ([`KIND_CLEANUP`](streaming::hub::KIND_CLEANUP)), the mailer job
 /// ([`mailer::KIND_SEND`]), the expired-mute sweep
-/// ([`mutes::KIND_EXPIRE`](jobs::mutes::KIND_EXPIRE)), the user-import
-/// jobs ([`imports::KIND_FOLLOWS`](jobs::imports::KIND_FOLLOWS),
+/// ([`mutes::KIND_EXPIRE`](jobs::mutes::KIND_EXPIRE)), the expired
+/// idempotency-key sweep
+/// ([`idempotency::KIND_CLEANUP`](jobs::idempotency::KIND_CLEANUP)), the
+/// user-import jobs ([`imports::KIND_FOLLOWS`](jobs::imports::KIND_FOLLOWS),
 /// [`imports::KIND_BLOCKS`](jobs::imports::KIND_BLOCKS) and
 /// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)), the account
 /// deletion job ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE))
@@ -173,6 +175,10 @@ fn job_registry() -> JobRegistry {
     );
     registry.register(streaming::hub::KIND_CLEANUP, streaming::hub::handle_cleanup);
     registry.register(jobs::mutes::KIND_EXPIRE, jobs::mutes::handle_expire);
+    registry.register(
+        jobs::idempotency::KIND_CLEANUP,
+        jobs::idempotency::handle_cleanup,
+    );
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);
@@ -1744,6 +1750,109 @@ mod tests {
             assert_eq!(
                 key_columns, "name",
                 "the name alone is the primary key {key}"
+            );
+        }
+
+        /// The foreign keys the idempotency-keys migration declares: both
+        /// cascade, so a departed account or a hard-deleted post retires
+        /// the mapping with them.
+        fn assert_idempotency_foreign_keys(keys: &[(String, String, String)]) {
+            for (constraint, action, target) in [
+                ("idempotency_keys_user_id_fkey", "c", "users"),
+                ("idempotency_keys_status_id_fkey", "c", "statuses"),
+            ] {
+                let found = keys
+                    .iter()
+                    .find(|(name, _, _)| name == constraint)
+                    .unwrap_or_else(|| panic!("{constraint} links the table"));
+                assert_eq!(found.1, action, "{constraint} deletes as {action}");
+                assert_eq!(found.2, target, "{constraint} points at {target}");
+            }
+        }
+
+        /// The idempotency-keys migration (WBE-87) creates the table
+        /// `src/models/idempotency_key.rs` claims and replays through: the
+        /// `(user_id, key)` pair as the primary key the create's
+        /// `ON CONFLICT DO NOTHING` inserts against, the status the key
+        /// created, and both foreign keys cascading — a departed account or
+        /// a hard-deleted post retires the mapping with them.
+        #[tokio::test]
+        async fn idempotency_keys_migration_keys_one_status_per_account_and_key() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let columns: Vec<Described> = sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'idempotency_keys'
+               ORDER BY ordinal_position",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                columns,
+                vec![
+                    (
+                        "user_id".to_owned(),
+                        "uuid".to_owned(),
+                        "NO".to_owned(),
+                        None
+                    ),
+                    ("key".to_owned(), "text".to_owned(), "NO".to_owned(), None),
+                    (
+                        "status_id".to_owned(),
+                        "uuid".to_owned(),
+                        "NO".to_owned(),
+                        None
+                    ),
+                    (
+                        "inserted_at".to_owned(),
+                        "timestamp with time zone".to_owned(),
+                        "NO".to_owned(),
+                        Some("now()".to_owned())
+                    ),
+                ],
+                "the ticket's four columns, in the ticket's order, only the timestamp defaulted"
+            );
+
+            let (key, key_columns): (String, String) = sqlx::query_as(
+                "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'idempotency_keys'
+               GROUP BY con.conname",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                key_columns, "key,user_id",
+                "the pair is the key {key}: one status per account and key"
+            );
+
+            let keys: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT con.conname, con.confdeltype::text, conf.relname
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_class conf ON conf.oid = con.confrelid
+                  WHERE con.contype = 'f' AND cls.relname = 'idempotency_keys'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_idempotency_foreign_keys(&keys);
+
+            let indexes: Vec<String> = sqlx::query_scalar(
+                "SELECT indexname FROM pg_indexes
+                  WHERE schemaname = 'public' AND tablename = 'idempotency_keys'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                indexes.contains(&"idempotency_keys_inserted_at_idx".to_owned()),
+                "the sweep's walk is indexed: {indexes:?}"
             );
         }
     }

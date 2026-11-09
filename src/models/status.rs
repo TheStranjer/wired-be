@@ -621,12 +621,34 @@ const CLEAR_PINS_SQL: &str = "DELETE FROM pinned_statuses WHERE status_id = $1";
 /// half-written status with it.
 pub async fn insert(pool: &PgPool, base_url: &str, new_status: &NewStatus) -> AppResult<Status> {
     let mut tx = pool.begin().await?;
-    let parent = parent_conversation(&mut tx, new_status.in_reply_to_id).await?;
-    let status = write_status(&mut tx, base_url, new_status, parent).await?;
-    mention::link_conn(&mut tx, status.id, &new_status.mentioned_user_ids).await?;
-    hashtag::link_names_conn(&mut tx, status.id, &new_status.hashtags).await?;
-    count_new_post(&mut tx, &status).await?;
+    let status = insert_conn(&mut tx, base_url, new_status).await?;
     tx.commit().await?;
+    Ok(status)
+}
+
+/// [`insert`]'s whole write on the caller's connection: the same status
+/// row, mention links, hashtag links and counter steps, with the
+/// transaction left open for the caller to extend or roll back.
+///
+/// This is the seam an idempotent create writes through — see
+/// [`crate::models::idempotency_key::claim`], whose `ON CONFLICT` insert
+/// joins this statement on the same transaction so a status and its key
+/// commit together or neither does.
+///
+/// # Errors
+///
+/// Those of [`insert`], arriving on the caller's transaction: only a commit
+/// this function never sees can make the write stand.
+pub async fn insert_conn(
+    conn: &mut PgConnection,
+    base_url: &str,
+    new_status: &NewStatus,
+) -> AppResult<Status> {
+    let parent = parent_conversation(conn, new_status.in_reply_to_id).await?;
+    let status = write_status(conn, base_url, new_status, parent).await?;
+    mention::link_conn(conn, status.id, &new_status.mentioned_user_ids).await?;
+    hashtag::link_names_conn(conn, status.id, &new_status.hashtags).await?;
+    count_new_post(conn, &status).await?;
     Ok(status)
 }
 

@@ -16,7 +16,10 @@
 //! [`create_status`] is the write side of the same idea: it decides what a
 //! `POST /api/v1/statuses` body means — its limits, its defaults, its
 //! refusals — from the request parameters alone, so the endpoint that stores
-//! the result never re-decides any of it.
+//! the result never re-decides any of it. The route's two request-level
+//! arms live here for the same reason: the `Idempotency-Key` replay claims
+//! its row inside the status's own transaction, and the `preview` dry run
+//! answers the would-be entity without writing anything.
 //!
 //! [`translate`] is the outbound half of status translation: which provider
 //! the instance talks to, what a translate call and a language list look like

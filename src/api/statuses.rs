@@ -43,15 +43,27 @@
 //! `POST /api/v1/statuses` is the module's other half, and Pleroma's
 //! `create`: a user token granting `write:statuses` (its own scope, not the
 //! root) on the `statuses_actions` throttle, the body read through
-//! [`ApiBody`] so JSON and form parameters arrive the same way, and the
-//! whole decision — what the text says, who it mentions, what it tags, how
-//! visible it is and what the author's settings default to — delegated to
-//! [`crate::services::create_status`]. The handler adds nothing but the
-//! gate, the client behind the token and the JSON envelope, and a post that
-//! passes answers **200** with the [`Status`] entity rendered for its
-//! author. Everything a fresh status still owes the streaming sockets, the
-//! notifications and the wider federation hangs off that service's single
-//! documented hook, so this file never grows a second write path.
+//! [`ApiParams`] so JSON, form and query parameters arrive the same way,
+//! and the whole decision — what the text says, who it mentions, what it
+//! tags, how visible it is and what the author's settings default to —
+//! delegated to [`crate::services::create_status`]. The handler adds the
+//! gate, the client behind the token, the JSON envelope, and the two
+//! request-level arms Pleroma hangs off this route: an `Idempotency-Key`
+//! header (its own [`IdempotencyPlug`] stands the create's replay on a
+//! cache; here the claim is a row in
+//! [`crate::models::idempotency_key`], inserted inside the status's own
+//! transaction, so a retry of a key that created a live status answers that
+//! status and creates nothing) and a `preview` parameter (Pleroma's
+//! `draft.preview?`: every check and the full render run, and the entity a
+//! create would have answered is built in memory without a write or a
+//! hook). A post that passes answers **200** with the [`Status`] entity
+//! rendered for its author. Everything a fresh status still owes the
+//! streaming sockets, the notifications and the wider federation hangs off
+//! that service's single documented hook, so this file never grows a second
+//! write path.
+//!
+//! [`ApiParams`]: crate::extract::ApiParams
+//! [`IdempotencyPlug`]: crate::models::idempotency_key
 //!
 //! # The reads
 //!
@@ -391,14 +403,13 @@
 //! [`Status`]: crate::entities::status::Status
 //! [`Account`]: crate::entities::account::Account
 //! [`Translation`]: crate::entities::translation::Translation
-//! [`ApiBody`]: crate::extract::ApiBody
 
 use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
-    http::{HeaderMap, Uri},
+    http::{HeaderMap, HeaderName, Uri},
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -610,6 +621,25 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// here because only the request knows it, and it travels to the service as
 /// the status's `application` pair.
 ///
+/// Two request-level decisions are this handler's own, both read before the
+/// service is asked for anything. The body's `preview` (a [`flex`] boolean,
+/// body or query, default false) answers the entity a create would have
+/// returned — validated, rendered, mentions and tags resolved, a fresh
+/// minted id, `created_at` now and zero counters — without persisting
+/// anything, firing a hook or consulting a key ([`create_status::preview_status`],
+/// Pleroma's `draft.preview?` arm). An `Idempotency-Key` header makes the
+/// create replayable: a key this account has used for a live status answers
+/// that status's entity and creates nothing; otherwise the create runs and
+/// claims the key on its own transaction
+/// ([`create_status::create_status_idempotent`], this instance's durable
+/// stand-in for Pleroma's [`IdempotencyPlug`] cache). A preview ignores the
+/// header entirely, and a header longer than [`MAX_IDEMPOTENCY_KEY_CHARS`]
+/// characters, repeated, or holding non-visible bytes is no key at all —
+/// the plain create.
+///
+/// [`flex`]: crate::extract::flex
+/// [`IdempotencyPlug`]: crate::models::idempotency_key
+///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
@@ -617,17 +647,54 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// bucket; whatever [`create_status::create_status`] refuses — 422 for an
 /// empty text, an over-long status, an over-long warning, an unknown
 /// `visibility` or an unknown `content_type` — plus its own database
-/// failures as [`AppError::Database`].
+/// failures as [`AppError::Database`]. A preview owes the same 422s:
+/// validation runs on it exactly as on a post.
 async fn create_status(
     State(state): State<AppState>,
     auth: AuthUser,
-    ApiBody(params): ApiBody<CreateStatusParams>,
+    headers: HeaderMap,
+    ApiParams(params): ApiParams<CreateStatusParams>,
 ) -> AppResult<Json<Status>> {
     auth.require(WRITE_STATUSES)?;
     let app: Option<OauthApp> = oauth_app::get_by_id(&state.db, auth.1.app_id).await?;
-    Ok(Json(
-        create_status::create_status(&state, &auth.0, app.as_ref(), params).await?,
-    ))
+    if params.previews() {
+        return Ok(Json(
+            create_status::preview_status(&state, &auth.0, app.as_ref(), &params).await?,
+        ));
+    }
+    let entity = match idempotency_key(&headers) {
+        Some(key) => {
+            create_status::create_status_idempotent(&state, &auth.0, app.as_ref(), params, &key)
+                .await?
+        }
+        None => create_status::create_status(&state, &auth.0, app.as_ref(), params).await?,
+    };
+    Ok(Json(entity))
+}
+
+/// The header whose value makes a create replayable (Pleroma's
+/// `IdempotencyPlug` key, [`crate::models::idempotency_key`]'s table rows).
+const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
+
+/// Longest `Idempotency-Key` this endpoint honors: a longer value is ignored
+/// (the create is a plain one and no key is stored), so the `key` column
+/// never holds more than this many characters and no client can turn the
+/// replay lookup into a large-value index probe.
+const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
+
+/// The `Idempotency-Key` header, read Pleroma's way (its plug's
+/// `get_req_header` single-value arm): exactly one visible-text value of at
+/// most [`MAX_IDEMPOTENCY_KEY_CHARS`] characters is the key; an absent
+/// header, a repeated one, bytes no header text can hold and an over-long
+/// value are all no key at all.
+fn idempotency_key(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+    let key = values.next()?.to_str().ok()?.to_owned();
+    values
+        .next()
+        .is_none()
+        .then_some(key)
+        .filter(|key| key.chars().count() <= MAX_IDEMPOTENCY_KEY_CHARS)
 }
 
 /// `GET /api/v1/statuses/{id}` — the status `id` names, as the viewer
@@ -2665,5 +2732,74 @@ mod tests {
             forbidden(edit_refusal(Uuid::now_v7(), &boost)),
             "and somebody else's boost is not yours before it is a boost"
         );
+    }
+
+    /// A header map carrying `values` under the idempotency header.
+    fn keyed(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            let _added: bool = headers.append(
+                IDEMPOTENCY_KEY_HEADER,
+                axum::http::HeaderValue::from_str(value).expect("a visible test value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn exactly_one_idempotency_key_header_is_the_key() {
+        assert!(idempotency_key(&keyed(&[])).is_none(), "absent is none");
+        assert_eq!(
+            idempotency_key(&keyed(&["k-1"])).as_deref(),
+            Some("k-1"),
+            "one value is the key, verbatim"
+        );
+        assert_eq!(
+            idempotency_key(&keyed(&[""])).as_deref(),
+            Some(""),
+            "the empty value is a key like any other text — Pleroma's plug \
+             caches the header's spelling without asking what it means"
+        );
+        assert!(
+            idempotency_key(&keyed(&["a", "b"])).is_none(),
+            "a repeated header names no single key and is no key at all"
+        );
+    }
+
+    #[test]
+    fn the_key_cap_is_255_characters_and_longer_is_ignored() {
+        let edge = "x".repeat(MAX_IDEMPOTENCY_KEY_CHARS);
+        assert_eq!(
+            idempotency_key(&keyed(&[&edge])).as_deref(),
+            Some(edge.as_str()),
+            "the cap itself is a key"
+        );
+        let over = "x".repeat(MAX_IDEMPOTENCY_KEY_CHARS + 1);
+        assert!(
+            idempotency_key(&keyed(&[&over])).is_none(),
+            "one character past the cap is ignored, not truncated: the \
+             create runs as if no header had arrived"
+        );
+    }
+
+    #[test]
+    fn the_preview_flag_is_the_body_s_own_default() {
+        let absent = serde_json::from_value::<CreateStatusParams>(json!({"status": "hi"}))
+            .expect("the documented shape parses");
+        assert!(!absent.previews(), "no key means a real post");
+        for value in [json!(true), json!("true"), json!("1"), json!("on")] {
+            let body = serde_json::from_value::<CreateStatusParams>(
+                json!({"status": "hi", "preview": value}),
+            )
+            .unwrap_or_else(|_| panic!("`{value}` is a flex-bool spelling"));
+            assert!(body.previews(), "`{value}` previews");
+        }
+        for value in [json!(false), json!("0"), json!("off"), Value::Null] {
+            let body = serde_json::from_value::<CreateStatusParams>(
+                json!({"status": "hi", "preview": value}),
+            )
+            .unwrap_or_else(|_| panic!("`{value}` is a flex-bool spelling"));
+            assert!(!body.previews(), "`{value}` is as absent as no key");
+        }
     }
 }

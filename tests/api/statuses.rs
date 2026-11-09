@@ -50,7 +50,12 @@
 //! `status_hashtags`, the posting client recorded as its application, the
 //! author's `statuses_count` stepped, and the whole thing answered as the
 //! `Status` entity the author themselves sees — from a JSON or a form body
-//! alike.
+//! alike. WBE-87 adds the route's two request-level arms: an
+//! `Idempotency-Key` header whose retry answers the status the key created
+//! without writing a second one (until the key's 24 hours run out and the
+//! `idempotency.cleanup` sweep frees the pair), and a `preview` parameter
+//! that runs every check and the full render and answers the would-be
+//! entity with no write, no hook and no key at all.
 //!
 //! `DELETE /api/v1/statuses/{id}` (WBE-79) is Pleroma's `delete`: a user
 //! token with `write:statuses`, on the same `statuses_actions` bucket the
@@ -68,6 +73,7 @@
 #![cfg(test)]
 
 use axum::{Router, http::StatusCode};
+use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -87,6 +93,7 @@ use wired_be::{
     util::{
         entities::{hashtag_html, mention_html},
         format::status_length,
+        time::parse_time,
     },
 };
 
@@ -2592,4 +2599,458 @@ async fn the_write_route_does_not_leak_onto_the_read_route() {
         json!([]),
         "and the visible ids it answers are unchanged by the throttle"
     );
+}
+
+// ─────────────  POST /api/v1/statuses: Idempotency-Key  ─────────────
+
+/// The row-count helpers above stop at `statuses`; the key claims live in
+/// their own table, and every keyed test reads this to see one claim per
+/// pair, no claim for a preview, and one for a key that moved.
+async fn key_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_keys")
+        .fetch_one(pool)
+        .await
+        .expect("the count reads")
+}
+
+/// `POST /api/v1/statuses` with the JSON `body` as `token`, carrying an
+/// `Idempotency-Key` header.
+async fn publish_keyed(app: &Router, token: &str, key: &str, body: Value) -> common::TestResponse {
+    common::TestRequest::post(STATUSES)
+        .json(&body)
+        .bearer(token)
+        .header("idempotency-key", key)
+        .send(app)
+        .await
+}
+
+/// The same post under one key twice: the second request creates nothing
+/// and answers the first status's entity — same id, same render, one row,
+/// one claim, one counted post. The retry body is not even looked at.
+#[tokio::test]
+async fn the_same_idempotency_key_creates_one_status() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let app = common::test_app(pool.clone());
+
+    let first = publish_keyed(
+        &app,
+        &token,
+        "K-1",
+        json!({"status": "keyed once @bob #tag"}),
+    )
+    .await;
+    common::assert_answer(&first, StatusCode::OK, "the keyed post");
+    let second = publish_keyed(&app, &token, "K-1", json!({"status": "a different retry"})).await;
+    common::assert_answer(&second, StatusCode::OK, "the replay of the same key");
+
+    assert_eq!(
+        second.json_value()["id"],
+        first.json_value()["id"],
+        "the same key answers the same id"
+    );
+    assert_eq!(
+        second.json_value()["content"],
+        format!(
+            "<p>keyed once {} {}</p>",
+            mention_html(&bob.ap_id, "bob"),
+            hashtag_html(TEST_BASE_URL, "tag"),
+        ),
+        "and the first body's entity — the retry body changed nothing"
+    );
+    assert_eq!(
+        stored_count(&pool).await,
+        1,
+        "the retry created no second status"
+    );
+    assert_eq!(author_now(&pool, alice.id).await.statuses_count, 1);
+    assert_eq!(key_rows(&pool).await, 1, "one claim for the pair");
+    let row = created_row(&pool, &first.json_value()).await;
+    assert_eq!(mention_links(&pool, row.id).await, vec![bob.id]);
+    assert_eq!(tag_links(&pool, row.id).await, vec!["tag"]);
+}
+
+/// Two keys are two posts: the same body under a different key creates
+/// afresh, each key keeping its own status.
+#[tokio::test]
+async fn different_idempotency_keys_create_two_statuses() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let body = json!({"status": "posted twice, under two keys"});
+    let first = publish_keyed(&app, &token, "K-1", body.clone()).await;
+    let second = publish_keyed(&app, &token, "K-2", body).await;
+    common::assert_answer(&first, StatusCode::OK, "the first key's post");
+    common::assert_answer(&second, StatusCode::OK, "the second key's post");
+
+    assert_ne!(
+        id_of(&first.json_value()),
+        id_of(&second.json_value()),
+        "a different key is a different post"
+    );
+    assert_eq!(stored_count(&pool).await, 2);
+    assert_eq!(key_rows(&pool).await, 2);
+    assert_eq!(author_now(&pool, alice.id).await.statuses_count, 2);
+}
+
+/// One key text belongs to the account that sent it: two users posting
+/// under `"shared"` get two statuses, and each one's replay answers its
+/// own author's post.
+#[tokio::test]
+async fn an_idempotency_key_is_its_owner_s_alone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, alice_token) = user_with_token(&pool, "alice", WRITE).await;
+    let (_bob, bob_token) = user_with_token(&pool, "bob", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let mine = publish_keyed(&app, &alice_token, "shared", json!({"status": "alice's"})).await;
+    let theirs = publish_keyed(&app, &bob_token, "shared", json!({"status": "bob's"})).await;
+    common::assert_answer(&mine, StatusCode::OK, "alice's keyed post");
+    common::assert_answer(&theirs, StatusCode::OK, "bob's keyed post");
+
+    assert_ne!(
+        id_of(&theirs.json_value()),
+        id_of(&mine.json_value()),
+        "the same key text is not the same key across accounts"
+    );
+    assert_eq!(mine.json_value()["account"]["acct"], "alice");
+    assert_eq!(theirs.json_value()["account"]["acct"], "bob");
+
+    let alice_again =
+        publish_keyed(&app, &alice_token, "shared", json!({"status": "ignored"})).await;
+    assert_eq!(
+        alice_again.json_value()["id"],
+        mine.json_value()["id"],
+        "alice's retry replays alice's post"
+    );
+    let bob_again = publish_keyed(&app, &bob_token, "shared", json!({"status": "ignored"})).await;
+    assert_eq!(
+        bob_again.json_value()["id"],
+        theirs.json_value()["id"],
+        "and bob's replays bob's"
+    );
+    assert_eq!(stored_count(&pool).await, 2);
+    assert_eq!(key_rows(&pool).await, 2, "one claim per (account, key)");
+}
+
+/// The cap is 255 characters, and a longer value is ignored rather than
+/// refused: 256 of the same text name no key, so each post creates and no
+/// claim is stored; the 255-character edge is honored like any shorter key.
+#[tokio::test]
+async fn a_key_longer_than_255_characters_is_ignored() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let over = "k".repeat(256);
+    let first = publish_keyed(&app, &token, &over, json!({"status": "one"})).await;
+    let second = publish_keyed(&app, &token, &over, json!({"status": "two"})).await;
+    common::assert_answer(&first, StatusCode::OK, "the first over-long post");
+    common::assert_answer(&second, StatusCode::OK, "the second over-long post");
+    assert_ne!(
+        id_of(&first.json_value()),
+        id_of(&second.json_value()),
+        "an ignored header cannot replay anything"
+    );
+    assert_eq!(stored_count(&pool).await, 2, "both posts stand");
+    assert_eq!(key_rows(&pool).await, 0, "and no claim was stored");
+
+    let edge = "k".repeat(255);
+    let third = publish_keyed(&app, &token, &edge, json!({"status": "three"})).await;
+    let again = publish_keyed(&app, &token, &edge, json!({"status": "ignored"})).await;
+    assert_eq!(
+        again.json_value()["id"],
+        third.json_value()["id"],
+        "the cap itself is a key like any other"
+    );
+    assert_eq!(key_rows(&pool).await, 1);
+    assert_eq!(stored_count(&pool).await, 3);
+}
+
+/// A replayed key whose status has been deleted is no replay-able answer:
+/// the next post under that key creates afresh, the claim moves onto it,
+/// and from then on the key replays the new status.
+#[tokio::test]
+async fn a_deleted_status_frees_its_idempotency_key() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let first = publish_keyed(
+        &app,
+        &token,
+        "K-1",
+        json!({"status": "post then delete me"}),
+    )
+    .await;
+    common::assert_answer(&first, StatusCode::OK, "the keyed post");
+    let doomed = id_of(&first.json_value());
+    let gone = destroy(&app, &token, &doomed.to_string()).await;
+    common::assert_answer(&gone, StatusCode::OK, "the delete");
+
+    let fresh = publish_keyed(&app, &token, "K-1", json!({"status": "the next one"})).await;
+    common::assert_answer(&fresh, StatusCode::OK, "the post under the freed key");
+    assert_ne!(
+        id_of(&fresh.json_value()),
+        doomed,
+        "a tombstone is not what the key replays"
+    );
+    let restated = publish_keyed(&app, &token, "K-1", json!({"status": "ignored"})).await;
+    assert_eq!(
+        restated.json_value()["id"],
+        fresh.json_value()["id"],
+        "and the moved claim now replays the fresh status"
+    );
+    assert_eq!(
+        key_rows(&pool).await,
+        1,
+        "still exactly one mapping for the pair"
+    );
+}
+
+// ─────────────  POST /api/v1/statuses: preview  ─────────────
+
+/// The three side tables a create fills: every preview test requires them
+/// all empty, because the point of a preview is that it renders without
+/// writing.
+async fn side_rows(pool: &PgPool) -> (i64, i64, i64) {
+    let mentions = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM status_mentions")
+        .fetch_one(pool)
+        .await
+        .expect("the mention count reads");
+    let tags = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM hashtags")
+        .fetch_one(pool)
+        .await
+        .expect("the tag count reads");
+    let links = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM status_hashtags")
+        .fetch_one(pool)
+        .await
+        .expect("the tag link count reads");
+    (mentions, tags, links)
+}
+
+/// A preview answers the [`Status`] entity a create of the same body would
+/// have: fresh id with the urls it derives, the render with the mention and
+/// the tag resolved into it, zero counters, `created_at` now, the author's
+/// view — and no row anywhere behind it.
+#[tokio::test]
+async fn a_preview_answers_the_entity_and_writes_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let app = common::test_app(pool.clone());
+
+    let response = publish(
+        &app,
+        Some(token.as_str()),
+        json!({"status": "hello @bob and @nobody, see #Rust", "preview": true}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "a preview");
+    let value = response.json_value();
+    let id = id_of(&value);
+
+    assert_eq!(
+        value["uri"],
+        format!("{TEST_BASE_URL}/objects/{id}"),
+        "the entity carries the id a create would mint, with its urls"
+    );
+    assert_eq!(value["url"], json!(format!("{TEST_BASE_URL}/notice/{id}")));
+    assert_eq!(
+        value["content"],
+        format!(
+            "<p>hello {} and @nobody, see {}</p>",
+            mention_html(&bob.ap_id, "bob"),
+            hashtag_html(TEST_BASE_URL, "rust"),
+        ),
+        "the same render a create stores, the unknown name still plain text"
+    );
+    assert_eq!(
+        value["mentions"],
+        json!([{ "id": bob.id.to_string(), "username": "bob",
+                 "url": bob.ap_id, "acct": "bob" }]),
+        "the mention is resolved into the entity"
+    );
+    assert_eq!(
+        value["tags"],
+        json!([{ "name": "rust", "url": format!("{TEST_BASE_URL}/tags/rust") }]),
+        "and so is the tag, folded"
+    );
+    assert_eq!(value["reblogs_count"], 0, "every counter zero");
+    assert_eq!(value["favourites_count"], 0, "all four");
+    assert_eq!(value["replies_count"], 0);
+    assert_eq!(value["pleroma"]["quotes_count"], 0);
+    assert_eq!(value["visibility"], "public", "the author's defaults apply");
+    assert_eq!(value["account"]["acct"], "alice", "as the author sees it");
+    assert_eq!(
+        value["pleroma"]["content"],
+        json!({ "text/plain": "hello @bob and @nobody, see #Rust" }),
+        "the source text beside the render"
+    );
+    let created_at = parse_time(value["created_at"].as_str().expect("a timestamp"))
+        .expect("the Mastodon-format stamp parses");
+    assert!(
+        (Utc::now() - created_at).num_seconds().abs() < 120,
+        "created_at is now: {created_at}"
+    );
+
+    assert_eq!(stored_count(&pool).await, 0, "no status row");
+    assert_eq!(side_rows(&pool).await, (0, 0, 0), "no mention or tag rows");
+    assert_eq!(key_rows(&pool).await, 0, "and no claim");
+    assert_eq!(
+        author_now(&pool, alice.id).await.statuses_count,
+        0,
+        "and the author's count stands"
+    );
+    assert!(
+        status::get_by_id(&pool, id).await.unwrap().is_none(),
+        "the previewed id names nothing in the database"
+    );
+}
+
+/// The flag is a [`flex`] boolean read through the query string as well as
+/// either body encoding (decision 10), and every false spelling — the
+/// absence of the key included — stays a real post.
+///
+/// [`flex`]: wired_be::extract::flex
+#[tokio::test]
+async fn the_preview_flag_reads_every_parameter_spelling() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let from_form = common::TestRequest::post(STATUSES)
+        .bearer(&token)
+        .form(&[("status", "previewed from a form"), ("preview", "true")])
+        .send(&app)
+        .await;
+    common::assert_answer(&from_form, StatusCode::OK, "a form preview");
+    assert_eq!(
+        stored_count(&pool).await,
+        0,
+        "the form preview wrote nothing"
+    );
+
+    let from_query = common::TestRequest::post(&format!("{STATUSES}?preview=1"))
+        .bearer(&token)
+        .json(&json!({"status": "previewed via the query"}))
+        .send(&app)
+        .await;
+    common::assert_answer(&from_query, StatusCode::OK, "a query preview");
+    assert_eq!(stored_count(&pool).await, 0, "and the query wrote nothing");
+
+    let spelled_off = publish(
+        &app,
+        Some(token.as_str()),
+        json!({"status": "a real post", "preview": "off"}),
+    )
+    .await;
+    common::assert_answer(&spelled_off, StatusCode::OK, "the `off` spelling posts");
+    assert_eq!(stored_count(&pool).await, 1, "and it stored its row");
+
+    let bare = publish(&app, Some(token.as_str()), json!({"status": "no flag"})).await;
+    common::assert_answer(&bare, StatusCode::OK, "the absent flag posts");
+    assert_eq!(stored_count(&pool).await, 2, "as it always did");
+}
+
+/// Validation runs on previews exactly as on posts: the same 422s in the
+/// same wordings, nothing written, and no key stored even when the request
+/// carried one.
+#[tokio::test]
+async fn a_preview_owes_the_creation_refusals() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    for (body, message) in [
+        (json!({"status": "   ", "preview": true}), EMPTY_STATUS),
+        (
+            json!({"status": "hi", "visibility": "sideways", "preview": true}),
+            BAD_VISIBILITY,
+        ),
+        (
+            json!({"status": "hi", "content_type": "text/rtf", "preview": true}),
+            BAD_CONTENT_TYPE,
+        ),
+        (
+            json!({"status": "hi", "spoiler_text": "x".repeat(201), "preview": true}),
+            "Validation failed: Spoiler text is too long (maximum is 200 characters)",
+        ),
+    ] {
+        let response = publish(&app, Some(token.as_str()), body.clone()).await;
+        common::assert_answer(
+            &response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("the refused preview `{body}`"),
+        );
+        common::assert_error(&response, message, &format!("the wording for `{body}`"));
+    }
+
+    let keyed_refusal =
+        publish_keyed(&app, &token, "K-1", json!({"status": "", "preview": true})).await;
+    common::assert_answer(
+        &keyed_refusal,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a refused preview that carried a key",
+    );
+
+    assert_eq!(stored_count(&pool).await, 0, "not one refusal wrote a row");
+    assert_eq!(key_rows(&pool).await, 0, "or stored a key");
+}
+
+/// A preview is not a create, so there is nothing for a key to remember:
+/// previews under one key mint fresh ids and claim nothing, and the real
+/// post that follows the previews claims the key as if it had never been
+/// spoken.
+#[tokio::test]
+async fn preview_ignores_the_idempotency_key() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let first = publish_keyed(
+        &app,
+        &token,
+        "K-1",
+        json!({"status": "first look", "preview": true}),
+    )
+    .await;
+    let second = publish_keyed(
+        &app,
+        &token,
+        "K-1",
+        json!({"status": "second look", "preview": true}),
+    )
+    .await;
+    common::assert_answer(&first, StatusCode::OK, "the first preview");
+    common::assert_answer(&second, StatusCode::OK, "the second preview");
+    assert_ne!(
+        id_of(&first.json_value()),
+        id_of(&second.json_value()),
+        "each preview mints its own id"
+    );
+    assert_eq!(stored_count(&pool).await, 0);
+    assert_eq!(key_rows(&pool).await, 0, "and the key stayed unclaimed");
+
+    let real = publish_keyed(&app, &token, "K-1", json!({"status": "the real post"})).await;
+    common::assert_answer(&real, StatusCode::OK, "the post after the previews");
+    assert_eq!(key_rows(&pool).await, 1, "now the key is claimed");
+    let replay = publish_keyed(&app, &token, "K-1", json!({"status": "ignored"})).await;
+    assert_eq!(
+        replay.json_value()["id"],
+        real.json_value()["id"],
+        "and replays the post it finally created"
+    );
+    assert_eq!(stored_count(&pool).await, 1);
 }
