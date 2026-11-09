@@ -10,7 +10,7 @@ use crate::{
         emoji_packs, emoji_reactions, endorsements, filters, follow_requests, instance, lists,
         markers, media, misc, mutes, notifications, oauth_tokens, password_reset, pleroma_accounts,
         pleroma_bookmark_folders, pleroma_settings, push, reports, scrobbles, search, statuses,
-        streaming, tags,
+        streaming, tags, timelines,
     },
     state::AppState,
 };
@@ -63,6 +63,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(statuses::router(state))
         .merge(streaming::router())
         .merge(tags::router())
+        .merge(timelines::router())
         .nest("/pleroma", misc::util_router())
         .nest("/pleroma/apps", oauth_tokens::apps_router())
         .nest(

@@ -81,6 +81,7 @@ pub mod search;
 pub mod statuses;
 pub mod streaming;
 pub mod tags;
+pub mod timelines;
 pub mod v1;
 pub mod v2;
 pub mod well_known;
