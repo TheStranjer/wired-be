@@ -44,6 +44,11 @@ blurhash = "0.2.3"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 dotenvy = "0.15.7"
+# Concurrent remote mention lookups (`src/services/mentions.rs`):
+# `future::join_all` runs every unknown-remote lookup of one status at the
+# same time under one shared `tokio::time::timeout` budget. The default
+# features (`std`, `async-await`) are all the combinator needs.
+futures = "0.3.34"
 # HMAC (`src/util/totp.rs`): RFC 6238/4226 TOTP is HMAC-SHA1 over the time
 # step; `sha1` below supplies the hash, `subtle` the constant-time compare.
 hmac = "0.13.0"
