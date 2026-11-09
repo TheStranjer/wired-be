@@ -24,6 +24,7 @@ pub mod idempotency;
 pub mod imports;
 pub mod mutes;
 pub mod scheduler;
+pub mod statuses;
 
 use std::{
     collections::HashMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,

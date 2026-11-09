@@ -29,7 +29,11 @@
 //! status and every live reblog of it in one transaction. Everything that
 //! reads by id hides tombstones; [`get_by_uri`] and
 //! [`get_by_id_including_deleted`] do not, because federation and moderation
-//! need to see them.
+//! need to see them. A status created with `expires_in` carries that moment
+//! in [`expires_at`](Status::expires_at), and the expiration is just the
+//! delete arriving on a schedule: [`fetch_expired`] hands the
+//! [`statuses.expire_sweep`](crate::jobs::statuses::KIND_SWEEP) safety job
+//! the rows whose time has run out.
 //!
 //! Reblogs are the same table wearing the `Announce` role (decision 6):
 //! [`create_reblog`] writes a live reblog row with no text of its own, the
@@ -933,6 +937,37 @@ pub async fn soft_delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult
         }
         total += tombstoned;
     }
+}
+
+/// The `SELECT` behind [`fetch_expired`]: live statuses whose expiration has
+/// run out, soonest-expiring first, at most `limit` of them.
+const EXPIRED_SQL: &str = "SELECT * FROM statuses
+     WHERE deleted_at IS NULL
+       AND expires_at IS NOT NULL
+       AND expires_at <= now()
+     ORDER BY expires_at, id
+     LIMIT $1";
+
+/// Fetches at most `limit` live statuses whose
+/// [`expires_at`](Status::expires_at) has run out, soonest expiry first.
+///
+/// This is the batch read of the
+/// [`statuses.expire_sweep`](crate::jobs::statuses::KIND_SWEEP) safety
+/// job. A tombstoned row no longer matches the predicate and a
+/// scheduled delete clears the row's own expiry from the queue's reach, so
+/// repeated batches of one call drain the backlog in order without ever
+/// handing the same row out twice.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn fetch_expired(pool: &PgPool, limit: i64) -> AppResult<Vec<Status>> {
+    let rows = sqlx::query_as::<_, Status>(EXPIRED_SQL)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// Adds `delta` to `counter` of status `id`, clamped at zero, and refreshes

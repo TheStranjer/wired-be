@@ -57,12 +57,15 @@
 //! `{"error":"…"}` (decision 8) — in Pleroma's or Mastodon's own wording,
 //! pinned by the tests below: the two limit messages, `Invalid visibility` for
 //! a submitted scope outside the five [`Visibility`] names, `Invalid
-//! content_type` for a MIME type outside `CONTENT_TYPES`, and Rails'
-//! too-long sentence for a content warning or a language tag past its cap.
+//! content_type` for a MIME type outside `CONTENT_TYPES`, Rails' too-long
+//! sentence for a content warning or a language tag past its cap, and the
+//! `expires_in` pair — `expires_in must be at least <floor> seconds` naming
+//! this instance's floor for a shorter span, `expires_in is too large` for a
+//! span no timestamp can hold.
 
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -121,6 +124,11 @@ const INVALID_VISIBILITY: &str = "Invalid visibility";
 /// 422 body for a submitted MIME type outside [`CONTENT_TYPES`].
 const INVALID_CONTENT_TYPE: &str = "Invalid content_type";
 
+/// 422 body, in this instance's own wording, for an `expires_in` whose span
+/// no calendar can land on: past the representable horizon the value is a
+/// mistake, not a very distant expiry.
+const EXPIRATION_TOO_LARGE: &str = "expires_in is too large";
+
 /// The body of `POST /api/v1/statuses`, as the client wrote it.
 ///
 /// Every field is an `Option` with a serde `default`, so a key the body omits
@@ -163,6 +171,18 @@ pub struct CreateStatusParams {
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
     preview: Option<bool>,
+    /// Pleroma's expiration extension: seconds from now after which the
+    /// post deletes itself. A [`flex`] integer — a form body's
+    /// `expires_in=3600` spells what JSON's `3600` spells, and anything
+    /// that is no integer at all is the extractor's 422. Absent or null is
+    /// a post that never expires; a value under
+    /// [`min_expiration_secs`](crate::config::Config::min_expiration_secs)
+    /// or too large to land on the calendar is the service's — see
+    /// `checked_expiration`.
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[serde(default, deserialize_with = "crate::extract::flex::opt_i64")]
+    expires_in: Option<i64>,
 }
 
 impl CreateStatusParams {
@@ -200,6 +220,10 @@ pub struct Checked<'a> {
     /// The declared MIME type, always one of `CONTENT_TYPES` —
     /// [`DEFAULT_CONTENT_TYPE`] when the body did not say.
     pub content_type: &'static str,
+    /// The moment the post deletes itself, `now` plus the submitted
+    /// `expires_in`, or `None` when the body named no expiration — see
+    /// `checked_expiration`.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Checks a status body against the instance's limits and the author's two
@@ -215,14 +239,17 @@ pub struct Checked<'a> {
 /// [`Visibility::Public`] rather than failing somebody's post.
 ///
 /// The rules run in this order — the text (empty, then too long), the content
-/// warning, the language, the visibility, then the content type — so a body
-/// that breaks several is refused for the first of them.
+/// warning, the language, the visibility, the content type, then the
+/// expiration — so a body that breaks several is refused for the first of
+/// them.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with `EMPTY_STATUS`, `OVER_LIMIT`,
-/// `INVALID_VISIBILITY` or `INVALID_CONTENT_TYPE`, or with Rails' too-long
-/// wording for a content warning or a language tag past its cap.
+/// `INVALID_VISIBILITY` or `INVALID_CONTENT_TYPE`, with Rails' too-long
+/// wording for a content warning or a language tag past its cap, and with
+/// `checked_expiration`'s refusal for an `expires_in` under the instance's
+/// floor or past the calendar.
 pub fn check_body<'a>(
     config: &Config,
     default_scope: &str,
@@ -234,6 +261,7 @@ pub fn check_body<'a>(
     let language = checked_language(params.language.as_deref())?;
     let visibility = checked_visibility(params.visibility.as_deref(), default_scope)?;
     let content_type = checked_content_type(params.content_type.as_deref())?;
+    let expires_at = checked_expiration(config, params.expires_in)?;
     Ok(Checked {
         text,
         spoiler_text,
@@ -241,6 +269,7 @@ pub fn check_body<'a>(
         visibility,
         language,
         content_type,
+        expires_at,
     })
 }
 
@@ -342,6 +371,45 @@ fn checked_len<'a>(text: &'a str, max_chars: usize, what: &str) -> AppResult<&'a
     Ok(text)
 }
 
+/// The instance's expiration floor as the `i64` the `expires_in` comparison
+/// runs in: [`min_expiration_secs`](crate::config::Config::min_expiration_secs)
+/// widened, with a floor too wide for `i64` becoming the largest number the
+/// comparison can hold — a floor nobody can post past, not a silent zero.
+fn expiration_floor(config: &Config) -> i64 {
+    i64::try_from(config.min_expiration_secs).unwrap_or(i64::MAX)
+}
+
+/// The expiry an `expires_in` of `seconds` describes: `None` when the body
+/// named none, and otherwise the instant `seconds` from now — Pleroma's
+/// `:expiration, minimum_expiration_interval` rule, which here is
+/// [`Config::min_expiration_secs`]: a shorter span (zero and negatives
+/// included) is refused rather than silently lengthened, and so is one whose
+/// span no calendar can land on. The accepted instant is computed once,
+/// here, and travels to the stored row and to the scheduled delete's
+/// `run_at` as the same value.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with `expires_in must be at least {floor}
+/// seconds` — naming this instance's floor — for a submitted value under
+/// [`expiration_floor`], and with [`EXPIRATION_TOO_LARGE`] for a span that
+/// does not fit a timestamp.
+fn checked_expiration(config: &Config, seconds: Option<i64>) -> AppResult<Option<DateTime<Utc>>> {
+    let Some(secs) = seconds else {
+        return Ok(None);
+    };
+    let floor = expiration_floor(config);
+    if secs < floor {
+        return Err(AppError::Unprocessable(format!(
+            "expires_in must be at least {floor} seconds"
+        )));
+    }
+    TimeDelta::try_seconds(secs)
+        .and_then(|span| Utc::now().checked_add_signed(span))
+        .map(Some)
+        .ok_or_else(|| AppError::Unprocessable(EXPIRATION_TOO_LARGE.to_owned()))
+}
+
 /// What reading a status text came to: the HTML to store, and the two
 /// entity lists that go with it in the order the text carries them.
 #[derive(Debug)]
@@ -398,9 +466,13 @@ pub async fn create_status(
     created_entity(state, user, row).await
 }
 
-/// The shared tail of both create arms: the fresh row's log line, its
+/// The shared tail of both create arms: the fresh row's log line, the
+/// [`statuses.expire`](crate::jobs::statuses::KIND_EXPIRE) job a row carrying
+/// an expiry schedules for itself (see [`schedule_expiration`]), its
 /// [`Status`] entity as `user` — the author — sees it, and the
 /// [`after_status_created`] hook every consumer of a new post hangs off.
+///
+/// [`schedule_expiration`]: crate::jobs::statuses::schedule_expiration
 ///
 /// # Errors
 ///
@@ -415,6 +487,7 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
         visibility = %row.visibility,
         "status created"
     );
+    crate::jobs::statuses::schedule_expiration(state, &row).await;
     let entity = render_status(state, Some(user), &row)
         .await?
         // Unreachable for what was written a moment ago — live, local and no
@@ -655,7 +728,7 @@ fn preview_row(
         quotes_count: 0,
         edited_at: None,
         deleted_at: None,
-        expires_at: None,
+        expires_at: checked.expires_at,
         inserted_at: now,
         updated_at: now,
     }
@@ -754,6 +827,7 @@ fn new_status(
         sensitive: checked.sensitive,
         visibility: checked.visibility,
         language: checked.language.map(str::to_owned),
+        expires_at: checked.expires_at,
         mentioned_user_ids: entities.mentioned_user_ids.clone(),
         hashtags: entities.hashtags.clone(),
         local: true,
@@ -827,8 +901,12 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         language: params.language.clone().or_else(|| row.language.clone()),
         content_type: kept(params.content_type.clone(), || row.content_type.clone()),
         // An edit is never a preview and never replays: the create's two
-        // decision parameters have no part in this merge.
+        // decision parameters have no part in this merge. An edit never
+        // moves the expiry either — `expires_in` is a creation parameter,
+        // the stored `expires_at` rides along untouched (Pleroma's
+        // `make_update_data` carries it forward the same way).
         preview: None,
+        expires_in: None,
     }
 }
 
@@ -2441,5 +2519,111 @@ mod tests {
             "not one refused preview wrote a row"
         );
         assert_eq!(key_rows(pool).await, 0, "or claimed a key");
+    }
+
+    /// Pleroma's `expires_in`: the accepted span becomes the exact instant
+    /// it counts out from now, the floor itself passes, and no expiry at
+    /// all — absent or null — is no `expires_at`.
+    #[test]
+    fn an_expires_in_becomes_the_instant_it_counts_out() {
+        let absent = params(json!({"status": "hi"}));
+        assert_eq!(accepted(&absent).expires_at, None, "no key, no expiry");
+        let null = params(json!({"status": "hi", "expires_in": null}));
+        assert_eq!(accepted(&null).expires_at, None, "and null is as absent");
+
+        for secs in [600_i64, 3_600, 86_400] {
+            let before = Utc::now();
+            let body = params(json!({"status": "hi", "expires_in": secs}));
+            let due = accepted(&body)
+                .expires_at
+                .unwrap_or_else(|| panic!("{secs} seconds is an expiry"));
+            let span = due - before;
+            assert!(
+                (TimeDelta::seconds(secs) - span).num_seconds().abs() <= 1,
+                "{secs} seconds lands within a second of the span it names"
+            );
+        }
+    }
+
+    /// Under the floor, over the calendar: the two 422s `expires_in` owes,
+    /// in the wording the ticket pins for the first and naming the value
+    /// from the configuration.
+    #[test]
+    fn the_floor_and_the_calendar_refuse_the_expirations_they_cannot_take() {
+        for secs in [-1_i64, 0, 1, 599] {
+            let body = params(json!({"status": "hi", "expires_in": secs}));
+            assert_eq!(
+                rejection(&body),
+                "expires_in must be at least 600 seconds",
+                "{secs} is under the stock 600-second floor"
+            );
+        }
+        let body = params(json!({"status": "hi", "expires_in": i64::MAX}));
+        assert_eq!(
+            rejection(&body),
+            EXPIRATION_TOO_LARGE,
+            "a span no timestamp can hold is a mistake, not a distant expiry"
+        );
+    }
+
+    /// The refusal is generated from `MIN_EXPIRATION_SECS`: an instance
+    /// that lowered the floor names its own number and takes its own
+    /// minimum.
+    #[test]
+    fn the_message_names_this_instances_floor() {
+        let config = Config {
+            min_expiration_secs: 120,
+            ..Config::for_tests()
+        };
+        let checked = |secs: i64| {
+            let body = params(json!({"status": "hi", "expires_in": secs}));
+            check_body(&config, "public", false, &body)
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        };
+        assert!(checked(120).is_ok(), "the configured floor itself passes");
+        assert_eq!(
+            checked(119).expect_err("one under it does not"),
+            "expires_in must be at least 120 seconds",
+            "and the message says the configured number, not the shipped one"
+        );
+        let stock = params(json!({"status": "hi", "expires_in": 120}));
+        assert_eq!(
+            check_body(&Config::for_tests(), "public", false, &stock)
+                .expect_err("the stock floor still refuses it")
+                .to_string(),
+            "expires_in must be at least 600 seconds",
+            "the default config keeps the default message"
+        );
+    }
+
+    /// The `flex` reading of the parameter: a form body's numeric string is
+    /// the same expiry as JSON's number, and everything that is no integer
+    /// at all — text, a boolean, a fraction, a container — is the
+    /// extractor's 422 before any service runs.
+    #[test]
+    fn only_integers_deserialize_and_a_numeric_string_counts_as_one() {
+        let body = params(json!({"status": "hi", "expires_in": "3600"}));
+        assert!(
+            accepted(&body).expires_at.is_some(),
+            "`expires_in=3600` from a form body is an expiry"
+        );
+        for value in [
+            json!("soon"),
+            json!(""),
+            json!("60.5"),
+            json!(60.5),
+            json!(true),
+            json!([3600]),
+            json!({"secs": 3600}),
+        ] {
+            let parsed = crate::extract::into_params::<CreateStatusParams>(
+                json!({"status": "hi", "expires_in": value}),
+            );
+            assert!(
+                parsed.is_err(),
+                "`{value}` is no integer and must not deserialize"
+            );
+        }
     }
 }
