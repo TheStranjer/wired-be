@@ -209,11 +209,13 @@ const FIRST_ADMIN_SQL: &str = "SELECT * FROM users
 /// [`list_peers`]: the distinct hosts of the remote actors mirrored here
 /// — local rows carry no `domain` (decision 7), so "not null" is
 /// "remote". Sorted and capped at [`PEER_LIMIT`] rows; Pleroma reads the
-/// same distinct hosts through its `Pleroma.Stats` `GenServer`.
-const PEERS_SQL: &str = "SELECT DISTINCT domain FROM users
+/// same distinct hosts through its `Pleroma.Stats` `GenServer`. The sort
+/// is pinned to the `"C"` collation (byte order) so the answer, and which
+/// hosts the cap cuts off, does not depend on the database's locale.
+const PEERS_SQL: &str = r#"SELECT DISTINCT domain COLLATE "C" AS domain FROM users
       WHERE domain IS NOT NULL
-  ORDER BY domain
-        LIMIT $1";
+  ORDER BY 1
+        LIMIT $1"#;
 
 /// The `/api/v1/instance` router, merged into [`crate::api::v1`]: the
 /// instance document and the sub-resources hung beside it.
