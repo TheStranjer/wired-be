@@ -266,6 +266,12 @@ pub struct User {
     /// flow (a later ticket) sets it, and completing a password reset
     /// clears it again. `check_account_ready` refuses a pending account.
     pub password_reset_pending: Flag,
+    /// When the account started its deletion (`POST
+    /// /api/pleroma/delete_account`, see [`mark_deleted`]); `None` while
+    /// it lives. The row is kept for referential integrity even after the
+    /// purge; this is what tells a deleted account from a merely
+    /// deactivated one.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
@@ -341,6 +347,7 @@ impl fmt::Debug for User {
             .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
             .field("password_reset_pending", &self.password_reset_pending)
+            .field("deleted_at", &self.deleted_at)
             .finish()
     }
 }
@@ -1235,6 +1242,137 @@ where
     sqlx::query(SET_PASSWORD_SQL)
         .bind(id)
         .bind(password_hash)
+        .execute(executor)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_email`]: writes the new address and the
+/// confirmed flag together and refreshes `updated_at`.
+const SET_EMAIL_SQL: &str =
+    "UPDATE users SET email = $2, email_confirmed = $3, updated_at = now() WHERE id = $1";
+
+/// Stores `email` as user `id`'s [`email`](User::email) and
+/// [`email_confirmed`](User::email_confirmed): the write
+/// `POST /api/pleroma/change_email` performs.
+///
+/// The caller decides the flag — the address stays confirmed unless the
+/// instance requires account confirmation (see
+/// [`Config::account_activation_required`]).
+///
+/// [`Config::account_activation_required`]: crate::config::Config::account_activation_required
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_email(
+    pool: &PgPool,
+    id: Uuid,
+    email: &str,
+    email_confirmed: bool,
+) -> AppResult<()> {
+    sqlx::query(SET_EMAIL_SQL)
+        .bind(id)
+        .bind(email)
+        .bind(Flag::new(email_confirmed))
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`set_activation`]: flips `is_active` and refreshes
+/// `updated_at`, leaving every other column alone.
+const SET_ACTIVATION_SQL: &str =
+    "UPDATE users SET is_active = $2, updated_at = now() WHERE id = $1";
+
+/// Sets user `id`'s [`is_active`](User::is_active) flag: the write
+/// `POST /api/pleroma/disable_account` performs.
+///
+/// `false` is Pleroma's `User.set_activation(user, false)` — the account
+/// stops signing in and the entity reads as suspended — and every other
+/// column stays untouched: unlike [`mark_deleted`], this writes no
+/// deletion time and queues no sweep.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_activation<'e, E>(executor: E, id: Uuid, active: bool) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(SET_ACTIVATION_SQL)
+        .bind(id)
+        .bind(Flag::new(active))
+        .execute(executor)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`mark_deleted`]: deactivates the account and
+/// stamps `deleted_at` in one statement, refreshing `updated_at`.
+const MARK_DELETED_SQL: &str = "UPDATE users
+       SET is_active = false,
+           deleted_at = now(),
+           updated_at = now()
+     WHERE id = $1";
+
+/// Deactivates user `id` and stamps [`deleted_at`](User::deleted_at): the
+/// mark `POST /api/pleroma/delete_account` puts on the account.
+///
+/// The row itself stays — see [`purge_personal_data`] for the state its
+/// [`users.delete`](crate::jobs::deletion::KIND_DELETE) job leaves behind.
+///
+/// Runs on the caller's executor (or any transaction), so the endpoint can
+/// land the mark together with the token revocation.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn mark_deleted<'e, E>(executor: E, id: Uuid) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(MARK_DELETED_SQL)
+        .bind(id)
+        .execute(executor)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The `UPDATE` behind [`purge_personal_data`]: nulls the two personal
+/// columns, blanks the display name, and refreshes `updated_at`.
+const PURGE_PERSONAL_DATA_SQL: &str = "UPDATE users
+       SET email = NULL,
+           password_hash = NULL,
+           name = '',
+           updated_at = now()
+     WHERE id = $1";
+
+/// Replaces user `id`'s personal data with empty values: the final step of
+/// the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
+///
+/// Email, password hash and display name are the account's person data —
+/// the three go, the row stays (decision 7: other tables and mirrored
+/// actors reference it), and nothing that was said about the account can
+/// be attributed to a person any more.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn purge_personal_data<'e, E>(executor: E, id: Uuid) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(PURGE_PERSONAL_DATA_SQL)
+        .bind(id)
         .execute(executor)
         .await
         .map(drop)?;

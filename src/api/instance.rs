@@ -1270,8 +1270,10 @@ impl ExtendedDescription {
 
 /// The lowercase hex `SHA-256` of `text` — Mastodon's domain-block
 /// digest: Pleroma's renderer writes it as `:crypto.hash(:sha256, host)`
-/// encoded with `Base.encode16(case: :lower)`.
-fn sha256_hex(text: &str) -> String {
+/// encoded with `Base.encode16(case: :lower)`. Also what
+/// [`crate::api::pleroma_account_settings`] derives email-confirmation
+/// tokens from.
+pub(crate) fn sha256_hex(text: &str) -> String {
     let mut hex = String::with_capacity(Sha256::output_size() * 2);
     for &byte in &Sha256::digest(text.as_bytes()) {
         hex.push(hex_digit(byte >> 4));

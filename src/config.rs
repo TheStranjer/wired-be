@@ -94,6 +94,12 @@ pub const OAUTH_TOKEN_TTL_SECS_VAR: &str = "OAUTH_TOKEN_TTL_SECS";
 /// Environment variable holding the lifetime of a password-reset token,
 /// in seconds.
 pub const PASSWORD_RESET_TTL_SECS_VAR: &str = "PASSWORD_RESET_TTL_SECS";
+/// Environment variable holding whether accounts must confirm the email
+/// address they carry.
+pub const ACCOUNT_ACTIVATION_REQUIRED_VAR: &str = "ACCOUNT_ACTIVATION_REQUIRED";
+/// Environment variable holding whether accounts may delete their own
+/// account through `POST /api/pleroma/delete_account`.
+pub const ALLOW_ACCOUNT_DELETION_VAR: &str = "ALLOW_ACCOUNT_DELETION";
 /// Environment variable holding whether the `MongooseIM` auth endpoints
 /// (`GET /user_exists`, `GET /check_password`) are served.
 pub const MONGOOSEIM_ENABLED_VAR: &str = "MONGOOSEIM_ENABLED";
@@ -323,6 +329,17 @@ pub const DEFAULT_OAUTH_TOKEN_TTL_SECS: usize = 2_592_000;
 /// unset: `86_400` seconds, 24 hours — Pleroma's
 /// `[:instance, :password_reset_token_validity]` default.
 pub const DEFAULT_PASSWORD_RESET_TTL_SECS: usize = 86_400;
+/// Email-confirmation state used when `ACCOUNT_ACTIVATION_REQUIRED` is
+/// unset: no confirmation required.
+///
+/// This server activates accounts at registration, so nothing asks an
+/// account to confirm its address — until the account changes it on an
+/// instance that turns confirmation on.
+pub const DEFAULT_ACCOUNT_ACTIVATION_REQUIRED: bool = false;
+/// Account-deletion state used when `ALLOW_ACCOUNT_DELETION` is unset:
+/// `POST /api/pleroma/delete_account` is offered, as Pleroma offers
+/// `UtilController.delete_account`; closing it is the operator's call.
+pub const DEFAULT_ALLOW_ACCOUNT_DELETION: bool = true;
 /// `MongooseIM` auth endpoint state used when `MONGOOSEIM_ENABLED` is
 /// unset: the endpoints answer the standard fallback 404 until an operator
 /// turns them on for their `extauth` backend.
@@ -844,6 +861,17 @@ pub struct Config {
     /// its `inserted_at` is within this window (see
     /// [`crate::models::password_reset`]).
     pub password_reset_ttl_secs: usize,
+    /// Whether accounts must confirm the email address they carry, from
+    /// `ACCOUNT_ACTIVATION_REQUIRED` (Pleroma's `[:account_activation,
+    /// :required]`). While on, `POST /api/pleroma/change_email` resets the
+    /// account's `email_confirmed` flag and queues a confirmation letter
+    /// for the new address (see [`crate::api::pleroma_account_settings`]).
+    pub account_activation_required: Toggle,
+    /// Whether accounts may delete their own account, from
+    /// `ALLOW_ACCOUNT_DELETION`. While off, `POST /api/pleroma/delete_account`
+    /// answers 403 `{"error":"Account deletion is disabled"}` (see
+    /// [`crate::api::pleroma_account_settings`]).
+    pub allow_account_deletion: Toggle,
     /// Whether the `MongooseIM` auth endpoints (`GET /user_exists`,
     /// `GET /check_password`) are served, from `MONGOOSEIM_ENABLED`. See
     /// [`crate::api::misc`].
@@ -1012,6 +1040,8 @@ impl Config {
             min_password_length: auth.min_password_length,
             oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
             password_reset_ttl_secs: auth.password_reset_ttl_secs,
+            account_activation_required: auth.account_activation_required,
+            allow_account_deletion: auth.allow_account_deletion,
             mongooseim_enabled,
             captcha_enabled,
             healthcheck_enabled,
@@ -1129,6 +1159,8 @@ impl Config {
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
             oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
             password_reset_ttl_secs: DEFAULT_PASSWORD_RESET_TTL_SECS,
+            account_activation_required: Toggle::new(DEFAULT_ACCOUNT_ACTIVATION_REQUIRED),
+            allow_account_deletion: Toggle::new(DEFAULT_ALLOW_ACCOUNT_DELETION),
             mongooseim_enabled: Toggle::new(DEFAULT_MONGOOSEIM_ENABLED),
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
@@ -1383,9 +1415,9 @@ fn default_mail_from(domain: &str) -> String {
     format!("{DEFAULT_MAIL_FROM_USER}@{host}")
 }
 
-/// What [`auth_settings`] reads: the five settings that gate registration,
-/// token issuance, password resets and the external logins, in [`Config`]
-/// field order.
+/// What [`auth_settings`] reads: the seven settings that gate
+/// registration, token issuance, password resets, the external logins,
+/// email confirmation and account deletion, in [`Config`] field order.
 #[derive(Debug)]
 struct AuthSettings {
     /// Whether registration may omit the email address
@@ -1397,14 +1429,20 @@ struct AuthSettings {
     oauth_token_ttl_secs: usize,
     /// The password-reset token lifetime (`PASSWORD_RESET_TTL_SECS`).
     password_reset_ttl_secs: usize,
+    /// Whether accounts must confirm their email address
+    /// (`ACCOUNT_ACTIVATION_REQUIRED`).
+    account_activation_required: Toggle,
+    /// Whether `POST /api/pleroma/delete_account` is offered
+    /// (`ALLOW_ACCOUNT_DELETION`).
+    allow_account_deletion: Toggle,
     /// The external login providers (`OAUTH_PROVIDERS`).
     oauth_providers: Vec<OauthProvider>,
 }
 
-/// Reads the five settings that gate registration, token issuance, password
-/// resets and the external logins. Grouped because each is a plain
-/// default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md).
+/// Reads the seven settings that gate registration, token issuance,
+/// password resets, the external logins, email confirmation and account
+/// deletion. Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md).
 fn auth_settings<F>(lookup: &F) -> Result<AuthSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -1425,11 +1463,25 @@ where
         PASSWORD_RESET_TTL_SECS_VAR,
         DEFAULT_PASSWORD_RESET_TTL_SECS,
     )?;
+    let account_activation_required = boolean(
+        lookup,
+        ACCOUNT_ACTIVATION_REQUIRED_VAR,
+        DEFAULT_ACCOUNT_ACTIVATION_REQUIRED,
+    )?
+    .into();
+    let allow_account_deletion = boolean(
+        lookup,
+        ALLOW_ACCOUNT_DELETION_VAR,
+        DEFAULT_ALLOW_ACCOUNT_DELETION,
+    )?
+    .into();
     Ok(AuthSettings {
         accounts_email_optional,
         min_password_length,
         oauth_token_ttl_secs,
         password_reset_ttl_secs,
+        account_activation_required,
+        allow_account_deletion,
         oauth_providers: oauth_providers(lookup)?,
     })
 }
@@ -1980,6 +2032,11 @@ impl fmt::Debug for Config {
             .field("min_password_length", &self.min_password_length)
             .field("oauth_token_ttl_secs", &self.oauth_token_ttl_secs)
             .field("password_reset_ttl_secs", &self.password_reset_ttl_secs)
+            .field(
+                "account_activation_required",
+                &self.account_activation_required,
+            )
+            .field("allow_account_deletion", &self.allow_account_deletion)
             .field("mongooseim_enabled", &self.mongooseim_enabled)
             .field("captcha_enabled", &self.captcha_enabled)
             .field("healthcheck_enabled", &self.healthcheck_enabled)
@@ -3190,6 +3247,69 @@ mod tests {
             err.to_string()
                 .starts_with(&format!("invalid {ACCOUNTS_EMAIL_OPTIONAL_VAR}: ")),
             "message names the variable"
+        );
+    }
+
+    /// Email confirmation: off by default (this server activates accounts
+    /// at registration), every boolean spelling read, junk refused.
+    #[test]
+    fn account_activation_required_defaults_off_and_parses_booleans() {
+        assert!(
+            !config_with(&[]).account_activation_required.get(),
+            "no account must confirm its email by default"
+        );
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", false),
+        ] {
+            let config = config_with(&[(ACCOUNT_ACTIVATION_REQUIRED_VAR, value)]);
+            assert_eq!(
+                config.account_activation_required.get(),
+                want,
+                "ACCOUNT_ACTIVATION_REQUIRED={value:?} means {want}"
+            );
+        }
+        let err = try_config_with(&[(ACCOUNT_ACTIVATION_REQUIRED_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(ACCOUNT_ACTIVATION_REQUIRED_VAR),
+            "error variant"
+        );
+    }
+
+    /// Account deletion: offered by default (Pleroma offers the endpoint),
+    /// every boolean spelling read, junk refused.
+    #[test]
+    fn allow_account_deletion_defaults_on_and_parses_booleans() {
+        assert!(
+            config_with(&[]).allow_account_deletion.get(),
+            "accounts may delete themselves by default"
+        );
+        for (value, want) in [
+            ("true", true),
+            ("1", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", true),
+        ] {
+            let config = config_with(&[(ALLOW_ACCOUNT_DELETION_VAR, value)]);
+            assert_eq!(
+                config.allow_account_deletion.get(),
+                want,
+                "ALLOW_ACCOUNT_DELETION={value:?} means {want} (blank falls back)"
+            );
+        }
+        let err = try_config_with(&[(ALLOW_ACCOUNT_DELETION_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(ALLOW_ACCOUNT_DELETION_VAR),
+            "error variant"
         );
     }
 

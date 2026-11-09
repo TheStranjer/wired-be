@@ -1,10 +1,14 @@
-//! Account aliases and account moves: `/api/pleroma/aliases` and
-//! `/api/pleroma/move_account` (WBE-137), Pleroma's `UtilController`
-//! account-utilities actions.
+//! Account utilities: aliases, moves, credentials and departure.
 //!
-//! The reference is `list_aliases`, `add_alias`, `delete_alias` and
-//! `move_account` in `lib/pleroma/web/pleroma_api/controllers/
-//! util_controller.ex`, with the state change behind Pleroma's
+//! `/api/pleroma/aliases`, `/api/pleroma/move_account` (WBE-137) plus
+//! `/api/pleroma/change_password`, `/api/pleroma/change_email`,
+//! `/api/pleroma/delete_account` and `/api/pleroma/disable_account`
+//! (WBE-136), Pleroma's `UtilController` actions.
+//!
+//! The reference is `list_aliases`, `add_alias`, `delete_alias`,
+//! `move_account`, `change_password`, `change_email`, `delete_account` and
+//! `disable_account` in `lib/pleroma/web/pleroma_api/controllers/
+//! util_controller.ex`, with the state changes behind Pleroma's
 //! `ActivityPub.move/3`
 //! (`lib/pleroma/web/activity_pub/activity_pub.ex`) and
 //! `FollowingRelationship.move_following/2`. The ticket shapes are
@@ -12,12 +16,12 @@
 //!
 //! Every route requires a user token ([`AuthUser`]): `GET` asks the
 //! `read:accounts` scope, everything that changes state the
-//! `write:accounts` scope. State lives in three `users` columns —
-//! `also_known_as` (the alias list of `ActivityPub` actor ids),
-//! `moved_to_ap_id` (the entity's top-level `moved`) and `last_move_at`
-//! (the move cooldown) — written through
-//! [`set_also_known_as`](crate::models::user::set_also_known_as) and
-//! [`mark_moved`](crate::models::user::mark_moved).
+//! `write:accounts` scope. The state lives in the `users` columns each
+//! action owns — `also_known_as` (the alias list of `ActivityPub` actor
+//! ids), `moved_to_ap_id` and `last_move_at` (the move and its cooldown),
+//! `password_hash`, `email` with `email_confirmed`, and `is_active` with
+//! `deleted_at` (the departure pair) — written through the model writers
+//! in [`crate::models::user`] and [`crate::models::oauth_token`].
 //!
 //! The endpoints:
 //!
@@ -47,6 +51,43 @@
 //!   `last_move_at`) is checked at the same 200-with-error shape. Once
 //!   every gate passes the account is marked moved, its followers
 //!   transfer, and the `after_account_moved` hook runs.
+//! - `POST /api/pleroma/change_password` — `password`, `new_password`
+//!   and `new_password_confirmation`: after the password gate, the
+//!   new password's confirmation and length are checked at the same
+//!   200-with-error shape (`"New password does not match confirmation."`
+//!   and `"Password too short."` — the ticket's wording for Pleroma's
+//!   `change_password` refusals). A pass stores the new Argon2id hash and
+//!   revokes every one of the account's other OAuth tokens, keeping the
+//!   credential the request authenticated with; `{"status":"success"}`.
+//! - `POST /api/pleroma/change_email` — `password` and `email`: after the
+//!   password gate the address must look like `x@y.z` (200 `"Email has
+//!   invalid format."`) and belong to no other account (200 `"Email has
+//!   already been taken"`, the ticket's spelling of Pleroma's changeset
+//!   message). The write stores the address; on an instance that requires
+//!   account confirmation
+//!   ([`account_activation_required`](crate::config::Config::account_activation_required))
+//!   the account becomes unconfirmed and a confirmation letter for the
+//!   new address is queued; `{"status":"success"}`.
+//! - `POST /api/pleroma/delete_account` — `password`: while
+//!   [`allow_account_deletion`](crate::config::Config::allow_account_deletion)
+//!   is off the endpoint answers 403 `{"error":"Account deletion is
+//!   disabled"}` before any other gate. A pass marks the account inactive
+//!   with `deleted_at` stamped, revokes all its tokens (the presenting
+//!   credential included) and enqueues the
+//!   [`users.delete`](crate::jobs::deletion::KIND_DELETE) job on the
+//!   background queue, which tombstones the account's statuses, deletes
+//!   its follows, favourites, bookmarks, notifications, lists and media
+//!   rows, and blanks the personal data of the kept row (decision 7:
+//!   other tables still reference the id); `{"status":"success"}`.
+//! - `POST /api/pleroma/disable_account` — `password`: deactivates the
+//!   account (`is_active = false`, no `deleted_at`, every datum kept) and
+//!   revokes all its tokens; `{"status":"success"}`. Pleroma's
+//!   `User.set_activation(user, false)`.
+//!
+//! The four utilities above all take the account's current `password`,
+//! verified against the stored hash exactly like `move_account` does: no
+//! hash on the row, or a mismatch, is the same 200 `"Invalid password."`,
+//! and every state change runs only past that gate.
 //!
 //! The follower transfer mirrors Pleroma's `move_following`: every
 //! *local* follower with an accepted relationship that still allows its
@@ -59,7 +100,9 @@
 //!
 //! Federation of the `Move` activity and the move notifications are not
 //! part of this ticket; they attach to the `after_account_moved` hook
-//! later.
+//! later. The federated `Delete` of a deleted account's actor attaches to
+//! the `after_account_deleted` hook with the ticket that owns the outbox
+//! pipeline.
 //!
 //! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
 //! [`get_or_fetch_by_ap_id`]: crate::federation::fetch_actor::get_or_fetch_by_ap_id
@@ -77,18 +120,23 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::{
+    api::instance::sha256_hex,
     auth::AuthUser,
     entities::account::full_nickname,
     error::{AppError, AppResult},
     extract::ApiBody,
     federation::fetch_actor::{get_or_fetch_by_acct, get_or_fetch_by_ap_id},
+    jobs::{QUEUE_BACKGROUND, deletion},
+    mailer::{self, templates},
     models::{
         follow,
-        user::{self, User, get_by_ap_id},
+        job::{NewJob, enqueue},
+        oauth_token,
+        user::{self, User, get_by_ap_id, get_by_email},
     },
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
     state::AppState,
-    util::password::verify_password,
+    util::password::{hash_password, verify_password},
 };
 
 /// 200 error body when the submitted password does not match the stored
@@ -96,6 +144,29 @@ use crate::{
 /// `move_account` renders it through `json(conn, %{error: msg})`, which
 /// is why these failures are 200s, not 4xx).
 const INVALID_PASSWORD: &str = "Invalid password.";
+/// 200 error body when the new password of `change_password` differs
+/// from its confirmation (Pleroma's `:password_confirmation` refusal).
+const PASSWORD_MISMATCH: &str = "New password does not match confirmation.";
+/// 200 error body when the new password of `change_password` is shorter
+/// than [`min_password_length`](crate::config::Config::min_password_length)
+/// (the ticket's wording for Pleroma's password-length changeset error).
+const PASSWORD_TOO_SHORT: &str = "Password too short.";
+/// 200 error body when the new address of `change_email` does not look
+/// like `x@y.z` (Pleroma's `validate_format` error, rendered as
+/// `"Email #{error}."`).
+const EMAIL_INVALID_FORMAT: &str = "Email has invalid format.";
+/// 200 error body when another account already carries the new address of
+/// `change_email` (the ticket's spelling of Pleroma's `unique_constraint`
+/// message, no period).
+const EMAIL_TAKEN: &str = "Email has already been taken";
+/// 403 error body of `delete_account` on an instance that switched
+/// account deletion off (the ticket's wording, no period).
+const DELETION_DISABLED: &str = "Account deletion is disabled";
+/// Path a `change_email` confirmation letter links to, before the
+/// account id and its confirmation token. The endpoint that consumes the
+/// token is the later confirmation ticket's; the address is fixed here so
+/// a letter already sent keeps pointing at it.
+const CONFIRM_EMAIL_PATH: &str = "/api/pleroma/account/confirm_email";
 /// 404 error body when the move target cannot be resolved (Pleroma's
 /// `move_account` `:not_found` branch, period included).
 const TARGET_NOT_FOUND: &str = "Target account not found.";
@@ -122,6 +193,10 @@ pub fn router() -> Router<AppState> {
             get(list_aliases).put(add_alias).delete(delete_alias),
         )
         .route("/move_account", post(move_account))
+        .route("/change_password", post(change_password))
+        .route("/change_email", post(change_email))
+        .route("/delete_account", post(delete_account))
+        .route("/disable_account", post(disable_account))
 }
 
 /// The `{"aliases": […]}` body of [`list_aliases`].
@@ -155,6 +230,64 @@ impl fmt::Debug for MoveParams {
         f.debug_struct("MoveParams")
             .field("password", &"<redacted>")
             .field("target_account", &self.target_account)
+            .finish()
+    }
+}
+
+/// The parameters of `POST /api/pleroma/change_password`.
+#[derive(Deserialize)]
+struct ChangePasswordParams {
+    /// The account's current password; secret material.
+    password: String,
+    /// The password to store; secret material.
+    new_password: String,
+    /// The repeated [`new_password`](Self::new_password); secret material.
+    new_password_confirmation: String,
+}
+
+/// All three fields are secret material and render as `<redacted>`.
+impl fmt::Debug for ChangePasswordParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChangePasswordParams")
+            .field("password", &"<redacted>")
+            .field("new_password", &"<redacted>")
+            .field("new_password_confirmation", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The parameters of `POST /api/pleroma/change_email`.
+#[derive(Deserialize)]
+struct ChangeEmailParams {
+    /// The account's current password; secret material.
+    password: String,
+    /// The address to store.
+    email: String,
+}
+
+/// `Debug` redacts the password.
+impl fmt::Debug for ChangeEmailParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChangeEmailParams")
+            .field("password", &"<redacted>")
+            .field("email", &self.email)
+            .finish()
+    }
+}
+
+/// The parameters of `POST /api/pleroma/delete_account` and
+/// `POST /api/pleroma/disable_account`: the credential gate, alone.
+#[derive(Deserialize)]
+struct PasswordParams {
+    /// The account's current password; secret material.
+    password: String,
+}
+
+/// `Debug` redacts the password.
+impl fmt::Debug for PasswordParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordParams")
+            .field("password", &"<redacted>")
             .finish()
     }
 }
@@ -420,6 +553,243 @@ async fn transfer_followers(state: &AppState, origin: &User, target: &User) -> A
 /// outbox pipeline. Later tickets replace the body, not the call sites.
 const fn after_account_moved(_state: &AppState, _old: &User, _new: &User) {}
 
+/// The hook the deletion runs once the account is marked deleted, its
+/// tokens revoked and its [`users.delete`](deletion::KIND_DELETE) sweep
+/// queued. It is deliberately empty: federating the actor's `Delete`
+/// (Pleroma's `ActivityPub.delete`) attaches here with the federation
+/// ticket that owns the outbox pipeline. Later tickets replace the body,
+/// not the call site.
+const fn after_account_deleted(_state: &AppState, _account: &User) {}
+
+/// `POST /api/pleroma/change_password` — set a new password. The gates
+/// run in order — the current password, then the confirmation, then the
+/// length; every refusal is a 200 error body, as Pleroma renders them —
+/// and a pass stores the new Argon2id hash and revokes every one of the
+/// account's *other* OAuth tokens in one transaction. The credential the
+/// request authenticated with keeps working; the password it was minted
+/// for no longer exists, so every other client must log in again.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check. A wrong password, a mismatching
+/// confirmation or a too-short new one answer with the 200 error bodies.
+/// A hashing failure arrives through `?` as [`AppError::Internal`], any
+/// database failure as [`AppError::Database`].
+async fn change_password(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<ChangePasswordParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !password_accepted(&auth.0, &params.password) {
+        return Ok(error_body(INVALID_PASSWORD));
+    }
+    if params.new_password != params.new_password_confirmation {
+        return Ok(error_body(PASSWORD_MISMATCH));
+    }
+    if params.new_password.chars().count() < state.config.min_password_length {
+        return Ok(error_body(PASSWORD_TOO_SHORT));
+    }
+    let hash = hash_password(&params.new_password)?;
+    let revoked = write_password_and_revoke(&state, &auth, &hash).await?;
+    debug!(account = %auth.0.nickname, revoked, "password changed: other tokens revoked");
+    Ok(success_body())
+}
+
+/// The `change_password` write: the new hash and the revocation of every
+/// token but the request's own, as one transaction — half of it is never
+/// a state an account is left in.
+async fn write_password_and_revoke(
+    state: &AppState,
+    auth: &AuthUser,
+    hash: &str,
+) -> AppResult<u64> {
+    let mut tx = state.db.begin().await?;
+    user::set_password(&mut *tx, auth.0.id, hash).await?;
+    let revoked = oauth_token::delete_all_for_user_except(&mut *tx, auth.0.id, auth.1.id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
+/// `POST /api/pleroma/change_email` — set a new address. After the
+/// password gate the trimmed address must look like `x@y.z` and belong
+/// to no other account — both refusals are the endpoint's 200 error
+/// bodies. The write stores the address; when the instance requires
+/// email confirmation the account becomes unconfirmed and a confirmation
+/// letter for the new address is queued (dropped silently while no SMTP
+/// relay is configured, see [`crate::mailer`]).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check. The password, format and uniqueness
+/// refusals are 200 error bodies. Any database failure arrives through
+/// `?` as [`AppError::Database`].
+async fn change_email(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<ChangeEmailParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !password_accepted(&auth.0, &params.password) {
+        return Ok(error_body(INVALID_PASSWORD));
+    }
+    let email = params.email.trim();
+    if !user::register::is_plausible_email(email) {
+        return Ok(error_body(EMAIL_INVALID_FORMAT));
+    }
+    if email_is_taken(&state, &auth.0, email).await? {
+        return Ok(error_body(EMAIL_TAKEN));
+    }
+    let confirmed = !state.config.account_activation_required.get();
+    user::set_email(&state.db, auth.0.id, email, confirmed).await?;
+    if !confirmed {
+        send_confirmation_mail(&state, &auth.0, email).await?;
+    }
+    debug!(account = %auth.0.nickname, confirmed, "email changed");
+    Ok(success_body())
+}
+
+/// Whether `email` (already format-checked) is carried by an account
+/// other than `account`: the citext column folds case, so "taken" means
+/// taken in any spelling, while the account's own address is never
+/// somebody else's taken.
+async fn email_is_taken(state: &AppState, account: &User, email: &str) -> AppResult<bool> {
+    Ok(get_by_email(&state.db, email)
+        .await?
+        .is_some_and(|holder| holder.id != account.id))
+}
+
+/// Queues the letter [`change_email`] sends a confirmation-requiring
+/// instance: the registration-confirmation template addressed to the new
+/// email, linking to [`CONFIRM_EMAIL_PATH`] with the account id and its
+/// [`confirmation_token`].
+async fn send_confirmation_mail(state: &AppState, account: &User, email: &str) -> AppResult<()> {
+    let link = format!(
+        "{}/{}/{}",
+        CONFIRM_EMAIL_PATH,
+        account.id,
+        confirmation_token(account, email)
+    );
+    mailer::deliver_later(
+        state,
+        templates::registration_confirmation(&state.config, email, &link),
+    )
+    .await
+}
+
+/// The email-confirmation token for `email`: the lowercase hex `SHA-256`
+/// of the account id, the address and the account's creation time. It is
+/// derived rather than stored — the confirmation ticket that serves the
+/// link can re-derive it from the row it reads, and because the address
+/// is part of the digest, changing the email again invalidates the
+/// letters already sent.
+#[must_use]
+fn confirmation_token(account: &User, email: &str) -> String {
+    sha256_hex(&format!(
+        "{}|{email}|{}",
+        account.id,
+        account.inserted_at.to_rfc3339()
+    ))
+}
+
+/// `POST /api/pleroma/delete_account` — start deleting the account. The
+/// config gate comes first: on an instance that switched deletion off
+/// the endpoint answers 403 `{"error":"Account deletion is disabled"}`
+/// whatever else the request said. Past it, the password gate, then the
+/// start: the account is deactivated with `deleted_at` stamped and all
+/// its tokens — the presenting one included — revoked in one transaction,
+/// the [`users.delete`](deletion::KIND_DELETE) sweep is queued on
+/// [`QUEUE_BACKGROUND`], and [`after_account_deleted`] runs.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`],
+/// the `write:accounts` check and the config gate. A wrong password is
+/// the 200 error body. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn delete_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<PasswordParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !state.config.allow_account_deletion.get() {
+        return Err(AppError::Forbidden(DELETION_DISABLED.to_owned()));
+    }
+    if !password_accepted(&auth.0, &params.password) {
+        return Ok(error_body(INVALID_PASSWORD));
+    }
+    let revoked = mark_and_revoke_all(&state, &auth.0).await?;
+    let queued = enqueue(
+        &state.db,
+        NewJob {
+            queue: QUEUE_BACKGROUND,
+            kind: deletion::KIND_DELETE,
+            args: deletion::job_args(auth.0.id),
+            run_at: None,
+            max_attempts: None,
+            unique_key: None,
+        },
+    )
+    .await?;
+    debug!(
+        account = %auth.0.nickname,
+        revoked,
+        queued = queued.is_some(),
+        "account deletion started"
+    );
+    after_account_deleted(&state, &auth.0);
+    Ok(success_body())
+}
+
+/// The `delete_account` write: inactive with `deleted_at` stamped, and
+/// every token gone, as one transaction — a half-started deletion must
+/// not leave the account active or still signed in.
+async fn mark_and_revoke_all(state: &AppState, account: &User) -> AppResult<u64> {
+    let mut tx = state.db.begin().await?;
+    user::mark_deleted(&mut *tx, account.id).await?;
+    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
+/// `POST /api/pleroma/disable_account` — deactivate the account and keep
+/// its data (Pleroma's `User.set_activation(user, false)`): the same
+/// write as [`delete_account`]'s mark without the `deleted_at` stamp and
+/// without the sweep, and its tokens are revoked whole because a
+/// disabled account must not still be acting.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check. A wrong password is the 200 error
+/// body. Any database failure arrives through `?` as [`AppError::Database`].
+async fn disable_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<PasswordParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !password_accepted(&auth.0, &params.password) {
+        return Ok(error_body(INVALID_PASSWORD));
+    }
+    let revoked = deactivate_and_revoke_all(&state, &auth.0).await?;
+    debug!(account = %auth.0.nickname, revoked, "account disabled");
+    Ok(success_body())
+}
+
+/// The `disable_account` write: `is_active = false` and every token
+/// gone, as one transaction.
+async fn deactivate_and_revoke_all(state: &AppState, account: &User) -> AppResult<u64> {
+    let mut tx = state.db.begin().await?;
+    user::set_activation(&mut *tx, account.id, false).await?;
+    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
 /// The `{"status":"success"}` body all four endpoints answer success
 /// with.
 fn success_body() -> Json<Value> {
@@ -571,6 +941,7 @@ mod tests {
             preferred_frontend: None,
             is_suggested: user::Flag::new(false),
             password_reset_pending: user::Flag::new(false),
+            deleted_at: None,
         }
     }
 
@@ -621,6 +992,75 @@ mod tests {
         assert!(
             !shown.contains("hunter2") && shown.contains("bob@remote.example"),
             "the Debug hides the credential and keeps the handle: {shown}"
+        );
+    }
+
+    #[test]
+    fn change_password_params_debug_redacts_all_three_secrets() {
+        let params: ChangePasswordParams = serde_json::from_value(json!({
+            "password": "hunter2",
+            "new_password": "s3cret-new",
+            "new_password_confirmation": "s3cret-new",
+        }))
+        .unwrap();
+        let shown = format!("{params:?}");
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("s3cret-new"),
+            "no password material shows in Debug: {shown}"
+        );
+        assert!(
+            shown.contains(r#"new_password_confirmation: "<redacted>""#),
+            "the markers name the fields: {shown}"
+        );
+    }
+
+    #[test]
+    fn change_email_and_password_params_debug_redact_the_password() {
+        let email: ChangeEmailParams = serde_json::from_value(json!({
+            "password": "hunter2",
+            "email": "new@example.org",
+        }))
+        .unwrap();
+        let shown = format!("{email:?}");
+        assert!(
+            !shown.contains("hunter2") && shown.contains("new@example.org"),
+            "the credential hides, the address shows: {shown}"
+        );
+        let bare: PasswordParams = serde_json::from_value(json!({"password": "hunter2"})).unwrap();
+        let bare_shown = format!("{bare:?}");
+        assert!(
+            !bare_shown.contains("hunter2"),
+            "the lone-password params hide their secret: {bare_shown}"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_token_is_stable_and_address_bound() {
+        let account = template_user("alice");
+        let first = confirmation_token(&account, "new@example.org");
+        assert_eq!(first.len(), 64, "a SHA-256 digest in lowercase hex");
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lowercase hex, nothing else: {first}"
+        );
+        assert_eq!(
+            first,
+            confirmation_token(&account, "new@example.org"),
+            "the same account and address derive the same token"
+        );
+        assert_ne!(
+            first,
+            confirmation_token(&account, "other@example.org"),
+            "a different address invalidates the letter already sent"
+        );
+        let mut renamed = template_user("alice");
+        renamed.inserted_at = account.inserted_at + Duration::seconds(1);
+        assert_ne!(
+            first,
+            confirmation_token(&renamed, "new@example.org"),
+            "the creation time salts the digest"
         );
     }
 }

@@ -566,8 +566,10 @@ fn validate_email(email: Option<&str>, config: &Config, errors: &mut FieldErrors
 /// Whether `email` looks like `x@y.z`: a non-empty local part, exactly one
 /// `@`, and a domain of at least two dot-separated hostname labels
 /// (Pleroma's local-part class, and a dotted domain as Mastodon's email
-/// validation requires).
-fn is_plausible_email(email: &str) -> bool {
+/// validation requires). Also the shape rule of
+/// `POST /api/pleroma/change_email` (see
+/// [`crate::api::pleroma_account_settings`]).
+pub(crate) fn is_plausible_email(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };

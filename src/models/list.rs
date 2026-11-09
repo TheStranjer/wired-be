@@ -291,6 +291,41 @@ pub async fn delete(pool: &PgPool, user_id: Uuid, id: Uuid) -> AppResult<bool> {
     Ok(deleted.rows_affected() > 0)
 }
 
+/// The `DELETE` behind [`delete_all_for_user`]: the account's own lists.
+const DELETE_ALL_FOR_USER_SQL: &str = "DELETE FROM lists WHERE user_id = $1";
+
+/// The `DELETE` behind [`delete_all_for_user`]: the account's memberships
+/// of the lists it does not own.
+const REMOVE_MEMBERSHIPS_SQL: &str = "DELETE FROM list_members WHERE user_id = $1";
+
+/// Removes every list the account owns and every membership of it: the
+/// list step of the [`users.delete`](crate::jobs::deletion::KIND_DELETE)
+/// job.
+///
+/// The owned lists' own member rows go with them through the members'
+/// cascade, before the second statement runs, so what it clears is exactly
+/// the memberships in other accounts' lists — both foreign keys pointing at
+/// the departing row, which the schema would cascade on a hard delete.
+/// Returns the number of rows taken from the two tables together.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let owned = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    let memberships = sqlx::query(REMOVE_MEMBERSHIPS_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(owned + memberships)
+}
+
 /// The lists `owner_id` owns that hold `member_id`, oldest first — what
 /// `GET /api/v1/accounts/:id/lists` answers for its viewer.
 ///
