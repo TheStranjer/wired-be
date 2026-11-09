@@ -374,14 +374,30 @@ pub(crate) async fn link_names_conn(
 /// with it.
 pub async fn replace_for_status(pool: &PgPool, status_id: Uuid, names: &[String]) -> AppResult<()> {
     let mut tx = pool.begin().await?;
-    sqlx::query(DELETE_FOR_STATUS_SQL)
-        .bind(status_id)
-        .execute(&mut *tx)
-        .await
-        .map(drop)?;
-    link_names_conn(&mut tx, status_id, names).await?;
+    replace_names_conn(&mut tx, status_id, names).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// [`replace_for_status`] on an open connection: the whole replacement runs
+/// on the caller's transaction, which is how
+/// [`crate::models::status_edit::update_status`] rewrites a status and its
+/// tags together.
+///
+/// # Errors
+///
+/// Those of [`replace_for_status`].
+pub(crate) async fn replace_names_conn(
+    conn: &mut PgConnection,
+    status_id: Uuid,
+    names: &[String],
+) -> AppResult<()> {
+    sqlx::query(DELETE_FOR_STATUS_SQL)
+        .bind(status_id)
+        .execute(&mut *conn)
+        .await
+        .map(drop)?;
+    link_names_conn(conn, status_id, names).await
 }
 
 /// The tags of every status in `ids`, keyed by status id, each entry
