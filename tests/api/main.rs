@@ -27,6 +27,11 @@ mod account_notes;
 /// invite tokens alike.
 mod account_registration;
 
+/// The account status listing (`GET /api/v1/accounts/{id}/statuses`): its
+/// filters, the visibility each reader reaches, the pinned page and the
+/// `RESTRICT_UNAUTHENTICATED` gate.
+mod account_statuses;
+
 /// The core account endpoints: `verify_credentials`, `GET /accounts/{id}` and `lookup`.
 mod accounts;
 

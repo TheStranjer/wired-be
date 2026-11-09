@@ -1,7 +1,7 @@
 //! Runtime configuration, read from environment variables.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
     net::{AddrParseError, SocketAddr},
@@ -119,6 +119,23 @@ pub const INVITES_ENABLED_VAR: &str = "INVITES_ENABLED";
 /// Environment variable holding whether anonymous requests may search
 /// statuses at `GET /api/v1/search` and `GET /api/v2/search`.
 pub const SEARCH_STATUSES_UNAUTHENTICATED_VAR: &str = "SEARCH_STATUSES_UNAUTHENTICATED";
+/// Environment variable holding the comma-separated areas of
+/// [`RESTRICT_UNAUTHENTICATED_AREAS`] an anonymous request may not read.
+pub const RESTRICT_UNAUTHENTICATED_VAR: &str = "RESTRICT_UNAUTHENTICATED";
+/// The areas [`RESTRICT_UNAUTHENTICATED_VAR`] accepts.
+///
+/// Pleroma's `:restrict_unauthenticated` groups (`timelines`, `profiles`,
+/// `activities`), each joined to its half of the world with an underscore —
+/// the flat spelling of Pleroma's nested keyword list in a single
+/// environment variable.
+pub const RESTRICT_UNAUTHENTICATED_AREAS: [&str; 6] = [
+    "timelines_local",
+    "timelines_federated",
+    "profiles_local",
+    "profiles_remote",
+    "activities_local",
+    "activities_remote",
+];
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
@@ -366,6 +383,11 @@ pub const DEFAULT_INVITES_ENABLED: bool = false;
 /// an empty `statuses` list: letting anonymous requests read the stored
 /// text is an explicit operator decision.
 pub const DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED: bool = false;
+/// Restricted areas used when `RESTRICT_UNAUTHENTICATED` is unset: nothing.
+///
+/// So every read an anonymous request may make is open — a public instance,
+/// as Pleroma's own `:if_instance_is_private` default resolves on one.
+pub const DEFAULT_RESTRICT_UNAUTHENTICATED: &str = "";
 /// The provider list used when `OAUTH_PROVIDERS` is unset: no external
 /// login provider is configured, so `GET /oauth/prepare_request` and the
 /// provider endpoints answer their errors for every name.
@@ -902,6 +924,13 @@ pub struct Config {
     /// [`crate::api::search`]). The account and hashtag searches are never
     /// gated by this.
     pub search_statuses_unauthenticated: Toggle,
+    /// The areas of [`RESTRICT_UNAUTHENTICATED_AREAS`] an anonymous request
+    /// may not read, from `RESTRICT_UNAUTHENTICATED` (a comma-separated
+    /// list, empty by default): Pleroma's `:restrict_unauthenticated`
+    /// nested config, spelled as one flat set of `group_half` area names.
+    /// [`Config::restricts`] answers it; [`crate::api::accounts`]' profile
+    /// reads are the endpoints that ask.
+    pub restrict_unauthenticated: BTreeSet<String>,
     /// The external OAuth login providers, from `OAUTH_PROVIDERS`; empty
     /// when none is configured. Each one answers the `/oauth` provider
     /// endpoints under its own name (see [`crate::api::oauth_external`]).
@@ -1048,6 +1077,7 @@ impl Config {
             registrations_open: exposure.registrations_open,
             invites_enabled: exposure.invites_enabled,
             search_statuses_unauthenticated: exposure.search_statuses_unauthenticated,
+            restrict_unauthenticated: exposure.restrict_unauthenticated,
             oauth_providers: auth.oauth_providers,
             available_frontends: exposure.available_frontends,
             job_concurrency,
@@ -1080,6 +1110,24 @@ impl Config {
     #[must_use]
     pub fn is_https(&self) -> bool {
         self.base_url.starts_with("https://")
+    }
+
+    /// Whether this instance keeps `area` from anonymous readers.
+    ///
+    /// `area` is one of the [`RESTRICT_UNAUTHENTICATED_AREAS`] names, and
+    /// the refusal is Pleroma's 403 `{"error":"This API requires an
+    /// authenticated user"}` (see [`crate::api::accounts`]' account status
+    /// route). A request that presents a live user token is never refused
+    /// by this: the restriction is about the anonymous reader, not about
+    /// the read.
+    ///
+    /// An `area` outside [`RESTRICT_UNAUTHENTICATED_AREAS`] restricts
+    /// nothing — naming one is a startup failure
+    /// ([`ConfigError::InvalidRestrictUnauthenticated`]), so reaching this
+    /// with one can only be a caller's mistake, never a silent hole.
+    #[must_use]
+    pub fn restricts(&self, area: &str) -> bool {
+        self.restrict_unauthenticated.contains(area)
     }
 
     /// The [`OAUTH_PROVIDERS`](OAUTH_PROVIDERS_VAR) entry named `name`,
@@ -1167,6 +1215,7 @@ impl Config {
             registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
             invites_enabled: Toggle::new(DEFAULT_INVITES_ENABLED),
             search_statuses_unauthenticated: Toggle::new(DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED),
+            restrict_unauthenticated: BTreeSet::new(),
             oauth_providers: Vec::new(),
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
@@ -1735,10 +1784,11 @@ where
 }
 
 /// What [`client_exposure`] reads: the toggles that gate what the instance
-/// exposes to clients and the pickable-frontend list, named by what they
-/// are and hung on the [`Config`] fields in [`Config::from_lookup`]
-/// (`REGISTRATIONS_OPEN`, `INVITES_ENABLED`,
-/// `SEARCH_STATUSES_UNAUTHENTICATED`, `AVAILABLE_FRONTENDS`).
+/// exposes to clients, the areas it keeps from anonymous readers and the
+/// pickable-frontend list, named by what they are and hung on the [`Config`]
+/// fields in [`Config::from_lookup`] (`REGISTRATIONS_OPEN`,
+/// `INVITES_ENABLED`, `SEARCH_STATUSES_UNAUTHENTICATED`,
+/// `RESTRICT_UNAUTHENTICATED`, `AVAILABLE_FRONTENDS`).
 #[derive(Debug)]
 struct ExposureSettings {
     /// Whether new registrations are open (`REGISTRATIONS_OPEN`).
@@ -1749,6 +1799,9 @@ struct ExposureSettings {
     /// Whether anonymous requests may search statuses at the combined
     /// search (`SEARCH_STATUSES_UNAUTHENTICATED`).
     search_statuses_unauthenticated: Toggle,
+    /// The areas an anonymous request may not read
+    /// (`RESTRICT_UNAUTHENTICATED`).
+    restrict_unauthenticated: BTreeSet<String>,
     /// The frontends the settings endpoints let a user pick
     /// (`AVAILABLE_FRONTENDS`).
     available_frontends: Vec<String>,
@@ -1758,16 +1811,16 @@ struct ExposureSettings {
 /// whether new registrations are open (`NodeInfo`'s `openRegistrations`),
 /// whether invite tokens substitute for open registrations
 /// (`invites_enabled` on the instance endpoints), whether anonymous
-/// requests may search statuses at the combined search, and the frontends
-/// the settings endpoints let a user pick. Grouped because each is a plain
-/// default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md).
+/// requests may search statuses at the combined search, which areas
+/// anonymous reads are refused, and the frontends the settings endpoints let
+/// a user pick. Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::InvalidBoolean`] when `REGISTRATIONS_OPEN`,
 /// `INVITES_ENABLED` or `SEARCH_STATUSES_UNAUTHENTICATED` holds a value
-/// that is neither spelling.
+/// that is neither spelling, and whatever [`restrict_areas`] reports.
 fn client_exposure<F>(lookup: &F) -> Result<ExposureSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -1781,6 +1834,7 @@ where
         DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED,
     )?
     .into();
+    let restrict_unauthenticated = restrict_areas(lookup)?;
     let available_frontends = comma_list(
         &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
     );
@@ -1788,8 +1842,41 @@ where
         registrations_open,
         invites_enabled,
         search_statuses_unauthenticated,
+        restrict_unauthenticated,
         available_frontends,
     })
+}
+
+/// The areas [`RESTRICT_UNAUTHENTICATED_VAR`] names, as a set of the
+/// canonical lowercase spellings in
+/// [`RESTRICT_UNAUTHENTICATED_AREAS`]: a comma-separated list, each entry
+/// trimmed and lowercased, so repeats fold and the order the operator wrote
+/// is irrelevant; unset or empty restricts nothing.
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidRestrictUnauthenticated`] for a name outside the
+/// six areas — an operator's typo must stop the process, not silently leave
+/// the profiles it meant to close open.
+fn restrict_areas<F>(lookup: &F) -> Result<BTreeSet<String>, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let configured = lookup(RESTRICT_UNAUTHENTICATED_VAR);
+    let text = configured
+        .as_deref()
+        .unwrap_or(DEFAULT_RESTRICT_UNAUTHENTICATED);
+    comma_list(text)
+        .into_iter()
+        .map(|area| {
+            let area = area.to_lowercase();
+            if RESTRICT_UNAUTHENTICATED_AREAS.contains(&area.as_str()) {
+                Ok(area)
+            } else {
+                Err(ConfigError::InvalidRestrictUnauthenticated(area))
+            }
+        })
+        .collect()
 }
 
 /// Reads `OAUTH_PROVIDERS`: the JSON text of the external OAuth login
@@ -2046,6 +2133,7 @@ impl fmt::Debug for Config {
                 "search_statuses_unauthenticated",
                 &self.search_statuses_unauthenticated,
             )
+            .field("restrict_unauthenticated", &self.restrict_unauthenticated)
             .field("oauth_providers", &self.oauth_providers)
             .field("available_frontends", &self.available_frontends)
             .field("job_concurrency", &self.job_concurrency)
@@ -2101,6 +2189,9 @@ pub enum ConfigError {
     /// `RATE_LIMITS` holds an entry that is not a `bucket=max:window_secs`
     /// triple (or a degenerate one); the value is the parser's reason.
     InvalidRateLimits(String),
+    /// `RESTRICT_UNAUTHENTICATED` names an area outside
+    /// [`RESTRICT_UNAUTHENTICATED_AREAS`]; the value is the name it read.
+    InvalidRestrictUnauthenticated(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -2133,6 +2224,11 @@ impl fmt::Display for ConfigError {
             Self::InvalidRateLimits(detail) => {
                 write!(f, "invalid {RATE_LIMITS_VAR}: {detail}")
             }
+            Self::InvalidRestrictUnauthenticated(area) => write!(
+                f,
+                "invalid {RESTRICT_UNAUTHENTICATED_VAR}: `{area}` is not one of {}",
+                RESTRICT_UNAUTHENTICATED_AREAS.join(", ")
+            ),
         }
     }
 }
@@ -2149,7 +2245,8 @@ impl Error for ConfigError {
             | Self::InvalidSmtpTls(_)
             | Self::InvalidTranslationProvider(_)
             | Self::ShortMediaProxySecret(_)
-            | Self::InvalidRateLimits(_) => None,
+            | Self::InvalidRateLimits(_)
+            | Self::InvalidRestrictUnauthenticated(_) => None,
         }
     }
 }
@@ -4365,6 +4462,88 @@ mod tests {
         assert!(
             !config.rate_limit.trust_proxy_headers.get(),
             "tests are unproxied by default"
+        );
+    }
+
+    /// The restricted areas: nothing by default, a comma list read trimmed
+    /// and lowercased with repeats folded, an empty value restricting
+    /// nothing, and an unknown area refusing startup rather than leaving a
+    /// profile silently open.
+    #[test]
+    fn restrict_unauthenticated_defaults_open_and_reads_its_areas() {
+        let open = config_with(&[]);
+        assert!(
+            open.restrict_unauthenticated.is_empty(),
+            "a default instance restricts nothing"
+        );
+        for area in RESTRICT_UNAUTHENTICATED_AREAS {
+            assert!(!open.restricts(area), "`{area}` is open by default");
+        }
+        let config = config_with(&[(
+            RESTRICT_UNAUTHENTICATED_VAR,
+            " PROFILES_LOCAL , profiles_remote, timelines_local, profiles_local ",
+        )]);
+        assert!(config.restricts("profiles_local"), "the half is closed");
+        assert!(config.restricts("profiles_remote"), "and so is its twin");
+        assert!(
+            config.restricts("timelines_local"),
+            "as is a timelines half"
+        );
+        assert!(
+            !config.restricts("activities_local"),
+            "an area the variable never named stays open"
+        );
+        assert!(
+            !config.restricts("no-such-area"),
+            "an unknown name restricts nothing"
+        );
+        assert_eq!(
+            config.restrict_unauthenticated.len(),
+            3,
+            "the repeat folds and the spacing is trimmed: {:?}",
+            config.restrict_unauthenticated
+        );
+        assert!(
+            !config_with(&[(RESTRICT_UNAUTHENTICATED_VAR, "")]).restricts("profiles_local"),
+            "an empty value restricts nothing"
+        );
+    }
+
+    /// An area outside [`RESTRICT_UNAUTHENTICATED_AREAS`] is a startup
+    /// failure naming the word it could not place.
+    #[test]
+    fn an_unknown_restricted_area_is_an_error() {
+        let err = try_config_with(&[(RESTRICT_UNAUTHENTICATED_VAR, "profiles_everywhere")])
+            .expect_err("an unknown area is refused");
+        assert_eq!(
+            err,
+            ConfigError::InvalidRestrictUnauthenticated("profiles_everywhere".to_owned()),
+            "the error carries the offending name"
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid RESTRICT_UNAUTHENTICATED: `profiles_everywhere` is not one of \
+             timelines_local, timelines_federated, profiles_local, profiles_remote, \
+             activities_local, activities_remote",
+            "the wording names the variable and the areas it takes"
+        );
+        assert!(err.source().is_none(), "there is no underlying error");
+    }
+
+    /// `Debug` shows the restricted areas: they name reads, not secrets.
+    #[test]
+    fn debug_shows_the_restricted_areas() {
+        let debug = format!(
+            "{:?}",
+            config_with(&[(RESTRICT_UNAUTHENTICATED_VAR, "profiles_local")])
+        );
+        assert!(
+            debug.contains("restrict_unauthenticated"),
+            "the setting is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("profiles_local"),
+            "and it shows which area is closed: {debug}"
         );
     }
 }

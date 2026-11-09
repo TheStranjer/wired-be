@@ -64,7 +64,12 @@ pub const fn features() -> &'static [&'static str] {
 /// Pleroma's `:restrict_unauthenticated` config (`config/config.exs`) sets
 /// every key to `:if_instance_is_private`, so a public instance — wired-be
 /// has no private-instance mode to configure — answers all-false with the
-/// same three groups and sub-keys.
+/// same three groups and sub-keys. This is that fixed advertisement: the
+/// operator-side setting that closes a read is
+/// [`RESTRICT_UNAUTHENTICATED`](crate::config::RESTRICT_UNAUTHENTICATED_VAR),
+/// read through [`crate::config::Config::restricts`], and the endpoints that
+/// gate on it are the ones that say so in their own docs; wiring this block
+/// to it is the instance documents' ticket.
 #[must_use]
 pub fn restrict_unauthenticated() -> Value {
     json!({
