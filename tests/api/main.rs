@@ -142,6 +142,10 @@ mod mutes;
 /// NodeInfo (`/.well-known/nodeinfo` and `/nodeinfo/{version}`).
 mod nodeinfo;
 
+/// Notification generation over HTTP: the follow, mention, reblog and
+/// favourite actions and the recipient's `GET /api/v1/notifications`.
+mod notification_generation;
+
 /// Pleroma's notification settings (`PUT /api/pleroma/notification_settings`)
 /// and the owner-only render of the flags.
 mod notification_settings;

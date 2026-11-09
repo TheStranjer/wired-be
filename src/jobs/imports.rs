@@ -299,7 +299,7 @@ async fn apply_follow(
         }
         None => created,
     };
-    after_follow_changed(state, importer, target, Some(&stored), true);
+    after_follow_changed(state, importer, target, Some(&stored), true).await;
     Ok(())
 }
 

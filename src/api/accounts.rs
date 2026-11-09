@@ -252,9 +252,11 @@
 //! unfollowing an account the caller does not follow is no error at all
 //! (where Pleroma's controller answers "Not subscribed!", this ticket is
 //! idempotent) — the unchanged [`Relationship`] answers it with 200. Creating
-//! or withdrawing a follow is the moment federation will owe the pair a
-//! `Follow` or its `Undo`; the later ticket wires that into this module's
-//! `after_follow_changed` hook.
+//! or withdrawing a follow is also the moment the followee is told — this
+//! module's `after_follow_changed` hook lands the
+//! [`notify`] module's follow telling — and the
+//! moment federation will owe the pair a `Follow` or its `Undo`; the later
+//! ticket wires that into the same hook.
 //!
 //! `POST /api/v1/follows` is Pleroma's `AccountController.follow_by_uri`
 //! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`): the
@@ -377,6 +379,7 @@ use crate::{
     },
     pagination::{PageParams, link_header, set_link_header},
     services::{
+        notify,
         render_status::render_statuses,
         timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     },
@@ -2078,10 +2081,9 @@ async fn one_relationship(
 /// activity to reject is [`Follow::ap_id`], its sender [`Follow::follower_id`],
 /// and the queueing happens through `state` (decision 11).
 ///
-/// Intentionally empty until then, like the follow-request answers'
-/// [`after_follow_request_resolved`](crate::api::follow_requests): Pleroma's
-/// `User.remove_follower` delivers the `Reject` inline, and this server's
-/// delivery queue is a later ticket.
+/// Intentionally empty until then: Pleroma's `User.remove_follower`
+/// delivers the `Reject` inline, and this server's delivery queue is a
+/// later ticket.
 const fn after_follower_removed(_state: &AppState, _followee: &User, _removed: &Follow) {}
 
 /// The request parameters of `POST /api/v1/accounts/{id}/follow`: Mastodon's
@@ -2157,7 +2159,7 @@ async fn follow_account(
         notifying = stored.notify,
         "account followed"
     );
-    after_follow_changed(&state, &auth.0, &target, Some(&stored), true);
+    after_follow_changed(&state, &auth.0, &target, Some(&stored), true).await;
     one_relationship(&state, auth.0.id, target.id).await
 }
 
@@ -2269,7 +2271,7 @@ async fn follow_by_uri(
         notifying = stored.notify,
         "account followed by uri"
     );
-    after_follow_changed(&state, &auth.0, &target, Some(&stored), true);
+    after_follow_changed(&state, &auth.0, &target, Some(&stored), true).await;
     Ok(Json(render_account(&state, Some(&auth.0), &target).await?))
 }
 
@@ -2342,38 +2344,33 @@ async fn unfollow_account(
         &target,
         previous.as_ref().filter(|_| removed),
         false,
-    );
+    )
+    .await;
     one_relationship(&state, auth.0.id, target.id).await
 }
 
-/// Post-write hook of [`follow_account`] and [`unfollow_account`], the landing
-/// point of the `Follow` / `Undo` federation: the ticket that delivers them
-/// wires the queueing in here (decision 11) — the activity to federate is
+/// Post-write hook of [`follow_account`] and [`unfollow_account`]: the
+/// notification telling the [`notify`] module owns
+/// runs through here, and the landing point of the `Follow` / `Undo`
+/// federation waits in the same body — the ticket that delivers them wires
+/// the queueing in here (decision 11): the activity to federate is
 /// `follow`'s [`Follow::ap_id`], its sender [`User::ap_id`] and its target
-/// [`Follow::followee_id`], and `following` states which way the write moved
-/// the fact: `true` for the `Follow` a `…/follow` created or reopened, `false`
-/// for the `Undo` of the `Follow` a `…/unfollow` withdrew.
+/// [`Follow::followee_id`].
 ///
 /// `follow` is the relationship the write left behind (a `…/follow` always has
 /// one; a `…/unfollow` names the row it deleted and is `None` for a pair with
-/// nothing to take back, which is nothing to federate either).
-///
-/// Intentionally empty until then: like [`after_follower_removed`] and the
-/// blocks' [`after_block_changed`](crate::api::blocks), it waits for the
-/// delivery queue — Pleroma's `User.follow` / `User.unfollow` build and send
-/// their activities inline, and this server's federation is a later ticket.
-/// It is a plain `fn` rather than an `async` one for the reason the others
-/// are: the gate denies the `unused_async` an empty `async fn` would be and
-/// forbids silencing it, so the ticket that queues the `Follow` / `Undo`
-/// delivery grows the body and the `async` together and leaves these two
-/// call sites alone.
-pub(crate) const fn after_follow_changed(
-    _state: &AppState,
-    _follower: &User,
-    _target: &User,
-    _follow: Option<&Follow>,
-    _following: bool,
+/// nothing to take back, which is nothing to federate either). `following`
+/// states which way the write moved the fact: `true` for the `Follow` a
+/// `…/follow` created or reopened, `false` for the `Undo` of the `Follow` a
+/// `…/unfollow` withdrew.
+pub(crate) async fn after_follow_changed(
+    state: &AppState,
+    follower: &User,
+    target: &User,
+    follow: Option<&Follow>,
+    following: bool,
 ) {
+    notify::on_follow(state, follower, target, follow, following).await;
 }
 
 /// `GET /api/v1/accounts/{id}/followers` — the accounts that follow `id`
