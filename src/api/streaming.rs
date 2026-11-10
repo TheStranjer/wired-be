@@ -17,7 +17,13 @@
 //!   connection's subscriptions on it, its [`Audience`] covers the socket's
 //!   reader (a `Users` event reaches those users only), a `local_only` event
 //!   has a reader at all — an anonymous socket never sees one — and the
-//!   reader's own `Filters` say nothing against it.
+//!   reader's own `Filters` say nothing against it. An event that carries a
+//!   status [`render`](crate::streaming::hub::StreamEvent::render) hint
+//!   instead of a payload has that status rendered for this connection's
+//!   reader before the frame is written — one hub event, each socket its
+//!   own view, the way Pleroma's `Streamer` renders in the socket process
+//!   — and a hint whose status no longer reads back drops the event rather
+//!   than sending an entity-less `update`.
 //! - **its own subscription set**, opened at the handshake by `stream` (plus
 //!   `tag` / `list` / `instance`) and changed afterwards by the `subscribe`
 //!   and `unsubscribe` frames, capped at [`MAX_SUBSCRIPTIONS`].
@@ -69,10 +75,14 @@ use uuid::Uuid;
 use crate::{
     auth,
     error::{AppError, AppResult},
-    models::{block, conversation_mute, domain_block, hashtag, list, mute},
+    models::{
+        block, conversation_mute, domain_block, hashtag, list, mute, status,
+        user::{self, User},
+    },
     oauth::scopes::{READ, READ_LISTS, READ_NOTIFICATIONS, READ_STATUSES, Scopes},
+    services::render_status::render_status,
     state::AppState,
-    streaming::hub::{Audience, StreamEvent, stream_matches},
+    streaming::hub::{Audience, RenderSpec, StreamEvent, stream_matches},
 };
 
 /// The heartbeat period of one streaming socket: Pleroma's `@tick`
@@ -524,27 +534,121 @@ impl Connection {
         }
     }
 
-    /// The frame to write for `event`, `None` when this connection may not see
-    /// it: no subscribed stream, an audience it is outside, a `local_only`
-    /// event with no reader to be local for, or a reader whose filters
-    /// suppress the entity.
-    fn frame_for(&self, event: &StreamEvent) -> Option<String> {
+    /// The frame to write for `event`, `None` when this connection may not
+    /// see it: no subscribed stream, an audience it is outside, a
+    /// `local_only` event with no reader to be local for, a reader whose
+    /// filters suppress the entity, or a status render hint whose entity
+    /// this socket can no longer render.
+    ///
+    /// An event that carries its entity as `payload` is written as it is.
+    /// An event that carries a status [`RenderSpec`] hint instead — what
+    /// [`status_created`] and [`status_edited`] publish — has that status
+    /// rendered for this connection's reader here, the way Pleroma's
+    /// `Streamer` renders in the socket process: one hub event, each
+    /// socket its own view, and the reader's `Filters` judge the rendered
+    /// payload. Notification and chat hints are no producer's yet and stay
+    /// the body-less pushes they have always been.
+    ///
+    /// [`status_created`]: crate::services::streaming::status_created
+    /// [`status_edited`]: crate::services::streaming::status_edited
+    async fn frame_for(&self, event: &StreamEvent) -> Option<String> {
         if !stream_matches(&self.subscriptions, event)
             || !self.audience_allows(event)
             || !self.local_allows(event)
-            || self.filters.suppresses(event)
         {
+            return None;
+        }
+        let payload = self.payload_for(event).await?;
+        if self.filters.suppresses(payload.as_deref()) {
             return None;
         }
         let frame = Frame {
             stream: event.streams.as_slice(),
             event: event.event.as_str(),
-            payload: event.payload.as_deref(),
+            payload: payload.as_deref(),
         };
         match serde_json::to_string(&frame) {
             Ok(text) => Some(text),
             Err(err) => {
                 warn!(%err, "streaming frame could not be serialized");
+                None
+            }
+        }
+    }
+
+    /// The payload to write for `event`: the event's own body when it
+    /// carries one, the hinted status rendered for the reader when it
+    /// carries a [`RenderSpec::Status`] hint without a body, and no body
+    /// for anything else. The outer `None` is the drop signal that
+    /// [`frame_for`] reads: a status hint whose row vanished between the
+    /// publish and this socket has no entity left to show, and Mastodon's
+    /// `update` *is* its entity — silence beats an entity-less frame.
+    async fn payload_for(&self, event: &StreamEvent) -> Option<Option<String>> {
+        if event.payload.is_some() {
+            return Some(event.payload.clone());
+        }
+        match event.render.as_ref() {
+            Some(RenderSpec::Status(id)) => self.render_hinted_status(*id).await.map(Some),
+            Some(RenderSpec::Notification(_) | RenderSpec::Chat(_)) | None => Some(None),
+        }
+    }
+
+    /// The Status entity JSON of the hinted status `id`, rendered for this
+    /// socket's reader. `None` — the drop signal — when the row is gone or
+    /// unreadable (a status deleted before this socket caught up reads as
+    /// gone: [`status::get_by_id`] hides tombstones), or when the renderer
+    /// has no view of it at all.
+    ///
+    /// [`status::get_by_id`]: crate::models::status::get_by_id
+    async fn render_hinted_status(&self, id: Uuid) -> Option<String> {
+        let row = match status::get_by_id(&self.state.db, id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                debug!(%id, "a streaming render hint names no live status");
+                return None;
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming render hint could not be read");
+                return None;
+            }
+        };
+        let viewer = self.hinted_viewer(id).await;
+        match render_status(&self.state, viewer.as_ref(), &row).await {
+            Ok(Some(entity)) => match serde_json::to_string(&entity) {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    warn!(%err, %id, "a streamed status could not be serialized");
+                    None
+                }
+            },
+            Ok(None) => {
+                debug!(%id, "a streaming render hint has no renderable view");
+                None
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming render hint could not be rendered");
+                None
+            }
+        }
+    }
+
+    /// The [`User`] to render a hinted status for: this socket's
+    /// authenticated reader read live, or nobody — the anonymous view —
+    /// when the socket has no reader, the reader's row is gone, or its
+    /// read failed. An authenticated reader never sees another reader's
+    /// view: each socket renders for its own.
+    ///
+    /// [`User`]: crate::models::user::User
+    async fn hinted_viewer(&self, id: Uuid) -> Option<User> {
+        let reader = self.reader?;
+        match user::get_by_id(&self.state.db, reader).await {
+            Ok(viewer) => viewer,
+            Err(err) => {
+                warn!(
+                    %err,
+                    %id,
+                    "the reader of a streaming render hint could not be read; the anonymous view is used"
+                );
                 None
             }
         }
@@ -792,16 +896,18 @@ impl Filters {
             && self.threads.is_empty()
     }
 
-    /// Whether `event` is one this reader suppresses: its entity is authored
-    /// by a blocked or muted account, posted from a blocked domain, or part of
-    /// a muted thread. An event whose payload names none of those — a
-    /// `delete`, whose payload is only a status id, or a body-less event — is
-    /// never suppressed: there is nothing to object to.
-    fn suppresses(&self, event: &StreamEvent) -> bool {
+    /// Whether the payload one frame would carry is something this reader
+    /// suppresses: an entity authored by a blocked or muted account, posted
+    /// from a blocked domain, or part of a muted thread. A payload that
+    /// names none of those — a `delete`, whose payload is only a status id,
+    /// or a body-less event — is never suppressed: there is nothing to
+    /// object to. The payload judged is the one [`frame_for`] resolved, so
+    /// a render-hinted event is weighed by its rendered entity too.
+    fn suppresses(&self, payload: Option<&str>) -> bool {
         if self.is_empty() {
             return false;
         }
-        let facts = Facts::of(event);
+        let facts = Facts::of(payload);
         self.suppressed_author(&facts)
             || facts.hosts.iter().any(|host| self.domains.contains(host))
             || facts
@@ -844,10 +950,10 @@ struct Facts {
 }
 
 impl Facts {
-    /// The facts `event`'s payload states.
-    fn of(event: &StreamEvent) -> Self {
+    /// The facts one frame payload states.
+    fn of(payload: Option<&str>) -> Self {
         let mut facts = Self::default();
-        let Some(payload) = event.payload.as_deref() else {
+        let Some(payload) = payload else {
             return facts;
         };
         match serde_json::from_str::<Value>(payload) {
@@ -1002,7 +1108,7 @@ async fn from_hub(
     received: Result<Arc<StreamEvent>, broadcast::error::RecvError>,
 ) -> Flow {
     match received {
-        Ok(event) => match connection.frame_for(&event) {
+        Ok(event) => match connection.frame_for(&event).await {
             None => Flow::Keep,
             Some(frame) => write(socket, Message::Text(frame.into())).await,
         },
@@ -1055,10 +1161,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, DEFAULT_STREAMING_PING_INTERVAL_SECS},
+        config::{Config, DEFAULT_STREAMING_PING_INTERVAL_SECS, TEST_BASE_URL},
         http_client::HttpClient,
         models::{
             list::NewList,
+            status::NewStatus,
             user::{NewUser, User, insert},
         },
         streaming::hub::Hub,
@@ -1454,6 +1561,7 @@ mod tests {
 
         let frame = connection
             .frame_for(&event(&["public"], r#"{"id":"7"}"#))
+            .await
             .expect("a matching public event is rendered");
 
         assert_eq!(
@@ -1475,6 +1583,7 @@ mod tests {
 
         let frame = connection
             .frame_for(&deleted)
+            .await
             .expect("a delete on a held stream is rendered");
 
         assert_eq!(
@@ -1490,12 +1599,16 @@ mod tests {
         let connection = watching(&state, &["hashtag:rust"]).await;
 
         assert!(
-            connection.frame_for(&event(&["public"], "{}")).is_none(),
+            connection
+                .frame_for(&event(&["public"], "{}"))
+                .await
+                .is_none(),
             "a public event does not reach a hashtag subscription"
         );
         assert!(
             connection
                 .frame_for(&event(&["hashtag", "hashtag:rust"], "{}"))
+                .await
                 .is_some(),
             "the hashtag's own event does, on any of its streams"
         );
@@ -1513,6 +1626,7 @@ mod tests {
 
         let frame = connection
             .frame_for(&filters_changed)
+            .await
             .expect("an event with no body is still delivered");
 
         assert_eq!(
@@ -1546,31 +1660,34 @@ mod tests {
         };
         let on_other_stream = event(&[other_stream.as_str()], "{}");
 
-        assert!(mine.frame_for(&for_me).is_some(), "its own user sees it");
         assert!(
-            mine.frame_for(&for_other).is_none(),
+            mine.frame_for(&for_me).await.is_some(),
+            "its own user sees it"
+        );
+        assert!(
+            mine.frame_for(&for_other).await.is_none(),
             "the audience stays the second gate even on a held stream name"
         );
         assert!(
-            mine.frame_for(&everyone).is_some(),
+            mine.frame_for(&everyone).await.is_some(),
             "an Everyone event reaches an authenticated socket"
         );
         assert!(
-            mine.frame_for(&on_other_stream).is_none(),
+            mine.frame_for(&on_other_stream).await.is_none(),
             "another reader's uuid-named stream never matches"
         );
 
         let anonymous = watching(&state, &[own_stream.as_str()]).await;
         assert!(
-            anonymous.frame_for(&for_me).is_none(),
+            anonymous.frame_for(&for_me).await.is_none(),
             "an anonymous socket never receives a Users event"
         );
         assert!(
-            anonymous.frame_for(&everyone).is_none(),
+            anonymous.frame_for(&everyone).await.is_none(),
             "nor an Everyone one"
         );
         assert!(
-            anonymous.frame_for(&on).is_some(),
+            anonymous.frame_for(&on).await.is_some(),
             "but a Public event is public"
         );
     }
@@ -1588,7 +1705,7 @@ mod tests {
         };
 
         assert!(
-            anonymous.frame_for(&local_public).is_none(),
+            anonymous.frame_for(&local_public).await.is_none(),
             "a local_only event is dropped for a readerless socket, whatever its audience"
         );
         let local_everyone = StreamEvent {
@@ -1596,11 +1713,11 @@ mod tests {
             ..local_public.clone()
         };
         assert!(
-            anonymous.frame_for(&local_everyone).is_none(),
+            anonymous.frame_for(&local_everyone).await.is_none(),
             "Everyone plus local_only means authenticated local viewers only"
         );
         assert!(
-            member.frame_for(&local_everyone).is_some(),
+            member.frame_for(&local_everyone).await.is_some(),
             "and an authenticated socket is exactly such a viewer"
         );
         let not_local = StreamEvent {
@@ -1608,7 +1725,7 @@ mod tests {
             ..local_public
         };
         assert!(
-            anonymous.frame_for(&not_local).is_some(),
+            anonymous.frame_for(&not_local).await.is_some(),
             "without the flag the same event streams on as before"
         );
     }
@@ -1671,7 +1788,10 @@ mod tests {
         connection.subscriptions = vec![PUBLIC.to_owned()];
 
         assert!(
-            connection.frame_for(&event(&["public"], &body)).is_none(),
+            connection
+                .frame_for(&event(&["public"], &body))
+                .await
+                .is_none(),
             "a muted author is suppressed, on a public stream too"
         );
         assert!(
@@ -1680,6 +1800,7 @@ mod tests {
                     &["public"],
                     &status_payload(Uuid::now_v7(), "loud", thread)
                 ))
+                .await
                 .is_some(),
             "and somebody else's status still arrives"
         );
@@ -1720,7 +1841,7 @@ mod tests {
 
         let body = status_payload(muted.id, "muted@spam.example", thread);
         assert!(
-            filters.suppresses(&event(&["public"], &body)),
+            filters.suppresses(Some(body.as_str())),
             "one entity can be suppressed on three counts at once"
         );
         assert!(
@@ -1737,8 +1858,7 @@ mod tests {
         let body = format!(
             r#"{{"account":{{"id":"{booster}","acct":"booster"}},"reblog":{{"account":{{"id":"{original}","acct":"original"}},"conversation_id":"{thread}"}}}}"#
         );
-        let status = event(&["public"], &body);
-        let facts = Facts::of(&status);
+        let facts = Facts::of(Some(body.as_str()));
 
         assert_eq!(
             facts.authors,
@@ -1750,27 +1870,27 @@ mod tests {
             ..Filters::default()
         };
         assert!(
-            blocking_the_original.suppresses(&status),
+            blocking_the_original.suppresses(Some(body.as_str())),
             "and blocking either one suppresses the reblog"
         );
     }
 
     #[test]
     fn a_delete_event_names_nobody_and_is_never_suppressed() {
-        let deleted = event(&["public"], &format!("\"{}\"", Uuid::now_v7()));
+        let body = format!("\"{}\"", Uuid::now_v7());
         let filters = Filters {
             muted: one(Uuid::now_v7()),
             ..Filters::default()
         };
 
-        let facts = Facts::of(&deleted);
+        let facts = Facts::of(Some(body.as_str()));
 
         assert!(
             facts.authors.is_empty() && facts.hosts.is_empty() && facts.threads.is_empty(),
             "a payload that is no entity object states no facts"
         );
         assert!(
-            !filters.suppresses(&deleted),
+            !filters.suppresses(Some(body.as_str())),
             "so there is nothing to object to and the delete goes out"
         );
     }
@@ -2025,9 +2145,153 @@ mod tests {
                     audience: Audience::Users(vec![reader.id]),
                     ..event(&[own_stream.as_str()], &body)
                 })
+                .await
                 .is_none(),
             "and the filters the new reader brought apply to what it sees"
         );
+    }
+
+    /// The render hint of a live status arrives at the socket as an
+    /// `update` carrying the rendered entity: the hint is the hub's
+    /// envelope, the entity the socket's own view of it.
+    #[tokio::test]
+    async fn a_status_render_hint_arrives_as_the_rendered_entity() {
+        let (_db, state) = state().await;
+        let alice = account(&state, "hint-render-alice").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&alice, "rendered at the socket"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let connection = watching(&state, &[PUBLIC]).await;
+
+        let frame = connection
+            .frame_for(&hinted_update(row.id))
+            .await
+            .expect("a hinted update is rendered for the socket");
+
+        let envelope: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+        assert_eq!(
+            envelope["event"], "update",
+            "the event name rides the frame as published: {frame}"
+        );
+        let payload: Value = serde_json::from_str(
+            envelope["payload"]
+                .as_str()
+                .expect("the rendered update carries a payload string"),
+        )
+        .expect("the payload is the entity JSON");
+        assert_eq!(
+            payload["id"],
+            Value::from(row.id.to_string()),
+            "the payload is the hinted status's entity"
+        );
+        assert_eq!(
+            payload["content"],
+            Value::from("<p>rendered at the socket</p>"),
+            "rendered from the live row"
+        );
+    }
+
+    /// A render hint that no longer names a renderable status — the row
+    /// tombstone between the publish and this socket's read — drops the
+    /// frame: Mastodon's `update` is its entity, and an entity-less one is
+    /// noise a client cannot use.
+    #[tokio::test]
+    async fn a_render_hint_whose_status_is_gone_drops_the_frame() {
+        let (_db, state) = state().await;
+        let alice = account(&state, "hint-gone-alice").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&alice, "doomed before delivery"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let _tombstone = status::soft_delete(&state.db, row.id)
+            .await
+            .expect("the delete fixture runs");
+        let connection = watching(&state, &[PUBLIC]).await;
+
+        assert!(
+            connection.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the tombstoned hint delivers nothing"
+        );
+        assert!(
+            connection
+                .frame_for(&hinted_update(Uuid::now_v7()))
+                .await
+                .is_none(),
+            "and so does a hint that never named a row"
+        );
+    }
+
+    /// A render hint of a kind the socket does not render (no producer's
+    /// yet) stays the body-less push it was: delivered, without a payload.
+    #[tokio::test]
+    async fn a_non_status_render_hint_rides_without_a_payload() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &[PUBLIC]).await;
+        let hinted = StreamEvent {
+            streams: vec![PUBLIC.to_owned()],
+            event: "notification".to_owned(),
+            payload: None,
+            audience: Audience::Public,
+            render: Some(RenderSpec::Notification(Uuid::now_v7())),
+            local_only: false,
+        };
+
+        let frame = connection
+            .frame_for(&hinted)
+            .await
+            .expect("an unrendered hint is still delivered");
+
+        assert_eq!(
+            frame, r#"{"stream":["public"],"event":"notification"}"#,
+            "and Mastodon's envelope simply omits the payload it has none of"
+        );
+    }
+
+    /// The reader's filters judge the rendered payload: an update hinted
+    /// from a muted account never reaches the muter's socket.
+    #[tokio::test]
+    async fn a_rendered_update_is_judged_by_the_readers_filters() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "hint-filter-reader").await;
+        let author = account(&state, "hint-filter-author").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "from a muted account"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        mute_author(&state, &reader, &author).await;
+        let mut connection = watching(&state, &[PUBLIC]).await;
+        connection.reader = Some(reader.id);
+        connection.filters = Filters::load(&state.db, Some(reader.id))
+            .await
+            .expect("the filters load");
+
+        assert!(
+            connection.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the rendered payload carries the authorship the filters read"
+        );
+    }
+
+    /// An `update` event that carries only a status render hint: the shape
+    /// [`crate::services::streaming::status_created`] publishes.
+    fn hinted_update(id: Uuid) -> StreamEvent {
+        StreamEvent {
+            streams: vec![PUBLIC.to_owned()],
+            event: "update".to_owned(),
+            payload: None,
+            audience: Audience::Public,
+            render: Some(RenderSpec::Status(id)),
+            local_only: false,
+        }
     }
 
     /// A bearer token string minted for `reader` granting `scopes`.

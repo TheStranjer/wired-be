@@ -28,9 +28,9 @@
 //! the warning and the `MIME` type, as `{"id", "text", "spoiler_text",
 //! "content_type"}`.
 //!
-//! Nothing federates yet: the `Update` activity and the `status.update`
-//! stream push attach at the module's `after_status_edited` hook, the
-//! documented landing point.
+//! Nothing federates yet: the `Update` activity still attaches at the
+//! module's `after_status_edited` hook, where the `status.update` stream
+//! push now runs.
 //!
 //! [`Status`]: wired_be::entities::status::Status
 
@@ -48,6 +48,7 @@ use wired_be::{
         status_edit,
         user::User,
     },
+    streaming::hub::{Audience, RenderSpec},
     util::time::mastodon_time,
 };
 
@@ -292,6 +293,52 @@ async fn an_edit_records_the_previous_version_and_stamps_the_answer() {
     assert_eq!(items[1]["media_attachments"], json!([]));
     assert_eq!(items[1]["emojis"], json!([]), "the standing placeholders");
     assert_eq!(items[1]["poll"], Value::Null);
+}
+
+/// The edit route's `after_status_edited` hook: a successful edit pushes
+/// Mastodon's `status.update` onto the hub, riding the post's own target
+/// streams with the render hint and no entity of its own.
+#[tokio::test]
+async fn an_edit_pushes_status_update_onto_the_hub() {
+    let db = common::test_db().await;
+    let state = common::test_app_state(db.pool().clone(), common::test_config());
+    let app = wired_be::app(state.clone());
+    let (alice, token) = editor(&state.db, "edit-pushing").await;
+    let row = post(&state.db, &alice, "before the push").await;
+    let mut rx = state.hub.subscribe();
+
+    let response = edit_row(&app, &token, &row, json!({"status": "after the push"})).await;
+    common::assert_answer(&response, StatusCode::OK, "the author edits their own post");
+
+    let event = rx.recv().await.expect("the edit hook published an event");
+    assert_eq!(
+        event.event, "status.update",
+        "the edit pushes the redraw event"
+    );
+    assert!(
+        event.streams.contains(&"public".to_owned()),
+        "a public post's streams carry it: {:?}",
+        event.streams
+    );
+    assert!(
+        event.streams.contains(&format!("user:{}", alice.id)),
+        "and the author's home stream: {:?}",
+        event.streams
+    );
+    assert_eq!(
+        event.render.as_ref(),
+        Some(&RenderSpec::Status(row.id)),
+        "the event carries the status render hint"
+    );
+    assert!(
+        event.payload.is_none(),
+        "the entity is rendered per socket, not shipped"
+    );
+    assert_eq!(
+        event.audience,
+        Audience::Public,
+        "a public post gates nobody"
+    );
 }
 
 /// The body's fields merge over the stored row: what it presents wins,

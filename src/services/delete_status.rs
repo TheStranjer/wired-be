@@ -4,9 +4,9 @@
 //! `DELETE /api/v1/statuses/{id}` is the HTTP half of Pleroma's
 //! `CommonAPI.delete` (`lib/pleroma/web/common_api.ex`); this module is the
 //! write it wraps — the tombstone of the row and of every live reblog of it,
-//! the counter steps, and the `after_status_deleted` hook the
-//! notification cleanup (and, once those tickets land, the `Delete`
-//! activity and the `status_deleted` stream push) hangs off. The endpoint
+//! the counter steps, and the `after_status_deleted` hook the notification
+//! cleanup and the `status_deleted` stream push hang off (the federation
+//! ticket that sends the `Delete` activity still lands there). The endpoint
 //! keeps its own gates — authentication, the visibility 404, the ownership
 //! rule, the pre-delete render — and calls [`delete_status`] for the write
 //! itself.
@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 use crate::{
     error::AppResult,
     models::{notification, status},
+    services::streaming,
     state::AppState,
 };
 
@@ -60,11 +61,12 @@ pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<
 /// clears the notifications the status caused is wired in here (the
 /// tombstoned row never fires the schema's `ON DELETE CASCADE`, so
 /// [`notification::delete_for_status`] is what takes the favourites,
-/// boosts, reactions and mentions about it with it). The federation
-/// ticket that sends the `Delete` activity (and, with it, the withdrawal
-/// of every reblog this delete took down) and the streaming ticket that
-/// pushes `status_deleted` to the timelines that carried the post still
-/// land here, and the queueing will happen through `state` (decision 11).
+/// boosts, reactions and mentions about it with it), and so is the
+/// streaming `delete` push ([`streaming::status_deleted`], Pleroma's
+/// `stream_out` of the `Delete`) to exactly the timelines that carried the
+/// post. The federation ticket that sends the `Delete` activity (and, with
+/// it, the withdrawal of every reblog this delete took down) still lands
+/// here, and the queueing will happen through `state` (decision 11).
 ///
 /// `status` is the row **as it was before the delete** — the delete clears the
 /// stored text, so this is the only copy of what the post said: its
@@ -72,11 +74,15 @@ pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<
 /// to withdraw, [`user_id`](status::Status::user_id) is the actor that owns
 /// it, and [`reblog_of_id`](status::Status::reblog_of_id) says whether the
 /// object was a boost whose original must stop counting it. Pleroma runs all
-/// three off the same `CommonAPI.delete` pipeline.
+/// three off the same `CommonAPI.delete` pipeline; the stream push needs the
+/// same snapshot, since only it still names a status the target computation
+/// can answer for.
 ///
 /// The cleanup is best-effort: the delete itself is already committed and
 /// must not answer a failure the client would retry against a gone
 /// status, so a cleanup that fails is logged, not returned.
+///
+/// [`streaming::status_deleted`]: crate::services::streaming::status_deleted
 async fn after_status_deleted(state: &AppState, status: &status::Status) {
     if let Err(err) = notification::delete_for_status(&state.db, status.id).await {
         warn!(
@@ -85,6 +91,7 @@ async fn after_status_deleted(state: &AppState, status: &status::Status) {
             "notification cleanup after status deletion failed"
         );
     }
+    streaming::status_deleted(state, status).await;
 }
 
 #[cfg(test)]
@@ -232,6 +239,55 @@ mod tests {
         assert_eq!(
             restated.updated_at, tombstone.updated_at,
             "the no-op pass did not touch the row"
+        );
+    }
+
+    /// The `after_status_deleted` hook pushes Mastodon's `delete` onto the
+    /// hub the served sockets read, carrying the deleted id as its payload;
+    /// the no-op second delete fires nothing.
+    #[tokio::test]
+    async fn the_delete_hook_pushes_the_delete_event_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let row = post(&pool, &alice, "deleted once streams once").await;
+        let mut rx = state.hub.subscribe();
+
+        assert!(
+            delete_status(&state, &row)
+                .await
+                .expect("the first delete runs"),
+            "the live row reports its deletion"
+        );
+
+        let event = rx.recv().await.expect("the hook published the withdrawal");
+        assert_eq!(
+            event.event, "delete",
+            "the delete hook pushed the withdrawal"
+        );
+        assert_eq!(
+            event.payload.as_deref(),
+            Some(row.id.to_string().as_str()),
+            "its payload is the deleted id"
+        );
+        assert_eq!(
+            event.render, None,
+            "a tombstoned row carries no render hint"
+        );
+
+        assert!(
+            !delete_status(&state, &row)
+                .await
+                .expect("the second pass runs"),
+            "the row was already a tombstone"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "the no-op delete fires no second event"
         );
     }
 }

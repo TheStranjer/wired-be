@@ -109,7 +109,7 @@ use crate::{
         status_edit, status_visibility,
         user::User,
     },
-    services::{mentions::resolve_mentions, notify, render_status::render_status},
+    services::{mentions::resolve_mentions, notify, render_status::render_status, streaming},
     state::AppState,
     util::{
         entities::{MentionRef, extract_hashtags, linkify_entities},
@@ -1145,21 +1145,24 @@ const fn visibility_width(visibility: Visibility) -> u8 {
 /// local status out of the database it was just written to — the mention
 /// notifications for the mentioned accounts and the replied-to author
 /// (landed from [`notify::on_mention`], Pleroma's `Create` notification
-/// arm), the streaming `update` broadcast to the author's and the mentioned
-/// users' sockets and to the public and hashtag timelines, the follower
-/// `status` notifications, and the federation of the `Create` activity
-/// through the job queue (see [`crate::models::job`], decision 11) — wire
-/// themselves in here, and only here.
+/// arm), the streaming `update` to every timeline the new post belongs to
+/// (landed from [`streaming::status_created`], Pleroma's `stream_out`),
+/// the follower `status` notifications, and the federation of the `Create`
+/// activity through the job queue (see [`crate::models::job`], decision
+/// 11) — wire themselves in here, and only here.
 ///
 /// `status` is the stored row: the id the tellings name, the author they
 /// do not tell, and the `reblog_of_id` that keeps a boost row out of the
-/// mention arm. The two consumers still waiting (streaming and
-/// federation) need the rendered entity too and will grow this one call's
-/// signature when they land.
+/// mention arm. The stream push names the row by render hint rather than
+/// shipping the rendered entity, so the streaming consumer needed no
+/// growth of this signature; the one consumer still waiting (federation)
+/// will grow it when it lands.
 ///
 /// [`notify::on_mention`]: crate::services::notify::on_mention
+/// [`streaming::status_created`]: crate::services::streaming::status_created
 async fn after_status_created(state: &AppState, status: &status::Status) {
     notify::on_mention(state, status).await;
+    streaming::status_created(state, status).await;
 }
 
 /// The body of `PUT /api/v1/statuses/{id}`, as the client wrote it.
@@ -3976,5 +3979,35 @@ mod tests {
         );
         assert_eq!(live_ids(pool).await.len(), 1, "no second row");
         assert_eq!(media_row(pool, mine.id).await.position, 0, "claimed once");
+    }
+
+    /// The `after_status_created` hook pushes Mastodon's `update` with the
+    /// render hint onto the hub the moment the row is written — the create
+    /// path a remote ingestion later shares — and the preview arm, which
+    /// writes nothing, fires nothing.
+    #[tokio::test]
+    async fn the_create_hook_pushes_the_update_event() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let app_state = state(&pool);
+        let alice = user(&pool, "hooking-author").await;
+        let mut rx = app_state.hub.subscribe();
+
+        let entity = created(&app_state, &alice, posted("streamed from the hook")).await;
+
+        let event = rx.recv().await.expect("the create hook published an event");
+        assert_eq!(event.event, "update", "the fresh post arrives");
+        let hinted = Uuid::parse_str(&entity.id).expect("the entity names its status");
+        assert_eq!(
+            event.render,
+            Some(crate::streaming::hub::RenderSpec::Status(hinted)),
+            "the push carries the created status's render hint"
+        );
+        assert!(
+            event.streams.contains(&"public".to_owned()),
+            "a public post rides the public timeline: {:?}",
+            event.streams
+        );
+        assert!(event.payload.is_none(), "the entity is rendered per socket");
     }
 }

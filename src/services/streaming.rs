@@ -10,10 +10,16 @@
 //! `Pleroma.Activity.Ir.Topics` (`lib/pleroma/activity/ir/topics.ex`)
 //! answers when it turns an activity into `PubSub` topics, restated over
 //! decision 6's relational statuses and the five `statuses.visibility`
-//! values. It computes and reads; it never publishes. The publish side —
-//! rendering the entity and handing the [`StreamEvent`] to
+//! values. [`targets`] computes and reads; [`status_created`],
+//! [`status_deleted`] and [`status_edited`] are its publish side: each
+//! resolves the row's answer and hands the finished [`StreamEvent`] to
 //! [`Hub::publish`](crate::streaming::hub::Hub::publish) from the action
-//! hooks — is the later slice that consumes [`targets`].
+//! hook that calls it, best-effort — a status already written never fails
+//! its request over a push. A created or edited status publishes a
+//! [`RenderSpec::Status`] hint rather than an entity, so every socket
+//! renders the entity for its own reader (the streaming endpoint of
+//! [`crate::api::streaming`] resolves the hint); a delete, whose row is a
+//! tombstone nothing can re-render, carries the deleted id itself.
 //!
 //! The rules, stated once here and split into one helper per component:
 //!
@@ -79,6 +85,7 @@
 //! [`list::lists_containing`]: crate::models::list::lists_containing
 
 use sqlx::PgPool;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -86,10 +93,10 @@ use crate::{
     models::{
         follow, hashtag, list, media_attachment, mention,
         status::{self, Status, Visibility},
-        user::User,
+        user::{self, User},
     },
     state::AppState,
-    streaming::hub::Audience,
+    streaming::hub::{Audience, RenderSpec, StreamEvent},
 };
 
 /// The stream, audience and locality a stored status would publish with,
@@ -112,8 +119,8 @@ use crate::{
 /// [module docs](self#when-a-status-is-never-published)).
 ///
 /// Pure computation over database reads: it publishes nothing and fires no
-/// hook, and the hooks that will hand a stored status here wait for the
-/// publishing slice that consumes this answer.
+/// hook. The emitters ([`status_created`], [`status_deleted`],
+/// [`status_edited`]) are its consumers, and the action hooks call those.
 ///
 /// [`Audience`]: crate::streaming::hub::Audience
 /// [`StreamEvent::local_only`]: crate::streaming::hub::StreamEvent::local_only
@@ -141,6 +148,122 @@ pub async fn targets(
         Visibility::Local => local_targets(state, row).await?,
     };
     Ok(Some(outcome))
+}
+
+/// Publish Mastodon's `update` for the freshly stored status `row`.
+///
+/// The event rides the target set [`targets`] answers for the row, and it
+/// carries a [`RenderSpec::Status`] hint rather than a payload: each
+/// receiving socket renders the entity for its own reader (see
+/// [`crate::api::streaming`], the reader that resolves the hint).
+///
+/// Best-effort like every action-hook tail: the row is already committed,
+/// so a lost push costs a socket a redraw, not the client a failure.
+/// Nothing publishes when [`targets`] answers `None` (the
+/// [never-published cases](self#when-a-status-is-never-published)) or when
+/// a read behind the computation fails, and every such refusal is a log
+/// line. A remote row ingested through the same create path publishes from
+/// here too — its `public:remote*` streams come from [`targets`].
+pub async fn status_created(state: &AppState, row: &Status) {
+    publish_status(state, row, "update", None, Some(RenderSpec::Status(row.id))).await;
+}
+
+/// Publish Mastodon's `delete` for the removed status.
+///
+/// `row` is the snapshot **as it was before the delete** (what
+/// [`after_status_deleted`] is handed), so the same [`targets`] answer
+/// names exactly the streams the `update` of this post rode: the delete
+/// clears the row's own text but leaves its mention, hashtag and
+/// attachment links, its visibility and its followers.
+///
+/// The payload is the deleted id as plain text (Mastodon's `delete`
+/// shape) and no render hint rides along: the row is a tombstone, so no
+/// socket can re-render an entity out of it. Best-effort and silent in
+/// the same refusal cases as [`status_created`].
+///
+/// [`after_status_deleted`]: crate::services::delete_status
+pub async fn status_deleted(state: &AppState, row: &Status) {
+    publish_status(state, row, "delete", Some(row.id.to_string()), None).await;
+}
+
+/// Publish Mastodon's `status.update` for the edited status `row`, so the
+/// sockets that carried the post redraw it.
+///
+/// `row` is the stored row as the edit route's gate read it, before the
+/// write: an edit moves none of the fields [`targets`] reads off the row
+/// itself — the author, the visibility, the thread, the locality and the
+/// reblog link all stand (a reblog is not editable at that route at all)
+/// — while the mentions, hashtags and attachments the computation looks up
+/// come from the live tables the edit's transaction replaced. Either
+/// version of the row therefore answers the same target set. The event
+/// carries the same [`RenderSpec::Status`] hint as [`status_created`] and
+/// no payload, and the same best-effort refusals apply.
+pub async fn status_edited(state: &AppState, row: &Status) {
+    publish_status(
+        state,
+        row,
+        "status.update",
+        None,
+        Some(RenderSpec::Status(row.id)),
+    )
+    .await;
+}
+
+/// The shared body of the three emitters: read `row`'s author, ask
+/// [`targets`], and hand the caller-shaped [`StreamEvent`] to
+/// [`Hub::publish`](crate::streaming::hub::Hub::publish). Every refusal
+/// is a return without publishing: a missing or unreadable author, a
+/// failed target read (a log line each, since the write behind the event
+/// already committed) and the target rules' own `None` (no log — the
+/// [rules](self#when-a-status-is-never-published) already say why).
+async fn publish_status(
+    state: &AppState,
+    row: &Status,
+    event: &str,
+    payload: Option<String>,
+    render: Option<RenderSpec>,
+) {
+    let author = match user::get_by_id(&state.db, row.user_id).await {
+        Ok(Some(author)) => author,
+        Ok(None) => {
+            warn!(
+                status = %row.id,
+                user = %row.user_id,
+                "status stream event skipped: the row has no author to gate it by"
+            );
+            return;
+        }
+        Err(err) => {
+            warn!(
+                status = %row.id,
+                %err,
+                "status stream event skipped: reading its author failed"
+            );
+            return;
+        }
+    };
+    let found = match targets(state, row, &author).await {
+        Ok(found) => found,
+        Err(err) => {
+            warn!(
+                status = %row.id,
+                %err,
+                "status stream event skipped: the target computation failed"
+            );
+            return;
+        }
+    };
+    let Some((streams, audience, local_only)) = found else {
+        return;
+    };
+    state.hub.publish(StreamEvent {
+        streams,
+        event: event.to_owned(),
+        payload,
+        audience,
+        render,
+        local_only,
+    });
 }
 
 /// Whether `row` is a reblog whose original is gone: [`status::get_by_id`]
@@ -432,6 +555,7 @@ mod tests {
     use std::sync::Arc;
 
     use sqlx::PgPool;
+    use tokio::sync::broadcast;
 
     use super::*;
     use crate::{
@@ -710,6 +834,22 @@ mod tests {
                 panic!("a users-gated event was the audience {audience:?}")
             }
         }
+    }
+
+    /// The single event the emitter under test handed to `rx`, which the
+    /// test subscribed to before making the call: the hub delivers every
+    /// publish to its local subscribers at once, so one awaited emitter
+    /// call is already buffered here by the time this reads.
+    async fn emitted(rx: &mut broadcast::Receiver<Arc<StreamEvent>>) -> StreamEvent {
+        Arc::unwrap_or_clone(rx.recv().await.expect("the emitter published an event"))
+    }
+
+    /// Asserts `rx` holds no event: the emitter published nothing.
+    fn assert_empty(rx: &mut broadcast::Receiver<Arc<StreamEvent>>) {
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "the emitter published an event it owed nothing"
+        );
     }
 
     #[tokio::test]
@@ -1135,5 +1275,349 @@ mod tests {
             "a boost whose original is tombstoned has nothing left to announce — \
              the same live read answers a never-stored original"
         );
+    }
+
+    #[tokio::test]
+    async fn status_created_pushes_update_on_the_public_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        follow_user(&pool, &bob, &alice).await;
+        let dana = local_user(&pool, "dana").await;
+        follow_user(&pool, &dana, &alice).await;
+        let alice_list = list_of(&pool, &dana, &alice, "followed").await;
+        let row = post(&pool, &alice, "hello #Rust world").await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "update", "Mastodon's arrival event");
+        assert_eq!(
+            event.streams,
+            canonical(vec![
+                "public".to_owned(),
+                "public:local".to_owned(),
+                "hashtag:rust".to_owned(),
+                "hashtag:local:rust".to_owned(),
+                user_stream(alice.id),
+                user_stream(bob.id),
+                user_stream(dana.id),
+                list_stream(alice_list.id),
+            ]),
+            "the event rides exactly the computed set — the public timelines, both tag \
+             streams, the home circle and the list"
+        );
+        assert_eq!(event.audience, Audience::Public, "the computed audience");
+        assert!(!event.local_only, "a public post is not local-only");
+        assert_eq!(
+            event.render,
+            Some(RenderSpec::Status(row.id)),
+            "the update carries the status render hint"
+        );
+        assert!(
+            event.payload.is_none(),
+            "and no body: the socket renders it"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_created_pushes_update_on_the_unlisted_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        follow_user(&pool, &bob, &alice).await;
+        let dana = local_user(&pool, "dana").await;
+        follow_user(&pool, &dana, &alice).await;
+        let alice_list = list_of(&pool, &dana, &alice, "followed").await;
+        let erin = local_user(&pool, "erin").await;
+        let row = post_vis(
+            &pool,
+            &alice,
+            "quietly #Rust",
+            Visibility::Unlisted,
+            &[erin.id],
+        )
+        .await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "update", "Mastodon's arrival event");
+        assert_eq!(
+            event.streams,
+            canonical(vec![
+                "hashtag:rust".to_owned(),
+                "hashtag:local:rust".to_owned(),
+                user_stream(alice.id),
+                user_stream(bob.id),
+                user_stream(dana.id),
+                user_stream(erin.id),
+                list_stream(alice_list.id),
+            ]),
+            "the unlisted set — hashtag, home (with the mentioned non-follower) and \
+             list — and no public stream at all"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(sorted_ids(vec![alice.id, bob.id, dana.id, erin.id])),
+            "the home circle plus the list owner gate delivery"
+        );
+        assert!(!event.local_only, "unlisted is still federated");
+        assert_eq!(event.render, Some(RenderSpec::Status(row.id)), "the hint");
+        assert!(event.payload.is_none(), "and no body");
+    }
+
+    #[tokio::test]
+    async fn status_created_pushes_update_on_the_private_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        follow_user(&pool, &bob, &alice).await;
+        let erin = local_user(&pool, "erin").await;
+        let row = post_vis(
+            &pool,
+            &alice,
+            "followers only",
+            Visibility::Private,
+            &[erin.id],
+        )
+        .await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "update", "Mastodon's arrival event");
+        assert_eq!(
+            event.streams,
+            canonical(vec![user_stream(alice.id), user_stream(bob.id)]),
+            "the author's and the accepted follower's home — not the mentioned \
+             non-follower, no public stream"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(sorted_ids(vec![alice.id, bob.id])),
+            "exactly those two"
+        );
+        assert_eq!(event.render, Some(RenderSpec::Status(row.id)), "the hint");
+        assert!(event.payload.is_none(), "and no body");
+    }
+
+    #[tokio::test]
+    async fn status_created_pushes_update_on_the_direct_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = remote_user(&pool, "carol").await;
+        let row = post_vis(
+            &pool,
+            &alice,
+            "for a few eyes only",
+            Visibility::Direct,
+            &[bob.id, carol.id],
+        )
+        .await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "update", "Mastodon's arrival event");
+        assert_eq!(
+            event.streams,
+            canonical(vec![
+                user_stream(alice.id),
+                direct_stream(alice.id),
+                user_stream(bob.id),
+                direct_stream(bob.id),
+            ]),
+            "author and every mentioned LOCAL user on both their streams — the remote \
+             mention gets nothing"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(sorted_ids(vec![alice.id, bob.id])),
+            "the recipients alone"
+        );
+        assert_eq!(event.render, Some(RenderSpec::Status(row.id)), "the hint");
+        assert!(event.payload.is_none(), "and no body");
+    }
+
+    #[tokio::test]
+    async fn status_created_pushes_the_local_visibility_as_local_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let row = post_vis(&pool, &alice, "instance only #Rust", Visibility::Local, &[]).await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "update", "Mastodon's arrival event");
+        assert_eq!(
+            event.streams,
+            canonical(vec![
+                "public:local".to_owned(),
+                "hashtag:local:rust".to_owned(),
+            ]),
+            "the local half of the public set and no global stream"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Everyone,
+            "every authenticated local user"
+        );
+        assert!(event.local_only, "the local-only flag rides the event");
+        assert_eq!(event.render, Some(RenderSpec::Status(row.id)), "the hint");
+        assert!(event.payload.is_none(), "and no body");
+    }
+
+    #[tokio::test]
+    async fn status_created_pushes_the_remote_statuses_domain_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let carol = remote_user(&pool, "carol").await;
+        let row = remote_post(&pool, &carol, "over here #Rust", &["Rust"]).await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(
+            event.streams,
+            canonical(vec![
+                "public".to_owned(),
+                "public:remote".to_owned(),
+                "public:remote:remote.example".to_owned(),
+                "hashtag:rust".to_owned(),
+                user_stream(carol.id),
+            ]),
+            "a remote status ingested through the create path rides the remote-domain \
+             streams straight off the target computation"
+        );
+        assert_eq!(event.audience, Audience::Public, "as the computation says");
+        assert!(!event.local_only, "a remote post is not local-only");
+        assert_eq!(event.event, "update", "the same arrival event");
+        assert_eq!(event.render, Some(RenderSpec::Status(row.id)), "the hint");
+    }
+
+    #[tokio::test]
+    async fn status_edited_pushes_status_update_on_the_same_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        follow_user(&pool, &bob, &alice).await;
+        let row = post(&pool, &alice, "before the edit").await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+        let created = emitted(&mut rx).await;
+        status_edited(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "status.update", "Mastodon's redraw event");
+        assert_eq!(
+            event.streams, created.streams,
+            "the redraw rides exactly the streams the post arrived on"
+        );
+        assert_eq!(event.audience, created.audience, "with the same audience");
+        assert_eq!(
+            event.local_only, created.local_only,
+            "and the same locality"
+        );
+        assert_eq!(
+            event.render,
+            Some(RenderSpec::Status(row.id)),
+            "the render hint lets each socket redraw the entity"
+        );
+        assert!(event.payload.is_none(), "and no body rides the bus");
+    }
+
+    #[tokio::test]
+    async fn status_deleted_mirrors_the_created_streams_with_the_id_payload() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        follow_user(&pool, &bob, &alice).await;
+        let row = post(&pool, &alice, "doomed #Rust").await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+        let created = emitted(&mut rx).await;
+        let _tombstone = status::soft_delete(&pool, row.id)
+            .await
+            .expect("the delete fixture runs");
+        status_deleted(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "delete", "Mastodon's withdrawal event");
+        assert_eq!(
+            event.streams, created.streams,
+            "the withdrawal rides exactly the streams the post arrived on"
+        );
+        assert_eq!(event.audience, created.audience, "with the same audience");
+        assert_eq!(
+            event.local_only, created.local_only,
+            "and the same locality"
+        );
+        assert_eq!(
+            event.payload.as_deref(),
+            Some(row.id.to_string().as_str()),
+            "the payload is the deleted id as plain text"
+        );
+        assert_eq!(event.render, None, "no render hint: the row is a tombstone");
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_author_publishes_nothing_on_any_push() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let ghost = inactive_user(&pool, "ghost").await;
+        let row = post(&pool, &ghost, "heard from the grave").await;
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+        assert_empty(&mut rx);
+        status_edited(&state, &row).await;
+        assert_empty(&mut rx);
+        status_deleted(&state, &row).await;
+        assert_empty(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn the_emitters_publish_nothing_for_a_reblog_of_a_deleted_original() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let dave = local_user(&pool, "dave").await;
+        let original = post(&pool, &alice, "doomed").await;
+        let row = boost(&pool, &dave, &original).await;
+        let _tombstone = status::soft_delete(&pool, original.id)
+            .await
+            .expect("the delete fixture runs");
+        let mut rx = state.hub.subscribe();
+
+        status_created(&state, &row).await;
+
+        assert_empty(&mut rx);
     }
 }

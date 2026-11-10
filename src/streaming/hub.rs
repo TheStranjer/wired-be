@@ -83,14 +83,17 @@ pub enum Audience {
     Everyone,
 }
 
-/// Which entity a [`StreamEvent`] points at by id, so a client may render
-/// it after fetching the body through the API instead of receiving the
-/// body on the socket.
+/// Which entity a [`StreamEvent`] points at by id, so the body is rendered
+/// at the delivery end for each reader rather than serialized once into a
+/// payload that rides to every listener of the stream.
 ///
 /// Pleroma's streamer sends this (its `render` push field) in place of the
-/// entity when the payload must not ride to every listener of the stream.
-/// Nothing publishes one yet, and the streaming WebSocket endpoint keeps
-/// ignoring [`StreamEvent::render`] until the slice that adopts it.
+/// entity, and its `Streamer` renders in the socket process per user; the
+/// status emitters of [`crate::services::streaming`] publish
+/// [`RenderSpec::Status`] with an empty payload and
+/// [`crate::api::streaming`] renders the hinted status for each socket's
+/// reader. The other variants stay hints until their producers' slices
+/// land.
 ///
 /// The variants serialize to `{"status": "<uuid>"}`,
 /// `{"notification": "<uuid>"}` and `{"chat": "<uuid>"}`: `snake_case`
@@ -133,9 +136,7 @@ pub struct StreamEvent {
     pub render: Option<RenderSpec>,
     /// Whether the event concerns this instance's local users and entities
     /// only (Pleroma's `local_only` push flag). The streaming WebSocket
-    /// drops such an event on a socket with no authenticated reader; the
-    /// endpoint keeps sending `payload` and still ignores
-    /// [`render`](Self::render) until a later slice.
+    /// drops such an event on a socket with no authenticated reader.
     pub local_only: bool,
 }
 

@@ -19,7 +19,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::{http::StatusCode, response::Response};
 use futures_util::{SinkExt as _, StreamExt as _};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::{
     net::TcpStream,
@@ -35,9 +35,14 @@ use wired_be::{
     api::streaming::MAX_SUBSCRIPTIONS,
     config::Config,
     models::{
-        block, conversation_mute, domain_block, list,
+        block, conversation_mute, domain_block, follow, list,
         mute::{self, MuteOptions},
+        status,
         user::{NewUser, User, insert},
+    },
+    services::{
+        create_status::{self, CreateStatusParams},
+        delete_status,
     },
     state::AppState,
     streaming::hub::{Audience, StreamEvent},
@@ -960,4 +965,130 @@ async fn read_raw_frame(stream: &mut TcpStream) -> Option<u8> {
         }
     }
     Some(opcode)
+}
+
+/// The whole lifecycle over a real socket: creating a public status through
+/// [`create_status`] publishes `update` with the rendered entity, and an
+/// anonymous socket on `public` and a follower's socket on `user` both
+/// receive it; deleting it publishes `delete` and both sockets see the
+/// withdrawal.
+#[tokio::test]
+async fn a_created_public_status_reaches_public_and_home_then_deletes() {
+    let server = Server::start().await;
+    let author = account(server.pool(), "lifecycle-author").await;
+    let follower = account(server.pool(), "lifecycle-follower").await;
+    let relationship = follow::follow(
+        server.pool(),
+        &server.state.config.base_url,
+        &follower,
+        &author,
+    )
+    .await
+    .expect("the follow fixture writes");
+    assert_eq!(
+        relationship.state,
+        follow::FollowState::Accepted,
+        "the unlocked local target grants the follow on the spot"
+    );
+    let secret = token(server.pool(), &follower, "read").await;
+
+    let mut anon = open(&server.url(PUBLIC)).await;
+    let mut home = open(&server.url(&format!("stream=user&access_token={secret}"))).await;
+    settled(&mut anon).await;
+    settled(&mut home).await;
+
+    let entity =
+        create_status::create_status(&server.state, &author, None, create_body(LIFECYCLE_TEXT))
+            .await
+            .expect("the create service runs");
+
+    let anon_frame = next_json(&mut anon).await;
+    assert_update_carries(&anon_frame, &entity.id);
+    assert!(
+        streams_of(&anon_frame).contains(&"public"),
+        "the anonymous socket's public stream carries it: {anon_frame}"
+    );
+
+    let home_stream = format!("user:{}", follower.id);
+    let home_frame = next_json(&mut home).await;
+    assert_update_carries(&home_frame, &entity.id);
+    assert!(
+        streams_of(&home_frame).contains(&home_stream.as_str()),
+        "the follower's home stream carries it: {home_frame}"
+    );
+
+    let id = Uuid::parse_str(&entity.id).expect("the entity id is a uuid");
+    let row = status::get_by_id(server.pool(), id)
+        .await
+        .expect("the row reads")
+        .expect("the create stored it");
+    assert!(
+        delete_status::delete_status(&server.state, &row)
+            .await
+            .expect("the delete service runs"),
+        "the row was live"
+    );
+
+    for (frame, who) in [
+        (next_json(&mut anon).await, "anonymous"),
+        (next_json(&mut home).await, "follower"),
+    ] {
+        assert_eq!(frame["event"], "delete", "the {who} socket sees the delete");
+        assert_eq!(
+            frame["payload"].as_str(),
+            Some(entity.id.as_str()),
+            "the {who} socket's delete payload is the status id"
+        );
+    }
+}
+
+/// The next text frame, parsed as Mastodon's JSON envelope.
+async fn next_json(client: &mut Client) -> Value {
+    serde_json::from_str(&next_text(client).await).expect("every streaming frame is JSON")
+}
+
+/// The frame's `stream` array, as strings.
+fn streams_of(frame: &Value) -> Vec<&str> {
+    frame["stream"]
+        .as_array()
+        .expect("the envelope names its streams")
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<&str>>>()
+        .expect("every stream name is a string")
+}
+
+/// A create body for a public status of `text`, through the service's own
+/// parameters type.
+fn create_body(text: &str) -> CreateStatusParams {
+    serde_json::from_value(json!({ "status": text, "visibility": "public" }))
+        .expect("the test body is a create body")
+}
+
+/// The post the lifecycle test creates, asserted in the streamed entity.
+const LIFECYCLE_TEXT: &str = "a status that streams live";
+
+/// Asserts an `update` frame is Mastodon's arrival event for the status
+/// `id`, its payload the rendered public-view entity with the lifecycle
+/// text in its content.
+fn assert_update_carries(frame: &Value, id: &str) {
+    assert_eq!(frame["event"], "update", "the socket sees an update");
+    let payload = frame["payload"]
+        .as_str()
+        .expect("the update carries a payload string");
+    let entity: Value = serde_json::from_str(payload).expect("the payload is the entity JSON");
+    assert_eq!(
+        entity["id"], id,
+        "the payload is the created status's rendered entity"
+    );
+    assert_eq!(
+        entity["visibility"], "public",
+        "rendered as the socket's reader sees it"
+    );
+    assert!(
+        entity["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(LIFECYCLE_TEXT)),
+        "the content rides the entity: {entity}"
+    );
 }
