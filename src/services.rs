@@ -43,6 +43,13 @@
 //! the viewer's block/mute/domain-block/thread-mute exclusions and the
 //! visibility clause into a single keyset-paged statement.
 //!
+//! [`rich_media`] is the pure half of the rich media cards: the parser that
+//! turns one page of HTML and its URL into a [`Card`](rich_media::Card) —
+//! Open Graph tags, then Twitter card tags, then the plain title — and the
+//! shaper that renders a card as the Mastodon entity JSON, the pair of
+//! Pleroma's `RichMedia.Parser` and `RichMedia.Card`. The fetch, the storage
+//! and the job that runs them are not here.
+//!
 //! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
@@ -57,6 +64,7 @@ pub mod media_proxy;
 pub mod mentions;
 pub mod notify;
 pub mod render_status;
+pub mod rich_media;
 pub mod timeline;
 pub mod translate;
 pub mod vapid;
