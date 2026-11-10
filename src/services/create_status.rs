@@ -44,7 +44,16 @@
 //! `Media not found`, and a body carrying at least one attachment may
 //! post with empty text (Pleroma's `attachments_from_ids` and
 //! `validate_character_limit`, with this instance's outright refusal
-//! where Pleroma silently drops).
+//! where Pleroma silently drops). `in_reply_to_conversation_id` has landed
+//! too (WBE-123's conversation arm): the poster's own
+//! [`Participation`](crate::models::conversation::Participation) id, read
+//! with the poster as owner through [`conversation::get_participation`]
+//! (a malformed, unknown or foreign id is the shared 404), forces the post
+//! to `direct`, merges the participation's recipients into its mentions
+//! and names its `direct_conversation_id`, so the post answers into that
+//! DM thread; the create's `after_status_created` hook then records every
+//! local participant's side of the conversation through
+//! [`conversation::participate_for_status`].
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //!
@@ -102,6 +111,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     models::{
+        conversation,
         hashtag::Hashtag,
         idempotency_key, mention,
         oauth_app::OauthApp,
@@ -236,6 +246,19 @@ pub struct CreateStatusParams {
     /// post, Pleroma's own empty-string "no reply" arm.
     #[serde(default)]
     in_reply_to_id: Option<String>,
+    /// Pleroma's conversation-reply arm: the id text of the poster's own
+    /// [`conversation_participation`](crate::models::conversation::Participation)
+    /// row. A named participation makes the post a `direct` reply into
+    /// that DM thread: the participation's recipients join its mentions,
+    /// the visibility is forced to `direct` however the body spelled it,
+    /// and the new row lands in the participation's conversation, which
+    /// is what `after_status_created`'s
+    /// [`participate`](crate::models::conversation::participate) hook then
+    /// reads back. A malformed, unknown, or someone-else's id is the
+    /// shared 404. Absent, null or empty names no conversation, and the
+    /// post stands on [`in_reply_to_id`](Self::in_reply_to_id) alone.
+    #[serde(default)]
+    in_reply_to_conversation_id: Option<String>,
     /// The ids of the poster's own unposted uploads this status carries,
     /// in the order they want them to render — decision 10's id-array:
     /// JSON's `["a","b"]` or the form's `media_ids[]=a&media_ids[]=b`,
@@ -778,6 +801,7 @@ pub async fn preview_status(
             bookmark_folder: None,
             pinned_at: None,
             muted: JsonBool(false),
+            direct_participation: None,
             reblog: None,
         },
         Some(user),
@@ -837,6 +861,7 @@ fn preview_row(
         in_reply_to_account_id: None,
         in_reply_to_ap_id: None,
         conversation_id: id,
+        direct_conversation_id: None,
         reblog_of_id: None,
         quote_of_id: None,
         local: true,
@@ -960,13 +985,17 @@ fn new_status(
 }
 
 /// The shared pre-write half of both create arms: [`check_body`] over the
-/// body, the reply's parent when the body names one, the render through
-/// [`render_status_fields`], and the [`NewStatus`] to store with every reply
-/// decision already applied — the parent's id, author and thread, the
-/// [`inherited_visibility`] audience, the parent's language where the body
-/// named none, and the parent's author and mentions auto-linked after the
-/// accounts the text itself mentioned (`status_mentions` only; the text is
-/// not modified and no mention span is inserted).
+/// body, the reply's parent when the body names one, the
+/// `in_reply_to_conversation_id` participation when the body names one,
+/// the render through [`render_status_fields`], and the [`NewStatus`] to
+/// store with every reply decision already applied — the parent's id,
+/// author and thread, the [`inherited_visibility`] audience, the parent's
+/// language where the body named none, and the parent's author and
+/// mentions auto-linked after the accounts the text itself mentioned
+/// (`status_mentions` only; the text is not modified and no mention span
+/// is inserted) — and, for a conversation reply, the `direct` visibility
+/// forced, the participation's recipients merged into the mentions, and
+/// its thread recorded for the insert ([`apply_conversation_reply`]).
 ///
 /// The parent read happens before the render, like Pleroma's `ActivityDraft`
 /// pipeline, where the `in_reply_to` arm runs before `content`: a body with
@@ -977,8 +1006,10 @@ fn new_status(
 ///
 /// Those of [`check_body`] and [`render_status_fields`], plus
 /// [`AppError::NotFound`] through [`reply_parent`] for an `in_reply_to_id`
-/// naming no status the poster may see, plus any database failure behind the
-/// parent's mention read as [`AppError::Database`].
+/// naming no status the poster may see, plus [`AppError::NotFound`]
+/// through [`reply_participation`] for an `in_reply_to_conversation_id`
+/// naming no participation the poster owns, plus any database failure
+/// behind the parent's mention read as [`AppError::Database`].
 async fn prepared_new_status(
     state: &AppState,
     user: &User,
@@ -992,6 +1023,7 @@ async fn prepared_new_status(
         params,
     )?;
     let parent = reply_parent(state, user, params).await?;
+    let participation = reply_participation(state, user, params).await?;
     let entities = render_status_fields(state, checked.text, checked.content_type).await?;
     let mut new = new_status(user, app, &checked, &entities);
     if let Some(parent) = parent {
@@ -1013,7 +1045,58 @@ async fn prepared_new_status(
         new.conversation_id = Some(parent.conversation_id);
         new.mentioned_user_ids = merged_mentions(&new.mentioned_user_ids, &inherited);
     }
+    if let Some(participation) = participation {
+        apply_conversation_reply(state, &participation, &mut new).await?;
+    }
     Ok(new)
+}
+
+/// The participation the body's `in_reply_to_conversation_id` names: read
+/// with the poster as owner, so a malformed id, an id that names no
+/// participation and a participation of somebody else's are all one
+/// indistinguishable [`AppError::NotFound`] — the route never confirms
+/// that a foreign conversation id exists. Absent, null or empty — the
+/// same "nothing named" spelling as [`in_reply_to_id`] — is no
+/// conversation at all.
+///
+/// [`in_reply_to_id`]: CreateStatusParams::in_reply_to_id
+async fn reply_participation(
+    state: &AppState,
+    poster: &User,
+    params: &CreateStatusParams,
+) -> AppResult<Option<conversation::Participation>> {
+    let Some(text) = params
+        .in_reply_to_conversation_id
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(id) = parse_id(text) else {
+        return Err(AppError::NotFound);
+    };
+    let found = conversation::get_participation(&state.db, poster.id, id).await?;
+    found.map(Some).ok_or(AppError::NotFound)
+}
+
+/// The whole `in_reply_to_conversation_id` arm on a built [`NewStatus`]:
+/// the post becomes a `direct` answer into `participation`'s thread —
+/// visibility forced, the row linked to the conversation for the insert
+/// (Pleroma's `make_context(in_reply_to, participation)`, which routes a
+/// conversation reply's context through the participation), and the
+/// participation's recipients merged into the mentions after whatever the
+/// text and the parent arm already carried (Pleroma's addressed-users
+/// union — each account linked once, in first-mention order).
+async fn apply_conversation_reply(
+    state: &AppState,
+    participation: &conversation::Participation,
+    new: &mut NewStatus,
+) -> AppResult<()> {
+    new.visibility = Visibility::Direct;
+    new.direct_conversation_id = Some(participation.conversation_id);
+    let addressed = conversation::recipients(&state.db, participation.id).await?;
+    new.mentioned_user_ids = merged_mentions(&new.mentioned_user_ids, &addressed);
+    Ok(())
 }
 
 /// The status the body's `in_reply_to_id` names, read with exactly the
@@ -1160,6 +1243,28 @@ const fn visibility_width(visibility: Visibility) -> u8 {
 /// [`notify::on_mention`]: crate::services::notify::on_mention
 async fn after_status_created(state: &AppState, status: &status::Status) {
     notify::on_mention(state, status).await;
+    participate_in_conversation(state, status).await;
+}
+
+/// The conversation arm of [`after_status_created`]: a `direct` status is
+/// recorded in its DM thread — the thread row found-or-created, the
+/// status linked to it, every local participant's side bumped and every
+/// addressee (remote included) stored on the recipient lists — through
+/// [`conversation::participate_for_status`], which reads the roster off
+/// the status's stored mention links. A status of any other visibility
+/// does nothing.
+///
+/// Best-effort beside the rest of this hook: the post itself is already
+/// committed, so a participation that fails to land is logged — the
+/// status stands, and its read view simply lacks the thread.
+async fn participate_in_conversation(state: &AppState, status: &status::Status) {
+    if let Err(err) = conversation::participate_for_status(&state.db, status).await {
+        warn!(
+            status = %status.id,
+            %err,
+            "could not record the conversation participations of a status"
+        );
+    }
 }
 
 /// The body of `PUT /api/v1/statuses/{id}`, as the client wrote it.
@@ -1226,6 +1331,7 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         preview: None,
         expires_in: None,
         in_reply_to_id: None,
+        in_reply_to_conversation_id: None,
         media_ids: None,
     }
 }

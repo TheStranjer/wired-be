@@ -81,7 +81,13 @@
 //! the body asked for and answered back in the entity's
 //! `media_attachments`. A post that carries at least one attachment may
 //! leave its text empty, and attachments ride every visibility, `direct`
-//! included.
+//! included. And `in_reply_to_conversation_id` — WBE-123's Pleroma arm —
+//! posts into a DM thread by the poster's own
+//! [`Participation`](crate::models::conversation::Participation) id: the
+//! participation's recipients join its mentions, its conversation becomes
+//! the new status's `direct_conversation_id`, and the visibility is forced
+//! to `direct` whatever the body asked for; a malformed, unknown or
+//! somebody-else's participation id is the same shared 404.
 //!
 //! [`Config::max_media_attachments`]: crate::config::Config::max_media_attachments
 //!
@@ -682,8 +688,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// failures as [`AppError::Database`]. An `in_reply_to_id` naming no
 /// status the poster may see — malformed, unknown, deleted or invisible —
 /// is the shared 404 `{"error":"Record not found"}`, exactly the show
-/// route's answer for the same id. A preview owes the same 422s:
-/// validation runs on it exactly as on a post.
+/// route's answer for the same id, and so is an
+/// `in_reply_to_conversation_id` naming no participation the poster owns.
+/// A preview owes the same 422s: validation runs on it exactly as on a
+/// post.
 async fn create_status(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -2346,6 +2354,7 @@ mod tests {
             in_reply_to_account_id: None,
             in_reply_to_ap_id: None,
             conversation_id: id,
+            direct_conversation_id: None,
             reblog_of_id: None,
             quote_of_id: None,
             local: true,
