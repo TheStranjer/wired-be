@@ -20,13 +20,15 @@
 //!   arm of `show.json` is the same shape.
 //! - `conversation_id` is the row's `UUIDv7` thread id as text
 //!   (decision 4), not Pleroma's deprecated CRC32 of the context.
-//! - `quote_id`, `quote_url` and `quote_visible` are not emitted at all.
+//! - Pleroma's `quote_url` is not emitted at all: the quoted target is
+//!   the top-level `quote_id` (its id, whatever the viewer may see of
+//!   it) and the rendered quote is the nested `quote` entity, mirrored
+//!   identically in the `pleroma` block with `quote_visible` beside it.
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
-//! `pleroma.direct_conversation_id` (chats); and `quote` (the quoting
-//! ticket, whose original rows the service already batch-loads).
+//! and `pleroma.direct_conversation_id` (chats).
 //! `pleroma.bookmark_folder` is filled by the folders ticket, from
 //! [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders) —
 //! the one read that also answers `bookmarked`: a bookmarked row renders
@@ -61,6 +63,15 @@
 //! takes both flags from its *own* `conversation_id`, because a mute is a
 //! fact about the thread, not the post, so a reblog row and its nested
 //! original always carry the same pair.
+//! `quote`, `quote_id` and the `pleroma.quote`/`pleroma.quote_visible`
+//! pair are filled by the quoting ticket, from the quoted originals the
+//! service batch-loads and the one batched
+//! [`filter_visible`](crate::models::status_visibility::filter_visible)
+//! read that decides which of them this viewer may see: a visible quote
+//! renders nested — one level deep, the quoted status's own quote never
+//! rendering — and the same object lands in `pleroma.quote` beside its
+//! `quote_visible` flag, false exactly when `quote` is `null`. `quote_id`
+//! names the quoted row either way.
 //!
 //! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
@@ -113,9 +124,9 @@ pub struct StatusApplication {
 /// The `pleroma` extension object of a [`Status`]: the Pleroma-specific
 /// keys of `StatusView.render("show.json", …)`.
 ///
-/// `quote_id`, `quote_url` and `quote_visible` are not part of this
-/// shape (ticket decision); `quote` lives at the entity's top level until
-/// the quoting ticket renders it.
+/// `quote_id` and `quote_url` are not part of this shape (ticket
+/// decision): the quoted id is the entity's top-level `quote_id`, and
+/// this instance stores no bare quote url to render.
 #[derive(Clone, Debug, Serialize)]
 pub struct PleromaMetadata {
     /// `content`: the post as its author wrote it — see the renderer's
@@ -170,6 +181,18 @@ pub struct PleromaMetadata {
     /// Pleroma emits it at the top level as well; here it belongs to the
     /// extension block only.
     pub quotes_count: i32,
+    /// `quote`: the quoted status as a nested entity — the SAME object as
+    /// top-level [`Status::quote`], the quoting ticket rendering it once
+    /// and mirroring it here the way Pleroma's `StatusView` does — or
+    /// `null` when this status quotes nothing or the viewer may not see
+    /// the quoted post (see [`quote_visible`](PleromaMetadata::quote_visible)).
+    pub quote: Option<Value>,
+    /// `quote_visible`: whether this viewer may see the quoted status, as
+    /// the quoting ticket's one batched
+    /// [`filter_visible`](crate::models::status_visibility::filter_visible)
+    /// read decides; false exactly when [`quote`](PleromaMetadata::quote)
+    /// is `null`, which is why the two can never disagree.
+    pub quote_visible: JsonBool,
     /// `bookmark_folder`: the id of the folder the viewer's bookmark of
     /// this post is filed in, as the hyphenated lowercase `UUIDv7` text
     /// (decision 4), or `null` — the value of the same
@@ -192,8 +215,7 @@ pub struct PleromaMetadata {
 ///
 /// [`Status::from_source`] consumes it. Later tickets add one field (and
 /// the service's one loader feeding it) per rendered extension: the
-/// viewer's flags for this row, its card, its poll, its emojis, its
-/// rendered quote.
+/// viewer's flags for this row, its card, its poll, its emojis.
 #[derive(Debug)]
 pub struct StatusSource<'a> {
     /// The `statuses` row being rendered.
@@ -268,6 +290,15 @@ pub struct StatusSource<'a> {
     /// `struct_excessive_bools`, so this flag rides the same [`JsonBool`]
     /// wrapper [`reblogged`](Self::reblogged) chose.
     pub muted: JsonBool,
+    /// The quoted original as the batch rendered it for this viewer,
+    /// already serialized to JSON: [`crate::services::render_status`]'s
+    /// nested quote render handed over so this layer stays pure
+    /// (decision 3), one level deep — the quoted status's own quote was
+    /// forced `null` there. `None` when the row quotes nothing or its
+    /// viewer may not see what it quotes; it renders top-level
+    /// [`quote`](Status::quote) and `pleroma.quote` `null`, with
+    /// `pleroma.quote_visible` false beside them.
+    pub quote: Option<Value>,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -281,9 +312,9 @@ pub struct StatusSource<'a> {
 /// exactly the keys listed in the [module docs](self). Presence: every
 /// key is always emitted — the nullable ones (`url`, `application`,
 /// `reblog`, `in_reply_to_id`, `in_reply_to_account_id`, `language`,
-/// `card`, `poll`, `edited_at`, `quote` and the `pleroma` nulls) render
-/// JSON `null` rather than disappearing, as Pleroma's renderer sends
-/// them.
+/// `card`, `poll`, `edited_at`, `quote`, `quote_id` and the `pleroma`
+/// nulls) render JSON `null` rather than disappearing, as Pleroma's
+/// renderer sends them.
 #[derive(Debug, Serialize)]
 pub struct Status {
     /// The status id as the hyphenated lowercase `UUIDv7` string
@@ -377,9 +408,17 @@ pub struct Status {
     /// viewer, for a post they have not pinned, and — since a pin is
     /// always the author's own act — for anybody else's post.
     pub pinned: JsonBool,
-    /// The quoted status as a nested entity; `null` until the quoting
-    /// ticket renders it — from the originals the service already
-    /// batch-loads. (`quote_id` is not emitted at all.)
+    /// The quoted original's id as the hyphenated lowercase `UUIDv7`
+    /// string (decision 4), or `null` when this status quotes nothing —
+    /// emitted whatever the viewer may see of the quoted row, so an
+    /// invisible quote still names its target.
+    pub quote_id: Option<String>,
+    /// The quoted status as the nested entity the quoting ticket's batch
+    /// rendered for this viewer, mirrored identically in
+    /// [`pleroma.quote`](PleromaMetadata::quote); one level deep — a
+    /// quoted status's own `quote` is `null`. `null` when this status
+    /// quotes nothing or its viewer may not see what it quotes, which is
+    /// exactly when `pleroma.quote_visible` is `false`.
     pub quote: Option<Value>,
     /// Pleroma's extension block (see [`PleromaMetadata`]).
     pub pleroma: PleromaMetadata,
@@ -417,6 +456,7 @@ impl Status {
             bookmark_folder,
             pinned_at,
             muted,
+            quote,
             reblog,
         } = source;
         Self {
@@ -455,7 +495,8 @@ impl Status {
             muted: muted.clone(),
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
-            quote: None,
+            quote_id: row.quote_of_id.map(|id| id.to_string()),
+            quote: quote.clone(),
             pleroma: pleroma_block(
                 row,
                 reply_author,
@@ -464,6 +505,7 @@ impl Status {
                     pinned_at,
                     muted,
                     bookmark_folder,
+                    quote,
                 },
             ),
         }
@@ -512,12 +554,13 @@ fn plain_text(row: &StatusRow) -> PlainText {
     PlainText { text_plain: text }
 }
 
-/// The three viewer facts the `pleroma` block renders, grouped because
-/// there are more than [`pleroma_block`] could take beside the row, its
-/// replied-to author and its reactions (decision 14's five-argument limit).
+/// The four viewer-dependent facts the `pleroma` block renders, grouped
+/// because there are more than [`pleroma_block`] could take beside the
+/// row, its replied-to author and its reactions (decision 14's
+/// five-argument limit).
 ///
 /// Each is the batch's one read per fact, keyed to the row: [`StatusSource`]'s
-/// `pinned_at`, `muted` and `bookmark_folder`.
+/// `pinned_at`, `muted`, `bookmark_folder` and `quote`.
 #[derive(Debug)]
 struct BlockViewer {
     /// When the viewer pinned the row, `None` while they have pinned
@@ -529,13 +572,19 @@ struct BlockViewer {
     /// The folder the viewer's bookmark files the row in, `None` when the
     /// bookmark is unfiled or there is none.
     bookmark_folder: Option<Uuid>,
+    /// The quoted original as the batch rendered it for this viewer,
+    /// `None` when there is nothing this viewer may see — the same
+    /// object the entity's top-level [`Status::quote`] carries, which is
+    /// why the two mirrors can never disagree.
+    quote: Option<Value>,
 }
 
 /// Builds the `pleroma` block of `row`, whose replied-to author is
 /// `reply_author` when the batch knew one, whose reactions are `reactions`
-/// when the batch found any, and whose pin stamp, thread-mute flag and
-/// bookmark folder are `viewer`'s three facts — see [`PleromaMetadata`] for
-/// where each key comes from and which later tickets fill the placeholders.
+/// when the batch found any, and whose pin stamp, thread-mute flag,
+/// bookmark folder and rendered quote are `viewer`'s four facts — see
+/// [`PleromaMetadata`] for where each key comes from and which later
+/// tickets fill the placeholders.
 fn pleroma_block(
     row: &StatusRow,
     reply_author: Option<&User>,
@@ -546,7 +595,9 @@ fn pleroma_block(
         pinned_at,
         muted,
         bookmark_folder,
+        quote,
     } = viewer;
+    let quote_visible = JsonBool(quote.is_some());
     PleromaMetadata {
         content: plain_text(row),
         spoiler_text: PlainText {
@@ -561,6 +612,8 @@ fn pleroma_block(
         emoji_reactions: reactions.iter().map(ReactionSummary::from_model).collect(),
         parent_visible: JsonBool(true),
         quotes_count: row.quotes_count,
+        quote,
+        quote_visible,
         bookmark_folder: bookmark_folder.map(|id| id.to_string()),
         pinned_at,
     }
@@ -587,7 +640,7 @@ mod tests {
     /// A custom emoji's image URL, for the reaction entries.
     const CAT_IMAGE: &str = "https://test.example/emoji/cats/cat.png";
     /// Every JSON key the entity must emit, sorted.
-    const EXPECTED_KEYS: [&str; 31] = [
+    const EXPECTED_KEYS: [&str; 32] = [
         "account",
         "application",
         "bookmarked",
@@ -609,6 +662,7 @@ mod tests {
         "pleroma",
         "poll",
         "quote",
+        "quote_id",
         "reblog",
         "reblogged",
         "reblogs_count",
@@ -620,9 +674,10 @@ mod tests {
         "url",
         "visibility",
     ];
-    /// Every `pleroma` block key, sorted — `quote_id`, `quote_url` and
-    /// `quote_visible` are deliberately absent.
-    const PLEROMA_KEYS: [&str; 13] = [
+    /// Every `pleroma` block key, sorted — `quote_id` and `quote_url` are
+    /// deliberately absent: the quoted id is a top-level key and no bare
+    /// quote url is rendered.
+    const PLEROMA_KEYS: [&str; 15] = [
         "bookmark_folder",
         "content",
         "conversation_id",
@@ -633,6 +688,8 @@ mod tests {
         "local",
         "parent_visible",
         "pinned_at",
+        "quote",
+        "quote_visible",
         "quotes_count",
         "spoiler_text",
         "thread_muted",
@@ -797,6 +854,10 @@ mod tests {
         /// [`JsonBool`] wrapper the source field carries (the batch's
         /// thread-mute membership feeding both flags).
         muted: JsonBool,
+        /// The rendered quote, in the serialized shape the quoting
+        /// ticket's batch hands the entity; `None` renders the quote
+        /// null.
+        quote: Option<Value>,
     }
 
     impl<'a> Parts<'a> {
@@ -815,6 +876,7 @@ mod tests {
                 bookmark_folder: None,
                 pinned_at: None,
                 muted: JsonBool(false),
+                quote: None,
             }
         }
 
@@ -908,6 +970,16 @@ mod tests {
                 ..self
             }
         }
+
+        /// Sets [`quote`](Self::quote): the rendered quote, which the
+        /// quoting ticket's batch hands the renderer for a quote this
+        /// viewer may see.
+        fn quoting(self, quote: Value) -> Self {
+            Self {
+                quote: Some(quote),
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -928,6 +1000,7 @@ mod tests {
             bookmark_folder: parts.bookmark_folder,
             pinned_at: parts.pinned_at,
             muted: parts.muted.clone(),
+            quote: parts.quote.clone(),
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -952,6 +1025,7 @@ mod tests {
                 bookmark_folder: None,
                 pinned_at: None,
                 muted: JsonBool(false),
+                quote: None,
                 reblog: None,
             },
             None,
@@ -1062,7 +1136,21 @@ mod tests {
             value["bookmarked"], false,
             "a page whose bookmarks read found nothing renders the flag false"
         );
-        assert_eq!(value["quote"], Value::Null, "quotes are a later ticket");
+        assert_eq!(
+            value["quote"],
+            Value::Null,
+            "a row that quotes nothing nests no quote"
+        );
+        assert_eq!(value["quote_id"], Value::Null, "and names no quoted target");
+        assert_eq!(
+            value["pleroma"]["quote"],
+            Value::Null,
+            "the pleroma mirror renders the same null"
+        );
+        assert_eq!(
+            value["pleroma"]["quote_visible"], false,
+            "and there is no quote to see"
+        );
     }
 
     #[test]
@@ -1150,6 +1238,59 @@ mod tests {
     }
 
     #[test]
+    fn a_rendered_quote_lands_in_the_entity_and_the_pleroma_block() {
+        let alice = base_user("alice");
+        let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+        let mut row = base_row();
+        row.quote_of_id = Some(quoted_id);
+        row.quotes_count = 2;
+        let quote = json!({ "id": quoted_id.to_string(), "content": "<p>quoted</p>" });
+        let value = render(&row, &Parts::of(&alice).quoting(quote.clone()), None);
+        assert_eq!(
+            value["quote_id"],
+            quoted_id.to_string(),
+            "the quoted target's id, hyphenated (decision 4)"
+        );
+        assert_eq!(value["quote"], quote, "the batch's nested render");
+        assert_eq!(
+            value["pleroma"]["quote"], value["quote"],
+            "and the pleroma mirror is the SAME object"
+        );
+        assert_eq!(
+            value["pleroma"]["quote_visible"], true,
+            "a rendered quote is a visible one"
+        );
+        assert_eq!(
+            value["pleroma"]["quotes_count"], 2,
+            "the counter of quotes OF this row rides along, untouched"
+        );
+    }
+
+    #[test]
+    fn an_unseeable_quote_keeps_its_id_and_nulls_its_render() {
+        let alice = base_user("alice");
+        let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+        let mut row = base_row();
+        row.quote_of_id = Some(quoted_id);
+        let value = render(&row, &Parts::of(&alice), None);
+        assert_eq!(
+            value["quote_id"],
+            quoted_id.to_string(),
+            "the id is emitted regardless of visibility"
+        );
+        assert_eq!(value["quote"], Value::Null, "the render is withheld");
+        assert_eq!(
+            value["pleroma"]["quote"],
+            Value::Null,
+            "in the pleroma block too"
+        );
+        assert_eq!(
+            value["pleroma"]["quote_visible"], false,
+            "false exactly when quote is null — one fact, two keys"
+        );
+    }
+
+    #[test]
     fn an_unpinned_row_carries_no_stamp() {
         let alice = base_user("alice");
         let row = base_row();
@@ -1198,6 +1339,15 @@ mod tests {
         );
         assert_eq!(pleroma["parent_visible"], true);
         assert_eq!(pleroma["quotes_count"], 0);
+        assert_eq!(
+            pleroma["quote"],
+            Value::Null,
+            "a row with no rendered quote mirrors the null"
+        );
+        assert_eq!(
+            pleroma["quote_visible"], false,
+            "and there is nothing for the viewer to see"
+        );
         assert_eq!(pleroma["bookmark_folder"], Value::Null);
         assert_eq!(pleroma["pinned_at"], Value::Null);
     }

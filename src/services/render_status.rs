@@ -11,44 +11,50 @@
 //! originals and quoted originals — with a FIXED set of batched
 //! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
 //! never a query per row. The count does not grow with the page size:
-//! thirteen statement groups whatever the batch —
+//! fourteen statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
-//! 2. quoted originals — one [`status::get_many`];
-//! 3. authors and replied-to authors — one [`user::get_many`];
-//! 4. media attachments — one [`media_attachment::for_statuses`];
-//! 5. mentions — one [`mention::for_statuses`];
-//! 6. hashtags — one [`hashtag::for_statuses`];
-//! 7. emoji reactions — one [`emoji_reaction::for_statuses`], the viewer's
+//! 2. quoted originals — one [`status::get_many`], the quoted rows' ids
+//!    threading into every id-keyed read below so a nested quote's
+//!    author, media, mentions, tags and reactions ride the same
+//!    statements;
+//! 3. which quoted originals this viewer may see — one
+//!    [`status_visibility::filter_visible`] over step 2's rows, skipped
+//!    entirely when no row on the page quotes anything;
+//! 4. authors and replied-to authors — one [`user::get_many`];
+//! 5. media attachments — one [`media_attachment::for_statuses`];
+//! 6. mentions — one [`mention::for_statuses`];
+//! 7. hashtags — one [`hashtag::for_statuses`];
+//! 8. emoji reactions — one [`emoji_reaction::for_statuses`], the viewer's
 //!    id riding along to answer each roll-up's `me`;
-//! 8. the viewer's favourites of the page — one
+//! 9. the viewer's favourites of the page — one
 //!    [`favourite::favourited_status_ids`], run only for an authenticated
 //!    viewer; a reblog row takes its flag through its original's id, which
 //!    is where the like lives;
-//! 9. the viewer's reblogs among the page — one
-//!    [`status::reblogged_status_ids`], likewise only for an authenticated
-//!    viewer, and likewise keyed to each row's *original's* id: the boost
-//!    lands on the original, so the outer entity of the viewer's own boost
-//!    renders `reblogged: true` together with the original it nests;
-//! 10. the viewer's bookmarks of the page — one [`bookmark::bookmarked_folders`],
+//! 10. the viewer's reblogs among the page — one
+//!     [`status::reblogged_status_ids`], likewise only for an authenticated
+//!     viewer, and likewise keyed to each row's *original's* id: the boost
+//!     lands on the original, so the outer entity of the viewer's own boost
+//!     renders `reblogged: true` together with the original it nests;
+//! 11. the viewer's bookmarks of the page — one [`bookmark::bookmarked_folders`],
 //!     likewise only for an authenticated viewer; every row takes its flag
 //!     from its *own* id, because a bookmark of a reblog lands on the reblog
 //!     row itself. The same map's value is the folder that bookmark is filed
 //!     in, which is what answers `pleroma.bookmark_folder` — so the flag and
 //!     the folder can never disagree;
-//! 11. the viewer's pins among the page — one [`pinned_status::pinned_ids`],
+//! 12. the viewer's pins among the page — one [`pinned_status::pinned_ids`],
 //!     likewise only for an authenticated viewer, and likewise keyed to
 //!     each row's *own* id: only a post of one's own can be pinned, so a
 //!     pin's author is its viewer. The same map answers `pinned` and
 //!     `pleroma.pinned_at`, which is why the two can never disagree;
-//! 12. the viewer's muted threads — one
+//! 13. the viewer's muted threads — one
 //!     [`conversation_mute::muted_conversation_ids`], likewise only for an
 //!     authenticated viewer, keyed to each row's *own*
 //!     `conversation_id`: a mute is a fact about the thread, so a reblog
 //!     row and its nested original carry the same pair. The same set
 //!     answers `muted` and `pleroma.thread_muted`, which is why the two can
 //!     never disagree;
-//! 13. the viewer's relationships to the page's authors — the one fixed
+//! 14. the viewer's relationships to the page's authors — the one fixed
 //!     [`Relationship::load_many`] set, run only for an authenticated
 //!     viewer.
 //!
@@ -64,14 +70,14 @@
 //! already shows: one id list, one keyed map) and threading that map
 //! through the batch context into [`StatusSource`]:
 //!
-//! - `pleroma.bookmark_folder`: *filled by the folders ticket* (step 10
+//! - `pleroma.bookmark_folder`: *filled by the folders ticket* (step 11
 //!   above); the folders ticket's [`bookmark::bookmarked_folders`] read
 //!   answers it off the same statement that answers `bookmarked`, which is
 //!   already filled by the bookmarks ticket.
 //! - `pinned` and `pleroma.pinned_at`: *filled by the pinning ticket*
-//!   (step 11 above), from the one [`pinned_status::pinned_ids`] read.
+//!   (step 12 above), from the one [`pinned_status::pinned_ids`] read.
 //! - `muted` and `pleroma.thread_muted`: *filled by the thread-mute
-//!   ticket* (step 12 above), from the one
+//!   ticket* (step 13 above), from the one
 //!   [`conversation_mute::muted_conversation_ids`] read; the writes are
 //!   `POST /api/v1/statuses/{id}/mute` and its `…/unmute` twin in
 //!   [`crate::api::statuses`].
@@ -81,25 +87,32 @@
 //! - `poll`: the polls tables, one read keyed by status id.
 //! - `emojis`: the custom emojis, one read keyed by the shortcodes the
 //!   content uses.
-//! - `pleroma.emoji_reactions`: *filled by the reactions ticket* (step 7
+//! - `pleroma.emoji_reactions`: *filled by the reactions ticket* (step 8
 //!   above); it renders the roll-up
 //!   [`emoji_reaction::for_statuses`] answers, capped at
 //!   [`MAX_SUMMARY_REACTORS`](crate::models::emoji_reaction::MAX_SUMMARY_REACTORS)
 //!   reactor ids per emoji. Reactions a viewer must not see are the
 //!   reactions endpoint's filter, not this renderer's.
-//! - `quote`: the quoted originals are *already* batch-loaded here
-//!   (step 2 above); the quoting ticket renders them into the entity —
-//!   one nested render, no new query — and decides its visibility.
+//! - `quote`, `quote_id`, `pleroma.quote` and `pleroma.quote_visible`:
+//!   *filled by the quoting ticket* (steps 2 and 3 above); the quoted
+//!   original the step 2 read brought in and the step 3 visibility read
+//!   admits renders as one nested entity — no new query, and one level
+//!   deep: a quoted status's own quote never renders — mirrored in
+//!   `pleroma.quote` beside `pleroma.quote_visible`. A quote the viewer
+//!   may not see renders `quote: null` with visibility `false` while
+//!   `quote_id` still names the target.
 //!
 //! [`models::status`]: crate::models::status
 //! [`Status`]: crate::entities::status::Status
 //! [`StatusSource`]: crate::entities::status::StatusSource
 //! [`Relationship::load_many`]: crate::entities::relationship::Relationship::load_many
 //! [`conversation_mute::muted_conversation_ids`]: crate::models::conversation_mute::muted_conversation_ids
+//! [`status_visibility::filter_visible`]: crate::models::status_visibility::filter_visible
 
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
@@ -120,6 +133,7 @@ use crate::{
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mention, pinned_status,
         status::{self, Status as StatusRow},
+        status_visibility,
         user::{self, User},
     },
     state::AppState,
@@ -197,6 +211,17 @@ struct Batch<'a> {
     users: HashMap<Uuid, User>,
     /// The reblogged originals, keyed by id.
     originals: HashMap<Uuid, StatusRow>,
+    /// The page's quoted originals, keyed by id — the module-docs step 2
+    /// read. A tombstone or a target that is not stored here is simply
+    /// absent, which is one way a quote renders `null`.
+    quoted: HashMap<Uuid, StatusRow>,
+    /// Which of [`Batch::quoted`] this viewer may see — the module-docs
+    /// step 3 read, the one [`status_visibility::filter_visible`] over
+    /// the loaded quoted rows; empty when no row on the page quotes
+    /// anything. A quoted row outside this set renders `quote: null`
+    /// with `pleroma.quote_visible` false while `quote_id` still names
+    /// it.
+    visible_quotes: HashSet<Uuid>,
     /// Media attachments, keyed by status, in position order.
     media: HashMap<Uuid, Vec<AttachmentRow>>,
     /// Mentions, keyed by status, in mention order.
@@ -261,20 +286,24 @@ impl<'a> Batch<'a> {
         let originals = load_statuses_by_id(pool, &reblog_ids).await?;
         let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
         let quoted = load_statuses_by_id(pool, &quote_ids).await?;
+        let visible_quotes = load_visible_quotes(pool, &quoted, viewer).await?;
         debug!(
             quotes = quoted.len(),
-            "quoted originals batch-loaded; the quoting ticket renders them"
+            visible = visible_quotes.len(),
+            "quoted originals batch-loaded; the visible ones render nested, one level deep"
         );
         let rendered_ids = distinct(
             rows.iter()
                 .copied()
                 .map(|row| row.id)
-                .chain(originals.keys().copied()),
+                .chain(originals.keys().copied())
+                .chain(quoted.keys().copied()),
         );
         let account_ids = distinct(
             rows.iter()
                 .copied()
                 .chain(originals.values())
+                .chain(quoted.values())
                 .flat_map(|row| [Some(row.user_id), row.in_reply_to_account_id])
                 .flatten(),
         );
@@ -282,12 +311,14 @@ impl<'a> Batch<'a> {
             rows.iter()
                 .copied()
                 .map(|row| row.user_id)
-                .chain(originals.values().map(|row| row.user_id)),
+                .chain(originals.values().map(|row| row.user_id))
+                .chain(quoted.values().map(|row| row.user_id)),
         );
         let conversation_ids = distinct(
             rows.iter()
                 .copied()
                 .chain(originals.values())
+                .chain(quoted.values())
                 .map(|row| row.conversation_id),
         );
         Ok(Self {
@@ -295,6 +326,8 @@ impl<'a> Batch<'a> {
             viewer,
             users: load_users(pool, &account_ids).await?,
             originals,
+            quoted,
+            visible_quotes,
             media: load_media(pool, &rendered_ids).await?,
             mentions: load_mentions(pool, &rendered_ids).await?,
             tags: load_tags(pool, &rendered_ids).await?,
@@ -309,8 +342,8 @@ impl<'a> Batch<'a> {
     }
 
     /// Renders every row of `rows` in order, nesting the original of a
-    /// reblog and dropping the rows the [`render_statuses`] contract
-    /// cannot answer for.
+    /// reblog and the quoted original of a quote, and dropping the rows
+    /// the [`render_statuses`] contract cannot answer for.
     fn render_all(&self, rows: &[&StatusRow]) -> Vec<Status> {
         let mut rendered = Vec::with_capacity(rows.len());
         for row in rows {
@@ -318,7 +351,8 @@ impl<'a> Batch<'a> {
             if row.reblog_of_id.is_some() && reblog.is_none() {
                 continue;
             }
-            if let Some(entity) = self.render_entity(row, reblog) {
+            let quote = self.render_quote(row);
+            if let Some(entity) = self.render_entity(row, reblog, quote) {
                 rendered.push(entity);
             }
         }
@@ -330,15 +364,40 @@ impl<'a> Batch<'a> {
     /// caller drops such reblogs. Every reblog renders its original
     /// afresh, from maps already in memory; chains longer than one link
     /// do not occur in stored data (see [`crate::models::status_visibility`]).
+    /// The original carries its own quote when one rides the batch and
+    /// this viewer may see it — the quote chain's depth limit belongs to
+    /// [`Batch::render_quote`], not here.
     fn render_reblog(&self, row: &StatusRow) -> Option<Box<Status>> {
         let original = self.originals.get(&row.reblog_of_id?)?;
-        Some(Box::new(self.render_entity(original, None)?))
+        let quote = self.render_quote(original);
+        Some(Box::new(self.render_entity(original, None, quote)?))
+    }
+
+    /// The nested render of the original `row` quotes: `Some` JSON when
+    /// [`row.quote_of_id`](StatusRow::quote_of_id) names a row the batch
+    /// loaded (live: [`status::get_many`] answers tombstones not at all),
+    /// the visibility read admitted to [`Batch::visible_quotes`], and the
+    /// maps can render (an author the batch knows). That render is one
+    /// level deep — Pleroma's `show_quote: false` on the quote's own
+    /// rendering — so the quoted row comes back with its OWN quote
+    /// forced to `None`, whatever it quoted. `None` — which the entity
+    /// renders as `quote: null` with `pleroma.quote_visible` false while
+    /// `quote_id` still names the target — when the id names nothing
+    /// this viewer may see.
+    fn render_quote(&self, row: &StatusRow) -> Option<Value> {
+        let quoted = self.quoted.get(&row.quote_of_id?)?;
+        if !self.visible_quotes.contains(&quoted.id) {
+            return None;
+        }
+        let entity = self.render_entity(quoted, None, None)?;
+        serde_json::to_value(entity).ok()
     }
 
     /// Renders one `row` from the loaded maps, attaching `reblog` as its
-    /// nested entity. `None` when the row's author is not in the batch —
-    /// the foreign keys make that unobservable in stored data, and a
-    /// status with no author has no render.
+    /// nested original and `quote` — a [`Batch::render_quote`] result —
+    /// as its nested quote. `None` when the row's author is not in the
+    /// batch — the foreign keys make that unobservable in stored data,
+    /// and a status with no author has no render.
     ///
     /// The `favourited` flag is membership in the loaded set, keyed to the
     /// row's own id — except for a reblog row, which is flagged through the
@@ -360,8 +419,17 @@ impl<'a> Batch<'a> {
     /// `muted` flag and `pleroma.thread_muted` are membership in the muted
     /// threads set keyed to the row's *own* `conversation_id` — a mute is a
     /// fact about the thread, and a reblog shares its original's, so the
-    /// nested pair always renders the same.
-    fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
+    /// nested pair always renders the same. The `quote` is the batch's
+    /// serialized nested quote render — `pleroma.quote` mirrors it and
+    /// `pleroma.quote_visible` is its presence, which is why the three can
+    /// never disagree, while `quote_id` names the target whatever the
+    /// render answered.
+    fn render_entity(
+        &self,
+        row: &StatusRow,
+        reblog: Option<Box<Status>>,
+        quote: Option<Value>,
+    ) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
         let subject_id = row.reblog_of_id.unwrap_or(row.id);
         let pinned_at = self.pins.get(&row.id).copied();
@@ -384,6 +452,7 @@ impl<'a> Batch<'a> {
             bookmark_folder: bookmark.copied().flatten(),
             pinned_at,
             muted: JsonBool(self.thread_mutes.contains(&row.conversation_id)),
+            quote,
             reblog,
         };
         Some(Status::from_source(
@@ -415,6 +484,25 @@ async fn load_statuses_by_id(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<U
     }
     let rows = status::get_many(pool, ids).await?;
     Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+}
+
+/// [`status_visibility::filter_visible`] over the batch-loaded quoted
+/// originals — the one read that decides which quotes this viewer may
+/// see, and the only statement step 3 adds: a page whose rows quote
+/// nothing skips it entirely, and the filter itself runs its visibility
+/// clause in the database, so a private or blocked quote falls out of
+/// the set and renders `quote: null` with `pleroma.quote_visible` false
+/// (its `quote_id` still names the target). The quoted rows' authors are
+/// the page's strangers' by nature, so the filter's follow/mention/
+/// block `EXISTS` arms run for real here.
+async fn load_visible_quotes(
+    pool: &PgPool,
+    quoted: &HashMap<Uuid, StatusRow>,
+    viewer: Option<&User>,
+) -> AppResult<HashSet<Uuid>> {
+    let candidates: Vec<StatusRow> = quoted.values().cloned().collect();
+    let visible = status_visibility::filter_visible(pool, candidates, viewer).await?;
+    Ok(visible.into_iter().map(|row| row.id).collect())
 }
 
 /// [`user::get_many`] keyed by id — one query for every author and
@@ -1401,6 +1489,119 @@ mod tests {
                 .all(|entity| flags(entity) == (json!(false), json!(false))),
             "an anonymous page is nobody's mute"
         );
+    }
+
+    /// Quotes `original` as `author` at `visibility`, straight through the
+    /// model — the batch tests' quote fixture.
+    async fn quote(
+        pool: &PgPool,
+        author: &User,
+        original: &StatusRow,
+        visibility: Visibility,
+    ) -> StatusRow {
+        insert(
+            pool,
+            BASE,
+            &NewStatus {
+                visibility,
+                quote_of_id: Some(original.id),
+                ..NewStatus::local(author, "quoting this")
+            },
+        )
+        .await
+        .expect("a quote of a stored status inserts")
+    }
+
+    /// The quoting ticket's nested render inside the fixed query set: the
+    /// batch's one visibility read decides which quoted originals render,
+    /// a quote nests exactly one level deep, an invisible one leaves
+    /// `quote` null with `quote_visible` false while `quote_id` still
+    /// names the target, and the quote's author rides the page's batch.
+    #[tokio::test]
+    async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let source = post(&pool, &bob, "the source").await;
+        let public_quote = quote(&pool, &carol, &source, Visibility::Public).await;
+        let secret = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                visibility: Visibility::Private,
+                ..NewStatus::local(&alice, "followers only")
+            },
+        )
+        .await
+        .expect("a private post inserts");
+        // C ← B (alice's private quote) ← A (carol's public quote of B):
+        // the depth chain, seeded past the endpoint's quotability rule.
+        let deep = quote(&pool, &alice, &secret, Visibility::Private).await;
+        let chain = quote(&pool, &carol, &deep, Visibility::Public).await;
+
+        let anonymous = render_status(&state, None, &public_quote)
+            .await
+            .expect("the public quote renders")
+            .expect("a live public row renders");
+        let open = serde_json::to_value(&anonymous).expect("it serializes");
+        assert_eq!(
+            open["quote_id"],
+            source.id.to_string(),
+            "the hyphenated id of the quoted row (decision 4)"
+        );
+        assert_eq!(open["quote"]["id"], source.id.to_string());
+        assert_eq!(
+            open["quote"]["content"], "<p>the source</p>",
+            "the nested entity is the quoted row's own render"
+        );
+        assert_eq!(
+            open["quote"]["account"]["acct"], "bob",
+            "the quote's author rode the page's user read"
+        );
+        assert_eq!(
+            open["pleroma"]["quote"], open["quote"],
+            "the pleroma mirror is the same object"
+        );
+        assert_eq!(open["pleroma"]["quote_visible"], json!(true));
+
+        let for_owner = render_status(&state, Some(&alice), &chain)
+            .await
+            .expect("the chain renders for alice")
+            .expect("and answers");
+        let owned = serde_json::to_value(&for_owner).expect("it serializes");
+        assert_eq!(
+            owned["quote"]["id"],
+            deep.id.to_string(),
+            "alice sees her own private quote nested even though it is private"
+        );
+        assert_eq!(
+            owned["quote"]["quote"],
+            Value::Null,
+            "depth 1: the quoted status's own quote never renders"
+        );
+        assert_eq!(owned["quote"]["quote_id"], secret.id.to_string());
+        assert_eq!(owned["quote"]["pleroma"]["quote_visible"], json!(false));
+
+        let anonymous_chain = render_status(&state, None, &chain)
+            .await
+            .expect("the chain renders anonymously")
+            .expect("and answers");
+        let quiet = serde_json::to_value(&anonymous_chain).expect("it serializes");
+        assert_eq!(
+            quiet["quote_id"],
+            deep.id.to_string(),
+            "the id names the invisible quote all the same"
+        );
+        assert_eq!(
+            quiet["quote"],
+            Value::Null,
+            "alice's private row is invisible to the anonymous viewer"
+        );
+        assert_eq!(quiet["pleroma"]["quote"], Value::Null);
+        assert_eq!(quiet["pleroma"]["quote_visible"], json!(false));
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
