@@ -33,6 +33,10 @@
 //! through it. Before that, this module's own rules: a notification goes
 //! only to a **local** user (the remote one's instance is told by
 //! federation, not by a row), and nobody is notified of their own action.
+//! Beside the row, every telling of a local recipient queues its Web Push
+//! deliveries — one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
+//! job per registered subscription, [`web_push::enqueue_deliveries`] —
+//! best-effort, since the inbox row stands whatever the push service does.
 //! Blocked and muted actors are not filtered here — the reads of
 //! [`crate::models::notification`] hide their rows (Pleroma's
 //! `for_user_query`), which also retroactively suppresses tellings made
@@ -59,6 +63,7 @@ use crate::{
         status::{self, Status as StatusRow},
         user::{self, User},
     },
+    services::web_push,
     state::AppState,
 };
 
@@ -68,7 +73,11 @@ use crate::{
 /// The shared create arm of every rule above: a recipient who is the actor
 /// (self-action) or who is not local is nobody to tell from here, and
 /// everyone else's row is decided by [`notification::maybe_notify`]'s own
-/// skip rules.
+/// skip rules. A row that lands also queues the recipient's Web Push
+/// deliveries (one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
+/// job per subscription, decision 11); the queueing is best-effort beside
+/// the telling itself — a notification that exists but fails to wake a
+/// browser is logged, never an error back to the endpoint.
 async fn tell(
     state: &AppState,
     recipient: &User,
@@ -79,7 +88,7 @@ async fn tell(
     if recipient.id == actor_id || !recipient.local.get() {
         return Ok(());
     }
-    notification::maybe_notify(
+    let created = notification::maybe_notify(
         &state.db,
         &NewNotification {
             user_id: recipient.id,
@@ -90,8 +99,16 @@ async fn tell(
             report_id: None,
         },
     )
-    .await
-    .map(drop)?;
+    .await?;
+    if let Some(note) = created
+        && let Err(err) = web_push::enqueue_deliveries(&state.db, note.id, recipient.id).await
+    {
+        warn!(
+            notification = %note.id,
+            %err,
+            "could not queue web push deliveries"
+        );
+    }
     Ok(())
 }
 
@@ -393,13 +410,21 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
+    use serde_json::json;
     use sqlx::PgPool;
 
     use super::*;
     use crate::{
         config::Config,
         http_client::HttpClient,
-        models::{favourite, follow, status::NewStatus, user::NewUser},
+        models::{
+            favourite, follow,
+            oauth_app::{self, NewOauthApp},
+            oauth_token::{self, NewToken},
+            status::NewStatus,
+            user::NewUser,
+            web_push_subscription::{self, NewSubscription},
+        },
         streaming::hub::Hub,
         uploads::UploaderBackend,
     };
@@ -903,6 +928,141 @@ mod tests {
         assert!(
             rows(pool, alice.id).await.is_empty(),
             "a status the reads cannot answer tells nobody and errors nowhere"
+        );
+    }
+
+    /// A fresh `push`-scoped access token of `owner_id`, as a subscription
+    /// is keyed to one.
+    async fn push_token(pool: &PgPool, owner_id: Uuid, name: &str) -> Uuid {
+        let app = oauth_app::create(
+            pool,
+            &NewOauthApp {
+                client_name: name.to_owned(),
+                redirect_uris: "https://client.example/callback".to_owned(),
+                scopes: "push".to_owned(),
+                website: None,
+                user_id: Some(owner_id),
+            },
+        )
+        .await
+        .expect("the push app fixture inserts");
+        oauth_token::create_token(
+            pool,
+            &NewToken {
+                user_id: Some(owner_id),
+                app_id: app.id,
+                scopes: "push".to_owned(),
+                ttl: None,
+            },
+        )
+        .await
+        .expect("the push token fixture inserts")
+        .id
+    }
+
+    /// A registered subscription of `owner`'s `token_id`, follow alert on.
+    async fn register_push(pool: &PgPool, owner: &User, token_id: Uuid) -> Uuid {
+        web_push_subscription::create(
+            pool,
+            &NewSubscription {
+                user_id: owner.id,
+                token_id,
+                endpoint: format!("https://push.example/{token_id}"),
+                key_p256dh: "BFpush-key".to_owned(),
+                key_auth: "push-auth".to_owned(),
+                alerts: json!({"follow": true}),
+                policy: "all".to_owned(),
+            },
+        )
+        .await
+        .expect("the push subscription registers")
+        .id
+    }
+
+    /// The queued `push.deliver` jobs as `(queue, args, max_attempts)`,
+    /// ordered by the subscription each names.
+    async fn push_jobs(pool: &PgPool) -> Vec<(String, serde_json::Value, i32)> {
+        sqlx::query_as::<_, (String, serde_json::Value, i32)>(
+            "SELECT queue, args, max_attempts FROM jobs WHERE kind = $1 \
+              ORDER BY args->>'subscription_id'",
+        )
+        .bind(crate::jobs::web_push::KIND_DELIVER)
+        .fetch_all(pool)
+        .await
+        .expect("the jobs read")
+    }
+
+    #[tokio::test]
+    async fn a_told_local_user_gets_one_push_job_per_subscription() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let follower = local(pool, "pp-follower").await;
+        let target = local(pool, "pp-target").await;
+        let one = push_token(pool, target.id, "pp-app-one").await;
+        let two = push_token(pool, target.id, "pp-app-two").await;
+        let sub_one = register_push(pool, &target, one).await;
+        let sub_two = register_push(pool, &target, two).await;
+
+        let created = followed(pool, &follower, &target).await;
+        on_follow(&state, &follower, &target, Some(&created), true).await;
+
+        let notes = rows(pool, target.id).await;
+        assert_eq!(notes.len(), 1, "the telling landed");
+        let jobs = push_jobs(pool).await;
+        assert_eq!(jobs.len(), 2, "one delivery job per subscription");
+        let want = [sub_one, sub_two];
+        let mut got: Vec<String> = jobs
+            .iter()
+            .map(|(_queue, args, _attempts)| args["subscription_id"].to_string())
+            .collect();
+        got.sort();
+        let mut want_text: Vec<String> = want.iter().map(|id| format!("\"{id}\"")).collect();
+        want_text.sort();
+        assert_eq!(got, want_text, "the jobs name both subscriptions");
+        for (queue, args, max_attempts) in &jobs {
+            assert_eq!(queue, crate::jobs::QUEUE_DEFAULT, "on the default queue");
+            assert_eq!(*max_attempts, 3, "the ticket's three attempts");
+            assert_eq!(
+                args["notification_id"],
+                serde_json::Value::String(notes[0].id.to_string()),
+                "and the notification the telling created"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_withheld_telling_queues_no_push_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let follower = local(pool, "pw-follower").await;
+        // A gated account that follows nobody: maybe_notify withholds the
+        // stranger's follow, and the hook queues nothing for it.
+        let gated = user::insert(
+            pool,
+            &NewUser {
+                notification_settings: json!({
+                    "block_from_strangers": true, "hide_notification_contents": false,
+                }),
+                ..NewUser::local("pw-gated", &user::local_ap_id(BASE, "pw-gated"))
+            },
+        )
+        .await
+        .expect("the gated fixture inserts");
+        let token_id = push_token(pool, gated.id, "pw-app").await;
+        let _sub = register_push(pool, &gated, token_id).await;
+
+        let created = followed(pool, &follower, &gated).await;
+        on_follow(&state, &follower, &gated, Some(&created), true).await;
+
+        assert!(
+            rows(pool, gated.id).await.is_empty(),
+            "the telling was withheld"
+        );
+        assert!(
+            push_jobs(pool).await.is_empty(),
+            "and no delivery job was queued for a notification that never landed"
         );
     }
 }

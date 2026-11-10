@@ -83,11 +83,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// user-import jobs ([`imports::KIND_FOLLOWS`](jobs::imports::KIND_FOLLOWS),
 /// [`imports::KIND_BLOCKS`](jobs::imports::KIND_BLOCKS) and
 /// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)), the account
-/// deletion job ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE))
-/// and the
+/// deletion job ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE)),
+/// the Web Push delivery job
+/// ([`web_push::KIND_DELIVER`](jobs::web_push::KIND_DELIVER)) and the
 /// incoming-activity stub
 /// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)), so
-/// the worker idles, sweeps, delivers, sends and drains received
+/// the worker idles, sweeps, delivers, sends, pushes and drains received
 /// activities. The state's mail transport comes from
 /// [`mailer::transport_from_config`]: the SMTP relay when `SMTP_HOST` is
 /// set, the disabled stand-in while it is not. An unset or blank
@@ -214,6 +215,7 @@ fn job_registry() -> JobRegistry {
     registry.register(jobs::deletion::KIND_DELETE, jobs::deletion::handle_delete);
     registry.register(jobs::statuses::KIND_EXPIRE, jobs::statuses::handle_expire);
     registry.register(jobs::statuses::KIND_SWEEP, jobs::statuses::handle_sweep);
+    registry.register(jobs::web_push::KIND_DELIVER, jobs::web_push::handle_deliver);
     registry.register(mailer::KIND_SEND, mailer::handle);
     registry.register(
         federation::dispatch::KIND_INCOMING,

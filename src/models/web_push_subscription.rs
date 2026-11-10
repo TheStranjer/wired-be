@@ -51,6 +51,13 @@ const UPSERT_SQL: &str = "INSERT INTO web_push_subscriptions (
 /// [`find`]: the subscription registered by one access token.
 const FIND_SQL: &str = "SELECT * FROM web_push_subscriptions WHERE token_id = $1";
 
+/// [`find_by_id`]: the subscription behind one delivery job's argument.
+const FIND_BY_ID_SQL: &str = "SELECT * FROM web_push_subscriptions WHERE id = $1";
+
+/// [`for_user`]: every subscription an account has registered, one per
+/// token, ordered by id (decision 4: that is registration order).
+const FOR_USER_SQL: &str = "SELECT * FROM web_push_subscriptions WHERE user_id = $1 ORDER BY id";
+
 /// [`update_settings`]: rewrite the notification preferences of the token's
 /// subscription, restamping `updated_at`; the endpoint and keys stay as
 /// registered (Mastodon: only the data part can be updated).
@@ -159,6 +166,40 @@ pub async fn find(pool: &PgPool, token_id: Uuid) -> AppResult<Option<WebPushSubs
         .fetch_optional(pool)
         .await?;
     Ok(row)
+}
+
+/// The subscription with row id `id`, `None` when it is gone (the delivery
+/// job's argument names a subscription that a later attempt may have
+/// already retired).
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn find_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<WebPushSubscription>> {
+    let row = sqlx::query_as::<_, WebPushSubscription>(FIND_BY_ID_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// Every subscription the account `user_id` has registered, ordered by id.
+///
+/// The [`notify`](crate::services::notify) hook's read — one
+/// `push.deliver` job per row. An account with no browser registered yields
+/// the empty vector, which is not an error.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<WebPushSubscription>> {
+    let rows = sqlx::query_as::<_, WebPushSubscription>(FOR_USER_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// Rewrites the token's subscription's notification preferences.
@@ -528,5 +569,75 @@ mod tests {
         )
         .await;
         assert!(outcome.is_err(), "no token row, no subscription");
+    }
+
+    /// [`find_by_id`] reads the row by its own id — the id the delivery
+    /// job carries — and `None` for an id nobody holds.
+    #[tokio::test]
+    async fn find_by_id_reads_the_row_behind_the_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (owner_id, token_id) = owner_and_token(pool, "push-byid").await;
+        let created = create(
+            pool,
+            &subscription(owner_id, token_id, "https://push.example/1"),
+        )
+        .await
+        .expect("the registration writes");
+
+        let found = find_by_id(pool, created.id)
+            .await
+            .expect("the lookup reaches the database")
+            .expect("the id names the row");
+        assert_eq!(found, created, "the same row the token's lookup reads");
+        assert!(
+            find_by_id(pool, new_id())
+                .await
+                .expect("the lookup runs")
+                .is_none(),
+            "an unknown id is nobody's subscription"
+        );
+    }
+
+    /// [`for_user`] hands back every token's subscription of the account,
+    /// none of another's, and the empty vector for a stranger.
+    #[tokio::test]
+    async fn for_user_lists_one_accounts_subscriptions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let owner_id = user(pool, "push-forall").await;
+        let one = token(pool, owner_id).await;
+        let two = token(pool, owner_id).await;
+        let first = create(
+            pool,
+            &subscription(owner_id, one, "https://push.example/one"),
+        )
+        .await
+        .expect("the first token registers");
+        let second = create(
+            pool,
+            &subscription(owner_id, two, "https://push.example/two"),
+        )
+        .await
+        .expect("the second token registers");
+        let other_id = user(pool, "push-forother").await;
+
+        let mut ids: Vec<Uuid> = for_user(pool, owner_id)
+            .await
+            .expect("the list reaches the database")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        ids.sort_unstable();
+        let mut want = vec![first.id, second.id];
+        want.sort_unstable();
+        assert_eq!(ids, want, "both tokens' rows, ordered by id");
+        assert!(
+            for_user(pool, other_id)
+                .await
+                .expect("the list runs")
+                .is_empty(),
+            "an account with no browser has nothing to push to"
+        );
     }
 }

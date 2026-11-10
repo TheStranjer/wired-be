@@ -46,6 +46,12 @@
 //! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
+//!
+//! [`web_push`] is the sender beside it: the RFC 8291 `aes128gcm` payload
+//! coding, the RFC 8292 VAPID authorization and the classified POST, plus
+//! the pure delivery decisions (alert flags, title verbs, payload document)
+//! the [`push.deliver`](crate::jobs::web_push) job runs and the [`notify`]
+//! hook queues jobs through.
 
 pub mod create_status;
 pub mod delete_status;
@@ -60,3 +66,4 @@ pub mod render_status;
 pub mod timeline;
 pub mod translate;
 pub mod vapid;
+pub mod web_push;
