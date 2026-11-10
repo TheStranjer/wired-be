@@ -27,12 +27,16 @@
 //! participant authored it (the recipients land unread), and its recipient
 //! list is refreshed to every other participant, remote accounts included.
 //!
-//! The reads serve the surfaces the later conversation endpoints build on:
+//! The reads serve the surfaces the conversation endpoints build on:
 //! [`get_participation`] one owned row, [`page_for_user`] the account's
-//! list newest-first, [`mark_read`] and [`mark_all_read`] the read flags,
+//! list newest-activity-first (Pleroma's `recipients` restriction and all),
+//! [`mark_read`] and [`mark_all_read`] the read flags,
 //! [`delete_participation`] a withdrawal, [`unread_count`] the badge,
 //! [`recipients`] the audience an `in_reply_to_conversation_id` post
-//! addresses, and [`participation_ids`] the one batched read
+//! addresses, [`recipients_map`] the same lists for a whole page in one
+//! read, [`set_recipients`] the wholesale rewrite Pleroma's `PATCH`
+//! performs, [`page_direct_statuses`] one thread's status listing, and
+//! [`participation_ids`] the one batched read
 //! [`crate::services::render_status`] runs per page to fill
 //! `pleroma.direct_conversation_id`.
 //!
@@ -185,10 +189,40 @@ const UNREAD_COUNT_SQL: &str = "SELECT count(*) FROM conversation_participations
      WHERE user_id = $1 AND NOT read";
 
 /// [`page_for_user`]: the account's threads. The text stops where its one
-/// placeholder belongs; the keyset [`PageParams::apply_keyset`] appends
+/// placeholder belongs; the recipients filter [`page_for_user`] pushes
+/// between the binds and the keyset [`PageParams::apply_keyset`] appends
 /// runs on the participation id `p.id` — the ticket's simplification of
-/// Pleroma's `updated_at DESC` listing, walked newest-participation first.
+/// Pleroma's `updated_at DESC` listing, walked newest-participation first
+/// and then ordered by activity in the fetched page.
 const PAGE_SQL: &str = "SELECT p.* FROM conversation_participations p WHERE p.user_id = ";
+
+/// [`page_for_user`]'s recipients filter, its tail: the head ` AND ` and the
+/// bound array go before this text, so the placeholder lands in its slot
+/// with the statement's own numbering (the array arrives typed `uuid[]`,
+/// and the containment is `uuid[] <@ uuid[]`). Pleroma's
+/// `Participation.restrict_recipients`, restated over this schema's
+/// recipient rows: here the ids a participation addresses, not the
+/// accounts holding one. A participation with no addressees aggregates to
+/// `NULL` and the containment is null — every named account fails to be
+/// among them, which is the right exclusion.
+const RECIPIENTS_FILTER_TAIL_SQL: &str = " <@ (SELECT array_agg(r.user_id) \
+     FROM conversation_participation_recipients r WHERE r.participation_id = p.id)";
+
+/// [`page_direct_statuses`]: the live `direct` statuses of one thread. The
+/// text stops where its one placeholder belongs and the keyset
+/// [`PageParams::apply_keyset`] appends run on the status id `s.id` —
+/// id descending is creation order (decision 4), so the page is newest
+/// activity first, the order the endpoint answers in.
+const THREAD_STATUSES_SQL: &str = "SELECT s.* FROM statuses s \
+     WHERE s.direct_conversation_id = ";
+
+/// [`set_recipients`]' and [`recipients_map`]'s batched read: the whole
+/// addressee roster of a page of participations in one statement, each row
+/// one (participation, addressee) pair, ordered so one list per
+/// participation comes back in the pair key's order.
+const RECIPIENTS_BATCH_SQL: &str = "SELECT participation_id, user_id \
+     FROM conversation_participation_recipients \
+     WHERE participation_id = ANY($1) ORDER BY participation_id, user_id";
 
 /// [`repoint_after_delete`]'s gate: does any participation still name the
 /// deleted status, and of which thread are they — all of them, since a
@@ -492,12 +526,21 @@ pub async fn get_participation(
     Ok(row)
 }
 
-/// `user_id`'s conversation list, newest participation first, `page`'s
-/// cursors and cap honoured.
+/// `user_id`'s conversation list, newest activity first, `page`'s cursors
+/// and cap honoured, `recipients`' accounts all addressed by each kept
+/// participation.
 ///
-/// The ticket's keyset walk on the participation id, ordered descending
-/// (decision 4's creation order). An account nobody has DM'd answers the
-/// empty `Vec`.
+/// The id keyset works the way the chats listing's does: [`PageParams`]
+/// selects and bounds the page by participation id (decision 4's creation
+/// order), and the fetched page is then ordered by [`updated_at`] — what
+/// every new direct status bumps, Pleroma's `for_user` order — newest
+/// first, the participation id breaking ties. The cursors a client follows
+/// are still the ids the `Link` header names. `recipients` is Pleroma's
+/// `restrict_recipients`: a participation whose addressee list misses any
+/// named account leaves the listing; an empty slice asks for everything.
+/// An account nobody has DM'd answers the empty `Vec`.
+///
+/// [`updated_at`]: Participation::updated_at
 ///
 /// # Errors
 ///
@@ -508,15 +551,134 @@ pub async fn page_for_user(
     pool: &PgPool,
     user_id: Uuid,
     page: PageParams,
+    recipients: &[Uuid],
 ) -> AppResult<Vec<Participation>> {
     let mut builder = QueryBuilder::<Postgres>::new(PAGE_SQL);
     let _user: &mut _ = builder.push_bind(user_id);
+    if !recipients.is_empty() {
+        let _filter: &mut _ = builder
+            .push(" AND ")
+            .push_bind(recipients.to_vec())
+            .push(RECIPIENTS_FILTER_TAIL_SQL);
+    }
     page.apply_keyset(&mut builder, "p.id");
     let rows = builder
         .build_query_as::<Participation>()
         .fetch_all(pool)
         .await?;
+    let mut rows = page.finish(rows);
+    sort_by_activity(&mut rows);
+    Ok(rows)
+}
+
+/// [`page_for_user`]'s list order: the participation whose thread saw
+/// activity last first, its id breaking a tie (the chats listing's rule,
+/// restated over [`updated_at`], which every bump moves).
+///
+/// [`updated_at`]: Participation::updated_at
+fn sort_by_activity(rows: &mut [Participation]) {
+    rows.sort_unstable_by(|newer, older| {
+        older
+            .updated_at
+            .cmp(&newer.updated_at)
+            .then(older.id.cmp(&newer.id))
+    });
+}
+
+/// The live `direct` statuses of thread `conversation_id`, newest first,
+/// one [`PageParams`] page (cursors and cap on the status id).
+///
+/// What Pleroma's `PleromaAPI.ConversationController#statuses` fetches for
+/// a participation's context: the thread's posts, tombstones out; whether
+/// the reader may see each one is [`crate::models::status_visibility`]'s
+/// question, asked by the endpoint that reads this. A thread with no live
+/// status answers the empty `Vec`.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+///
+/// [`AppError::Database`]: crate::error::AppError
+pub async fn page_direct_statuses(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    page: PageParams,
+) -> AppResult<Vec<Status>> {
+    let mut builder = QueryBuilder::<Postgres>::new(THREAD_STATUSES_SQL);
+    let _thread: &mut _ = builder
+        .push_bind(conversation_id)
+        .push(" AND s.visibility = 'direct' AND s.deleted_at IS NULL");
+    page.apply_keyset(&mut builder, "s.id");
+    let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
     Ok(page.finish(rows))
+}
+
+/// The addressee lists of `participation_ids`, one per participation.
+///
+/// Each list is in the pair key's order — [`recipients`] for a whole page
+/// of participations in one statement (decision 3's batched reads). A
+/// participation with an empty list — and one the page never names — is
+/// absent from the map.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+///
+/// [`AppError::Database`]: crate::error::AppError
+pub async fn recipients_map(
+    pool: &PgPool,
+    participation_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<Uuid>>> {
+    if participation_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query_as::<_, (Uuid, Uuid)>(RECIPIENTS_BATCH_SQL)
+        .bind(participation_ids)
+        .fetch_all(pool)
+        .await?;
+    let mut lists: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (participation_id, user_id) in rows {
+        lists.entry(participation_id).or_default().push(user_id);
+    }
+    Ok(lists)
+}
+
+/// Makes `user_ids` the whole addressee list of `participation_id`.
+///
+/// One transaction: the old set goes before the new one lands, exactly the
+/// wholesale rewrite [`participate`] runs — with the caller's list instead
+/// of the status's roster (Pleroma's `Participation.set_recipients`, which
+/// the `PATCH /api/v1/pleroma/conversations/{id}` endpoint drives; whether
+/// every named account exists is that endpoint's check, since Pleroma
+/// refuses an unknown recipient and the ticket owes it a 404). An empty
+/// slice clears the list.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`] and the rollback
+/// leaves the old list in place.
+///
+/// [`AppError::Database`]: crate::error::AppError
+pub async fn set_recipients(
+    pool: &PgPool,
+    participation_id: Uuid,
+    user_ids: &[Uuid],
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(CLEAR_RECIPIENTS_SQL)
+        .bind(participation_id)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    if !user_ids.is_empty() {
+        let _stored = sqlx::query(INSERT_RECIPIENTS_SQL)
+            .bind(participation_id)
+            .bind(user_ids)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Flags `user_id`'s participation `id` read and answers the row, `None`
@@ -1136,7 +1298,7 @@ mod tests {
             bump(&pool, &post).await;
         }
 
-        let first_two = page_for_user(&pool, bob.id, page(2))
+        let first_two = page_for_user(&pool, bob.id, page(2), &[])
             .await
             .expect("the first page reads");
         assert_eq!(first_two.len(), 2, "the cap held");
@@ -1152,6 +1314,7 @@ mod tests {
                 max_id: first_two.last().map(|row| row.id),
                 ..page(2)
             },
+            &[],
         )
         .await
         .expect("the second page reads");
@@ -1161,7 +1324,7 @@ mod tests {
             "and every one is older than the cursor"
         );
 
-        let alice_page = page_for_user(&pool, alice.id, page(10))
+        let alice_page = page_for_user(&pool, alice.id, page(10), &[])
             .await
             .expect("alice's page reads");
         assert_eq!(
@@ -1172,6 +1335,223 @@ mod tests {
         assert!(
             alice_page.iter().all(|row| row.user_id == alice.id),
             "every row is hers"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_moves_the_thread_that_saw_activity_last_to_the_front() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let first = direct(&pool, &alice, &[&bob], "@bob first").await;
+        bump(&pool, &first).await;
+        let second = direct(&pool, &alice, &[&bob], "@bob second").await;
+        bump(&pool, &second).await;
+        let first_thread = linked_thread(&pool, &first).await;
+
+        // A third thread, then a reply into the first: its participation is
+        // the freshest activity of the three, though the oldest row.
+        let third = direct(&pool, &alice, &[&bob], "@bob third").await;
+        bump(&pool, &third).await;
+        let echoed = direct_reply(&pool, &bob, &first, &[&alice], "@alice back").await;
+        bump(&pool, &echoed).await;
+
+        let listed = page_for_user(&pool, alice.id, page(10), &[])
+            .await
+            .expect("the listing reads");
+        assert_eq!(
+            listed.first().expect("three threads").conversation_id,
+            first_thread,
+            "the thread the reply bumped leads the newest-activity-first list"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recipients_filter_keeps_only_threads_addressing_everyone() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let dave = local(&pool, "dave").await;
+        let pair = direct(&pool, &alice, &[&bob, &carol], "@bob @carol psst").await;
+        bump(&pool, &pair).await;
+        let single = direct(&pool, &alice, &[&bob], "@bob alone").await;
+        bump(&pool, &single).await;
+        let pair_thread = linked_thread(&pool, &pair).await;
+
+        let both = page_for_user(&pool, bob.id, page(10), &[carol.id])
+            .await
+            .expect("the filtered page reads");
+        assert_eq!(
+            both.iter()
+                .map(|row| row.conversation_id)
+                .collect::<Vec<_>>(),
+            vec![pair_thread],
+            "only the thread whose recipient list also names carol stands"
+        );
+        let everyone = page_for_user(&pool, bob.id, page(10), &[])
+            .await
+            .expect("the open page reads");
+        assert_eq!(everyone.len(), 2, "nobody named keeps everything");
+        let stranger = page_for_user(&pool, bob.id, page(10), &[dave.id])
+            .await
+            .expect("the stranger-naming page reads");
+        assert!(
+            stranger.is_empty(),
+            "an account no thread addresses matches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn recipients_map_answers_the_page_in_one_read() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = remote(&pool, "carol").await;
+        let post = direct(&pool, &alice, &[&bob, &carol], "@bob @carol psst").await;
+        bump(&pool, &post).await;
+        let thread = linked_thread(&pool, &post).await;
+        let alice_row = participation(&pool, alice.id, thread)
+            .await
+            .expect("alice participates");
+        let bob_row = participation(&pool, bob.id, thread)
+            .await
+            .expect("bob participates");
+        let lonely = Participation {
+            id: Uuid::now_v7(),
+            ..alice_row.clone()
+        };
+
+        let asked = [alice_row.id, bob_row.id, lonely.id];
+        let found = recipients_map(&pool, &asked)
+            .await
+            .expect("the batch reads");
+        assert_eq!(
+            found.get(&alice_row.id),
+            Some(&vec![bob.id, carol.id]),
+            "alice's list, in the pair key's order"
+        );
+        assert_eq!(
+            found.get(&bob_row.id),
+            Some(&vec![alice.id, carol.id]),
+            "and bob's, the batch answering both from one read"
+        );
+        assert!(
+            !found.contains_key(&lonely.id),
+            "a participation with no rows is absent"
+        );
+        assert!(
+            recipients_map(&pool, &[])
+                .await
+                .expect("the empty ask runs")
+                .is_empty(),
+            "an empty ask is the empty map"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_recipients_rewrites_the_whole_list() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let post = direct(&pool, &alice, &[&bob], "@bob psst").await;
+        bump(&pool, &post).await;
+        let thread = linked_thread(&pool, &post).await;
+        let alice_row = participation(&pool, alice.id, thread)
+            .await
+            .expect("alice participates");
+
+        set_recipients(&pool, alice_row.id, &[bob.id, carol.id])
+            .await
+            .expect("the rewrite runs");
+        assert_eq!(
+            stored_recipients(&pool, alice_row.id).await,
+            vec![bob.id, carol.id],
+            "the new list is exactly what was asked"
+        );
+        set_recipients(&pool, alice_row.id, &[carol.id])
+            .await
+            .expect("the second rewrite runs");
+        assert_eq!(
+            stored_recipients(&pool, alice_row.id).await,
+            vec![carol.id],
+            "and it replaced the first, not accumulated onto it"
+        );
+        set_recipients(&pool, alice_row.id, &[])
+            .await
+            .expect("the clearing runs");
+        assert!(
+            stored_recipients(&pool, alice_row.id).await.is_empty(),
+            "an empty list clears the roster"
+        );
+    }
+
+    #[tokio::test]
+    async fn page_direct_statuses_answers_the_thread_newest_first() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let first = direct(&pool, &alice, &[&bob], "@bob first").await;
+        bump(&pool, &first).await;
+        let second = direct_reply(&pool, &bob, &first, &[&alice], "@alice second").await;
+        bump(&pool, &second).await;
+        let thread = linked_thread(&pool, &first).await;
+        let outside = direct(&pool, &alice, &[&bob], "@bob elsewhere").await;
+        bump(&pool, &outside).await;
+        let _public = status::insert(
+            &pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                visibility: Visibility::Public,
+                ..NewStatus::local(&alice, "not a dm")
+            },
+        )
+        .await
+        .expect("the public fixture inserts");
+
+        let page_all = page_direct_statuses(&pool, thread, page(10))
+            .await
+            .expect("the thread reads");
+        assert_eq!(
+            page_all.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![second.id, first.id],
+            "the thread's two direct statuses, newest first, other threads out"
+        );
+
+        let _gone = status::soft_delete(&pool, second.id)
+            .await
+            .expect("the newest fixture deletes");
+        let after_delete = page_direct_statuses(&pool, thread, page(10))
+            .await
+            .expect("the page after the delete reads");
+        assert_eq!(
+            after_delete.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![first.id],
+            "the tombstone leaves the listing"
+        );
+        let small = page_direct_statuses(
+            &pool,
+            thread,
+            PageParams {
+                limit: 1,
+                ..page(1)
+            },
+        )
+        .await
+        .expect("the capped page reads");
+        assert_eq!(
+            small.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![first.id],
+            "the cap held"
+        );
+        assert!(
+            page_direct_statuses(&pool, Uuid::now_v7(), page(10))
+                .await
+                .expect("the unknown thread reads")
+                .is_empty(),
+            "a thread that never posted answers nothing — and the public \
+             post is in no thread's page"
         );
     }
 
