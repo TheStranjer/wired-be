@@ -103,6 +103,10 @@ mod follow_requests;
 /// The `/health` endpoint and the `common` harness itself.
 mod health;
 
+/// The HTML helper pages (`/frontend_switcher` and the module's shared
+/// page builders).
+mod html_pages;
+
 /// The public instance endpoints (`src/api/instance.rs`).
 mod instance;
 
