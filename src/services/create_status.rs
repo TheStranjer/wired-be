@@ -1147,9 +1147,12 @@ const fn visibility_width(visibility: Visibility) -> u8 {
 /// (landed from [`notify::on_mention`], Pleroma's `Create` notification
 /// arm), the streaming `update` broadcast to the author's and the mentioned
 /// users' sockets and to the public and hashtag timelines, the follower
-/// `status` notifications, and the federation of the `Create` activity
-/// through the job queue (see [`crate::models::job`], decision 11) — wire
-/// themselves in here, and only here.
+/// `status` notifications, the [`rich_media.fetch`](crate::jobs::rich_media)
+/// card job the post's first link schedules for itself (see
+/// [`schedule_fetch`](crate::jobs::rich_media::schedule_fetch)), and the
+/// federation of the `Create` activity through the job queue (see
+/// [`crate::models::job`], decision 11) — wire themselves in here, and only
+/// here.
 ///
 /// `status` is the stored row: the id the tellings name, the author they
 /// do not tell, and the `reblog_of_id` that keeps a boost row out of the
@@ -1160,6 +1163,7 @@ const fn visibility_width(visibility: Visibility) -> u8 {
 /// [`notify::on_mention`]: crate::services::notify::on_mention
 async fn after_status_created(state: &AppState, status: &status::Status) {
     notify::on_mention(state, status).await;
+    crate::jobs::rich_media::schedule_fetch(state, status).await;
 }
 
 /// The body of `PUT /api/v1/statuses/{id}`, as the client wrote it.

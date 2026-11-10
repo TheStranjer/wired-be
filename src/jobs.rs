@@ -23,6 +23,7 @@ pub mod deletion;
 pub mod idempotency;
 pub mod imports;
 pub mod mutes;
+pub mod rich_media;
 pub mod scheduler;
 pub mod statuses;
 
