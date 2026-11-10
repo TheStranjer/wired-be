@@ -39,6 +39,7 @@ pub mod instance_secret;
 pub mod instance_setting;
 pub mod invite_token;
 pub mod job;
+pub mod link_card;
 pub mod list;
 pub mod marker;
 pub mod media_attachment;

@@ -185,6 +185,12 @@ pub const MEDIA_PROXY_MAX_BYTES_VAR: &str = "MEDIA_PROXY_MAX_BYTES";
 /// Environment variable holding the comma-separated list of hosts the
 /// media proxy never proxies.
 pub const MEDIA_PROXY_BLACKLIST_VAR: &str = "MEDIA_PROXY_BLACKLIST";
+/// Environment variable holding the comma-separated list of hosts rich
+/// media card fetching never visits.
+pub const RICH_MEDIA_IGNORE_HOSTS_VAR: &str = "RICH_MEDIA_IGNORE_HOSTS";
+/// Environment variable holding whether preview cards are fetched for the
+/// remote URLs statuses link to.
+pub const RICH_MEDIA_REMOTE_VAR: &str = "RICH_MEDIA_REMOTE";
 /// Environment variable holding the instance's VAPID private key for Web
 /// Push, the ES256 signing key as PKCS#8 PEM.
 ///
@@ -436,6 +442,12 @@ pub const DEFAULT_MEDIA_PROXY_MAX_BYTES: usize = 50_000_000;
 /// Minimum length, in characters, of `MEDIA_PROXY_SECRET` when the media
 /// proxy is enabled: 32 bytes of key material for HMAC-SHA256.
 pub const MIN_MEDIA_PROXY_SECRET_CHARS: usize = 32;
+/// Ignore list used when `RICH_MEDIA_IGNORE_HOSTS` is unset: nothing, so
+/// card fetching visits every host the rest of the settings allow.
+pub const DEFAULT_RICH_MEDIA_IGNORE_HOSTS: &str = "";
+/// Remote-card state used when `RICH_MEDIA_REMOTE` is unset: off, so no
+/// preview card is ever fetched for a status's remote link.
+pub const DEFAULT_RICH_MEDIA_REMOTE: bool = false;
 /// Signed-fetch state used when `SIGN_FETCHES` is unset: actor `GET`s are
 /// signed.
 ///
@@ -999,6 +1011,14 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
+    /// Hosts rich media card fetching never visits, from
+    /// `RICH_MEDIA_IGNORE_HOSTS` (a comma-separated list, empty by
+    /// default): a link to one of them is never fetched and gets no card.
+    pub rich_media_ignore_hosts: Vec<String>,
+    /// Whether preview cards are fetched for the remote URLs statuses link
+    /// to, from `RICH_MEDIA_REMOTE`: off by default, so the card cache
+    /// stays empty until an operator turns fetching on.
+    pub rich_media_remote: Toggle,
     /// The VAPID key overrides, from `VAPID_PRIVATE_KEY` and
     /// `VAPID_PUBLIC_KEY` (see [`crate::services::vapid`]).
     pub vapid: VapidConfig,
@@ -1051,8 +1071,7 @@ impl Config {
         let profile = instance_profile(&lookup);
         let limits = content_limits(&lookup)?;
         let text = text_length_limits(&lookup)?;
-        let (max_image_pixels, max_report_comment, max_pinned_statuses, min_expiration_secs) =
-            cap_limits(&lookup)?;
+        let caps = cap_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let (inbox_max_bytes, max_remote_mention_lookups) = inbox_and_mention_caps(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
@@ -1078,10 +1097,10 @@ impl Config {
             max_display_name_chars: text.display_name_chars,
             max_bio_chars: text.bio_chars,
             max_profile_fields: text.profile_fields,
-            max_report_comment,
-            max_image_pixels,
-            max_pinned_statuses,
-            min_expiration_secs,
+            max_report_comment: caps.max_report_comment,
+            max_image_pixels: caps.max_image_pixels,
+            max_pinned_statuses: caps.max_pinned_statuses,
+            min_expiration_secs: caps.min_expiration_secs,
             upload_limits,
             avatar_limit_bytes,
             banner_limit_bytes,
@@ -1116,6 +1135,8 @@ impl Config {
             smtp_tls: mailer.tls,
             mail_from: mailer.from,
             media_proxy: media_proxy_settings(&lookup)?,
+            rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
+            rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup),
             translation: translation_settings(&lookup)?,
             sign_fetches,
@@ -1189,6 +1210,8 @@ impl Config {
             BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
             HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
             RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
+            RICH_MEDIA_IGNORE_HOSTS_VAR => Some(DEFAULT_RICH_MEDIA_IGNORE_HOSTS.to_owned()),
+            RICH_MEDIA_REMOTE_VAR => Some(DEFAULT_RICH_MEDIA_REMOTE.to_string()),
             _ => None,
         })
         .unwrap_or_else(|_| Self::test_defaults())
@@ -1262,6 +1285,8 @@ impl Config {
                 max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
                 blacklist: Vec::new(),
             },
+            rich_media_ignore_hosts: comma_list(DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
+            rich_media_remote: Toggle::new(DEFAULT_RICH_MEDIA_REMOTE),
             vapid: VapidConfig::default(),
             translation: TranslationConfig {
                 provider: TranslationProvider::default(),
@@ -1702,12 +1727,23 @@ where
     })
 }
 
-/// The shape [`cap_limits`] answers: the limits that sit outside the
-/// text-length groups, in [`Config`] field order (an uploaded image's pixel
-/// count, a report comment's character count, the number of statuses one
-/// account may pin, then the shortest status expiration); factored out
-/// because a bare tuple of same-typed numbers reads better by name.
-type CapLimits = (usize, usize, usize, usize);
+/// What [`cap_limits`] reads: the limits that sit outside the text-length
+/// groups, named by what they cap and hung on the [`Config`] fields in
+/// [`Config::from_lookup`] (`MAX_IMAGE_PIXELS`, `MAX_REPORT_COMMENT`,
+/// `MAX_PINNED_STATUSES`, `MIN_EXPIRATION_SECS`); a struct rather than a
+/// bare tuple of same-typed numbers so the one read binds on one line and
+/// [`Config::from_lookup`] stays inside its length budget (AGENTS.md).
+#[derive(Debug)]
+struct CapLimits {
+    /// The uploaded image pixel count (`MAX_IMAGE_PIXELS`).
+    max_image_pixels: usize,
+    /// The report comment length (`MAX_REPORT_COMMENT`).
+    max_report_comment: usize,
+    /// The pinned statuses per account (`MAX_PINNED_STATUSES`).
+    max_pinned_statuses: usize,
+    /// The shortest status expiration (`MIN_EXPIRATION_SECS`).
+    min_expiration_secs: usize,
+}
 
 /// Reads the four caps that sit beside the text limits: the pixel count an
 /// uploaded image may decode to (`MAX_IMAGE_PIXELS`), the length of a
@@ -1715,8 +1751,7 @@ type CapLimits = (usize, usize, usize, usize);
 /// account may pin to its profile (`MAX_PINNED_STATUSES`) and the shortest
 /// `expires_in` a status create may ask for (`MIN_EXPIRATION_SECS`).
 /// Grouped because each is a plain default-or-parse and
-/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
-/// back in field order.
+/// [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1726,12 +1761,12 @@ fn cap_limits<F>(lookup: &F) -> Result<CapLimits, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    Ok((
-        number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
-        number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
-        number(lookup, MAX_PINNED_STATUSES_VAR, DEFAULT_MAX_PINNED_STATUSES)?,
-        number(lookup, MIN_EXPIRATION_SECS_VAR, DEFAULT_MIN_EXPIRATION_SECS)?,
-    ))
+    Ok(CapLimits {
+        max_image_pixels: number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
+        max_report_comment: number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
+        max_pinned_statuses: number(lookup, MAX_PINNED_STATUSES_VAR, DEFAULT_MAX_PINNED_STATUSES)?,
+        min_expiration_secs: number(lookup, MIN_EXPIRATION_SECS_VAR, DEFAULT_MIN_EXPIRATION_SECS)?,
+    })
 }
 
 /// Reads the three settings that govern how this instance fetches and is
@@ -2014,6 +2049,33 @@ where
     })
 }
 
+/// Reads `RICH_MEDIA_IGNORE_HOSTS`: the comma-separated list of hosts rich
+/// media card fetching never visits, empty when unset or blank — the same
+/// trimmed-list reading as the media proxy's blacklist.
+fn rich_media_ignore_hosts<F>(lookup: &F) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    comma_list(
+        &lookup(RICH_MEDIA_IGNORE_HOSTS_VAR)
+            .unwrap_or_else(|| DEFAULT_RICH_MEDIA_IGNORE_HOSTS.to_owned()),
+    )
+}
+
+/// Reads `RICH_MEDIA_REMOTE`: whether preview cards are fetched for the
+/// remote URLs statuses link to, off by default.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when the variable holds a value
+/// that is neither spelling.
+fn rich_media_remote<F>(lookup: &F) -> Result<Toggle, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(boolean(lookup, RICH_MEDIA_REMOTE_VAR, DEFAULT_RICH_MEDIA_REMOTE)?.into())
+}
+
 /// Reads the two VAPID overrides, each trimmed, a blank standing for
 /// unset (the generated pair then stays in charge).
 fn vapid_settings<F>(lookup: &F) -> VapidConfig
@@ -2227,6 +2289,8 @@ impl fmt::Debug for Config {
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
             .field("media_proxy", &self.media_proxy)
+            .field("rich_media_ignore_hosts", &self.rich_media_ignore_hosts)
+            .field("rich_media_remote", &self.rich_media_remote)
             .field("vapid", &self.vapid)
             .field("translation", &self.translation)
             .field("sign_fetches", &self.sign_fetches)
@@ -3825,6 +3889,69 @@ mod tests {
     }
 
     #[test]
+    fn rich_media_defaults_to_nothing_ignored_and_no_remote_cards() {
+        let config = config_with(&[]);
+        assert!(
+            config.rich_media_ignore_hosts.is_empty(),
+            "nothing is ignored by default"
+        );
+        assert!(
+            !config.rich_media_remote.get(),
+            "remote cards are off by default"
+        );
+    }
+
+    #[test]
+    fn reads_custom_rich_media_settings() {
+        let config = config_with(&[
+            (RICH_MEDIA_IGNORE_HOSTS_VAR, "internal.example, 127.0.0.1 ,"),
+            (RICH_MEDIA_REMOTE_VAR, "true"),
+        ]);
+        assert_eq!(
+            config.rich_media_ignore_hosts,
+            vec!["internal.example".to_owned(), "127.0.0.1".to_owned()],
+            "the ignore list is a trimmed comma list"
+        );
+        assert!(config.rich_media_remote.get(), "custom RICH_MEDIA_REMOTE");
+    }
+
+    #[test]
+    fn rich_media_ignore_list_of_only_separators_is_empty() {
+        let config = config_with(&[(RICH_MEDIA_IGNORE_HOSTS_VAR, " , , ")]);
+        assert!(
+            config.rich_media_ignore_hosts.is_empty(),
+            "blank entries fold away, like the media proxy's blacklist"
+        );
+    }
+
+    #[test]
+    fn invalid_rich_media_remote_is_an_error() {
+        let err = try_config_with(&[(RICH_MEDIA_REMOTE_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(RICH_MEDIA_REMOTE_VAR),
+            "error variant"
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_rich_media_settings() {
+        let config = config_with(&[
+            (RICH_MEDIA_IGNORE_HOSTS_VAR, "blocked.example"),
+            (RICH_MEDIA_REMOTE_VAR, "true"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("rich_media_ignore_hosts: [\"blocked.example\"]"),
+            "the ignore list is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("rich_media_remote: Toggle(true)"),
+            "the remote toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
     fn debug_redacts_the_media_proxy_secret() {
         let config = config_with(&[
             (MEDIA_PROXY_ENABLED_VAR, "true"),
@@ -4388,11 +4515,21 @@ mod tests {
             !config.media_proxy.enabled,
             "the media proxy is off for tests by default, so entity URLs pass through"
         );
+        assert!(
+            config.rich_media_ignore_hosts.is_empty(),
+            "the test config ignores no rich media hosts"
+        );
+        assert!(
+            !config.rich_media_remote.get(),
+            "rich media cards fetch no remote URLs for tests by default"
+        );
         let expected = Config::from_lookup(lookup_from(&[
             (DATABASE_URL_VAR, TEST_DATABASE_URL),
             (BASE_URL_VAR, TEST_BASE_URL),
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
             (RATE_LIMITS_ENABLED_VAR, "false"),
+            (RICH_MEDIA_IGNORE_HOSTS_VAR, DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
+            (RICH_MEDIA_REMOTE_VAR, "false"),
         ]))
         .unwrap();
         assert_eq!(config, expected, "for_tests equals from_lookup");
@@ -4407,6 +4544,8 @@ mod tests {
             (BASE_URL_VAR, TEST_BASE_URL),
             (HTTP_ALLOW_PRIVATE_HOSTS_VAR, "true"),
             (RATE_LIMITS_ENABLED_VAR, "false"),
+            (RICH_MEDIA_IGNORE_HOSTS_VAR, DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
+            (RICH_MEDIA_REMOTE_VAR, "false"),
         ]))
         .unwrap();
         assert_eq!(
