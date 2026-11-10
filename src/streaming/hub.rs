@@ -112,9 +112,9 @@ pub enum RenderSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamEvent {
     /// The stream names this event belongs to (`"public"`,
-    /// `"public:local"`, `"user"`, `"hashtag:rust"`, `"list:<id>"`,
-    /// `"direct"`, …); a connection subscribed to any of them receives it
-    /// — see [`stream_matches`].
+    /// `"public:local"`, `"user:<uuid>"`, `"hashtag:rust"`, `"list:<id>"`,
+    /// `"direct:<uuid>"`, …); a connection subscribed to any of them
+    /// receives it — see [`stream_matches`].
     pub streams: Vec<String>,
     /// The Mastodon event name: `update`, `delete`, `notification`,
     /// `status.update`, `conversation`, `filters_changed`, `announcement`,
@@ -132,9 +132,10 @@ pub struct StreamEvent {
     /// entity pushes; an event may carry `render`, `payload`, or neither.
     pub render: Option<RenderSpec>,
     /// Whether the event concerns this instance's local users and entities
-    /// only (Pleroma's `local_only` push flag). Nothing consults it yet:
-    /// the WebSocket endpoint keeps sending `payload` and ignores both
-    /// this and [`render`](Self::render) until a later slice.
+    /// only (Pleroma's `local_only` push flag). The streaming WebSocket
+    /// drops such an event on a socket with no authenticated reader; the
+    /// endpoint keeps sending `payload` and still ignores
+    /// [`render`](Self::render) until a later slice.
     pub local_only: bool,
 }
 

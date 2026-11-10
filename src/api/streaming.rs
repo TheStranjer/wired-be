@@ -12,11 +12,12 @@
 //! - **a reader of the hub**. Every connection takes a
 //!   [`Hub::subscribe`](crate::streaming::hub::Hub::subscribe) receiver and
 //!   forwards the events it may see as Mastodon's text frame,
-//!   `{"stream":["user"],"event":"update","payload":"<json string>"}`. An
-//!   event passes when [`stream_matches`] finds one of the connection's
-//!   subscriptions on it, its [`Audience`] covers the socket's reader (a
-//!   `Users` event reaches those users only) and the reader's own `Filters`
-//!   say nothing against it.
+//!   `{"stream":["user:<reader uuid>"],"event":"update","payload":"<json
+//!   string>"}`. An event passes when [`stream_matches`] finds one of the
+//!   connection's subscriptions on it, its [`Audience`] covers the socket's
+//!   reader (a `Users` event reaches those users only), a `local_only` event
+//!   has a reader at all — an anonymous socket never sees one — and the
+//!   reader's own `Filters` say nothing against it.
 //! - **its own subscription set**, opened at the handshake by `stream` (plus
 //!   `tag` / `list` / `instance`) and changed afterwards by the `subscribe`
 //!   and `unsubscribe` frames, capped at [`MAX_SUBSCRIPTIONS`].
@@ -134,13 +135,17 @@ const PUBLIC_REMOTE_MEDIA: &str = "public:remote:media";
 const HASHTAG: &str = "hashtag";
 /// One hashtag's local statuses (`tag` names it).
 const HASHTAG_LOCAL: &str = "hashtag:local";
-/// The reader's own timeline.
+/// The reader's own timeline; the socket holds it as the hub's
+/// `user:<reader uuid>`.
 const USER: &str = "user";
-/// The reader's notifications.
+/// The reader's notifications; the socket holds it as the hub's
+/// `user:notification:<reader uuid>`.
 const USER_NOTIFICATION: &str = "user:notification";
-/// The reader's chats (Pleroma's `user:pleroma_chat`).
+/// The reader's chats (Pleroma's `user:pleroma_chat`); the socket holds it
+/// as the hub's `user:pleroma_chat:<reader uuid>`.
 const USER_PLEROMA_CHAT: &str = "user:pleroma_chat";
-/// The reader's direct messages.
+/// The reader's direct messages; the socket holds it as the hub's
+/// `direct:<reader uuid>`.
 const DIRECT: &str = "direct";
 /// One of the reader's lists (`list` names it).
 const LIST: &str = "list";
@@ -460,13 +465,15 @@ impl Connection {
 
     /// The hub stream name the requested `name` expands to for this socket.
     ///
-    /// `user`, `user:notification`, `user:pleroma_chat` and `direct` keep
-    /// their own names: where Pleroma registers a socket on a `user:<id>`
-    /// topic, this hub carries the readers in the event's [`Audience`], so the
-    /// name is the same for every user and [`Connection::audience_allows`]
-    /// decides who sees it. A hashtag and a list are suffixed with what they
-    /// are about, exactly as Pleroma's topics are (`hashtag:<tag>`,
-    /// `list:<id>`).
+    /// The client keeps sending the bare `user`, `user:notification`,
+    /// `user:pleroma_chat` and `direct`; what the socket holds is the
+    /// canonical per-reader hub name with the reader's uuid suffixed onto
+    /// it (`user:<reader uuid>`, `direct:<reader uuid>`, …), the way
+    /// Pleroma registers a socket on a `user:<id>` topic. The event's
+    /// [`Audience`] stays the second gate: a matching stream name alone
+    /// does not deliver to a reader it does not cover. A hashtag and a
+    /// list are suffixed with what they are about, exactly as Pleroma's
+    /// topics are (`hashtag:<tag>`, `list:<id>`).
     async fn topic_for(&self, name: &str, args: &StreamArgs) -> Result<String, Refusal> {
         if is_user_stream(name) {
             return self.user_topic(name);
@@ -480,12 +487,17 @@ impl Connection {
     /// A private user stream: the socket needs a user whose token grants one
     /// of [`PRIVATE_SCOPES`] (Pleroma's `get_topic` `@user_streams` clause is
     /// the same user-bound-token match with one scope per stream; the ticket
-    /// lists the three accepted scopes together, and `read` covers them all).
+    /// lists the three accepted scopes together, and `read` covers them all),
+    /// and the topic it holds is the reader's own: the requested `name` with
+    /// the reader's uuid suffixed onto it.
     fn user_topic(&self, name: &str) -> Result<String, Refusal> {
-        if self.reader.is_some() && grants(&self.scopes, &PRIVATE_SCOPES) {
-            return Ok(name.to_owned());
-        }
-        Err(Refusal::Unauthorized)
+        let Some(reader) = self
+            .reader
+            .filter(|_| grants(&self.scopes, &PRIVATE_SCOPES))
+        else {
+            return Err(Refusal::Unauthorized);
+        };
+        Ok(format!("{name}:{reader}"))
     }
 
     /// A list stream: one of [`PRIVATE_SCOPES`] or [`LIST_SCOPES`], and a list
@@ -513,11 +525,13 @@ impl Connection {
     }
 
     /// The frame to write for `event`, `None` when this connection may not see
-    /// it: no subscribed stream, an audience it is outside, or a reader whose
-    /// filters suppress the entity.
+    /// it: no subscribed stream, an audience it is outside, a `local_only`
+    /// event with no reader to be local for, or a reader whose filters
+    /// suppress the entity.
     fn frame_for(&self, event: &StreamEvent) -> Option<String> {
         if !stream_matches(&self.subscriptions, event)
             || !self.audience_allows(event)
+            || !self.local_allows(event)
             || self.filters.suppresses(event)
         {
             return None;
@@ -545,6 +559,14 @@ impl Connection {
             Audience::Everyone => self.reader.is_some(),
             Audience::Users(ids) => self.reader.is_some_and(|reader| ids.contains(&reader)),
         }
+    }
+
+    /// Whether the event's `local_only` flag lets this connection see it at
+    /// all: the flag marks an event about this instance's local users and
+    /// entities, and a socket with no authenticated reader is not one of the
+    /// local viewers it may reach — whatever its audience or stream names say.
+    const fn local_allows(&self, event: &StreamEvent) -> bool {
+        !event.local_only || self.reader.is_some()
     }
 }
 
@@ -1503,35 +1525,42 @@ mod tests {
     async fn audience_decides_who_sees_an_event() {
         let (_db, state) = state().await;
         let reader = account(&state, "stream-reader").await;
-        let mut mine = watching(&state, &[USER]).await;
+        let other = Uuid::now_v7();
+        let own_stream = format!("{USER}:{}", reader.id);
+        let other_stream = format!("{USER}:{other}");
+        let mut mine = watching(&state, &[own_stream.as_str()]).await;
         mine.reader = Some(reader.id);
-        let on = event(&["user"], "{}");
+        let on = event(&[own_stream.as_str()], "{}");
 
         let for_me = StreamEvent {
             audience: Audience::Users(vec![reader.id]),
             ..on.clone()
         };
         let for_other = StreamEvent {
-            audience: Audience::Users(vec![Uuid::now_v7()]),
+            audience: Audience::Users(vec![other]),
             ..on.clone()
         };
         let everyone = StreamEvent {
             audience: Audience::Everyone,
             ..on.clone()
         };
+        let on_other_stream = event(&[other_stream.as_str()], "{}");
 
         assert!(mine.frame_for(&for_me).is_some(), "its own user sees it");
         assert!(
             mine.frame_for(&for_other).is_none(),
-            "and nobody else's user does"
+            "the audience stays the second gate even on a held stream name"
         );
         assert!(
             mine.frame_for(&everyone).is_some(),
             "an Everyone event reaches an authenticated socket"
         );
+        assert!(
+            mine.frame_for(&on_other_stream).is_none(),
+            "another reader's uuid-named stream never matches"
+        );
 
-        let mut anonymous = watching(&state, &[USER]).await;
-        anonymous.subscriptions = vec![USER.to_owned()];
+        let anonymous = watching(&state, &[own_stream.as_str()]).await;
         assert!(
             anonymous.frame_for(&for_me).is_none(),
             "an anonymous socket never receives a Users event"
@@ -1543,6 +1572,84 @@ mod tests {
         assert!(
             anonymous.frame_for(&on).is_some(),
             "but a Public event is public"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_only_event_never_reaches_an_anonymous_socket() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "local-gate-reader").await;
+        let anonymous = watching(&state, &[PUBLIC]).await;
+        let mut member = watching(&state, &[PUBLIC]).await;
+        member.reader = Some(reader.id);
+        let local_public = StreamEvent {
+            local_only: true,
+            ..event(&[PUBLIC], "{}")
+        };
+
+        assert!(
+            anonymous.frame_for(&local_public).is_none(),
+            "a local_only event is dropped for a readerless socket, whatever its audience"
+        );
+        let local_everyone = StreamEvent {
+            audience: Audience::Everyone,
+            ..local_public.clone()
+        };
+        assert!(
+            anonymous.frame_for(&local_everyone).is_none(),
+            "Everyone plus local_only means authenticated local viewers only"
+        );
+        assert!(
+            member.frame_for(&local_everyone).is_some(),
+            "and an authenticated socket is exactly such a viewer"
+        );
+        let not_local = StreamEvent {
+            local_only: false,
+            ..local_public
+        };
+        assert!(
+            anonymous.frame_for(&not_local).is_some(),
+            "without the flag the same event streams on as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_stream_is_held_under_the_readers_uuid() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "uuid-naming-reader").await;
+        let mut connection = Connection::new(state, None).await.unwrap();
+        connection.reader = Some(reader.id);
+        connection.scopes = Scopes::parse(READ);
+
+        for name in [USER, USER_NOTIFICATION, USER_PLEROMA_CHAT, DIRECT] {
+            let topic = connection
+                .topic_for(name, &StreamArgs::default())
+                .await
+                .expect("a reader with read watches its own streams");
+            assert_eq!(
+                topic,
+                format!("{name}:{}", reader.id),
+                "the client's bare `{name}` is held as the canonical hub name"
+            );
+        }
+
+        let subscribed = connection
+            .on_client_text(r#"{"type":"subscribe","stream":"user"}"#)
+            .await;
+        assert_eq!(
+            connection.subscriptions,
+            vec![format!("{USER}:{}", reader.id)],
+            "the bare subscribe is answered nothing and holds the suffixed name"
+        );
+        assert!(subscribed.is_empty(), "and the frame itself is accepted");
+
+        let unsubscribed = connection
+            .on_client_text(r#"{"type":"unsubscribe","stream":"user"}"#)
+            .await;
+        assert!(unsubscribed.is_empty(), "and the bare name lets go of it");
+        assert!(
+            connection.subscriptions.is_empty(),
+            "the suffixed name left with it"
         );
     }
 
@@ -1902,15 +2009,21 @@ mod tests {
             subscribed.is_empty(),
             "its own stream opens without a reconnect"
         );
+        assert_eq!(
+            connection.subscriptions,
+            vec![format!("{USER}:{}", reader.id)],
+            "and is held under the reader's uuid"
+        );
         connection.filters = Filters::load(&state.db, connection.reader)
             .await
             .expect("the filters load");
         let body = status_payload(muted.id, "late-suppressed", Uuid::now_v7());
+        let own_stream = format!("{USER}:{}", reader.id);
         assert!(
             connection
                 .frame_for(&StreamEvent {
                     audience: Audience::Users(vec![reader.id]),
-                    ..event(&[USER], &body)
+                    ..event(&[own_stream.as_str()], &body)
                 })
                 .is_none(),
             "and the filters the new reader brought apply to what it sees"

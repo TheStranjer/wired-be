@@ -297,6 +297,15 @@ fn public_update(marker: &str) -> StreamEvent {
     event_on(&["public"], marker, Audience::Public)
 }
 
+/// An `Everyone` `update` on `streams` flagged `local_only`, whose entity
+/// carries `marker` as its id: for authenticated local viewers only.
+fn local_only_update(streams: &[&str], marker: &str) -> StreamEvent {
+    StreamEvent {
+        local_only: true,
+        ..event_on(streams, marker, Audience::Everyone)
+    }
+}
+
 /// A public `update` whose entity is authored by `author` (as `acct`, which
 /// names a domain when it holds an `@`) in the thread `thread` — the payload a
 /// connection's filters judge.
@@ -430,33 +439,39 @@ async fn an_invalid_token_rejects_the_upgrade() {
     );
 }
 
-/// A token in the query string authenticates the socket, and its `user` stream
-/// carries only the events addressed to that user.
+/// A token in the query string authenticates the socket, its bare
+/// `stream=user` subscription is held under the canonical `user:<reader uuid>`
+/// hub name, and it receives the event whose streams name `user:<its uuid>`
+/// while staying silent about one naming another user's `user:<uuid>`.
 #[tokio::test]
 async fn token_in_the_query_string_opens_the_user_stream() {
     let server = Server::start().await;
     let reader = account(server.pool(), "query-reader").await;
     let other = account(server.pool(), "query-other").await;
+    let own_stream = format!("user:{}", reader.id);
+    let other_stream = format!("user:{}", other.id);
     let secret = token(server.pool(), &reader, "read:statuses").await;
     let mut client = open(&server.url(&format!("stream=user&access_token={secret}"))).await;
 
     server.publish(event_on(
-        &["user"],
+        &[other_stream.as_str()],
         "for-other",
         Audience::Users(vec![other.id]),
     ));
     server.publish(event_on(
-        &["user"],
+        &[own_stream.as_str()],
         "for-me",
         Audience::Users(vec![reader.id]),
     ));
 
     let frames = read_until(&mut client, "for-me").await;
-    assert_absent(&frames, &["for-other"]);
+    assert_absent(&frames, &["for-other", &other_stream]);
     assert_eq!(
         frames.last().expect("the control frame"),
-        r#"{"stream":["user"],"event":"update","payload":"{\"id\":\"for-me\"}"}"#,
-        "the socket's own event arrives on its own stream"
+        &format!(
+            r#"{{"stream":["{own_stream}"],"event":"update","payload":"{{\"id\":\"for-me\"}}"}}"#
+        ),
+        "the socket's own event arrives on its uuid-named stream"
     );
 }
 
@@ -483,8 +498,9 @@ async fn token_in_the_subprotocol_is_echoed_back() {
         "the offered protocol comes back as the chosen one"
     );
 
+    let own_stream = format!("user:{}", reader.id);
     server.publish(event_on(
-        &["user"],
+        &[own_stream.as_str()],
         "via-subprotocol",
         Audience::Users(vec![reader.id]),
     ));
@@ -647,13 +663,15 @@ async fn an_anonymous_socket_authenticates_without_a_reconnect() {
     .await;
     send(&mut client, r#"{"type":"subscribe","stream":"user"}"#).await;
     settled(&mut client).await;
+    let own_stream = format!("user:{}", reader.id);
+    let other_stream = format!("user:{}", other.id);
     server.publish(event_on(
-        &["user"],
+        &[other_stream.as_str()],
         "for-other",
         Audience::Users(vec![other.id]),
     ));
     server.publish(event_on(
-        &["user"],
+        &[own_stream.as_str()],
         "after-auth",
         Audience::Users(vec![reader.id]),
     ));
@@ -776,6 +794,35 @@ async fn audience_decides_between_an_anonymous_and_an_authenticated_socket() {
     );
     let alone = read_until(&mut anonymous, "for-anyone").await;
     assert_absent(&alone, &["for-everyone"]);
+}
+
+/// A `local_only` event is for local viewers: an anonymous socket on the same
+/// stream skips it however its audience and streams match, and the control
+/// event published after it arrives as usual. An authenticated socket sees
+/// both.
+#[tokio::test]
+async fn a_local_only_event_never_reaches_an_anonymous_socket() {
+    let server = Server::start().await;
+    let reader = account(server.pool(), "local-gate-reader").await;
+    let secret = token(server.pool(), &reader, "read").await;
+    let mut anonymous = open(&server.url(PUBLIC)).await;
+    let mut authenticated = open(&server.url(&format!("{PUBLIC}&access_token={secret}"))).await;
+
+    server.publish(local_only_update(&["public"], "local-for-everyone"));
+    server.publish(public_update("local-control"));
+
+    let alone = read_until(&mut anonymous, "local-control").await;
+    assert_absent(&alone, &["local-for-everyone"]);
+    assert!(
+        alone.iter().any(|frame| frame.contains("local-control")),
+        "the anonymous socket receives the control event after it: {alone:?}"
+    );
+    let both = read_until(&mut authenticated, "local-control").await;
+    assert!(
+        both.iter()
+            .any(|frame| frame.contains("local-for-everyone")),
+        "an authenticated socket is a local viewer and does see the event: {both:?}"
+    );
 }
 
 /// Every heartbeat period the server pings the socket, and the client's
