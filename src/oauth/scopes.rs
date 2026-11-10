@@ -120,6 +120,17 @@ pub const READ_STATUSES: &str = "read:statuses";
 /// (Pleroma's `write:statuses` on the marker `upsert` action).
 pub const WRITE_STATUSES: &str = "write:statuses";
 
+/// The write side of conversations: the read markers, the withdrawal and
+/// the recipient rewrite.
+///
+/// `POST /api/v1/conversations/{id}/read`,
+/// `DELETE /api/v1/conversations/{id}`, Pleroma's
+/// `POST /api/v1/pleroma/conversations/read` and its
+/// `PATCH /api/v1/pleroma/conversations/{id}` — Pleroma's
+/// `write:conversations` grant on every non-`index` action of its
+/// `ConversationController` and on the matching `PleromaAPI` actions.
+pub const WRITE_CONVERSATIONS: &str = "write:conversations";
+
 /// The read side of favourites: `GET /api/v1/favourites`, the list a
 /// client shows its user (Mastodon's `read:favourites`).
 pub const READ_FAVOURITES: &str = "read:favourites";

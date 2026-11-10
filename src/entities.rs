@@ -13,7 +13,8 @@
 //! [`custom_emoji`] the Mastodon `CustomEmoji` entity, [`filter`] the
 //! Mastodon v1 `Filter` entity, [`list`] the Mastodon v1 `List` entity,
 //! [`chat`] the
-//! Pleroma chat `Chat` and `ChatMessage` entities, [`marker`] the
+//! Pleroma chat `Chat` and `ChatMessage` entities, [`conversation`] the
+//! Mastodon `Conversation` entity, [`marker`] the
 //! Mastodon v1 `Marker` entity, [`mention`] the Mastodon `Mention` entity,
 //! [`scrobble`] the Pleroma `Scrobble` entity, [`tag`] the Mastodon
 //! `Tag` entity
@@ -41,6 +42,7 @@ pub mod announcement;
 pub mod application;
 pub mod bookmark_folder;
 pub mod chat;
+pub mod conversation;
 pub mod custom_emoji;
 pub mod emoji_reaction;
 pub mod filter;
