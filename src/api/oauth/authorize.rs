@@ -53,6 +53,7 @@ use url::form_urlencoded;
 
 use super::{NO_STORE, mfa};
 use crate::{
+    api::oauth::check_account_ready,
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams},
     models::{
@@ -173,8 +174,16 @@ async fn consent(state: &AppState, query: AuthorizeQuery) -> AppResult<String> {
 }
 
 /// The `POST` half in order: application, redirect URI, the denial
-/// short-circuit, scopes, the login — then the MFA detour or the minted
-/// code.
+/// short-circuit, scopes, the login, the account's readiness — then the
+/// MFA detour or the minted code.
+///
+/// A wrong login re-renders the form; an account that logged in but is not
+/// ready to use it — awaiting approval, or with an unconfirmed address — is
+/// refused [`check_account_ready`]'s 403 with its identifier, the same pair
+/// the token endpoint answers (Pleroma shows it as the page's flash error;
+/// this server has no page to flash it on, decision 1). A *deactivated*
+/// account never reaches that gate: [`register::authenticate`] is the strict
+/// login check and refuses it with every other bad credential.
 async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResult<AuthorizeReply> {
     let attrs = form.authorization;
     let app = load_app(&state.db, attrs.client_id.as_deref()).await?;
@@ -185,16 +194,19 @@ async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResul
     }
     let scopes = submitted_scopes(attrs.scope.as_ref());
     check_scopes_subset(&scopes, &app)?;
-    match authenticate_attrs(&state.db, &attrs).await {
-        Some(user) if mfa::required(&user) => mfa_detour(state, &user, &app, &scopes, &attrs).await,
-        Some(user) => grant_code(state, &user, &app, &scopes, &attrs.delivery()).await,
-        None => Ok(AuthorizeReply::Page(consent_html(
+    let Some(user) = authenticate_attrs(&state.db, &attrs).await else {
+        return Ok(AuthorizeReply::Page(consent_html(
             &app,
             &attrs,
             &scopes,
             Some(INVALID_LOGIN),
-        ))),
+        )));
+    };
+    check_account_ready(&user)?;
+    if mfa::required(&user) {
+        return mfa_detour(state, &user, &app, &scopes, &attrs).await;
     }
+    grant_code(state, &user, &app, &scopes, &attrs.delivery()).await
 }
 
 /// The MFA detour of a valid login (Pleroma's

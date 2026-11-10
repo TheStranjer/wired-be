@@ -295,9 +295,8 @@
 //! expired or exhausted token (and the absent one) is the 400
 //! `{"error":"Invalid token"}`, and the accepted token is consumed in
 //! the same transaction that creates the user (see
-//! [`crate::models::invite_token`]). An invited user skips approval —
-//! moot until the approval-flow ticket, which must keep the invited row
-//! active — but not email confirmation. While registrations are closed
+//! [`crate::models::invite_token`]). An invited user skips approval — the
+//! mode leaves its row active — but not email confirmation. While registrations are closed
 //! and invites are disabled the route answers the 403 `{"error":
 //! "Registration is disabled"}`; Pleroma's 2.10 `create` action carries
 //! no such string (closed registrations there mean "return with an invite
@@ -309,12 +308,29 @@
 //! [`create_local_user`]
 //! — every validation failure arrives as its 422 whose `error` value is
 //! the JSON string of the field map — and `reason` is stored in
-//! `users.registration_reason` for the later approval flow. Success mints
-//! a fresh user token for the issuing app carrying the presenting
-//! token's scopes (Pleroma's `OAuthController.login(user, app, …)`) and
-//! answers the token JSON: `token_type`, `access_token`, `scope`,
-//! `created_at` (unix seconds), the token row's `id`, `expires_in` and
-//! `refresh_token`.
+//! `users.registration_reason` for the approval flow.
+//!
+//! What a success then answers is decided by the two registration modes,
+//! read back off the finished row: with
+//! `REGISTRATIONS_APPROVAL_REQUIRED` the account awaits staff approval and
+//! the answer is 200 `REGISTERED_AWAITING_APPROVAL` beside the
+//! `awaiting_approval` identifier; with `ACCOUNT_ACTIVATION_REQUIRED` the
+//! account is unconfirmed, its letter is queued, and the answer is 200
+//! `REGISTERED_AWAITING_CONFIRMATION` beside `missing_confirmed_email`.
+//! Both at once reports the approval, the wait that ends last. Neither —
+//! the default — mints a fresh user token for the issuing app carrying the
+//! presenting token's scopes (Pleroma's
+//! `OAuthController.login(user, app, …)`) and answers the token JSON:
+//! `token_type`, `access_token`, `scope`, `created_at` (unix seconds), the
+//! token row's `id`, `expires_in` and `refresh_token`. A pending
+//! registration gets no credentials at all: minting a token for an account
+//! the login gate refuses would only hand out a credential that cannot be
+//! used.
+//!
+//! `GET /api/account/confirm_email/{user_id}/{token}` is the link that
+//! confirmation letter carries: [`email_confirmation_router`], which
+//! [`crate::api`] mounts outside the versioned API, answers it in
+//! `confirm_email`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -324,7 +340,8 @@ use std::{
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, Query, State},
-    http::{HeaderMap, Uri},
+    http::{HeaderMap, StatusCode, Uri, header::LOCATION},
+    response::{IntoResponse as _, Response},
     routing::{get, patch, post},
 };
 use bytes::Bytes;
@@ -370,7 +387,7 @@ use crate::{
         pinned_status,
         status::{Status as StatusRow, Visibility},
         user::{
-            self, DEFAULT_ACTOR_TYPE, Flag, PleromaPrefs, ProfileFields, User,
+            self, DEFAULT_ACTOR_TYPE, Flag, PleromaPrefs, ProfileFields, User, confirmation,
             register::{RegisterParams, create_local_user},
         },
     },
@@ -537,6 +554,28 @@ const INVALID_TOKEN: &str = "Invalid token";
 /// schema requires only that the field is there).
 const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 
+/// The 200 body message `POST /api/v1/accounts` answers when the account
+/// landed awaiting staff approval (`REGISTRATIONS_APPROVAL_REQUIRED`),
+/// beside the `awaiting_approval` identifier (Pleroma's `create` action,
+/// `{:login, {:account_status, :approval_pending}}`).
+const REGISTERED_AWAITING_APPROVAL: &str =
+    "You have been registered. You'll be able to log in once your account is approved.";
+
+/// The 200 body message `POST /api/v1/accounts` answers when the account
+/// landed unconfirmed (`ACCOUNT_ACTIVATION_REQUIRED`) and no approval waits
+/// ahead of it, beside the `missing_confirmed_email` identifier (Pleroma's
+/// `create` action, `{:login, {:account_status, :confirmation_pending}}`).
+const REGISTERED_AWAITING_CONFIRMATION: &str =
+    "You have been registered. Please check your email for further instructions.";
+
+/// The machine-readable identifier of an approval-pending registration and
+/// of every login that account attempts.
+const AWAITING_APPROVAL: &str = "awaiting_approval";
+
+/// The machine-readable identifier of an unconfirmed registration and of
+/// every login that account attempts.
+const MISSING_CONFIRMED_EMAIL: &str = "missing_confirmed_email";
+
 /// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
 ///
 /// [`state.config`](AppState::config) is what [`upload_body_limit`] sizes
@@ -590,6 +629,21 @@ pub fn router(state: &AppState) -> Router<AppState> {
         )
         .route("/accounts/{id}", get(show_account))
         .layer(upload_body_limit(&state.config))
+}
+
+/// The email-confirmation route, merged by [`crate::api`] at `/api/account`.
+///
+/// That is the prefix Pleroma serves the confirmation link on
+/// (`/api/account/confirm_email/:user_id/:token`,
+/// `lib/pleroma/web/router.ex`), which belongs to neither versioned API nor
+/// to `/api/pleroma`.
+///
+/// No body limit is raised here: the route reads its whole request from the
+/// path and runs no credential, so the app-wide
+/// [`MAX_BODY_BYTES`](crate::middleware::MAX_BODY_BYTES) is more than
+/// enough.
+pub fn email_confirmation_router() -> Router<AppState> {
+    Router::new().route("/confirm_email/{user_id}/{token}", get(confirm_email))
 }
 
 /// The request parameters of `POST /api/v1/accounts`, Pleroma's
@@ -698,9 +752,64 @@ impl RegistrationToken {
     }
 }
 
+/// The 200 body of a registration whose account may not log in yet: Pleroma's
+/// `create` answer for `{:account_status, :approval_pending}` and
+/// `{:account_status, :confirmation_pending}` — a human-facing `message`
+/// beside the machine-readable `identifier`, and no token at all.
+#[derive(Debug, Serialize)]
+struct RegistrationMessage {
+    /// What the applicant is told: see
+    /// [`REGISTERED_AWAITING_APPROVAL`] and
+    /// [`REGISTERED_AWAITING_CONFIRMATION`].
+    message: &'static str,
+    /// Why the registration has no token: [`AWAITING_APPROVAL`] or
+    /// [`MISSING_CONFIRMED_EMAIL`].
+    identifier: &'static str,
+}
+
+/// What a finished registration answers: the bearer credentials of an
+/// account that may log in now, or the message of one that may not.
+///
+/// `untagged` is the whole point: the two shapes are the two bodies, with
+/// no wrapper key around either, exactly as Pleroma renders them.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum RegistrationAnswer {
+    /// The token JSON of a ready account.
+    Ready(RegistrationToken),
+    /// The `message`/`identifier` pair of an account that first has to be
+    /// approved, confirmed, or both.
+    Pending(RegistrationMessage),
+}
+
+impl RegistrationMessage {
+    /// The message an unfinished registration owes `user`, `None` when the
+    /// account may log in now and its token is what answers. Approval is
+    /// reported before confirmation — an account that waits on staff is
+    /// told that first, whatever its mailbox still owes (Pleroma's `create`
+    /// reads the two statuses off `User.account_status`, which likewise
+    /// weighs approval before confirmation).
+    const fn for_user(user: &User) -> Option<Self> {
+        if user.approval_pending.get() {
+            return Some(Self {
+                message: REGISTERED_AWAITING_APPROVAL,
+                identifier: AWAITING_APPROVAL,
+            });
+        }
+        if !user.email_confirmed.get() {
+            return Some(Self {
+                message: REGISTERED_AWAITING_CONFIRMATION,
+                identifier: MISSING_CONFIRMED_EMAIL,
+            });
+        }
+        None
+    }
+}
+
 /// `POST /api/v1/accounts` — register a local account and receive a
 /// bearer token for it (Pleroma's `.create`, which ends in
-/// `OAuthController.login(user, app, …)` + the token view).
+/// `OAuthController.login(user, app, …)` + the token view), or the message
+/// saying what the new account first has to wait for.
 ///
 /// The gates run in Pleroma's plug order: [`AppAuth`] first rejects a
 /// missing or invalid credential (401) — an app-only `client_credentials`
@@ -711,9 +820,15 @@ impl RegistrationToken {
 /// [`create_local_user`], whose errors this endpoint's ticket maps as
 /// implemented there: a 422 whose `error` value is the JSON string of the
 /// field map; an invited registration spends its token inside that same
-/// write's transaction. Success mints the new user's token for the
-/// presenting token's app with the presenting token's scopes, valid for
-/// `OAUTH_TOKEN_TTL_SECS`.
+/// write's transaction.
+///
+/// A success then answers what the finished row says, through
+/// [`RegistrationMessage::for_user`]: an account awaiting staff approval
+/// gets 200 [`REGISTERED_AWAITING_APPROVAL`] and no token, an unconfirmed
+/// one 200 [`REGISTERED_AWAITING_CONFIRMATION`] and no token, and both at
+/// once the approval message. Only a ready account is issued credentials —
+/// [`issue_registration_token`] mints them for the presenting token's app
+/// with the presenting token's scopes, valid for `OAUTH_TOKEN_TTL_SECS`.
 ///
 /// # Errors
 ///
@@ -729,21 +844,76 @@ async fn create_account(
     State(state): State<AppState>,
     AppAuth(app, token): AppAuth,
     ApiBody(params): ApiBody<CreateAccountParams>,
-) -> AppResult<Json<RegistrationToken>> {
+) -> AppResult<Json<RegistrationAnswer>> {
     require_scope(&token, WRITE_ACCOUNTS)?;
     let invite = load_invite(&state, params.token.as_deref()).await?;
     if !params.agreement {
         return Err(AppError::Unprocessable(AGREEMENT_REQUIRED.to_owned()));
     }
     let user = create_local_user(&state, params.into_register_params(), invite.as_ref()).await?;
-    let issued = issue_registration_token(&state, &app, &token.scopes, user.id).await?;
+    let answer = match RegistrationMessage::for_user(&user) {
+        Some(message) => RegistrationAnswer::Pending(message),
+        None => {
+            RegistrationAnswer::Ready(issue_registration_token(&state, &app, &token, &user).await?)
+        }
+    };
     debug!(
         user = %user.id,
         app = %app.id,
         invited = invite.is_some(),
+        tokened = matches!(answer, RegistrationAnswer::Ready(_)),
         "registered a new local account"
     );
-    Ok(Json(RegistrationToken::new(issued)))
+    Ok(Json(answer))
+}
+
+/// `GET /api/account/confirm_email/{user_id}/{token}` — the link a
+/// confirmation email carries (Pleroma's `TokenController.confirm_email`,
+/// `lib/pleroma/web/o_auth/token_controller.ex`): clicking it confirms the
+/// address of the unconfirmed local account whose id and token the link
+/// names, clearing the token and the send stamp with it, and nothing else.
+///
+/// The route is open — no token, no scope — because it is what a registrant
+/// who cannot log in yet has to click. Pleroma's answer is `redirect(conn,
+/// to: "/")` on the success path and its `errors` fallback on every other;
+/// this API-only server has no frontend to land on (decision 1), so the
+/// ticket pins one answer for both: 302 with `Location: {BASE_URL}/`. The
+/// row changes only when [`confirm`] matches — a malformed id, an unknown
+/// account, an already-confirmed address or a stale token all redirect
+/// without confirming anything, so the reply leaks nothing about which of
+/// them arrived.
+///
+/// [`confirm`]: crate::models::user::confirmation::confirm
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn confirm_email(
+    State(state): State<AppState>,
+    Path((user_id, token)): Path<(String, String)>,
+) -> AppResult<Response> {
+    let confirmed = match Uuid::parse_str(&user_id) {
+        Ok(id) => confirmation::confirm(&state.db, id, &token).await?,
+        Err(_unparsable) => false,
+    };
+    debug!(account = %user_id, confirmed, "visited an email-confirmation link");
+    Ok(redirect_home(&state.config))
+}
+
+/// The one answer both halves of the confirmation flow give: a 302 to the
+/// root of [`Config::base_url`], the page Pleroma's frontend is served on.
+///
+/// Assembled by hand rather than through axum's `Redirect`, because
+/// `Redirect::to` answers 303 `See Other` and Pleroma's
+/// `redirect(conn, to: "/")` — which this ticket pins — is a 302.
+///
+/// [`Config::base_url`]: Config::base_url
+fn redirect_home(config: &Config) -> Response {
+    (
+        StatusCode::FOUND,
+        [(LOCATION, format!("{}/", config.base_url))],
+    )
+        .into_response()
 }
 
 /// The invite the registration gate hands the user-creation write, or the
@@ -784,8 +954,8 @@ async fn load_invite(state: &AppState, submitted: Option<&str>) -> AppResult<Opt
     Ok(Some(invite))
 }
 
-/// Mints the new user's bearer token: the presenting token's scopes on
-/// the issuing application, valid for the configured
+/// Mints the new user's bearer token and renders it: the presenting
+/// token's scopes on the issuing application, valid for the configured
 /// `OAUTH_TOKEN_TTL_SECS` (the `/oauth/token` grant's
 /// `issue_token`, with the scopes fixed by the presenting credential
 /// rather than requested).
@@ -796,23 +966,24 @@ async fn load_invite(state: &AppState, submitted: Option<&str>) -> AppResult<Opt
 async fn issue_registration_token(
     state: &AppState,
     app: &OauthApp,
-    scopes: &str,
-    user_id: Uuid,
-) -> AppResult<OauthToken> {
+    presented: &OauthToken,
+    user: &User,
+) -> AppResult<RegistrationToken> {
     // `OAUTH_TOKEN_TTL_SECS` is a `usize`; on any target where it could
     // exceed `u64::MAX` the absurd upper bound fails the insert instead
     // of silently shortening the lifetime.
     let ttl_secs = u64::try_from(state.config.oauth_token_ttl_secs).unwrap_or(u64::MAX);
-    oauth_token::create_token(
+    let issued = oauth_token::create_token(
         &state.db,
         &NewToken {
-            user_id: Some(user_id),
+            user_id: Some(user.id),
             app_id: app.id,
-            scopes: scopes.to_owned(),
+            scopes: presented.scopes.clone(),
             ttl: Some(Duration::from_secs(ttl_secs)),
         },
     )
-    .await
+    .await?;
+    Ok(RegistrationToken::new(issued))
 }
 
 /// `GET /api/v1/accounts/verify_credentials` — the caller's own account,
@@ -3232,6 +3403,8 @@ mod tests {
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
             registration_reason: None,
+            confirmation_token: None,
+            confirmation_sent_at: None,
             last_active_at: None,
             followers_count: 0,
             following_count: 0,
@@ -3958,6 +4131,96 @@ mod tests {
             tagged_name(" ## "),
             "",
             "and so does whitespace around a `#`"
+        );
+    }
+
+    /// `stored_user` with the two registration-mode flags set as named: the
+    /// row [`RegistrationMessage::for_user`] reads.
+    fn registered(approval_pending: Flag, email_confirmed: Flag) -> User {
+        let mut user = stored_user();
+        user.approval_pending = approval_pending;
+        user.email_confirmed = email_confirmed;
+        user
+    }
+
+    #[test]
+    fn a_ready_registration_owes_no_message() {
+        assert!(
+            RegistrationMessage::for_user(&registered(Flag::new(false), Flag::new(true))).is_none(),
+            "approved and confirmed: the token answers"
+        );
+    }
+
+    /// The two pending answers, in Pleroma's exact wording and key order,
+    /// and the order the two modes are reported in.
+    #[test]
+    fn a_pending_registration_answers_the_message_and_identifier() {
+        let approval = serde_json::to_value(RegistrationMessage::for_user(&registered(
+            Flag::new(true),
+            Flag::new(true),
+        )))
+        .expect("a message serializes");
+        assert_eq!(
+            approval,
+            json!({
+                "message": REGISTERED_AWAITING_APPROVAL,
+                "identifier": AWAITING_APPROVAL,
+            }),
+            "the approval answer, with no token keys beside it"
+        );
+        assert_eq!(
+            approval.as_object().expect("an object").len(),
+            2,
+            "message and identifier only"
+        );
+        let confirmation = serde_json::to_value(RegistrationMessage::for_user(&registered(
+            Flag::new(false),
+            Flag::new(false),
+        )))
+        .expect("a message serializes");
+        assert_eq!(
+            confirmation,
+            json!({
+                "message": REGISTERED_AWAITING_CONFIRMATION,
+                "identifier": MISSING_CONFIRMED_EMAIL,
+            }),
+            "the confirmation answer"
+        );
+    }
+
+    #[test]
+    fn approval_is_reported_before_confirmation() {
+        let both = RegistrationMessage::for_user(&registered(Flag::new(true), Flag::new(false)))
+            .expect("both wait");
+        assert_eq!(
+            both.identifier, AWAITING_APPROVAL,
+            "an account waiting on staff and on its mailbox is told about staff"
+        );
+        assert_eq!(
+            both.message, REGISTERED_AWAITING_APPROVAL,
+            "with the approval letter, which is the wait that ends last"
+        );
+    }
+
+    #[test]
+    fn the_registration_answer_serializes_either_arm_without_a_wrapper() {
+        let ready = serde_json::to_value(RegistrationAnswer::Ready(RegistrationToken::new(
+            minted_token(),
+        )))
+        .expect("the token arm");
+        assert!(
+            ready["access_token"].is_string() && ready["message"].is_null(),
+            "the token JSON is written bare: {ready}"
+        );
+        let pending = serde_json::to_value(RegistrationAnswer::Pending(RegistrationMessage {
+            message: REGISTERED_AWAITING_CONFIRMATION,
+            identifier: MISSING_CONFIRMED_EMAIL,
+        }))
+        .expect("the message arm");
+        assert!(
+            pending.get("access_token").is_none()
+                && pending["identifier"] == MISSING_CONFIRMED_EMAIL,
+            "the message is written bare, with no credential in it: {pending}"
         );
     }
 }

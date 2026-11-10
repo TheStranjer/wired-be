@@ -1,10 +1,12 @@
 //! Pleroma's account extensions under `/api/v1/pleroma`
 //! (`docs/ARCHITECTURE.md` decision 1): the subscription toggles, the
-//! caller's own unanswered follow asks, and one account's favourites list.
+//! caller's follow asks, one account's favourites, and the confirmation
+//! resend.
 //!
 //! The reference is Pleroma's `PleromaAPI.AccountController`
 //! (`lib/pleroma/web/pleroma_api/controllers/account_controller.ex`, the
-//! `subscribe`, `unsubscribe` and `favourites` actions) and
+//! `subscribe`, `unsubscribe`, `favourites` and `confirmation_resend`
+//! actions) and
 //! `PleromaAPI.FollowRequestController`
 //! (`lib/pleroma/web/pleroma_api/controllers/follow_request_controller.ex`,
 //! the `outgoing` action). What a subscription *is* on this server stays
@@ -16,7 +18,7 @@
 //!
 //! The subscription routes and the outgoing listing require a user token
 //! ([`AuthUser`]); the favourites listing authenticates optionally
-//! ([`MaybeAuthUser`]).
+//! ([`MaybeAuthUser`]); the confirmation resend needs no credential at all.
 //!
 //! - `POST /api/v1/pleroma/accounts/{id}/subscribe` and `…/unsubscribe`
 //!   need either the `follow` root or `write:follows` (Pleroma's scopes plug
@@ -51,6 +53,14 @@
 //!   (Pleroma's global page sizes, default 20, at most 40), `Link` cursors
 //!   on those same like ids, and the pairs [`page_for_user`] already
 //!   dropped with their statuses.
+//! - `POST /api/v1/pleroma/accounts/confirmation_resend` is the one route
+//!   here with no credential at all: an account that cannot log in is the
+//!   only one that needs its confirmation letter again. It reads `email`,
+//!   re-mails the local account that is still unconfirmed (and nothing for
+//!   any other request, including the ones naming no address), and answers
+//!   204 with an empty body always — see `confirmation_resend`. Pleroma
+//!   throttles this action through its `account_confirmation_resend`
+//!   bucket, and [`router`] mounts the route on that bucket.
 //!
 //! [`Relationship`]: crate::entities::relationship::Relationship
 //! [`set_notify`]: crate::models::follow::set_notify
@@ -62,9 +72,10 @@ use std::collections::HashSet;
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use serde::Deserialize;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -77,7 +88,13 @@ use crate::{
         status::Status,
     },
     error::{AppError, AppResult},
-    models::{favourite, follow, status::Status as StatusRow, status_visibility, user::User},
+    extract::ApiBody,
+    models::{
+        favourite, follow,
+        status::Status as StatusRow,
+        status_visibility,
+        user::{User, confirmation},
+    },
     oauth::scopes::{FOLLOW, READ_FAVOURITES, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
     services::render_status::render_statuses,
@@ -101,12 +118,79 @@ const CANT_GET_FAVOURITES: &str = "Can't get favorites";
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/pleroma` account router, merged into [`crate::api::v1`].
-pub fn router() -> Router<AppState> {
+///
+/// `confirmation_resend` runs in `account_confirmation_resend`, the bucket
+/// Pleroma throttles that action through and [`crate::rate_limit`] already
+/// counts by name.
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/pleroma/accounts/{id}/favourites", get(favourites))
         .route("/pleroma/accounts/{id}/subscribe", post(subscribe))
         .route("/pleroma/accounts/{id}/unsubscribe", post(unsubscribe))
+        .route(
+            "/pleroma/accounts/confirmation_resend",
+            post(confirmation_resend).layer(crate::rate_limit::rate_limit(
+                state,
+                "account_confirmation_resend",
+            )),
+        )
         .route("/pleroma/outgoing_follow_requests", get(outgoing))
+}
+
+/// The request parameters of `POST /api/v1/pleroma/accounts/confirmation_resend`:
+/// Pleroma's `User.get_by_nickname_or_email` accepts either spelling, and
+/// this ticket's parameter list names the address, so `email` is the only
+/// key read — and it is optional, because its absence is the same 204 every
+/// other refusal answers.
+#[derive(Debug, Deserialize)]
+struct ConfirmationResendParams {
+    /// The address to re-mail, `None` when the body carried none.
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// `POST /api/v1/pleroma/accounts/confirmation_resend` — send the
+/// confirmation letter again to the account whose `email` is still
+/// unconfirmed (Pleroma's `PleromaAPI.AccountController.confirmation_resend`,
+/// `lib/pleroma/web/pleroma_api/controllers/account_controller.ex`).
+///
+/// No credential is asked for — the caller cannot log in yet, which is the
+/// whole reason the letter is owed — and the answer is 204 with an empty
+/// body whether or not anything was sent, so the endpoint cannot be used to
+/// probe which addresses are registered here. When an unconfirmed account
+/// does own the address, [`send`] replaces its token with a freshly minted
+/// one — the old link stops working — and queues the letter carrying it.
+///
+/// Pleroma runs this action through its `account_confirmation_resend`
+/// throttle bucket (`config/config.exs`); [`router`] mounts the route on
+/// that bucket, which [`crate::rate_limit`] has counted by name since it
+/// first configured the Pleroma set.
+///
+/// [`send`]: crate::models::user::confirmation::send
+///
+/// # Errors
+///
+/// Any database or job-queue failure arrives through `?` as
+/// [`AppError::Database`]; the body shape [`ApiBody`] accepts is the only
+/// other refusal, and it leaks nothing about the address.
+async fn confirmation_resend(
+    State(state): State<AppState>,
+    ApiBody(params): ApiBody<ConfirmationResendParams>,
+) -> AppResult<StatusCode> {
+    let Some(email) = params
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    let Some(user) = confirmation::unconfirmed_by_email(&state.db, email).await? else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    confirmation::send(&state, &user).await?;
+    debug!(account = %user.id, "resent the confirmation letter");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /api/v1/pleroma/accounts/{id}/subscribe` — turn notifications on for

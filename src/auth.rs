@@ -13,9 +13,12 @@
 //! present the header wins. A token is valid when
 //! [`get_with_app`](crate::models::oauth_token::get_with_app) finds its
 //! row, `valid_until` lies in the future, and — for user-bound tokens —
-//! the owner is still active; [`AuthUser`] reports a deactivated owner
-//! as its own 403, every other extractor lumps it in with the invalid
-//! tokens.
+//! the owner is still active and approved; [`AuthUser`] reports a
+//! deactivated owner as its own 403 and an unapproved one as 403
+//! `awaiting_approval`, every other extractor lumps both in with the
+//! invalid tokens. An account whose email is merely unconfirmed keeps
+//! working here: confirmation refuses a *login*, not a credential that
+//! was already issued.
 //!
 //! The extractors and their rejections (all bodies are the `{"error": …}`
 //! shape of decision 8, worded as Pleroma's fallback renders them):
@@ -23,8 +26,9 @@
 //! - [`AuthUser`]: requires a valid user token. No token at all: 401
 //!   "Invalid credentials"; unknown, expired or deactivated: 401 "The
 //!   access token is invalid" (403 "Your account is currently disabled"
-//!   for the deactivated owner); an app-only token: 403 "This API
-//!   requires an authenticated user".
+//!   for the deactivated owner, 403 "Your account is awaiting approval."
+//!   with `identifier` `awaiting_approval` for the unapproved one); an
+//!   app-only token: 403 "This API requires an authenticated user".
 //! - [`MaybeAuthUser`]: no token yields `None`, a valid user token the
 //!   user, an app-only token `None` — but an invalid, expired or
 //!   deactivated token is a 401, never a silently ignored one. The
@@ -55,7 +59,7 @@ use crate::{
     models::{
         oauth_app::OauthApp,
         oauth_token::{self, OauthToken},
-        user::{self, User},
+        user::{self, AccountStatus, User},
     },
     oauth::scopes::Scopes,
     state::AppState,
@@ -73,6 +77,23 @@ const USER_REQUIRED: &str = "This API requires an authenticated user";
 /// 403 body for a valid token whose user account is deactivated
 /// (Pleroma's disabled-account wording).
 const DISABLED: &str = "Your account is currently disabled";
+/// 403 body for an account staff have not approved yet, and the identifier
+/// every refusal of it carries: Pleroma's
+/// `handle_token_exchange_error({:account_status, :approval_pending})` and
+/// the matching `create` answer of
+/// `lib/pleroma/web/mastodon_api/controllers/account_controller.ex`.
+///
+/// [`check_account_ready`](crate::api::oauth::check_account_ready) and this
+/// module's bearer rejection share the pair.
+pub(crate) const AWAITING_APPROVAL: &str = "Your account is awaiting approval.";
+/// The machine-readable identifier of [`AWAITING_APPROVAL`].
+pub(crate) const AWAITING_APPROVAL_ID: &str = "awaiting_approval";
+/// 403 body for a login whose account has not confirmed its email address
+/// (Pleroma's `confirmation_pending` refusal), with its identifier. Shared
+/// with [`check_account_ready`](crate::api::oauth::check_account_ready).
+pub(crate) const EMAIL_UNCONFIRMED: &str = "Your login is missing a confirmed e-mail address";
+/// The machine-readable identifier of [`EMAIL_UNCONFIRMED`].
+pub(crate) const EMAIL_UNCONFIRMED_ID: &str = "missing_confirmed_email";
 /// `Authorization` scheme the header token is expected under, matched
 /// case-insensitively.
 const BEARER_SCHEME: &str = "Bearer";
@@ -172,6 +193,10 @@ impl FromRequestParts<AppState> for AuthUser {
                 )
             }
             Auth::Deactivated => Err(AppError::Forbidden(DISABLED.to_owned())),
+            Auth::ApprovalPending => Err(AppError::forbidden_with_identifier(
+                AWAITING_APPROVAL,
+                AWAITING_APPROVAL_ID,
+            )),
             Auth::Invalid => Err(AppError::Unauthorized(INVALID_TOKEN.to_owned())),
         }
     }
@@ -192,7 +217,7 @@ impl FromRequestParts<AppState> for MaybeAuthUser {
                 let AuthContext { token, user, .. } = *ctx;
                 Ok(Self(user, Some(token)))
             }
-            Auth::Deactivated | Auth::Invalid => {
+            Auth::Deactivated | Auth::ApprovalPending | Auth::Invalid => {
                 Err(AppError::Unauthorized(INVALID_TOKEN.to_owned()))
             }
         }
@@ -275,7 +300,7 @@ impl AuthUser {
 pub async fn credential(state: &AppState, raw: &str) -> AppResult<Option<AuthContext>> {
     match resolve(state, raw).await? {
         Auth::Valid(ctx) if ctx.user.is_some() => Ok(Some(*ctx)),
-        Auth::Valid(_) | Auth::Deactivated | Auth::Invalid => Ok(None),
+        Auth::Valid(_) | Auth::Deactivated | Auth::ApprovalPending | Auth::Invalid => Ok(None),
     }
 }
 
@@ -316,6 +341,13 @@ enum Auth {
     /// [`AuthUser`] reports this as 403 [`DISABLED`], every other
     /// extractor treats it like an invalid token.
     Deactivated,
+    /// The token is live but its user's account still awaits staff
+    /// approval; [`AuthUser`] reports this as 403 [`AWAITING_APPROVAL`]
+    /// with [`AWAITING_APPROVAL_ID`], every other extractor treats it
+    /// like an invalid token. A credential minted before the mode was
+    /// switched on (or issued to the account by an app token) is worth
+    /// nothing while approval is pending.
+    ApprovalPending,
     /// No row carries this token, or the row is past `valid_until`.
     Invalid,
 }
@@ -323,20 +355,25 @@ enum Auth {
 /// The bearer identity a token-requiring extractor shares: the raw
 /// string of [`bearer_string`] resolved, with 401 [`NO_TOKEN`] when no
 /// token was presented and 401 [`INVALID_TOKEN`] when it does not
-/// resolve (deactivated owner included).
+/// resolve (a deactivated or unapproved owner included).
 async fn require_valid(parts: &Parts, state: &AppState) -> AppResult<AuthContext> {
     let Some(raw) = bearer_string(parts) else {
         return Err(AppError::Unauthorized(NO_TOKEN.to_owned()));
     };
     match resolve(state, &raw).await? {
         Auth::Valid(ctx) => Ok(*ctx),
-        Auth::Deactivated | Auth::Invalid => Err(AppError::Unauthorized(INVALID_TOKEN.to_owned())),
+        Auth::Deactivated | Auth::ApprovalPending | Auth::Invalid => {
+            Err(AppError::Unauthorized(INVALID_TOKEN.to_owned()))
+        }
     }
 }
 
 /// Looks the access token `raw` up with its app and user and rules it
 /// valid: the row must exist, `valid_until` must lie in the future
-/// (Pleroma's `Token.expired?`), and a bound user must still be active.
+/// (Pleroma's `Token.expired?`), and a bound user must still be active and
+/// approved — [`account_status`](User::account_status) is what decides, and
+/// an unconfirmed address is not a refusal here (only a login is refused
+/// for that, in [`crate::api::oauth`]).
 async fn resolve(state: &AppState, raw: &str) -> AppResult<Auth> {
     let Some((token, app)) = oauth_token::get_with_app(&state.db, raw).await? else {
         return Ok(Auth::Invalid);
@@ -348,10 +385,16 @@ async fn resolve(state: &AppState, raw: &str) -> AppResult<Auth> {
         Some(user_id) => user::get_by_id(&state.db, user_id).await?,
         None => None,
     };
-    if user.as_ref().is_some_and(|found| !found.is_active.get()) {
-        return Ok(Auth::Deactivated);
+    let status = user
+        .as_ref()
+        .map_or(AccountStatus::Active, User::account_status);
+    match status {
+        AccountStatus::Deactivated => Ok(Auth::Deactivated),
+        AccountStatus::ApprovalPending => Ok(Auth::ApprovalPending),
+        AccountStatus::Active | AccountStatus::ConfirmationPending => {
+            Ok(Auth::Valid(Box::new(AuthContext { token, user, app })))
+        }
     }
-    Ok(Auth::Valid(Box::new(AuthContext { token, user, app })))
 }
 
 /// Looks up the bearer token the request presents: the

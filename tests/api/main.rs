@@ -32,6 +32,10 @@ mod account_registration;
 /// `RESTRICT_UNAUTHENTICATED` gate.
 mod account_statuses;
 
+/// The registration modes over HTTP: approval required, email confirmation,
+/// the confirmation link, the resend, and the instance flags they drive.
+mod registration_modes;
+
 /// The core account endpoints: `verify_credentials`, `GET /accounts/{id}` and `lookup`.
 mod accounts;
 

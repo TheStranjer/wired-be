@@ -54,7 +54,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(mutes::router())
         .merge(notifications::router())
         .merge(password_reset::pleroma_router())
-        .merge(pleroma_accounts::router())
+        .merge(pleroma_accounts::router(state))
         .merge(pleroma_settings::router(&state.config))
         .merge(push::router())
         .merge(reports::router(state))

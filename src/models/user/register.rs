@@ -12,6 +12,14 @@
 //! runs on the same transaction as the insert, so a failed registration
 //! spends nothing.
 //!
+//! The row's starting state follows the two registration-mode settings
+//! (see [`crate::config`]): `REGISTRATIONS_APPROVAL_REQUIRED` leaves a new
+//! account awaiting staff approval (an invite skips that wait), and
+//! `ACCOUNT_ACTIVATION_REQUIRED` leaves it unconfirmed with a
+//! [`confirmation`] token and a queued letter. Neither mode changes what
+//! the insert stores; both are read back off the row by the endpoints that
+//! act on them.
+//!
 //! [`authenticate`] is the login path: it verifies the password against
 //! any supported hash for the local, active user found by nickname or
 //! email, transparently upgrading legacy (bcrypt / PBKDF2) hashes to
@@ -34,8 +42,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::{
-    NewUser, User, featured, followers, following, get_by_email, get_by_nickname, inbox, insert,
-    local_ap_id, outbox,
+    Flag, NewUser, User, confirmation, featured, followers, following, get_by_email,
+    get_by_nickname, inbox, insert, local_ap_id, outbox,
 };
 use crate::{
     config::Config,
@@ -239,18 +247,25 @@ impl From<RegisterError> for AppError {
 /// in with, or `None` for an open-registrations request: an invited
 /// account's [`consume`] runs on the same transaction as the user insert,
 /// so a registration that fails validation spends no invite and the
-/// invite is never left spent without its account. An invited user skips
-/// approval when the approval mode lands (this server activates every
-/// registered account today, and the invited one must stay active when
-/// others start awaiting approval); email confirmation, when it lands,
-/// gates invited accounts like every other.
+/// invite is never left spent without its account.
+///
+/// The two registration modes decide what the finished row says about
+/// itself. With `REGISTRATIONS_APPROVAL_REQUIRED` the account starts with
+/// `approval_pending` set — except on an invite, which already is a staff
+/// decision, exactly as Pleroma's `create_user_with_invite` passes
+/// `approved: true`. With `ACCOUNT_ACTIVATION_REQUIRED` an account that
+/// gave an address starts unconfirmed, and its confirmation letter — the
+/// token and the link it carries included — goes out through
+/// [`confirmation::send`] once the row exists. An account with no address
+/// to confirm (an `ACCOUNTS_EMAIL_OPTIONAL` instance) is registered
+/// confirmed: there is nothing a link could prove.
 ///
 /// # Errors
 ///
 /// [`RegisterError::Invalid`] with every failed rule keyed by field when
 /// validation or an availability check does not pass;
-/// [`RegisterError::Failed`] for hashing, key generation or database
-/// failures beyond those.
+/// [`RegisterError::Failed`] for hashing, key generation, the confirmation
+/// queue or database failures beyond those.
 ///
 /// [`consume`]: crate::models::invite_token::consume
 pub async fn create_local_user(
@@ -268,7 +283,11 @@ pub async fn create_local_user(
     if !errors.is_empty() {
         return Err(RegisterError::Invalid(errors));
     }
-    build_and_insert(state, &params, &nickname, email, invite).await
+    let user = build_and_insert(state, &params, &nickname, email, invite).await?;
+    if !user.email_confirmed.get() {
+        confirmation::send(state, &user).await?;
+    }
+    Ok(user)
 }
 
 /// Verifies `password` for the local, active user whose nickname or email
@@ -385,6 +404,13 @@ async fn set_password_hash(pool: &PgPool, id: Uuid, hash: &str) -> AppResult<()>
 /// hash the password, generate the keys, assemble the [`NewUser`] and
 /// insert it — on the pool alone, or, when `invite` names one, inside a
 /// transaction with the invite's consumption (see [`create_local_user`]).
+///
+/// The two registration modes decide the account's starting state here
+/// (Pleroma's `register_changeset`, which reads the same two config keys):
+/// `REGISTRATIONS_APPROVAL_REQUIRED` sets `approval_pending` unless the
+/// registration came in on an invite, and `ACCOUNT_ACTIVATION_REQUIRED`
+/// clears `email_confirmed` for an account with an address to confirm. The
+/// unconfirmed account's letter goes out afterwards, in [`create_local_user`].
 async fn build_and_insert(
     state: &AppState,
     params: &RegisterParams,
@@ -402,6 +428,7 @@ async fn build_and_insert(
     } else {
         text_to_html(&raw_bio)
     };
+    let activation_required = state.config.account_activation_required.get() && email.is_some();
     let new_user = NewUser {
         email,
         password_hash: Some(password_hash),
@@ -409,6 +436,8 @@ async fn build_and_insert(
         bio,
         raw_bio,
         registration_reason: params.reason.clone(),
+        approval_pending: registration_waits_for_approval(state, invite),
+        email_confirmed: Flag::new(!activation_required),
         inbox: Some(inbox(&ap_id)),
         shared_inbox: Some(shared_inbox),
         outbox: Some(outbox(&ap_id)),
@@ -427,6 +456,16 @@ async fn build_and_insert(
         Ok(user) => Ok(user),
         Err(err) => Err(map_insert_error(err)),
     }
+}
+
+/// Whether the account this registration creates starts out awaiting staff
+/// approval: `REGISTRATIONS_APPROVAL_REQUIRED` set and no invite token
+/// spent on the registration (Pleroma's `Registration.create_user_with_invite`
+/// passes `approved: true` for an invited user, so an invite is a staff
+/// decision made in advance). The flag, not the answer, is what the login
+/// gate and `POST /api/v1/accounts` read back off the row.
+fn registration_waits_for_approval(state: &AppState, invite: Option<&InviteToken>) -> Flag {
+    Flag::new(state.config.registrations_approval_required.get() && invite.is_none())
 }
 
 /// The invited registration's write: user insert and invite consumption
@@ -655,8 +694,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::TEST_BASE_URL,
+        config::{TEST_BASE_URL, Toggle},
         http_client::HttpClient,
+        jobs::QUEUE_MAILER,
         models::user::{Flag, get_by_id},
         uploads::UploaderBackend,
         util::{
@@ -1607,6 +1647,196 @@ mod tests {
             .into_iter()
             .find(|invite| invite.id == id)
             .expect("the invite exists")
+    }
+
+    /// A [`Config`] in the two registration modes `approval` and
+    /// `activation`, with `SMTP_HOST` set so a confirmation letter really
+    /// queues (mail disabled would drop it before the table saw it).
+    fn mode_config(approval: Toggle, activation: Toggle) -> Config {
+        Config {
+            registrations_approval_required: approval,
+            account_activation_required: activation,
+            smtp_host: Some("smtp.example.org".to_owned()),
+            ..Config::for_tests()
+        }
+    }
+
+    /// The live mailer jobs, oldest first: the letters a registration owed.
+    async fn queued_letters(pool: &PgPool) -> Vec<serde_json::Value> {
+        sqlx::query_as::<_, (serde_json::Value,)>(
+            "SELECT args FROM jobs WHERE queue = $1 ORDER BY inserted_at",
+        )
+        .bind(QUEUE_MAILER)
+        .fetch_all(pool)
+        .await
+        .expect("the jobs read")
+        .into_iter()
+        .map(|(args,)| args)
+        .collect()
+    }
+
+    /// The two registration-mode flags plus the token, as the stored row
+    /// says them: what `POST /api/v1/accounts` reads back to pick its
+    /// answer.
+    async fn stored_state(pool: &PgPool, id: Uuid) -> (bool, bool, Option<String>) {
+        let row = get_by_id(pool, id).await.unwrap().expect("the row exists");
+        (
+            row.approval_pending.get(),
+            row.email_confirmed.get(),
+            row.confirmation_token,
+        )
+    }
+
+    /// A plain registration on a plain instance is the account the token
+    /// response promises: active, approved, confirmed, nothing queued.
+    #[tokio::test]
+    async fn a_modeless_registration_lands_ready() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(false), Toggle::new(false)));
+
+        let user = create_local_user(&state, params_for("plain"), None)
+            .await
+            .expect("the registration lands");
+
+        assert!(user.is_active.get(), "the account is active");
+        assert_eq!(
+            stored_state(&pool, user.id).await,
+            (false, true, None),
+            "nothing waits on it: no approval, no confirmation, no token"
+        );
+        assert!(
+            queued_letters(&pool).await.is_empty(),
+            "and no letter was queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_mode_registration_lands_pending() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(true), Toggle::new(false)));
+
+        let user = create_local_user(&state, params_for("awaiting"), None)
+            .await
+            .expect("the registration lands");
+
+        assert!(user.is_active.get(), "approval does not deactivate");
+        assert_eq!(
+            stored_state(&pool, user.id).await,
+            (true, true, None),
+            "the account awaits staff, not a mailbox"
+        );
+        assert!(
+            queued_letters(&pool).await.is_empty(),
+            "approval queues no letter: the admin flow is a later ticket"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activation_mode_registration_lands_unconfirmed_with_a_letter() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(false), Toggle::new(true)));
+
+        let user = create_local_user(&state, params_for("confirm-me"), None)
+            .await
+            .expect("the registration lands");
+
+        let (approval, confirmed, token) = stored_state(&pool, user.id).await;
+        assert!(!approval, "confirmation does not ask staff");
+        assert!(!confirmed, "the address is not confirmed yet");
+        let token = token.expect("a confirmation token was minted");
+        assert_eq!(token.len(), 43, "the same credential shape as a token");
+        let letters = queued_letters(&pool).await;
+        assert_eq!(letters.len(), 1, "exactly one letter was queued");
+        assert_eq!(
+            letters[0]["to"], "confirm-me@example.org",
+            "to the new account"
+        );
+        assert!(
+            letters[0]["text_body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "https://test.example/api/account/confirm_email/{}/{}",
+                    user.id, token
+                )),
+            "the letter carries the confirmation link: {}",
+            letters[0]["text_body"]
+        );
+    }
+
+    #[tokio::test]
+    async fn both_modes_together_land_pending_and_unconfirmed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(true), Toggle::new(true)));
+
+        let user = create_local_user(&state, params_for("both-waits"), None)
+            .await
+            .expect("the registration lands");
+
+        let (approval, confirmed, token) = stored_state(&pool, user.id).await;
+        assert!(approval && !confirmed, "both waits are recorded");
+        assert!(token.is_some(), "and the letter is owed all the same");
+        assert_eq!(
+            queued_letters(&pool).await.len(),
+            1,
+            "the confirmation letter went out even though staff must answer first"
+        );
+    }
+
+    /// An invite is a staff decision made in advance, so it skips the
+    /// approval wait — but it proves nothing about a mailbox, so the
+    /// confirmation gate still closes over the invited account.
+    #[tokio::test]
+    async fn an_invited_registration_skips_approval_but_not_confirmation() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(true), Toggle::new(true)));
+        let invite = invite_token::create(&pool, &invite_token::InviteParams::one_time())
+            .await
+            .expect("the invite mints");
+
+        let user = create_local_user(&state, params_for("invited-pending"), Some(&invite))
+            .await
+            .expect("the invited registration lands");
+
+        let (approval, confirmed, token) = stored_state(&pool, user.id).await;
+        assert!(!approval, "the invite answered the approval question");
+        assert!(!confirmed, "it says nothing about the address");
+        assert!(token.is_some(), "so the confirmation flow still runs");
+    }
+
+    /// An instance that lets registration omit the email cannot also demand
+    /// it be confirmed: with no address there is nothing a link could
+    /// prove, so the account lands confirmed rather than locked out.
+    #[tokio::test]
+    async fn activation_without_an_address_lands_confirmed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut config = mode_config(Toggle::new(false), Toggle::new(true));
+        config.accounts_email_optional = true;
+        let state = test_state_with(&pool, config);
+        let params = RegisterParams {
+            email: None,
+            ..params_for("no-address")
+        };
+
+        let user = create_local_user(&state, params, None)
+            .await
+            .expect("the addressless registration lands");
+
+        assert_eq!(
+            stored_state(&pool, user.id).await,
+            (false, true, None),
+            "unconfirmable is not the same as unconfirmed"
+        );
+        assert!(
+            queued_letters(&pool).await.is_empty(),
+            "and there was nothing to send"
+        );
     }
 
     #[tokio::test]

@@ -98,10 +98,12 @@ use crate::state::AppState;
 /// Composes the API area routers under their URL prefixes.
 ///
 /// `/api/v1` ([`v1`]) and `/api/v2` ([`v2`]) hold the Mastodon-compatible
-/// client API, `/api/pleroma` ([`pleroma`]) Pleroma's own extensions, and
+/// client API, `/api/pleroma` ([`pleroma`]) Pleroma's own extensions,
 /// `/api/oauth_tokens` ([`oauth_tokens`]) Pleroma's token-management
-/// endpoints; later tickets add the remaining `/api` areas (admin) here
-/// the same way. [`media_files`] and [`activitypub`] are the exceptions:
+/// endpoints and `/api/account` ([`accounts::email_confirmation_router`])
+/// the email-confirmation link Pleroma serves outside its versioned API;
+/// later tickets add the remaining `/api` areas (admin) here the same way.
+/// [`media_files`] and [`activitypub`] are the exceptions:
 /// they serve `/media` and `/users`, addresses that go out in
 /// `ActivityPub` documents, and [`crate::app`] merges them directly.
 ///
@@ -117,4 +119,5 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .nest("/api/v2", v2::router(state))
         .nest("/api/pleroma", pleroma::router())
         .nest("/api/oauth_tokens", oauth_tokens::router())
+        .nest("/api/account", accounts::email_confirmation_router())
 }

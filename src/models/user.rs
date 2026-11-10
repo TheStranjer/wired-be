@@ -17,7 +17,8 @@
 //! them, so they can never reach a log line.
 //!
 //! Registration and password login live in [`register`]; the MFA column's
-//! shape and updates live in [`mfa`].
+//! shape and updates live in [`mfa`]; the email-confirmation token, its
+//! letter and its two writers live in [`confirmation`].
 
 use std::fmt;
 
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 use crate::{config::Config, error::AppResult, pagination::PageParams, util::id::new_id};
 
+pub mod confirmation;
 pub mod mfa;
 pub mod notification_settings;
 pub mod register;
@@ -89,6 +91,28 @@ impl From<bool> for Flag {
     fn from(value: bool) -> Self {
         Self(value)
     }
+}
+
+/// Where an account stands between registration and use: Pleroma's
+/// `User.account_status` (`lib/pleroma/user.ex`) over the states this
+/// server tracks.
+///
+/// They are weighed in Pleroma's order — a deactivated account outranks an
+/// unapproved one, which outranks an unconfirmed one. (Pleroma's
+/// `:password_reset_pending` has no column here; the password-reset ticket
+/// adds its arm.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountStatus {
+    /// Nothing waits: the account logs in and uses its tokens.
+    Active,
+    /// [`is_active`](User::is_active) is false.
+    Deactivated,
+    /// Staff have not approved the registration
+    /// ([`approval_pending`](User::approval_pending) is set).
+    ApprovalPending,
+    /// The email address is not confirmed
+    /// ([`email_confirmed`](User::email_confirmed) is false).
+    ConfirmationPending,
 }
 
 /// One row of `users`: a local account or a mirror of a remote actor
@@ -227,6 +251,13 @@ pub struct User {
     pub email_confirmed: Flag,
     /// Whether a moderator still has to approve the account.
     pub approval_pending: Flag,
+    /// The secret token the confirmation link carries, `None` once the
+    /// address is confirmed (or for an account that never had to confirm
+    /// one). Secret material: redacted from `Debug` output.
+    pub confirmation_token: Option<String>,
+    /// When the confirmation email bearing [`confirmation_token`](Self::confirmation_token)
+    /// was queued; `None` when none ever was.
+    pub confirmation_sent_at: Option<DateTime<Utc>>,
     /// The `reason` text given at registration, kept for the later
     /// approval flow (Pleroma's `users.registration_reason`); `None` when
     /// the account stated none.
@@ -339,6 +370,8 @@ impl fmt::Debug for User {
             .field("last_move_at", &self.last_move_at)
             .field("email_confirmed", &self.email_confirmed)
             .field("approval_pending", &self.approval_pending)
+            .field("confirmation_token", &"<redacted>")
+            .field("confirmation_sent_at", &self.confirmation_sent_at)
             .field("registration_reason", &self.registration_reason)
             .field("last_active_at", &self.last_active_at)
             .field("followers_count", &self.followers_count)
@@ -355,6 +388,32 @@ impl fmt::Debug for User {
             .field("email_notifications", &self.email_notifications)
             .field("deleted_at", &self.deleted_at)
             .finish()
+    }
+}
+
+impl User {
+    /// Where this account stands between registration and use, weighed in
+    /// the order Pleroma's `User.account_status` uses: deactivation, then
+    /// the staff approval `REGISTRATIONS_APPROVAL_REQUIRED` asks for, then
+    /// the email confirmation `ACCOUNT_ACTIVATION_REQUIRED` asks for.
+    ///
+    /// The two registration flags are only ever cleared for local accounts
+    /// (a federated mirror arrives confirmed and approved), so no `local`
+    /// arm is needed to reproduce Pleroma's. The login gate of
+    /// [`crate::api::oauth`] and the bearer extractors of [`crate::auth`]
+    /// both decide from this one read.
+    #[must_use]
+    pub const fn account_status(&self) -> AccountStatus {
+        if !self.is_active.get() {
+            return AccountStatus::Deactivated;
+        }
+        if self.approval_pending.get() {
+            return AccountStatus::ApprovalPending;
+        }
+        if !self.email_confirmed.get() {
+            return AccountStatus::ConfirmationPending;
+        }
+        AccountStatus::Active
     }
 }
 
@@ -477,6 +536,11 @@ pub struct NewUser {
     pub email_confirmed: Flag,
     /// Whether the account awaits moderator approval; `false` by default.
     pub approval_pending: Flag,
+    /// The confirmation token to store; `None` (`no confirmation owed`) by
+    /// default. Secret material: redacted from `Debug` output.
+    pub confirmation_token: Option<String>,
+    /// When the confirmation email was queued; `None` by default.
+    pub confirmation_sent_at: Option<DateTime<Utc>>,
     /// The registration `reason` text to store; `None` (no reason stated)
     /// by default.
     pub registration_reason: Option<String>,
@@ -571,6 +635,8 @@ impl fmt::Debug for NewUser {
             .field("last_move_at", &self.last_move_at)
             .field("email_confirmed", &self.email_confirmed)
             .field("approval_pending", &self.approval_pending)
+            .field("confirmation_token", &"<redacted>")
+            .field("confirmation_sent_at", &self.confirmation_sent_at)
             .field("registration_reason", &self.registration_reason)
             .field("last_active_at", &self.last_active_at)
             .field("followers_count", &self.followers_count)
@@ -645,6 +711,8 @@ impl Default for NewUser {
             last_move_at: None,
             email_confirmed: Flag::new(true),
             approval_pending: Flag::new(false),
+            confirmation_token: None,
+            confirmation_sent_at: None,
             registration_reason: None,
             last_active_at: None,
             followers_count: 0,
@@ -707,13 +775,14 @@ const INSERT_SQL: &str = "INSERT INTO users (
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
      preferred_frontend, raw_fields, is_suggested, registration_reason,
-     password_reset_pending, notification_settings, email_notifications
+     password_reset_pending, notification_settings, email_notifications,
+     confirmation_token, confirmation_sent_at
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66
+     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68
 ) RETURNING *";
 
 /// Inserts `new_user` on `executor` — the pool or an open transaction —
@@ -801,6 +870,8 @@ where
         .bind(new_user.password_reset_pending)
         .bind(new_user.notification_settings.clone())
         .bind(new_user.email_notifications)
+        .bind(new_user.confirmation_token.as_deref())
+        .bind(new_user.confirmation_sent_at)
         .fetch_one(executor)
         .await?;
     Ok(user)
@@ -1665,6 +1736,9 @@ mod tests {
     /// A TOTP secret (inside `mfa_settings`) that must never surface in
     /// `Debug` output.
     const SECRET_TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    /// An email-confirmation token: a link credential, so it must never
+    /// surface in `Debug` output either.
+    const SECRET_CONFIRMATION: &str = "confirmation-token-c1JCzoTmgLmq9B1z7";
 
     /// A local [`NewUser`] named `nickname` at this module's [`BASE`] url.
     fn local_new(nickname: &str) -> NewUser {
@@ -1952,6 +2026,14 @@ mod tests {
             "approval is not pending by default"
         );
         assert!(
+            user.confirmation_token.is_none(),
+            "no confirmation token exists until the confirmation flow mints one"
+        );
+        assert!(
+            user.confirmation_sent_at.is_none(),
+            "no confirmation letter was queued by default"
+        );
+        assert!(
             user.registration_reason.is_none(),
             "an account that stated no registration reason has none stored"
         );
@@ -2079,6 +2161,16 @@ mod tests {
             "the last-active timestamp round trips"
         );
         assert_eq!(
+            user.confirmation_token.as_deref(),
+            Some(SECRET_CONFIRMATION),
+            "the confirmation token round trips even though Debug redacts it"
+        );
+        assert_eq!(
+            user.confirmation_sent_at,
+            Some(active_at),
+            "the confirmation send stamp round trips"
+        );
+        assert_eq!(
             user.mfa_settings,
             json!({
                 "enabled": true,
@@ -2126,6 +2218,8 @@ mod tests {
             last_move_at: Some(active_at),
             email_confirmed: Flag::new(false),
             approval_pending: Flag::new(true),
+            confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
+            confirmation_sent_at: Some(active_at),
             registration_reason: Some("please let me in".to_owned()),
             last_active_at: Some(active_at),
             mfa_settings: json!({
@@ -2367,6 +2461,7 @@ mod tests {
             &NewUser {
                 password_hash: Some(SECRET_HASH.to_owned()),
                 private_key: Some(SECRET_KEY.to_owned()),
+                confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
                 mfa_settings: json!({
                     "enabled": true,
                     "totp": {"secret": SECRET_TOTP, "confirmed": true},
@@ -2388,12 +2483,20 @@ mod tests {
             "the TOTP secret inside mfa_settings must not leak"
         );
         assert!(
+            !debug.contains(SECRET_CONFIRMATION),
+            "the confirmation token must not leak: {debug}"
+        );
+        assert!(
             debug.contains(r#"password_hash: "<redacted>""#),
             "the redaction marker names the field"
         );
         assert!(
             debug.contains(r#"private_key: "<redacted>""#),
             "the redaction marker names the field"
+        );
+        assert!(
+            debug.contains(r#"confirmation_token: "<redacted>""#),
+            "the confirmation token keeps its own marker"
         );
         assert!(
             debug.contains(r#"mfa_settings: "<redacted>""#),
@@ -2404,6 +2507,7 @@ mod tests {
         let new = NewUser {
             password_hash: Some(SECRET_HASH.to_owned()),
             private_key: Some(SECRET_KEY.to_owned()),
+            confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
             mfa_settings: json!({
                 "enabled": true,
                 "totp": {"secret": SECRET_TOTP, "confirmed": true},
@@ -2415,7 +2519,8 @@ mod tests {
         assert!(
             !new_debug.contains(SECRET_HASH)
                 && !new_debug.contains(SECRET_KEY)
-                && !new_debug.contains(SECRET_TOTP),
+                && !new_debug.contains(SECRET_TOTP)
+                && !new_debug.contains(SECRET_CONFIRMATION),
             "NewUser redacts the same secrets"
         );
         assert!(
