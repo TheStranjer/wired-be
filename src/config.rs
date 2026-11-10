@@ -60,6 +60,15 @@ pub const MAX_PINNED_STATUSES_VAR: &str = "MAX_PINNED_STATUSES";
 /// Environment variable holding the shortest `expires_in` a status may ask
 /// for, in seconds.
 pub const MIN_EXPIRATION_SECS_VAR: &str = "MIN_EXPIRATION_SECS";
+/// Environment variable holding how far in the future a
+/// `POST /api/v1/statuses` `scheduled_at` must be, in seconds.
+pub const MIN_SCHEDULED_SECS_VAR: &str = "MIN_SCHEDULED_SECS";
+/// Environment variable holding how many pending scheduled rows one account
+/// may hold.
+pub const MAX_SCHEDULED_PER_USER_VAR: &str = "MAX_SCHEDULED_PER_USER";
+/// Environment variable holding how many pending scheduled rows one account
+/// may hold for one UTC day.
+pub const MAX_SCHEDULED_PER_USER_PER_DAY_VAR: &str = "MAX_SCHEDULED_PER_USER_PER_DAY";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -296,6 +305,28 @@ pub const DEFAULT_MAX_PINNED_STATUSES: usize = 1;
 /// `POST /api/v1/statuses` refuses a shorter `expires_in` with 422, so a
 /// client cannot schedule a purge faster than ten minutes out.
 pub const DEFAULT_MIN_EXPIRATION_SECS: usize = 600;
+/// Scheduled-statuses window used when `MIN_SCHEDULED_SECS` is unset.
+///
+/// Pleroma's `Pleroma.ScheduledActivity` `@min_offset` ships as
+/// `:timer.minutes(5)`: the scheduled-statuses window check will refuse a
+/// `POST /api/v1/statuses` `scheduled_at` less than five minutes ahead.
+pub const DEFAULT_MIN_SCHEDULED_SECS: usize = 300;
+/// Pending scheduled rows per account used when `MAX_SCHEDULED_PER_USER` is
+/// unset.
+///
+/// Pleroma's `[:Pleroma.ScheduledActivity, :total_user_limit]` ships as 300:
+/// the per-user scheduled-status limit check will refuse a `POST
+/// /api/v1/statuses` `scheduled_at` that would take one account past this
+/// many pending rows.
+pub const DEFAULT_MAX_SCHEDULED_PER_USER: usize = 300;
+/// Pending scheduled rows per account per day used when
+/// `MAX_SCHEDULED_PER_USER_PER_DAY` is unset.
+///
+/// Pleroma's `[:Pleroma.ScheduledActivity, :daily_user_limit]` ships as 25:
+/// the per-user-per-day scheduled-status limit check will refuse a `POST
+/// /api/v1/statuses` `scheduled_at` falling on a UTC day that already holds
+/// this many pending rows for the account.
+pub const DEFAULT_MAX_SCHEDULED_PER_USER_PER_DAY: usize = 25;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -703,8 +734,9 @@ impl fmt::Debug for VapidConfig {
 ///
 /// [`crate::services::translate`] turns one of these into the translator the
 /// endpoints use. [`api_key`](Self::api_key) is secret material: the manual
-/// `Debug` impl below redacts it.
-#[derive(Clone, PartialEq, Eq)]
+/// `Debug` impl below redacts it. The [`Default`] is the unset state: no
+/// provider, no URL, no key.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TranslationConfig {
     /// The provider to translate with, from `TRANSLATION_PROVIDER`;
     /// [`None`](TranslationProvider::None) by default.
@@ -865,6 +897,20 @@ pub struct Config {
     /// stores the accepted span as the status's `expires_at` (see
     /// [`crate::jobs::statuses`]).
     pub min_expiration_secs: usize,
+    /// How far in the future a `POST /api/v1/statuses` `scheduled_at` must
+    /// be, in seconds, from `MIN_SCHEDULED_SECS`; the scheduled-statuses
+    /// window check will refuse a `scheduled_at` less than this many seconds
+    /// ahead.
+    pub min_scheduled_secs: usize,
+    /// How many pending scheduled rows one account may hold, from
+    /// `MAX_SCHEDULED_PER_USER`; the per-user scheduled-status limit check
+    /// will refuse a `POST /api/v1/statuses` `scheduled_at` past this count.
+    pub max_scheduled_per_user: usize,
+    /// How many pending scheduled rows one account may hold for one UTC day,
+    /// from `MAX_SCHEDULED_PER_USER_PER_DAY`; the per-user-per-day
+    /// scheduled-status limit check will refuse a `scheduled_at` on a day
+    /// that already holds this many.
+    pub max_scheduled_per_user_per_day: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -1058,17 +1104,14 @@ impl Config {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let database_url = required_var(&lookup, DATABASE_URL_VAR)?;
-        let bind_addr = listen_addr(&lookup)?;
-        let base_url_raw = required_var(&lookup, BASE_URL_VAR)?;
-        let base_url = normalize_base_url(&base_url_raw)?;
+        let (database_url, base_url) = required_settings(&lookup)?;
         let profile = instance_profile(&lookup);
         let limits = content_limits(&lookup)?;
         let text = text_length_limits(&lookup)?;
-        let (max_image_pixels, max_report_comment, max_pinned_statuses, min_expiration_secs) =
-            cap_limits(&lookup)?;
+        let caps = cap_limits(&lookup)?;
+        let (min_scheduled_secs, max_scheduled_per_user, max_scheduled_per_user_per_day) =
+            scheduled_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
-        let (inbox_max_bytes, max_remote_mention_lookups) = inbox_and_mention_caps(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
         let (uploads_dir, emoji_dir, media_base_url) = storage_paths(&lookup, &base_url);
         let auth = auth_settings(&lookup)?;
@@ -1078,7 +1121,7 @@ impl Config {
         let mailer = mailer_settings(&lookup, domain_of(&base_url))?;
         Ok(Self {
             database_url,
-            bind_addr,
+            bind_addr: listen_addr(&lookup)?,
             base_url,
             instance_name: profile.name,
             instance_description: profile.description,
@@ -1092,15 +1135,18 @@ impl Config {
             max_display_name_chars: text.display_name_chars,
             max_bio_chars: text.bio_chars,
             max_profile_fields: text.profile_fields,
-            max_report_comment,
-            max_image_pixels,
-            max_pinned_statuses,
-            min_expiration_secs,
+            max_report_comment: caps.max_report_comment,
+            max_image_pixels: caps.max_image_pixels,
+            max_pinned_statuses: caps.max_pinned_statuses,
+            min_expiration_secs: caps.min_expiration_secs,
+            min_scheduled_secs,
+            max_scheduled_per_user,
+            max_scheduled_per_user_per_day,
             upload_limits,
             avatar_limit_bytes,
             banner_limit_bytes,
-            inbox_max_bytes,
-            max_remote_mention_lookups,
+            inbox_max_bytes: caps.inbox_max_bytes,
+            max_remote_mention_lookups: caps.max_remote_mention_lookups,
             uploads_dir,
             emoji_dir,
             media_base_url,
@@ -1234,6 +1280,9 @@ impl Config {
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             max_pinned_statuses: DEFAULT_MAX_PINNED_STATUSES,
             min_expiration_secs: DEFAULT_MIN_EXPIRATION_SECS,
+            min_scheduled_secs: DEFAULT_MIN_SCHEDULED_SECS,
+            max_scheduled_per_user: DEFAULT_MAX_SCHEDULED_PER_USER,
+            max_scheduled_per_user_per_day: DEFAULT_MAX_SCHEDULED_PER_USER_PER_DAY,
             upload_limits: UploadLimits {
                 max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
                 max_files: DEFAULT_UPLOAD_MAX_FILES,
@@ -1279,11 +1328,7 @@ impl Config {
                 blacklist: Vec::new(),
             },
             vapid: VapidConfig::default(),
-            translation: TranslationConfig {
-                provider: TranslationProvider::default(),
-                api_url: None,
-                api_key: None,
-            },
+            translation: TranslationConfig::default(),
             sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
@@ -1320,6 +1365,25 @@ fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
         .port()
         .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
     Ok(format!("{}://{domain}", url.scheme()))
+}
+
+/// Reads the two settings the instance cannot start without: the
+/// `DATABASE_URL` verbatim and the [`normalize_base_url`]ed `BASE_URL`
+/// (`database_url` then `base_url`, in [`Config`] field order). Grouped
+/// because [`Config::from_lookup`] has a size budget (AGENTS.md).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Missing`] naming whichever variable is unset or
+/// empty, and [`ConfigError::InvalidBaseUrl`] when `BASE_URL` is not a
+/// bare http(s) origin.
+fn required_settings<F>(lookup: &F) -> Result<(String, String), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let database_url = required_var(lookup, DATABASE_URL_VAR)?;
+    let base_url_raw = required_var(lookup, BASE_URL_VAR)?;
+    Ok((database_url, normalize_base_url(&base_url_raw)?))
 }
 
 /// What [`instance_profile`] reads: the four settings that describe the
@@ -1397,32 +1461,6 @@ where
         STREAMING_PING_INTERVAL_SECS_VAR,
         DEFAULT_STREAMING_PING_INTERVAL_SECS,
     )
-}
-
-/// Reads the two caps that bound how much of the network one request may
-/// ask for: the byte size of one inbound `ActivityPub` inbox body
-/// (`INBOX_MAX_BYTES`) and the number of unknown-remote mentions one
-/// status may look up (`MAX_REMOTE_MENTION_LOOKUPS`,
-/// [`DEFAULT_MAX_REMOTE_MENTION_LOOKUPS`] when unset). Grouped because
-/// [`Config::from_lookup`] has a size budget (AGENTS.md) and each is the
-/// same `number` read; the tuple comes back in field order.
-///
-/// # Errors
-///
-/// Returns [`ConfigError::InvalidNumber`] when either variable holds a
-/// value that is not a whole number.
-fn inbox_and_mention_caps<F>(lookup: &F) -> Result<(usize, usize), ConfigError>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    Ok((
-        number(lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?,
-        number(
-            lookup,
-            MAX_REMOTE_MENTION_LOOKUPS_VAR,
-            DEFAULT_MAX_REMOTE_MENTION_LOOKUPS,
-        )?,
-    ))
 }
 
 /// Reads `BIND_ADDR`: the address the HTTP server listens on,
@@ -1731,21 +1769,40 @@ where
     })
 }
 
-/// The shape [`cap_limits`] answers: the limits that sit outside the
+/// What [`cap_limits`] reads: the numeric caps that sit outside the
 /// text-length groups, in [`Config`] field order (an uploaded image's pixel
 /// count, a report comment's character count, the number of statuses one
-/// account may pin, then the shortest status expiration); factored out
-/// because a bare tuple of same-typed numbers reads better by name.
-type CapLimits = (usize, usize, usize, usize);
+/// account may pin, the shortest status expiration, one inbound
+/// `ActivityPub` inbox body's byte size, and the unknown-remote mentions
+/// one status may look up); fields rather than a bare tuple of same-typed
+/// numbers because they read better by name.
+#[derive(Debug)]
+struct CapLimits {
+    /// The maximum pixel count of an uploaded image (`MAX_IMAGE_PIXELS`).
+    max_image_pixels: usize,
+    /// The maximum report `comment` length (`MAX_REPORT_COMMENT`).
+    max_report_comment: usize,
+    /// The maximum pinned statuses per account (`MAX_PINNED_STATUSES`).
+    max_pinned_statuses: usize,
+    /// The shortest status expiration (`MIN_EXPIRATION_SECS`).
+    min_expiration_secs: usize,
+    /// The maximum inbound `ActivityPub` inbox body size
+    /// (`INBOX_MAX_BYTES`).
+    inbox_max_bytes: usize,
+    /// The maximum remote mention lookups per status
+    /// (`MAX_REMOTE_MENTION_LOOKUPS`).
+    max_remote_mention_lookups: usize,
+}
 
-/// Reads the four caps that sit beside the text limits: the pixel count an
+/// Reads the six caps that sit beside the text limits: the pixel count an
 /// uploaded image may decode to (`MAX_IMAGE_PIXELS`), the length of a
 /// report's `comment` (`MAX_REPORT_COMMENT`), the number of statuses one
-/// account may pin to its profile (`MAX_PINNED_STATUSES`) and the shortest
-/// `expires_in` a status create may ask for (`MIN_EXPIRATION_SECS`).
-/// Grouped because each is a plain default-or-parse and
-/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
-/// back in field order.
+/// account may pin to its profile (`MAX_PINNED_STATUSES`), the shortest
+/// `expires_in` a status create may ask for (`MIN_EXPIRATION_SECS`), the
+/// byte size of one inbound `ActivityPub` inbox body (`INBOX_MAX_BYTES`)
+/// and the number of unknown-remote mentions one status may look up
+/// (`MAX_REMOTE_MENTION_LOOKUPS`). Grouped because each is the same `number`
+/// read and [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1755,11 +1812,48 @@ fn cap_limits<F>(lookup: &F) -> Result<CapLimits, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
+    Ok(CapLimits {
+        max_image_pixels: number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
+        max_report_comment: number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
+        max_pinned_statuses: number(lookup, MAX_PINNED_STATUSES_VAR, DEFAULT_MAX_PINNED_STATUSES)?,
+        min_expiration_secs: number(lookup, MIN_EXPIRATION_SECS_VAR, DEFAULT_MIN_EXPIRATION_SECS)?,
+        inbox_max_bytes: number(lookup, INBOX_MAX_BYTES_VAR, DEFAULT_INBOX_MAX_BYTES)?,
+        max_remote_mention_lookups: number(
+            lookup,
+            MAX_REMOTE_MENTION_LOOKUPS_VAR,
+            DEFAULT_MAX_REMOTE_MENTION_LOOKUPS,
+        )?,
+    })
+}
+
+/// Reads the three settings that bound scheduled statuses: how far in the
+/// future a `POST /api/v1/statuses` `scheduled_at` must be
+/// (`MIN_SCHEDULED_SECS`), how many pending scheduled rows one account may
+/// hold (`MAX_SCHEDULED_PER_USER`) and how many it may hold for one UTC day
+/// (`MAX_SCHEDULED_PER_USER_PER_DAY`). Grouped because each is a plain
+/// default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] for whichever variable holds a
+/// value that is not a whole number.
+fn scheduled_limits<F>(lookup: &F) -> Result<(usize, usize, usize), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
     Ok((
-        number(lookup, MAX_IMAGE_PIXELS_VAR, DEFAULT_MAX_IMAGE_PIXELS)?,
-        number(lookup, MAX_REPORT_COMMENT_VAR, DEFAULT_MAX_REPORT_COMMENT)?,
-        number(lookup, MAX_PINNED_STATUSES_VAR, DEFAULT_MAX_PINNED_STATUSES)?,
-        number(lookup, MIN_EXPIRATION_SECS_VAR, DEFAULT_MIN_EXPIRATION_SECS)?,
+        number(lookup, MIN_SCHEDULED_SECS_VAR, DEFAULT_MIN_SCHEDULED_SECS)?,
+        number(
+            lookup,
+            MAX_SCHEDULED_PER_USER_VAR,
+            DEFAULT_MAX_SCHEDULED_PER_USER,
+        )?,
+        number(
+            lookup,
+            MAX_SCHEDULED_PER_USER_PER_DAY_VAR,
+            DEFAULT_MAX_SCHEDULED_PER_USER_PER_DAY,
+        )?,
     ))
 }
 
@@ -2190,6 +2284,8 @@ fn comma_list(value: &str) -> Vec<String> {
 /// Redacts `database_url`, which usually contains a password.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let max_remote_mention_lookups = &self.max_remote_mention_lookups;
+        let max_scheduled_per_day = &self.max_scheduled_per_user_per_day;
         f.debug_struct("Config")
             .field("database_url", &"<redacted>")
             .field("bind_addr", &self.bind_addr)
@@ -2210,14 +2306,14 @@ impl fmt::Debug for Config {
             .field("max_image_pixels", &self.max_image_pixels)
             .field("max_pinned_statuses", &self.max_pinned_statuses)
             .field("min_expiration_secs", &self.min_expiration_secs)
+            .field("min_scheduled_secs", &self.min_scheduled_secs)
+            .field("max_scheduled_per_user", &self.max_scheduled_per_user)
+            .field("max_scheduled_per_user_per_day", max_scheduled_per_day)
             .field("upload_limits", &self.upload_limits)
             .field("avatar_limit_bytes", &self.avatar_limit_bytes)
             .field("banner_limit_bytes", &self.banner_limit_bytes)
             .field("inbox_max_bytes", &self.inbox_max_bytes)
-            .field(
-                "max_remote_mention_lookups",
-                &self.max_remote_mention_lookups,
-            )
+            .field("max_remote_mention_lookups", max_remote_mention_lookups)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
             .field("emoji_dir", &self.emoji_dir)
@@ -3062,6 +3158,65 @@ mod tests {
         assert!(
             debug.contains("min_expiration_secs: 120"),
             "the expiration floor is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The scheduled-statuses window and the two per-user limits: Pleroma's
+    /// 300 seconds, 300 rows and 25 rows per day by default, the environment
+    /// overriding each.
+    #[test]
+    fn scheduled_status_limits_default_and_read_their_variables() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.min_scheduled_secs, 300,
+            "default MIN_SCHEDULED_SECS"
+        );
+        assert_eq!(
+            defaults.max_scheduled_per_user, 300,
+            "default MAX_SCHEDULED_PER_USER"
+        );
+        assert_eq!(
+            defaults.max_scheduled_per_user_per_day, 25,
+            "default MAX_SCHEDULED_PER_USER_PER_DAY"
+        );
+
+        let config = config_with(&[
+            (MIN_SCHEDULED_SECS_VAR, "60"),
+            (MAX_SCHEDULED_PER_USER_VAR, "10"),
+            (MAX_SCHEDULED_PER_USER_PER_DAY_VAR, "5"),
+        ]);
+        assert_eq!(config.min_scheduled_secs, 60, "custom MIN_SCHEDULED_SECS");
+        assert_eq!(
+            config.max_scheduled_per_user, 10,
+            "custom MAX_SCHEDULED_PER_USER"
+        );
+        assert_eq!(
+            config.max_scheduled_per_user_per_day, 5,
+            "custom MAX_SCHEDULED_PER_USER_PER_DAY"
+        );
+    }
+
+    /// The three scheduled-status settings are visible in `Debug` output:
+    /// they name limits, not secrets.
+    #[test]
+    fn debug_shows_the_scheduled_status_limits() {
+        let config = config_with(&[
+            (MIN_SCHEDULED_SECS_VAR, "60"),
+            (MAX_SCHEDULED_PER_USER_VAR, "10"),
+            (MAX_SCHEDULED_PER_USER_PER_DAY_VAR, "5"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("min_scheduled_secs: 60"),
+            "the scheduled-statuses window is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_scheduled_per_user: 10"),
+            "the per-user pending cap is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_scheduled_per_user_per_day: 5"),
+            "the per-user per-day cap is visible in Debug output: {debug}"
         );
     }
 
@@ -4376,6 +4531,9 @@ mod tests {
             MAX_REPORT_COMMENT_VAR,
             MAX_PINNED_STATUSES_VAR,
             MIN_EXPIRATION_SECS_VAR,
+            MIN_SCHEDULED_SECS_VAR,
+            MAX_SCHEDULED_PER_USER_VAR,
+            MAX_SCHEDULED_PER_USER_PER_DAY_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             AVATAR_LIMIT_BYTES_VAR,
