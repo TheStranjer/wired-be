@@ -209,6 +209,23 @@ fn job_registry() -> JobRegistry {
         jobs::idempotency::KIND_CLEANUP,
         jobs::idempotency::handle_cleanup,
     );
+    registry.register(
+        jobs::maintenance::KIND_NOTIFICATIONS,
+        jobs::maintenance::handle_notifications,
+    );
+    registry.register(
+        jobs::maintenance::KIND_TOKENS,
+        jobs::maintenance::handle_tokens,
+    );
+    registry.register(jobs::maintenance::KIND_JOBS, jobs::maintenance::handle_jobs);
+    registry.register(
+        jobs::maintenance::KIND_DELETED_STATUSES,
+        jobs::maintenance::handle_purge_deleted_statuses,
+    );
+    registry.register(
+        jobs::maintenance::KIND_MEDIA,
+        jobs::maintenance::handle_sweep_media,
+    );
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);
