@@ -210,6 +210,10 @@ mod remove_from_followers;
 /// Reports over HTTP (`POST /api/v1/reports`): filing a report.
 mod reports;
 
+/// Rich media cards over HTTP: the entity's `card` key on the status
+/// reads and the deprecated `GET /api/v1/statuses/{id}/card` endpoint.
+mod rich_media;
+
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 

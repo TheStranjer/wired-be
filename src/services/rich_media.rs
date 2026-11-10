@@ -7,8 +7,10 @@
 //! over it, and renders the result as the Mastodon `card` object; this
 //! module is those parts of the pipeline — [`host_ignored`] gates on the
 //! instance's ignore list, [`fetch_card`] fetches a page over the
-//! SSRF-guarded client, and [`parse_card`] and [`card_json`] parse and
-//! render it — while the storage and the job that runs them live elsewhere.
+//! SSRF-guarded client, [`parse_card`] and [`card_json`] parse and render
+//! it, and [`stored_card_json`] answers a cached [`LinkCard`] row back as
+//! the entity JSON the fetch job stored in it — while the storage and the
+//! job that runs them live elsewhere.
 //!
 //! The field sources follow the parent ticket's priority: Open Graph meta
 //! tags (`og:*`) first, then Twitter card tags (`twitter:*`), then the
@@ -32,6 +34,7 @@ use url::Url;
 use crate::{
     config::Config,
     http_client::{HttpClient, HttpError, HttpResponse},
+    models::link_card::LinkCard,
     util::format::truncate_chars,
 };
 
@@ -160,6 +163,27 @@ pub fn card_json(card: &Card) -> Value {
         "blurhash": null,
         "pleroma": { "opengraph": card.opengraph },
     })
+}
+
+/// The [`LinkCard::status`] text of a row whose fetch produced a card:
+/// the one outcome that renders as a card (the fetch job writes the same
+/// text it stores under).
+const STATUS_OK: &str = "ok";
+
+/// The status entity JSON behind one [`link_card`] cache row.
+///
+/// The fetch job stores [`card_json`]'s own output in
+/// [`LinkCard::card`], so an `ok` row answers its cached JSON verbatim;
+/// a `failed` row — the remembered dead URL — and a row that stores no
+/// card answer `None`, which renders as JSON `null`. The status
+/// entity's `card` key and the deprecated
+/// `GET /api/v1/statuses/{id}/card` endpoint share this one reading of
+/// the cache, so the two can never disagree.
+///
+/// [`link_card`]: crate::models::link_card
+#[must_use]
+pub fn stored_card_json(card: &LinkCard) -> Option<Value> {
+    card.card.clone().filter(|_card| card.status == STATUS_OK)
 }
 
 /// The host of `url` for [`card_json`]'s `provider_name` fallback; "" when
@@ -664,6 +688,50 @@ mod tests {
             Value::String(String::new()),
             "an empty description stays an empty string"
         );
+    }
+
+    /// `stored_card_json` answers the cached card of an `ok` row
+    /// verbatim — the fetch job stores [`card_json`]'s output there — and
+    /// nothing for a `failed` row or one that stores no card.
+    #[test]
+    fn stored_card_json_renders_the_cached_card_or_nothing() {
+        let stored = json!({
+            "url": "https://example.test",
+            "title": "Example",
+            "pleroma": { "opengraph": {} },
+        });
+        let ok = cache_row("ok", Some(stored.clone()));
+        assert_eq!(
+            stored_card_json(&ok).as_ref(),
+            Some(&stored),
+            "an ok row's card renders exactly as stored"
+        );
+        assert_eq!(
+            stored_card_json(&cache_row("ok", None)),
+            None,
+            "a row that parsed no card renders nothing"
+        );
+        assert_eq!(
+            stored_card_json(&cache_row("failed", None)),
+            None,
+            "a remembered dead fetch renders nothing"
+        );
+        assert_eq!(
+            stored_card_json(&cache_row("failed", Some(stored))),
+            None,
+            "and even a card stored under a failure never renders"
+        );
+    }
+
+    /// A [`LinkCard`] cache row for the URL [`cache_row`] names, holding
+    /// `card` under fetch outcome `status`.
+    fn cache_row(status: &str, card: Option<Value>) -> LinkCard {
+        LinkCard {
+            url: "https://example.test".to_owned(),
+            status: status.to_owned(),
+            card,
+            fetched_at: chrono::Utc::now(),
+        }
     }
 
     /// `User-Agent` of the test fetch clients.

@@ -5,7 +5,8 @@
 //! The routes are the write `POST /api/v1/statuses`, the lookups
 //! `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=a&id[]=b`, the thread read
-//! `GET /api/v1/statuses/{id}/context`, the favourite writes
+//! `GET /api/v1/statuses/{id}/context` and the card read
+//! `GET /api/v1/statuses/{id}/card`, the favourite writes
 //! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
 //! the state listing `GET /api/v1/statuses/{id}/favourited_by`, the
 //! caller's own favourites list `GET /api/v1/favourites`, the reblog
@@ -111,6 +112,14 @@
 //! usable id is the empty array, and only the first [`MAX_STATUS_IDS`] ids
 //! are acted on — Pleroma's `limit = 100` over `Enum.take(ids, limit)`,
 //! which drops the rest silently rather than refusing the call.
+//!
+//! The card read is Mastodon's deprecated `GET /api/v1/statuses/{id}/card`,
+//! which Pleroma keeps: the same optional auth and scope as the show route
+//! and the same [`status_for_viewer_or_404`] gate, and the answer the
+//! status's stored rich-media card — the same cached JSON the batched
+//! renderer emits into the entity's `card` key — or, for a status that
+//! links no card, JSON `null` with 200: having no card is an answer, not
+//! a miss, so only the 404 gate can refuse this read.
 //!
 //! # The context
 //!
@@ -440,6 +449,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -459,6 +469,7 @@ use crate::{
     models::{
         block, bookmark, bookmark_folder, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
+        link_card,
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mute,
         oauth_app::{self, OauthApp},
@@ -476,6 +487,7 @@ use crate::{
         create_status::{self, CreateStatusParams, EditStatusParams},
         notify,
         render_status::{render_status, render_statuses},
+        rich_media::stored_card_json,
         translate::Translator,
     },
     state::AppState,
@@ -597,6 +609,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/bookmarks", get(list_bookmarks))
         .route("/statuses/{id}", get(show_status))
         .route("/statuses/{id}", put(edit_status))
+        .route("/statuses/{id}/card", get(get_status_card))
         .route("/statuses/{id}/context", get(get_status_context))
         .route("/statuses/{id}/history", get(get_status_history))
         .route("/statuses/{id}/source", get(get_status_source))
@@ -756,6 +769,51 @@ async fn show_status(
     let row = status_for_viewer_or_404(&state, viewer, &id).await?;
     let rendered = render_status(&state, viewer, &row).await?;
     Ok(Json(rendered.ok_or(AppError::NotFound)?))
+}
+
+/// `GET /api/v1/statuses/{id}/card` — the stored rich-media card of the
+/// status `id`, or JSON `null` when it has none (Mastodon's deprecated
+/// endpoint, which Pleroma keeps).
+///
+/// The gate is the show route's: optional auth ([`MaybeAuthUser`], with
+/// `read:statuses` enforced on a presented user token) and the shared
+/// [`status_for_viewer_or_404`], so a malformed, unknown, deleted or
+/// invisible id is the module's one 404 and never a `null` that hints at
+/// an existing private post. Behind it one [`link_card`] read by the
+/// status's own id answers the row the fetch job linked; [`stored_card_json`]
+/// renders its cached [`card_json`] output verbatim — the same reading
+/// the entity's `card` key uses — and a status that links no card, or
+/// links only a failed fetch, answers JSON `null` with 200.
+///
+/// [`link_card`]: crate::models::link_card
+/// [`card_json`]: crate::services::rich_media::card_json
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] for a malformed, unknown, deleted or invisible
+/// id; [`AppError::Forbidden`] when a presented user token lacks
+/// `read:statuses`; [`AppError::Unauthorized`] from the extractor for a
+/// token that does not resolve. Any database failure arrives through `?`
+/// as [`AppError::Database`].
+async fn get_status_card(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    auth.require_user_scope(READ_STATUSES)?;
+    let row = status_for_viewer_or_404(&state, auth.0.as_ref(), &id).await?;
+    let cards = link_card::for_statuses(&state.db, &[row.id]).await?;
+    debug!(
+        status = %row.id,
+        linked = cards.contains_key(&row.id),
+        "status card read"
+    );
+    Ok(Json(
+        cards
+            .get(&row.id)
+            .and_then(stored_card_json)
+            .unwrap_or(Value::Null),
+    ))
 }
 
 /// `DELETE /api/v1/statuses/{id}` — delete the status `id` and answer the

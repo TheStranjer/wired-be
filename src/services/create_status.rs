@@ -772,6 +772,7 @@ pub async fn preview_status(
             mentions: &mentioned,
             tags: &tags,
             reactions: &[],
+            card: None,
             favourited: false,
             reblogged: JsonBool(false),
             bookmarked: false,
