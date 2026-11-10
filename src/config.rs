@@ -129,6 +129,10 @@ pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.
 pub const JOB_QUEUES_VAR: &str = "JOB_QUEUES";
+/// Environment variable holding the age in days after which soft-deleted
+/// local statuses are hard-deleted by the daily maintenance purge; `0`
+/// disables the purge.
+pub const PURGE_DELETED_STATUSES_DAYS_VAR: &str = "PURGE_DELETED_STATUSES_DAYS";
 /// Environment variable holding how many seconds the streaming WebSocket
 /// waits between two heartbeat pings of one socket.
 pub const STREAMING_PING_INTERVAL_SECS_VAR: &str = "STREAMING_PING_INTERVAL_SECS";
@@ -377,6 +381,10 @@ pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
 pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
 /// Worker concurrency used when `JOB_CONCURRENCY` is unset.
 pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
+/// Deleted-status purge age used when `PURGE_DELETED_STATUSES_DAYS` is
+/// unset: thirty days, the window the earlier maintenance sweeps give
+/// their rows before reclaiming them.
+pub const DEFAULT_PURGE_DELETED_STATUSES_DAYS: usize = 30;
 /// Streaming heartbeat period used when `STREAMING_PING_INTERVAL_SECS` is
 /// unset: the 30 seconds Pleroma's `WebsocketHandler` pings a socket on
 /// (`lib/pleroma/web/mastodon_api/websocket_handler.ex`, `@tick`).
@@ -915,6 +923,13 @@ pub struct Config {
     pub job_concurrency: usize,
     /// Job queue names the worker drains, in claim priority order.
     pub job_queues: Vec<String>,
+    /// Age in days after which soft-deleted LOCAL statuses are
+    /// hard-deleted by the daily maintenance purge
+    /// (see [`crate::jobs::maintenance::handle_purge_deleted_statuses`]),
+    /// from `PURGE_DELETED_STATUSES_DAYS`; `0` disables the purge. Remote
+    /// tombstones are never deleted — their rows keep a deleted remote
+    /// post from being re-imported.
+    pub purge_deleted_statuses_days: usize,
     /// Seconds between the heartbeat pings of one streaming socket, from
     /// `STREAMING_PING_INTERVAL_SECS`: [`PING_INTERVAL`] spells the same span
     /// (30, Pleroma's `@tick`), and a test keeps the two agreeing.
@@ -1007,7 +1022,7 @@ impl Config {
         let auth = auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let exposure = client_exposure(&lookup)?;
-        let (job_concurrency, job_queues) = job_worker(&lookup)?;
+        let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(&lookup)?;
         let mailer = mailer_settings(&lookup, domain_of(&base_url))?;
         Ok(Self {
             database_url,
@@ -1052,6 +1067,7 @@ impl Config {
             available_frontends: exposure.available_frontends,
             job_concurrency,
             job_queues,
+            purge_deleted_statuses_days,
             streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
             smtp_host: mailer.host,
             smtp_port: mailer.port,
@@ -1171,6 +1187,7 @@ impl Config {
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
             job_queues: comma_list(DEFAULT_JOB_QUEUES),
+            purge_deleted_statuses_days: DEFAULT_PURGE_DELETED_STATUSES_DAYS,
             streaming_ping_interval_secs: DEFAULT_STREAMING_PING_INTERVAL_SECS,
             smtp_host: None,
             smtp_port: DEFAULT_SMTP_PORT,
@@ -1270,24 +1287,38 @@ where
     }
 }
 
-/// Reads the two settings that shape the job worker: how many handlers a
-/// single worker runs at the same time, and the queue names it drains, in
-/// claim priority order. Grouped because each is a plain default-or-parse
-/// and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
-/// comes back in field order.
+/// The shape [`job_worker`] answers: the worker's concurrent handler count,
+/// its queue names in claim order, and the age in days after which the
+/// daily sweep hard-deletes soft-deleted local statuses; factored out
+/// because a mixed tuple of queues and numbers reads better by name (and a
+/// bare `Result` of it trips `type_complexity`).
+type JobWorkerSettings = (usize, Vec<String>, usize);
+
+/// Reads the three settings that shape the job worker and its maintenance
+/// purge: how many handlers a single worker runs at the same time, the
+/// queue names it drains, in claim priority order, and the age in days
+/// after which the daily sweep hard-deletes soft-deleted local statuses
+/// ([`PURGE_DELETED_STATUSES_DAYS_VAR`], `0` disabling the purge). Grouped
+/// because each is a plain default-or-parse and [`Config::from_lookup`]
+/// has a size budget (AGENTS.md); the tuple comes back in field order.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidNumber`] when `JOB_CONCURRENCY` holds a
-/// value that is not a whole number.
-fn job_worker<F>(lookup: &F) -> Result<(usize, Vec<String>), ConfigError>
+/// Returns [`ConfigError::InvalidNumber`] when `JOB_CONCURRENCY` or
+/// `PURGE_DELETED_STATUSES_DAYS` holds a value that is not a whole number.
+fn job_worker<F>(lookup: &F) -> Result<JobWorkerSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
     let job_concurrency = number(lookup, JOB_CONCURRENCY_VAR, DEFAULT_JOB_CONCURRENCY)?;
     let job_queues =
         comma_list(&lookup(JOB_QUEUES_VAR).unwrap_or_else(|| DEFAULT_JOB_QUEUES.to_owned()));
-    Ok((job_concurrency, job_queues))
+    let purge_deleted_statuses_days = number(
+        lookup,
+        PURGE_DELETED_STATUSES_DAYS_VAR,
+        DEFAULT_PURGE_DELETED_STATUSES_DAYS,
+    )?;
+    Ok((job_concurrency, job_queues, purge_deleted_statuses_days))
 }
 
 /// Reads the one setting that shapes the streaming WebSocket: how many
@@ -2051,6 +2082,10 @@ impl fmt::Debug for Config {
             .field("job_concurrency", &self.job_concurrency)
             .field("job_queues", &self.job_queues)
             .field(
+                "purge_deleted_statuses_days",
+                &self.purge_deleted_statuses_days,
+            )
+            .field(
                 "streaming_ping_interval_secs",
                 &self.streaming_ping_interval_secs,
             )
@@ -2496,6 +2531,49 @@ mod tests {
                 "background".to_owned(),
             ],
             "default job_queues"
+        );
+        assert_eq!(
+            config.purge_deleted_statuses_days, 30,
+            "default PURGE_DELETED_STATUSES_DAYS is thirty days"
+        );
+    }
+
+    /// The deleted-status purge age: thirty days by default, the environment
+    /// overriding it, `0` expressible (the handler's disable value), a blank
+    /// falling back, junk refused, and `Debug` showing the value.
+    #[test]
+    fn purge_deleted_statuses_days_defaults_and_reads_its_variable() {
+        let config = config_with(&[(PURGE_DELETED_STATUSES_DAYS_VAR, "7")]);
+        assert_eq!(
+            config.purge_deleted_statuses_days, 7,
+            "custom PURGE_DELETED_STATUSES_DAYS"
+        );
+        let disabled = config_with(&[(PURGE_DELETED_STATUSES_DAYS_VAR, "0")]);
+        assert_eq!(
+            disabled.purge_deleted_statuses_days, 0,
+            "zero is a legal value, and the purge handler reads it as disabled"
+        );
+        let blank = config_with(&[(PURGE_DELETED_STATUSES_DAYS_VAR, "")]);
+        assert_eq!(
+            blank.purge_deleted_statuses_days, 30,
+            "an empty value applies the default"
+        );
+        let err = try_config_with(&[(PURGE_DELETED_STATUSES_DAYS_VAR, "many")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNumber(PURGE_DELETED_STATUSES_DAYS_VAR),
+            "a value that is not a whole number is refused"
+        );
+        assert!(err.source().is_none(), "no source");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {PURGE_DELETED_STATUSES_DAYS_VAR}: ")),
+            "message names the variable"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("purge_deleted_statuses_days: 7"),
+            "the purge age is visible in Debug output: {debug}"
         );
     }
 
@@ -4081,6 +4159,7 @@ mod tests {
             OAUTH_TOKEN_TTL_SECS_VAR,
             PASSWORD_RESET_TTL_SECS_VAR,
             JOB_CONCURRENCY_VAR,
+            PURGE_DELETED_STATUSES_DAYS_VAR,
             STREAMING_PING_INTERVAL_SECS_VAR,
             MEDIA_PROXY_MAX_BYTES_VAR,
         ] {

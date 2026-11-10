@@ -59,6 +59,7 @@ All configuration comes from environment variables. For local development, copy 
 | `MEDIA_BASE_URL` | no | `{BASE_URL}/media` | Public prefix of uploaded files' URLs, served by `GET /media/{key}` (no trailing slash) |
 | `JOB_CONCURRENCY` | no | `10` | Job handlers a single worker runs at the same time |
 | `JOB_QUEUES` | no | `default,federator_incoming,federator_outgoing,mailer,scheduled,background` | Comma-separated job queue names, in claim priority order |
+| `PURGE_DELETED_STATUSES_DAYS` | no | `30` | Age in days after which soft-deleted local statuses are hard-deleted by the daily maintenance purge; `0` disables the purge (remote tombstones are never deleted, so a deleted remote post is never re-imported) |
 | `STREAMING_PING_INTERVAL_SECS` | no | `30` | Seconds between the heartbeat pings one `/api/v1/streaming` WebSocket receives; a socket that never answers a ping is closed on the next tick |
 | `SMTP_HOST` | no | | SMTP relay host for outbound email; while unset, mail is disabled and emails are dropped at queue time (logged at debug), never sent |
 | `SMTP_PORT` | no | `587` | SMTP relay port (the submission port; usually `465` with `SMTP_TLS=tls`) |

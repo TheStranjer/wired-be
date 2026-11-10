@@ -5,7 +5,8 @@
 //! [`periodic_jobs`] registry lists every recurring job (today the
 //! streaming hub's reference-table sweep, the mutes expiry sweep, the daily
 //! dismissed-notification sweep, the hourly OAuth/MFA/password-reset
-//! token sweep and the daily jobs-table prune; later tickets append one line per
+//! token sweep, the daily jobs-table prune and the daily deleted-local-status
+//! purge; later tickets append one line per
 //! entry), and [`run`] ticks every ten seconds,
 //! enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
@@ -73,6 +74,11 @@ pub struct PeriodicJob {
 /// ([`KIND_JOBS`](super::maintenance::KIND_JOBS)) shares it too: a job that
 /// ended a week ago and an activity redelivered after its window are pure
 /// bookkeeping, so the period only decides how long their storage lives on.
+/// The daily hard purge of the local statuses soft-deleted beyond the
+/// configured age
+/// ([`KIND_DELETED_STATUSES`](super::maintenance::KIND_DELETED_STATUSES))
+/// shares it too: a tombstone answers no read, so the period only decides
+/// how long its row and its cascading dependents live on after it.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -98,6 +104,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
         },
         PeriodicJob {
             kind: super::maintenance::KIND_JOBS,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_hours(24),
+        },
+        PeriodicJob {
+            kind: super::maintenance::KIND_DELETED_STATUSES,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_hours(24),
         },
