@@ -5,9 +5,9 @@
 //! [`periodic_jobs`] registry lists every recurring job (today the
 //! streaming hub's reference-table sweep, the mutes expiry sweep, the daily
 //! dismissed-notification sweep, the hourly OAuth/MFA/password-reset
-//! token sweep, the daily jobs-table prune and the daily deleted-local-status
-//! purge; later tickets append one line per
-//! entry), and [`run`] ticks every ten seconds,
+//! token sweep, the daily jobs-table prune, the daily deleted-local-status
+//! purge and the six-hourly orphaned-local-media sweep; later tickets
+//! append one line per entry), and [`run`] ticks every ten seconds,
 //! enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
@@ -78,7 +78,12 @@ pub struct PeriodicJob {
 /// configured age
 /// ([`KIND_DELETED_STATUSES`](super::maintenance::KIND_DELETED_STATUSES))
 /// shares it too: a tombstone answers no read, so the period only decides
-/// how long its row and its cascading dependents live on after it.
+/// how long its row and its cascading dependents live on after it. The
+/// six-hourly sweep of unposted local media whose grace window ran out
+/// ([`KIND_MEDIA`](super::maintenance::KIND_MEDIA)) shares it too: media
+/// no status, and no chat message, claims within the two-day window is
+/// storage nothing can read back, so the period only decides how long the
+/// file and its row outlive that window.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -111,6 +116,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             kind: super::maintenance::KIND_DELETED_STATUSES,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_hours(24),
+        },
+        PeriodicJob {
+            kind: super::maintenance::KIND_MEDIA,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_secs(21_600),
         },
     ]
 }

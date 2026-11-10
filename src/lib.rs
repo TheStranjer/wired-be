@@ -186,6 +186,10 @@ fn job_registry() -> JobRegistry {
         jobs::maintenance::KIND_DELETED_STATUSES,
         jobs::maintenance::handle_purge_deleted_statuses,
     );
+    registry.register(
+        jobs::maintenance::KIND_MEDIA,
+        jobs::maintenance::handle_sweep_media,
+    );
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);

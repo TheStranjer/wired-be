@@ -51,10 +51,25 @@
 //! through their `ON DELETE CASCADE` foreign keys, not by hand. The
 //! reference is Pleroma's status-expiry `Purge` step, here driven by the
 //! configured age instead of per-row `expires_at`.
+//!
+//! [`handle_sweep_media`] (job kind [`KIND_MEDIA`]) is the fifth: a
+//! six-hourly sweep of locally stored media no status ever claimed. The
+//! candidates are `status_id IS NULL` (unposted), `remote_url IS NULL`
+//! (this instance's own file, not a mirror), at least `MEDIA_STALE_HOURS`
+//! hours old, and not referenced by any
+//! `chat_messages` row — today the only other stored reference to unposted
+//! media (`attachment_media_id`, `migrations/1791714489_chats.sql`). Each
+//! reclaimed row loses its stored file first, through
+//! [`UploaderBackend::delete`](crate::uploads::UploaderBackend::delete),
+//! and then itself; a file whose removal fails keeps its row for the next
+//! pass, so the sweep never deletes a pointer and strands its bytes. The
+//! rows are walked in id-cursored batches of `MEDIA_BATCH_SIZE` so one
+//! kept row cannot re-loop inside a run.
 
 use serde_json::Value;
-use sqlx::{PgPool, query, query_scalar};
-use tracing::{debug, info};
+use sqlx::{PgPool, query, query_as, query_scalar};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError},
@@ -456,10 +471,169 @@ pub fn handle_purge_deleted_statuses(
     })
 }
 
+/// The job kind of the orphaned local-media sweep, run from the
+/// [`periodic_jobs`](super::scheduler::periodic_jobs) registry through the
+/// [`JobRegistry`](super::JobRegistry) handler [`handle_sweep_media`], on
+/// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND).
+pub const KIND_MEDIA: &str = "maintenance.media";
+
+/// How long an unposted local media row must sit before the sweep may call
+/// it abandoned: forty-eight hours. A client stores media first and names
+/// it in the status only minutes later, so the grace covers that round
+/// trip; past it nothing in the schema still names the file.
+const MEDIA_STALE_HOURS: i32 = 48;
+
+/// Rows one round of the orphaned-media walk claims. Walking the backlog
+/// in [`MEDIA_BATCH_SIZE`]-row batches, ordered by `id` behind an id
+/// cursor, keeps every statement short and — because the cursor only ever
+/// moves past visited rows — guarantees a row kept after a failed file
+/// delete is not revisited within the same run.
+const MEDIA_BATCH_SIZE: i64 = 200;
+
+/// The [`MediaCandidate`] fetch behind [`fetch_orphaned_batch`]: the next
+/// [`MEDIA_BATCH_SIZE`] local, orphaned, stale rows past `id` cursor `$2`,
+/// in id order.
+///
+/// "Local, orphaned, stale" is the ticket's conjunction: `status_id IS
+/// NULL` (no status ever claimed the upload), `remote_url IS NULL` (a file
+/// this instance stores, not a mirror of a remote one), and `inserted_at`
+/// beyond [`MEDIA_STALE_HOURS`] hours ago. The `NOT EXISTS` arm skips the
+/// media a live chat message still carries through
+/// `attachment_media_id` — the one other stored reference to unposted
+/// media in today's schema (`migrations/1791714489_chats.sql`).
+///
+/// The exclusion grows when the scheduled-statuses ticket lands: media
+/// kept for a not-yet-due post will need the same guard against that
+/// table. `scheduled_at` is only a deferred parameter in
+/// `src/services/create_status.rs` today, so no table exists to name here
+/// yet and this statement deliberately names none.
+const SWEEP_MEDIA_CANDIDATES_SQL: &str = "SELECT id, storage_key FROM media_attachments
+         WHERE status_id IS NULL
+           AND remote_url IS NULL
+           AND inserted_at < now() - make_interval(hours => $1)
+           AND id > $2
+           AND NOT EXISTS (
+               SELECT 1 FROM chat_messages cm
+                WHERE cm.attachment_media_id = media_attachments.id
+           )
+         ORDER BY id
+         LIMIT $3";
+
+/// The `DELETE` behind [`reclaim_media`]: one candidate row by id, issued
+/// only once its stored file (if any) is gone.
+const DELETE_MEDIA_ROW_SQL: &str = "DELETE FROM media_attachments WHERE id = $1";
+
+/// One candidate row of the orphaned-media walk: enough to advance the
+/// cursor, delete the file, and delete the row.
+#[derive(Debug, sqlx::FromRow)]
+struct MediaCandidate {
+    /// The row's id: the walk's cursor and the delete's target.
+    id: Uuid,
+    /// The file's key inside the upload storage; `None` when the row has
+    /// no stored file and needs no file step at all.
+    storage_key: Option<String>,
+}
+
+/// Fetches the next batch of orphaned-media candidates past `after`, the
+/// shape documented on [`SWEEP_MEDIA_CANDIDATES_SQL`].
+async fn fetch_orphaned_batch(
+    pool: &PgPool,
+    after: Uuid,
+) -> Result<Vec<MediaCandidate>, sqlx::Error> {
+    query_as::<_, MediaCandidate>(SWEEP_MEDIA_CANDIDATES_SQL)
+        .bind(MEDIA_STALE_HOURS)
+        .bind(after)
+        .bind(MEDIA_BATCH_SIZE)
+        .fetch_all(pool)
+        .await
+}
+
+/// Reclaims one candidate: the stored file goes first when there is one,
+/// and only then the row; reports the rows it deleted (`1`) or kept (`0`).
+///
+/// A file the uploader refuses to remove — a key [`check_key`] rejects, or
+/// bytes that are not on disk — keeps the row: the next pass tries again,
+/// and storage never ends up with a file whose database pointer was
+/// deleted around it.
+///
+/// [`check_key`]: crate::uploads::check_key
+async fn reclaim_media(state: &AppState, row: MediaCandidate) -> Result<u64, sqlx::Error> {
+    if let Some(key) = row.storage_key.as_deref()
+        && let Err(err) = state.uploader.delete(key).await
+    {
+        warn!(
+            %err,
+            media_id = %row.id,
+            "orphaned media file delete failed; keeping the row for the next sweep"
+        );
+        return Ok(0);
+    }
+    let removed = query(DELETE_MEDIA_ROW_SQL)
+        .bind(row.id)
+        .execute(&state.db)
+        .await?;
+    Ok(removed.rows_affected())
+}
+
+/// Runs one sweep: the whole stale-orphan backlog, walked in
+/// [`MEDIA_BATCH_SIZE`]-row batches behind a forward-only id cursor, the
+/// rows reclaimed summed into one count.
+///
+/// The cursor starts at the nil uuid — below every `UUIDv7` id (decision 4)
+/// — and lands on the last row of each batch, kept or deleted alike, so a
+/// row that survived its failed file delete waits for the next run instead
+/// of re-appearing in this one. A short batch ends the walk.
+///
+/// Split out from [`handle_sweep_media`] so the handler is only the
+/// logging-and-error shape the [`JobRegistry`](super::JobRegistry) expects.
+async fn sweep_media(state: &AppState) -> Result<u64, sqlx::Error> {
+    let batch_limit = usize::try_from(MEDIA_BATCH_SIZE).unwrap_or(usize::MAX);
+    let mut cursor = Uuid::nil();
+    let mut deleted = 0_u64;
+    loop {
+        let batch = fetch_orphaned_batch(&state.db, cursor).await?;
+        let visited = batch.len();
+        if let Some(last) = batch.last() {
+            cursor = last.id;
+        }
+        for candidate in batch {
+            deleted += reclaim_media(state, candidate).await?;
+        }
+        if visited < batch_limit {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
+/// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_MEDIA`]: one
+/// sweep of the stale, orphaned local media rows, logging the number of
+/// rows it deleted.
+///
+/// A file that cannot be removed is not a failed pass: its row is kept,
+/// warned about, and retried by the next run, so one unreadable file never
+/// strands the sweep on the rest. Only a database failure is a
+/// [`JobError::Retry`], and the scheduler enqueues the next six hours
+/// regardless; a pass lost to an outage costs nothing but the storage.
+pub fn handle_sweep_media(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        match sweep_media(&state).await {
+            Ok(deleted) => {
+                info!(deleted, "orphaned local media deleted");
+                Ok(())
+            }
+            Err(err) => Err(JobError::Retry(format!(
+                "orphaned media sweep failed: {err}"
+            ))),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, time::Duration};
 
+    use bytes::Bytes;
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
@@ -483,6 +657,9 @@ mod tests {
 
     /// The period the token sweep is scheduled on: one hour.
     const HOURLY: Duration = Duration::from_secs(3_600);
+
+    /// The period the orphaned-media sweep is scheduled on: six hours.
+    const SIX_HOURS: Duration = Duration::from_secs(21_600);
 
     /// One day in the seconds the fixture helpers count ages in.
     const DAY: i64 = 86_400;
@@ -1503,6 +1680,349 @@ mod tests {
         }
         assert!(
             row_exists(&pool, "statuses", stale).await,
+            "the healthy pool sees no work the broken one claimed to do"
+        );
+    }
+
+    /// Test state over `pool` whose uploads live in a fresh temporary
+    /// directory, together with that directory's guard and the backend a
+    /// test puts files through: the handler deletes from that same
+    /// directory, so the guard must outlive both (the pattern of
+    /// `src/uploads.rs`'s `backend_delegates_every_operation` test).
+    fn uploads_state(pool: &PgPool) -> (tempfile::TempDir, AppState, UploaderBackend) {
+        let dir = tempfile::TempDir::new().expect("a temp uploads dir");
+        let mut config = Config::for_tests();
+        config.uploads_dir = dir.path().to_path_buf();
+        let backend = UploaderBackend::from(&config);
+        let state = state_with_config(pool, config);
+        (dir, state, backend)
+    }
+
+    /// Inserts a `media_attachments` row aged `hours_old` into the past,
+    /// the sweep's inputs set as given: an unposted local upload is
+    /// `status_id` NULL and `remote_url` NULL with a `storage_key`; a
+    /// mirrored remote row is one with `remote_url` set. Returns its id.
+    async fn unposted_media_row(
+        pool: &PgPool,
+        owner: &User,
+        storage_key: Option<&str>,
+        remote_url: Option<&str>,
+        hours_old: i32,
+    ) -> Uuid {
+        let id = Uuid::now_v7();
+        let sql = "INSERT INTO media_attachments
+                       (id, user_id, status_id, storage_key, remote_url, url, content_type,
+                        inserted_at)
+                   VALUES ($1, $2, NULL, $3, $4, $5, 'image/png',
+                           now() - make_interval(hours => $6))";
+        let written = query(sql)
+            .bind(id)
+            .bind(owner.id)
+            .bind(storage_key)
+            .bind(remote_url)
+            .bind(format!("{TEST_BASE_URL}/media/{id}.png"))
+            .bind(hours_old)
+            .execute(pool)
+            .await
+            .expect("the media fixture inserts");
+        assert_eq!(written.rows_affected(), 1, "one row was written");
+        id
+    }
+
+    /// Inserts a chat between `owner` and `other` and one message from
+    /// `owner` carrying `media_id` as its attachment: the stored reference
+    /// that keeps an unposted media row out of the sweep's candidates.
+    async fn chat_message_with_media(pool: &PgPool, owner: &User, other: &User, media_id: Uuid) {
+        let chat = Uuid::now_v7();
+        let chat_rows = query("INSERT INTO chats (id, user_id, recipient_id) VALUES ($1, $2, $3)")
+            .bind(chat)
+            .bind(owner.id)
+            .bind(other.id)
+            .execute(pool)
+            .await
+            .expect("the chat fixture inserts");
+        assert_eq!(chat_rows.rows_affected(), 1, "the chat row was written");
+        let sql = "INSERT INTO chat_messages (id, sender_id, attachment_media_id)
+                   VALUES ($1, $2, $3)";
+        let message_rows = query(sql)
+            .bind(Uuid::now_v7())
+            .bind(owner.id)
+            .bind(media_id)
+            .execute(pool)
+            .await
+            .expect("the chat message fixture inserts");
+        assert_eq!(
+            message_rows.rows_affected(),
+            1,
+            "the message row was written"
+        );
+    }
+
+    /// Stores `body` at `key` through the test backend and answers whether
+    /// the file is on disk under the temporary uploads directory.
+    async fn put_media_file(backend: &UploaderBackend, key: &str) {
+        backend
+            .put(key, Bytes::from_static(b"png bytes"), "image/png")
+            .await
+            .expect("the upload fixture stores");
+    }
+
+    /// Whether `dir` holds a file at relative `key`.
+    fn file_on_disk(dir: &std::path::Path, key: &str) -> bool {
+        dir.join(key).is_file()
+    }
+
+    /// The sweep deletes exactly the stale unposted local orphans: a fresh
+    /// orphan (47 h), a stale row with a `remote_url`, and a stale row a
+    /// chat message references all stay.
+    #[tokio::test]
+    async fn the_media_sweep_deletes_only_stale_unposted_local_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let orphan = unposted_media_row(&pool, &alice, None, None, 49).await;
+        let fresh = unposted_media_row(&pool, &alice, None, None, 47).await;
+        let remote = unposted_media_row(
+            &pool,
+            &alice,
+            None,
+            Some("https://remote.example/media/x.png"),
+            49,
+        )
+        .await;
+        let in_chat = unposted_media_row(&pool, &alice, None, None, 49).await;
+        chat_message_with_media(&pool, &alice, &bob, in_chat).await;
+
+        let outcome = handle_sweep_media(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+
+        assert_eq!(outcome, Ok(()), "a sweep over orphans and keeps succeeds");
+        assert!(
+            !row_exists(&pool, "media_attachments", orphan).await,
+            "the stale unposted local row is gone"
+        );
+        assert!(
+            row_exists(&pool, "media_attachments", fresh).await,
+            "a 47-hour-old orphan is still inside its posting window"
+        );
+        assert!(
+            row_exists(&pool, "media_attachments", remote).await,
+            "a mirrored remote row is not this instance's file to delete"
+        );
+        assert!(
+            row_exists(&pool, "media_attachments", in_chat).await,
+            "a chat message still carries the row"
+        );
+    }
+
+    /// The sweep removes the stored file before it removes the row, so a
+    /// reclaimed orphan leaves nothing behind on disk.
+    #[tokio::test]
+    async fn the_media_sweep_takes_the_stored_file_with_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state, backend) = uploads_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let key = format!("alice/{}/stale.png", Uuid::now_v7());
+        put_media_file(&backend, &key).await;
+        assert!(
+            file_on_disk(dir.path(), &key),
+            "the fixture file is on disk"
+        );
+        let orphan = unposted_media_row(&pool, &alice, Some(&key), None, 49).await;
+
+        let outcome = handle_sweep_media(state, FIRST_ATTEMPT, json!({})).await;
+
+        assert_eq!(outcome, Ok(()), "the sweep over a real file succeeds");
+        assert!(
+            !row_exists(&pool, "media_attachments", orphan).await,
+            "the orphan row is gone"
+        );
+        assert!(
+            !file_on_disk(dir.path(), &key),
+            "and its stored file went with it"
+        );
+    }
+
+    /// A file the uploader refuses to delete (the key names nothing on
+    /// disk) keeps its row and costs the pass nothing but the one skip:
+    /// the handler still returns `Ok`, and the deleted count covers only
+    /// the row it could reclaim, never the kept one.
+    #[tokio::test]
+    async fn a_row_whose_file_cannot_be_deleted_keeps_its_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (_dir, state, _backend) = uploads_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let stuck = unposted_media_row(&pool, &alice, Some("alice/missing.png"), None, 49).await;
+        let clean = unposted_media_row(&pool, &alice, None, None, 49).await;
+
+        let deleted = sweep_media(&state).await.expect("the sweep runs");
+
+        assert_eq!(
+            deleted, 1,
+            "the count excludes the row whose file delete failed"
+        );
+        assert!(
+            !row_exists(&pool, "media_attachments", clean).await,
+            "the row with nothing to remove went"
+        );
+        assert!(
+            row_exists(&pool, "media_attachments", stuck).await,
+            "the stuck row waits for the next run"
+        );
+
+        let outcome = handle_sweep_media(state, FIRST_ATTEMPT, json!({})).await;
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "an undeletable file is a warn, not a failure"
+        );
+        assert!(
+            row_exists(&pool, "media_attachments", stuck).await,
+            "and the job run keeps skipping it without going down"
+        );
+    }
+
+    /// A row with no `storage_key` has no file step: it goes directly.
+    #[tokio::test]
+    async fn a_row_without_a_storage_key_deletes_without_a_file_step() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state, _backend) = uploads_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let keyless = unposted_media_row(&pool, &alice, None, None, 49).await;
+
+        let outcome = handle_sweep_media(state, FIRST_ATTEMPT, json!({})).await;
+
+        assert_eq!(outcome, Ok(()), "the keyless row is deletable bookkeeping");
+        assert!(
+            !row_exists(&pool, "media_attachments", keyless).await,
+            "it goes without any file"
+        );
+        let leftovers = dir
+            .path()
+            .read_dir()
+            .expect("the fresh uploads dir is readable")
+            .count();
+        assert_eq!(leftovers, 0, "the sweep created no stray file for it");
+    }
+
+    /// A backlog larger than one batch is swept by a single handler run:
+    /// the id cursor walks every batch in one pass, and a row kept after a
+    /// failed file delete does not re-loop inside it.
+    #[tokio::test]
+    async fn the_media_sweep_walks_more_than_one_batch_in_one_run() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let want = u64::try_from(MEDIA_BATCH_SIZE + 5).expect("the batch size is positive");
+        let inserted = query(
+            "INSERT INTO media_attachments (id, user_id, url, content_type, inserted_at)
+             SELECT gen_random_uuid(), $1, 'https://test.example/media/bulk.png', 'image/png',
+                    now() - make_interval(hours => 49)
+               FROM generate_series(1, $2)",
+        )
+        .bind(alice.id)
+        .bind(MEDIA_BATCH_SIZE + 5)
+        .execute(&pool)
+        .await
+        .expect("the bulk media fixture inserts");
+        assert_eq!(
+            inserted.rows_affected(),
+            want,
+            "every seeded orphan landed in the table"
+        );
+
+        let outcome = handle_sweep_media(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+
+        assert_eq!(outcome, Ok(()), "the multi-batch pass succeeds");
+        let left = query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_attachments
+              WHERE status_id IS NULL AND remote_url IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the rows read");
+        assert_eq!(
+            left, 0,
+            "one handler run cleared more than {MEDIA_BATCH_SIZE} rows: \
+             the cursor walked, not a single batch"
+        );
+    }
+
+    /// The media sweep is wired into both registries the ticket names: the
+    /// worker can run its kind, and the scheduler places it on the
+    /// maintenance queue every six hours.
+    #[test]
+    fn the_media_kind_is_registered_and_scheduled() {
+        let registry = crate::job_registry();
+        assert!(
+            registry.get(KIND_MEDIA).is_some(),
+            "the worker knows `{KIND_MEDIA}`"
+        );
+        assert_eq!(KIND_MEDIA, "maintenance.media", "the ticket's kind name");
+
+        let job = periodic_jobs()
+            .into_iter()
+            .find(|job| job.kind == KIND_MEDIA)
+            .expect("the sweep is on the periodic schedule");
+        assert_eq!(job.queue, QUEUE_BACKGROUND, "on the maintenance queue");
+        assert_eq!(job.every, SIX_HOURS, "once every six hours");
+    }
+
+    /// The handler the registry binds to the kind is this module's
+    /// [`handle_sweep_media`], not some other sweep: calling the registered
+    /// handler reclaims the stale orphan and keeps the fresh one.
+    #[tokio::test]
+    async fn the_registered_media_handler_is_this_sweep() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let orphan = unposted_media_row(&pool, &alice, None, None, 49).await;
+        let fresh = unposted_media_row(&pool, &alice, None, None, 47).await;
+        let registry = crate::job_registry();
+        let handler = registry
+            .get(KIND_MEDIA)
+            .expect("the sweep's kind is registered");
+
+        let outcome = handler(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+
+        assert_eq!(outcome, Ok(()), "the registered handler runs");
+        assert!(
+            !row_exists(&pool, "media_attachments", orphan).await,
+            "and it is this module's sweep: the stale orphan is gone"
+        );
+        assert!(
+            row_exists(&pool, "media_attachments", fresh).await,
+            "and only the stale rows went: the fresh one stays"
+        );
+    }
+
+    /// A sweep that cannot reach the database is a retryable failure, so
+    /// the queue keeps the pass while the scheduler enqueues the next
+    /// period: the stale rows wait for a working sweep instead of being
+    /// assumed gone.
+    #[tokio::test]
+    async fn an_unreachable_database_retries_the_media_sweep() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let orphan = unposted_media_row(&pool, &alice, Some("alice/orphan.png"), None, 49).await;
+        let broken = broken_state().await;
+
+        let outcome = handle_sweep_media(broken, FIRST_ATTEMPT, json!({})).await;
+
+        match outcome {
+            Err(JobError::Retry(detail)) => assert!(
+                detail.starts_with("orphaned media sweep failed"),
+                "the retry states what failed: {detail}"
+            ),
+            Ok(()) => panic!("a closed pool must not read as a successful sweep"),
+            Err(other) => panic!("a closed pool is retryable, not {other:?}"),
+        }
+        assert!(
+            row_exists(&pool, "media_attachments", orphan).await,
             "the healthy pool sees no work the broken one claimed to do"
         );
     }
