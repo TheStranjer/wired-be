@@ -16,8 +16,12 @@
 //! resolves [`conversation_id`](Status::conversation_id) — a reply inherits
 //! its parent's conversation, a root status is its own conversation — and
 //! moves the denormalised counters in the same transaction, so a status and
-//! the counts that describe it are always written together. It also links
-//! the accounts in [`NewStatus::mentioned_user_ids`] in that transaction
+//! the counts that describe it are always written together. A `direct`
+//! status also belongs to a DM thread: the
+//! [`direct_conversation_id`](Status::direct_conversation_id) column names
+//! its `conversations` row, landed by
+//! [`crate::models::conversation::participate`] once the row is stored. It
+//! also links the accounts in [`NewStatus::mentioned_user_ids`] in that transaction
 //! (see [`crate::models::mention`]), so a status and the mentions it
 //! carries appear together or not at all, and the same for the tags in
 //! [`NewStatus::hashtags`] (see [`crate::models::hashtag`]).
@@ -197,6 +201,10 @@ pub struct Status {
     /// Thread group id: every status of one conversation shares it, and a
     /// root status's is its own id.
     pub conversation_id: Uuid,
+    /// The `conversations` row this `direct` status posts into, `None` for
+    /// every other visibility and for a direct status written outside the
+    /// participation hook (see [`crate::models::conversation`]).
+    pub direct_conversation_id: Option<Uuid>,
     /// Original this status reblogs; `None` for anything but a reblog.
     pub reblog_of_id: Option<Uuid>,
     /// Original this status quotes; `None` for anything but a quote.
@@ -288,6 +296,11 @@ pub struct NewStatus {
     /// Thread group id; `None` lets [`insert`] take the parent's
     /// conversation, or the new id when there is no parent.
     pub conversation_id: Option<Uuid>,
+    /// The `conversations` row a `direct` post answers into: only
+    /// `POST /api/v1/statuses`'s `in_reply_to_conversation_id` arm names
+    /// one; every other direct status gets its thread row from
+    /// [`crate::models::conversation::participate`] after the insert.
+    pub direct_conversation_id: Option<Uuid>,
     /// Original being reblogged.
     pub reblog_of_id: Option<Uuid>,
     /// Original being quoted.
@@ -345,6 +358,7 @@ impl Default for NewStatus {
             in_reply_to_account_id: None,
             in_reply_to_ap_id: None,
             conversation_id: None,
+            direct_conversation_id: None,
             reblog_of_id: None,
             quote_of_id: None,
             mentioned_user_ids: Vec::new(),
@@ -397,11 +411,11 @@ const INSERT_SQL: &str = "INSERT INTO statuses (
      id, uri, url, user_id, content, raw_text, content_type, spoiler_text,
      sensitive, visibility, language, in_reply_to_id,
      in_reply_to_account_id, in_reply_to_ap_id, conversation_id,
-     reblog_of_id, quote_of_id, local, application_name,
-     application_website, edited_at, expires_at, inserted_at
+     direct_conversation_id, reblog_of_id, quote_of_id, local,
+     application_name, application_website, edited_at, expires_at, inserted_at
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-     $17, $18, $19, $20, $21, $22, COALESCE($23, now())
+     $17, $18, $19, $20, $21, $22, $23, COALESCE($24, now())
 ) RETURNING *";
 
 /// The conversation the status being replied to belongs to, read from the
@@ -1264,6 +1278,7 @@ async fn write_status(
         .bind(new_status.in_reply_to_account_id)
         .bind(new_status.in_reply_to_ap_id.as_deref())
         .bind(conversation)
+        .bind(new_status.direct_conversation_id)
         .bind(new_status.reblog_of_id)
         .bind(new_status.quote_of_id)
         .bind(new_status.local)

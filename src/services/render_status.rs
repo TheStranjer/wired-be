@@ -7,11 +7,12 @@
 //! `safe_render_many`): it takes the already-paged rows and loads
 //! everything they render from — authors, media attachments, mentions,
 //! hashtags, emoji reactions, favourites, the viewer's own reblogs,
-//! bookmarks, the viewer's own pins, the viewer's muted threads, reblogged
-//! originals and quoted originals — with a FIXED set of batched
+//! bookmarks, the viewer's own pins, the viewer's muted threads, the
+//! viewer's direct-message participations, reblogged originals and quoted
+//! originals — with a FIXED set of batched
 //! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
 //! never a query per row. The count does not grow with the page size:
-//! thirteen statement groups whatever the batch —
+//! fourteen statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -48,13 +49,19 @@
 //!     row and its nested original carry the same pair. The same set
 //!     answers `muted` and `pleroma.thread_muted`, which is why the two can
 //!     never disagree;
-//! 13. the viewer's relationships to the page's authors — the one fixed
+//! 13. the viewer's direct-message participations — one
+//!     [`conversation::participation_ids`], likewise only for an
+//!     authenticated viewer, keyed to each row's *own*
+//!     `direct_conversation_id`: a participation is a fact about the DM
+//!     thread, and this is what answers `pleroma.direct_conversation_id`;
+//! 14. the viewer's relationships to the page's authors — the one fixed
 //!     [`Relationship::load_many`] set, run only for an authenticated
 //!     viewer.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
 //! page of plain posts costs five queries, and a viewer adds the favourite,
-//! reblog, bookmark, pin and thread-mute reads and the relationship set.
+//! reblog, bookmark, pin, thread-mute and participation reads and the
+//! relationship set.
 //!
 //! # Extension points
 //!
@@ -75,8 +82,9 @@
 //!   [`conversation_mute::muted_conversation_ids`] read; the writes are
 //!   `POST /api/v1/statuses/{id}/mute` and its `…/unmute` twin in
 //!   [`crate::api::statuses`].
-//! - `pleroma.direct_conversation_id`: the chat-participation ticket,
-//!   one read keyed by status and viewer.
+//! - `pleroma.direct_conversation_id`: *filled by the
+//!   conversation-participations ticket* (step 13 above), from the one
+//!   [`conversation::participation_ids`] read.
 //! - `card`: the rich-media cards table, one read keyed by status id.
 //! - `poll`: the polls tables, one read keyed by status id.
 //! - `emojis`: the custom emojis, one read keyed by the shortcodes the
@@ -113,7 +121,7 @@ use crate::{
     },
     error::AppResult,
     models::{
-        bookmark, conversation_mute,
+        bookmark, conversation, conversation_mute,
         emoji_reaction::{self, ReactionSummary},
         favourite,
         hashtag::{self, Hashtag},
@@ -241,6 +249,15 @@ struct Batch<'a> {
     /// conversation, so the pair of flags rides the same membership and the
     /// two can never disagree.
     thread_mutes: HashSet<Uuid>,
+    /// The DM threads on the page the viewer participates in, each keyed to
+    /// the thread with the id of *their own* participation row — one
+    /// [`conversation::participation_ids`] read keyed by the page's
+    /// `direct_conversation_id`s; empty for an anonymous viewer, who has no
+    /// rows. Keyed to each row's *own*
+    /// [`direct_conversation_id`](StatusRow::direct_conversation_id),
+    /// because a participation is a fact about the thread: this is what
+    /// answers `pleroma.direct_conversation_id`.
+    direct_participations: HashMap<Uuid, Uuid>,
     /// The viewer's relationships to the page's authors, keyed by account
     /// id; `None` for an anonymous viewer.
     relationships: Option<RelationshipMap>,
@@ -290,6 +307,12 @@ impl<'a> Batch<'a> {
                 .chain(originals.values())
                 .map(|row| row.conversation_id),
         );
+        let direct_ids = distinct(
+            rows.iter()
+                .copied()
+                .chain(originals.values())
+                .filter_map(|row| row.direct_conversation_id),
+        );
         Ok(Self {
             config: state.config.as_ref(),
             viewer,
@@ -304,6 +327,7 @@ impl<'a> Batch<'a> {
             bookmarks: load_bookmarks(pool, &rendered_ids, viewer).await?,
             pins: load_pins(pool, &rendered_ids, viewer).await?,
             thread_mutes: load_thread_mutes(pool, &conversation_ids, viewer).await?,
+            direct_participations: load_direct_participations(pool, &direct_ids, viewer).await?,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
         })
     }
@@ -384,6 +408,9 @@ impl<'a> Batch<'a> {
             bookmark_folder: bookmark.copied().flatten(),
             pinned_at,
             muted: JsonBool(self.thread_mutes.contains(&row.conversation_id)),
+            direct_participation: row
+                .direct_conversation_id
+                .and_then(|thread| self.direct_participations.get(&thread).copied()),
             reblog,
         };
         Some(Status::from_source(
@@ -549,6 +576,22 @@ async fn load_thread_mutes(
         return Ok(HashSet::new());
     };
     conversation_mute::muted_conversation_ids(pool, viewer.id, conversation_ids).await
+}
+
+/// [`conversation::participation_ids`]: one query for the DM threads among
+/// the page's direct-conversation ids the viewer participates in, keyed by
+/// thread with the viewer's own participation id. An anonymous viewer has
+/// no rows to ask about, and the empty map makes every
+/// `pleroma.direct_conversation_id` `null` — no query at all.
+async fn load_direct_participations(
+    pool: &PgPool,
+    direct_ids: &[Uuid],
+    viewer: Option<&User>,
+) -> AppResult<HashMap<Uuid, Uuid>> {
+    let Some(viewer) = viewer else {
+        return Ok(HashMap::new());
+    };
+    conversation::participation_ids(pool, viewer.id, direct_ids).await
 }
 
 /// The viewer's relationships to the page's authors, keyed by account id:
@@ -1401,6 +1444,105 @@ mod tests {
                 .all(|entity| flags(entity) == (json!(false), json!(false))),
             "an anonymous page is nobody's mute"
         );
+    }
+
+    /// The conversation-participations ticket's loader inside the fixed
+    /// query set: one batched read answers `pleroma.direct_conversation_id`
+    /// of a whole page with each viewer's own participation id — the same
+    /// DM thread renders a different id per participant, and a non-DM row,
+    /// a non-participant and the anonymous request all render `null`.
+    #[tokio::test]
+    async fn the_direct_conversation_id_follows_one_batched_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let dm = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                visibility: Visibility::Direct,
+                mentioned_user_ids: vec![bob.id],
+                ..NewStatus::local(&alice, "@bob psst")
+            },
+        )
+        .await
+        .expect("the direct fixture inserts");
+        conversation::participate_for_status(&pool, &dm)
+            .await
+            .expect("the fixture thread bump runs");
+        // Re-read for the render: the page renderer keys the participation
+        // to the row's stored `direct_conversation_id`, which the bump
+        // writes after the insert's own answer.
+        let dm = status::get_by_id(&pool, dm.id)
+            .await
+            .expect("the row reads")
+            .expect("the fixture is live");
+        let thread = dm
+            .direct_conversation_id
+            .expect("the bump linked the thread");
+        let quiet = post(&pool, &bob, "public noise").await;
+
+        let field = |entity: &Status| {
+            serde_json::to_value(entity).expect("a rendered status serializes")["pleroma"]
+                ["direct_conversation_id"]
+                .clone()
+        };
+        let alice_expected = the_participation(&pool, &alice, thread).await;
+        let bob_expected = the_participation(&pool, &bob, thread).await;
+        let page = [dm.clone(), quiet.clone()];
+
+        let for_alice = render_statuses(&state, Some(&alice), &page)
+            .await
+            .expect("the page renders for alice");
+        assert_eq!(
+            field(&for_alice[0]),
+            json!(alice_expected),
+            "the author sees her own participation id"
+        );
+        assert_eq!(
+            field(&for_alice[1]),
+            Value::Null,
+            "and the public row on the same page stays unkeyed"
+        );
+
+        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&dm))
+            .await
+            .expect("the post renders for bob");
+        assert_eq!(
+            field(&for_bob[0]),
+            json!(bob_expected),
+            "bob's view of the same DM names his participation, not alice's"
+        );
+
+        let for_carol = render_statuses(&state, Some(&carol), std::slice::from_ref(&dm))
+            .await
+            .expect("the post renders for carol");
+        assert_eq!(
+            field(&for_carol[0]),
+            Value::Null,
+            "a stranger to the thread renders null"
+        );
+        let anonymous = render_statuses(&state, None, &page)
+            .await
+            .expect("the page renders anonymously");
+        assert!(
+            anonymous.iter().all(|entity| field(entity) == Value::Null),
+            "an anonymous page has no participation to name"
+        );
+    }
+
+    /// `who`'s stored participation id in `thread`, as the wire spells it.
+    async fn the_participation(pool: &PgPool, who: &User, thread: Uuid) -> String {
+        conversation::participation_ids(pool, who.id, &[thread])
+            .await
+            .expect("the participation reads")
+            .get(&thread)
+            .copied()
+            .expect("the fixture account participates")
+            .to_string()
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

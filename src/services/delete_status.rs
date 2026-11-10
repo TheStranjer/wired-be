@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::{
     error::AppResult,
-    models::{notification, status},
+    models::{conversation, notification, status},
     state::AppState,
 };
 
@@ -60,7 +60,11 @@ pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<
 /// clears the notifications the status caused is wired in here (the
 /// tombstoned row never fires the schema's `ON DELETE CASCADE`, so
 /// [`notification::delete_for_status`] is what takes the favourites,
-/// boosts, reactions and mentions about it with it). The federation
+/// boosts, reactions and mentions about it with it), and so is the
+/// conversation repoint that moves every participation which last saw the
+/// deleted status onto its thread's newest remaining direct status — or
+/// withdraws the participation when the thread has none (see
+/// [`conversation::repoint_after_delete`]). The federation
 /// ticket that sends the `Delete` activity (and, with it, the withdrawal
 /// of every reblog this delete took down) and the streaming ticket that
 /// pushes `status_deleted` to the timelines that carried the post still
@@ -83,6 +87,13 @@ async fn after_status_deleted(state: &AppState, status: &status::Status) {
             status = %status.id,
             %err,
             "notification cleanup after status deletion failed"
+        );
+    }
+    if let Err(err) = conversation::repoint_after_delete(&state.db, status.id).await {
+        warn!(
+            status = %status.id,
+            %err,
+            "conversation repoint after status deletion failed"
         );
     }
 }

@@ -25,8 +25,14 @@
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
 //! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
-//! `pleroma.direct_conversation_id` (chats); and `quote` (the quoting
-//! ticket, whose original rows the service already batch-loads).
+//! and `quote` (the quoting ticket, whose original rows the service
+//! already batch-loads).
+//! `pleroma.direct_conversation_id` is filled by the
+//! conversation-participations ticket, from
+//! [`participation_ids`](crate::models::conversation::participation_ids)
+//! — one batched read per page: a status of a DM thread renders the
+//! viewer's participation id there, and every other row and every
+//! non-participant `null`.
 //! `pleroma.bookmark_folder` is filled by the folders ticket, from
 //! [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders) —
 //! the one read that also answers `bookmarked`: a bookmarked row renders
@@ -131,10 +137,16 @@ pub struct PleromaMetadata {
     /// `UUIDv7` string (decision 4) — this instance's replacement for
     /// Pleroma's deprecated CRC32 context id.
     pub conversation_id: String,
-    /// `direct_conversation_id`: the viewer's chat participation id for a
-    /// direct message; the chat-conversations ticket sets this, so it
-    /// renders JSON `null` for now.
-    pub direct_conversation_id: Option<Value>,
+    /// `direct_conversation_id`: the id of the viewer's
+    /// [`Participation`](crate::models::conversation::Participation) in
+    /// the DM thread this status belongs to, as the hyphenated lowercase
+    /// `UUIDv7` text (decision 4), or `null` — the value of the same
+    /// [`participation_ids`](crate::models::conversation::participation_ids)
+    /// read the batch runs per page, keyed to the row's
+    /// [`direct_conversation_id`](StatusRow::direct_conversation_id). A
+    /// status of no DM thread, an anonymous viewer and a stranger to the
+    /// thread all render `null`; only a participant ever sees a value.
+    pub direct_conversation_id: Option<String>,
     /// `in_reply_to_account_acct`: the handle of the replied-to status's
     /// author as stored (decision 7), or `null` when this status answers
     /// nothing, or this instance does not know that author.
@@ -268,6 +280,15 @@ pub struct StatusSource<'a> {
     /// `struct_excessive_bools`, so this flag rides the same [`JsonBool`]
     /// wrapper [`reblogged`](Self::reblogged) chose.
     pub muted: JsonBool,
+    /// The viewer's `conversation_participations` row for this row's DM
+    /// thread, `None` when the row belongs to no thread or the viewer is
+    /// no participant: the value of the one
+    /// [`participation_ids`](crate::models::conversation::participation_ids)
+    /// read the batch runs for the page, keyed to the row's own
+    /// [`direct_conversation_id`](StatusRow::direct_conversation_id) and
+    /// answering `pleroma.direct_conversation_id`. An anonymous viewer has
+    /// no rows and so no participation.
+    pub direct_participation: Option<Uuid>,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
@@ -417,6 +438,7 @@ impl Status {
             bookmark_folder,
             pinned_at,
             muted,
+            direct_participation,
             reblog,
         } = source;
         Self {
@@ -464,6 +486,7 @@ impl Status {
                     pinned_at,
                     muted,
                     bookmark_folder,
+                    direct_participation,
                 },
             ),
         }
@@ -512,12 +535,12 @@ fn plain_text(row: &StatusRow) -> PlainText {
     PlainText { text_plain: text }
 }
 
-/// The three viewer facts the `pleroma` block renders, grouped because
+/// The four viewer facts the `pleroma` block renders, grouped because
 /// there are more than [`pleroma_block`] could take beside the row, its
 /// replied-to author and its reactions (decision 14's five-argument limit).
 ///
 /// Each is the batch's one read per fact, keyed to the row: [`StatusSource`]'s
-/// `pinned_at`, `muted` and `bookmark_folder`.
+/// `pinned_at`, `muted`, `bookmark_folder` and `direct_participation`.
 #[derive(Debug)]
 struct BlockViewer {
     /// When the viewer pinned the row, `None` while they have pinned
@@ -529,6 +552,9 @@ struct BlockViewer {
     /// The folder the viewer's bookmark files the row in, `None` when the
     /// bookmark is unfiled or there is none.
     bookmark_folder: Option<Uuid>,
+    /// The viewer's `conversation_participations` row for the row's DM
+    /// thread, `None` when they are no participant or there is no thread.
+    direct_participation: Option<Uuid>,
 }
 
 /// Builds the `pleroma` block of `row`, whose replied-to author is
@@ -546,6 +572,7 @@ fn pleroma_block(
         pinned_at,
         muted,
         bookmark_folder,
+        direct_participation,
     } = viewer;
     PleromaMetadata {
         content: plain_text(row),
@@ -553,7 +580,7 @@ fn pleroma_block(
             text_plain: row.spoiler_text.clone(),
         },
         conversation_id: row.conversation_id.to_string(),
-        direct_conversation_id: None,
+        direct_conversation_id: direct_participation.map(|id| id.to_string()),
         in_reply_to_account_acct: reply_author.map(|author| author.nickname.clone()),
         local: JsonBool(row.local),
         expires_at: row.expires_at,
@@ -747,6 +774,7 @@ mod tests {
             in_reply_to_account_id: None,
             in_reply_to_ap_id: None,
             conversation_id: id,
+            direct_conversation_id: None,
             reblog_of_id: None,
             quote_of_id: None,
             local: true,
@@ -929,6 +957,7 @@ mod tests {
             bookmark_folder: parts.bookmark_folder,
             pinned_at: parts.pinned_at,
             muted: parts.muted.clone(),
+            direct_participation: None,
             reblog: reblog.map(Box::new),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
@@ -953,6 +982,7 @@ mod tests {
                 bookmark_folder: None,
                 pinned_at: None,
                 muted: JsonBool(false),
+                direct_participation: None,
                 reblog: None,
             },
             None,

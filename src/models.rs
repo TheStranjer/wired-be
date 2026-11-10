@@ -22,6 +22,7 @@ pub mod block;
 pub mod bookmark;
 pub mod bookmark_folder;
 pub mod chat;
+pub mod conversation;
 pub mod conversation_mute;
 pub mod custom_emoji;
 pub mod domain_block;
