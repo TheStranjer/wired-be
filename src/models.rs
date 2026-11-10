@@ -11,10 +11,12 @@
 //! each later flag table as its ticket lands); [`status_visibility`] owns
 //! no table either — it is the single statement of the who-may-see-a-status
 //! rules, reading `statuses` beside `follows`, `status_mentions` and
-//! `blocks`. Nothing here
-//! knows about HTTP, though every fallible function returns
-//! [`AppError`](crate::error::AppError), the crate's single error type, so
-//! handlers can use `?`.
+//! `blocks`. And one more follows the rule with a twist:
+//! [`scheduled_status`] owns a single table but keeps its payload as opaque
+//! `jsonb` — the create-status params as received — for a later slice to
+//! replay. Nothing here knows about HTTP, though every fallible function
+//! returns [`AppError`](crate::error::AppError), the crate's single error
+//! type, so handlers can use `?`.
 
 pub mod account_note;
 pub mod announcement;
@@ -54,6 +56,7 @@ pub mod password_reset;
 pub mod pinned_status;
 pub mod relationship;
 pub mod report;
+pub mod scheduled_status;
 pub mod scrobble;
 pub mod status;
 pub mod status_edit;
