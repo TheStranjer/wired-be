@@ -52,7 +52,13 @@
 //! `status_hashtags`, the posting client recorded as its application, the
 //! author's `statuses_count` stepped, and the whole thing answered as the
 //! `Status` entity the author themselves sees — from a JSON or a form body
-//! alike.
+//! alike. A body may also name a status to quote under `quote_id` (Pleroma's
+//! `quoted_status_id` alias accepted): the target must be live and visible to
+//! the poster — a malformed, unknown, deleted or unseen one is the shared
+//! 404 — and public or unlisted unless it is the poster's own, and the stored
+//! row carries the quotable original's id (a reblog target resolves through
+//! to what it boosts) with the original's `quotes_count` stepped by the
+//! insert.
 //!
 //! `DELETE /api/v1/statuses/{id}` (WBE-79) is Pleroma's `delete`: a user
 //! token with `write:statuses`, on the same `statuses_actions` bucket the
@@ -1742,6 +1748,9 @@ const OVER_LIMIT: &str = "The status is over the character limit";
 const BAD_VISIBILITY: &str = "Invalid visibility";
 /// 422 body for a `content_type` outside the three advertised formats.
 const BAD_CONTENT_TYPE: &str = "Invalid content_type";
+/// 422 body for quoting a status the poster may see but may not quote —
+/// somebody else's `private`, `direct` or `local` post.
+const QUOTE_NOT_ALLOWED: &str = "You can only quote public or unlisted statuses";
 
 /// `POST /api/v1/statuses` with the JSON `body` as `token` (`None`: no
 /// credential at all).
@@ -1881,6 +1890,10 @@ async fn a_minimal_post_creates_the_status_it_answers() {
             Visibility::Public
         ),
         "and the row holds what the body said"
+    );
+    assert!(
+        row.quote_of_id.is_none(),
+        "a body that names no quote stores no quote"
     );
 }
 
@@ -2479,6 +2492,202 @@ async fn a_form_body_posts_like_the_json_one() {
         off.json_value()["sensitive"],
         false,
         "`0` is the flag off, whatever the account defaults to"
+    );
+}
+
+/// A post naming a live, visible, quotable `quote_id` is stored as a quote
+/// of the original, and the original's `pleroma.quotes_count` answers the
+/// insert-time bump through the show route.
+#[tokio::test]
+async fn a_post_can_quote_a_public_status() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE_AND_READ).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let original = common::create_status(&pool, &bob, "quote me", Visibility::Public).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "look at this", "quote_id": original.id.to_string()}),
+    )
+    .await;
+    let row = created_row(&pool, &value).await;
+    assert_eq!(
+        row.quote_of_id,
+        Some(original.id),
+        "the quoting row carries the original's id"
+    );
+    assert_eq!(row.user_id, alice.id, "and the post is the caller's own");
+
+    let shown = show(&app, Some(&token), &original.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the quoted original");
+    assert_eq!(
+        shown.json_value()["pleroma"]["quotes_count"],
+        1,
+        "status::insert stepped the original's counter with the row"
+    );
+}
+
+/// Pleroma's older `quoted_status_id` key names the same target as
+/// `quote_id`, from a JSON body and from a form body alike (decision 10).
+#[tokio::test]
+async fn the_quoted_status_id_alias_names_the_same_quote() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let original = common::create_status(&pool, &bob, "quote me", Visibility::Unlisted).await;
+    let app = common::test_app(pool.clone());
+    let id = original.id.to_string();
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "alias quote", "quoted_status_id": &id}),
+    )
+    .await;
+    assert_eq!(
+        created_row(&pool, &value).await.quote_of_id,
+        Some(original.id),
+        "the alias is the same parameter under a different key"
+    );
+
+    let form = common::TestRequest::post(STATUSES)
+        .bearer(&token)
+        .form(&[("status", "form quote"), ("quote_id", id.as_str())])
+        .send(&app)
+        .await;
+    common::assert_answer(&form, StatusCode::OK, "a form body quoting a post");
+    assert_eq!(
+        created_row(&pool, &form.json_value()).await.quote_of_id,
+        Some(original.id),
+        "and the form spelling quotes it exactly the same way"
+    );
+}
+
+/// A `quote_id` naming nothing the poster may address is the shared 404:
+/// malformed text, an unknown id, a deleted target and a target the poster
+/// cannot see are indistinguishable from each other, and none of them
+/// posts.
+#[tokio::test]
+async fn an_unusable_quote_target_is_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let doomed = common::create_status(&pool, &bob, "doomed", Visibility::Public).await;
+    deleted(&pool, &doomed).await;
+    let secret = common::create_status(&pool, &carol, "not for you", Visibility::Private).await;
+    let app = common::test_app(pool.clone());
+
+    let doomed_id = doomed.id.to_string();
+    let secret_id = secret.id.to_string();
+    for id in [
+        "not-an-id",
+        UNKNOWN_ID,
+        doomed_id.as_str(),
+        secret_id.as_str(),
+    ] {
+        let response = publish(
+            &app,
+            Some(&token),
+            json!({"status": "quoting nothing", "quote_id": id}),
+        )
+        .await;
+        common::assert_answer(
+            &response,
+            StatusCode::NOT_FOUND,
+            &format!("quote target `{id}`"),
+        );
+        common::assert_error(&response, NOT_FOUND, &format!("quote target `{id}`"));
+    }
+    assert_eq!(
+        stored_count(&pool).await,
+        2,
+        "the two fixtures are all the table holds: no refusal wrote a row"
+    );
+}
+
+/// A target the poster may see but may not quote — somebody else's `private`
+/// post, as an accepted follower, and a `direct` addressed to the poster —
+/// is refused 422 in the pinned wording, where the poster's own `private`
+/// post is quotable.
+#[tokio::test]
+async fn only_public_and_unlisted_posts_may_be_quoted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    followed(&pool, &alice, &bob).await;
+    let private = common::create_status(&pool, &bob, "followers only", Visibility::Private).await;
+    let dm = direct_to(&pool, &bob, &alice).await;
+    let mine = common::create_status(&pool, &alice, "my own secret", Visibility::Private).await;
+    let app = common::test_app(pool.clone());
+
+    for target in [&private, &dm] {
+        refused(
+            &app,
+            &token,
+            json!({"status": "over my station", "quote_id": target.id.to_string()}),
+            QUOTE_NOT_ALLOWED,
+        )
+        .await;
+    }
+    assert_eq!(stored_count(&pool).await, 3, "both 422s wrote nothing");
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "quoting myself", "quote_id": mine.id.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        created_row(&pool, &value).await.quote_of_id,
+        Some(mine.id),
+        "an author may quote their own private post"
+    );
+}
+
+/// A `quote_id` naming a reblog row quotes through to the original it
+/// boosts: the stored id is the original's, the original's counter steps,
+/// and the reblog row stays uncounted.
+#[tokio::test]
+async fn quoting_a_reblog_stores_the_original_it_boosts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE_AND_READ).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let original = common::create_status(&pool, &carol, "the source", Visibility::Public).await;
+    let boost = reblog_of(&pool, &bob, &original).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "quoting a boost", "quote_id": boost.id.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        created_row(&pool, &value).await.quote_of_id,
+        Some(original.id),
+        "the quote links the original, not the boost row"
+    );
+    assert_eq!(
+        stored(&pool, boost.id).await.quotes_count,
+        0,
+        "the reblog row counts no quotes of its own"
+    );
+
+    let shown = show(&app, Some(&token), &original.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the quoted original");
+    assert_eq!(
+        shown.json_value()["pleroma"]["quotes_count"],
+        1,
+        "the original takes the bump"
     );
 }
 
