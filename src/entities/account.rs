@@ -52,8 +52,10 @@ const GROUP_ACTOR_TYPE: &str = "Group";
 
 /// Path appended to [`Config::base_url`] for the default avatar, matching
 /// Pleroma's `[:assets, :default_user_avatar]` fallback
-/// (`lib/pleroma/user.ex`, `avatar_url/2`).
-const DEFAULT_AVATAR_PATH: &str = "/images/avi.png";
+/// (`lib/pleroma/user.ex`, `avatar_url/2`). Crate-visible because the
+/// `push.deliver` job renders the same fallback into a payload's `icon`
+/// (see [`crate::jobs::web_push`]).
+pub(crate) const DEFAULT_AVATAR_PATH: &str = "/images/avi.png";
 
 /// Path appended to [`Config::base_url`] for the default banner, matching
 /// Pleroma's `banner_url/2` fallback.

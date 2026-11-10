@@ -255,6 +255,29 @@ pub async fn get_valid_token(
     Ok(Some((found, user)))
 }
 
+/// The `SELECT` behind [`get_by_id`]: the token row verbatim by primary
+/// key — no validity filter, because the caller (the `push.deliver` job)
+/// reads the token string a subscription was registered for, expiry or not.
+const GET_BY_ID_SQL: &str = "SELECT * FROM oauth_tokens WHERE id = $1";
+
+/// The access token row with id `id`, `None` when it is gone.
+///
+/// The [`push.deliver` job](crate::jobs::web_push) reads the token string
+/// the payload carries through its subscription's `token_id`; the foreign
+/// key's cascade means a live subscription normally has one.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<OauthToken>> {
+    let row = sqlx::query_as::<_, OauthToken>(GET_BY_ID_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
 /// The `SELECT` behind [`get_with_app`]: the `oauth_tokens` row
 /// verbatim, then every `oauth_apps` column but its `id` aliased under
 /// an `app_` prefix — the two tables share `scopes`, `user_id` and the
@@ -876,6 +899,42 @@ mod tests {
         assert!(
             (30..=70).contains(&remaining),
             "a one-minute ttl expires a minute out, got {remaining}s"
+        );
+    }
+
+    /// [`get_by_id`] hands back the row behind a primary key — an expired
+    /// one included, since the read is the push job's, not the auth
+    /// gate's — and `None` for an id nobody holds.
+    #[tokio::test]
+    async fn get_by_id_reads_the_stored_row_whatever_its_expiry() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let app = insert_app(&pool, "By-Id").await;
+        let created = create_token(&pool, &new_token(None, app.id)).await.unwrap();
+
+        let found = get_by_id(&pool, created.id).await.unwrap();
+        assert_eq!(
+            found.map(|row| (row.id, row.token)),
+            Some((created.id, created.token.clone())),
+            "the row reads back verbatim"
+        );
+
+        expire_token(&pool, created.id).await;
+        let stale = get_by_id(&pool, created.id)
+            .await
+            .unwrap()
+            .expect("an expired row is still the row behind the id");
+        assert_eq!(stale.token, created.token, "no validity filter applies");
+        assert!(
+            get_valid_token(&pool, &created.token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the validity read, by contrast, refuses it"
+        );
+        assert!(
+            get_by_id(&pool, new_id()).await.unwrap().is_none(),
+            "an unknown id names no token"
         );
     }
 

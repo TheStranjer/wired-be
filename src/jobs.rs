@@ -25,6 +25,7 @@ pub mod imports;
 pub mod mutes;
 pub mod scheduler;
 pub mod statuses;
+pub mod web_push;
 
 use std::{
     collections::HashMap, error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration,
