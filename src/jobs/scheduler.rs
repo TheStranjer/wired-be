@@ -114,6 +114,12 @@ pub fn bucket(now: DateTime<Utc>, every: Duration) -> i64 {
 /// makes that at most one row per job per period, from any number of app
 /// instances. Enqueue failures are logged, never fatal: the next tick
 /// retries the same period because no row claimed the key.
+///
+/// The shutdown is consulted even while a tick is in flight: one slow
+/// database round trip of an enqueue must not deafen the scheduler to the
+/// stop signal, so a shutdown that resolves mid-tick ends the loop at
+/// once — a half-issued period is exactly what the next tick's retry (or
+/// the next app instance) is for.
 pub async fn run<F>(pool: PgPool, jobs: Vec<PeriodicJob>, shutdown: F)
 where
     F: Future<Output = ()>,
@@ -133,7 +139,13 @@ where
         tokio::select! {
             biased;
             () = &mut shutdown => ticking = false,
-            _ = ticker.tick() => tick(&pool, &jobs, clock_now(wall, started)).await,
+            _ = ticker.tick() => {
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => ticking = false,
+                    () = tick(&pool, &jobs, clock_now(wall, started)) => {}
+                }
+            }
         }
     }
     debug!("periodic job scheduler stopped");
@@ -215,6 +227,22 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// Steps the hand-cranked clock a second at a time until two reads of
+    /// `kind`'s row count agree: the settled count after a scheduler run
+    /// whose last shutdown may have abandoned an in-flight enqueue whose
+    /// statement the server still lands.
+    async fn settle_count(pool: &PgPool, kind: &str, mut last: i64) -> i64 {
+        for _settle in 0..8 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let next = count_jobs(pool, kind).await;
+            if next == last {
+                break;
+            }
+            last = next;
+        }
+        last
     }
 
     #[test]
@@ -398,55 +426,74 @@ mod tests {
             every: Duration::from_secs(1),
         }];
 
-        // The first tick fires at once; the next lands only 10 s of virtual
-        // time later. Stepping 20 ms at a time wakes the shutdown future's
-        // poll on that rhythm — and the poll's own round trip is what hands
-        // the scheduler's inserts real time to land — while 900 steps still
-        // stop short of a third tick, so the finished scheduler holds
-        // exactly the two periods the keys below are asserted on.
-        let watched = pool.clone();
+        // The shutdown arrives from the test itself rather than from a
+        // database count the scheduler polls. Under a loaded suite the
+        // scheduler's enqueue round trips stall in real time while this
+        // hand-cranked virtual clock races ahead of them — one probe
+        // measured the first two periods landing at 13 s and 25 s of
+        // virtual time — so a fixed step budget could be too short for
+        // the second row and too generous for a third at once. Instead
+        // the loop below stops cranking the moment its own read sees two
+        // periods, and `run` hears the oneshot even with a tick handler
+        // in flight (its handler selects on the same shutdown), so the
+        // scheduler stops on the signal rather than on a race against
+        // the next tick boundary.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
         let scheduler = tokio::spawn(run(pool.clone(), jobs, async move {
-            wait_for_count(&watched, "heartbeat", 2).await;
+            let _closed = done_rx.await;
         }));
         let started = std::time::Instant::now();
         let mut steps = 0_u32;
-        while !scheduler.is_finished() {
+        let mut rows = 0_i64;
+        while rows < 2 && !scheduler.is_finished() {
             assert!(
-                steps < 900,
-                "the schedule never turned over a period: {steps} steps"
+                steps < 6000,
+                "the schedule never turned over a period: {steps} steps, {rows} row(s)"
             );
             assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "the scheduler wedged in real time"
+                started.elapsed() < Duration::from_secs(60),
+                "the scheduler wedged in real time at {rows} row(s)"
             );
             steps += 1;
             tokio::time::advance(Duration::from_millis(20)).await;
-            let _rows = count_jobs(&pool, "heartbeat").await;
+            rows = count_jobs(&pool, "heartbeat").await;
         }
+        let _sent: Result<(), ()> = done_tx.send(());
         scheduler
             .await
             .expect("the scheduler task ran to completion");
 
+        // A stopped handler's statement can already be at the server, so
+        // one straggler period may still land behind the shutdown; the
+        // assertions wait for the count to settle (two reads in a row
+        // that agree) rather than pinning it to an instant's snapshot.
+        let settled = settle_count(&pool, "heartbeat", rows).await;
+
         let keys = keys_for(&pool, "heartbeat").await;
-        assert_eq!(
-            keys.len(),
-            2,
-            "one row for the current period, one for a later one"
+        assert!(
+            keys.len() >= 2,
+            "one row for the current period and one for a later one: {keys:?}"
         );
         assert!(
-            keys[0].starts_with("periodic:heartbeat:")
-                && keys[1].starts_with("periodic:heartbeat:"),
-            "both rows carry the ticket's key prefix: {keys:?}"
+            keys.iter()
+                .all(|key| key.starts_with("periodic:heartbeat:")),
+            "every row carries the ticket's key prefix: {keys:?}"
         );
-        assert_ne!(keys[0], keys[1], "the two rows come from different buckets");
+        assert_ne!(
+            keys.first(),
+            keys.last(),
+            "the periods turned over: {keys:?}"
+        );
 
-        // `run` returned when the shutdown future resolved; 60 more seconds
-        // of virtual time (six tick periods) prove nothing keeps ticking
-        // behind it.
+        // `run` returned when the shutdown resolved; 60 more seconds of
+        // virtual time (six tick periods) prove nothing keeps ticking
+        // behind it: a live scheduler adds rows on every boundary and the
+        // re-settle outgrows the settled count, while the one straggler a
+        // stopped handler could still land is already absorbed by it.
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(
-            count_jobs(&pool, "heartbeat").await,
-            2,
+            settle_count(&pool, "heartbeat", settled).await,
+            settled,
             "the scheduler stopped with its shutdown"
         );
 
@@ -462,22 +509,6 @@ mod tests {
         // time handshake against sqlx's virtual 30 s acquire timeout, the
         // cleanup would time out, and the test database would leak.
         tokio::time::resume();
-    }
-
-    /// Resolves once `kind` has at least `want` rows.
-    ///
-    /// The polls park on short virtual sleeps, which the driving test steps
-    /// forward; the deadline is a real-time guard, which is what watches a
-    /// paused runtime for a scheduler that never ticks.
-    async fn wait_for_count(pool: &PgPool, kind: &str, want: i64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while count_jobs(pool, kind).await < want {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{kind} rows never reached {want}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
     }
 
     #[tokio::test]

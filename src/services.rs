@@ -43,6 +43,14 @@
 //! the viewer's block/mute/domain-block/thread-mute exclusions and the
 //! visibility clause into a single keyset-paged statement.
 //!
+//! [`streaming`] is the audience side of the streaming bus: for a stored
+//! status and its author it computes the hub stream names the event would
+//! ride (`public`, `user:<uuid>`, `list:<uuid>`, `hashtag:<tag>`, …), the
+//! [`Audience`](crate::streaming::hub::Audience) that gates its delivery
+//! and the local-only flag, so the publishing slice that hands the event to
+//! [`Hub::publish`](crate::streaming::hub::Hub::publish) never re-decides
+//! who may see what.
+//!
 //! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
@@ -57,6 +65,7 @@ pub mod media_proxy;
 pub mod mentions;
 pub mod notify;
 pub mod render_status;
+pub mod streaming;
 pub mod timeline;
 pub mod translate;
 pub mod vapid;
