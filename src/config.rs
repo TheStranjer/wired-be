@@ -36,6 +36,15 @@ pub const MAX_STATUS_CHARS_VAR: &str = "MAX_STATUS_CHARS";
 pub const MAX_MEDIA_ATTACHMENTS_VAR: &str = "MAX_MEDIA_ATTACHMENTS";
 /// Environment variable holding the maximum options per poll.
 pub const MAX_POLL_OPTIONS_VAR: &str = "MAX_POLL_OPTIONS";
+/// Environment variable holding the maximum length of one poll option in
+/// characters.
+pub const MAX_POLL_OPTION_CHARS_VAR: &str = "MAX_POLL_OPTION_CHARS";
+/// Environment variable holding the shortest poll `poll[expires_in]`, in
+/// seconds.
+pub const MIN_POLL_EXPIRATION_VAR: &str = "MIN_POLL_EXPIRATION";
+/// Environment variable holding the longest poll `poll[expires_in]`, in
+/// seconds.
+pub const MAX_POLL_EXPIRATION_VAR: &str = "MAX_POLL_EXPIRATION";
 /// Environment variable holding the maximum chat message length in
 /// characters.
 pub const MAX_CHAT_MESSAGE_CHARS_VAR: &str = "MAX_CHAT_MESSAGE_CHARS";
@@ -240,6 +249,28 @@ pub const DEFAULT_MAX_STATUS_CHARS: usize = 5000;
 pub const DEFAULT_MAX_MEDIA_ATTACHMENTS: usize = 4;
 /// Poll option limit used when `MAX_POLL_OPTIONS` is unset.
 pub const DEFAULT_MAX_POLL_OPTIONS: usize = 20;
+/// Poll option length used when `MAX_POLL_OPTION_CHARS` is unset.
+///
+/// Pleroma's `[:instance, :poll_limits, :max_option_chars]` ships as 200;
+/// `POST /api/v1/statuses` refuses a poll carrying an empty option or an
+/// option longer than this with 422 `{"error":"Poll options cannot be longer
+/// than 200 characters"}` (the message names this value).
+pub const DEFAULT_MAX_POLL_OPTION_CHARS: usize = 200;
+/// Shortest poll expiration used when `MIN_POLL_EXPIRATION` is unset.
+///
+/// The 300 seconds the parent ticket fixes for
+/// `[:instance, :poll_limits, :min_expiration]` (Pleroma's own shipped
+/// literal is `0`); `POST /api/v1/statuses` refuses a shorter
+/// `poll[expires_in]` with 422 `{"error":"Expiration date is too soon"}`.
+pub const DEFAULT_MIN_POLL_EXPIRATION: usize = 300;
+/// Longest poll expiration used when `MAX_POLL_EXPIRATION` is unset.
+///
+/// The `31_536_000` seconds (one year) the parent ticket fixes over Pleroma's
+/// `[:instance, :poll_limits, :max_expiration]` literal `365 * 24 * 60 * 60`,
+/// which is the same number; `POST /api/v1/statuses` refuses a longer
+/// `poll[expires_in]` with 422 `{"error":"Expiration date is too far in the
+/// future"}`.
+pub const DEFAULT_MAX_POLL_EXPIRATION: usize = 31_536_000;
 /// Chat message length used when `MAX_CHAT_MESSAGE_CHARS` is unset.
 ///
 /// The 5000 characters of Pleroma's `[:instance, :chat_limit]` default —
@@ -297,6 +328,14 @@ pub const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 16_000_000;
 /// Upload file count used when `UPLOAD_MAX_FILES` is unset: Pleroma's
 /// `:upload, max_number_of_files`.
 pub const DEFAULT_UPLOAD_MAX_FILES: usize = 16;
+/// The two upload defaults together as an [`UploadLimits`], spelled once
+/// for [`Config::test_defaults`]'s literal; the real read of the same
+/// pair is the `upload_settings` function.
+#[cfg(any(test, feature = "integration-tests"))]
+const TEST_UPLOAD_LIMITS: UploadLimits = UploadLimits {
+    max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
+    max_files: DEFAULT_UPLOAD_MAX_FILES,
+};
 /// Avatar image size used when `AVATAR_LIMIT_BYTES` is unset.
 ///
 /// Pleroma's `[:avatar, :limit]` `[size: 2_000_000]`:
@@ -817,6 +856,21 @@ pub struct Config {
     pub max_media_attachments: usize,
     /// Maximum number of options per poll.
     pub max_poll_options: usize,
+    /// Maximum length of one poll option in characters, from
+    /// `MAX_POLL_OPTION_CHARS`; `POST /api/v1/statuses` refuses a poll
+    /// carrying an empty option or an option longer than this with 422
+    /// `{"error":"Poll options cannot be longer than <n> characters"}` (the
+    /// message names this value).
+    pub max_poll_option_chars: usize,
+    /// Shortest poll expiration, in seconds, from `MIN_POLL_EXPIRATION`;
+    /// `POST /api/v1/statuses` refuses a poll whose `poll[expires_in]` is
+    /// shorter with 422 `{"error":"Expiration date is too soon"}`.
+    pub min_poll_expiration_secs: usize,
+    /// Longest poll expiration, in seconds, from `MAX_POLL_EXPIRATION`;
+    /// `POST /api/v1/statuses` refuses a poll whose `poll[expires_in]` is
+    /// longer with 422 `{"error":"Expiration date is too far in the
+    /// future"}`.
+    pub max_poll_expiration_secs: usize,
     /// Maximum length of a chat message in characters, from
     /// `MAX_CHAT_MESSAGE_CHARS`; `POST /api/v1/pleroma/chats/{id}/messages`
     /// refuses longer content.
@@ -1044,10 +1098,8 @@ impl Config {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let database_url = required_var(&lookup, DATABASE_URL_VAR)?;
+        let (database_url, base_url) = required_settings(&lookup)?;
         let bind_addr = listen_addr(&lookup)?;
-        let base_url_raw = required_var(&lookup, BASE_URL_VAR)?;
-        let base_url = normalize_base_url(&base_url_raw)?;
         let profile = instance_profile(&lookup);
         let limits = content_limits(&lookup)?;
         let text = text_length_limits(&lookup)?;
@@ -1073,6 +1125,9 @@ impl Config {
             max_status_chars: limits.status_chars,
             max_media_attachments: limits.media_attachments,
             max_poll_options: limits.poll_options,
+            max_poll_option_chars: limits.poll_option_chars,
+            min_poll_expiration_secs: limits.min_poll_expiration_secs,
+            max_poll_expiration_secs: limits.max_poll_expiration_secs,
             max_chat_message_chars: limits.chat_message_chars,
             max_media_description: text.media_description,
             max_display_name_chars: text.display_name_chars,
@@ -1210,6 +1265,9 @@ impl Config {
             max_status_chars: DEFAULT_MAX_STATUS_CHARS,
             max_media_attachments: DEFAULT_MAX_MEDIA_ATTACHMENTS,
             max_poll_options: DEFAULT_MAX_POLL_OPTIONS,
+            max_poll_option_chars: DEFAULT_MAX_POLL_OPTION_CHARS,
+            min_poll_expiration_secs: DEFAULT_MIN_POLL_EXPIRATION,
+            max_poll_expiration_secs: DEFAULT_MAX_POLL_EXPIRATION,
             max_chat_message_chars: DEFAULT_MAX_CHAT_MESSAGE_CHARS,
             max_media_description: DEFAULT_MAX_MEDIA_DESCRIPTION,
             max_display_name_chars: DEFAULT_MAX_DISPLAY_NAME_CHARS,
@@ -1219,10 +1277,7 @@ impl Config {
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             max_pinned_statuses: DEFAULT_MAX_PINNED_STATUSES,
             min_expiration_secs: DEFAULT_MIN_EXPIRATION_SECS,
-            upload_limits: UploadLimits {
-                max_file_bytes: DEFAULT_UPLOAD_LIMIT_BYTES,
-                max_files: DEFAULT_UPLOAD_MAX_FILES,
-            },
+            upload_limits: TEST_UPLOAD_LIMITS,
             avatar_limit_bytes: DEFAULT_AVATAR_LIMIT_BYTES,
             banner_limit_bytes: DEFAULT_BANNER_LIMIT_BYTES,
             inbox_max_bytes: DEFAULT_INBOX_MAX_BYTES,
@@ -1278,6 +1333,25 @@ impl Config {
             },
         }
     }
+}
+
+/// Reads the two required settings together: the `DATABASE_URL` text and
+/// the `BASE_URL` value normalized to its bare origin. Grouped because
+/// both are plain `required_var` reads and [`Config::from_lookup`] has a
+/// size budget (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Missing`] when either variable is unset or
+/// blank, and [`ConfigError::InvalidBaseUrl`] when `BASE_URL` names no
+/// origin.
+fn required_settings<F>(lookup: &F) -> Result<(String, String), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let database_url = required_var(lookup, DATABASE_URL_VAR)?;
+    let base_url_raw = required_var(lookup, BASE_URL_VAR)?;
+    Ok((database_url, normalize_base_url(&base_url_raw)?))
 }
 
 /// Validates a `BASE_URL` value and normalizes it to the bare origin with no
@@ -1655,10 +1729,11 @@ where
     ))
 }
 
-/// What [`content_limits`] reads: the four plain numeric content limits,
+/// What [`content_limits`] reads: the seven plain numeric content limits,
 /// named by what they cap and hung on the [`Config`] fields in
 /// [`Config::from_lookup`] (`MAX_STATUS_CHARS`, `MAX_MEDIA_ATTACHMENTS`,
-/// `MAX_POLL_OPTIONS`, `MAX_CHAT_MESSAGE_CHARS`).
+/// `MAX_POLL_OPTIONS`, `MAX_POLL_OPTION_CHARS`, `MIN_POLL_EXPIRATION`,
+/// `MAX_POLL_EXPIRATION`, `MAX_CHAT_MESSAGE_CHARS`).
 #[derive(Debug)]
 struct ContentLimits {
     /// The maximum status length (`MAX_STATUS_CHARS`).
@@ -1667,16 +1742,24 @@ struct ContentLimits {
     media_attachments: usize,
     /// The poll option count (`MAX_POLL_OPTIONS`).
     poll_options: usize,
+    /// The poll option length (`MAX_POLL_OPTION_CHARS`).
+    poll_option_chars: usize,
+    /// The shortest poll expiration, in seconds (`MIN_POLL_EXPIRATION`).
+    min_poll_expiration_secs: usize,
+    /// The longest poll expiration, in seconds (`MAX_POLL_EXPIRATION`).
+    max_poll_expiration_secs: usize,
     /// The chat message length (`MAX_CHAT_MESSAGE_CHARS`).
     chat_message_chars: usize,
 }
 
-/// Reads the four plain numeric content limits: the maximum status length
+/// Reads the seven plain numeric content limits: the maximum status length
 /// (`MAX_STATUS_CHARS`), the media attachment count
-/// (`MAX_MEDIA_ATTACHMENTS`), the poll option count (`MAX_POLL_OPTIONS`)
-/// and the chat message length (`MAX_CHAT_MESSAGE_CHARS`). Grouped because
-/// each is the same `number` read and [`Config::from_lookup`] has a size
-/// budget (AGENTS.md).
+/// (`MAX_MEDIA_ATTACHMENTS`), the poll option count (`MAX_POLL_OPTIONS`),
+/// the poll option length (`MAX_POLL_OPTION_CHARS`), the shortest
+/// (`MIN_POLL_EXPIRATION`) and longest (`MAX_POLL_EXPIRATION`) poll
+/// expiration and the chat message length (`MAX_CHAT_MESSAGE_CHARS`).
+/// Grouped because each is the same `number` read and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1694,6 +1777,21 @@ where
             DEFAULT_MAX_MEDIA_ATTACHMENTS,
         )?,
         poll_options: number(lookup, MAX_POLL_OPTIONS_VAR, DEFAULT_MAX_POLL_OPTIONS)?,
+        poll_option_chars: number(
+            lookup,
+            MAX_POLL_OPTION_CHARS_VAR,
+            DEFAULT_MAX_POLL_OPTION_CHARS,
+        )?,
+        min_poll_expiration_secs: number(
+            lookup,
+            MIN_POLL_EXPIRATION_VAR,
+            DEFAULT_MIN_POLL_EXPIRATION,
+        )?,
+        max_poll_expiration_secs: number(
+            lookup,
+            MAX_POLL_EXPIRATION_VAR,
+            DEFAULT_MAX_POLL_EXPIRATION,
+        )?,
         chat_message_chars: number(
             lookup,
             MAX_CHAT_MESSAGE_CHARS_VAR,
@@ -2172,6 +2270,9 @@ impl fmt::Debug for Config {
             .field("max_status_chars", &self.max_status_chars)
             .field("max_media_attachments", &self.max_media_attachments)
             .field("max_poll_options", &self.max_poll_options)
+            .field("max_poll_option_chars", &self.max_poll_option_chars)
+            .field("min_poll_expiration_secs", &self.min_poll_expiration_secs)
+            .field("max_poll_expiration_secs", &self.max_poll_expiration_secs)
             .field("max_chat_message_chars", &self.max_chat_message_chars)
             .field("max_media_description", &self.max_media_description)
             .field("max_display_name_chars", &self.max_display_name_chars)
@@ -2990,6 +3091,66 @@ mod tests {
         assert!(
             debug.contains("min_expiration_secs: 120"),
             "the expiration floor is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The poll option length cap: Pleroma's 200 characters by default, the
+    /// environment overriding it, and `Debug` showing the value.
+    #[test]
+    fn reads_custom_max_poll_option_chars() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.max_poll_option_chars, 200,
+            "default MAX_POLL_OPTION_CHARS"
+        );
+
+        let config = config_with(&[(MAX_POLL_OPTION_CHARS_VAR, "50")]);
+        assert_eq!(
+            config.max_poll_option_chars, 50,
+            "custom MAX_POLL_OPTION_CHARS"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("max_poll_option_chars: 50"),
+            "the poll option length cap is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The two poll expiration bounds: the 300-second floor and the
+    /// 31_536_000-second (one-year) ceiling by default, the environment
+    /// overriding each, and `Debug` showing both.
+    #[test]
+    fn reads_custom_poll_expiration_bounds() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.min_poll_expiration_secs, 300,
+            "default MIN_POLL_EXPIRATION"
+        );
+        assert_eq!(
+            defaults.max_poll_expiration_secs, 31_536_000,
+            "default MAX_POLL_EXPIRATION"
+        );
+
+        let config = config_with(&[
+            (MIN_POLL_EXPIRATION_VAR, "60"),
+            (MAX_POLL_EXPIRATION_VAR, "86400"),
+        ]);
+        assert_eq!(
+            config.min_poll_expiration_secs, 60,
+            "custom MIN_POLL_EXPIRATION"
+        );
+        assert_eq!(
+            config.max_poll_expiration_secs, 86_400,
+            "custom MAX_POLL_EXPIRATION"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("min_poll_expiration_secs: 60"),
+            "the poll floor is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_poll_expiration_secs: 86400"),
+            "the poll ceiling is visible in Debug output: {debug}"
         );
     }
 
@@ -4296,6 +4457,9 @@ mod tests {
             MAX_STATUS_CHARS_VAR,
             MAX_MEDIA_ATTACHMENTS_VAR,
             MAX_POLL_OPTIONS_VAR,
+            MAX_POLL_OPTION_CHARS_VAR,
+            MIN_POLL_EXPIRATION_VAR,
+            MAX_POLL_EXPIRATION_VAR,
             MAX_CHAT_MESSAGE_CHARS_VAR,
             MAX_MEDIA_DESCRIPTION_VAR,
             MAX_DISPLAY_NAME_CHARS_VAR,

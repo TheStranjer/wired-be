@@ -23,6 +23,9 @@ All configuration comes from environment variables. For local development, copy 
 | `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status; `POST /api/v1/statuses` counts them the way clients do (each bare URL is worth 23) and refuses a longer post with 422 `{"error":"The status is over the character limit"}` |
 | `MAX_MEDIA_ATTACHMENTS` | no | `4` | Maximum media attachments per status |
 | `MAX_POLL_OPTIONS` | no | `20` | Maximum options per poll |
+| `MAX_POLL_OPTION_CHARS` | no | `200` | Maximum characters in one poll option; `POST /api/v1/statuses` refuses a poll carrying an empty option or a longer one with 422 `{"error":"Poll options cannot be longer than 200 characters"}` (the message names this value) |
+| `MIN_POLL_EXPIRATION` | no | `300` | Shortest poll expiration (seconds); `POST /api/v1/statuses` refuses a poll whose `poll[expires_in]` is shorter with 422 `{"error":"Expiration date is too soon"}` |
+| `MAX_POLL_EXPIRATION` | no | `31536000` | Longest poll expiration (seconds, one year); `POST /api/v1/statuses` refuses a poll whose `poll[expires_in]` is longer with 422 `{"error":"Expiration date is too far in the future"}` |
 | `MAX_CHAT_MESSAGE_CHARS` | no | `5000` | Maximum characters per chat message; longer posted content is refused with 400 |
 | `MAX_MEDIA_DESCRIPTION` | no | `1500` | Maximum characters in a media attachment's description (alt text); `PUT /api/v1/media/{id}` refuses longer values with 422 |
 | `MAX_DISPLAY_NAME_CHARS` | no | `50` | Maximum characters in an account display name; `PATCH /api/v1/accounts/update_credentials` refuses a longer `display_name` with 422 |

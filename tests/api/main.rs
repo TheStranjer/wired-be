@@ -186,6 +186,11 @@ mod pleroma_settings;
 /// Pinned statuses (`/api/v1/statuses/{id}/pin` and its `…/unpin` twin).
 mod pins;
 
+/// Poll parameters on `POST /api/v1/statuses`: the `CommonAPI` poll rules,
+/// the empty-text skip, the form nesting — and the `poll: null` answer
+/// while storage is still a later ticket.
+mod polls;
+
 /// Web Push subscriptions (`/api/v1/push/subscription`) and the VAPID key
 /// the app and instance responses advertise.
 mod push;
