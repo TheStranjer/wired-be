@@ -1050,6 +1050,8 @@ mod tests {
             event: "update".to_owned(),
             payload: Some(payload.to_owned()),
             audience: Audience::Public,
+            render: None,
+            local_only: false,
         }
     }
 

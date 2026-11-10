@@ -287,6 +287,8 @@ fn event_on(streams: &[&str], marker: &str, audience: Audience) -> StreamEvent {
         event: "update".to_owned(),
         payload: Some(format!(r#"{{"id":"{marker}"}}"#)),
         audience,
+        render: None,
+        local_only: false,
     }
 }
 

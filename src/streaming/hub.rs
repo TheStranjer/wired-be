@@ -83,6 +83,30 @@ pub enum Audience {
     Everyone,
 }
 
+/// Which entity a [`StreamEvent`] points at by id, so a client may render
+/// it after fetching the body through the API instead of receiving the
+/// body on the socket.
+///
+/// Pleroma's streamer sends this (its `render` push field) in place of the
+/// entity when the payload must not ride to every listener of the stream.
+/// Nothing publishes one yet, and the streaming WebSocket endpoint keeps
+/// ignoring [`StreamEvent::render`] until the slice that adopts it.
+///
+/// The variants serialize to `{"status": "<uuid>"}`,
+/// `{"notification": "<uuid>"}` and `{"chat": "<uuid>"}`: `snake_case`
+/// tags, like [`Audience`]'s wire forms, so the value rides the JSON
+/// envelope unchanged.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderSpec {
+    /// The event points at the status with this id.
+    Status(Uuid),
+    /// The event points at the notification with this id.
+    Notification(Uuid),
+    /// The event points at the chat message with this id.
+    Chat(Uuid),
+}
+
 /// One event on the streaming bus, in the shape a Mastodon streaming
 /// client receives it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +127,15 @@ pub struct StreamEvent {
     pub payload: Option<String>,
     /// Who the event is for; see [`Audience`].
     pub audience: Audience,
+    /// The event's render hint: the entity to fetch by id when the body
+    /// does not ride the socket (see [`RenderSpec`]). `None` for ordinary
+    /// entity pushes; an event may carry `render`, `payload`, or neither.
+    pub render: Option<RenderSpec>,
+    /// Whether the event concerns this instance's local users and entities
+    /// only (Pleroma's `local_only` push flag). Nothing consults it yet:
+    /// the WebSocket endpoint keeps sending `payload` and ignores both
+    /// this and [`render`](Self::render) until a later slice.
+    pub local_only: bool,
 }
 
 /// Whether a connection subscribed to the streams in `subscribed` should
@@ -251,9 +284,12 @@ impl From<sqlx::Error> for BridgeError {
     }
 }
 
-/// The JSON envelope `NOTIFY` carries: a [`StreamEvent`] with its payload
-/// either inline (the JSON string itself, or `null`), or replaced by a
+/// The JSON envelope `NOTIFY` carries: a [`StreamEvent`]'s `streams`,
+/// `event`, `audience`, `render` and `local_only`, with its `payload`
+/// either inline (the JSON string itself, or `null`) or replaced by a
 /// `{"ref": "<uuid>"}` object naming a `stream_event_payloads` row.
+/// `render` and `local_only` default when absent, so envelopes written
+/// before those fields existed still parse.
 #[derive(Debug, Deserialize, Serialize)]
 struct Envelope {
     /// The id of the process that published this envelope.
@@ -267,6 +303,12 @@ struct Envelope {
     payload: Value,
     /// [`StreamEvent::audience`].
     audience: Audience,
+    /// [`StreamEvent::render`]; [`None`] for envelopes that predate it.
+    #[serde(default)]
+    render: Option<RenderSpec>,
+    /// [`StreamEvent::local_only`]; `false` for envelopes that predate it.
+    #[serde(default)]
+    local_only: bool,
 }
 
 impl Envelope {
@@ -278,6 +320,8 @@ impl Envelope {
             event: event.event.clone(),
             payload: event.payload.clone().map_or(Value::Null, Value::String),
             audience: event.audience.clone(),
+            render: event.render.clone(),
+            local_only: event.local_only,
         }
     }
 
@@ -307,6 +351,8 @@ impl Envelope {
             event: self.event,
             payload,
             audience: self.audience,
+            render: self.render,
+            local_only: self.local_only,
         }))
     }
 }
@@ -535,6 +581,8 @@ mod tests {
             event: "update".to_owned(),
             payload: Some(payload.to_owned()),
             audience: Audience::Public,
+            render: None,
+            local_only: false,
         }
     }
 
@@ -545,7 +593,35 @@ mod tests {
             event: "update".to_owned(),
             payload: None,
             audience: Audience::Public,
+            render: None,
+            local_only: false,
         }
+    }
+
+    /// A public `update` carrying a small entity plus `render` and
+    /// `local_only`.
+    fn render_event(render: RenderSpec, local_only: bool) -> StreamEvent {
+        StreamEvent {
+            render: Some(render),
+            local_only,
+            ..update_event(r#"{"id":"7"}"#)
+        }
+    }
+
+    /// The six `(render, local_only)` shapes the hub must thread through
+    /// the bridge: every [`RenderSpec`] variant with the flag on and off.
+    fn render_cases(id: Uuid) -> Vec<(RenderSpec, bool)> {
+        let mut cases = Vec::new();
+        for render in [
+            RenderSpec::Status(id),
+            RenderSpec::Notification(id),
+            RenderSpec::Chat(id),
+        ] {
+            for local_only in [true, false] {
+                cases.push((render.clone(), local_only));
+            }
+        }
+        cases
     }
 
     /// The shutdown future [`run_pg_listener`] accepts: resolves once
@@ -565,9 +641,13 @@ mod tests {
         (stop, task)
     }
 
-    /// Waits until `rx` yields an event whose payload is `want`, failing
-    /// the test past [`BRIDGE_WAIT`]; lagged reports are skipped over.
-    async fn await_payload(rx: &mut broadcast::Receiver<Arc<StreamEvent>>, want: &str) {
+    /// Waits until `rx` yields an event whose payload is `want` and hands
+    /// that event back, failing the test past [`BRIDGE_WAIT`]; lagged
+    /// reports are skipped over.
+    async fn await_payload(
+        rx: &mut broadcast::Receiver<Arc<StreamEvent>>,
+        want: &str,
+    ) -> Arc<StreamEvent> {
         let deadline = Instant::now() + BRIDGE_WAIT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -576,7 +656,7 @@ mod tests {
                 "the wait for payload {want:?} ran out of time"
             );
             match timeout(remaining, rx.recv()).await {
-                Ok(Ok(event)) if event.payload.as_deref() == Some(want) => return,
+                Ok(Ok(event)) if event.payload.as_deref() == Some(want) => return event,
                 Ok(Ok(_other)) => {}
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
                 Ok(Err(closed)) => panic!("the bus closed while waiting: {closed:?}"),
@@ -805,6 +885,25 @@ mod tests {
         assert_eq!(back, Audience::Users(vec![id]), "and reads back");
     }
 
+    #[test]
+    fn render_spec_serializes_to_its_wire_forms() {
+        let id = Uuid::now_v7();
+        for (spec, name) in [
+            (RenderSpec::Status(id), "status"),
+            (RenderSpec::Notification(id), "notification"),
+            (RenderSpec::Chat(id), "chat"),
+        ] {
+            let text = serde_json::to_string(&spec).unwrap();
+            assert_eq!(
+                text,
+                format!("{{\"{name}\":\"{id}\"}}"),
+                "{name} is a snake_case tag over the uuid"
+            );
+            let back: RenderSpec = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, spec, "and reads back");
+        }
+    }
+
     #[tokio::test]
     async fn an_inline_envelope_round_trips_without_the_database() {
         let hub = Hub::new(&lazy_pool());
@@ -828,6 +927,190 @@ mod tests {
             Some(&event),
             "an inline payload needs no reference-table read"
         );
+    }
+
+    /// Every [`RenderSpec`] variant with `local_only` on and off
+    /// round-trips publish to subscriber and through the envelope
+    /// serialize/deserialize pair — the inline wire form, the
+    /// reference-spill form read back from a leased test-database slot,
+    /// and [`Hub::ingest`]'s re-broadcast — and a real two-hub `NOTIFY`
+    /// crossing delivers the whole event.
+    #[tokio::test]
+    async fn render_and_local_only_ride_every_envelope_path() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hub = Hub::new(&pool);
+        let mut rx = hub.subscribe();
+
+        for (render, local_only) in render_cases(Uuid::now_v7()) {
+            let event = render_event(render, local_only);
+
+            hub.publish(event.clone());
+            let delivered = rx.recv().await.unwrap();
+            assert_eq!(
+                &*delivered, &event,
+                "publish hands the subscriber both new fields"
+            );
+
+            assert_envelope_round_trips(&pool, &hub, &mut rx, &event).await;
+        }
+    }
+
+    /// Asserts `event` survives the envelope pair on every path: inline
+    /// serialize/deserialize, re-broadcast through [`Hub::ingest`], and
+    /// the reference spill with its body stored in and read back from
+    /// `db`.
+    async fn assert_envelope_round_trips(
+        db: &PgPool,
+        hub: &Hub,
+        rx: &mut broadcast::Receiver<Arc<StreamEvent>>,
+        event: &StreamEvent,
+    ) {
+        let inline = Envelope::inline(Uuid::now_v7(), event);
+        let text = serde_json::to_string(&inline).unwrap();
+        assert!(
+            text.contains(r#""render":{"#),
+            "a render event writes its render key: {text}"
+        );
+        let parsed: Envelope = serde_json::from_str(&text).unwrap();
+        let back = parsed.into_stream_event(db).await.unwrap();
+        assert_eq!(
+            back.as_ref(),
+            Some(event),
+            "the inline path round-trips: {text}"
+        );
+
+        hub.ingest(&text).await;
+        let rebroadcast = rx.recv().await.unwrap();
+        assert_eq!(
+            &*rebroadcast, event,
+            "ingest re-broadcasts both new fields: {text}"
+        );
+
+        let reference = Uuid::now_v7();
+        store_payload(db, reference, event.payload.as_deref().unwrap())
+            .await
+            .unwrap();
+        let spilled = Envelope {
+            payload: json!({ "ref": reference.to_string() }),
+            ..inline
+        };
+        let spill_text = serde_json::to_string(&spilled).unwrap();
+        assert!(
+            spill_text.contains(r#""payload":{"ref":"#),
+            "the body left the envelope for the reference: {spill_text}"
+        );
+        let spill_parsed: Envelope = serde_json::from_str(&spill_text).unwrap();
+        let spill_back = spill_parsed.into_stream_event(db).await.unwrap();
+        assert_eq!(
+            spill_back.as_ref(),
+            Some(event),
+            "the reference path round-trips with the body read back: {spill_text}"
+        );
+    }
+
+    /// An envelope JSON written before the new fields — it simply lacks
+    /// the keys — still parses, and the event it describes carries
+    /// `render: None` and `local_only: false`.
+    #[tokio::test]
+    async fn an_envelope_without_the_new_keys_still_parses() {
+        // Build the old shape by taking a fresh inline envelope and
+        // deleting the two keys from its JSON object.
+        let mut legacy = serde_json::to_value(Envelope::inline(
+            Uuid::now_v7(),
+            &update_event(r#"{"id":"7"}"#),
+        ))
+        .unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        assert!(
+            object.remove("render").is_some() && object.remove("local_only").is_some(),
+            "an inline envelope writes both keys"
+        );
+        let text = serde_json::to_string(&legacy).unwrap();
+
+        let envelope: Envelope = serde_json::from_str(&text).unwrap();
+        let event = envelope
+            .into_stream_event(&lazy_pool())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.render, None, "an absent render key reads None");
+        assert!(!event.local_only, "an absent local_only key reads false");
+        assert_eq!(
+            event.payload.as_deref(),
+            Some(r#"{"id":"7"}"#),
+            "and the old members parse as before"
+        );
+    }
+
+    /// An event may carry `render`, `payload`, or neither: all four
+    /// combinations survive the envelope serialize/deserialize pair.
+    #[tokio::test]
+    async fn render_and_payload_are_independent_envelope_members() {
+        let entity = r#"{"id":"7"}"#.to_owned();
+        let spec = RenderSpec::Status(Uuid::now_v7());
+        for (payload, render) in [
+            (Some(entity.clone()), Some(spec.clone())),
+            (None, Some(spec.clone())),
+            (Some(entity.clone()), None),
+            (None, None),
+        ] {
+            let event = StreamEvent {
+                payload,
+                render,
+                ..event_on(&["public"])
+            };
+
+            let text = serde_json::to_string(&Envelope::inline(Uuid::now_v7(), &event)).unwrap();
+            let parsed: Envelope = serde_json::from_str(&text).unwrap();
+            let back = parsed.into_stream_event(&lazy_pool()).await.unwrap();
+
+            assert_eq!(
+                back.as_ref(),
+                Some(&event),
+                "this payload/render combination round-trips: {text}"
+            );
+        }
+    }
+
+    /// Both new fields cross a live two-hub `NOTIFY`: an event published
+    /// on hub A with a render spec and the local flag arrives complete on
+    /// hub B's bus.
+    #[tokio::test]
+    async fn render_and_local_only_cross_the_live_bridge() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hub_a = Hub::new(&pool);
+        let hub_b = Hub::new(&pool);
+        let (stop_a, task_a) = spawn_listener(&pool, &hub_a);
+        let (stop_b, task_b) = spawn_listener(&pool, &hub_b);
+        let mut rx_a = hub_a.subscribe();
+        let mut rx_b = hub_b.subscribe();
+        warm_up(&hub_a, &mut rx_b, "\"warm-a\"").await;
+        warm_up(&hub_b, &mut rx_a, "\"warm-b\"").await;
+        settle(&mut rx_a).await;
+        settle(&mut rx_b).await;
+
+        let event = render_event(RenderSpec::Notification(Uuid::now_v7()), true);
+        hub_a.publish(event.clone());
+
+        let arrived = await_payload(&mut rx_b, event.payload.as_deref().unwrap()).await;
+        assert_eq!(
+            &*arrived, &event,
+            "the far hub reassembles both new fields from the NOTIFY"
+        );
+
+        drop(stop_a);
+        drop(stop_b);
+        timeout(BRIDGE_WAIT, task_a)
+            .await
+            .expect("listener A stopped")
+            .expect("listener A did not panic");
+        timeout(BRIDGE_WAIT, task_b)
+            .await
+            .expect("listener B stopped")
+            .expect("listener B did not panic");
     }
 
     #[tokio::test]
@@ -879,6 +1162,8 @@ mod tests {
             event: "update".to_owned(),
             payload: Value::from(7),
             audience: Audience::Public,
+            render: None,
+            local_only: false,
         };
         let reference = Envelope {
             payload: json!({ "ref": Uuid::now_v7().to_string() }),
@@ -905,6 +1190,8 @@ mod tests {
             event: "update".to_owned(),
             payload: None,
             audience: Audience::Public,
+            render: None,
+            local_only: false,
         };
 
         let err = bridge_publish(&lazy_pool(), Uuid::now_v7(), &fat)
@@ -1001,7 +1288,7 @@ mod tests {
 
         hub_a.publish(update_event("\"final\""));
 
-        await_payload(&mut rx_b, "\"final\"").await;
+        let _final = await_payload(&mut rx_b, "\"final\"").await;
         assert_single_delivery(&mut rx_a, "\"final\"", "the origin").await;
 
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM stream_event_payloads")
@@ -1040,7 +1327,7 @@ mod tests {
         let big = format!(r#"{{"content":"{}"}}"#, "x".repeat(2 * MAX_NOTIFY_BYTES));
         hub_a.publish(update_event(&big));
 
-        await_payload(&mut rx_b, &big).await;
+        let _spilled = await_payload(&mut rx_b, &big).await;
         assert_single_delivery(&mut rx_a, &big, "the origin").await;
 
         let stored: Vec<String> = sqlx::query_scalar("SELECT payload FROM stream_event_payloads")
