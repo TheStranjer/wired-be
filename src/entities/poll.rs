@@ -22,9 +22,10 @@
 //!   [`voted_option_positions`](crate::models::poll::voted_option_positions);
 //!   a viewer who voted nothing gets `false` and `[]`.
 //!
-//! The entity is self-contained for now: [`Status::poll`](crate::entities::status::Status)
-//! keeps its `Option<Value>` placeholder of `None` until the status-wiring
-//! ticket connects the batch loader to this builder.
+//! The status-wiring ticket connected it: [`crate::services::render_status`]
+//! batch-loads the rows and the viewer's marks and hands the built entity
+//! to [`Status::poll`](crate::entities::status::Status), which renders it
+//! in its `poll` key (`null` for a status that carries none).
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;

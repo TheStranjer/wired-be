@@ -659,6 +659,7 @@ pub async fn preview_status(
             pinned_at: None,
             muted: JsonBool(false),
             reblog: None,
+            poll: None,
         },
         Some(user),
         None,

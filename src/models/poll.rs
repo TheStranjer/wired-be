@@ -30,7 +30,9 @@
 //! [`options`] for a poll's choices in order, and
 //! [`voted_option_positions`] — added by this ticket too — for the positions
 //! the viewer marked, which is the entity's `voted` flag and `own_votes`
-//! array.
+//! array. The render batch's page-shaped mates, [`options_for_statuses`] and
+//! [`votes_by_status`], answer the whole page with the same reads in one
+//! statement each, keyed by status id like [`for_statuses`].
 
 use std::collections::HashMap;
 
@@ -242,6 +244,62 @@ pub async fn options(pool: &PgPool, poll_id: Uuid) -> AppResult<Vec<PollOption>>
         .await?)
 }
 
+/// [`options_for_statuses`]: the options of a whole batch of statuses'
+/// polls in one walk. `poll_options` keys to the poll, not the status, so
+/// the statement joins through `polls` to reach the `status_id` the map is
+/// keyed by; `poll_id, position` order keeps each poll's choices together,
+/// lowest position first.
+const OPTIONS_FOR_STATUSES_SQL: &str = "SELECT o.id, o.poll_id, o.position, o.title,
+        o.votes_count, p.status_id
+   FROM poll_options o
+   JOIN polls p ON p.id = o.poll_id
+  WHERE p.status_id = ANY($1)
+  ORDER BY o.poll_id, o.position";
+
+/// The joined row of [`OPTIONS_FOR_STATUSES_SQL`]: one option with the
+/// status its poll belongs to, the key [`options_for_statuses`] groups by.
+#[derive(Debug, sqlx::FromRow)]
+struct OptionForStatusRow {
+    /// The status the option's poll belongs to, from the joined `polls`
+    /// row; the map key.
+    status_id: Uuid,
+    /// The option itself, from the `poll_options` row.
+    #[sqlx(flatten)]
+    option: PollOption,
+}
+
+/// Fetches the options of the poll of every status in `status_ids`, keyed
+/// by status and, within each entry, ordered by
+/// [`position`](PollOption::position).
+///
+/// Statuses that carry no poll get no entry in the map at all, and an
+/// empty `status_ids` yields an empty map — the batched mate of [`options`]
+/// in the shape [`for_statuses`] takes for the polls themselves: one query
+/// for a whole page of choices.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn options_for_statuses(
+    pool: &PgPool,
+    status_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<PollOption>>> {
+    let status_ids = status_ids.to_vec();
+    let rows = sqlx::query_as::<_, OptionForStatusRow>(OPTIONS_FOR_STATUSES_SQL)
+        .bind(&status_ids)
+        .fetch_all(pool)
+        .await?;
+    // Rows arrive grouped by poll (one poll per status) and ordered by
+    // position, so pushing in read order hands each entry its choices in
+    // the order voters see them.
+    let mut grouped: HashMap<Uuid, Vec<PollOption>> = HashMap::new();
+    for row in rows {
+        grouped.entry(row.status_id).or_default().push(row.option);
+    }
+    Ok(grouped)
+}
+
 /// [`voted_option_positions`]: one account's marks on one poll, walked through
 /// the primary key's `poll_id` lead and joined to `poll_options` because the
 /// answer is the option's `position`, not the row that stored the mark.
@@ -272,6 +330,50 @@ pub async fn voted_option_positions(
         .bind(user_id)
         .fetch_all(pool)
         .await?)
+}
+
+/// [`votes_by_status`]: one account's marks on the polls of a whole batch
+/// of statuses, walked from `poll_votes` through `poll_options` (for the
+/// position) and `polls` (for the status the map is keyed by). Ordering by
+/// status then position makes each entry of the grouped answer ascending,
+/// the same shape [`voted_option_positions`] answers in for one poll.
+const VOTES_BY_STATUS_SQL: &str = "SELECT p.status_id, o.position
+    FROM poll_votes v
+    JOIN poll_options o ON o.id = v.option_id
+    JOIN polls p ON p.id = v.poll_id
+   WHERE p.status_id = ANY($1) AND v.user_id = $2
+ORDER BY p.status_id, o.position";
+
+/// The positions `user_id` marked on the poll of every status in
+/// `status_ids`, keyed by status and ascending by position within each
+/// entry.
+///
+/// This is the batched mate of [`voted_option_positions`] — the render
+/// batch's one read behind every poll entity's `voted` flag and
+/// `own_votes` array. A status whose poll the viewer said nothing on (or
+/// that carries no poll) gets no entry in the map, and an empty
+/// `status_ids` yields an empty map; nobody's marks stay nobody's facts.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn votes_by_status(
+    pool: &PgPool,
+    status_ids: &[Uuid],
+    user_id: Uuid,
+) -> AppResult<HashMap<Uuid, Vec<i32>>> {
+    let status_ids = status_ids.to_vec();
+    let rows = sqlx::query_as::<_, (Uuid, i32)>(VOTES_BY_STATUS_SQL)
+        .bind(&status_ids)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    let mut grouped: HashMap<Uuid, Vec<i32>> = HashMap::new();
+    for (status_id, position) in rows {
+        grouped.entry(status_id).or_default().push(position);
+    }
+    Ok(grouped)
 }
 
 #[cfg(test)]
@@ -839,6 +941,175 @@ mod tests {
                 .expect("the unknown poll reads")
                 .is_empty(),
             "an unknown poll answers no positions"
+        );
+    }
+
+    /// The options mapped for `status_id`, as `(position, title)` pairs —
+    /// the shape the batched grouping tests compare.
+    fn positions_and_titled(
+        map: &HashMap<Uuid, Vec<PollOption>>,
+        status_id: Uuid,
+    ) -> Vec<(i32, String)> {
+        map.get(&status_id)
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|option| (option.position, option.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn options_for_statuses_groups_by_status_in_position_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let first = create_status(&pool, &alice).await;
+        let second = create_status(&pool, &alice).await;
+        let plain = create_status(&pool, &alice).await;
+        let first_poll = create_for(&pool, first.id, &params(&["a", "b", "c"])).await;
+        let second_poll = create_for(&pool, second.id, &params(&["x"])).await;
+
+        let grouped = options_for_statuses(&pool, &[first.id, second.id, plain.id, new_id()])
+            .await
+            .expect("the batched options read");
+        assert_eq!(grouped.len(), 2, "the poll-less status has no key");
+        assert!(
+            !grouped.contains_key(&plain.id),
+            "and neither has an unknown id"
+        );
+        assert_eq!(
+            positions_and_titled(&grouped, first.id),
+            vec![
+                (0, "a".to_owned()),
+                (1, "b".to_owned()),
+                (2, "c".to_owned())
+            ],
+            "the first status's options, lowest position first"
+        );
+        assert_eq!(
+            positions_and_titled(&grouped, second.id),
+            vec![(0, "x".to_owned())],
+            "the second status sees only its own choices"
+        );
+        let rows = grouped
+            .get(&first.id)
+            .expect("the first status's options are grouped");
+        assert!(
+            rows.iter().all(|option| option.poll_id == first_poll.id),
+            "each entry's rows name their own poll"
+        );
+        let moved = sqlx::query("UPDATE poll_options SET position = 5 WHERE id = $1")
+            .bind(
+                rows.first()
+                    .expect("the first status's options are grouped")
+                    .id,
+            )
+            .execute(&pool)
+            .await
+            .expect("the position moves");
+        assert_eq!(moved.rows_affected(), 1, "the option was there to move");
+        let again = options_for_statuses(&pool, &[first.id])
+            .await
+            .expect("the re-read works");
+        assert_eq!(
+            positions_and_titled(&again, first.id),
+            vec![
+                (1, "b".to_owned()),
+                (2, "c".to_owned()),
+                (5, "a".to_owned())
+            ],
+            "the read follows `position`, not creation order"
+        );
+
+        // Every option row carries its own identity: the ids round trip and
+        // name the right poll, and the stored counters ride along.
+        let whole = options_for_statuses(&pool, std::slice::from_ref(&second.id))
+            .await
+            .expect("the batched options read");
+        let only = whole
+            .get(&second.id)
+            .and_then(|options| options.first())
+            .expect("the second poll's option is grouped");
+        assert_eq!(only.poll_id, second_poll.id, "the row names its poll");
+        assert!(
+            only.id.get_version_num() == 7,
+            "the option carries its UUIDv7"
+        );
+        assert_eq!(only.votes_count, 0, "a fresh option has no votes");
+
+        assert!(
+            options_for_statuses(&pool, &[])
+                .await
+                .expect("the empty batch reads")
+                .is_empty(),
+            "no statuses, no options"
+        );
+    }
+
+    #[tokio::test]
+    async fn votes_by_status_groups_the_viewer_s_positions_per_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let first = create_status(&pool, &alice).await;
+        let second = create_status(&pool, &alice).await;
+        let plain = create_status(&pool, &alice).await;
+        let first_poll = create_for(&pool, first.id, &params(&["a", "b", "c"])).await;
+        let second_poll = create_for(&pool, second.id, &params(&["d", "e"])).await;
+        let choices = options(&pool, first_poll.id).await.expect("options read");
+        let other_choices = options(&pool, second_poll.id).await.expect("options read");
+
+        // Voted out of order: each entry answers ascending by position.
+        vote(&pool, first_poll.id, choices[2].id, alice.id).await;
+        vote(&pool, first_poll.id, choices[0].id, alice.id).await;
+        vote(&pool, second_poll.id, other_choices[1].id, bob.id).await;
+
+        let for_alice =
+            votes_by_status(&pool, &[first.id, second.id, plain.id, new_id()], alice.id)
+                .await
+                .expect("the batched votes read");
+        assert_eq!(
+            for_alice.get(&first.id),
+            Some(&vec![0, 2]),
+            "alice's two marks, lowest position first"
+        );
+        assert_eq!(
+            for_alice.len(),
+            1,
+            "the poll she said nothing on, the poll-less status and the \
+             unknown id all stay out of the map"
+        );
+
+        let for_bob = votes_by_status(&pool, &[first.id, second.id], bob.id)
+            .await
+            .expect("the batched votes read");
+        assert_eq!(
+            for_bob.get(&second.id),
+            Some(&vec![1]),
+            "bob's one mark is nobody else's"
+        );
+        assert!(
+            !for_bob.contains_key(&first.id),
+            "and he never touched the first poll"
+        );
+
+        let for_carol = create_user(&pool, "carol").await;
+        assert!(
+            votes_by_status(&pool, &[first.id, second.id], for_carol.id)
+                .await
+                .expect("a fresh account's votes read")
+                .is_empty(),
+            "an account that never voted has no entries"
+        );
+        assert!(
+            votes_by_status(&pool, &[], alice.id)
+                .await
+                .expect("the empty batch reads")
+                .is_empty(),
+            "no statuses, no marks"
         );
     }
 }

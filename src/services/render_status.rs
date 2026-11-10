@@ -8,10 +8,10 @@
 //! everything they render from — authors, media attachments, mentions,
 //! hashtags, emoji reactions, favourites, the viewer's own reblogs,
 //! bookmarks, the viewer's own pins, the viewer's muted threads, reblogged
-//! originals and quoted originals — with a FIXED set of batched
+//! originals, quoted originals and polls — with a FIXED set of batched
 //! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
 //! never a query per row. The count does not grow with the page size:
-//! thirteen statement groups whatever the batch —
+//! sixteen statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -50,11 +50,22 @@
 //!     never disagree;
 //! 13. the viewer's relationships to the page's authors — the one fixed
 //!     [`Relationship::load_many`] set, run only for an authenticated
-//!     viewer.
+//!     viewer;
+//! 14. the page's polls — one [`poll::for_statuses`] read keyed by every
+//!     rendered id (reblogged originals included, so a reblog nests its
+//!     original's poll); a row the read does not answer renders `poll:
+//!     null`;
+//! 15. the options of those polls — one [`poll::options_for_statuses`]
+//!     read over the same ids, each entry in position order;
+//! 16. the viewer's marks on the page's polls — one
+//!     [`poll::votes_by_status`] read over the same ids, run only for an
+//!     authenticated viewer; it answers every poll entity's `voted` flag
+//!     and `own_votes` array.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
-//! page of plain posts costs five queries, and a viewer adds the favourite,
-//! reblog, bookmark, pin and thread-mute reads and the relationship set.
+//! page of plain posts costs seven queries (the two poll reads answer
+//! empty for it), and a viewer adds the favourite, reblog, bookmark, pin,
+//! thread-mute and poll-vote reads and the relationship set.
 //!
 //! # Extension points
 //!
@@ -78,7 +89,10 @@
 //! - `pleroma.direct_conversation_id`: the chat-participation ticket,
 //!   one read keyed by status and viewer.
 //! - `card`: the rich-media cards table, one read keyed by status id.
-//! - `poll`: the polls tables, one read keyed by status id.
+//! - `poll`: *filled by the polls render ticket* (steps 14–16 above);
+//!   [`crate::entities::poll::Poll::build`] renders the poll row, its
+//!   options and the viewer's marks into the entity, and the row's own
+//!   absence from the poll read is the entity's `null`.
 //! - `emojis`: the custom emojis, one read keyed by the shortcodes the
 //!   content uses.
 //! - `pleroma.emoji_reactions`: *filled by the reactions ticket* (step 7
@@ -108,6 +122,7 @@ use crate::{
     config::Config,
     entities::{
         account::JsonBool,
+        poll::Poll as PollEntity,
         relationship::{Relationship, RelationshipMap},
         status::{Status, StatusSource},
     },
@@ -119,6 +134,7 @@ use crate::{
         hashtag::{self, Hashtag},
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mention, pinned_status,
+        poll::{self, Poll as PollRow, PollOption as PollOptionRow},
         status::{self, Status as StatusRow},
         user::{self, User},
     },
@@ -241,6 +257,19 @@ struct Batch<'a> {
     /// conversation, so the pair of flags rides the same membership and the
     /// two can never disagree.
     thread_mutes: HashSet<Uuid>,
+    /// The polls on the page — one [`poll::for_statuses`] read keyed by
+    /// every rendered id; a reblogged original's id is among them, so a
+    /// reblog nests its original's poll. Rows the read does not answer
+    /// carry no entry, which is the entity's `poll: null`.
+    polls: HashMap<Uuid, PollRow>,
+    /// The options of those polls, keyed by status, in position order —
+    /// one [`poll::options_for_statuses`] read over the same ids.
+    poll_options: HashMap<Uuid, Vec<PollOptionRow>>,
+    /// The viewer's marks on the page's polls, keyed by status with
+    /// positions ascending — one [`poll::votes_by_status`] read over the
+    /// same ids, run only for an authenticated viewer; the empty map makes
+    /// every poll entity read `voted: false` with `own_votes: []`.
+    poll_votes: HashMap<Uuid, Vec<i32>>,
     /// The viewer's relationships to the page's authors, keyed by account
     /// id; `None` for an anonymous viewer.
     relationships: Option<RelationshipMap>,
@@ -290,6 +319,15 @@ impl<'a> Batch<'a> {
                 .chain(originals.values())
                 .map(|row| row.conversation_id),
         );
+        let polls = load_polls(pool, &rendered_ids).await?;
+        let poll_options = load_poll_options(pool, &rendered_ids).await?;
+        let poll_votes = load_poll_votes(pool, &rendered_ids, viewer).await?;
+        debug!(
+            polls = polls.len(),
+            options = poll_options.len(),
+            votes = poll_votes.len(),
+            "polls batch-loaded with their options and the viewer's marks"
+        );
         Ok(Self {
             config: state.config.as_ref(),
             viewer,
@@ -304,6 +342,9 @@ impl<'a> Batch<'a> {
             bookmarks: load_bookmarks(pool, &rendered_ids, viewer).await?,
             pins: load_pins(pool, &rendered_ids, viewer).await?,
             thread_mutes: load_thread_mutes(pool, &conversation_ids, viewer).await?,
+            polls,
+            poll_options,
+            poll_votes,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
         })
     }
@@ -360,7 +401,11 @@ impl<'a> Batch<'a> {
     /// `muted` flag and `pleroma.thread_muted` are membership in the muted
     /// threads set keyed to the row's *own* `conversation_id` — a mute is a
     /// fact about the thread, and a reblog shares its original's, so the
-    /// nested pair always renders the same.
+    /// nested pair always renders the same. The `poll` entity is the poll
+    /// read at the row's *own* id, with its options and the viewer's marks
+    /// from the same-keyed mates — and because the batch loaded over the
+    /// rendered ids, originals included, the nested render of a reblog
+    /// carries the original's poll.
     fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
         let subject_id = row.reblog_of_id.unwrap_or(row.id);
@@ -385,12 +430,33 @@ impl<'a> Batch<'a> {
             pinned_at,
             muted: JsonBool(self.thread_mutes.contains(&row.conversation_id)),
             reblog,
+            poll: self.render_poll(row),
         };
         Some(Status::from_source(
             source,
             self.viewer,
             self.relationships.as_ref(),
             self.config,
+        ))
+    }
+
+    /// The [`Poll`] entity of `row`: `None` when the batch's poll read
+    /// found nothing for it, and otherwise [`Poll::build`] over the row,
+    /// its options in position order and the viewer's marks — the empty
+    /// slice for an anonymous viewer, whose every poll renders `voted:
+    /// false` with `own_votes: []`. The render instant decides `expired`
+    /// and, through it, whether `hide_totals` still withholds the option
+    /// counts.
+    ///
+    /// [`Poll`]: crate::entities::poll::Poll
+    /// [`Poll::build`]: crate::entities::poll::Poll::build
+    fn render_poll(&self, row: &StatusRow) -> Option<PollEntity> {
+        let poll = self.polls.get(&row.id)?;
+        Some(PollEntity::build(
+            poll,
+            self.poll_options.get(&row.id).map_or(&[], Vec::as_slice),
+            self.poll_votes.get(&row.id).map_or(&[], Vec::as_slice),
+            Utc::now(),
         ))
     }
 }
@@ -551,6 +617,44 @@ async fn load_thread_mutes(
     conversation_mute::muted_conversation_ids(pool, viewer.id, conversation_ids).await
 }
 
+/// [`poll::for_statuses`]: one query for every poll of the page (reblogged
+/// originals included, since a reblog nests its original's poll). A row
+/// with no poll stays absent from the map, which is the entity's `null`.
+async fn load_polls(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, PollRow>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    poll::for_statuses(pool, ids).await
+}
+
+/// [`poll::options_for_statuses`]: one query for the options of the page's
+/// polls, keyed by status and in position order — the choices every poll
+/// entity lists.
+async fn load_poll_options(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<PollOptionRow>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    poll::options_for_statuses(pool, ids).await
+}
+
+/// [`poll::votes_by_status`]: one query for the viewer's marks on the
+/// page's polls, keyed by status with positions ascending. An anonymous
+/// viewer has no marks to ask about, and the empty map makes every poll
+/// render `voted: false` with `own_votes: []` — no query at all.
+async fn load_poll_votes(
+    pool: &PgPool,
+    ids: &[Uuid],
+    viewer: Option<&User>,
+) -> AppResult<HashMap<Uuid, Vec<i32>>> {
+    let Some(viewer) = viewer else {
+        return Ok(HashMap::new());
+    };
+    poll::votes_by_status(pool, ids, viewer.id).await
+}
+
 /// The viewer's relationships to the page's authors, keyed by account id:
 /// [`Relationship::load_many`] runs its own fixed set of queries once per
 /// page; an anonymous viewer has none to load, and an empty author list
@@ -588,6 +692,7 @@ mod tests {
             emoji_reaction::{self, NewReaction},
             follow,
             media_attachment::NewMediaAttachment,
+            poll::{self, PollParams},
             status::{NewStatus, Visibility, insert, soft_delete},
             user::{NewUser, local_ap_id},
         },
@@ -1401,6 +1506,239 @@ mod tests {
                 .all(|entity| flags(entity) == (json!(false), json!(false))),
             "an anonymous page is nobody's mute"
         );
+    }
+
+    /// [`PollParams`] for the given option titles, nothing else set — the
+    /// fixture polls' starting point.
+    fn poll_params(titles: &[&str]) -> PollParams {
+        PollParams {
+            options: titles.iter().map(|title| (*title).to_owned()).collect(),
+            ..PollParams::default()
+        }
+    }
+
+    /// Creates a poll on `status_id` through a connection of the pool's
+    /// own — the way a caller outside a transaction reaches
+    /// [`poll::create`].
+    async fn create_poll(pool: &PgPool, status_id: Uuid, params: &PollParams) -> poll::Poll {
+        let mut conn = pool.acquire().await.expect("slot connection");
+        poll::create(&mut conn, status_id, params)
+            .await
+            .expect("the fixture poll creates")
+    }
+
+    /// Records a mark straight into `poll_votes`: the vote endpoint that
+    /// normally writes it (and moves the counters) is a later ticket, and
+    /// the render batch's votes read needs rows to find.
+    async fn vote(pool: &PgPool, poll_id: Uuid, option_id: Uuid, user_id: Uuid) {
+        let inserted = sqlx::query(
+            "INSERT INTO poll_votes (poll_id, option_id, user_id, inserted_at)
+             VALUES ($1, $2, $3, now())",
+        )
+        .bind(poll_id)
+        .bind(option_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("the fixture vote inserts");
+        assert_eq!(inserted.rows_affected(), 1, "the mark was written");
+    }
+
+    /// Moves the stored roll-up counters the way the vote endpoint's
+    /// transaction will — they are columns, not computed reads (see
+    /// [`crate::models::poll`]) — to one voter, one vote, on `option_id`.
+    async fn count_one_vote(pool: &PgPool, poll_id: Uuid, option_id: Uuid) {
+        let moved = sqlx::query("UPDATE polls SET voters_count = 1, votes_count = 1 WHERE id = $1")
+            .bind(poll_id)
+            .execute(pool)
+            .await
+            .expect("the poll counters move");
+        assert_eq!(moved.rows_affected(), 1, "the poll row was there to move");
+        let option_moved = sqlx::query("UPDATE poll_options SET votes_count = 1 WHERE id = $1")
+            .bind(option_id)
+            .execute(pool)
+            .await
+            .expect("the option counter moves");
+        assert_eq!(
+            option_moved.rows_affected(),
+            1,
+            "the option row was there to move"
+        );
+    }
+
+    /// A deadline a thousand years out: whatever the render instant is, a
+    /// poll due then is still open, so `hide_totals` still withholds.
+    fn far_future() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2999, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    /// The open-poll fixture the render batch's poll tests share: alice's
+    /// `tea or coffee` post carrying a multiple-choice poll, bob's mark on
+    /// its second option, and the roll-ups moved to one voter and one vote
+    /// the way the vote endpoint will.
+    async fn open_poll_fixture(pool: &PgPool) -> (User, User, StatusRow, poll::Poll) {
+        let alice = user(pool, "alice").await;
+        let bob = user(pool, "bob").await;
+        let polled = post(pool, &alice, "tea or coffee").await;
+        let mut params = poll_params(&["tea", "coffee"]);
+        params.multiple = true;
+        let open = create_poll(pool, polled.id, &params).await;
+        let choices = poll::options(pool, open.id).await.expect("options read");
+        let coffee = choices.get(1).expect("the fixture poll has two options");
+        vote(pool, open.id, coffee.id, bob.id).await;
+        count_one_vote(pool, open.id, coffee.id).await;
+        (alice, bob, polled, open)
+    }
+
+    /// The whole [`Poll`] entity the batch builds for the fixture poll as
+    /// bob sees it: stored roll-ups, options in position order, and his
+    /// mark at position 1 in `voted` and `own_votes`.
+    ///
+    /// [`Poll`]: crate::entities::poll::Poll
+    fn expected_open_poll(open: &poll::Poll, voted: bool, own_votes: &[i32]) -> Value {
+        json!({
+            "id": open.id.to_string(),
+            "expires_at": null,
+            "expired": false,
+            "multiple": true,
+            "votes_count": 1,
+            "voters_count": 1,
+            "voted": voted,
+            "own_votes": own_votes,
+            "options": [
+                {"title": "tea", "votes_count": 0},
+                {"title": "coffee", "votes_count": 1},
+            ],
+            "emojis": [],
+        })
+    }
+
+    /// The polls ticket's loaders inside the fixed query set: one page
+    /// mixing a polled row, a plain one and a reblog of the polled one
+    /// embeds each poll in its status — the full entity for the viewer who
+    /// voted, `null` on the poll-less row and on the boost itself, and the
+    /// original's poll nested in the boost, from the same batch.
+    #[tokio::test]
+    async fn the_poll_embeds_in_the_render_batch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let (alice, bob, polled, open) = open_poll_fixture(&pool).await;
+        let plain = post(&pool, &alice, "nothing asked").await;
+        let reblog = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(polled.id),
+                ..NewStatus::local(&bob, "")
+            },
+        )
+        .await
+        .expect("a reblog of a stored post inserts");
+        let expected = expected_open_poll(&open, true, &[1]);
+
+        let page = [polled.clone(), plain.clone(), reblog.clone()];
+        let for_bob = render_statuses(&state, Some(&bob), &page)
+            .await
+            .expect("the page renders for bob");
+        assert_eq!(
+            serde_json::to_value(&for_bob[0]).expect("the polled status serializes")["poll"],
+            expected,
+            "the whole entity rides its status, key for key"
+        );
+        assert_eq!(
+            serde_json::to_value(&for_bob[1]).expect("the plain status serializes")["poll"],
+            Value::Null,
+            "a poll-less row renders poll: null"
+        );
+        let reblog_json = serde_json::to_value(&for_bob[2]).expect("the reblog serializes");
+        assert_eq!(
+            reblog_json["poll"],
+            Value::Null,
+            "the boost row carries no poll of its own"
+        );
+        assert_eq!(
+            reblog_json["reblog"]["poll"], expected,
+            "the nested original brings its poll along from the same batch"
+        );
+    }
+
+    /// The same batch for a viewer with no marks: the votes read runs only
+    /// when there is one, so an anonymous render reports the poll voted by
+    /// nobody — `voted: false`, `own_votes: []` — while every stored
+    /// option and count renders unchanged.
+    #[tokio::test]
+    async fn an_anonymous_render_reports_the_page_poll_unvoted() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let (_alice, _bob, polled, open) = open_poll_fixture(&pool).await;
+
+        let anonymous = render_statuses(&state, None, std::slice::from_ref(&polled))
+            .await
+            .expect("the poll renders anonymously");
+        let value = serde_json::to_value(&anonymous[0]).expect("it serializes");
+        assert_eq!(
+            value["poll"],
+            expected_open_poll(&open, false, &[]),
+            "the whole entity again, minus nobody's marks"
+        );
+    }
+
+    /// `hide_totals` inside the render batch: while an expired-less-due
+    /// poll runs, its per-option counts come back JSON `null` even to the
+    /// viewer who voted; the roll-up totals, the deadline and the viewer's
+    /// own marks are not hidden totals and render as stored.
+    #[tokio::test]
+    async fn hide_totals_nulls_the_option_counts_while_the_poll_is_open() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let secret = post(&pool, &alice, "hush").await;
+        let mut params = poll_params(&["yes", "no"]);
+        params.expires_at = Some(far_future());
+        params.hide_totals = true;
+        let hidden = create_poll(&pool, secret.id, &params).await;
+        let choices = poll::options(&pool, hidden.id).await.expect("options read");
+        let yes = choices.first().expect("the fixture poll has an option");
+        vote(&pool, hidden.id, yes.id, bob.id).await;
+
+        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&secret))
+            .await
+            .expect("the hidden-totals poll renders for bob");
+        let value = serde_json::to_value(&for_bob[0]).expect("it serializes");
+        assert_eq!(
+            value["poll"]["options"],
+            json!([
+                {"title": "yes", "votes_count": null},
+                {"title": "no", "votes_count": null},
+            ]),
+            "the per-option counts stay hidden while the poll is open"
+        );
+        assert_eq!(
+            value["poll"]["votes_count"], 0,
+            "the roll-up total renders as stored, hidden or not"
+        );
+        assert_eq!(
+            value["poll"]["voted"],
+            json!(true),
+            "the viewer's own mark is not a hidden total"
+        );
+        assert_eq!(value["poll"]["own_votes"], json!([0]), "and it is his");
+        assert_eq!(
+            value["poll"]["expires_at"], "2999-01-01T00:00:00.000Z",
+            "the deadline rides along"
+        );
+        assert_eq!(
+            value["poll"]["expired"],
+            json!(false),
+            "due a thousand years out: the poll runs"
+        );
+        assert_eq!(value["poll"]["id"], hidden.id.to_string());
+        assert_eq!(value["poll"]["multiple"], json!(false));
+        assert_eq!(value["poll"]["voters_count"], 0);
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
