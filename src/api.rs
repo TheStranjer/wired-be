@@ -83,6 +83,7 @@ pub mod pleroma_settings;
 pub mod polls;
 pub mod push;
 pub mod reports;
+pub mod scheduled_statuses;
 pub mod scrobbles;
 pub mod search;
 pub mod statuses;

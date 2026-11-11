@@ -13,8 +13,10 @@
 //! | `discarded` | failed for good (terminal)                            |
 //!
 //! [`enqueue`] inserts, [`claim_next`] hands one due job to one worker,
-//! [`complete`] and [`fail`] end an attempt, and [`rescue_stuck`] recovers
-//! jobs whose worker died mid-flight. A live job (`available`, `executing`
+//! [`complete`] and [`fail`] end an attempt, [`rescue_stuck`] recovers
+//! jobs whose worker died mid-flight, and [`cancel_pending`] takes back a
+//! keyed job no worker has started yet — the cancel half of re-queueing
+//! scheduled work. A live job (`available`, `executing`
 //! or `retryable`) carrying a `unique_key` blocks any further job with the
 //! same key: the deduplication contract of the partial unique index.
 
@@ -278,6 +280,30 @@ pub async fn rescue_stuck(pool: &PgPool, older_than: Duration) -> AppResult<u64>
     .execute(pool)
     .await?;
     Ok(rescued.rows_affected())
+}
+
+/// Deletes the not-yet-started jobs of one `unique_key`, reporting how many
+/// rows went.
+///
+/// The cancel half of re-queueing keyed work — moving a schedule to a new
+/// moment runs this before the fresh [`enqueue`], because the partial unique
+/// index holds the key through a live job and the old row's `run_at` is the
+/// very moment the caller is leaving behind. Only `available` rows go: an
+/// `executing` job is in a worker's hands and a `retryable` one is a failure
+/// the queue owns, and neither is a not-yet-due fire the caller can replace.
+/// Terminal rows are out of the index's reach already, and a `NULL` key
+/// matches nothing here, so unkeyed jobs are never this statement's.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn cancel_pending(pool: &PgPool, unique_key: &str) -> AppResult<u64> {
+    let cancelled = sqlx::query("DELETE FROM jobs WHERE unique_key = $1 AND state = 'available'")
+        .bind(unique_key)
+        .execute(pool)
+        .await?;
+    Ok(cancelled.rows_affected())
 }
 
 #[cfg(test)]
@@ -631,5 +657,131 @@ mod tests {
             .expect("the rescued job is claimable again");
         assert_eq!(reclaimed.id, claimed_two.id, "it is the rescued row");
         assert_eq!(reclaimed.attempts, 2, "the lost attempt stays counted");
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_takes_back_an_unstarted_keyed_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let later = Utc::now() + TimeDelta::seconds(3_600);
+        let waiting = enqueue(
+            &pool,
+            NewJob {
+                run_at: Some(later),
+                unique_key: Some("sched/1"),
+                ..new_job("scheduled", "fire")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the first keyed job inserts");
+
+        let replacement = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("sched/1"),
+                ..new_job("scheduled", "fire")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            replacement.is_none(),
+            "the live job holds the key against a second one"
+        );
+
+        assert_eq!(
+            cancel_pending(&pool, "sched/1").await.unwrap(),
+            1,
+            "the unstarted job goes"
+        );
+        let still_there: Option<Job> = sqlx::query_as("SELECT * FROM jobs WHERE id = $1")
+            .bind(waiting.id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+        assert!(
+            still_there.is_none(),
+            "the cancelled row is deleted, not reset"
+        );
+
+        let moved = enqueue(
+            &pool,
+            NewJob {
+                run_at: Some(later),
+                unique_key: Some("sched/1"),
+                ..new_job("scheduled", "fire")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            moved.is_some(),
+            "the freed key takes the replacement job the caller wanted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_pending_leaves_work_the_queue_owns() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let running = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("sched/2"),
+                ..new_job("scheduled", "fire")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the job inserts");
+        let claimed = claim_next(&pool, &["scheduled"])
+            .await
+            .unwrap()
+            .expect("the job is due and claimed");
+        assert_eq!(claimed.id, running.id, "and it is the keyed row");
+
+        assert_eq!(
+            cancel_pending(&pool, "sched/2").await.unwrap(),
+            0,
+            "an executing job is in a worker's hands, not this cancel's"
+        );
+        fail(&pool, running.id, "boom", Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        assert_eq!(
+            cancel_pending(&pool, "sched/2").await.unwrap(),
+            0,
+            "nor is a retryable one"
+        );
+        let waiting = fetch(&pool, running.id).await;
+        assert_eq!(waiting.state, "retryable", "the row and its key stand");
+
+        complete(&pool, running.id).await.unwrap();
+        assert_eq!(
+            cancel_pending(&pool, "sched/2").await.unwrap(),
+            0,
+            "and a terminal row is never deleted by it either"
+        );
+        assert_eq!(
+            fetch(&pool, running.id).await.state,
+            "completed",
+            "the completed row stays"
+        );
+
+        let unkeyed = enqueue(&pool, new_job("scheduled", "fire"))
+            .await
+            .unwrap()
+            .expect("the unkeyed job inserts");
+        assert_eq!(
+            cancel_pending(&pool, "sched/2").await.unwrap(),
+            0,
+            "a NULL key matches no key at all"
+        );
+        assert_eq!(
+            fetch(&pool, unkeyed.id).await.state,
+            "available",
+            "and the unkeyed job is left alone"
+        );
     }
 }
