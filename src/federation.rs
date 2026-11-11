@@ -22,8 +22,11 @@
 //! the `federator.incoming` job handler, a documented stub until the
 //! dispatcher ticket fills it in. [`note_parser`] is the dispatcher's pure
 //! front end: the reader that turns a received `Note`-family object into
-//! the parts of a status. Activity documents, inboxes and outboxes arrive
-//! in later tickets and get their modules beside them.
+//! the parts of a status. [`note`] is the way back out for statuses: the
+//! pure builder of the `Note`/`Question` objects a local post federates as
+//! and of the `Create`, `Announce` and `Tombstone` documents around it,
+//! plus the JSON-LD schema they reference. Activity collections, inboxes
+//! and outboxes arrive in later tickets and get their modules beside them.
 
 pub mod actor;
 pub mod authorized_fetch;
@@ -32,6 +35,7 @@ pub mod dispatch;
 pub mod fetch_actor;
 pub mod inbox_auth;
 pub mod json;
+pub mod note;
 pub mod note_parser;
 pub mod remote_actor;
 pub mod signature;

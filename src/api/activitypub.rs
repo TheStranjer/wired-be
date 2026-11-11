@@ -11,11 +11,15 @@
 //! `UserView.render("user.json", …)`
 //! (`lib/pleroma/web/activity_pub/views/user_view.ex`), the instance
 //! actor document, `GET /internal/fetch` — Pleroma's same controller's
-//! `internal_fetch/2` action, and the three inbox `POST`s of the actors
-//! those documents name (`inbox/2` feeding `Federator.incoming_ap_doc`).
-//! The outboxes and the collections beside them arrive in later tickets
-//! and get their handlers here; `GET /users/{nickname}/inbox`, the client
-//! reads of a personal inbox, belongs to the C2S ticket.
+//! `internal_fetch/2` action, the JSON-LD schema document,
+//! `GET /schemas/litepub-0.1.jsonld` — Pleroma's static
+//! `priv/static/schemas/litepub-0.1.jsonld`, which the [`crate::federation::note`]
+//! documents name in their `@context` — and the three inbox `POST`s of the
+//! actors those documents name (`inbox/2` feeding
+//! `Federator.incoming_ap_doc`). The outboxes and the collections beside
+//! them arrive in later tickets and get their handlers here;
+//! `GET /users/{nickname}/inbox`, the client reads of a personal inbox,
+//! belongs to the C2S ticket.
 //!
 //! The route negotiates content: an `Accept` header naming one of the two
 //! `ActivityPub` media types gets the actor document; an `Accept` naming
@@ -75,6 +79,7 @@ use crate::{
         authorized_fetch::fetch_allowed,
         dispatch::KIND_INCOMING,
         inbox_auth::{InboxAuthError, SignedActivity},
+        note::{LITEPUB_SCHEMA_PATH, litepub_context_json},
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
@@ -128,6 +133,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/users/{nickname}", get(get_actor))
         .route("/internal/fetch", get(get_instance_actor))
+        .route(LITEPUB_SCHEMA_PATH, get(litepub_schema))
         .route("/inbox", post(inbox))
         .route("/users/{nickname}/inbox", post(user_inbox))
         .route("/internal/fetch/inbox", post(inbox))
@@ -193,6 +199,17 @@ async fn get_instance_actor(State(state): State<AppState>) -> Response {
         Ok(actor) => actor_response(&actor, &state.config),
         Err(err) => err.into_response(),
     }
+}
+
+/// `GET /schemas/litepub-0.1.jsonld` — the JSON-LD context document every
+/// `Note`/`Question` and activity this instance serves references from its
+/// `@context`, the counterpart of Pleroma's static
+/// `priv/static/schemas/litepub-0.1.jsonld`. Content negotiation, the
+/// `AUTHORIZED_FETCH` gate and the account read are all irrelevant here:
+/// it is one fixed document, so peers can expand our vocabulary before
+/// they have ever authenticated to us.
+async fn litepub_schema() -> Json<Value> {
+    Json(litepub_context_json())
 }
 
 /// Either shared inbox — the instance's `POST /inbox` and the instance
