@@ -213,8 +213,14 @@ async fn publish_one(state: &AppState, row: &ScheduledStatus) -> Result<(), JobE
 /// Runs the create and sorts its outcome into the ticket's three arms:
 /// published, refused-for-good, or retry. A refusal is the row's last word
 /// — the same body will be refused again — so it leaves through [`drop_row`]
-/// like the author-less arm, and the client's `Idempotency-Key` (if it sent
-/// one) is simply never claimed by a fire that will not happen.
+/// like the author-less arm. Either way the fire runs the plain
+/// [`create_status`], never its replayable twin, so an `idempotency` key
+/// parked beside the stored params is inert in every arm: it is the
+/// [`ScheduledStatus`] entity's echo, and nothing claims it on the account's
+/// replay list.
+///
+/// [`create_status`]: crate::services::create_status::create_status
+/// [`ScheduledStatus`]: crate::entities::scheduled_status::ScheduledStatus
 ///
 /// # Errors
 ///
@@ -402,6 +408,16 @@ mod tests {
             .expect("the count reads")
     }
 
+    /// How many `idempotency_keys` rows the database holds: a fire must leave
+    /// this at zero, since it posts through the plain create rather than its
+    /// replayable twin.
+    async fn key_count(pool: &PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM idempotency_keys")
+            .fetch_one(pool)
+            .await
+            .expect("the key count reads")
+    }
+
     /// An unposted `image/png` upload by `owner`, as a `media_ids` entry names it.
     async fn upload(pool: &PgPool, owner: &User) -> media_attachment::MediaAttachment {
         media_attachment::insert(
@@ -506,6 +522,13 @@ mod tests {
         assert!(
             fetched(&pool, row.id).await.is_none(),
             "the fired schedule is gone"
+        );
+        // The parked `idempotency` key is the entity's echo, and the fire
+        // runs the plain create: no replay key is claimed on the account.
+        assert_eq!(
+            key_count(&pool).await,
+            0,
+            "publishing a parked key claims nothing on the replay list"
         );
         let posts = posts_of(&pool, &alice).await;
         assert_eq!(posts.len(), 1, "exactly the one status was written");

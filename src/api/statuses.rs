@@ -99,8 +99,10 @@
 //! `media_attachments` in the order the body submitted them, though no
 //! attachment row is touched — and nothing else happens: no `statuses`
 //! row, no `after_status_created` hook, no expiration job, and an
-//! `Idempotency-Key` on the request is only echoed into the stored params,
-//! never claimed (the publish claims it at run time).
+//! `Idempotency-Key` on the request is only echoed into the stored params
+//! and the entity — claimed by nobody, here or at the fire, because the
+//! publish replays through [`create_status::create_status`] rather than
+//! its replayable twin.
 //!
 //! [`Config::max_media_attachments`]: crate::config::Config::max_media_attachments
 //!
@@ -683,7 +685,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// with the reserved attachments loaded from their untouched rows in
 /// submission order; see [`scheduled_media`]); the request's
 /// `Idempotency-Key` rides along as the entity's echo only — a scheduled
-/// create claims no replay key, the publish claims it at run time. The
+/// create claims no replay key, and neither does its publish, which posts
+/// through [`create_status::create_status`] like any other fire. The
 /// body's `preview` (a [`flex`] boolean, body or query, default false)
 /// answers the entity a create would have
 /// returned — validated, rendered, mentions and tags resolved, a fresh

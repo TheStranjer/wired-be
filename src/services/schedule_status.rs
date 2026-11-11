@@ -51,8 +51,10 @@
 //! keys the [`ScheduledStatus`] entity echoes. Those extra keys are inert
 //! to the publish, which reads
 //! the params back as a [`CreateStatusParams`] and ignores what it is not.
-//! A scheduled create claims no replay key itself: the row's own claim
-//! belongs to the publish at run time.
+//! A scheduled create claims no replay key at all, and neither does its
+//! fire: the publish posts through the plain
+//! [`create_status`](crate::services::create_status::create_status), so the
+//! parked `idempotency` value is only ever the entity's echo.
 //!
 //! [`MEDIA_NOT_FOUND`]: crate::models::media_attachment::MEDIA_NOT_FOUND
 
