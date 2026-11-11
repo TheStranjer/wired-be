@@ -7,8 +7,9 @@
 //! idempotency-key sweep, the status-expiry sweep, the scheduled-status
 //! fire sweep, the daily dismissed-notification sweep, the hourly
 //! OAuth/MFA/password-reset token sweep, the daily jobs-table prune, the
-//! daily deleted-local-status purge and the six-hourly orphaned-local-media
-//! sweep; later tickets append one line per entry), and [`run`] ticks every
+//! daily deleted-local-status purge, the six-hourly orphaned-local-media
+//! sweep and the daily received-activity-ledger prune; later tickets
+//! append one line per entry), and [`run`] ticks every
 //! ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
@@ -101,7 +102,12 @@ pub struct PeriodicJob {
 /// ([`KIND_MEDIA`](super::maintenance::KIND_MEDIA)) shares it too: media
 /// no status, and no chat message, claims within the two-day window is
 /// storage nothing can read back, so the period only decides how long the
-/// file and its row outlive that window.
+/// file and its row outlive that window. The daily prune of the
+/// received-activity ledger
+/// ([`federation.cleanup_received`](crate::federation::dispatch::KIND_CLEANUP_RECEIVED))
+/// shares it too: past two weeks an id is beyond any inbox retry chain
+/// still running, so the period only decides how long the bookkeeping row
+/// outlives the redeliveries it guards against.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -146,6 +152,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             kind: super::maintenance::KIND_MEDIA,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_secs(21_600),
+        },
+        PeriodicJob {
+            kind: crate::federation::dispatch::KIND_CLEANUP_RECEIVED,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_hours(24),
         },
     ]
 }
