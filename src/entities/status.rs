@@ -24,7 +24,7 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `card` (rich-media cards); `poll` (polls); `emojis` (custom emojis);
+//! `card` (rich-media cards); `emojis` (custom emojis);
 //! and `quote` (the quoting ticket, whose original rows the service
 //! already batch-loads).
 //! `pleroma.direct_conversation_id` is filled by the
@@ -33,6 +33,11 @@
 //! — one batched read per page: a status of a DM thread renders the
 //! viewer's participation id there, and every other row and every
 //! non-participant `null`.
+//! `poll` is filled by the polls render ticket, from the batch's reads of
+//! [`crate::models::poll`]: a row the batch found a poll on embeds the
+//! full [`Poll`] entity — options in position
+//! order, and the viewer's marks as `voted` and `own_votes` — while a
+//! poll-less row renders JSON `null`.
 //! `pleroma.bookmark_folder` is filled by the folders ticket, from
 //! [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders) —
 //! the one read that also answers `bookmarked`: a bookmarked row renders
@@ -82,6 +87,7 @@ use crate::{
         emoji_reaction::ReactionSummary,
         media_attachment::MediaAttachment,
         mention::Mention,
+        poll::Poll,
         relationship::RelationshipMap,
         tag::Tag,
     },
@@ -204,8 +210,8 @@ pub struct PleromaMetadata {
 ///
 /// [`Status::from_source`] consumes it. Later tickets add one field (and
 /// the service's one loader feeding it) per rendered extension: the
-/// viewer's flags for this row, its card, its poll, its emojis, its
-/// rendered quote.
+/// viewer's flags for this row, its card, its emojis, its rendered quote.
+/// The polls ticket added [`poll`](Self::poll); the render batch fills it.
 #[derive(Debug)]
 pub struct StatusSource<'a> {
     /// The `statuses` row being rendered.
@@ -294,6 +300,12 @@ pub struct StatusSource<'a> {
     /// from the original's own `StatusSource`, one level deep — Pleroma's
     /// recursion into `show.json` for an `Announce`.
     pub reblog: Option<Box<Status>>,
+    /// The row's poll, already rendered by [`crate::services::render_status`]
+    /// from the batch's poll, option and vote reads of
+    /// [`crate::models::poll`] (see [`Poll::build`]);
+    /// `None` for a row the batch found no poll on, and for a preview that
+    /// has stored nothing. Feeds the entity's [`poll`](Status::poll) key.
+    pub poll: Option<Poll>,
 }
 
 /// The Mastodon `Status` entity (core fields plus the `pleroma` block).
@@ -367,9 +379,11 @@ pub struct Status {
     /// The rich-media card for the post's first link; `null` until the
     /// link-preview ticket renders it from one more batched loader.
     pub card: Option<Value>,
-    /// The poll attached to the post; `null` until the polls ticket
-    /// renders it.
-    pub poll: Option<Value>,
+    /// The poll attached to the post, as the [`Poll`] entity; `null` for a
+    /// row the batch found no poll on. The polls render ticket's batched
+    /// reads of [`crate::models::poll`] feed the render — see
+    /// [`StatusSource::poll`] and [`Poll::build`].
+    pub poll: Option<Poll>,
     /// When the content last changed, in the Mastodon time format, or
     /// `null` for an unedited post.
     #[serde(with = "crate::util::time::serde_mastodon_time::option")]
@@ -440,6 +454,7 @@ impl Status {
             muted,
             direct_participation,
             reblog,
+            poll,
         } = source;
         Self {
             id: row.id.to_string(),
@@ -470,7 +485,7 @@ impl Status {
             in_reply_to_account_id: row.in_reply_to_account_id.map(|id| id.to_string()),
             language: row.language.clone(),
             card: None,
-            poll: None,
+            poll,
             edited_at: row.edited_at,
             favourited: JsonBool(favourited),
             reblogged,
@@ -828,6 +843,10 @@ mod tests {
         /// [`JsonBool`] wrapper the source field carries (the batch's
         /// thread-mute membership feeding both flags).
         muted: JsonBool,
+        /// The row's rendered poll, in the same [`Option<Poll>`] the source
+        /// field carries (what the polls batch's three reads would hand the
+        /// renderer, already built).
+        poll: Option<Poll>,
     }
 
     impl<'a> Parts<'a> {
@@ -846,6 +865,7 @@ mod tests {
                 bookmark_folder: None,
                 pinned_at: None,
                 muted: JsonBool(false),
+                poll: None,
             }
         }
 
@@ -939,6 +959,16 @@ mod tests {
                 ..self
             }
         }
+
+        /// Sets [`poll`](Self::poll): the built poll entity the polls
+        /// ticket's batched reads would hand the renderer for a row that
+        /// carries one.
+        fn with_poll(self, poll: Poll) -> Self {
+            Self {
+                poll: Some(poll),
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -961,6 +991,7 @@ mod tests {
             muted: parts.muted.clone(),
             direct_participation: None,
             reblog: reblog.map(Box::new),
+            poll: parts.poll.clone(),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
     }
@@ -986,6 +1017,7 @@ mod tests {
                 muted: JsonBool(false),
                 direct_participation: None,
                 reblog: None,
+                poll: None,
             },
             None,
             None,
@@ -1071,7 +1103,11 @@ mod tests {
         assert_eq!(value["in_reply_to_account_id"], Value::Null);
         assert_eq!(value["language"], Value::Null);
         assert_eq!(value["card"], Value::Null, "cards are a later ticket");
-        assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
+        assert_eq!(
+            value["poll"],
+            Value::Null,
+            "a row the batch found no poll on renders null"
+        );
         assert_eq!(value["edited_at"], Value::Null);
         assert_eq!(
             value["reblogged"], false,
@@ -1179,6 +1215,70 @@ mod tests {
             value["pleroma"]["thread_muted"], true,
             "and the same membership reaches the pleroma block — the two \
              halves are one lookup"
+        );
+    }
+
+    /// The [`Poll`] entity the batch would hand a polled render: the
+    /// fixture row's stored poll, two choices with one vote on the second,
+    /// and the viewer's mark at position 1. `expires_at` is the render
+    /// instant itself, and [`Poll::build`] expires a poll only strictly
+    /// past its deadline — so this one is open, and `hide_totals` (false
+    /// here, as stored) has nothing to withhold.
+    fn built_poll() -> Poll {
+        use crate::models::poll::{Poll as PollRow, PollOption as PollOptionRow};
+
+        let poll_id = Uuid::parse_str("01966666-6666-7666-8666-666666666666").unwrap();
+        let option = |position: i32, title: &str, votes_count: i32| PollOptionRow {
+            id: Uuid::now_v7(),
+            poll_id,
+            position,
+            title: title.to_owned(),
+            votes_count,
+        };
+        Poll::build(
+            &PollRow {
+                id: poll_id,
+                status_id: Uuid::parse_str("01944444-4444-7444-8444-444444444444").unwrap(),
+                expires_at: Some(stamped()),
+                multiple: true,
+                hide_totals: false,
+                voters_count: 1,
+                votes_count: 1,
+            },
+            &[option(0, "tea", 0), option(1, "coffee", 1)],
+            &[1],
+            stamped(),
+        )
+    }
+
+    #[test]
+    fn a_polled_row_renders_the_full_poll_entity() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).with_poll(built_poll()), None);
+        assert_eq!(
+            value["poll"],
+            json!({
+                "id": "01966666-6666-7666-8666-666666666666",
+                "expires_at": "2024-01-31T12:34:56.789Z",
+                "expired": false,
+                "multiple": true,
+                "votes_count": 1,
+                "voters_count": 1,
+                "voted": true,
+                "own_votes": [1],
+                "options": [
+                    {"title": "tea", "votes_count": 0},
+                    {"title": "coffee", "votes_count": 1},
+                ],
+                "emojis": [],
+            }),
+            "the batch's built poll reaches the wire whole, key for key"
+        );
+        assert_eq!(
+            json_keys(&value),
+            EXPECTED_KEYS,
+            "and the entity's key set is unchanged by filling the slot"
         );
     }
 

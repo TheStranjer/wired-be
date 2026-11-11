@@ -17,13 +17,22 @@
 //! [`check_body`] rather than being read off a row, so the whole ruleset is
 //! testable without a database. [`create_status`] is the database-facing
 //! half the endpoint calls: it supplies those two values from the caller's
-//! row, renders the checked text, resolves its mentions, stores the row and
-//! its mention and hashtag links through [`status::insert`], and answers the
-//! [`Status`] entity rendered for the author — Pleroma's `for: user`. The
-//! endpoint's remaining parameters — `poll` and `scheduled_at` — join
-//! [`CreateStatusParams`] as extra `Option`s with their own tickets
-//! (decision 15), and until then a body that sends them is only a body
-//! whose known fields are checked here. `in_reply_to_id` has landed: a
+//! row, renders the checked text, resolves its mentions, stores the row,
+//! its mention and hashtag links, its claimed attachments and the body's
+//! poll (when it carried one) in one transaction through
+//! [`status::insert_conn`] and [`crate::models::poll::create`], and answers
+//! the [`Status`] entity rendered for the author — Pleroma's `for: user`.
+//! The endpoint's remaining parameter — `scheduled_at` — joins
+//! [`CreateStatusParams`] as a further `Option` with its own ticket
+//! (decision 15), and until then a body that sends it is only a body
+//! whose known fields are checked here. `poll` has landed: the
+//! `poll[options]`/`poll[expires_in]`/`poll[multiple]`/`poll[hide_totals]`
+//! shape the [`ApiBody`] extractor already nests joined
+//! [`CreateStatusParams`], [`check_body`] runs Pleroma's `CommonAPI` poll
+//! rules over it, the checked poll travels on [`Checked::poll`], and both
+//! create arms store it beside their status row through
+//! [`crate::models::poll::create`], so an accepted poll answers its
+//! [`Poll`] entity on the fresh post. `in_reply_to_id` has landed: a
 //! body that names a parent posts into that parent's thread, and every
 //! reply rule — the parent read through the same viewer-visibility rules
 //! as [`status_for_viewer_or_404`] with a reblog row folded to its
@@ -37,8 +46,7 @@
 //! poster's own unposted uploads, named as decision 10's id-array, read by
 //! `checked_media` (which counts them against
 //! [`Config::max_media_attachments`] and refuses id text that is no id)
-//! and claimed by the status on the insert's own transaction through
-//! [`crate::models::status::insert`] over
+//! and claimed by the status on the insert's own transaction over
 //! [`crate::models::media_attachment::attach_to_status`] — an id that names
 //! no row, somebody else's row or a row another status already holds is 422
 //! `Media not found`, and a body carrying at least one attachment may
@@ -55,6 +63,7 @@
 //! local participant's side of the conversation through
 //! [`conversation::participate_for_status`].
 //!
+//! [`ApiBody`]: crate::extract::ApiBody
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //!
 //! The module is also the shared half of `PUT /api/v1/statuses/{id}`:
@@ -66,7 +75,8 @@
 //! `media_ids` parameter resolves to the ids the author may attach,
 //! Pleroma's `attachments_from_ids` dropping the ids that name nothing —
 //! the edit wears an unusable id by leaving it out, where the create
-//! refuses it outright;
+//! refuses it outright (and where a poll sent beside non-empty ids is its
+//! own refusal — see [`CreateStatusParams`]);
 //! [`crate::models::status_edit::update_status`] writes the whole edit as
 //! one transaction.
 //!
@@ -81,25 +91,32 @@
 //! arm: the whole `check_body`/`rendered_fields` pipeline runs, but
 //! nothing is written and no hook fires — the [`Status`] entity a create
 //! would have answered is built in memory from a minted id, `now()` and
-//! zero counters.
+//! zero counters, and its `poll` is the `null` of a question nothing was
+//! stored for.
 //!
 //! [`Status`]: crate::entities::status::Status
-//! [`status::insert`]: crate::models::status::insert
+//! [`Poll`]: crate::entities::poll::Poll
+//! [`status::insert_conn`]: crate::models::status::insert_conn
 //!
 //! Every refusal is an [`AppError::Unprocessable`] — a 422 whose body is
 //! `{"error":"…"}` (decision 8) — in Pleroma's or Mastodon's own wording,
-//! pinned by the tests below: the two limit messages, `Invalid visibility` for
-//! a submitted scope outside the five [`Visibility`] names, `Invalid
-//! content_type` for a MIME type outside `CONTENT_TYPES`, Rails' too-long
-//! sentence for a content warning or a language tag past its cap, and the
-//! `expires_in` pair — `expires_in must be at least <floor> seconds` naming
-//! this instance's floor for a shorter span, `expires_in is too large` for a
-//! span no timestamp can hold.
+//! pinned by the tests below: the two limit messages, the poll refusals of
+//! `checked_poll` — `Poll must contain at least 2 options`, `Poll can't
+//! contain more than <max> options`, `Poll options cannot be longer than
+//! <chars> characters`, `Expiration date is too soon`, `Expiration date is
+//! too far in the future` and `Polls cannot have attachments`, `Invalid
+//! visibility` for a submitted scope outside the five [`Visibility`] names,
+//! `Invalid content_type` for a MIME type outside `CONTENT_TYPES`, Rails'
+//! too-long sentence for a content warning or a language tag past its cap,
+//! and the `expires_in` pair — `expires_in must be at least <floor> seconds`
+//! naming this instance's floor for a shorter span, `expires_in is too
+//! large` for a span no timestamp can hold.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
+use sqlx::PgConnection;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -115,6 +132,7 @@ use crate::{
         hashtag::Hashtag,
         idempotency_key, mention,
         oauth_app::OauthApp,
+        poll::{self, PollParams},
         status::{self, DEFAULT_CONTENT_TYPE, NewStatus, Visibility},
         status_edit, status_visibility,
         user::User,
@@ -143,9 +161,10 @@ const MAX_LANGUAGE_CHARS: usize = 10;
 /// as this server's `post_formats`.
 const CONTENT_TYPES: [&str; 3] = ["text/plain", "text/html", "text/markdown"];
 
-/// 422 body for text that leaves nothing behind once trimmed and no
-/// attachment stands beside it (Pleroma's `validate_character_limit` wording;
-/// a media-only post carries attachments and so is allowed to send it).
+/// 422 body for text that leaves nothing behind once trimmed with neither an
+/// attachment nor a poll standing beside it (Pleroma's
+/// `validate_character_limit` wording; a media-only post carries attachments
+/// and a polled post carries its question, so both may send it).
 const EMPTY_STATUS: &str = "Cannot post an empty status without attachments";
 
 /// 422 body for more submitted `media_ids` than
@@ -181,13 +200,35 @@ const EXPIRATION_TOO_LARGE: &str = "expires_in is too large";
 /// text mentions do not count against this cap — the author wrote them.
 const MAX_INHERITED_MENTIONS: usize = 20;
 
+/// 422 body for a poll with fewer than two options: Pleroma's
+/// `validate_poll_options_amount` wording.
+const TOO_FEW_POLL_OPTIONS: &str = "Poll must contain at least 2 options";
+
+/// 422 body for a poll whose `poll[expires_in]` runs past
+/// [`max_poll_expiration_secs`](crate::config::Config::max_poll_expiration_secs):
+/// Pleroma's `validate_poll_expiration` wording for the too-far arm.
+const POLL_EXPIRATION_TOO_FAR: &str = "Expiration date is too far in the future";
+
+/// 422 body for a poll whose `poll[expires_in]` runs under
+/// [`min_poll_expiration_secs`](crate::config::Config::min_poll_expiration_secs):
+/// Pleroma's `validate_poll_expiration` wording for the too-soon arm.
+const POLL_EXPIRATION_TOO_SOON: &str = "Expiration date is too soon";
+
+/// 422 body for a poll submitted beside non-empty `media_ids`: a question
+/// is not posted with pictures.
+const POLL_WITH_MEDIA: &str = "Polls cannot have attachments";
+
 /// The body of `POST /api/v1/statuses`, as the client wrote it.
 ///
 /// Every field is an `Option` with a serde `default`, so a key the body omits
 /// or sends as `null` stays this module's decision instead of becoming a
-/// deserialization error; a later ticket joins the struct with `poll` and
-/// `scheduled_at` as further `Option`s, the same
-/// way. The `sensitive` field is a [`flex`] boolean, so a form body's
+/// deserialization error. `poll` joined the struct with the polls ticket:
+/// [`check_body`] runs Pleroma's poll rules over it and both create arms
+/// store the accepted question beside the status row (`media_ids` beside a
+/// poll is the 422 `Polls cannot have attachments`; the ids themselves mean
+/// the post's attachments — see the struct's own `media_ids` field).
+/// `scheduled_at` joins the struct with its own ticket (decision 15), the
+/// same way. The `sensitive` field is a [`flex`] boolean, so a form body's
 /// `sensitive=on` spells what a JSON body's `true` spells.
 ///
 /// [`flex`]: crate::extract::flex
@@ -269,12 +310,92 @@ pub struct CreateStatusParams {
     /// `Media not found` — the write's own gate, through
     /// [`crate::models::media_attachment::attach_to_status`]. With at
     /// least one id here, an empty [`status`](Self::status) is a
-    /// media-only post rather than a refusal. Absent or null attaches
-    /// nothing.
+    /// media-only post rather than a refusal; a poll sent beside a
+    /// non-empty list is 422 `Polls cannot have attachments`. Absent or
+    /// null attaches nothing.
     ///
     /// [`EditStatusParams`]: self::EditStatusParams
     #[serde(default)]
     media_ids: Option<Vec<String>>,
+    /// The poll the body asks for, in the shape the [`ApiBody`]
+    /// extractor nests out of `poll[options][]`, `poll[expires_in]`,
+    /// `poll[multiple]` and `poll[hide_totals]` form keys — or out of
+    /// the equivalent JSON object. [`check_body`] runs Pleroma's
+    /// `CommonAPI` rules over it and carries the result as
+    /// [`Checked::poll`]; both create arms store it beside the status
+    /// row through [`crate::models::poll::create`], and an accepted
+    /// poll answers its [`Poll`] entity on the created post.
+    ///
+    /// [`ApiBody`]: crate::extract::ApiBody
+    /// [`Poll`]: crate::entities::poll::Poll
+    #[serde(default)]
+    poll: Option<PollRequest>,
+}
+
+/// The `poll` half of a [`CreateStatusParams`] body, as the client wrote
+/// it.
+///
+/// This is the shape the [`ApiBody`] extractor nests out of
+/// `poll[options][]`, `poll[expires_in]`, `poll[multiple]` and
+/// `poll[hide_totals]` form keys (see [`crate::extract::multipart`]'s
+/// bracket-key test) or out of the equivalent JSON object. `expires_in`,
+/// `multiple` and `hide_totals` are [`flex`] fields, so a form body's
+/// `poll[expires_in]=3600`, `poll[multiple]=true` and
+/// `poll[hide_totals]=false` strings spell what JSON's number and booleans
+/// spell. `checked_poll` applies Pleroma's `CommonAPI.Utils` poll rules
+/// and answers the [`CheckedPoll`] both create arms store.
+///
+/// [`ApiBody`]: crate::extract::ApiBody
+/// [`flex`]: crate::extract::flex
+#[derive(Debug, Deserialize)]
+pub struct PollRequest {
+    /// The options as posted, in order. `#[serde(default)]` lets a poll
+    /// that names no options at all reach `checked_poll`'s minimum of
+    /// two rather than failing the extractor.
+    #[serde(default)]
+    options: Vec<String>,
+    /// Seconds from now until the poll closes; a [`flex`] integer, with
+    /// absent or null meaning a poll that never closes. Accepted values
+    /// run from [`Config::min_poll_expiration_secs`] to
+    /// [`Config::max_poll_expiration_secs`].
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[serde(default, deserialize_with = "crate::extract::flex::opt_i64")]
+    expires_in: Option<i64>,
+    /// Whether one voter may mark several options; a [`flex`] boolean,
+    /// `false` when absent or null.
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
+    multiple: Option<bool>,
+    /// Whether the per-option counts stay hidden while the poll runs; a
+    /// [`flex`] boolean, `false` when absent or null.
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
+    hide_totals: Option<bool>,
+}
+
+/// The poll [`check_body`] accepted.
+///
+/// What its `checked_poll` step measured and computed, handed by both
+/// create arms to [`crate::models::poll::create`] beside the status row
+/// they insert on the same transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckedPoll {
+    /// The options as posted, in order; duplicates are the poster's
+    /// business (Pleroma's own rules allow them) and every count and
+    /// length bound `checked_poll` vouches for.
+    pub options: Vec<String>,
+    /// The moment voting closes: `now` plus the posted `expires_in`, or
+    /// `None` when the body named none and the poll never closes.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Whether a voter may mark more than one option: the posted flag,
+    /// `false` when the body left it out.
+    pub multiple: bool,
+    /// Whether the per-option counts stay hidden: the posted flag,
+    /// `false` when the body left it out.
+    pub hide_totals: bool,
 }
 
 impl CreateStatusParams {
@@ -322,6 +443,12 @@ pub struct Checked<'a> {
     /// is the write's decision, made atomically with the insert (see
     /// [`crate::models::status::insert`]).
     pub media_ids: Vec<Uuid>,
+    /// The poll the body asked for, after [`check_body`]'s poll rules —
+    /// see `checked_poll` — or `None` when the body carried none. The
+    /// storage payload: both create arms hand it to
+    /// [`crate::models::poll::create`] beside their status row, and the
+    /// render batch reads it back into the entity's `poll` key.
+    pub poll: Option<CheckedPoll>,
 }
 
 /// Checks a status body against the instance's limits and the author's two
@@ -337,10 +464,12 @@ pub struct Checked<'a> {
 /// [`Visibility::Public`] rather than failing somebody's post.
 ///
 /// The rules run in this order — the attachments (count, then id text), the
-/// text (empty without attachments, then too long), the content warning, the
-/// language, the visibility, the content type, then the expiration — so a
-/// body that breaks several is refused for the first of them, and a
-/// media-only post is read before its empty text can be refused, the way
+/// text (empty only with attachments or a poll standing behind it, then too
+/// long), the poll (`checked_poll`, Pleroma's `CommonAPI` rules: options,
+/// expiration, `media_ids`), the content warning, the language, the
+/// visibility, the content type, then the expiration — so a body that
+/// breaks several is refused for the first of them, and a media-only or
+/// polled post is read before its empty text can be refused, the way
 /// Pleroma's draft pipeline resolves attachments before it checks the
 /// payload. The attachment refusal an id the poster may not claim earns is
 /// not here — it is the write's, made on the database inside the status's
@@ -348,13 +477,15 @@ pub struct Checked<'a> {
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with `EMPTY_STATUS`, `OVER_LIMIT`,
-/// `INVALID_VISIBILITY` or `INVALID_CONTENT_TYPE`, with Rails' too-long
-/// wording for a content warning or a language tag past its cap, with
-/// `checked_expiration`'s refusal for an `expires_in` under the instance's
-/// floor or past the calendar, and with `checked_media`'s refusals for
-/// more submitted `media_ids` than the instance allows or for an entry
-/// that is no id at all.
+/// [`AppError::Unprocessable`] with `EMPTY_STATUS` (skipped when the body
+/// carries attachments or a poll, either of which stands in for the text),
+/// `OVER_LIMIT`, `INVALID_VISIBILITY` or `INVALID_CONTENT_TYPE`, with
+/// `checked_media`'s refusals for more submitted `media_ids` than the
+/// instance allows or for an entry that is no id at all, with
+/// `checked_poll`'s six refusals for a poll that breaks one of its rules,
+/// with Rails' too-long wording for a content warning or a language tag
+/// past its cap, and with `checked_expiration`'s refusal for an
+/// `expires_in` under the instance's floor or past the calendar.
 pub fn check_body<'a>(
     config: &Config,
     default_scope: &str,
@@ -362,11 +493,13 @@ pub fn check_body<'a>(
     params: &'a CreateStatusParams,
 ) -> AppResult<Checked<'a>> {
     let media_ids = checked_media(config, params)?;
+    let has_poll = params.poll.is_some();
     let text = check_text(
         config,
         params.status.as_deref().unwrap_or_default(),
-        !media_ids.is_empty(),
+        !media_ids.is_empty() || has_poll,
     )?;
+    let poll = checked_poll(config, params)?;
     let spoiler_text = checked_spoiler(params.spoiler_text.as_deref())?;
     let language = checked_language(params.language.as_deref())?;
     let visibility = checked_visibility(params.visibility.as_deref(), default_scope)?;
@@ -381,6 +514,7 @@ pub fn check_body<'a>(
         content_type,
         expires_at,
         media_ids,
+        poll,
     })
 }
 
@@ -418,24 +552,155 @@ fn checked_media(config: &Config, params: &CreateStatusParams) -> AppResult<Vec<
 }
 
 /// The post text: trimmed, no longer than [`Config::max_status_chars`]
-/// measured with [`status_length`]'s weighting, and — with no attachments
-/// posted beside it — not empty. A media-only post trims to nothing and
-/// still stands; Pleroma's `validate_character_limit` refuses `""` only
-/// over an empty attachment list.
+/// measured with [`status_length`]'s weighting, and — with neither
+/// attachments nor a poll standing beside it — not empty. A media-only
+/// post trims to nothing and still stands, and so does a polled one:
+/// Pleroma's `validate_character_limit` refuses `""` only over an empty
+/// attachment list, and its `CommonAPI` posts a question with no text.
+/// The cap itself survives either companion; a poll does not lift it.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with [`EMPTY_STATUS`] (empty text and
-/// `attachments` false) or [`OVER_LIMIT`].
-fn check_text<'a>(config: &Config, text: &'a str, attachments: bool) -> AppResult<&'a str> {
+/// `can_stand_empty` false) or [`OVER_LIMIT`].
+fn check_text<'a>(config: &Config, text: &'a str, can_stand_empty: bool) -> AppResult<&'a str> {
     let trimmed = text.trim();
-    if trimmed.is_empty() && !attachments {
+    if trimmed.is_empty() && !can_stand_empty {
         return Err(AppError::Unprocessable(EMPTY_STATUS.to_owned()));
     }
     if status_length(trimmed, URL_WEIGHT) > config.max_status_chars {
         return Err(AppError::Unprocessable(OVER_LIMIT.to_owned()));
     }
     Ok(trimmed)
+}
+
+/// The poll of a create body, checked by Pleroma's `CommonAPI` rules
+/// (`validate_poll_options_amount`, `validate_poll_options_length` and
+/// `validate_poll_expiration` of `lib/pleroma/web/common_api/utils.ex`),
+/// or `None` when the body carried none.
+///
+/// In order: at least two options and at most
+/// [`Config::max_poll_options`] of them (duplicates are allowed — Pleroma
+/// dedups at render, and this implementation stores every option as
+/// posted); then every option non-empty and no longer than
+/// [`Config::max_poll_option_chars`] characters, measured in scalar
+/// values; then the posted `expires_in`, when present, inside
+/// [`Config::min_poll_expiration_secs`] to
+/// [`Config::max_poll_expiration_secs`] — the accepted span becomes
+/// [`CheckedPoll::expires_at`], `now` plus the seconds (a span so far out
+/// no calendar can land on it closes never, which no configuration that
+/// keeps the shipped ceiling can reach); and last the one cross-parameter
+/// rule, that a poll sent beside non-empty `media_ids` is refused:
+/// questions are not asked over attachments.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`TOO_FEW_POLL_OPTIONS`],
+/// `Poll can't contain more than {max_poll_options} options`,
+/// `Poll options cannot be longer than {max_poll_option_chars}
+/// characters`, [`POLL_EXPIRATION_TOO_FAR`], [`POLL_EXPIRATION_TOO_SOON`]
+/// or [`POLL_WITH_MEDIA`].
+fn checked_poll(config: &Config, params: &CreateStatusParams) -> AppResult<Option<CheckedPoll>> {
+    let Some(request) = params.poll.as_ref() else {
+        return Ok(None);
+    };
+    checked_poll_options(config, &request.options)?;
+    checked_poll_option_chars(config, &request.options)?;
+    let expires_at = checked_poll_expiration(config, request.expires_in)?;
+    checked_poll_media(params.media_ids.as_deref())?;
+    Ok(Some(CheckedPoll {
+        options: request.options.clone(),
+        expires_at,
+        multiple: request.multiple.unwrap_or(false),
+        hide_totals: request.hide_totals.unwrap_or(false),
+    }))
+}
+
+/// The option-count arms of [`checked_poll`]: at least two, at most
+/// [`Config::max_poll_options`].
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`TOO_FEW_POLL_OPTIONS`] or
+/// `Poll can't contain more than {max_poll_options} options`.
+fn checked_poll_options(config: &Config, options: &[String]) -> AppResult<()> {
+    if options.len() < 2 {
+        return Err(AppError::Unprocessable(TOO_FEW_POLL_OPTIONS.to_owned()));
+    }
+    if options.len() > config.max_poll_options {
+        return Err(AppError::Unprocessable(format!(
+            "Poll can't contain more than {} options",
+            config.max_poll_options
+        )));
+    }
+    Ok(())
+}
+
+/// The option-length arm of [`checked_poll`]: no option empty, none
+/// past [`Config::max_poll_option_chars`] scalar values — Pleroma's one
+/// message covers both spellings of a broken option.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with `Poll options cannot be longer than
+/// {max_poll_option_chars} characters`.
+fn checked_poll_option_chars(config: &Config, options: &[String]) -> AppResult<()> {
+    let broken = options.iter().any(|option| {
+        let length = option.chars().count();
+        length == 0 || length > config.max_poll_option_chars
+    });
+    if broken {
+        return Err(AppError::Unprocessable(format!(
+            "Poll options cannot be longer than {} characters",
+            config.max_poll_option_chars
+        )));
+    }
+    Ok(())
+}
+
+/// The expiration arm of [`checked_poll`]: the posted span, when present,
+/// must land inside the instance's poll window, and the accepted instant
+/// is computed once here — the same value [`create_status`] stores
+/// as the poll's `expires_at` (see [`crate::models::poll::PollParams`]).
+/// Bounds too wide for the `i64` the comparison runs in become the
+/// nearest number it can hold: a ceiling that cannot be represented
+/// refuses nothing, a floor that cannot be represented refuses every
+/// submitted span, neither silently permissive.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`POLL_EXPIRATION_TOO_FAR`] above the
+/// ceiling or [`POLL_EXPIRATION_TOO_SOON`] under the floor.
+fn checked_poll_expiration(
+    config: &Config,
+    seconds: Option<i64>,
+) -> AppResult<Option<DateTime<Utc>>> {
+    let Some(secs) = seconds else {
+        return Ok(None);
+    };
+    let max = i64::try_from(config.max_poll_expiration_secs).unwrap_or(i64::MAX);
+    if secs > max {
+        return Err(AppError::Unprocessable(POLL_EXPIRATION_TOO_FAR.to_owned()));
+    }
+    let min = i64::try_from(config.min_poll_expiration_secs).unwrap_or(i64::MAX);
+    if secs < min {
+        return Err(AppError::Unprocessable(POLL_EXPIRATION_TOO_SOON.to_owned()));
+    }
+    Ok(TimeDelta::try_seconds(secs).and_then(|span| Utc::now().checked_add_signed(span)))
+}
+
+/// The cross-parameter arm of [`checked_poll`]: a poll sent beside
+/// non-empty `media_ids` is the attachment conflict; an empty or absent
+/// list is no attachment at all.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`POLL_WITH_MEDIA`].
+fn checked_poll_media(media_ids: Option<&[String]>) -> AppResult<()> {
+    if media_ids.is_some_and(|ids| !ids.is_empty()) {
+        return Err(AppError::Unprocessable(POLL_WITH_MEDIA.to_owned()));
+    }
+    Ok(())
 }
 
 /// The content warning: [`MAX_SPOILER_CHARS`] characters at most, and the
@@ -578,9 +843,10 @@ pub struct RenderedFields {
 /// [`default_scope`](User::default_scope) and
 /// [`sensitive_default`](User::sensitive_default), Pleroma reads the same
 /// pair off the user — and [`create_status`] does the rest: the render and
-/// the entity lists (the [`render_status_fields`] step below), the stored row
-/// with its mention and hashtag links, its claimed attachments and the
-/// author's moved counters ([`status::insert`]), and the render for the
+/// the entity lists (the [`render_status_fields`] step below), the stored
+/// row with its mention and hashtag links, its claimed attachments and the
+/// author's moved counters, the body's poll stored beside it when it
+/// carried one (the `store_poll` step below), and the render for the
 /// author. `app` — the client
 /// that issued the presenting
 /// token, `None` when the caller names none — is recorded as the post's
@@ -615,9 +881,47 @@ pub async fn create_status(
     app: Option<&OauthApp>,
     params: CreateStatusParams,
 ) -> AppResult<Status> {
-    let new = prepared_new_status(state, user, app, &params).await?;
-    let row = status::insert(&state.db, &state.config.base_url, &new).await?;
+    let (new, poll) = prepared_new_status(state, user, app, &params).await?;
+    let mut tx = state.db.begin().await?;
+    let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
+    store_poll(&mut tx, row.id, poll.as_ref()).await?;
+    tx.commit().await?;
     created_entity(state, user, row).await
+}
+
+/// Stores the checked body's poll beside its freshly inserted status row,
+/// on the create's open transaction: [`poll::create`] with the whole
+/// [`CheckedPoll`] reshaped into [`PollParams`]. A body that carried no
+/// poll writes nothing here, so a plain create is the same write it always
+/// was; and a create that never commits — an idempotency-key race lost
+/// after this point — leaves no stray poll behind, because the rollback
+/// takes the poll and its options down with the status: a stored poll can
+/// only ever belong to a status that was committed beside it.
+///
+/// # Errors
+///
+/// Any database failure of the poll or option insert arrives through `?`
+/// as [`AppError::Database`].
+async fn store_poll(
+    conn: &mut PgConnection,
+    status_id: Uuid,
+    poll: Option<&CheckedPoll>,
+) -> AppResult<()> {
+    let Some(poll) = poll else {
+        return Ok(());
+    };
+    poll::create(
+        conn,
+        status_id,
+        &PollParams {
+            options: poll.options.clone(),
+            expires_at: poll.expires_at,
+            multiple: poll.multiple,
+            hide_totals: poll.hide_totals,
+        },
+    )
+    .await
+    .map(drop)
 }
 
 /// The shared tail of both create arms: the fresh row's log line, the
@@ -662,8 +966,11 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
 /// does, with one more statement on its transaction: the key is claimed
 /// around the freshly written status with `ON CONFLICT DO NOTHING` (see
 /// [`idempotency_key::claim`]), so two requests racing under one key
-/// serialize on that insert. The winner commits its own status; the loser
-/// finds the pair taken, rolls its write back without a trace and answers
+/// serialize on that insert. The winner commits its own status — and its
+/// poll, stored on the same transaction by `store_poll`, with it; the
+/// loser finds the pair taken, rolls its write back without a trace (poll
+/// and options included: a replayed or raced key leaves exactly one poll
+/// row behind) and answers
 /// the winner's entity. The third arm — the pair is taken but its status has
 /// been deleted since — moves the key onto the fresh status
 /// ([`idempotency_key::reassign`]), because a dead post is not a
@@ -689,9 +996,10 @@ pub async fn create_status_idempotent(
         );
         return replayed_entity(state, user, &row).await;
     }
-    let new = prepared_new_status(state, user, app, &params).await?;
+    let (new, poll) = prepared_new_status(state, user, app, &params).await?;
     let mut tx = state.db.begin().await?;
     let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
+    store_poll(&mut tx, row.id, poll.as_ref()).await?;
     if idempotency_key::claim(&mut tx, user.id, key, row.id).await? {
         tx.commit().await?;
         return created_entity(state, user, row).await;
@@ -752,12 +1060,14 @@ async fn replayed_entity(state: &AppState, user: &User, row: &status::Status) ->
 /// `ActivityPub.create(changes, true)` answers the draft activity and
 /// persists none of it.
 ///
-/// Nothing touches `statuses`, `status_mentions` or the hashtag tables, no
-/// counter moves, no key is claimed and `after_status_created` never
-/// fires. The one read the preview does perform is the mention lookup —
-/// [`render_status_fields`]'s own, network fetch of an unknown remote
-/// account included, since the rendered content is only honest if the
-/// mention links are.
+/// Nothing touches `statuses`, `status_mentions`, the hashtag tables or
+/// the poll tables, no counter moves, no key is claimed and
+/// `after_status_created` never fires. A body carrying a poll is checked
+/// the way a post's is and its entity answers `poll: null` — the question
+/// is previewed, never stored. The one read the preview does perform is
+/// the mention lookup — [`render_status_fields`]'s own, network fetch of
+/// an unknown remote account included, since the rendered content is only
+/// honest if the mention links are.
 ///
 /// # Errors
 ///
@@ -803,6 +1113,7 @@ pub async fn preview_status(
             muted: JsonBool(false),
             direct_participation: None,
             reblog: None,
+            poll: None,
         },
         Some(user),
         None,
@@ -984,6 +1295,13 @@ fn new_status(
     }
 }
 
+/// What [`prepared_new_status`] answers: the [`NewStatus`] both create
+/// arms store and the checked body's poll beside it — the question names
+/// no `NewStatus` column, so it rides out separately for `store_poll`.
+/// Factored out because a mixed tuple of row and poll reads better by
+/// name (and a bare `Result` of it trips `type_complexity`).
+type Prepared = (NewStatus, Option<CheckedPoll>);
+
 /// The shared pre-write half of both create arms: [`check_body`] over the
 /// body, the reply's parent when the body names one, the
 /// `in_reply_to_conversation_id` participation when the body names one,
@@ -996,6 +1314,9 @@ fn new_status(
 /// is inserted) — and, for a conversation reply, the `direct` visibility
 /// forced, the participation's recipients merged into the mentions, and
 /// its thread recorded for the insert ([`apply_conversation_reply`]).
+/// The checked body's poll comes back beside the row: it belongs to no
+/// `NewStatus` column, and both create arms hand it to `store_poll` on
+/// the insert's own transaction.
 ///
 /// The parent read happens before the render, like Pleroma's `ActivityDraft`
 /// pipeline, where the `in_reply_to` arm runs before `content`: a body with
@@ -1015,7 +1336,7 @@ async fn prepared_new_status(
     user: &User,
     app: Option<&OauthApp>,
     params: &CreateStatusParams,
-) -> AppResult<NewStatus> {
+) -> AppResult<Prepared> {
     let checked = check_body(
         &state.config,
         &user.default_scope,
@@ -1048,7 +1369,7 @@ async fn prepared_new_status(
     if let Some(participation) = participation {
         apply_conversation_reply(state, &participation, &mut new).await?;
     }
-    Ok(new)
+    Ok((new, checked.poll))
 }
 
 /// The participation the body's `in_reply_to_conversation_id` names: read
@@ -1322,7 +1643,8 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // the stored `expires_at` rides along untouched (Pleroma's
         // `make_update_data` carries it forward the same way) — and never
         // its parent: an edit rewrites what was said in the thread it
-        // stands in, and `in_reply_to_id` is not an edit parameter. The
+        // stands in, and `in_reply_to_id` is not an edit parameter. Neither
+        // is a poll: a post's question is fixed when it is asked. The
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
         // which drops what the author may not attach instead of refusing
@@ -1332,6 +1654,7 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         expires_in: None,
         in_reply_to_id: None,
         in_reply_to_conversation_id: None,
+        poll: None,
         media_ids: None,
     }
 }
@@ -1475,6 +1798,20 @@ mod tests {
         CreateStatusParams {
             status: Some(text.to_owned()),
             ..CreateStatusParams::default()
+        }
+    }
+
+    /// A body posting `text` beside the minimum two-option poll, for the
+    /// persistence and key-race tests.
+    fn polled(text: &str) -> CreateStatusParams {
+        CreateStatusParams {
+            poll: Some(PollRequest {
+                options: vec!["a".to_owned(), "b".to_owned()],
+                expires_in: None,
+                multiple: None,
+                hide_totals: None,
+            }),
+            ..posted(text)
         }
     }
 
@@ -2556,6 +2893,15 @@ mod tests {
 
     // ────────────  the Idempotency-Key and preview arms  ────────────
 
+    /// How many `polls` rows the database holds: one per stored question,
+    /// none for a plain create, a refused body or a preview.
+    async fn poll_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM polls")
+            .fetch_one(pool)
+            .await
+            .expect("the poll count reads")
+    }
+
     /// How many `idempotency_keys` rows the database holds: one per create
     /// that claimed a key, none for a replay or a preview.
     async fn key_rows(pool: &PgPool) -> i64 {
@@ -2696,7 +3042,9 @@ mod tests {
     /// Two creates under one fresh key, driven concurrently from one task:
     /// whichever arm the second request takes — pre-read replay or the
     /// mid-transaction `ON CONFLICT` loss — exactly one status stands and
-    /// both callers answer it with the same id.
+    /// both callers answer it with the same id. Both bodies carry a poll,
+    /// so the single surviving `polls` row proves the loser's poll rolled
+    /// back with its status.
     #[tokio::test]
     async fn two_creates_racing_under_one_key_leave_one_status() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -2705,8 +3053,8 @@ mod tests {
         let fixture = Arc::new((state(pool), alice));
 
         let (first, second) = tokio::join!(
-            create_status_idempotent(&fixture.0, &fixture.1, None, posted("race one"), "k1"),
-            create_status_idempotent(&fixture.0, &fixture.1, None, posted("race two"), "k1"),
+            create_status_idempotent(&fixture.0, &fixture.1, None, polled("race one"), "k1"),
+            create_status_idempotent(&fixture.0, &fixture.1, None, polled("race two"), "k1"),
         );
         let one = first.expect("the first racer creates or replays");
         let two = second.expect("the second racer creates or replays");
@@ -2720,6 +3068,32 @@ mod tests {
             vec![Uuid::parse_str(&one.id).expect("an id")]
         );
         assert_eq!(key_rows(pool).await, 1, "one claim");
+        assert_eq!(
+            poll_rows(pool).await,
+            1,
+            "one poll — the loser's rolled back with its status"
+        );
+        let winner_id = Uuid::parse_str(&one.id).expect("an id");
+        let stand = poll::get_for_status(pool, winner_id)
+            .await
+            .expect("the poll reads")
+            .expect("the winner's poll stands");
+        assert_eq!(
+            poll::options(pool, stand.id)
+                .await
+                .expect("the options read")
+                .len(),
+            2,
+            "and its options stand with it"
+        );
+        for entity in [&one, &two] {
+            let value = serde_json::to_value(entity).expect("the entity serializes");
+            assert_eq!(
+                value["poll"]["id"],
+                stand.id.to_string(),
+                "both answers carry the one surviving poll"
+            );
+        }
         let counted = crate::models::user::get_by_id(pool, fixture.1.id)
             .await
             .unwrap()
@@ -4082,5 +4456,639 @@ mod tests {
         );
         assert_eq!(live_ids(pool).await.len(), 1, "no second row");
         assert_eq!(media_row(pool, mine.id).await.position, 0, "claimed once");
+    }
+
+    /// `n` distinct option texts, numbered from zero.
+    fn option_texts(n: usize) -> Vec<String> {
+        (0..n).map(|index| format!("option {index}")).collect()
+    }
+
+    /// The reading of [`check_body`] under the stock test config with one
+    /// field changed by `update`: the error's text, or `None` when the
+    /// body was accepted.
+    fn rejection_under<F>(config: &Config, body: &CreateStatusParams, update: F) -> Option<String>
+    where
+        F: FnOnce(&mut Config),
+    {
+        let mut owned = config.clone();
+        update(&mut owned);
+        check_body(&owned, "public", false, body)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+            .err()
+    }
+
+    /// An accepted poll rides out of [`check_body`] as the [`CheckedPoll`]
+    /// the create will store: options in order, the submitted
+    /// span computed into a closing instant, and both flags as posted. A
+    /// body without a poll leaves the field `None`; a `false` spelling is
+    /// a decision, not an absence.
+    #[test]
+    fn an_accepted_poll_is_carried_in_full() {
+        let absent = params(json!({"status": "hi"}));
+        assert!(accepted(&absent).poll.is_none(), "no poll key, no poll");
+
+        let body = params(json!({
+            "status": "vote please",
+            "poll": {
+                "options": ["yes", "no"],
+                "expires_in": 3600,
+                "multiple": true,
+                "hide_totals": true,
+            },
+        }));
+        let poll = accepted(&body)
+            .poll
+            .expect("the checked body carries its poll");
+        assert_eq!(poll.options, vec!["yes", "no"], "options keep their order");
+        let due = poll
+            .expires_at
+            .unwrap_or_else(|| panic!("3600 seconds is a closing instant"));
+        let span = due - Utc::now();
+        assert!(
+            (TimeDelta::seconds(3600) - span).num_seconds().abs() <= 1,
+            "the poll closes about an hour out, not {span}"
+        );
+        assert!(poll.multiple, "the submitted any-choice flag");
+        assert!(poll.hide_totals, "the submitted hidden-totals flag");
+
+        let plain = params(json!({"status": "hi", "poll": {"options": ["a", "b"]}}));
+        let plain = accepted(&plain).poll.expect("the bare poll is carried too");
+        assert_eq!(
+            plain.expires_at, None,
+            "no expires_in is a poll that never closes"
+        );
+        assert!(!plain.multiple, "an absent flag is `false`, not undecided");
+        assert!(!plain.hide_totals, "and so is the other one");
+
+        let off = params(json!({
+            "status": "hi",
+            "poll": {"options": ["a", "b"], "multiple": false, "hide_totals": "off"},
+        }));
+        let off = accepted(&off)
+            .poll
+            .expect("a submitted `false` is as valid as a `true`");
+        assert!(!off.multiple, "`false` stays false");
+        assert!(!off.hide_totals, "and the form spelling `off` does too");
+    }
+
+    /// Fewer than two options — including a poll that named none at all,
+    /// which the `serde(default)` keeps a service decision rather than an
+    /// extractor error — is Pleroma's minimum refusal; two is the minimum
+    /// met.
+    #[test]
+    fn a_poll_needs_at_least_two_options() {
+        for poll in [
+            json!({}),
+            json!({"options": []}),
+            json!({"options": ["only"]}),
+        ] {
+            let body = params(json!({"status": "hi", "poll": poll}));
+            assert_eq!(
+                rejection(&body),
+                TOO_FEW_POLL_OPTIONS,
+                "`{poll}` is less than a question"
+            );
+        }
+        let body = params(json!({"status": "hi", "poll": {"options": ["a", "b"]}}));
+        assert!(
+            accepted(&body).poll.is_some(),
+            "two options is the minimum met"
+        );
+    }
+
+    /// The option ceiling at its exact boundary: twenty pass, twenty-one
+    /// are refused, and the message names the configured number.
+    #[test]
+    fn a_poll_cannot_carry_more_options_than_the_ceiling() {
+        let config = Config::for_tests();
+        assert_eq!(
+            config.max_poll_options, 20,
+            "the stock ceiling is the twenty this test counts options against"
+        );
+        let exact = params(json!({"status": "hi", "poll": {"options": option_texts(20)}}));
+        let checked = accepted(&exact)
+            .poll
+            .expect("twenty options are within the ceiling");
+        assert_eq!(checked.options.len(), 20, "and all of them ride along");
+        let over = params(json!({"status": "hi", "poll": {"options": option_texts(21)}}));
+        assert_eq!(
+            rejection(&over),
+            "Poll can't contain more than 20 options",
+            "one past the ceiling is refused, naming it"
+        );
+    }
+
+    /// The ceiling is the configuration's, not a welded 20: an instance
+    /// that raised it takes twenty-one, and one that lowered it names its
+    /// own number in its own message.
+    #[test]
+    fn the_poll_option_ceiling_is_configurable() {
+        let two = params(json!({"status": "hi", "poll": {"options": ["a", "b"]}}));
+        let tight = rejection_under(&Config::for_tests(), &two, |config| {
+            config.max_poll_options = 1;
+        });
+        assert_eq!(
+            tight.expect("a ceiling of one refuses the two-option minimum"),
+            "Poll can't contain more than 1 options",
+            "the message names the configured number, not the shipped one"
+        );
+        let roomy = params(json!({"status": "hi", "poll": {"options": option_texts(21)}}));
+        let opened = rejection_under(&Config::for_tests(), &roomy, |config| {
+            config.max_poll_options = 21;
+        });
+        assert!(
+            opened.is_none(),
+            "the 21 the stock config refuses pass one that raised the ceiling to 21"
+        );
+    }
+
+    /// The option-length rule at its exact boundaries: 200 characters pass,
+    /// 201 are refused, and an empty option is refused with the same
+    /// message — the one wording Pleroma's rule covers broken options
+    /// with.
+    #[test]
+    fn a_poll_option_must_not_be_empty_or_over_long() {
+        let exact = params(json!({
+            "status": "hi",
+            "poll": {"options": ["x".repeat(200), "b"]},
+        }));
+        assert!(
+            accepted(&exact).poll.is_some(),
+            "exactly 200 characters is still within the cap"
+        );
+        let over = params(json!({
+            "status": "hi",
+            "poll": {"options": ["a", "x".repeat(201)]},
+        }));
+        assert_eq!(
+            rejection(&over),
+            "Poll options cannot be longer than 200 characters",
+            "one character past the cap is the refusal, naming it"
+        );
+        let empty = params(json!({"status": "hi", "poll": {"options": ["", "b"]}}));
+        assert_eq!(
+            rejection(&empty),
+            "Poll options cannot be longer than 200 characters",
+            "an empty option is refused with the same sentence"
+        );
+    }
+
+    /// The length cap is the configuration's too: a short-capped instance
+    /// measures and names its own number.
+    #[test]
+    fn the_poll_option_cap_is_configurable() {
+        let body = params(json!({
+            "status": "hi",
+            "poll": {"options": ["0123456789", "eleven chars"]},
+        }));
+        let refused = rejection_under(&Config::for_tests(), &body, |config| {
+            config.max_poll_option_chars = 10;
+        });
+        assert_eq!(
+            refused.expect("the 11-character option breaks the configured cap"),
+            "Poll options cannot be longer than 10 characters",
+            "the message names the configured cap"
+        );
+    }
+
+    /// The expiration window: 299 (and every shorter span, negatives
+    /// included) are too soon, the 300 floor and the `31_536_000` ceiling
+    /// pass, and `31_536_001` is too far — each with Pleroma's own words.
+    #[test]
+    fn the_poll_expiration_window_refuses_the_spans_it_cannot_take() {
+        let posted = |secs: i64| {
+            params(json!({
+                "status": "hi",
+                "poll": {"options": ["a", "b"], "expires_in": secs},
+            }))
+        };
+        for short in [-1_i64, 0, 1, 299] {
+            assert_eq!(
+                rejection(&posted(short)),
+                POLL_EXPIRATION_TOO_SOON,
+                "{short} seconds is under the 300-second floor"
+            );
+        }
+        assert!(
+            accepted(&posted(300)).poll.is_some(),
+            "the floor itself passes"
+        );
+        assert!(
+            accepted(&posted(31_536_000)).poll.is_some(),
+            "and the one-year ceiling itself passes"
+        );
+        assert_eq!(
+            rejection(&posted(31_536_001)),
+            POLL_EXPIRATION_TOO_FAR,
+            "one second past the ceiling is too far"
+        );
+    }
+
+    /// Both window bounds come from the configuration, and the stock
+    /// window still refuses what an opened one takes.
+    #[test]
+    fn the_poll_expiration_window_is_configurable() {
+        let short = params(json!({
+            "status": "hi",
+            "poll": {"options": ["a", "b"], "expires_in": 60},
+        }));
+        let lowered = rejection_under(&Config::for_tests(), &short, |config| {
+            config.min_poll_expiration_secs = 30;
+        });
+        assert!(lowered.is_none(), "60 seconds pass a 30-second floor");
+        assert_eq!(
+            rejection(&short),
+            POLL_EXPIRATION_TOO_SOON,
+            "the stock 300-second floor still refuses it"
+        );
+        let far = params(json!({
+            "status": "hi",
+            "poll": {"options": ["a", "b"], "expires_in": 172_800},
+        }));
+        let shortened = rejection_under(&Config::for_tests(), &far, |config| {
+            config.max_poll_expiration_secs = 86_400;
+        });
+        assert_eq!(
+            shortened.expect("two days are past a one-day ceiling"),
+            POLL_EXPIRATION_TOO_FAR,
+            "the message is the same whatever the number was"
+        );
+    }
+
+    /// A poll beside attachments is the conflict refusal; an empty
+    /// `media_ids` list is no attachment at all, and `media_ids` without
+    /// a poll is the attachments field — accepted here, claimed or
+    /// refused by the write.
+    #[test]
+    fn a_poll_cannot_have_attachments() {
+        let with_media = params(json!({
+            "status": "hi",
+            "poll": {"options": ["a", "b"]},
+            "media_ids": ["01934567-89ab-7cde-f012-3456789abcde"],
+        }));
+        assert_eq!(
+            rejection(&with_media),
+            POLL_WITH_MEDIA,
+            "a question over a picture is refused"
+        );
+        let empty_list = params(json!({
+            "status": "hi",
+            "poll": {"options": ["a", "b"]},
+            "media_ids": [],
+        }));
+        assert!(
+            accepted(&empty_list).poll.is_some(),
+            "an empty id list names no attachment, so there is no conflict"
+        );
+        let media_only = params(json!({
+            "status": "hi",
+            "media_ids": ["01934567-89ab-7cde-f012-3456789abcde"],
+        }));
+        let checked = accepted(&media_only);
+        assert!(
+            checked.poll.is_none(),
+            "media_ids without a poll is no conflict — just the attachment ids"
+        );
+    }
+
+    /// A poll carries an otherwise empty status: the empty refusal is
+    /// skipped, the length cap is not lifted, and the poll rules run
+    /// between the text and the visibility — a body breaking a poll rule
+    /// and a scope rule is refused for the poll, and one breaking the
+    /// poll's window and the top-level `expires_in` for the poll.
+    #[test]
+    fn a_poll_stands_in_for_the_text_and_runs_before_the_visibility() {
+        let blank = params(json!({"status": "   ", "poll": {"options": ["a", "b"]}}));
+        let checked = accepted(&blank);
+        assert_eq!(checked.text, "", "the trimmed nothing is stored as nothing");
+        assert!(checked.poll.is_some(), "and the question carries the post");
+
+        let limit = Config::for_tests().max_status_chars;
+        let over = params(json!({
+            "status": "x".repeat(limit + 1),
+            "poll": {"options": ["a", "b"]},
+        }));
+        assert_eq!(
+            rejection(&over),
+            OVER_LIMIT,
+            "the poll does not lift the status length cap"
+        );
+
+        let bad_poll_and_bad_scope = params(json!({
+            "status": "hi",
+            "visibility": "sideways",
+            "poll": {"options": ["only"]},
+        }));
+        assert_eq!(
+            rejection(&bad_poll_and_bad_scope),
+            TOO_FEW_POLL_OPTIONS,
+            "the poll is refused before the visibility is looked at"
+        );
+
+        let bad_poll_and_bad_expiry = params(json!({
+            "status": "",
+            "poll": {"options": ["a", "b"], "expires_in": 1},
+            "expires_in": -5,
+        }));
+        assert_eq!(
+            rejection(&bad_poll_and_bad_expiry),
+            POLL_EXPIRATION_TOO_SOON,
+            "the poll's window answers before the top-level `checked_expiration` gets its turn"
+        );
+    }
+
+    /// A `direct` poll is a private question, which Pleroma posts: the
+    /// audience check neither sees nor refuses the poll.
+    #[test]
+    fn a_direct_poll_is_allowed() {
+        let body = params(json!({
+            "status": "vote quietly",
+            "visibility": "direct",
+            "poll": {"options": ["a", "b"]},
+        }));
+        let checked = accepted(&body);
+        assert_eq!(
+            checked.visibility,
+            Visibility::Direct,
+            "the audience posted"
+        );
+        assert!(checked.poll.is_some(), "and the poll carried");
+    }
+
+    /// Repeated options are the poster's business: the count bounds are
+    /// kept, the texts are not deduplicated.
+    #[test]
+    fn duplicate_poll_options_are_allowed() {
+        let body = params(json!({"status": "hi", "poll": {"options": ["same", "same"]}}));
+        let poll = accepted(&body).poll.expect("duplicates are no rule broken");
+        assert_eq!(
+            poll.options,
+            vec!["same", "same"],
+            "both copies ride along as posted"
+        );
+    }
+
+    /// The poll arrives the same from JSON and from form keys: the
+    /// extractor nests `poll[options][]` into the option list and every
+    /// other `poll[...]` value is a [`flex`] string the deserializers
+    /// read; anything that is no poll shape at all stays the extractor's
+    /// 422.
+    ///
+    /// [`flex`]: crate::extract::flex
+    #[test]
+    fn the_poll_deserializes_from_the_json_and_form_spellings() {
+        let from_json = params(json!({
+            "status": "pick",
+            "poll": {
+                "options": ["a", "b"],
+                "expires_in": 3600,
+                "multiple": true,
+                "hide_totals": false,
+            },
+        }));
+        assert!(from_json.poll.is_some(), "the json shape is a poll request");
+
+        let form = crate::extract::parse_pairs([
+            ("status", "pick"),
+            ("poll[options][]", "a"),
+            ("poll[options][]", "b"),
+            ("poll[expires_in]", "3600"),
+            ("poll[multiple]", "true"),
+            ("poll[hide_totals]", "on"),
+            ("media_ids[]", "id-1"),
+        ]);
+        let from_form: CreateStatusParams =
+            crate::extract::into_params(form).expect("the form shape fits the same type");
+        let poll = from_form.poll.expect("the nested keys became a poll");
+        assert_eq!(
+            poll.options,
+            vec!["a", "b"],
+            "the append keys are the option list"
+        );
+        assert_eq!(
+            poll.expires_in,
+            Some(3_600),
+            "the string number is the flex integer"
+        );
+        assert_eq!(
+            poll.multiple,
+            Some(true),
+            "the string boolean is the flex boolean"
+        );
+        assert_eq!(poll.hide_totals, Some(true), "`on` means true");
+        assert_eq!(
+            from_form.media_ids,
+            Some(vec!["id-1".to_owned()]),
+            "and `media_ids[]` nests beside it"
+        );
+
+        for broken in [
+            json!("yes"),
+            json!({"options": "ab"}),
+            json!({"options": ["a", "b"], "expires_in": "soon"}),
+            json!({"options": ["a", "b"], "multiple": "maybe"}),
+        ] {
+            let parsed = crate::extract::into_params::<CreateStatusParams>(
+                json!({"status": "hi", "poll": broken}),
+            );
+            assert!(
+                parsed.is_err(),
+                "`{broken}` is no poll and must not deserialize"
+            );
+        }
+    }
+
+    // ────────────  poll persistence through the service  ────────────
+
+    /// A create whose body carries a poll stores the `polls` row and its
+    /// options beside the status — and the entity answers the whole
+    /// [`Poll`]: the stored row's id, options in submission order at zero
+    /// votes, the deadline the posted span counts out, and the posted
+    /// flags. The status's own expiry stays what the body's top-level
+    /// `expires_in` said, which here is nothing.
+    ///
+    /// [`Poll`]: crate::entities::poll::Poll
+    #[tokio::test]
+    async fn a_polled_create_stores_the_poll_and_renders_its_entity() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "balloter").await;
+
+        let before = Utc::now();
+        let entity = created(
+            &app_state,
+            &alice,
+            params(json!({
+                "status": "ballot",
+                "poll": {
+                    "options": ["a", "b"],
+                    "expires_in": 3600,
+                    "multiple": true,
+                    "hide_totals": false,
+                },
+            })),
+        )
+        .await;
+        let row = stored(pool, &entity).await;
+        let stand = poll::get_for_status(pool, row.id)
+            .await
+            .expect("the poll reads")
+            .expect("the create stored the poll beside its status");
+
+        assert_eq!(stand.status_id, row.id, "the poll names its status");
+        assert!(stand.multiple, "the posted any-choice flag is stored");
+        assert!(
+            !stand.hide_totals,
+            "and so is the posted show-totals decision"
+        );
+        let due = stand.expires_at.expect("an hour-out deadline");
+        let span = due - before;
+        assert!(
+            (TimeDelta::seconds(3600) - span).num_seconds().abs() <= 5,
+            "the stored instant is now plus the posted span, not {span}"
+        );
+        assert_eq!(stand.voters_count, 0, "a fresh poll counts nothing");
+        assert_eq!(stand.votes_count, 0, "in either column");
+
+        let options = poll::options(pool, stand.id)
+            .await
+            .expect("the options read");
+        let titles: Vec<&str> = options.iter().map(|found| found.title.as_str()).collect();
+        assert_eq!(titles, vec!["a", "b"], "options store in submission order");
+        assert!(
+            options.iter().all(|found| found.votes_count == 0),
+            "a fresh option has no votes"
+        );
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["poll"]["id"],
+            stand.id.to_string(),
+            "the entity answers the stored poll's id"
+        );
+        assert_eq!(
+            value["poll"]["options"],
+            json!([
+                {"title": "a", "votes_count": 0},
+                {"title": "b", "votes_count": 0},
+            ]),
+            "options render in order with their fresh counts"
+        );
+        assert_eq!(value["poll"]["multiple"], true, "the posted flags render");
+        assert_eq!(value["poll"]["expired"], false, "an hour out is wide open");
+        assert!(
+            value["poll"]["expires_at"].is_string(),
+            "the deadline renders as a timestamp"
+        );
+        assert_eq!(
+            value["pleroma"]["expires_at"],
+            Value::Null,
+            "the poll's closing time is not the status's deletion time"
+        );
+        assert_eq!(
+            poll_rows(pool).await,
+            1,
+            "exactly one polls row was written"
+        );
+    }
+
+    /// A body whose poll carries only the options — no span, no flags —
+    /// stores the never-closing single-choice question the checked body
+    /// decided, and the entity agrees: `expires_at` null, `expired` false,
+    /// `multiple` false.
+    #[tokio::test]
+    async fn a_bare_poll_stores_the_defaults_the_check_computed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "plain-balloter").await;
+
+        let entity = created(&app_state, &alice, polled("which one?")).await;
+        let row = stored(pool, &entity).await;
+        let stand = poll::get_for_status(pool, row.id)
+            .await
+            .expect("the poll reads")
+            .expect("the create stored the poll");
+
+        assert!(
+            stand.expires_at.is_none(),
+            "no expires_in is a poll that never closes"
+        );
+        assert!(!stand.multiple, "an absent flag stores `false`");
+        assert!(!stand.hide_totals, "and so does the other one");
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(value["poll"]["expires_at"], Value::Null);
+        assert_eq!(
+            value["poll"]["expired"], false,
+            "never closes, never closed"
+        );
+        assert_eq!(value["poll"]["multiple"], false);
+        assert_eq!(
+            value["poll"]["votes_count"], 0,
+            "the roll-ups start at zero"
+        );
+        assert_eq!(value["poll"]["voters_count"], 0);
+        assert_eq!(value["poll"]["voted"], false, "the author has not voted");
+        assert_eq!(value["poll"]["own_votes"], json!([]));
+        assert_eq!(
+            value["poll"]["options"],
+            json!([
+                {"title": "a", "votes_count": 0},
+                {"title": "b", "votes_count": 0},
+            ]),
+            "the checked options reach the rows and the render in order"
+        );
+    }
+
+    /// A preview whose body carries a poll runs the whole check and render
+    /// and stores nothing: the entity answers `poll: null`, the `polls`
+    /// and `poll_options` tables stay as empty as the `statuses` one, and
+    /// the poll still stood in for the empty text the way a post's would.
+    #[tokio::test]
+    async fn a_previewed_poll_answers_null_and_is_stored_nowhere() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "poll-looker").await;
+
+        let entity = preview_status(
+            &app_state,
+            &alice,
+            None,
+            &params(json!({
+                "status": "   ",
+                "preview": true,
+                "poll": {
+                    "options": ["a", "b"],
+                    "expires_in": 3600,
+                    "multiple": true,
+                },
+            })),
+        )
+        .await
+        .expect("the poll stands in for the empty text, previewed or not");
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["poll"],
+            Value::Null,
+            "a preview has stored nothing to render"
+        );
+        assert!(live_ids(pool).await.is_empty(), "no status row");
+        assert_eq!(poll_rows(pool).await, 0, "no polls row");
+        let options: (i64,) = sqlx::query_as("SELECT count(*) FROM poll_options")
+            .fetch_one(pool)
+            .await
+            .expect("the option count reads");
+        assert_eq!(options.0, 0, "and no option rows either");
+        assert_eq!(key_rows(pool).await, 0, "and no key was claimed");
+        let counted = crate::models::user::get_by_id(pool, alice.id)
+            .await
+            .unwrap()
+            .expect("the author exists");
+        assert_eq!(counted.statuses_count, 0, "and no count moved");
     }
 }
