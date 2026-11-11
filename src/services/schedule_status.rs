@@ -178,19 +178,26 @@ fn parse_schedule(params: &CreateStatusParams) -> AppResult<DateTime<Utc>> {
         .ok_or_else(|| AppError::Unprocessable(INVALID_SCHEDULED_AT.to_owned()))
 }
 
-/// The window: `at` must be at least
+/// The window a fire moment has to clear: `at` must sit at least
 /// [`Config::min_scheduled_secs`](crate::config::Config::min_scheduled_secs)
-/// seconds ahead of now, so any past instant fails this same gate. The
-/// refusal names the setting in whole minutes (the default `300` reads "5
-/// minutes"); the comparison truncates the span to whole seconds, which at
-/// worst lets a sub-second boundary through and refuses nothing it should
-/// accept.
+/// seconds ahead of now.
+///
+/// So any past instant fails this same gate. The refusal names the setting in
+/// whole minutes (the default `300` reads "5 minutes"); the comparison
+/// truncates the span to whole seconds, which at worst lets a sub-second
+/// boundary through and refuses nothing it should accept.
+///
+/// The service's own rule, and both of the endpoints that park a moment run
+/// it: the create's `scheduled_at` arm and
+/// `PUT /api/v1/scheduled_statuses/{id}` (see
+/// [`crate::api::scheduled_statuses`]), so a moved schedule owes exactly the
+/// answer a new one does.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with `Scheduled time must be at least
 /// {minutes} minutes in the future`.
-fn check_window(config: &Config, at: DateTime<Utc>) -> AppResult<()> {
+pub fn check_window(config: &Config, at: DateTime<Utc>) -> AppResult<()> {
     let floor_secs = i64::try_from(config.min_scheduled_secs).unwrap_or(i64::MAX);
     if at.signed_duration_since(Utc::now()).num_seconds() >= floor_secs {
         return Ok(());

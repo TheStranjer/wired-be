@@ -232,8 +232,10 @@ mod reports;
 /// reads and the deprecated `GET /api/v1/statuses/{id}/card` endpoint.
 mod rich_media;
 
-/// The `scheduled_at` arm of `POST /api/v1/statuses` over HTTP: parking a
-/// create, its window, limits, media reservation and entity answer.
+/// Scheduled statuses over HTTP: the `scheduled_at` arm of
+/// `POST /api/v1/statuses` (parking a create, its window, limits, media
+/// reservation and entity answer) and the four `/api/v1/scheduled_statuses`
+/// routes that list, read, move and cancel what was parked.
 mod scheduled_statuses;
 
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).

@@ -10,7 +10,7 @@ use crate::{
         domain_blocks, emoji_packs, emoji_reactions, endorsements, filters, follow_requests,
         instance, lists, markers, media, misc, mutes, notifications, oauth_tokens, password_reset,
         pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push, reports,
-        scrobbles, search, statuses, streaming, tags, timelines,
+        scheduled_statuses, scrobbles, search, statuses, streaming, tags, timelines,
     },
     state::AppState,
 };
@@ -60,6 +60,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(polls::router(state))
         .merge(push::router())
         .merge(reports::router(state))
+        .merge(scheduled_statuses::router())
         .merge(scrobbles::router())
         .merge(search::router(state))
         .merge(statuses::router(state))

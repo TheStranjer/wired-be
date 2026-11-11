@@ -23,14 +23,25 @@
 //! an id any schedule names in its `params -> 'media_ids'` array must not be
 //! posted by anything else until that schedule fires or is cancelled.
 //!
+//! The management endpoints themselves ([`crate::api::scheduled_statuses`])
+//! need four more, and these are the account-scoped ones: [`page_for_user`]
+//! walks one account's schedules as a [`PageParams`] keyset page,
+//! [`get_owned`] reads a row only for the account it belongs to,
+//! [`reschedule`] moves a row's fire moment in the same scoped statement, and
+//! [`delete_owned`] cancels it. Scoping is what makes a foreign schedule
+//! indistinguishable from a missing one, which is the 404 those endpoints
+//! owe; the unscoped [`get_by_id`] and [`delete`] stay the worker's, since a
+//! fire knows the row by id alone and has no account to compare against.
+//!
 //! [`scheduled_at`]: ScheduledStatus::scheduled_at
+//! [`PageParams`]: crate::pagination::PageParams
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{error::AppResult, pagination::PageParams, util::id::new_id};
 
 /// The `INSERT` behind [`insert`]: the minted id plus the three payload
 /// fields, with `RETURNING *` so the row comes back with its database-side
@@ -60,6 +71,34 @@ const FETCH_DUE_SQL: &str = "SELECT * FROM scheduled_statuses
    ORDER BY scheduled_at, id
       LIMIT $2";
 
+/// [`page_for_user`]: the start of one account's schedule listing — the
+/// owner bound first, then [`PageParams`]' keyset conditions, ordering and
+/// `LIMIT` on `id` appended after it. The ordering is the id column's, not
+/// the fire moment's; see [`page_for_user`] for why.
+///
+/// [`PageParams`]: crate::pagination::PageParams
+const PAGE_SQL: &str = "SELECT * FROM scheduled_statuses WHERE user_id = ";
+
+/// [`get_owned`]: one row, only for the account it belongs to — the join-free
+/// form of Pleroma's `ScheduledActivity.get(user, id)`, whose `nil` is the
+/// endpoint's 404 whether the id was unknown or somebody else's.
+const GET_OWNED_SQL: &str = "SELECT * FROM scheduled_statuses WHERE id = $1 AND user_id = $2";
+
+/// [`reschedule`]: the moved row, in the statement that moves it. The scope
+/// and the stamp are the point: `updated_at` records the change — the one
+/// place a schedule's two timestamps come apart — and matching on `user_id`
+/// too is what turns a foreign id into `None` rather than into somebody
+/// else's moved schedule.
+const RESCHEDULE_SQL: &str = "UPDATE scheduled_statuses
+      SET scheduled_at = $2, updated_at = now()
+    WHERE id = $1 AND user_id = $3
+RETURNING *";
+
+/// [`delete_owned`]: [`delete`]'s account-scoped twin, for the endpoint that
+/// cancels; a foreign or already-gone id deletes nothing, rows-affected
+/// answers `0`, and the caller reports the 404.
+const DELETE_OWNED_SQL: &str = "DELETE FROM scheduled_statuses WHERE id = $1 AND user_id = $2";
+
 /// [`reserved_media_ids`]: the submitted ids, keeping submission order, that
 /// some pending row names inside its `params -> 'media_ids'` array. The
 /// containment test is against a one-element array of the id's text, the
@@ -87,8 +126,9 @@ pub struct ScheduledStatus {
     pub params: Value,
     /// When the schedule was created.
     pub inserted_at: DateTime<Utc>,
-    /// When the row last changed; a schedule is write-once, so in practice
-    /// it keeps equal to [`inserted_at`](Self::inserted_at).
+    /// When the row last changed: [`inserted_at`](Self::inserted_at)'s equal
+    /// while the schedule stands as it was created, and later than it once
+    /// [`reschedule`] has moved its fire moment.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -143,6 +183,70 @@ pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<ScheduledSta
     Ok(fetched)
 }
 
+/// One account's schedules as a [`PageParams`] keyset page, newest-created
+/// first.
+///
+/// This is Pleroma's `MastodonAPI.get_scheduled_activities`:
+/// `ScheduledActivity.for_user_query` through `Pagination.fetch_paginated`,
+/// which carries no ordering of its own, so Pleroma's default `id desc` is
+/// what the listing answers. The keyset, the cursors and the `Link` header all
+/// live on `id`, and that is what fixes the order: a listing read in
+/// [`scheduled_at`] order cannot be walked by id comparisons, so the time
+/// order and the cursors cannot both hold. Pleroma settles it for the id
+/// column, and since a `UUIDv7` is minted in creation order the page still
+/// runs a burst of scheduling back through the order it was submitted in. For
+/// the read that genuinely needs the due-time order there is [`fetch_due`].
+///
+/// `page.finish` is what turns the `min_id` page — read ascending off the
+/// index — back into the newest-first order the response goes out in.
+///
+/// [`scheduled_at`]: ScheduledStatus::scheduled_at
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn page_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    page: PageParams,
+) -> AppResult<Vec<ScheduledStatus>> {
+    let mut builder = QueryBuilder::<Postgres>::new(PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // the result keeps these statements from being unused (decision 14).
+    let _bound: &mut _ = builder.push_bind(user_id);
+    page.apply_keyset(&mut builder, "id");
+    let rows = builder
+        .build_query_as::<ScheduledStatus>()
+        .fetch_all(pool)
+        .await?;
+    Ok(page.finish(rows))
+}
+
+/// Fetches one schedule by id, **only for the account that owns it**.
+///
+/// `None` then means an unknown id and somebody else's id alike — the single
+/// answer the management endpoints turn into their 404, so a probe learns
+/// nothing about a row it may not touch. Pleroma's
+/// `ScheduledActivity.get(user, id)` is the same one `nil` for both.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_owned(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+) -> AppResult<Option<ScheduledStatus>> {
+    let fetched = sqlx::query_as::<_, ScheduledStatus>(GET_OWNED_SQL)
+        .bind(id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(fetched)
+}
+
 /// Deletes schedule `id`, reporting whether a row went.
 ///
 /// Cancelling the schedule of a status that never fired is the ordinary
@@ -156,6 +260,55 @@ pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<ScheduledSta
 pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<bool> {
     let deleted = sqlx::query("DELETE FROM scheduled_statuses WHERE id = $1")
         .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
+/// Moves schedule `id` of `user_id` to fire at `scheduled_at`, returning the
+/// moved row.
+///
+/// `None` is [`get_owned`]'s pair of answers again: no such row, or one
+/// belonging to somebody else.
+///
+/// Only the moment and `updated_at` change: the parked `params` are exactly
+/// what the create normalised, and moving when a post fires rewrites nothing
+/// of what it says. Rescheduling past a moment already reached is the
+/// caller's decision, not this write's — the endpoint checks the window
+/// before it gets here.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn reschedule(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+    scheduled_at: DateTime<Utc>,
+) -> AppResult<Option<ScheduledStatus>> {
+    let moved = sqlx::query_as::<_, ScheduledStatus>(RESCHEDULE_SQL)
+        .bind(id)
+        .bind(scheduled_at)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(moved)
+}
+
+/// Cancels `user_id`'s schedule `id`, reporting whether a row went.
+///
+/// `false` — the endpoint's 404 — for an id the account does not own (or
+/// never owned) and for one whose fire or cancel already took it away.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_owned(pool: &PgPool, id: Uuid, user_id: Uuid) -> AppResult<bool> {
+    let deleted = sqlx::query(DELETE_OWNED_SQL)
+        .bind(id)
+        .bind(user_id)
         .execute(pool)
         .await?;
     Ok(deleted.rows_affected() > 0)
@@ -387,6 +540,247 @@ mod tests {
             .await
             .expect("the delete runs");
         assert!(!gone, "an id the table never held deletes nothing");
+    }
+
+    /// The page parameters of `query`, on the listing's cap.
+    fn page(query: &str) -> PageParams {
+        PageParams::from_query(Some(query), crate::pagination::MAX_LIMIT)
+            .expect("the fixture query paginates")
+    }
+
+    /// The ids of `rows`, in the order they came back.
+    fn ids(rows: &[ScheduledStatus]) -> Vec<Uuid> {
+        rows.iter().map(|row| row.id).collect()
+    }
+
+    /// Rewinds schedule `id`'s `updated_at` to a fixed past instant and hands
+    /// the row back, so a later write's restamping is something a test can
+    /// see rather than a race against the clock's resolution.
+    async fn backdate(pool: &PgPool, id: Uuid) -> ScheduledStatus {
+        let rewound = sqlx::query(
+            "UPDATE scheduled_statuses SET updated_at = '2000-01-01T00:00:00Z' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("the fixture rewinds");
+        assert_eq!(
+            rewound.rows_affected(),
+            1,
+            "the fixture row was there to rewind"
+        );
+        get_by_id(pool, id)
+            .await
+            .expect("the row reads")
+            .expect("the row is stored")
+    }
+
+    #[tokio::test]
+    async fn page_for_user_walks_one_account_newest_id_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        // Created oldest-first with the due times the other way round: the
+        // page is keyed on `id`, so the newest id leads no matter when the
+        // row fires.
+        let first = schedule(&pool, &alice, at(20, 0, 0), json!({ "status": "a" })).await;
+        let second = schedule(&pool, &alice, at(19, 0, 0), json!({ "status": "b" })).await;
+        let third = schedule(&pool, &alice, at(18, 0, 0), json!({ "status": "c" })).await;
+        let theirs = schedule(&pool, &bob, at(17, 0, 0), json!({ "status": "d" })).await;
+
+        let all = page_for_user(&pool, alice.id, page(""))
+            .await
+            .expect("the first page reads");
+        assert_eq!(
+            ids(&all),
+            vec![third.id, second.id, first.id],
+            "the account's own rows, newest id first, another account's left out"
+        );
+
+        let older = page_for_user(&pool, alice.id, page(&format!("max_id={}", second.id)))
+            .await
+            .expect("the cursor page reads");
+        assert_eq!(
+            ids(&older),
+            vec![first.id],
+            "max_id continues where the page ended"
+        );
+
+        let newer = page_for_user(&pool, alice.id, page(&format!("min_id={}", second.id)))
+            .await
+            .expect("the forward page reads");
+        assert_eq!(
+            ids(&newer),
+            vec![third.id],
+            "min_id answers the newer page, still newest first"
+        );
+
+        let unseen = page_for_user(&pool, alice.id, page(&format!("since_id={}", first.id)))
+            .await
+            .expect("the unseen page reads");
+        assert_eq!(
+            ids(&unseen),
+            vec![third.id, second.id],
+            "since_id reads everything made after its cursor"
+        );
+
+        let small = page_for_user(&pool, alice.id, page("limit=2"))
+            .await
+            .expect("the limited page reads");
+        assert_eq!(
+            ids(&small),
+            vec![third.id, second.id],
+            "and the limit cuts the newest page"
+        );
+
+        assert!(
+            page_for_user(&pool, Uuid::now_v7(), page(""))
+                .await
+                .expect("a stranger's page reads")
+                .is_empty(),
+            "an account with no schedule lists nothing"
+        );
+        assert_eq!(
+            ids(&page_for_user(&pool, bob.id, page(""))
+                .await
+                .expect("bob's page reads"),),
+            vec![theirs.id],
+            "the page is each account's own"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_owned_answers_only_to_its_owner() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let row = schedule(&pool, &alice, at(9, 0, 0), json!({ "status": "a" })).await;
+
+        let owned = get_owned(&pool, row.id, alice.id)
+            .await
+            .expect("the owner's read runs")
+            .expect("the owner sees the row");
+        assert_eq!(owned.id, row.id, "the row comes back whole");
+        assert_eq!(owned.scheduled_at, row.scheduled_at, "same moment");
+        assert_eq!(owned.params, row.params, "same params");
+
+        assert!(
+            get_owned(&pool, row.id, bob.id)
+                .await
+                .expect("the stranger's read runs")
+                .is_none(),
+            "another account's schedule is indistinguishable from no schedule"
+        );
+        assert!(
+            get_owned(&pool, Uuid::now_v7(), alice.id)
+                .await
+                .expect("the unknown read runs")
+                .is_none(),
+            "and so is an id the table never held"
+        );
+    }
+
+    #[tokio::test]
+    async fn reschedule_moves_the_moment_and_restamps_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let params = json!({ "status": "moved", "visibility": "unlisted" });
+        let created = schedule(&pool, &alice, at(9, 0, 0), params.clone()).await;
+        let stale = backdate(&pool, created.id).await;
+
+        let moved = reschedule(&pool, created.id, alice.id, at(15, 30, 0))
+            .await
+            .expect("the reschedule runs")
+            .expect("the owner's row moved");
+        assert_eq!(moved.id, created.id, "the same row, not a new one");
+        assert_eq!(
+            moved.scheduled_at,
+            at(15, 30, 0),
+            "due at the instant it was given"
+        );
+        assert_eq!(moved.params, params, "the parked request is untouched");
+        assert_eq!(moved.user_id, alice.id, "and so is its account");
+        assert_eq!(
+            moved.inserted_at, created.inserted_at,
+            "created when created"
+        );
+        assert!(
+            moved.updated_at > stale.updated_at,
+            "and the write stamps updated_at"
+        );
+
+        let back = reschedule(&pool, created.id, alice.id, at(9, 0, 0))
+            .await
+            .expect("the second reschedule runs")
+            .expect("a schedule can move again");
+        assert_eq!(
+            back.scheduled_at,
+            at(9, 0, 0),
+            "including to an earlier moment"
+        );
+
+        assert!(
+            reschedule(&pool, created.id, bob.id, at(23, 0, 0))
+                .await
+                .expect("the stranger's reschedule runs")
+                .is_none(),
+            "another account moves nothing"
+        );
+        assert!(
+            reschedule(&pool, Uuid::now_v7(), alice.id, at(23, 0, 0))
+                .await
+                .expect("the unknown reschedule runs")
+                .is_none(),
+            "and so is an id the table never held"
+        );
+        let untouched = get_by_id(&pool, created.id)
+            .await
+            .expect("the read runs")
+            .expect("the row is stored");
+        assert_eq!(
+            untouched.scheduled_at,
+            at(9, 0, 0),
+            "the two refused writes left the moment alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_owned_cancels_only_its_owners_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let row = schedule(&pool, &alice, at(9, 0, 0), json!({ "status": "a" })).await;
+
+        assert!(
+            !delete_owned(&pool, row.id, bob.id)
+                .await
+                .expect("the stranger's cancel runs"),
+            "another account's schedule does not go"
+        );
+        assert!(
+            !delete_owned(&pool, Uuid::now_v7(), alice.id)
+                .await
+                .expect("the unknown cancel runs"),
+            "and neither does an id the table never held"
+        );
+        assert!(
+            delete_owned(&pool, row.id, alice.id)
+                .await
+                .expect("the owner's cancel runs"),
+            "the owner's own row goes"
+        );
+        assert!(
+            get_by_id(&pool, row.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "and is gone afterwards"
+        );
     }
 
     #[tokio::test]
