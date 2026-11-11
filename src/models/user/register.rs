@@ -151,6 +151,14 @@ pub struct RegisterParams {
     /// verbatim in `users.registration_reason` (Pleroma's
     /// `reason` parameter); `None` stores `NULL`.
     pub reason: Option<String>,
+    /// Whether an external provider has already proven the address: the
+    /// external OAuth registration sets this when the form submits the
+    /// very email its provider reported. `ACCOUNT_ACTIVATION_REQUIRED`
+    /// then registers the account confirmed and queues no letter (the
+    /// address needed no link to prove it); `false` — the only value
+    /// `POST /api/v1/accounts` ever gives — leaves the confirmation mode
+    /// in full force.
+    pub provider_email_verified: bool,
 }
 
 /// The password is secret material and renders as `<redacted>`; everything
@@ -164,6 +172,7 @@ impl fmt::Debug for RegisterParams {
             .field("name", &self.name)
             .field("bio", &self.bio)
             .field("reason", &self.reason)
+            .field("provider_email_verified", &self.provider_email_verified)
             .finish()
     }
 }
@@ -258,7 +267,11 @@ impl From<RegisterError> for AppError {
 /// token and the link it carries included — goes out through
 /// [`confirmation::send`] once the row exists. An account with no address
 /// to confirm (an `ACCOUNTS_EMAIL_OPTIONAL` instance) is registered
-/// confirmed: there is nothing a link could prove.
+/// confirmed: there is nothing a link could prove. So is one whose
+/// address an external provider already vouched for
+/// ([`RegisterParams::provider_email_verified`], the external-OAuth
+/// registration's rule): the proof exists, the letter would ask for it
+/// again.
 ///
 /// # Errors
 ///
@@ -409,7 +422,10 @@ async fn set_password_hash(pool: &PgPool, id: Uuid, hash: &str) -> AppResult<()>
 /// (Pleroma's `register_changeset`, which reads the same two config keys):
 /// `REGISTRATIONS_APPROVAL_REQUIRED` sets `approval_pending` unless the
 /// registration came in on an invite, and `ACCOUNT_ACTIVATION_REQUIRED`
-/// clears `email_confirmed` for an account with an address to confirm. The
+/// clears `email_confirmed` for an account with an address to confirm —
+/// unless the provider already verified that address
+/// ([`RegisterParams::provider_email_verified`], which starts such an
+/// account confirmed). The
 /// unconfirmed account's letter goes out afterwards, in [`create_local_user`].
 async fn build_and_insert(
     state: &AppState,
@@ -428,7 +444,9 @@ async fn build_and_insert(
     } else {
         text_to_html(&raw_bio)
     };
-    let activation_required = state.config.account_activation_required.get() && email.is_some();
+    let activation_required = state.config.account_activation_required.get()
+        && email.is_some()
+        && !params.provider_email_verified;
     let new_user = NewUser {
         email,
         password_hash: Some(password_hash),
@@ -749,6 +767,7 @@ mod tests {
             name: None,
             bio: None,
             reason: None,
+            provider_email_verified: false,
         }
     }
 
@@ -1222,6 +1241,7 @@ mod tests {
             name: None,
             bio: Some(raw_bio.to_owned()),
             reason: Some("I'm a cool dude, bro".to_owned()),
+            provider_email_verified: false,
         };
         let user = create_local_user(&state, params, None).await.unwrap();
 
@@ -1260,6 +1280,7 @@ mod tests {
             name: Some("<b>Mr Nobody</b>".to_owned()),
             bio: None,
             reason: None,
+            provider_email_verified: false,
         };
         let user = create_local_user(&state, params, None).await.unwrap();
         assert!(user.email.is_none(), "the account has no email");
@@ -1285,6 +1306,7 @@ mod tests {
             name: None,
             bio: None,
             reason: None,
+            provider_email_verified: false,
         };
         let shape_err = create_local_user(&state, bad_shape, None)
             .await
@@ -1315,6 +1337,7 @@ mod tests {
             name: None,
             bio: None,
             reason: None,
+            provider_email_verified: false,
         };
         let blank_err = create_local_user(&state, all_blank, None)
             .await
@@ -1836,6 +1859,57 @@ mod tests {
         assert!(
             queued_letters(&pool).await.is_empty(),
             "and there was nothing to send"
+        );
+    }
+
+    /// A provider-verified address needs no link to prove it: the same
+    /// activation mode that leaves every other registration unconfirmed
+    /// lands this one confirmed, and no letter is queued.
+    #[tokio::test]
+    async fn a_provider_verified_email_lands_confirmed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(false), Toggle::new(true)));
+        let params = RegisterParams {
+            provider_email_verified: true,
+            ..params_for("external")
+        };
+
+        let user = create_local_user(&state, params, None)
+            .await
+            .expect("the external registration lands");
+
+        assert_eq!(
+            stored_state(&pool, user.id).await,
+            (false, true, None),
+            "confirmed right away: no approval, no confirmation, no token"
+        );
+        assert!(
+            queued_letters(&pool).await.is_empty(),
+            "and nothing was mailed to ask for a click"
+        );
+    }
+
+    /// Approval is a staff decision an external provider cannot vouch
+    /// for: the verified email confirms the address, not the wait.
+    #[tokio::test]
+    async fn a_provider_verified_email_still_waits_for_approval() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state_with(&pool, mode_config(Toggle::new(true), Toggle::new(true)));
+        let params = RegisterParams {
+            provider_email_verified: true,
+            ..params_for("awaiting-external")
+        };
+
+        let user = create_local_user(&state, params, None)
+            .await
+            .expect("the external registration lands");
+
+        assert_eq!(
+            stored_state(&pool, user.id).await,
+            (true, true, None),
+            "confirmed, and still awaiting approval"
         );
     }
 

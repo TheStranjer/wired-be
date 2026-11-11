@@ -25,8 +25,9 @@ use crate::{
 /// How long an issued state survives: ten minutes, the window between
 /// `GET /oauth/prepare_request` and the provider's callback.
 ///
-/// Past it a row is unreadable through [`get_valid`] and writes nothing
-/// through [`set_pending`]; nothing here reads a state at all once its
+/// Past it a row is unreadable through [`get_valid`] and [`get_live`],
+/// writes nothing through [`set_pending`], and goes in the hourly
+/// `maintenance.tokens` sweep; nothing here reads a state at all once its
 /// expiry has passed.
 pub const LOGIN_STATE_TTL: Duration = Duration::from_mins(10);
 
@@ -65,8 +66,12 @@ const INSERT_SQL: &str = "INSERT INTO oauth_login_states (state, provider, param
      VALUES ($1, $2, $3, now() + $4)
   RETURNING *";
 
-/// [`get_valid`]: one state, and only while it is still valid.
+/// [`get_valid`] and [`get_live`]: one state, and only while it is still
+/// valid; the provider arm is the caller's filter in [`get_valid`].
 const GET_SQL: &str = "SELECT * FROM oauth_login_states WHERE state = $1 AND valid_until > now()";
+
+/// [`delete`]: a finished round trip's state has nothing left to carry.
+const DELETE_SQL: &str = "DELETE FROM oauth_login_states WHERE state = $1";
 
 /// [`set_pending`]: the provider's account info under the `pending` key,
 /// leaving the stored authorize parameters beside it.
@@ -116,6 +121,45 @@ pub async fn get_valid(
         .await?
         .filter(|row| row.provider == provider);
     Ok(found)
+}
+
+/// The live state `state` names, whichever provider it was issued to.
+///
+/// The registration pages (`/oauth/registration_details`, `/oauth/register`)
+/// know only the key the callback handed the browser; the row's own
+/// `provider` column is what they work with, so no provider filter belongs
+/// on the lookup. `None` when no live row carries the state.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_live(pool: &PgPool, state: &str) -> AppResult<Option<OauthLoginState>> {
+    let found = sqlx::query_as::<_, OauthLoginState>(GET_SQL)
+        .bind(state)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found)
+}
+
+/// Deletes the state `state` names, answering whether a row went away.
+///
+/// A finished (or abandoned) registration has nothing left to carry: the
+/// same key must not be redeemable twice. An unknown state deletes nothing
+/// and answers `false`, which is the caller's success just the same — no
+/// live row holds it.
+///
+/// # Errors
+///
+/// Any database failure (connection) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete(pool: &PgPool, state: &str) -> AppResult<bool> {
+    let removed = sqlx::query(DELETE_SQL)
+        .bind(state)
+        .execute(pool)
+        .await
+        .map(|outcome| outcome.rows_affected())?;
+    Ok(removed > 0)
 }
 
 /// Moves `provider`'s account info into the `pending` key of the state's
@@ -257,6 +301,80 @@ mod tests {
                 .expect("the lookup runs")
                 .is_some(),
             "the live state beside it is still readable"
+        );
+    }
+
+    /// [`get_live`] reads a live row without any provider filter — the
+    /// registration pages look the state up by key alone — and refuses an
+    /// expired one exactly like [`get_valid`] does.
+    #[tokio::test]
+    async fn get_live_reads_any_provider_and_refuses_the_expired() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let issued = create(&pool, "keycloak", &params())
+            .await
+            .expect("the insert runs");
+        let found = get_live(&pool, &issued.state)
+            .await
+            .expect("the lookup reaches the database")
+            .expect("the state is live");
+        assert_eq!(
+            found.provider, "keycloak",
+            "the provider comes from the row"
+        );
+        assert_eq!(found.params, params(), "and so do its parameters");
+
+        let rewound = sqlx::query("UPDATE oauth_login_states SET valid_until = now() - interval '1 second' WHERE state = $1")
+            .bind(&issued.state)
+            .execute(&pool)
+            .await
+            .expect("the rewind runs");
+        assert_eq!(rewound.rows_affected(), 1, "the rewind hit the row");
+        assert!(
+            get_live(&pool, &issued.state)
+                .await
+                .expect("the lookup runs")
+                .is_none(),
+            "the expired state is unreadable"
+        );
+        assert!(
+            get_live(&pool, "never-issued")
+                .await
+                .expect("the lookup runs")
+                .is_none(),
+            "and so is one that was never issued"
+        );
+    }
+
+    /// [`delete`] takes the row, answers whether one went away, and leaves a
+    /// second call (and an unknown state) with nothing to remove.
+    #[tokio::test]
+    async fn delete_removes_the_finished_state_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let issued = create(&pool, "github", &params())
+            .await
+            .expect("the insert runs");
+        assert!(
+            !delete(&pool, "never-issued")
+                .await
+                .expect("the delete runs"),
+            "an unknown state removes nothing"
+        );
+        assert!(
+            delete(&pool, &issued.state).await.expect("the delete runs"),
+            "the live row goes"
+        );
+        assert!(
+            !delete(&pool, &issued.state).await.expect("the delete runs"),
+            "and the second call has nothing left"
+        );
+        assert!(
+            get_live(&pool, &issued.state)
+                .await
+                .expect("the lookup runs")
+                .is_none(),
+            "the state is gone for good"
         );
     }
 
