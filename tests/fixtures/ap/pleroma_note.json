@@ -1,0 +1,28 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    { "ostatus": "http://ostatus.org#", "conversation": "ostatus:conversation" }
+  ],
+  "id": "https://remote.example/objects/9c41c1c4-2b6e-4a67-b4d5-b2c5f7e4468d",
+  "type": "Note",
+  "attributedTo": [{ "id": "https://remote.example/users/bob", "type": "Person" }],
+  "to": ["https://remote.example/users/bob/followers"],
+  "cc": ["as:Public"],
+  "contentMap": { "en": "<div><di>contentMap <b>wins</b> here</di></di></div>" },
+  "source": "a bare string is not a source object",
+  "published": "2024-02-02T09:00:00Z",
+  "url": [{"type": "Link", "href": "https://remote.example/notice/01ABC"}],
+  "inReplyTo": "https://remote.example/objects/f19266fb-1e2f-4a4a-9c7d-2f9a9a0e9d5e",
+  "context": null,
+  "ostatus:conversation": {
+    "litepub:messageId": "https://remote.example/notice/01ABC",
+    "href": "https://remote.example/contexts/01DEF"
+  },
+  "tag": { "type": "Mention", "href": "https://remote.example/users/carol", "name": "@carol" },
+  "attachment": {
+    "type": "Image",
+    "url": "https://remote.example/images/photo.jpg",
+    "name": "A photo",
+    "width": "800"
+  }
+}

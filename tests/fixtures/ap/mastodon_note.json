@@ -1,0 +1,79 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/v1",
+    {
+      "toot": "http://joinmastodon.org/ns#",
+      "Hashtag": "as:Hashtag"
+    }
+  ],
+  "id": "https://remote.example/users/bob/statuses/01HQXYZ",
+  "type": "Note",
+  "attributedTo": "https://remote.example/users/bob",
+  "to": ["https://www.w3.org/ns/activitystreams#Public"],
+  "cc": ["https://remote.example/users/bob/followers"],
+  "content": "<p>Hello <script>steal()</script>world <a href=\"https://example.org/post\" onclick=\"steal()\" target=\"_blank\">link</a> <span class=\"h-card\"><a href=\"https://remote.example/users/carol\" class=\"u-url mention\">@<span>carol</span></a></span></p>",
+  "summary": "trigger warnings",
+  "sensitive": true,
+  "source": {
+    "content": "Hello world @carol https://example.org/post #Rust",
+    "mediaType": "text/plain"
+  },
+  "published": "2024-02-01T10:00:00.000Z",
+  "updated": "2024-02-01T10:05:00.000Z",
+  "url": [
+    { "type": "Link", "href": "https://remote.example/@bob/01HQXYZ", "mediaType": "text/html" }
+  ],
+  "inReplyTo": {
+    "id": "https://remote.example/users/carol/statuses/01HR",
+    "href": "https://remote.example/@carol/01HR"
+  },
+  "context": "https://remote.example/contexts/01HS",
+  "conversation": "https://remote.example/contexts/ignored",
+  "quoteUrl": "https://remote.example/users/dave/statuses/01HT",
+  "tag": [
+    {
+      "type": "Mention",
+      "href": "https://remote.example/users/carol",
+      "name": "@carol@remote.example"
+    },
+    { "type": "Hashtag", "href": "https://remote.example/tags/rust", "name": "#Rust" },
+    {
+      "type": "Hashtag",
+      "href": "https://remote.example/tags/too-long",
+      "name": "#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa101"
+    },
+    {
+      "type": "Emoji",
+      "name": ":ralph:",
+      "updated": "2015-01-01T00:00:00Z",
+      "icon": { "type": "Image", "mediaType": "image/png", "url": "https://remote.example/emoji/ralph.png" }
+    },
+    { "type": "Show", "name": "Some Podcast", "href": "https://remote.example/shows/1" },
+    "a bare string tag"
+  ],
+  "attachment": [
+    {
+      "type": "Document",
+      "mediaType": "image/png",
+      "url": "https://remote.example/media/a.png",
+      "name": "A chart",
+      "blurhash": "UBLf:XfQ00fQ",
+      "width": 1920,
+      "height": 1080,
+      "focalPoint": [0.25, -0.5]
+    },
+    {
+      "type": "Document",
+      "url": { "href": "https://remote.example/media/movie.mp4", "mediaType": "video/mp4" }
+    },
+    {
+      "type": "Link",
+      "mediaType": "text/html",
+      "name": "An article",
+      "url": "https://example.com/article"
+    },
+    { "type": "Document", "url": "https://remote.example/media/unknown.qqq" },
+    { "type": "Tombstone", "url": "https://remote.example/media/gone.png" }
+  ]
+}

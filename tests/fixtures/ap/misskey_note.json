@@ -1,0 +1,25 @@
+{
+  "@context": ["https://www.w3.org/ns/activitystreams", "https://misskey-hub.net/ext/activity.json"],
+  "id": "https://remote.example/notes/mk0001",
+  "type": "Note",
+  "attributedTo": "https://remote.example/users/bob",
+  "to": ["https://remote.example/users/carol"],
+  "cc": [],
+  "content": "<p>Quoting <span>https://remote.example/notes/target</span> silently</p>",
+  "_misskey_content": "$[count 3]3 times!",
+  "_misskey_quote": "https://remote.example/notes/target",
+  "summary": "cw",
+  "sensitive": false,
+  "published": "2024-02-05T23:59:59.500Z",
+  "url": "not a url at all",
+  "tag": [
+    {
+      "type": "Emoji",
+      "name": "plainname",
+      "icon": [
+        { "href": "javascript:alert(1)" },
+        "https://remote.example/emoji/custom/ten.gif"
+      ]
+    }
+  ]
+}

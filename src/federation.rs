@@ -20,8 +20,10 @@
 //! against its actor's key before any handler sees the activity, and
 //! [`dispatch`] is what the inbox routes do with it once authenticated —
 //! the `federator.incoming` job handler, a documented stub until the
-//! dispatcher ticket fills it in. Activity documents, inboxes and outboxes
-//! arrive in later tickets and get their modules beside them.
+//! dispatcher ticket fills it in. [`note_parser`] is the dispatcher's pure
+//! front end: the reader that turns a received `Note`-family object into
+//! the parts of a status. Activity documents, inboxes and outboxes arrive
+//! in later tickets and get their modules beside them.
 
 pub mod actor;
 pub mod authorized_fetch;
@@ -30,6 +32,7 @@ pub mod dispatch;
 pub mod fetch_actor;
 pub mod inbox_auth;
 pub mod json;
+pub mod note_parser;
 pub mod remote_actor;
 pub mod signature;
 pub mod webfinger_client;
