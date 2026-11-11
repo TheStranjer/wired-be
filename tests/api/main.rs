@@ -77,6 +77,10 @@ mod custom_emojis;
 /// Domain blocks (`/api/v1/domain_blocks`).
 mod domain_blocks;
 
+/// The end-to-end job harness (`common::run_all_jobs`) and the scheduling,
+/// idempotency and preview scenarios it proves.
+mod e2e_scheduled;
+
 /// The emoji-pack endpoints of `src/api/emoji_packs.rs`.
 mod emoji_packs;
 

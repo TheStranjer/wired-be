@@ -197,7 +197,12 @@ fn with_generated_secret_key_base(mut config: Config) -> Config {
 
 /// The [`JobRegistry`] the [`serve`] worker runs: every job kind this
 /// instance handles, bound to its handler.
-fn job_registry() -> JobRegistry {
+///
+/// `pub` because the integration tests drain the queues with the very same
+/// table the worker uses (`run_all_jobs` in `tests/api/common.rs`), so a
+/// job kind registered here is one a test can run end to end.
+#[must_use]
+pub fn job_registry() -> JobRegistry {
     let mut registry = JobRegistry::new();
     registry.register(
         federation::delivery::KIND_DELIVER,
