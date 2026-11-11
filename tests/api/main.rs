@@ -214,6 +214,10 @@ mod remove_from_followers;
 /// Reports over HTTP (`POST /api/v1/reports`): filing a report.
 mod reports;
 
+/// The `scheduled_at` arm of `POST /api/v1/statuses` over HTTP: parking a
+/// create, its window, limits, media reservation and entity answer.
+mod scheduled_statuses;
+
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 

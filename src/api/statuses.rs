@@ -87,7 +87,20 @@
 //! participation's recipients join its mentions, its conversation becomes
 //! the new status's `direct_conversation_id`, and the visibility is forced
 //! to `direct` whatever the body asked for; a malformed, unknown or
-//! somebody-else's participation id is the same shared 404.
+//! somebody-else's participation id is the same shared 404. And
+//! `scheduled_at` — an RFC3339 instant — parks the post instead of writing
+//! it: [`crate::services::schedule_status`] runs the very same body checks,
+//! then the instance's future window, the account's schedule limits and the
+//! media reservation, and stores the normalised request in
+//! [`scheduled_statuses`](crate::models::scheduled_status) with one
+//! [`scheduled_statuses.publish`](crate::jobs::scheduled_statuses::KIND_PUBLISH)
+//! job due at that instant. The answer is **200** with the
+//! [`ScheduledStatus`] entity — its `media_attachments` read back from
+//! `media_attachments` in the order the body submitted them, though no
+//! attachment row is touched — and nothing else happens: no `statuses`
+//! row, no `after_status_created` hook, no expiration job, and an
+//! `Idempotency-Key` on the request is only echoed into the stored params,
+//! never claimed (the publish claims it at run time).
 //!
 //! [`Config::max_media_attachments`]: crate::config::Config::max_media_attachments
 //!
@@ -434,6 +447,7 @@
 //! [`soft_delete_with_reblogs`]: crate::models::status::soft_delete_with_reblogs
 //! [`filter_visible`]: crate::models::status_visibility::filter_visible
 //! [`Status`]: crate::entities::status::Status
+//! [`ScheduledStatus`]: crate::entities::scheduled_status::ScheduledStatus
 //! [`Account`]: crate::entities::account::Account
 //! [`Translation`]: crate::entities::translation::Translation
 
@@ -443,6 +457,7 @@ use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
     http::{HeaderMap, HeaderName, Uri},
+    response::{IntoResponse as _, Response},
     routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -456,6 +471,7 @@ use crate::{
     entities::{
         account::{Account, AccountViewer, JsonBool},
         media_attachment::MediaAttachment,
+        scheduled_status::ScheduledStatus,
         status::Status,
         status_edit::{StatusEdit, StatusEditSource},
         translation::Translation,
@@ -482,6 +498,7 @@ use crate::{
         create_status::{self, CreateStatusParams, EditStatusParams},
         notify,
         render_status::{render_status, render_statuses},
+        schedule_status,
         translate::Translator,
     },
     state::AppState,
@@ -644,7 +661,9 @@ pub fn router(state: &AppState) -> Router<AppState> {
 }
 
 /// `POST /api/v1/statuses` — create the status the body describes and answer
-/// its [`Status`] entity as its author sees it.
+/// its [`Status`] entity as its author sees it, or — when the body names a
+/// `scheduled_at` — park the whole create and answer a [`ScheduledStatus`]
+/// entity instead.
 ///
 /// The gate is Pleroma's pipeline for the `create` action:
 /// [`AuthUser`] then `write:statuses` then the `statuses_actions` throttle
@@ -655,9 +674,18 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// here because only the request knows it, and it travels to the service as
 /// the status's `application` pair.
 ///
-/// Two request-level decisions are this handler's own, both read before the
-/// service is asked for anything. The body's `preview` (a [`flex`] boolean,
-/// body or query, default false) answers the entity a create would have
+/// Three request-level decisions are this handler's own, all read before the
+/// service is asked for anything, in this order. A body naming
+/// `scheduled_at` is not a create: [`schedule_status::schedule_status`]
+/// checks it with the create's own rules, then the window, the account's
+/// schedule limits and the media reservation, stores the normalised request
+/// as a pending schedule and queues its fire ([`ScheduledStatus`] answers,
+/// with the reserved attachments loaded from their untouched rows in
+/// submission order; see [`scheduled_media`]); the request's
+/// `Idempotency-Key` rides along as the entity's echo only — a scheduled
+/// create claims no replay key, the publish claims it at run time. The
+/// body's `preview` (a [`flex`] boolean, body or query, default false)
+/// answers the entity a create would have
 /// returned — validated, rendered, mentions and tags resolved, a fresh
 /// minted id, `created_at` now and zero counters — without persisting
 /// anything, firing a hook or consulting a key ([`create_status::preview_status`],
@@ -691,19 +719,29 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// route's answer for the same id, and so is an
 /// `in_reply_to_conversation_id` naming no participation the poster owns.
 /// A preview owes the same 422s: validation runs on it exactly as on a
-/// post.
+/// post. A scheduled create owes the same body 422s and the same 404s
+/// before its own: 422 `Invalid scheduled_at` for text that is no RFC3339
+/// instant, 422 naming the instance's future window for a moment inside
+/// it (a past one included), 422 `Too many scheduled statuses` for an
+/// account at either schedule limit, and 422 `Media not found` for an
+/// attachment it may not reserve.
 async fn create_status(
     State(state): State<AppState>,
     auth: AuthUser,
     headers: HeaderMap,
     ApiParams(params): ApiParams<CreateStatusParams>,
-) -> AppResult<Json<Status>> {
+) -> AppResult<Response> {
     auth.require(WRITE_STATUSES)?;
     let app: Option<OauthApp> = oauth_app::get_by_id(&state.db, auth.1.app_id).await?;
+    if params.scheduled_at.is_some() {
+        let entity = schedule_create(&state, &auth.0, app.as_ref(), &headers, params).await?;
+        return Ok(Json(entity).into_response());
+    }
     if params.previews() {
         return Ok(Json(
             create_status::preview_status(&state, &auth.0, app.as_ref(), &params).await?,
-        ));
+        )
+        .into_response());
     }
     let entity = match idempotency_key(&headers) {
         Some(key) => {
@@ -712,7 +750,54 @@ async fn create_status(
         }
         None => create_status::create_status(&state, &auth.0, app.as_ref(), params).await?,
     };
-    Ok(Json(entity))
+    Ok(Json(entity).into_response())
+}
+
+/// The `scheduled_at` arm of the create: park the request through
+/// [`schedule_status::schedule_status`] — the request's `Idempotency-Key`,
+/// if it had one, travels along for the stored params' echo only, claimed
+/// by nobody — and finish the [`ScheduledStatus`] entity with the
+/// schedule's reserved attachments, read by
+/// [`media_attachment::get_many`] and answered in the order the body
+/// submitted them (the read is id-ordered; this one is not). No media
+/// row is written or moved by this route: the reservation is the pending
+/// row's params.
+///
+/// # Errors
+///
+/// Those of [`schedule_status::schedule_status`] and any database failure
+/// behind the media read, as [`AppError::Database`].
+async fn schedule_create(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    headers: &HeaderMap,
+    params: CreateStatusParams,
+) -> AppResult<ScheduledStatus> {
+    let key = idempotency_key(headers);
+    let (mut entity, _row) =
+        schedule_status::schedule_status(state, user, app, key.as_deref(), params).await?;
+    entity.media_attachments = scheduled_media(state, &entity.params.media_ids).await?;
+    Ok(entity)
+}
+
+/// The `media_attachments` of a schedule answer: the reserved ids the
+/// stored params name, in that submitted order, each rendered through
+/// the [`MediaAttachment`] entity from its untouched row; an id whose
+/// row has since been deleted simply contributes nothing.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn scheduled_media(state: &AppState, texts: &[String]) -> AppResult<Vec<MediaAttachment>> {
+    let ids: Vec<Uuid> = texts.iter().filter_map(|text| parse_id(text)).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = media_attachment::get_many(&state.db, &ids).await?;
+    let by_id: HashMap<Uuid, AttachmentRow> =
+        rows.into_iter().map(|found| (found.id, found)).collect();
+    Ok(media_entities(&ids, &by_id, &state.config))
 }
 
 /// The header whose value makes a create replayable (Pleroma's

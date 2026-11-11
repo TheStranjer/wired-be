@@ -20,10 +20,16 @@
 //! row, renders the checked text, resolves its mentions, stores the row and
 //! its mention and hashtag links through [`status::insert`], and answers the
 //! [`Status`] entity rendered for the author — Pleroma's `for: user`. The
-//! endpoint's remaining parameters — `poll` and `scheduled_at` — join
-//! [`CreateStatusParams`] as extra `Option`s with their own tickets
-//! (decision 15), and until then a body that sends them is only a body
-//! whose known fields are checked here. `in_reply_to_id` has landed: a
+//! endpoint's one remaining parameter — `poll` — joins
+//! [`CreateStatusParams`] as an extra `Option` with its own ticket
+//! (decision 15), and until then a body that sends it is only a body
+//! whose known fields are checked here. `scheduled_at` has landed: an
+//! RFC3339 instant that routes the request to
+//! [`crate::services::schedule_status`] instead of a create, so the key
+//! never reaches a stored status through this module's create arms — the
+//! schedule parks the normalised params without it, and the publish
+//! replays them through [`create_status`] at the parked moment.
+//! `in_reply_to_id` has landed: a
 //! body that names a parent posts into that parent's thread, and every
 //! reply rule — the parent read through the same viewer-visibility rules
 //! as [`status_for_viewer_or_404`] with a reblog row folded to its
@@ -99,7 +105,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -185,44 +191,49 @@ const MAX_INHERITED_MENTIONS: usize = 20;
 ///
 /// Every field is an `Option` with a serde `default`, so a key the body omits
 /// or sends as `null` stays this module's decision instead of becoming a
-/// deserialization error; a later ticket joins the struct with `poll` and
-/// `scheduled_at` as further `Option`s, the same
+/// deserialization error; a later ticket joins the struct with `poll` as a
+/// further `Option`, the same
 /// way. The `sensitive` field is a [`flex`] boolean, so a form body's
 /// `sensitive=on` spells what a JSON body's `true` spells.
 ///
+/// The [`Serialize`] half is the schedule's: [`crate::services::schedule_status`]
+/// stores the normalised params as the pending row's jsonb, and the
+/// [`scheduled_statuses.publish`](crate::jobs::scheduled_statuses::KIND_PUBLISH)
+/// job reads them back through this same shape.
+///
 /// [`flex`]: crate::extract::flex
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct CreateStatusParams {
     /// The post text; trimmed, and required to leave something behind.
     #[serde(default)]
-    status: Option<String>,
+    pub status: Option<String>,
     /// The content warning shown in place of the post; at most
     /// `MAX_SPOILER_CHARS` characters, and the empty string when absent.
     #[serde(default)]
-    spoiler_text: Option<String>,
+    pub spoiler_text: Option<String>,
     /// Whether the post starts folded; the author's own default when the body
     /// does not say.
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
-    sensitive: Option<bool>,
+    pub sensitive: Option<bool>,
     /// The requested audience, one of the five [`Visibility`] names; the
     /// author's default scope when absent.
     #[serde(default)]
-    visibility: Option<String>,
+    pub visibility: Option<String>,
     /// The content language tag; at most `MAX_LANGUAGE_CHARS` characters,
     /// and no tag at all when absent or empty.
     #[serde(default)]
-    language: Option<String>,
+    pub language: Option<String>,
     /// The MIME type of the `status` text; [`DEFAULT_CONTENT_TYPE`] when
     /// absent.
     #[serde(default)]
-    content_type: Option<String>,
+    pub content_type: Option<String>,
     /// Whether this is a preview: validate and render, answer the entity a
     /// create would have, write nothing — see [`preview_status`]. Absent,
     /// null and every [`flex`] false spelling are a real post.
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
-    preview: Option<bool>,
+    pub preview: Option<bool>,
     /// Pleroma's expiration extension: seconds from now after which the
     /// post deletes itself. A [`flex`] integer — a form body's
     /// `expires_in=3600` spells what JSON's `3600` spells, and anything
@@ -234,7 +245,7 @@ pub struct CreateStatusParams {
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_i64")]
-    expires_in: Option<i64>,
+    pub expires_in: Option<i64>,
     /// The status this one answers, as id text. A named parent is read
     /// with the same viewer-visibility rules as the show route's shared
     /// gate, so a malformed, unknown, deleted or poster-invisible parent
@@ -245,7 +256,7 @@ pub struct CreateStatusParams {
     /// text itself is never modified. Absent, null or empty is a root
     /// post, Pleroma's own empty-string "no reply" arm.
     #[serde(default)]
-    in_reply_to_id: Option<String>,
+    pub in_reply_to_id: Option<String>,
     /// Pleroma's conversation-reply arm: the id text of the poster's own
     /// [`conversation_participation`](crate::models::conversation::Participation)
     /// row. A named participation makes the post a `direct` reply into
@@ -258,7 +269,7 @@ pub struct CreateStatusParams {
     /// shared 404. Absent, null or empty names no conversation, and the
     /// post stands on [`in_reply_to_id`](Self::in_reply_to_id) alone.
     #[serde(default)]
-    in_reply_to_conversation_id: Option<String>,
+    pub in_reply_to_conversation_id: Option<String>,
     /// The ids of the poster's own unposted uploads this status carries,
     /// in the order they want them to render — decision 10's id-array:
     /// JSON's `["a","b"]` or the form's `media_ids[]=a&media_ids[]=b`,
@@ -274,7 +285,22 @@ pub struct CreateStatusParams {
     ///
     /// [`EditStatusParams`]: self::EditStatusParams
     #[serde(default)]
-    media_ids: Option<Vec<String>>,
+    pub media_ids: Option<Vec<String>>,
+    /// Pleroma's scheduling arm: the instant the post should fire, as
+    /// RFC3339 text. A body that sends it is not a create at all: the
+    /// endpoint hands the whole request to
+    /// [`crate::services::schedule_status`], which validates it exactly
+    /// as a create is validated, parks the normalised params (without
+    /// this key) until that moment, and answers a
+    /// [`ScheduledStatus`](crate::entities::scheduled_status::ScheduledStatus)
+    /// entity instead of a [`Status`]. Absent or null posts now; present
+    /// text that is no RFC3339 instant is the schedule's 422. This key
+    /// is handled by that arm and never by a create — the stored params
+    /// the publish replays carry no `scheduled_at`.
+    ///
+    /// [`Status`]: crate::entities::status::Status
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
 }
 
 impl CreateStatusParams {
@@ -984,8 +1010,9 @@ fn new_status(
     }
 }
 
-/// The shared pre-write half of both create arms: [`check_body`] over the
-/// body, the reply's parent when the body names one, the
+/// The shared pre-write half of both create arms and of the schedule
+/// service: [`check_body`] over the body, the reply's parent when the body
+/// names one, the
 /// `in_reply_to_conversation_id` participation when the body names one,
 /// the render through [`render_status_fields`], and the [`NewStatus`] to
 /// store with every reply decision already applied — the parent's id,
@@ -1010,7 +1037,7 @@ fn new_status(
 /// through [`reply_participation`] for an `in_reply_to_conversation_id`
 /// naming no participation the poster owns, plus any database failure
 /// behind the parent's mention read as [`AppError::Database`].
-async fn prepared_new_status(
+pub(crate) async fn prepared_new_status(
     state: &AppState,
     user: &User,
     app: Option<&OauthApp>,
@@ -1316,13 +1343,14 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         visibility: Some(row.visibility.as_str().to_owned()),
         language: params.language.clone().or_else(|| row.language.clone()),
         content_type: kept(params.content_type.clone(), || row.content_type.clone()),
-        // An edit is never a preview and never replays: the create's two
-        // decision parameters have no part in this merge. An edit never
-        // moves the expiry either — `expires_in` is a creation parameter,
-        // the stored `expires_at` rides along untouched (Pleroma's
-        // `make_update_data` carries it forward the same way) — and never
-        // its parent: an edit rewrites what was said in the thread it
-        // stands in, and `in_reply_to_id` is not an edit parameter. The
+        // An edit is never a preview, never a schedule and never replays:
+        // the create's decision parameters have no part in this merge. An
+        // edit never moves the expiry either — `expires_in` is a creation
+        // parameter, the stored `expires_at` rides along untouched
+        // (Pleroma's `make_update_data` carries it forward the same way)
+        // — and never its parent: an edit rewrites what was said in the
+        // thread it stands in, and `in_reply_to_id` is not an edit
+        // parameter. The
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
         // which drops what the author may not attach instead of refusing
@@ -1333,6 +1361,7 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         in_reply_to_id: None,
         in_reply_to_conversation_id: None,
         media_ids: None,
+        scheduled_at: None,
     }
 }
 
