@@ -33,6 +33,15 @@
 //! array. The render batch's page-shaped mates, [`options_for_statuses`] and
 //! [`votes_by_status`], answer the whole page with the same reads in one
 //! statement each, keyed by status id like [`for_statuses`].
+//!
+//! The vote endpoint's ticket (WBE-106) lands the reads and the write the
+//! `POST /api/v1/polls/{id}/votes` transaction is made of: [`get_by_id`]
+//! resolves the poll the route is keyed on, [`has_voted`] answers the
+//! endpoint's already-voted refusal, and [`cast_vote`] is the one
+//! transaction that inserts the voter's marks and moves every counter the
+//! entity reports — locking the poll row first, so two concurrent ballots
+//! from one account serialize and the second is refused rather than
+//! double-counted.
 
 use std::collections::HashMap;
 
@@ -40,7 +49,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{
+    error::{AppError, AppResult},
+    util::id::new_id,
+};
 
 /// The `INSERT` behind [`create`]: the minted id, the status named, and what
 /// [`PollParams`] holds, with `inserted_at` stamped by the database's `now()`
@@ -178,6 +190,28 @@ pub async fn get_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<Option<
            FROM polls WHERE status_id = $1",
     )
     .bind(status_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(stored)
+}
+
+/// Fetches the poll whose own primary key is `poll_id`, `None` when no such
+/// poll is stored.
+///
+/// This is the read behind `GET /api/v1/polls/{id}` and the vote endpoint:
+/// those routes are keyed on the poll's own id (decision 4), not on the
+/// status's that [`get_for_status`] answers from.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_id(pool: &PgPool, poll_id: Uuid) -> AppResult<Option<Poll>> {
+    let stored = sqlx::query_as::<_, Poll>(
+        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count
+           FROM polls WHERE id = $1",
+    )
+    .bind(poll_id)
     .fetch_optional(pool)
     .await?;
     Ok(stored)
@@ -374,6 +408,156 @@ pub async fn votes_by_status(
         grouped.entry(status_id).or_default().push(position);
     }
     Ok(grouped)
+}
+
+/// [`has_voted`]: one probe of the primary key's `poll_id, option_id`
+/// prefix restricted to the voter — the walk the entity's `voted` flag
+/// already makes, stopped at its first row because only the existence of
+/// a mark is asked.
+const HAS_VOTED_SQL: &str =
+    "SELECT EXISTS (SELECT 1 FROM poll_votes WHERE poll_id = $1 AND user_id = $2)";
+
+/// Whether `user_id` has marked anything on poll `poll_id`.
+///
+/// This is the vote endpoint's already-voted refusal: a voter with any
+/// mark on the poll is turned away, whichever option it was. An unknown
+/// poll, an account that never voted and a poll only others voted on all
+/// answer `false` — nobody else's ballot is this voter's fact.
+///
+/// [`cast_vote`] runs the same probe again inside its transaction, so the
+/// endpoint's answer stays honest under concurrent requests.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn has_voted(pool: &PgPool, poll_id: Uuid, user_id: Uuid) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(HAS_VOTED_SQL)
+        .bind(poll_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?)
+}
+
+/// [`cast_vote`]'s first read: the poll's own row, locked for the rest of
+/// the transaction. Every ballot on one poll takes this lock first, so two
+/// voters (or one voter's two racing requests) move the counters one at a
+/// time, and a poll deleted between the endpoint's reads and this lock is
+/// caught here.
+const LOCK_POLL_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
+                                    voters_count, votes_count
+                               FROM polls
+                              WHERE id = $1
+                                FOR UPDATE";
+
+/// [`cast_vote`]'s in-transaction rerun of [`HAS_VOTED_SQL`]: taken under
+/// the poll's row lock, it is what makes the endpoint's already-voted
+/// refusal hold even for two requests that raced past the cheap read.
+const VOTER_MARKED_SQL: &str = HAS_VOTED_SQL;
+
+/// [`cast_vote`]'s marks: one `poll_votes` row per chosen option, all in
+/// one statement on the transaction — the same [`WITH ORDINALITY`]-style
+/// `unnest` write [`create`] uses for the options, without the position
+/// because the triple `(poll_id, option_id, user_id)` is the whole fact.
+///
+/// [`WITH ORDINALITY`]: https://www.postgresql.org/docs/current/functions-array.html
+const INSERT_MARKS_SQL: &str = "INSERT INTO poll_votes (poll_id, option_id, user_id, inserted_at)
+     SELECT $1, o.id, $2, now()
+       FROM unnest($3::uuid[]) AS o(id)";
+
+/// [`cast_vote`]'s per-option bump: each chosen option gains exactly one
+/// vote. The `poll_id` guard keeps a mistargeted option id from moving a
+/// row of another poll; the endpoint only ever passes ids read from this
+/// poll's own [`options`].
+const BUMP_OPTIONS_SQL: &str = "UPDATE poll_options SET votes_count = votes_count + 1
+     WHERE poll_id = $1 AND id = ANY($2)";
+
+/// [`cast_vote`]'s roll-up bump: `votes_count` gains one per mark,
+/// `voters_count` gains the one new voter. Both moves are in-statement
+/// arithmetic on the stored column, so racing ballots on one poll sum
+/// instead of overwriting each other — on top of the row lock that makes
+/// every voter's marks land as one indivisible ballot.
+const BUMP_POLL_SQL: &str = "UPDATE polls SET votes_count = votes_count + $2,
+        voters_count = voters_count + 1
+    WHERE id = $1";
+
+/// Records `user_id`'s ballot on poll `poll_id` as one transaction.
+///
+/// The write is the marks themselves, each chosen option's
+/// [`votes_count`](PollOption::votes_count) stepped, and the poll's
+/// roll-up columns — [`votes_count`](Poll::votes_count) by the number of
+/// options marked, [`voters_count`](Poll::voters_count) by the one new
+/// voter.
+///
+/// `option_ids` must name options of `poll_id`, deduplicated by the caller
+/// (a voter cannot tick the same option twice, and the primary key would
+/// refuse the attempt anyway); the endpoint derives them from the parsed
+/// choices before it gets here. The answer is `true` when the ballot was
+/// recorded and `false` when the voter already had a mark on this poll —
+/// detected under the poll's row lock, which is what serializes racing
+/// requests into one ballot and one refusal. A poll that was deleted
+/// between the caller's read and this write is [`AppError::NotFound`];
+/// nothing was changed in either refused case, because the whole write
+/// rolls back.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] when the poll row is gone at the lock;
+/// [`AppError::Internal`] for a ballot too long to count in an `i32`
+/// (unreachable through the API, whose polls cap at twenty options);
+/// any other database failure (connection, constraint, encoding) arrives
+/// as [`AppError::Database`](crate::error::AppError).
+pub async fn cast_vote(
+    pool: &PgPool,
+    poll_id: Uuid,
+    user_id: Uuid,
+    option_ids: &[Uuid],
+) -> AppResult<bool> {
+    let mut tx = pool.begin().await?;
+    let locked: Option<Poll> = sqlx::query_as::<_, Poll>(LOCK_POLL_SQL)
+        .bind(poll_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if locked.is_none() {
+        tx.rollback().await?;
+        return Err(AppError::NotFound);
+    }
+    let already_voted: bool = sqlx::query_scalar::<_, bool>(VOTER_MARKED_SQL)
+        .bind(poll_id)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if already_voted {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let marks = i32::try_from(option_ids.len()).map_err(|_overflow| {
+        AppError::Internal(format!(
+            "ballot of {} marks is longer than an i32",
+            option_ids.len()
+        ))
+    })?;
+    sqlx::query(INSERT_MARKS_SQL)
+        .bind(poll_id)
+        .bind(user_id)
+        .bind(option_ids)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    sqlx::query(BUMP_OPTIONS_SQL)
+        .bind(poll_id)
+        .bind(option_ids)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    sqlx::query(BUMP_POLL_SQL)
+        .bind(poll_id)
+        .bind(marks)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1110,6 +1294,265 @@ mod tests {
                 .expect("the empty batch reads")
                 .is_empty(),
             "no statuses, no marks"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_id_reads_the_poll_by_its_own_key() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let posted = create_status(&pool, &alice).await;
+        let created = create_for(&pool, posted.id, &params(&["tea", "coffee"])).await;
+
+        let read = get_by_id(&pool, created.id)
+            .await
+            .expect("the poll reads")
+            .expect("the created poll is there");
+        assert_eq!(read, created, "the row round trips through its own id");
+
+        assert!(
+            get_by_id(&pool, new_id()).await.expect("reads").is_none(),
+            "a poll id that names no poll has no row — the status's id is
+               not the poll's key either, and a fresh uuid stands in for both"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_voted_reads_only_the_asking_account_s_ballot() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let posted = create_status(&pool, &alice).await;
+        let created = create_for(&pool, posted.id, &params(&["tea", "coffee"])).await;
+        let choices = options(&pool, created.id).await.expect("options read");
+
+        assert!(
+            !has_voted(&pool, created.id, bob.id)
+                .await
+                .expect("the flag reads"),
+            "an account that never voted has no ballot"
+        );
+        vote(&pool, created.id, choices[1].id, bob.id).await;
+        assert!(
+            has_voted(&pool, created.id, bob.id)
+                .await
+                .expect("the flag reads"),
+            "one mark on any option is a ballot"
+        );
+        assert!(
+            !has_voted(&pool, created.id, alice.id)
+                .await
+                .expect("the flag reads"),
+            "and it is nobody else's ballot — the author's included"
+        );
+        assert!(
+            !has_voted(&pool, new_id(), bob.id)
+                .await
+                .expect("the flag reads"),
+            "an unknown poll holds nobody's marks"
+        );
+    }
+
+    /// The options of `poll_id` as `(position, votes_count)`, the shape the
+    /// bump assertions compare.
+    async fn option_counts(pool: &PgPool, poll_id: Uuid) -> Vec<(i32, i32)> {
+        options(pool, poll_id)
+            .await
+            .expect("the options read")
+            .into_iter()
+            .map(|option| (option.position, option.votes_count))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cast_vote_records_the_ballot_and_moves_every_count() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(
+            &pool,
+            posted.id,
+            &PollParams {
+                options: vec!["tea".to_owned(), "coffee".to_owned(), "water".to_owned()],
+                multiple: true,
+                ..PollParams::default()
+            },
+        )
+        .await;
+        let choices = options(&pool, stand.id).await.expect("options read");
+        let ids: Vec<Uuid> = choices.iter().map(|choice| choice.id).collect();
+
+        // Bob marks the first and the third option in one ballot.
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[0], ids[2]])
+                .await
+                .expect("the ballot is recorded"),
+            "a first ballot answers recorded, not refused"
+        );
+        let after = get_by_id(&pool, stand.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert_eq!(after.votes_count, 2, "one vote per mark");
+        assert_eq!(after.voters_count, 1, "one voter however many marks");
+        assert_eq!(
+            option_counts(&pool, stand.id).await,
+            vec![(0, 1), (1, 0), (2, 1)],
+            "each chosen option gained exactly one"
+        );
+        assert_eq!(
+            voted_option_positions(&pool, stand.id, bob.id)
+                .await
+                .expect("the marks read"),
+            vec![0, 2],
+            "the marks sit on the chosen options under the voter"
+        );
+        assert_eq!(
+            count_for(
+                &pool,
+                "SELECT count(*) FROM poll_votes WHERE poll_id = $1",
+                stand.id
+            )
+            .await,
+            2,
+            "one row per mark"
+        );
+        let stamped = sqlx::query_scalar::<_, bool>(
+            "SELECT bool_and(inserted_at <= now() AND inserted_at >= now() - interval '1 minute')
+               FROM poll_votes WHERE poll_id = $1",
+        )
+        .bind(stand.id)
+        .fetch_one(&pool)
+        .await
+        .expect("the timestamps read");
+        assert!(
+            stamped,
+            "the write stamps `inserted_at`, which has no default"
+        );
+    }
+
+    #[tokio::test]
+    async fn cast_vote_sums_separate_ballots_into_the_same_counts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let carol = create_user(&pool, "carol").await;
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(&pool, posted.id, &params(&["tea", "coffee"])).await;
+        let choices = options(&pool, stand.id).await.expect("options read");
+        let ids: Vec<Uuid> = choices.iter().map(|choice| choice.id).collect();
+
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[0]])
+                .await
+                .expect("the first ballot is recorded"),
+            "bob's mark lands"
+        );
+        assert!(
+            cast_vote(&pool, stand.id, carol.id, &[ids[1]])
+                .await
+                .expect("the second ballot is recorded"),
+            "a different voter is no collision"
+        );
+        let summed = get_by_id(&pool, stand.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert_eq!(summed.votes_count, 2, "one vote per ballot");
+        assert_eq!(summed.voters_count, 2, "each voter counts once");
+        assert_eq!(
+            option_counts(&pool, stand.id).await,
+            vec![(0, 1), (1, 1)],
+            "and the options sum the ballots"
+        );
+    }
+
+    #[tokio::test]
+    async fn cast_vote_refuses_the_second_ballot_of_one_voter_without_effects() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(&pool, posted.id, &params(&["tea", "coffee"])).await;
+        let choices = options(&pool, stand.id).await.expect("options read");
+        let ids: Vec<Uuid> = choices.iter().map(|choice| choice.id).collect();
+
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[0]])
+                .await
+                .expect("the first ballot is recorded"),
+            "the first ballot lands"
+        );
+
+        assert!(
+            !cast_vote(&pool, stand.id, bob.id, &[ids[1]])
+                .await
+                .expect("the second ballot is answered"),
+            "the same voter's second ballot is refused, whichever option it names"
+        );
+        let after = get_by_id(&pool, stand.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert_eq!(after.votes_count, 1, "the refusal changed no count");
+        assert_eq!(after.voters_count, 1, "in either column");
+        assert_eq!(
+            option_counts(&pool, stand.id).await,
+            vec![(0, 1), (1, 0)],
+            "nor any option's share"
+        );
+        assert_eq!(
+            voted_option_positions(&pool, stand.id, bob.id)
+                .await
+                .expect("the marks read"),
+            vec![0],
+            "and wrote no second mark"
+        );
+    }
+
+    #[tokio::test]
+    async fn cast_vote_needs_a_poll_that_is_still_stored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+
+        let err = cast_vote(&pool, new_id(), bob.id, &[])
+            .await
+            .expect_err("a poll that is not stored cannot take a ballot");
+        assert!(
+            matches!(err, AppError::NotFound),
+            "the gone poll is the 404, not a database failure: {err}"
+        );
+
+        // And a poll deleted after the endpoint read it: the lock catches
+        // it, and the half-open transaction leaves nothing behind.
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(&pool, posted.id, &params(&["tea"])).await;
+        let choice = options(&pool, stand.id)
+            .await
+            .expect("options read")
+            .first()
+            .expect("the fixture poll has its option")
+            .id;
+        let removed = sqlx::query("DELETE FROM statuses WHERE id = $1")
+            .bind(posted.id)
+            .execute(&pool)
+            .await
+            .expect("the status delete runs");
+        assert_eq!(removed.rows_affected(), 1, "the fixture status was live");
+        let cascaded = cast_vote(&pool, stand.id, bob.id, &[choice])
+            .await
+            .expect_err("the cascaded poll is gone at the lock");
+        assert!(
+            matches!(cascaded, AppError::NotFound),
+            "a poll deleted under the endpoint is the 404: {cascaded}"
         );
     }
 }

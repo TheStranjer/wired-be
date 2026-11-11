@@ -80,6 +80,7 @@ pub mod pleroma_accounts;
 pub mod pleroma_bookmark_folders;
 pub mod pleroma_import;
 pub mod pleroma_settings;
+pub mod polls;
 pub mod push;
 pub mod reports;
 pub mod scrobbles;
