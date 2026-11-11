@@ -1,5 +1,6 @@
 //! Tests for the `ActivityPub` routes: `GET /users/{nickname}`, the actor
-//! document, and the three inbox `POST`s.
+//! document, the JSON-LD schema document at
+//! `GET /schemas/litepub-0.1.jsonld`, and the three inbox `POST`s.
 //!
 //! An `ActivityPub` client (an `Accept` naming `application/activity+json`
 //! or `application/ld+json`) gets Pleroma's `user.json` document as
@@ -126,6 +127,71 @@ fn key_set(document: &Value) -> Vec<&str> {
         .collect();
     keys.sort_unstable();
     keys
+}
+
+/// `GET /schemas/litepub-0.1.jsonld` — the JSON-LD context document the
+/// `@context` of the `Note`/`Question` and activity documents names. It is
+/// one fixed document served to anyone, no `Accept` negotiation and no
+/// signature, holding the vocabulary terms those documents actually use.
+#[tokio::test]
+async fn the_litepub_schema_document_is_served() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/schemas/litepub-0.1.jsonld")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the schema is served");
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/json"),
+        "as JSON, like Pleroma's static file"
+    );
+    let document = response.json_value();
+    let context = document
+        .get("@context")
+        .and_then(Value::as_object)
+        .expect("the document is a term map under @context");
+    assert_eq!(
+        context.get("conversation"),
+        Some(&json!({"@id": "ostatus:conversation", "@type": "@id"})),
+        "the ostatus conversation reference every note carries"
+    );
+    assert_eq!(
+        context.get("EmojiReact"),
+        Some(&json!("litepub:EmojiReact")),
+        "the litepub terms"
+    );
+    assert_eq!(
+        context.get("capabilities"),
+        Some(&json!("litepub:capabilities")),
+        "…all of them…"
+    );
+    assert_eq!(
+        context.get("quoteUrl"),
+        Some(&json!("as:quoteUrl")),
+        "…the quote pair…"
+    );
+    assert_eq!(
+        context.get("quoteUri"),
+        Some(&json!("fedibird:quoteUri")),
+        "…"
+    );
+    assert_eq!(
+        context.get("votersCount"),
+        Some(&json!("toot:votersCount")),
+        "…the poll count…"
+    );
+    assert_eq!(
+        context.get("sensitive"),
+        Some(&json!("as:sensitive")),
+        "…the content-warning flag…"
+    );
+    assert_eq!(
+        context.get("Hashtag"),
+        Some(&json!("as:Hashtag")),
+        "…and the tag type"
+    );
 }
 
 /// The whole document a provisioned local account is served as: every key
