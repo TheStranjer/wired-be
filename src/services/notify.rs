@@ -6,7 +6,7 @@
 //! ends in one telling of the affected local account, with the same rules
 //! Pleroma's `skip?` list applies. This module is the single place those
 //! tellings are decided, and the action hooks in [`crate::api`] and
-//! [`crate::services`] are thin landings that call exactly one of its five
+//! [`crate::services`] are thin landings that call exactly one of its ten
 //! functions:
 //!
 //! - [`on_follow`] — the follow endpoint's telling: `follow` when the
@@ -26,15 +26,39 @@
 //!   status (the group key Pleroma groups boosts and likes on is the
 //!   object id, and the entity renders the post that was acted on). The
 //!   withdrawal of either takes that one telling back.
+//! - [`on_poll_vote`] — the vote endpoint's telling: the poll's author is
+//!   told `poll` of every ballot, `from` the voter and about the poll's
+//!   status, deduplicated per voter and poll so a re-fired hook cannot
+//!   stack tellings.
+//! - [`on_poll_ended`] — the [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY)
+//!   sweep's telling: the poll's author *and* every local voter are told
+//!   `poll` with the author as actor (Pleroma's `create_poll_notifications`
+//!   walks the Question's actor-and-voters list with the self skip waived
+//!   for the poll type).
+//! - [`on_status_edited`] — the edit route's telling: every local account
+//!   boosting the post is told `update` naming it, the author as actor
+//!   (Pleroma's `Update` arm: the object's local repeaters minus the
+//!   actor).
+//! - [`on_subscribed_status`] — the create service's subscription telling:
+//!   every local user *subscribed* to the author (an accepted follow with
+//!   its `notify` toggle on) is told `status` of the fresh post, whenever
+//!   its visibility can reach them — never of a `direct` post, and never
+//!   of a reblog row.
+//! - [`on_reaction_changed`] — the reaction routes' telling: the status's
+//!   author is told `pleroma:emoji_reaction` naming the emoji, and the
+//!   withdrawal takes exactly that telling back (one emoji's row, not the
+//!   other emoji's on the same status).
 //!
 //! Every creation runs through [`notification::maybe_notify`], so the
 //! recipient's `block_from_strangers` setting withholds what it withholds
 //! and the exempt [`TYPE_FOLLOW_REQUEST`] alone reaches a gated account
 //! through it. Before that, this module's own rules: a notification goes
 //! only to a **local** user (the remote one's instance is told by
-//! federation, not by a row), and nobody is notified of their own action.
-//! Beside the row, every telling of a local recipient queues its Web Push
-//! deliveries — one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
+//! federation, not by a row), and nobody is notified of their own action —
+//! the one exemption is [`on_poll_ended`]'s author, whose own poll closing
+//! is news *to them* (Pleroma's `:self` skip answering `false` for the
+//! `poll` type). Beside the row, every telling of a local recipient queues
+//! its Web Push deliveries — one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
 //! job per registered subscription, [`web_push::enqueue_deliveries`] —
 //! best-effort, since the inbox row stands whatever the push service does.
 //! Blocked and muted actors are not filtered here — the reads of
@@ -46,6 +70,10 @@
 //! [`after_status_deleted`](crate::services::delete_status): the action
 //! they report is already committed, so a failing write is logged with
 //! `warn!` and the causing endpoint answers as if the telling had landed.
+//! The one caller that is *itself* background work — the poll-end sweep —
+//! takes the error instead of a log line, so its retry and its
+//! [`ended_notified`](crate::models::poll::Poll::ended_notified) flag keep
+//! the tellings exactly-once.
 
 use tracing::warn;
 use uuid::Uuid;
@@ -53,31 +81,57 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::{
+        emoji_reaction::EmojiReaction as ReactionRow,
         favourite::Favourite,
-        follow::{Follow, FollowState},
+        follow::{self, Follow, FollowState},
         mention,
         notification::{
-            self, NewNotification, TYPE_FAVOURITE, TYPE_FOLLOW, TYPE_FOLLOW_REQUEST, TYPE_MENTION,
-            TYPE_REBLOG,
+            self, NewNotification, TYPE_EMOJI_REACTION, TYPE_FAVOURITE, TYPE_FOLLOW,
+            TYPE_FOLLOW_REQUEST, TYPE_MENTION, TYPE_POLL, TYPE_REBLOG, TYPE_STATUS, TYPE_UPDATE,
+            Telling,
         },
-        status::{self, Status as StatusRow},
+        poll::{self, Poll as PollRow},
+        status::{self, Status as StatusRow, Visibility},
         user::{self, User},
     },
     services::web_push,
     state::AppState,
 };
 
+/// The shared creation arm behind every telling: [`notification::maybe_notify`]
+/// for `recipient` — who must be **local**, or there is nobody to tell from
+/// here — and, when the row lands, the queueing of its Web Push deliveries.
+///
+/// Split out from [`tell`] for the two arms that pair with their own extra
+/// checks: [`tell`] adds the self-action skip, and [`on_poll_ended`]'s
+/// author arm deliberately skips *without* it (the poll closing on one's
+/// own post is one's own news). The push queueing stays best-effort here —
+/// a notification that exists but fails to wake a browser is logged, never
+/// an error back to the endpoint.
+async fn announce(state: &AppState, recipient: &User, note: &NewNotification<'_>) -> AppResult<()> {
+    if !recipient.local.get() {
+        return Ok(());
+    }
+    let created = notification::maybe_notify(&state.db, note).await?;
+    if let Some(row) = created
+        && let Err(err) = web_push::enqueue_deliveries(&state.db, row.id, recipient.id).await
+    {
+        warn!(
+            notification = %row.id,
+            %err,
+            "could not queue web push deliveries"
+        );
+    }
+    Ok(())
+}
+
 /// Tell `recipient` (a [`User`] row already in hand) that `actor_id` did
 /// `event_type` about `status_id`.
 ///
-/// The shared create arm of every rule above: a recipient who is the actor
-/// (self-action) or who is not local is nobody to tell from here, and
-/// everyone else's row is decided by [`notification::maybe_notify`]'s own
-/// skip rules. A row that lands also queues the recipient's Web Push
-/// deliveries (one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
-/// job per subscription, decision 11); the queueing is best-effort beside
-/// the telling itself — a notification that exists but fails to wake a
-/// browser is logged, never an error back to the endpoint.
+/// The shared create arm of the endpoint rules above: a recipient who is
+/// the actor (self-action) or who is not local is nobody to tell from here,
+/// and everyone else's row is decided by [`notification::maybe_notify`]'s
+/// own skip rules.
 async fn tell(
     state: &AppState,
     recipient: &User,
@@ -85,11 +139,12 @@ async fn tell(
     event_type: &str,
     status_id: Option<Uuid>,
 ) -> AppResult<()> {
-    if recipient.id == actor_id || !recipient.local.get() {
+    if recipient.id == actor_id {
         return Ok(());
     }
-    let created = notification::maybe_notify(
-        &state.db,
+    announce(
+        state,
+        recipient,
         &NewNotification {
             user_id: recipient.id,
             from_account_id: actor_id,
@@ -99,17 +154,7 @@ async fn tell(
             report_id: None,
         },
     )
-    .await?;
-    if let Some(note) = created
-        && let Err(err) = web_push::enqueue_deliveries(&state.db, note.id, recipient.id).await
-    {
-        warn!(
-            notification = %note.id,
-            %err,
-            "could not queue web push deliveries"
-        );
-    }
-    Ok(())
+    .await
 }
 
 /// [`tell`] for a recipient named by id: the row is read first — an id
@@ -405,6 +450,275 @@ async fn favourite_telling(
     }
 }
 
+/// The poll vote endpoint's notification, landed from `after_vote_cast` in
+/// [`crate::api::polls`].
+///
+/// A ballot tells the poll's author `poll`, `from` the voter and about the
+/// poll's status (Pleroma's `CommonAPI.vote` runs each `Answer` through its
+/// pipeline, which lands the same telling). Deduplicated per voter and
+/// poll: the endpoint already refuses a second ballot, so only a re-fired
+/// hook can offer the same fact twice, and [`notification::already_told`]
+/// keeps that one telling standing.
+pub async fn on_poll_vote(state: &AppState, poll: &PollRow, voter: &User) {
+    if let Err(err) = poll_vote_telling(state, poll, voter).await {
+        warn!(
+            poll = %poll.id,
+            voter = %voter.id,
+            %err,
+            "could not tell a poll's author about a ballot"
+        );
+    }
+}
+
+/// [`on_poll_vote`]'s work: the author read off the poll's status, the
+/// deduplication on the full telling key, and [`tell`] for the local and
+/// self decisions (an author who somehow marked their own poll tells
+/// themselves nothing).
+async fn poll_vote_telling(state: &AppState, poll: &PollRow, voter: &User) -> AppResult<()> {
+    let Some(posted) = status::get_by_id(&state.db, poll.status_id).await? else {
+        return Ok(());
+    };
+    let telling = Telling {
+        user_id: posted.user_id,
+        from_account_id: voter.id,
+        notification_type: TYPE_POLL,
+        status_id: Some(poll.status_id),
+        emoji: None,
+    };
+    if notification::already_told(&state.db, &telling).await? {
+        return Ok(());
+    }
+    let Some(author) = user::get_by_id(&state.db, posted.user_id).await? else {
+        return Ok(());
+    };
+    tell(state, &author, voter.id, TYPE_POLL, Some(poll.status_id)).await
+}
+
+/// The [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY) sweep's
+/// telling: the poll's author and every local voter are told `poll`, with
+/// the *author* as the actor, that the question closed.
+///
+/// Pleroma's `create_poll_notifications` (`lib/pleroma/notification.ex`,
+/// run by `lib/pleroma/workers/poll_worker.ex` when a Question's `closed`
+/// moment arrives) walks `[actor | voters]` and waives the self skip for
+/// the `poll` type — the author is told of their own poll's ending because
+/// the *closing*, not the acting, is what the row reports. Here the same
+/// pair: the author goes through this module's shared creation arm
+/// directly (the local check and the skip rules intact, the self exemption
+/// owed to them), and each voter through its self-skipping teller.
+///
+/// Unlike the endpoint landings this one **returns** its failure: the sweep
+/// sets the poll's `ended_notified` flag only after it answers `Ok`, so a
+/// retried pass re-runs the tellings — where [`notification::already_told`]
+/// keeps each recipient's single row a single row.
+///
+/// [`polls.end_notify`]: crate::jobs::polls::KIND_END_NOTIFY
+///
+/// # Errors
+///
+/// Any database failure behind the status, user, deduplication or insert
+/// reads arrives as [`AppError::Database`](crate::error::AppError); the
+/// caller owns the retry (see [`handle_end_notify`](crate::jobs::polls::handle_end_notify)).
+pub async fn on_poll_ended(state: &AppState, poll: &PollRow) -> AppResult<()> {
+    let Some(posted) = status::get_by_id(&state.db, poll.status_id).await? else {
+        return Ok(());
+    };
+    let Some(author) = user::get_by_id(&state.db, posted.user_id).await? else {
+        return Ok(());
+    };
+    let ending = Telling {
+        user_id: author.id,
+        from_account_id: author.id,
+        notification_type: TYPE_POLL,
+        status_id: Some(poll.status_id),
+        emoji: None,
+    };
+    if !notification::already_told(&state.db, &ending).await? {
+        announce(state, &author, &told_row(&ending)).await?;
+    }
+    for voter_id in poll::voter_ids(&state.db, poll.id).await? {
+        poll_end_voter_telling(state, author.id, poll, voter_id).await?;
+    }
+    Ok(())
+}
+
+/// The [`NewNotification`] a [`Telling`] key names, emoji-free — the shape
+/// the `poll` tellings are told in.
+const fn told_row<'a>(telling: &Telling<'a>) -> NewNotification<'a> {
+    NewNotification {
+        user_id: telling.user_id,
+        from_account_id: telling.from_account_id,
+        notification_type: telling.notification_type,
+        status_id: telling.status_id,
+        emoji: None,
+        report_id: None,
+    }
+}
+
+/// The voter arm of [`on_poll_ended`]: each *other* local voter is told
+/// their ballot's question closed, once however many sweep reruns pass
+/// (the author cannot mark their own poll, and is told by the arm above
+/// whatever this one decides).
+async fn poll_end_voter_telling(
+    state: &AppState,
+    actor_id: Uuid,
+    poll: &PollRow,
+    voter_id: Uuid,
+) -> AppResult<()> {
+    if voter_id == actor_id {
+        return Ok(());
+    }
+    let Some(voter) = user::get_by_id(&state.db, voter_id).await? else {
+        return Ok(());
+    };
+    let telling = Telling {
+        user_id: voter.id,
+        from_account_id: actor_id,
+        notification_type: TYPE_POLL,
+        status_id: Some(poll.status_id),
+        emoji: None,
+    };
+    if notification::already_told(&state.db, &telling).await? {
+        return Ok(());
+    }
+    tell(state, &voter, actor_id, TYPE_POLL, Some(poll.status_id)).await
+}
+
+/// The edit route's notification, landed from `after_status_edited` in
+/// [`crate::api::statuses`].
+///
+/// An edit tells every **local** account still boosting the post an
+/// `update` naming it, with the author as the actor (Pleroma's `Update`
+/// arm of `get_potential_receiver_ap_ids`: the object's `Announce` actors,
+/// `where u.local`, minus the actor — `lib/pleroma/notification.ex`). A
+/// withdrawn boost names nobody ([`status::local_reblogger_ids`] reads live
+/// rows only), a remote booster is federation's to tell, and the author
+/// boosting their own post is no one's news.
+pub async fn on_status_edited(state: &AppState, row: &StatusRow) {
+    if let Err(err) = edit_telling(state, row).await {
+        warn!(
+            status = %row.id,
+            %err,
+            "could not tell a post's boosters about its edit"
+        );
+    }
+}
+
+/// [`on_status_edited`]'s work, one [`tell`] per local booster.
+async fn edit_telling(state: &AppState, row: &StatusRow) -> AppResult<()> {
+    for booster_id in status::local_reblogger_ids(&state.db, row.id).await? {
+        if let Some(booster) = user::get_by_id(&state.db, booster_id).await? {
+            tell(state, &booster, row.user_id, TYPE_UPDATE, Some(row.id)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The create service's subscription notifications, landed from
+/// `after_status_created` in [`crate::services::create_status`] beside
+/// [`on_mention`].
+///
+/// Every local user **subscribed** to the author — an accepted follow with
+/// its `notify` toggle on ([`follow::subscribers`], Pleroma's
+/// `User.subscriber_users` behind `get_notified_subscribers`) — is told
+/// `status` naming the fresh post. The audience rules, per the ticket:
+/// never a reblog row (its telling is the boost's [`on_reblog`], and a
+/// boosted post was already the original author's news), never a `direct`
+/// post (an address is not a subscription's subject), and every other
+/// visibility as its own audience allows — a `local` post reaches the
+/// local subscribers this read returns, and remote subscribers, which it
+/// never does, are federation's to tell.
+pub async fn on_subscribed_status(state: &AppState, row: &StatusRow) {
+    if let Err(err) = subscription_telling(state, row).await {
+        warn!(
+            status = %row.id,
+            %err,
+            "could not tell an author's subscribers about their status"
+        );
+    }
+}
+
+/// [`on_subscribed_status`]'s work: the two never-arms answered before any
+/// read, then one [`tell`] per subscriber (whose own mention telling, from
+/// [`on_mention`], is a separate fact and stands beside this one).
+async fn subscription_telling(state: &AppState, row: &StatusRow) -> AppResult<()> {
+    if row.reblog_of_id.is_some() || row.visibility == Visibility::Direct {
+        return Ok(());
+    }
+    for subscriber in follow::subscribers(&state.db, row.user_id).await? {
+        tell(state, &subscriber, row.user_id, TYPE_STATUS, Some(row.id)).await?;
+    }
+    Ok(())
+}
+
+/// The reaction routes' notification, landed from `after_reaction_changed`
+/// in [`crate::api::emoji_reactions`].
+///
+/// A reaction tells the status's author `pleroma:emoji_reaction` with the
+/// emoji stored on the row (Pleroma's `EmojiReact` arm: the potential
+/// receiver is the object's actor alone), and the withdrawal takes exactly
+/// that telling back — the one emoji's row, so a second reaction with a
+/// different emoji on the same status stands. The repeat `PUT` an
+/// idempotent write answers again is deduplicated on the full key
+/// ([`notification::already_told`]); a `DELETE` that found no reaction
+/// never reaches the hook, and a deleted status has lost its
+/// notifications to [`notification::delete_for_status`] anyway.
+pub async fn on_reaction_changed(state: &AppState, reaction: &ReactionRow, reacting: bool) {
+    if let Err(err) = reaction_telling(state, reaction, reacting).await {
+        warn!(
+            status = %reaction.status_id,
+            emoji = %reaction.emoji,
+            %err,
+            "could not tell a reacted post's author about the reaction"
+        );
+    }
+}
+
+/// [`on_reaction_changed`]'s work, create and withdraw arms.
+async fn reaction_telling(
+    state: &AppState,
+    reaction: &ReactionRow,
+    reacting: bool,
+) -> AppResult<()> {
+    let Some(reacted) = status::get_by_id(&state.db, reaction.status_id).await? else {
+        return Ok(());
+    };
+    let telling = Telling {
+        user_id: reacted.user_id,
+        from_account_id: reaction.user_id,
+        notification_type: TYPE_EMOJI_REACTION,
+        status_id: Some(reaction.status_id),
+        emoji: Some(reaction.emoji.as_str()),
+    };
+    if !reacting {
+        return notification::delete_telling(&state.db, &telling)
+            .await
+            .map(drop);
+    }
+    if notification::already_told(&state.db, &telling).await? {
+        return Ok(());
+    }
+    let Some(author) = user::get_by_id(&state.db, reacted.user_id).await? else {
+        return Ok(());
+    };
+    if author.id == reaction.user_id {
+        return Ok(());
+    }
+    announce(
+        state,
+        &author,
+        &NewNotification {
+            user_id: author.id,
+            from_account_id: reaction.user_id,
+            notification_type: TYPE_EMOJI_REACTION,
+            status_id: Some(reaction.status_id),
+            emoji: Some(reaction.emoji.as_str()),
+            report_id: None,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -418,6 +732,7 @@ mod tests {
         config::Config,
         http_client::HttpClient,
         models::{
+            emoji_reaction::{self, NewReaction},
             favourite, follow,
             oauth_app::{self, NewOauthApp},
             oauth_token::{self, NewToken},
@@ -803,7 +1118,7 @@ mod tests {
 
         let original = post(pool, &alice, "boost me").await;
         let (reblog, created) =
-            status::create_reblog(pool, BASE, &bob, &original, status::Visibility::Public)
+            status::create_reblog(pool, BASE, &bob, &original, Visibility::Public)
                 .await
                 .expect("the reblog writes");
         assert!(created, "the fixture is the first boost");
@@ -834,15 +1149,14 @@ mod tests {
         let mallory = remote(pool, "sr-mallory", "remote.example").await;
 
         let own = post(pool, &alice, "my post").await;
-        let (self_boost, _) =
-            status::create_reblog(pool, BASE, &alice, &own, status::Visibility::Public)
-                .await
-                .expect("the self boost writes");
+        let (self_boost, _) = status::create_reblog(pool, BASE, &alice, &own, Visibility::Public)
+            .await
+            .expect("the self boost writes");
         on_reblog(&state, &self_boost, true).await;
 
         let mirror = post(pool, &mallory, "their post").await;
         let (remote_boost, _) =
-            status::create_reblog(pool, BASE, &alice, &mirror, status::Visibility::Public)
+            status::create_reblog(pool, BASE, &alice, &mirror, Visibility::Public)
                 .await
                 .expect("the boost of the mirror writes");
         on_reblog(&state, &remote_boost, true).await;
@@ -1063,6 +1377,557 @@ mod tests {
         assert!(
             push_jobs(pool).await.is_empty(),
             "and no delivery job was queued for a notification that never landed"
+        );
+    }
+
+    /// The poll fixture: a two-option multiple-choice poll on `posted`,
+    /// closing `mins` minutes from now (negative: already closed).
+    async fn poll_on(pool: &PgPool, posted: &StatusRow, mins: i64) -> PollRow {
+        poll::create(
+            &mut pool.acquire().await.expect("a slot connection"),
+            posted.id,
+            &poll::PollParams {
+                options: vec!["tea".to_owned(), "coffee".to_owned()],
+                expires_at: Some(Utc::now() + chrono::TimeDelta::minutes(mins)),
+                multiple: true,
+                ..poll::PollParams::default()
+            },
+        )
+        .await
+        .expect("the poll fixture creates")
+    }
+
+    /// `voter` marks the first option of `stand`, straight through the
+    /// vote write the endpoint uses.
+    async fn ballot(pool: &PgPool, stand: &PollRow, voter: &User) {
+        let first = poll::options(pool, stand.id)
+            .await
+            .expect("the options read")
+            .into_iter()
+            .next()
+            .expect("the fixture poll has an option")
+            .id;
+        assert!(
+            poll::cast_vote(pool, stand.id, voter.id, &[first])
+                .await
+                .expect("the ballot writes"),
+            "the fixture pair had not voted yet"
+        );
+    }
+
+    /// A post of `author` at `visibility`.
+    async fn post_vis(
+        pool: &PgPool,
+        author: &User,
+        text: &str,
+        visibility: Visibility,
+    ) -> StatusRow {
+        status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                visibility,
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("the visibility status fixture inserts")
+    }
+
+    /// `subscriber` holds an accepted, notified follow of `author`.
+    async fn subscribed(pool: &PgPool, subscriber: &User, author: &User) {
+        let _open = followed(pool, subscriber, author).await;
+        assert!(
+            follow::set_notify(pool, subscriber.id, author.id, true)
+                .await
+                .expect("the toggle runs")
+                .is_some(),
+            "the accepted pair takes the flag"
+        );
+    }
+
+    /// `reactor` reacts to `target` with `emoji` through the reaction
+    /// write, and the hook lands: the pair the `PUT` route runs.
+    async fn reacted(
+        state: &AppState,
+        pool: &PgPool,
+        reactor: &User,
+        target: &StatusRow,
+        emoji: &str,
+    ) {
+        let stored = emoji_reaction::react(
+            pool,
+            BASE,
+            &NewReaction {
+                user_id: reactor.id,
+                status_id: target.id,
+                emoji,
+                url: None,
+            },
+        )
+        .await
+        .expect("the reaction writes");
+        on_reaction_changed(state, &stored, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_poll_vote_tells_the_author_once_per_voter_and_poll() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "pv-alice").await;
+        let bob = local(pool, "pv-bob").await;
+
+        let posted = post(pool, &alice, "vote on me").await;
+        let stand = poll_on(pool, &posted, 30).await;
+        ballot(pool, &stand, &bob).await;
+        on_poll_vote(&state, &stand, &bob).await;
+        assert_eq!(
+            facts(pool, alice.id).await,
+            vec![(TYPE_POLL.to_owned(), bob.id, Some(posted.id))],
+            "the ballot is told to the author, about the poll's status"
+        );
+
+        // The same fact re-fired (the endpoint refuses a second ballot, so
+        // only a re-run of the hook can offer it again) stands deduped.
+        on_poll_vote(&state, &stand, &bob).await;
+        assert_eq!(
+            facts(pool, alice.id).await.len(),
+            1,
+            "one voter and one poll tell once"
+        );
+
+        // The same voter on a second poll is a second fact.
+        let second = post(pool, &alice, "another question").await;
+        let second_stand = poll_on(pool, &second, 30).await;
+        ballot(pool, &second_stand, &bob).await;
+        on_poll_vote(&state, &second_stand, &bob).await;
+        assert_eq!(
+            facts(pool, alice.id).await,
+            vec![
+                (TYPE_POLL.to_owned(), bob.id, Some(second.id)),
+                (TYPE_POLL.to_owned(), bob.id, Some(posted.id)),
+            ],
+            "the deduplication is per voter *and* poll"
+        );
+
+        // The author's own ballot (unreachable through the endpoint's
+        // refusal, reachable through a re-fired hook) tells nobody.
+        on_poll_vote(&state, &stand, &alice).await;
+        assert_eq!(
+            facts(pool, alice.id).await.len(),
+            2,
+            "nobody is told of their own action"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vote_on_a_remote_or_gone_poll_stays_silent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let bob = local(pool, "pg-bob").await;
+
+        // A mirrored remote author is told by federation, not by a row.
+        let mallory = remote(pool, "pg-mallory", "remote.example").await;
+        let theirs = post(pool, &mallory, "their question").await;
+        let stand = poll_on(pool, &theirs, 30).await;
+        ballot(pool, &stand, &bob).await;
+        on_poll_vote(&state, &stand, &bob).await;
+        assert!(
+            rows(pool, mallory.id).await.is_empty(),
+            "the remote author is nobody's telling target here"
+        );
+
+        // A status deleted after the vote read: the tell finds no author
+        // and errors nowhere.
+        let alice = local(pool, "pg-alice").await;
+        let doomed = post(pool, &alice, "doomed question").await;
+        let doomed_stand = poll_on(pool, &doomed, 30).await;
+        let _tombstone = status::soft_delete(pool, doomed.id)
+            .await
+            .expect("the delete runs");
+        on_poll_vote(&state, &doomed_stand, &bob).await;
+        assert!(
+            rows(pool, alice.id).await.is_empty(),
+            "a poll status the reads cannot answer tells nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_poll_end_tells_the_author_and_the_local_voters_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "pe-alice").await;
+        let bob = local(pool, "pe-bob").await;
+        let carol = local(pool, "pe-carol").await;
+        let mallory = remote(pool, "pe-mallory", "remote.example").await;
+
+        let posted = post(pool, &alice, "tea or coffee?").await;
+        let stand = poll_on(pool, &posted, -1).await;
+        for voter in [&bob, &carol] {
+            ballot(pool, &stand, voter).await;
+            on_poll_vote(&state, &stand, voter).await;
+        }
+        ballot(pool, &stand, &mallory).await;
+
+        on_poll_ended(&state, &stand)
+            .await
+            .expect("the closing telling runs");
+        let closing = (TYPE_POLL.to_owned(), alice.id, Some(posted.id));
+        assert_eq!(
+            facts(pool, alice.id).await,
+            vec![
+                closing.clone(),
+                (TYPE_POLL.to_owned(), carol.id, Some(posted.id)),
+                (TYPE_POLL.to_owned(), bob.id, Some(posted.id)),
+            ],
+            "the author keeps the two ballot tellings and gains their own \
+             closing — the self skip's one exemption"
+        );
+        for voter in [&bob, &carol] {
+            assert_eq!(
+                facts(pool, voter.id).await,
+                vec![closing.clone()],
+                "each local voter is told the closing, from the author"
+            );
+        }
+        assert!(
+            rows(pool, mallory.id).await.is_empty(),
+            "a remote voter is not ours to tell"
+        );
+
+        // The sweep's rerun (a retried job pass) retells nobody.
+        on_poll_ended(&state, &stand).await.expect("the rerun runs");
+        assert_eq!(
+            facts(pool, alice.id).await.len(),
+            3,
+            "the author is not told twice"
+        );
+        assert_eq!(
+            facts(pool, bob.id).await,
+            vec![closing],
+            "and neither is the voter"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closing_on_a_gone_poll_status_tells_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "pd-alice").await;
+        let posted = post(pool, &alice, "doomed closing").await;
+        let stand = poll_on(pool, &posted, -1).await;
+        let _tombstone = status::soft_delete(pool, posted.id)
+            .await
+            .expect("the delete runs");
+
+        on_poll_ended(&state, &stand)
+            .await
+            .expect("the gone status is done work, not an error");
+        assert!(
+            rows(pool, alice.id).await.is_empty(),
+            "nobody is told about a deleted question"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_tells_the_boosters_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "ed-alice").await;
+        let bob = local(pool, "ed-bob").await;
+        let carol = local(pool, "ed-carol").await;
+        let mallory = remote(pool, "ed-mallory", "remote.example").await;
+
+        let posted = post(pool, &alice, "worth boosting").await;
+        let _bobs_boost = status::create_reblog(pool, BASE, &bob, &posted, Visibility::Public)
+            .await
+            .expect("bob's boost writes");
+        let _carols_boost = status::create_reblog(pool, BASE, &carol, &posted, Visibility::Public)
+            .await
+            .expect("carol's boost starts");
+        // Carol withdraws hers: a tombstoned boost names nobody.
+        let _tombstone = status::remove_reblog(pool, carol.id, posted.id)
+            .await
+            .expect("the withdrawal runs");
+        // A remote account's boost is federation's to tell.
+        let _mirrored_boost =
+            status::create_reblog(pool, BASE, &mallory, &posted, Visibility::Public)
+                .await
+                .expect("the mirrored boost writes");
+        // And the author boosting her own post is her own news.
+        let _own_boost = status::create_reblog(pool, BASE, &alice, &posted, Visibility::Public)
+            .await
+            .expect("the self boost writes");
+
+        on_status_edited(&state, &posted).await;
+        assert_eq!(
+            facts(pool, bob.id).await,
+            vec![(TYPE_UPDATE.to_owned(), alice.id, Some(posted.id))],
+            "the one live local booster is told, naming the edited original"
+        );
+        for quiet in [&alice, &carol] {
+            assert!(
+                rows(pool, quiet.id).await.is_empty(),
+                "{} (author or withdrawn booster) hears nothing",
+                quiet.nickname
+            );
+        }
+        assert!(
+            rows(pool, mallory.id).await.is_empty(),
+            "the remote booster is not told from here"
+        );
+
+        // A second edit — and a booster who took the boost back since —
+        // reaches exactly the audience that stands.
+        let _gone = status::remove_reblog(pool, bob.id, posted.id)
+            .await
+            .expect("bob withdraws after the first edit");
+        on_status_edited(&state, &posted).await;
+        assert_eq!(
+            facts(pool, bob.id).await,
+            vec![(TYPE_UPDATE.to_owned(), alice.id, Some(posted.id))],
+            "the second edit finds no booster and grows no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_told_of_every_visible_visibility() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "su-alice").await;
+        let bob = local(pool, "su-bob").await;
+        let carol = local(pool, "su-carol").await;
+        subscribed(pool, &bob, &alice).await;
+        // Carol follows without the notify toggle: a plain follower.
+        let _quiet = followed(pool, &carol, &alice).await;
+
+        for (label, visibility) in [
+            ("public", Visibility::Public),
+            ("unlisted", Visibility::Unlisted),
+            ("private", Visibility::Private),
+            ("local", Visibility::Local),
+        ] {
+            let row = post_vis(pool, &alice, &format!("{label} news"), visibility).await;
+            on_subscribed_status(&state, &row).await;
+        }
+        let told: Vec<String> = facts(pool, bob.id)
+            .await
+            .into_iter()
+            .map(|found| found.0)
+            .collect();
+        assert_eq!(
+            told,
+            vec![TYPE_STATUS.to_owned(); 4],
+            "the subscriber is told of every visibility but direct, newest first"
+        );
+        assert!(
+            rows(pool, carol.id).await.is_empty(),
+            "the unsubscribed follower is told nothing"
+        );
+
+        // A `direct` post is never a subscriber's news.
+        let dm = post_vis(pool, &alice, "for addressees only", Visibility::Direct).await;
+        on_subscribed_status(&state, &dm).await;
+        assert_eq!(
+            facts(pool, bob.id).await.len(),
+            4,
+            "the direct post grew no fifth telling"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reblog_row_and_a_pending_request_tell_no_subscribers() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "sr2-alice").await;
+        let bob = local(pool, "sr2-bob").await;
+        subscribed(pool, &bob, &alice).await;
+
+        // Alice boosts a mirrored remote post: the reblog row is not a
+        // subscriber's `status` news (the boost's own arm tells the
+        // original's author instead).
+        let mallory = remote(pool, "sr2-mallory", "remote.example").await;
+        let theirs = post(pool, &mallory, "their post").await;
+        let (boost, _) = status::create_reblog(pool, BASE, &alice, &theirs, Visibility::Public)
+            .await
+            .expect("the boost writes");
+        on_subscribed_status(&state, &boost).await;
+        assert!(
+            rows(pool, bob.id).await.is_empty(),
+            "a reblog row notifies no subscriptions"
+        );
+
+        // A pending request with its toggle on has subscribed nobody yet.
+        let lara = locked(pool, "sr2-lara").await;
+        let fred = local(pool, "sr2-fred").await;
+        let request = followed(pool, &fred, &lara).await;
+        assert_eq!(request.state, FollowState::Pending, "the fixture waits");
+        let _toggled = follow::set_toggles(
+            pool,
+            fred.id,
+            lara.id,
+            follow::FollowToggles {
+                show_reblogs: None,
+                notify: Some(true),
+            },
+        )
+        .await
+        .expect("the toggles run");
+        let news = post(pool, &lara, "locked news").await;
+        on_subscribed_status(&state, &news).await;
+        assert!(
+            rows(pool, fred.id).await.is_empty(),
+            "the waiting request carries no subscription yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reaction_tells_the_author_per_emoji_and_the_undo_retires_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "rc-alice").await;
+        let bob = local(pool, "rc-bob").await;
+
+        let posted = post(pool, &alice, "react to me").await;
+        reacted(&state, pool, &bob, &posted, "👍").await;
+        let notes = rows(pool, alice.id).await;
+        assert_eq!(notes.len(), 1, "the reaction is told to the author");
+        let note = notes.first().expect("the fixture telling");
+        assert_eq!(note.event_type, TYPE_EMOJI_REACTION);
+        assert_eq!(note.from_account_id, bob.id);
+        assert_eq!(note.status_id, Some(posted.id));
+        assert_eq!(
+            note.emoji.as_deref(),
+            Some("👍"),
+            "the emoji rides in the row"
+        );
+
+        // The idempotent `PUT` re-fires the hook on the same fact: the
+        // deduplication keeps it one row.
+        let again = emoji_reaction::react(
+            pool,
+            BASE,
+            &NewReaction {
+                user_id: bob.id,
+                status_id: posted.id,
+                emoji: "👍",
+                url: None,
+            },
+        )
+        .await
+        .expect("the repeat reaction restates the row");
+        on_reaction_changed(&state, &again, true).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            1,
+            "a restated reaction tells once"
+        );
+
+        // A second emoji is a second fact.
+        reacted(&state, pool, &bob, &posted, "🎉").await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            2,
+            "two emojis on one status are two tellings"
+        );
+
+        // And the withdrawal takes exactly its own emoji back.
+        let removed = emoji_reaction::unreact(pool, bob.id, posted.id, "👍")
+            .await
+            .expect("the withdrawal runs")
+            .expect("the reaction was there");
+        on_reaction_changed(&state, &removed, false).await;
+        let left = rows(pool, alice.id).await;
+        assert_eq!(left.len(), 1, "the other emoji's telling stands");
+        assert_eq!(
+            left.first().expect("the standing telling").emoji.as_deref(),
+            Some("🎉"),
+            "and it is the one that was not withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_or_remote_reaction_tells_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let bob = local(pool, "rs-bob").await;
+        let mallory = remote(pool, "rs-mallory", "remote.example").await;
+
+        let own = post(pool, &bob, "my own post").await;
+        reacted(&state, pool, &bob, &own, "👍").await;
+        assert!(
+            rows(pool, bob.id).await.is_empty(),
+            "reacting to your own post tells nobody"
+        );
+
+        let theirs = post(pool, &mallory, "their post").await;
+        reacted(&state, pool, &bob, &theirs, "👍").await;
+        assert!(
+            rows(pool, mallory.id).await.is_empty(),
+            "a remote author is not ours to tell"
+        );
+
+        // A withdrawal of a reaction that never existed leaves the hook
+        // nothing to retire and no error to report.
+        let untouched = emoji_reaction::unreact(pool, bob.id, own.id, "🎉")
+            .await
+            .expect("the withdrawal runs");
+        assert!(untouched.is_none(), "there was no row to remove");
+    }
+
+    #[tokio::test]
+    async fn the_skip_rules_still_hold_for_the_new_tellings() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let bob = local(pool, "sk-bob").await;
+        // A gated author who follows nobody: every stranger's new telling
+        // is withheld exactly like the old ones.
+        let gated = user::insert(
+            pool,
+            &NewUser {
+                notification_settings: json!({
+                    "block_from_strangers": true, "hide_notification_contents": false,
+                }),
+                ..NewUser::local("sk-gated", &user::local_ap_id(BASE, "sk-gated"))
+            },
+        )
+        .await
+        .expect("the gated fixture inserts");
+
+        let posted = post(pool, &gated, "gate me").await;
+        let stand = poll_on(pool, &posted, 30).await;
+        ballot(pool, &stand, &bob).await;
+        on_poll_vote(&state, &stand, &bob).await;
+        assert!(
+            rows(pool, gated.id).await.is_empty(),
+            "the stranger's ballot is withheld by the setting"
+        );
+
+        reacted(&state, pool, &bob, &posted, "👍").await;
+        assert!(
+            rows(pool, gated.id).await.is_empty(),
+            "and so is the stranger's reaction"
+        );
+
+        let second = post(pool, &gated, "second question").await;
+        let second_stand = poll_on(pool, &second, -1).await;
+        on_poll_ended(&state, &second_stand)
+            .await
+            .expect("the closing runs");
+        assert!(
+            rows(pool, gated.id).await.is_empty(),
+            "even the self-exempt closing reaches a gated author only as \
+             the setting allows, which for an unfollowed actor it does not"
         );
     }
 }

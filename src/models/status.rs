@@ -1340,6 +1340,37 @@ pub async fn reblogger_page(
     Ok(page.finish(entries))
 }
 
+/// [`local_reblogger_ids`]: the accounts behind the *live* reblog rows of
+/// one original, restricted to users this instance owns — the boosters the
+/// [`crate::services::notify`] edit telling can reach with a row. The
+/// partial unique index on `(user_id, reblog_of_id) WHERE deleted_at IS
+/// NULL` makes each account appear at most once without a `DISTINCT`.
+const LOCAL_REBLOGGER_IDS_SQL: &str = "SELECT s.user_id FROM statuses s
+      JOIN users u ON u.id = s.user_id
+       WHERE s.reblog_of_id = $1 AND s.deleted_at IS NULL AND u.local
+   ORDER BY s.id";
+
+/// The local accounts that currently boost `original_id`, oldest reblog
+/// first.
+///
+/// This is the audience of the `update` telling an edit sends (Pleroma's
+/// `get_potential_receiver_ap_ids` of an `Update` activity: the object's
+/// `Announce` actors, `where u.local`, the edit's actor subtracted —
+/// `lib/pleroma/notification.ex`). A tombstoned boost names nobody, and a
+/// remote booster is federation's to tell.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn local_reblogger_ids(pool: &PgPool, original_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(LOCAL_REBLOGGER_IDS_SQL)
+        .bind(original_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
 /// Reads the restatement arm of [`create_reblog`]: the caller's live reblog
 /// row of `original_id`, which the conflict says exists — unless a
 /// concurrent withdrawal tombstoned it in the same window, which is this
@@ -3359,6 +3390,65 @@ mod tests {
                 .unwrap(),
             HashSet::from([third.id]),
             "and the flagged set shrinks with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_reblogger_ids_answers_the_live_local_boosters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let mallory = remote_user(&pool, "mallory").await;
+        let original = post(&pool, &alice, "edited soon").await;
+        let untouched = post(&pool, &alice, "left alone").await;
+        let bobs_boost = reblog_it(&pool, &bob, &original).await;
+        reblog_as(&pool, &carol, &original).await;
+        // A remote booster mirrors an `Announce` this instance delivers to,
+        // never a row it can back with a notification.
+        let _mirrored = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original.id),
+                ..mirrored(&mallory, "https://remote.example/activities/mallory-boost")
+            },
+        )
+        .await
+        .expect("the mirrored boost writes");
+
+        let mut boosters = local_reblogger_ids(&pool, original.id)
+            .await
+            .expect("the read runs");
+        boosters.sort();
+        let mut want = vec![bob.id, carol.id];
+        want.sort();
+        assert_eq!(boosters, want, "both local boosters, no remote one");
+        assert!(
+            local_reblogger_ids(&pool, untouched.id)
+                .await
+                .expect("the unboosted read")
+                .is_empty(),
+            "a post nobody boosts names nobody"
+        );
+
+        // A withdrawn boost leaves the audience with its row.
+        let tombstone = remove_reblog(&pool, bob.id, original.id)
+            .await
+            .expect("the withdrawal runs")
+            .expect("the boost was there");
+        assert!(
+            tombstone.deleted_at.is_some(),
+            "the withdrawn row {} is the tombstone the read skips",
+            bobs_boost.id
+        );
+        assert_eq!(
+            local_reblogger_ids(&pool, original.id)
+                .await
+                .expect("the reread runs"),
+            vec![carol.id],
+            "and the tombstone's account is off the list"
         );
     }
 

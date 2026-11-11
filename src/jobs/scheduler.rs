@@ -5,7 +5,8 @@
 //! [`periodic_jobs`] registry lists every recurring job (today the
 //! streaming hub's reference-table sweep, the mutes expiry sweep, the
 //! idempotency-key sweep, the status-expiry sweep, the scheduled-status
-//! fire sweep, the daily dismissed-notification sweep, the hourly
+//! fire sweep, the poll-end notification sweep, the daily
+//! dismissed-notification sweep, the hourly
 //! OAuth/MFA/password-reset token sweep, the daily jobs-table prune, the
 //! daily deleted-local-status purge, the six-hourly orphaned-local-media
 //! sweep and the daily received-activity-ledger prune; later tickets
@@ -81,6 +82,12 @@ pub struct PeriodicJob {
 /// [`scheduled_statuses.publish`](super::scheduled_statuses::KIND_PUBLISH)
 /// job is the fire proper, and this pass publishes whatever a lost job row
 /// or a spent retry budget would otherwise leave parked forever. The
+/// per-minute poll-end notification sweep
+/// ([`polls.end_notify`](super::polls::KIND_END_NOTIFY)),
+/// [`super::polls::end_notify_job`], shares the queue: where Pleroma
+/// schedules one `PollWorker` Oban job per Question, this instance finds
+/// closed polls by sweeping, and each poll's own `ended_notified` column
+/// keeps the telling to exactly once. The
 /// daily sweep of notifications dismissed beyond their retention
 /// ([`KIND_NOTIFICATIONS`](super::maintenance::KIND_NOTIFICATIONS)) sits on the
 /// same queue too: dismissal already hides those rows from every read, so a
@@ -128,6 +135,7 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
         },
         super::statuses::sweep_job(),
         super::scheduled_statuses::sweep_job(),
+        super::polls::end_notify_job(),
         PeriodicJob {
             kind: super::maintenance::KIND_NOTIFICATIONS,
             queue: super::QUEUE_BACKGROUND,

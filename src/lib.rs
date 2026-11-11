@@ -85,7 +85,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)), the account
 /// deletion job ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE)),
 /// the Web Push delivery job
-/// ([`web_push::KIND_DELIVER`](jobs::web_push::KIND_DELIVER)) and the
+/// ([`web_push::KIND_DELIVER`](jobs::web_push::KIND_DELIVER)), the poll-end
+/// notification sweep ([`KIND_END_NOTIFY`](jobs::polls::KIND_END_NOTIFY))
+/// and the
 /// federation intake pair — the incoming-activity dispatcher
 /// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)) and
 /// its daily received-activity ledger prune
@@ -246,6 +248,7 @@ fn job_registry() -> JobRegistry {
     );
     registry.register(jobs::web_push::KIND_DELIVER, jobs::web_push::handle_deliver);
     registry.register(jobs::rich_media::KIND_FETCH, jobs::rich_media::handle_fetch);
+    registry.register(jobs::polls::KIND_END_NOTIFY, jobs::polls::handle_end_notify);
     registry.register(mailer::KIND_SEND, mailer::handle);
     registry.register(
         federation::dispatch::KIND_INCOMING,

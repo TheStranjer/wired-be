@@ -42,6 +42,15 @@
 //! entity reports — locking the poll row first, so two concurrent ballots
 //! from one account serialize and the second is refused rather than
 //! double-counted.
+//!
+//! The poll-end notification ticket (WBE-113) adds the sweep the
+//! [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY) job runs:
+//! [`fetch_ended_unnotified`] finds the polls that closed inside its window
+//! and were never told about, [`voter_ids`] answers whose ballots the
+//! closing should tell, and [`mark_ended_notified`] retires the row so the
+//! next pass walks past it (Pleroma needs no such flag — its
+//! `PollWorker` Oban job is scheduled once per poll and simply runs,
+//! `lib/pleroma/workers/poll_worker.ex`).
 
 use std::collections::HashMap;
 
@@ -51,20 +60,22 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
+    models::user,
     util::id::new_id,
 };
 
 /// The `INSERT` behind [`create`]: the minted id, the status named, and what
 /// [`PollParams`] holds, with `inserted_at` stamped by the database's `now()`
-/// (the column has no default) and the seven read columns brought back as
+/// (the column has no default) and the eight read columns brought back as
 /// stored — the two counters at their column defaults, since a fresh poll has
-/// no votes.
+/// no votes, and [`ended_notified`](Poll::ended_notified) at its default,
+/// since a fresh poll has not closed.
 const INSERT_POLL_SQL: &str = "INSERT INTO polls (
      id, status_id, expires_at, multiple, hide_totals, inserted_at
 ) VALUES (
      $1, $2, $3, $4, $5, now()
 ) RETURNING id, status_id, expires_at, multiple, hide_totals,
-            voters_count, votes_count";
+            voters_count, votes_count, ended_notified";
 
 /// The option rows behind [`create`]: one per title, in the order given, each
 /// with the id minted for it and a `position` counting from zero — `(ord - 1)`
@@ -96,6 +107,15 @@ pub struct Poll {
     /// Votes cast in total, which passes [`voters_count`](Self::voters_count)
     /// as soon as [`multiple`](Self::multiple) lets a voter tick twice.
     pub votes_count: i32,
+    /// Whether the [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY)
+    /// sweep has already told about this poll closing (WBE-113); the column
+    /// starts `false` and [`mark_ended_notified`] is the only write that
+    /// raises it. A [`user::Flag`], not a third bare `bool`, for the reason
+    /// every wide table's booleans are (Clippy's `struct_excessive_bools`,
+    /// which the repo models rather than loosens).
+    ///
+    /// [`user::Flag`]: crate::models::user::Flag
+    pub ended_notified: user::Flag,
 }
 
 /// One row of `poll_options`: one choice of a poll.
@@ -186,7 +206,8 @@ pub async fn create(
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<Option<Poll>> {
     let stored = sqlx::query_as::<_, Poll>(
-        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count
+        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count,
+                ended_notified
            FROM polls WHERE status_id = $1",
     )
     .bind(status_id)
@@ -208,7 +229,8 @@ pub async fn get_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<Option<
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_by_id(pool: &PgPool, poll_id: Uuid) -> AppResult<Option<Poll>> {
     let stored = sqlx::query_as::<_, Poll>(
-        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count
+        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count,
+                ended_notified
            FROM polls WHERE id = $1",
     )
     .bind(poll_id)
@@ -220,7 +242,7 @@ pub async fn get_by_id(pool: &PgPool, poll_id: Uuid) -> AppResult<Option<Poll>> 
 /// [`for_statuses`]: the polls of a whole batch of statuses in one walk of the
 /// unique key on `status_id`.
 const FOR_STATUSES_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
-                                       voters_count, votes_count
+                                       voters_count, votes_count, ended_notified
                                 FROM polls
                                WHERE status_id = ANY($1)
                             ORDER BY status_id";
@@ -445,7 +467,7 @@ pub async fn has_voted(pool: &PgPool, poll_id: Uuid, user_id: Uuid) -> AppResult
 /// time, and a poll deleted between the endpoint's reads and this lock is
 /// caught here.
 const LOCK_POLL_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
-                                    voters_count, votes_count
+                                    voters_count, votes_count, ended_notified
                                FROM polls
                               WHERE id = $1
                                 FOR UPDATE";
@@ -560,6 +582,94 @@ pub async fn cast_vote(
     Ok(true)
 }
 
+/// [`fetch_ended_unnotified`]: the polls the end-notify sweep has not told
+/// about yet whose deadline fell inside the look-back window — the strict
+/// `expires_at < now()` of the entity's `expired` flag, floored by
+/// `now() - $1 minutes` so a poll nobody ever voted on (or a sweep that ran
+/// while this instance was down) is not shouted about years late.
+/// [`make_interval`] takes the window as a number so the caller's constant
+/// and the statement cannot drift apart.
+///
+/// [`make_interval`]: https://www.postgresql.org/docs/current/functions-datetime.html
+const FETCH_ENDED_UNNOTIFIED_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
+       voters_count, votes_count, ended_notified
+  FROM polls
+ WHERE NOT ended_notified
+   AND expires_at IS NOT NULL
+   AND expires_at < now()
+   AND expires_at >= now() - make_interval(mins => $1)
+ ORDER BY id";
+
+/// The polls whose [`expires_at`](Poll::expires_at) ran out within the last
+/// `window_minutes` minutes and that the [`polls.end_notify`] sweep has not
+/// yet told about, oldest id first.
+///
+/// This is the [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY)
+/// job's work list; a poll that closed before the window is left where it
+/// is (its telling moment has passed), and one already flagged is done.
+///
+/// [`polls.end_notify`]: crate::jobs::polls::KIND_END_NOTIFY
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn fetch_ended_unnotified(pool: &PgPool, window_minutes: i32) -> AppResult<Vec<Poll>> {
+    let rows = sqlx::query_as::<_, Poll>(FETCH_ENDED_UNNOTIFIED_SQL)
+        .bind(window_minutes)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// [`voter_ids`]: the distinct accounts behind one poll's marks, walked
+/// through the primary key's `poll_id` lead. `DISTINCT` because a ballot
+/// marks one option per row and the sweep tells each voter once, whatever
+/// their ballot looked like.
+const VOTER_IDS_SQL: &str = "SELECT DISTINCT user_id FROM poll_votes WHERE poll_id = $1 \
+      ORDER BY user_id";
+
+/// Every account that marked anything on poll `poll_id`, deduplicated.
+///
+/// The [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY) telling
+/// hands this list to [`crate::services::notify`], which tells the local
+/// ones (Pleroma's `create_poll_notifications` walks the Question object's
+/// voter list exactly this way).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn voter_ids(pool: &PgPool, poll_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(VOTER_IDS_SQL)
+        .bind(poll_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
+/// [`mark_ended_notified`]: the flag write, guarded so a rerun of the same
+/// poll reports `0` — the telling it guards has already happened.
+const MARK_ENDED_NOTIFIED_SQL: &str = "UPDATE polls SET ended_notified = true \
+      WHERE id = $1 AND NOT ended_notified";
+
+/// Sets [`ended_notified`](Poll::ended_notified) on poll `poll_id`, telling
+/// the [`fetch_ended_unnotified`] sweep it is done with this row.
+///
+/// Returns how many rows changed: `1` for the sweep that retired the poll,
+/// `0` for a rerun on an already-flagged row.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn mark_ended_notified(pool: &PgPool, poll_id: Uuid) -> AppResult<u64> {
+    let outcome = sqlx::query(MARK_ENDED_NOTIFIED_SQL)
+        .bind(poll_id)
+        .execute(pool)
+        .await?;
+    Ok(outcome.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone as _;
@@ -669,6 +779,10 @@ mod tests {
         );
         assert!(!created.multiple, "single choice by default");
         assert!(!created.hide_totals, "totals shown by default");
+        assert!(
+            !created.ended_notified.get(),
+            "a fresh poll was never swept"
+        );
         assert_eq!(created.voters_count, 0, "a fresh poll has no voters");
         assert_eq!(created.votes_count, 0, "a fresh poll has no votes");
 
@@ -1553,6 +1667,148 @@ mod tests {
         assert!(
             matches!(cascaded, AppError::NotFound),
             "a poll deleted under the endpoint is the 404: {cascaded}"
+        );
+    }
+
+    /// A two-option [`PollParams`] closing `mins` minutes from now
+    /// (negative: one whose deadline already ran out).
+    fn ending_in(mins: i64) -> PollParams {
+        PollParams {
+            options: vec!["tea".to_owned(), "coffee".to_owned()],
+            expires_at: Some(Utc::now() + chrono::TimeDelta::minutes(mins)),
+            multiple: true,
+            ..PollParams::default()
+        }
+    }
+
+    /// A poll by `author` closing `mins` minutes from now, on its own
+    /// status.
+    async fn ending_poll(pool: &PgPool, author: &User, mins: i64) -> Poll {
+        let posted = create_status(pool, author).await;
+        create_for(pool, posted.id, &ending_in(mins)).await
+    }
+
+    #[tokio::test]
+    async fn fetch_ended_unnotified_walks_only_the_window() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let just_ended = ending_poll(&pool, &alice, -1).await;
+        let long_ended = ending_poll(&pool, &alice, -10).await;
+        let still_open = ending_poll(&pool, &alice, 10).await;
+        let immortal = {
+            let posted = create_status(&pool, &alice).await;
+            create_for(&pool, posted.id, &params(&["tea", "coffee"])).await
+        };
+
+        let swept = fetch_ended_unnotified(&pool, 5)
+            .await
+            .expect("the sweep reads");
+        let swept_ids: Vec<Uuid> = swept.iter().map(|found| found.id).collect();
+        assert!(
+            swept_ids.contains(&just_ended.id),
+            "the poll that closed a minute ago is due its telling"
+        );
+        for absent in [long_ended.id, still_open.id, immortal.id] {
+            assert!(
+                !swept_ids.contains(&absent),
+                "past the window, still open, or without a deadline is nobody's news"
+            );
+        }
+
+        // A wider window reaches the older close: the bound is the
+        // caller's constant, not a second rule.
+        let wider = fetch_ended_unnotified(&pool, 15)
+            .await
+            .expect("the wider sweep reads");
+        let wider_ids: Vec<Uuid> = wider.iter().map(|found| found.id).collect();
+        assert!(
+            wider_ids.contains(&long_ended.id) && wider_ids.contains(&just_ended.id),
+            "both closed poll are inside fifteen minutes"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_ended_notified_retires_the_row_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let closed = ending_poll(&pool, &alice, -1).await;
+
+        assert_eq!(
+            mark_ended_notified(&pool, closed.id)
+                .await
+                .expect("the first marking runs"),
+            1,
+            "the sweep retires the poll"
+        );
+        assert_eq!(
+            mark_ended_notified(&pool, closed.id)
+                .await
+                .expect("the rerun runs"),
+            0,
+            "and a rerun changes nothing"
+        );
+        assert!(
+            fetch_ended_unnotified(&pool, 5)
+                .await
+                .expect("the sweep reads")
+                .iter()
+                .all(|found| found.id != closed.id),
+            "the flagged poll is off the next work list"
+        );
+        let stored = get_by_id(&pool, closed.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert!(stored.ended_notified.get(), "and the flag round trips");
+        assert_eq!(
+            mark_ended_notified(&pool, new_id())
+                .await
+                .expect("an unknown id changes nothing"),
+            0,
+            "an id that names no poll is not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn voter_ids_answer_the_distinct_ballots_once_each() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let carol = create_user(&pool, "carol").await;
+        let closed = ending_poll(&pool, &alice, -1).await;
+        let choices = options(&pool, closed.id).await.expect("options read");
+
+        // Bob marks both options of a multiple poll: one ballot, one id.
+        assert!(
+            cast_vote(&pool, closed.id, bob.id, &[choices[0].id, choices[1].id])
+                .await
+                .expect("the first ballot writes"),
+            "the pair was free"
+        );
+        assert!(
+            cast_vote(&pool, closed.id, carol.id, &[choices[1].id])
+                .await
+                .expect("the second ballot writes"),
+            "and so was hers"
+        );
+
+        let mut voters = voter_ids(&pool, closed.id).await.expect("the voters read");
+        voters.sort();
+        let mut want = vec![bob.id, carol.id];
+        want.sort();
+        assert_eq!(
+            voters, want,
+            "each voter once, whichever option they marked"
+        );
+        assert!(
+            voter_ids(&pool, new_id())
+                .await
+                .expect("the unknown poll reads")
+                .is_empty(),
+            "a poll nobody voted on has no voters"
         );
     }
 }

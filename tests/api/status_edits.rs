@@ -28,9 +28,10 @@
 //! the warning and the `MIME` type, as `{"id", "text", "spoiler_text",
 //! "content_type"}`.
 //!
-//! Nothing federates yet: the `Update` activity and the `status.update`
-//! stream push attach at the module's `after_status_edited` hook, the
-//! documented landing point.
+//! The `update` telling of the post's local boosters already lands at the
+//! module's `after_status_edited` hook (WBE-113, tested in
+//! `notification_generation.rs`). Nothing federates yet: the `Update`
+//! activity and the `status.update` stream push attach at the same point.
 //!
 //! [`Status`]: wired_be::entities::status::Status
 
