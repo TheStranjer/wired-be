@@ -80,6 +80,11 @@
 //! takes both flags from its *own* `conversation_id`, because a mute is a
 //! fact about the thread, not the post, so a reblog row and its nested
 //! original always carry the same pair.
+//! `filtered` is not the render batch's at all: the filter ticket applies
+//! it as a post-processing step over rendered pages
+//! ([`crate::services::filter::apply_filters`]), and a render that batch
+//! alone produced — like [`Status::from_source`] here — carries the empty
+//! array.
 //!
 //! [`ReactionSummary`]: crate::entities::emoji_reaction::ReactionSummary
 
@@ -93,6 +98,7 @@ use crate::{
     entities::{
         account::{Account, AccountViewer, JsonBool},
         emoji_reaction::ReactionSummary,
+        filter::FilterResult,
         media_attachment::MediaAttachment,
         mention::Mention,
         poll::Poll,
@@ -439,6 +445,14 @@ pub struct Status {
     /// ticket renders it — from the originals the service already
     /// batch-loads. (`quote_id` is not emitted at all.)
     pub quote: Option<Value>,
+    /// The filters that warned over this status, as the v2 `FilterResult`
+    /// entities: [`crate::services::filter::apply_filters`] fills it from
+    /// the viewer's active filters as a page is post-processed, and an
+    /// unfiltered (or exempt, or anonymous) render — and every endpoint
+    /// the filter contexts do not reach — carries the empty array. A
+    /// status a matching `irreversible` filter governs never renders at
+    /// all: it leaves the response instead.
+    pub filtered: Vec<FilterResult>,
     /// Pleroma's extension block (see [`PleromaMetadata`]).
     pub pleroma: PleromaMetadata,
 }
@@ -517,6 +531,7 @@ impl Status {
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
             quote: None,
+            filtered: Vec::new(),
             pleroma: pleroma_block(
                 row,
                 reply_author,
@@ -655,7 +670,7 @@ mod tests {
     /// The URL a link card is cached under, for the card entries.
     const CARD_URL: &str = "https://example.test/post";
     /// Every JSON key the entity must emit, sorted.
-    const EXPECTED_KEYS: [&str; 31] = [
+    const EXPECTED_KEYS: [&str; 32] = [
         "account",
         "application",
         "bookmarked",
@@ -666,6 +681,7 @@ mod tests {
         "emojis",
         "favourited",
         "favourites_count",
+        "filtered",
         "id",
         "in_reply_to_account_id",
         "in_reply_to_id",
@@ -1200,6 +1216,12 @@ mod tests {
             "a page whose bookmarks read found nothing renders the flag false"
         );
         assert_eq!(value["quote"], Value::Null, "quotes are a later ticket");
+        assert_eq!(
+            value["filtered"],
+            json!([]),
+            "the render itself never filters: the entity comes out with the \
+             empty array and `services::filter` fills it as a page is post-processed"
+        );
     }
 
     #[test]

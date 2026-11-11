@@ -509,6 +509,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         create_status::{self, CreateStatusParams, EditStatusParams},
+        filter::{self, FilterContext},
         notify,
         render_status::{render_status, render_statuses},
         rich_media::stored_card_json,
@@ -1278,7 +1279,14 @@ async fn list_statuses(
 /// shown, and each descendant's `pleroma.parent_visible` is then set to
 /// whether its own direct parent came back in this answer
 /// ([`mark_invisible_parents`]). Both arrays render through the shared
-/// [`render_statuses`] batch.
+/// [`render_statuses`] batch and then pass through
+/// [`apply_active`](crate::services::filter::apply_active) in the `thread`
+/// filter context — the viewer's warning matches arrive annotated, their
+/// irreversible matches leave the arrays, and a parent one of those matches
+/// removed is what the then-computed `parent_visible` reads as absent.
+/// The named status itself is not filtered here: it is the read's anchor,
+/// and the single-status route is the filter contexts' business, not this
+/// one's.
 ///
 /// # Errors
 ///
@@ -1297,8 +1305,12 @@ async fn get_status_context(
     let row = status_for_viewer_or_404(&state, viewer, &id).await?;
     let ancestor_rows = visible_ancestors(&state, viewer, row.id).await?;
     let descendant_rows = visible_descendants(&state, viewer, row.id).await?;
-    let ancestors = render_statuses(&state, viewer, &ancestor_rows).await?;
-    let mut descendants = render_statuses(&state, viewer, &descendant_rows).await?;
+    let rendered_ancestors = render_statuses(&state, viewer, &ancestor_rows).await?;
+    let rendered_descendants = render_statuses(&state, viewer, &descendant_rows).await?;
+    let ancestors =
+        filter::apply_active(&state, viewer, rendered_ancestors, FilterContext::Thread).await?;
+    let mut descendants =
+        filter::apply_active(&state, viewer, rendered_descendants, FilterContext::Thread).await?;
     mark_invisible_parents(&mut descendants, &ancestors, row.id);
     debug!(
         status = %row.id,
