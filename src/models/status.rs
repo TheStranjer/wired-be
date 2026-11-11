@@ -473,6 +473,31 @@ const NEWEST_PUBLIC_POSTS_SQL: &str = "SELECT * FROM statuses
 ORDER BY id DESC
     LIMIT $3";
 
+/// [`outbox_page`]: the head of the author's outbox statement, up to (and
+/// including) the placeholder [`outbox_page`] pushes the author's id into;
+/// [`PageParams::apply_keyset`] then appends the cursors, the ordering and
+/// the `LIMIT` on `s.id`.
+const OUTBOX_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.user_id = ";
+
+/// The visibility arms of the two `ActivityPub` listing reads: a row the
+/// fediverse may be shown is `public` or `unlisted` — `private`, `direct`
+/// and Pleroma's never-federated `local` belong to nobody's outbox or
+/// public replies collection — and a tombstone is no post at all.
+const AP_VISIBLE: &str = " AND s.deleted_at IS NULL AND s.visibility IN ('public', 'unlisted')";
+
+/// [`public_replies_page`]: the head of the replies statement, up to (and
+/// including) the placeholder the object id is pushed into; the function
+/// then appends [`AP_VISIBLE`], the cursor, the ordering and the `LIMIT`.
+const REPLIES_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.in_reply_to_id = ";
+
+/// [`public_replies_count`]: the same live `public`/`unlisted` answers
+/// [`public_replies_page`] pages through, counted rather than listed; the
+/// `count(*)` `bigint` arrives as the `i64` the JSON number carries.
+const PUBLIC_REPLIES_COUNT_SQL: &str = "SELECT count(*) FROM statuses s
+      WHERE s.in_reply_to_id = $1
+        AND s.deleted_at IS NULL
+        AND s.visibility IN ('public', 'unlisted')";
+
 /// [`ancestor_chain`]: the walk *up* from `$1` along `in_reply_to_id`, one
 /// hop per row, stopped at depth `$2`. `$3` is again the starting id, which
 /// the answer must not carry; the base row sits at depth `0` so a cap of
@@ -819,6 +844,101 @@ pub async fn newest_public_posts(
         .fetch_all(pool)
         .await?;
     Ok(statuses)
+}
+
+/// The `user_id`'s outbox page: their publicly visible rows, newest first.
+///
+/// Live `public` and `unlisted` rows — posts, replies and reblogs alike —
+/// with `page`'s cursors and `limit` applied on the status id
+/// (decision 4). This is the read behind
+/// `GET /users/{nickname}/outbox?page=true` (Pleroma's
+/// `ActivityPubController.outbox`, fed by `fetch_user_activities`); who may
+/// see it is the route's gate, not this query's.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn outbox_page(
+    pool: &PgPool,
+    user_id: Uuid,
+    page: &PageParams,
+) -> AppResult<Vec<Status>> {
+    let mut builder = QueryBuilder::<Postgres>::new(OUTBOX_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(user_id).push(AP_VISIBLE);
+    page.apply_keyset(&mut builder, "s.id");
+    let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
+    Ok(page.finish(rows))
+}
+
+/// The publicly visible answers to `object_id`, counted rather than listed.
+///
+/// The same live `public`/`unlisted` rows [`public_replies_page`] pages
+/// through; the `count(*)` `bigint` arrives as the `i64` the JSON number
+/// carries. This is the `totalItems` of `GET /objects/{uuid}/replies`.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn public_replies_count(pool: &PgPool, object_id: Uuid) -> AppResult<i64> {
+    let row = sqlx::query_scalar::<_, i64>(PUBLIC_REPLIES_COUNT_SQL)
+        .bind(object_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
+/// One page of `object_id`'s publicly visible replies, oldest first.
+///
+/// `min_id` moves the window forward (the `limit` rows just newer than the
+/// cursor), `max_id` backward (the `limit` rows just older, answered in the
+/// same oldest-first order); neither reads the rows the other side of the
+/// cursor hides, and both together narrow to the window between. With no
+/// cursor the page is the `limit` oldest replies of all.
+///
+/// The direction is the replies collection's own (Pleroma's
+/// `object_replies` runs its keyset `:asc`), which is why this read takes
+/// its cursors plainly rather than through [`PageParams`], whose pages are
+/// all newest-first.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn public_replies_page(
+    pool: &PgPool,
+    object_id: Uuid,
+    min_id: Option<Uuid>,
+    max_id: Option<Uuid>,
+    limit: i64,
+) -> AppResult<Vec<Status>> {
+    let mut builder = QueryBuilder::<Postgres>::new(REPLIES_PAGE_SQL);
+    let _bound: &mut _ = builder.push_bind(object_id).push(AP_VISIBLE);
+    // A `max_id` page is read from the cursor backwards — the newest rows
+    // below it come off the index first — and flipped, so the answer keeps
+    // the oldest-first order every replies page is served in.
+    let backwards = max_id.is_some();
+    if let Some(max_id) = max_id {
+        let _older: &mut _ = builder.push(" AND s.id < ").push_bind(max_id);
+    } else if let Some(min_id) = min_id {
+        let _newer: &mut _ = builder.push(" AND s.id > ").push_bind(min_id);
+    }
+    let _paged: &mut _ = builder
+        .push(if backwards {
+            " ORDER BY s.id DESC"
+        } else {
+            " ORDER BY s.id ASC"
+        })
+        .push(" LIMIT ")
+        .push_bind(limit);
+    let mut rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
+    if backwards {
+        rows.reverse();
+    }
+    Ok(rows)
 }
 
 /// Every status *above* `status_id`: the walk up its
@@ -2580,6 +2700,151 @@ mod tests {
             ids(&newest_public_posts(&pool, bob.id, None, 20).await.unwrap()),
             vec![bob_post.id],
             "the other author keeps their own single public root"
+        );
+    }
+
+    /// The outbox page answers the author's live `public` and `unlisted`
+    /// rows newest-first — replies and reblogs among them, the other
+    /// visibilities, the tombstones and another author's rows never — and
+    /// the `PageParams` cursors walk the page on the status id.
+    #[tokio::test]
+    async fn outbox_page_reads_the_author_s_ap_visible_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let root = post(&pool, &alice, "root").await;
+        let answer = reply(&pool, &alice, &root, "answer").await;
+        let hidden = visible(&pool, &alice, "unlisted", Visibility::Unlisted).await;
+        let _direct = visible(&pool, &alice, "dm", Visibility::Direct).await;
+        let _private = visible(&pool, &alice, "followers only", Visibility::Private).await;
+        let _localonly = visible(&pool, &alice, "instance only", Visibility::Local).await;
+        let gone = post(&pool, &alice, "gone").await;
+        assert!(
+            soft_delete(&pool, gone.id).await.unwrap().is_some(),
+            "one outbox row is deleted"
+        );
+        let _bobs = post(&pool, &bob, "not alice's outbox").await;
+
+        let first_page = PageParams {
+            limit: 4,
+            ..PageParams::from_query(None, 40).expect("no query is the default page")
+        };
+        assert_eq!(
+            ids(&outbox_page(&pool, alice.id, &first_page).await.unwrap()),
+            vec![hidden.id, answer.id, root.id],
+            "newest first: the unlisted post, the answer, the root; the \
+             direct, private, local and deleted rows and bob's posts stay out"
+        );
+        let older = PageParams {
+            max_id: Some(answer.id),
+            ..first_page
+        };
+        assert_eq!(
+            ids(&outbox_page(&pool, alice.id, &older).await.unwrap()),
+            vec![root.id],
+            "the max_id page holds only the strictly older rows"
+        );
+        let newer = PageParams {
+            min_id: Some(answer.id),
+            ..first_page
+        };
+        assert_eq!(
+            ids(&outbox_page(&pool, alice.id, &newer).await.unwrap()),
+            vec![hidden.id],
+            "the min_id page holds only the strictly newer rows, newest first"
+        );
+        let tiny = PageParams {
+            limit: 1,
+            ..first_page
+        };
+        assert_eq!(
+            ids(&outbox_page(&pool, alice.id, &tiny).await.unwrap()),
+            vec![hidden.id],
+            "the limit cuts the page"
+        );
+    }
+
+    /// The replies reads answer the live `public`/`unlisted` answers only,
+    /// oldest first; `min_id` walks the window forward and `max_id` back,
+    /// each page still oldest-first, and the count agrees with the page.
+    #[tokio::test]
+    async fn public_replies_page_walks_oldest_first() {
+        /// `author`'s answer to `parent`, as one visibility.
+        async fn answered(
+            pool: &PgPool,
+            author: &User,
+            parent: &Status,
+            text: &str,
+            visibility: Visibility,
+        ) -> Status {
+            insert(
+                pool,
+                BASE,
+                &NewStatus {
+                    in_reply_to_id: Some(parent.id),
+                    visibility,
+                    ..NewStatus::local(author, text)
+                },
+            )
+            .await
+            .expect("a visible reply fixture inserts")
+        }
+
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let root = post(&pool, &alice, "root").await;
+        let other = post(&pool, &alice, "another root").await;
+        let one = reply(&pool, &alice, &root, "one").await;
+        let two = answered(&pool, &alice, &root, "two", Visibility::Unlisted).await;
+        let _dm = answered(&pool, &alice, &root, "dm", Visibility::Direct).await;
+        let _followers_only = answered(&pool, &alice, &root, "fm", Visibility::Private).await;
+        let elsewhere = reply(&pool, &alice, &other, "not a reply of root").await;
+        let gone = reply(&pool, &alice, &root, "gone").await;
+        assert!(
+            soft_delete(&pool, gone.id).await.unwrap().is_some(),
+            "one reply is deleted"
+        );
+
+        assert_eq!(
+            ids(&public_replies_page(&pool, root.id, None, None, 20)
+                .await
+                .unwrap()),
+            vec![one.id, two.id],
+            "oldest first; the direct and private answers, the other thread \
+             and the tombstone stay out"
+        );
+        assert_eq!(
+            public_replies_count(&pool, root.id).await.unwrap(),
+            2,
+            "the count agrees with the page"
+        );
+        assert_eq!(
+            ids(&public_replies_page(&pool, root.id, Some(one.id), None, 20)
+                .await
+                .unwrap()),
+            vec![two.id],
+            "min_id walks forward to the newer answers"
+        );
+        assert_eq!(
+            ids(&public_replies_page(&pool, root.id, None, Some(two.id), 20)
+                .await
+                .unwrap()),
+            vec![one.id],
+            "max_id walks back to the older answers, still oldest first"
+        );
+        assert_eq!(
+            ids(&public_replies_page(&pool, other.id, None, None, 20)
+                .await
+                .unwrap()),
+            vec![elsewhere.id],
+            "each thread pages its own answers"
+        );
+        assert_eq!(
+            public_replies_count(&pool, other.id).await.unwrap(),
+            1,
+            "and counts them"
         );
     }
 

@@ -14,24 +14,30 @@
 //! `internal_fetch/2` action, the JSON-LD schema document,
 //! `GET /schemas/litepub-0.1.jsonld` — Pleroma's static
 //! `priv/static/schemas/litepub-0.1.jsonld`, which the [`crate::federation::note`]
-//! documents name in their `@context` — and the three inbox `POST`s of the
-//! actors those documents name (`inbox/2` feeding
-//! `Federator.incoming_ap_doc`). The outboxes and the collections beside
-//! them arrive in later tickets and get their handlers here;
-//! `GET /users/{nickname}/inbox`, the client reads of a personal inbox,
-//! belongs to the C2S ticket.
+//! documents name in their `@context` — the five activity-collection
+//! documents the actor names, `GET /users/{nickname}/outbox` (and
+//! `/followers`, `/following`, `/collections/featured`) and
+//! `GET /objects/{uuid}/replies`, built by [`crate::federation::collections`]
+//! from the same controller's `outbox/2`, `followers/2`, `following/2`,
+//! `pinned/2` and `object_replies/2` actions — and the three inbox
+//! `POST`s of the actors those documents name (`inbox/2` feeding
+//! `Federator.incoming_ap_doc`). `GET /users/{nickname}/inbox`, the
+//! client reads of a personal inbox, belongs to the C2S ticket.
 //!
-//! The route negotiates content: an `Accept` header naming one of the two
-//! `ActivityPub` media types gets the actor document; an `Accept` naming
-//! `text/html` (and no `ActivityPub` type) is a browser and gets Pleroma's
-//! redirect to the frontend profile page — 302 with `Location:`
-//! `{BASE_URL}/{nickname}` (this backend is API-only and serves no HTML of
-//! its own, `lib/pleroma/web/feed/user_controller.ex`'s `feed_redirect`);
-//! anything else gets Pleroma's 404 `{"error":"Not found"}`. Every answer
-//! carries `Vary: Accept`, since the header decides which of the three the
-//! client sees.
+//! Every `GET` of this router negotiates content: an `Accept` header
+//! naming one of the two `ActivityPub` media types gets the document; an
+//! `Accept` naming `text/html` (and no `ActivityPub` type) is a browser
+//! and gets Pleroma's redirect to the frontend page of the same address —
+//! 302 with `Location:` `{BASE_URL}/{nickname}` for an actor path,
+//! `{BASE_URL}/notice/{uuid}` for an object's (this backend is API-only
+//! and serves no HTML of its own,
+//! `lib/pleroma/web/feed/user_controller.ex`'s `feed_redirect`); anything
+//! else gets Pleroma's 404 `{"error":"Not found"}`. Every answer carries
+//! `Vary: Accept`, since the header decides which of the three the client
+//! sees.
 //!
-//! With `AUTHORIZED_FETCH` on, the user actor route additionally demands a
+//! With `AUTHORIZED_FETCH` on, every `ActivityPub` document route — the
+//! actor, the collections, the object replies — additionally demands a
 //! valid HTTP Signature (see [`fetch_allowed`]).
 //! `/internal/fetch` is not gated: it is the document a peer reads to
 //! learn the key it has to sign with, so gating it would deadlock the
@@ -77,6 +83,7 @@ use crate::{
     federation::{
         actor::actor_json,
         authorized_fetch::fetch_allowed,
+        collections::{self, FollowSide},
         dispatch::KIND_INCOMING,
         inbox_auth::{InboxAuthError, SignedActivity},
         note::{LITEPUB_SCHEMA_PATH, litepub_context_json},
@@ -84,10 +91,13 @@ use crate::{
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
         job::{NewJob, enqueue},
+        status::{self, Status},
+        status_visibility,
         user::{User, get_by_nickname},
     },
     services::instance_actor,
     state::AppState,
+    util::id::parse_id,
 };
 
 /// `Content-Type` of an actor document: `ActivityPub` is JSON-LD with its
@@ -125,13 +135,20 @@ pub const RATE_LIMIT_BUCKET: &str = "ap_routes";
 
 /// The top-level `ActivityPub` router, merged by [`crate::app`].
 ///
-/// It serves the actor documents peers fetch and the three inbox routes
-/// that accept their deliveries (`POST /inbox`, `POST /users/{nickname}/inbox`
-/// and `POST /internal/fetch/inbox`). `GET /users/{nickname}/inbox` is the
-/// C2S ticket's, not this router's.
+/// It serves the actor documents peers fetch, the activity collections
+/// beside them (the account's outbox, followers, following and featured
+/// list, an object's replies), and the three inbox routes that accept
+/// their deliveries (`POST /inbox`, `POST /users/{nickname}/inbox`
+/// and `POST /internal/fetch/inbox`). `GET /users/{nickname}/inbox` is
+/// the C2S ticket's, not this router's.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/users/{nickname}", get(get_actor))
+        .route("/users/{nickname}/outbox", get(get_outbox))
+        .route("/users/{nickname}/followers", get(get_followers))
+        .route("/users/{nickname}/following", get(get_following))
+        .route("/users/{nickname}/collections/featured", get(get_featured))
+        .route("/objects/{uuid}/replies", get(get_replies))
         .route("/internal/fetch", get(get_instance_actor))
         .route(LITEPUB_SCHEMA_PATH, get(litepub_schema))
         .route("/inbox", post(inbox))
@@ -139,39 +156,36 @@ pub fn router() -> Router<AppState> {
         .route("/internal/fetch/inbox", post(inbox))
 }
 
-/// `GET /users/{nickname}` — the local actor named `nickname`, as an
-/// `ActivityPub` document. No OAuth: federation fetches actors with
-/// anonymous requests — or, once `AUTHORIZED_FETCH` is on, with HTTP
-/// Signatures, which the gate below checks before the account is read.
-///
-/// `Vary: Accept` is added to whatever the handler below decides, so the
-/// negotiation itself never has to remember the header.
-async fn get_actor(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-    Path(nickname): Path<String>,
-) -> Response {
-    let response = negotiated_actor(&state, &nickname, &headers, &uri).await;
-    with_vary(response)
+/// What the negotiation and the account lookup settled on for a
+/// user-keyed `ActivityPub` `GET`.
+enum Reader {
+    /// The named account, live and local: the route may serve its
+    /// documents to this `ActivityPub` client. Boxed because the row
+    /// outgrows the redirect by an order of magnitude.
+    Account(Box<User>),
+    /// The negotiation already answered the request, with the browser's
+    /// redirect to the frontend.
+    Redirect(Response),
 }
 
-/// The response the route sends: the actor document for an `ActivityPub`
-/// client that asks for a live local account, Pleroma's frontend redirect
-/// for an HTML client, and the errors the ticket prescribes for everyone
-/// else. The `AUTHORIZED_FETCH` gate runs after the content negotiation
-/// (a client that never speaks `ActivityPub` stays a 404, and an HTML
-/// redirect needs no signature) and before the account is read (no
-/// existence leak to unsigned callers).
-async fn negotiated_actor(
+/// The shared front half of every `ActivityPub` `GET` under
+/// `/users/{nickname}` — the actor document and the four collections
+/// beside it: content negotiation (a browser leaves with the frontend
+/// redirect, anyone else with the 404), the `AUTHORIZED_FETCH` gate
+/// (after the negotiation, before the account is read, so a client that
+/// never speaks `ActivityPub` stays a 404 and no existence leaks to an
+/// unsigned caller), and the account checks: unknown or remote is the
+/// 404, deactivated the 410.
+async fn gate_actor_read(
     state: &AppState,
     nickname: &str,
     headers: &HeaderMap,
     uri: &Uri,
-) -> AppResult<Response> {
+) -> AppResult<Reader> {
     if !wants_activity_json(headers) {
         if wants_html(headers) {
-            return html_redirect(&state.config, nickname);
+            let redirect = html_redirect(&state.config, nickname)?;
+            return Ok(Reader::Redirect(redirect));
         }
         return Err(AppError::RouteNotFound);
     }
@@ -185,7 +199,172 @@ async fn negotiated_actor(
     if !user.is_active.get() {
         return Err(AppError::Gone);
     }
-    Ok(actor_response(&user, &state.config))
+    Ok(Reader::Account(Box::new(user)))
+}
+
+/// `GET /users/{nickname}` — the local actor named `nickname`, as an
+/// `ActivityPub` document. No OAuth: federation fetches actors with
+/// anonymous requests — or, once `AUTHORIZED_FETCH` is on, with HTTP
+/// Signatures, which the gate above checks before the account is read.
+///
+/// `Vary: Accept` is added to whatever the route sends, so the
+/// negotiation itself never has to remember the header.
+async fn get_actor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(nickname): Path<String>,
+) -> Response {
+    let outcome = gate_actor_read(&state, &nickname, &headers, &uri).await;
+    let response = match outcome {
+        Ok(Reader::Account(user)) => Ok(actor_response(&user, &state.config)),
+        Ok(Reader::Redirect(redirect)) => Ok(redirect),
+        Err(err) => Err(err),
+    };
+    with_vary(response)
+}
+
+/// `GET /users/{nickname}/outbox` — the account's public activity
+/// stream: the collection root, or with `?page=true` a newest-first keyset
+/// page (up to 20 per page, cursor `max_id`) of the `Create` and `Announce`
+/// activities the account's publicly visible statuses federate as.
+async fn get_outbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(nickname): Path<String>,
+) -> Response {
+    let outcome = gate_actor_read(&state, &nickname, &headers, &uri).await;
+    let response = match outcome {
+        Ok(Reader::Account(user)) => document(
+            collections::outbox_document(&state.db, &state.config, &user, uri.query()).await,
+        ),
+        Ok(Reader::Redirect(redirect)) => Ok(redirect),
+        Err(err) => Err(err),
+    };
+    with_vary(response)
+}
+
+/// `GET /users/{nickname}/followers` — who follows the account: the
+/// collection root, or with `?page=true` a newest-first keyset page (up to
+/// 10 per page, cursor `max_id` on the follow row id) of follower actor
+/// ids. The page lists nothing while `hide_followers` is set; the root
+/// carries `totalItems` only while `hide_followers_count` is not.
+async fn get_followers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(nickname): Path<String>,
+) -> Response {
+    follow_side_document(&state, &nickname, &headers, &uri, FollowSide::Followers).await
+}
+
+/// `GET /users/{nickname}/following` — whom the account follows; the same
+/// route as [`get_followers`]'s, on the other side of the relationship
+/// (and the `hide_follows` / `hide_follows_count` flags).
+async fn get_following(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(nickname): Path<String>,
+) -> Response {
+    follow_side_document(&state, &nickname, &headers, &uri, FollowSide::Following).await
+}
+
+/// The followers/following pair's shared body: the actor route's gate,
+/// then that side's document.
+async fn follow_side_document(
+    state: &AppState,
+    nickname: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    side: FollowSide,
+) -> Response {
+    let outcome = gate_actor_read(state, nickname, headers, uri).await;
+    let response = match outcome {
+        Ok(Reader::Account(user)) => document(
+            collections::follows_document(&state.db, &state.config, &user, side, uri.query()).await,
+        ),
+        Ok(Reader::Redirect(redirect)) => Ok(redirect),
+        Err(err) => Err(err),
+    };
+    with_vary(response)
+}
+
+/// `GET /users/{nickname}/collections/featured` — the account's pinned
+/// posts as one `OrderedCollection` whose `orderedItems` are the full
+/// `Note` documents, the counterpart of Pleroma's `pinned` action; the
+/// list is inline, not paged.
+async fn get_featured(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(nickname): Path<String>,
+) -> Response {
+    let outcome = gate_actor_read(&state, &nickname, &headers, &uri).await;
+    let response = match outcome {
+        Ok(Reader::Account(user)) => {
+            document(collections::featured_document(&state.db, &state.config, &user).await)
+        }
+        Ok(Reader::Redirect(redirect)) => Ok(redirect),
+        Err(err) => Err(err),
+    };
+    with_vary(response)
+}
+
+/// `GET /objects/{uuid}/replies` — the replies collection of one local
+/// status: the `Collection` root with the count of publicly visible
+/// answers, or with `?page=true` a `CollectionPage` of their object ids,
+/// oldest first, up to 20 per page. An unknown, tombstoned, non-local or
+/// not-publicly-visible object answers the same 404 as an unknown actor.
+async fn get_replies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let response = object_replies_answer(&state, &raw_id, &headers, &uri).await;
+    with_vary(response)
+}
+
+/// The replies route's answer: the same three-way negotiation as the
+/// actor route (a browser leaves for the frontend post page, which shows
+/// the thread), then the gate, the object, and its document.
+async fn object_replies_answer(
+    state: &AppState,
+    raw_id: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Response> {
+    if !wants_activity_json(headers) {
+        if wants_html(headers) {
+            return frontend_redirect(&state.config.base_url, &format!("notice/{raw_id}"));
+        }
+        return Err(AppError::RouteNotFound);
+    }
+    fetch_allowed(state, &Method::GET, uri, headers).await?;
+    let object = publicly_replyable(state, raw_id).await?;
+    let built = collections::replies_document(&state.db, &state.config, &object, uri.query()).await;
+    document(built)
+}
+
+/// The object behind `GET /objects/{uuid}/replies`: the id must parse,
+/// the row must be a live status this instance authored, and it must be
+/// visible to the anonymous reader (Pleroma's `visible_for_user?` gate of
+/// `object_replies`, which a `private`, `direct` or `local` post fails) —
+/// every miss the one 404.
+async fn publicly_replyable(state: &AppState, raw_id: &str) -> AppResult<Status> {
+    let missing = || AppError::RouteNotFound;
+    let id = parse_id(raw_id).ok_or_else(missing)?;
+    let object = status::get_by_id(&state.db, id)
+        .await?
+        .filter(|row| row.local)
+        .ok_or_else(missing)?;
+    if status_visibility::can_view(&state.db, &object, None).await? {
+        Ok(object)
+    } else {
+        Err(missing())
+    }
 }
 
 /// `GET /internal/fetch` — the instance actor document, served by the
@@ -374,7 +553,15 @@ fn accept_text(headers: &HeaderMap) -> Option<&str> {
 /// decide whether that page exists. A nickname whose text cannot ride a
 /// `Location` header names no page either, and answers the 404.
 fn html_redirect(config: &Config, nickname: &str) -> AppResult<Response> {
-    let location = format!("{}/{}", config.base_url, nickname);
+    frontend_redirect(config.base_url.as_str(), nickname)
+}
+
+/// The 302 to the frontend at `{base_url}/{path}`, shared by the actor
+/// route's profile redirect and the replies route's redirect to the post
+/// page. Text that cannot ride a `Location` header names no page, and
+/// answers the plain 404.
+fn frontend_redirect(base_url: &str, path: &str) -> AppResult<Response> {
+    let location = format!("{base_url}/{path}");
     let value = HeaderValue::from_str(&location)
         .ok()
         .ok_or(AppError::RouteNotFound)?;
@@ -383,12 +570,23 @@ fn html_redirect(config: &Config, nickname: &str) -> AppResult<Response> {
 
 /// The actor document for `user` as an `ActivityPub` response.
 fn actor_response(user: &User, config: &Config) -> Response {
+    document_response(&actor_json(user, config))
+}
+
+/// A built document's answer, the collection routes' shared ending.
+fn document(built: AppResult<Value>) -> AppResult<Response> {
+    built.map(|document| document_response(&document))
+}
+
+/// Any `ActivityPub` document as a response: the JSON body under the
+/// `activity+json` content type.
+fn document_response(document: &Value) -> Response {
     (
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static(ACTIVITY_JSON),
         )],
-        Json(actor_json(user, config)),
+        Json(document),
     )
         .into_response()
 }

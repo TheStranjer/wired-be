@@ -67,6 +67,10 @@ mod bookmarks;
 /// The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 twin).
 mod chats;
 
+/// The `ActivityPub` collections over HTTP: outbox, followers, following,
+/// featured and an object's replies (`src/federation/collections.rs`).
+mod collections;
+
 /// The conversation API over HTTP (`/api/v1/conversations` and Pleroma's
 /// `/api/v1/pleroma/conversations` routes).
 mod conversations;
