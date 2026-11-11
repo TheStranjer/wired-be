@@ -77,6 +77,12 @@ mod custom_emojis;
 /// Domain blocks (`/api/v1/domain_blocks`).
 mod domain_blocks;
 
+/// The end-to-end interaction scenarios (WBE-223): favourite, reblog,
+/// bookmark + folder, pin, thread mute, reaction, poll vote, edit, expiry
+/// through the job queue, and delete, each asserted across the direct
+/// read and the home and public timeline representations.
+mod e2e_interactions;
+
 /// The end-to-end job harness (`common::run_all_jobs`) and the scheduling,
 /// idempotency and preview scenarios it proves.
 mod e2e_scheduled;
