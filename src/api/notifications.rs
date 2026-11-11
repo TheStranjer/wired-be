@@ -24,7 +24,12 @@
 //!   rows of deactivated actors never appear; with `with_muted` left
 //!   false the caller's muted actors, muted threads, blocked actors and
 //!   blocked domains are hidden too — and Pleroma's `with_muted` never
-//!   uncovers blocks. The `pleroma.is_seen` flag rides on the row's
+//!   uncovers blocks. The caller's active filters then apply in the
+//!   `notifications` context: a notification whose rendered status a
+//!   warning filter matched carries the status's `filtered` annotation,
+//!   and one an `irreversible` filter matched leaves the listing with it
+//!   (see [`crate::services::filter`]). The
+//!   `pleroma.is_seen` flag rides on the row's
 //!   `seen` flag.
 //! - `GET /api/v1/notifications/{id}` — the one notification, owner
 //!   only; a dismissed, foreign, unknown or malformed id is the shared
@@ -87,6 +92,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
     models::{
+        filter::{Filter, list_active},
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
@@ -96,7 +102,10 @@ use crate::{
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{PageParams, link_header, set_link_header},
-    services::render_status::render_statuses,
+    services::{
+        filter::{FilterContext, apply_filters},
+        render_status::render_statuses,
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -140,7 +149,10 @@ fn empty_body() -> Json<Value> {
 /// deactivated-actor rows out) [`notification::page_for_user`] carries;
 /// `with_muted` decides what else hides there. The page's actors and
 /// statuses are batched once into the render (see
-/// [`render_notifications`]).
+/// [`render_notifications`]), which then applies the caller's active
+/// filters in the `notifications` context: a rendered status a warning
+/// filter matched carries its `filtered` array, and a notification whose
+/// status an `irreversible` filter matched leaves the listing with it.
 ///
 /// # Errors
 ///
@@ -181,7 +193,8 @@ async fn list(
         user = %auth.0.id,
         "notifications listed"
     );
-    let entities = render_notifications(&state, &auth.0, &rows).await?;
+    let active = list_active(&state.db, auth.0.id).await?;
+    let entities = render_notifications(&state, &auth.0, &rows, &active).await?;
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
@@ -219,7 +232,10 @@ async fn show(
         user = %auth.0.id,
         "notification read"
     );
-    let entities = render_notifications(&state, &auth.0, std::slice::from_ref(&row)).await?;
+    // The v1 listing is the filtered read (the ticket's context map names
+    // the *list*); a single notification read by id keeps its full render,
+    // and `filters: &[]` is that pass's no-op spelling.
+    let entities = render_notifications(&state, &auth.0, std::slice::from_ref(&row), &[]).await?;
     entities
         .into_iter()
         .next()
@@ -571,7 +587,7 @@ async fn read_one(state: &AppState, viewer: &User, id_text: &str) -> AppResult<R
         user = %viewer.id,
         "notification read"
     );
-    let entities = render_notifications(state, viewer, std::slice::from_ref(&row)).await?;
+    let entities = render_notifications(state, viewer, std::slice::from_ref(&row), &[]).await?;
     let entity = entities.into_iter().next().ok_or(AppError::NotFound)?;
     Ok(ReadAnswer::One(Box::new(entity)))
 }
@@ -596,7 +612,7 @@ async fn read_up_to(state: &AppState, viewer: &User, max_text: &str) -> AppResul
         user = %viewer.id,
         "notifications marked read"
     );
-    let entities = render_notifications(state, viewer, &marked).await?;
+    let entities = render_notifications(state, viewer, &marked, &[]).await?;
     Ok(ReadAnswer::Many(entities))
 }
 
@@ -606,8 +622,12 @@ async fn read_up_to(state: &AppState, viewer: &User, max_text: &str) -> AppResul
 /// through the shared batched path (a status that is gone or hidden from
 /// this reader simply leaves the entity's `status` key out), and the
 /// viewer's mutes read from the same relationship load that feeds the
-/// account embeds. A row whose actor left no row (deleted mid-request)
-/// drops out of the answer.
+/// account embeds. `filters` are the viewer's active phrase filters,
+/// applied to every rendered status in the `notifications` context: a
+/// warning match rides its entity's `filtered` array, and a status an
+/// `irreversible` filter matches is hidden — and the notification naming
+/// it leaves the listing with it. A row whose actor left no row (deleted
+/// mid-request) drops out of the answer.
 ///
 /// # Errors
 ///
@@ -617,6 +637,7 @@ async fn render_notifications(
     state: &AppState,
     viewer: &User,
     rows: &[NotificationRow],
+    filters: &[Filter],
 ) -> AppResult<Vec<NotificationEntity>> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -634,13 +655,21 @@ async fn render_notifications(
         .zip(actor_ids)
         .map(|(relationship, target)| (target, relationship))
         .collect::<RelationshipMap>();
-    let statuses = visible_statuses(state, Some(viewer), &status_ids).await?;
+    let statuses = visible_statuses(state, Some(viewer), &status_ids, filters).await?;
     let mut entities = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(actor) = users.get(&row.from_account_id) else {
             continue;
         };
-        let status = row.status_id.and_then(|id| statuses.get(&id).cloned());
+        if row
+            .status_id
+            .is_some_and(|id| statuses.hidden_by_filter.contains(&id))
+        {
+            continue;
+        }
+        let status = row
+            .status_id
+            .and_then(|id| statuses.rendered.get(&id).cloned());
         entities.push(NotificationEntity::from_row(
             row,
             Account::from_user_for(Some(viewer), actor, &state.config, Some(&relationships)),
@@ -653,12 +682,27 @@ async fn render_notifications(
     Ok(entities)
 }
 
-/// The distinct status ids of `ids`, rendered as seen by `viewer`,
-/// serialized, and keyed by their row ids: rows that name no row, that a
-/// delete took, or that [`status_visibility`] hides from this reader are
-/// not in the map (the rendered [`Status`] entity does not duplicate
-/// cheaply, and several notifications can name one status, so the map
-/// holds its JSON shape).
+/// The notification render's status half: every visible row rendered,
+/// filtered for the `notifications` context and serialized, keyed by its
+/// row id (the rendered [`Status`] entity does not duplicate cheaply, and
+/// several notifications can name one status, so the map holds its JSON
+/// shape), beside the ids the irreversible filters hid — the rows whose
+/// notifications leave the listing rather than render without a status.
+///
+/// [`Status`]: crate::entities::status::Status
+#[derive(Debug)]
+struct RenderedStatuses {
+    /// The surviving rendered entities, serialized, keyed by row id.
+    rendered: HashMap<Uuid, Value>,
+    /// The ids the irreversible filter matches removed from `rendered`.
+    hidden_by_filter: Vec<Uuid>,
+}
+
+/// The distinct status ids of `ids`, rendered as seen by `viewer`, run
+/// through [`apply_filters`] in the `notifications` context, serialized,
+/// and keyed by their row ids: rows that name no row, that a delete took,
+/// or that [`status_visibility`] hides from this reader are not in the map
+/// (see [`RenderedStatuses`] for what the map and the hidden list carry).
 ///
 /// # Errors
 ///
@@ -666,15 +710,17 @@ async fn render_notifications(
 /// visibility reads;
 /// [`Internal`](crate::error::AppError::Internal) if a rendered entity
 /// would not serialize.
-///
-/// [`Status`]: crate::entities::status::Status
 async fn visible_statuses(
     state: &AppState,
     viewer: AccountViewer<'_>,
     ids: &[Uuid],
-) -> AppResult<HashMap<Uuid, Value>> {
+    filters: &[Filter],
+) -> AppResult<RenderedStatuses> {
     if ids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(RenderedStatuses {
+            rendered: HashMap::new(),
+            hidden_by_filter: Vec::new(),
+        });
     }
     let rows = status::get_many(&state.db, ids).await?;
     let mut visible: Vec<StatusRow> = Vec::new();
@@ -683,18 +729,35 @@ async fn visible_statuses(
             visible.push(row);
         }
     }
-    let rendered = render_statuses(state, viewer, &visible).await?;
-    let mut statuses = HashMap::new();
-    for entity in rendered {
+    let page = render_statuses(state, viewer, &visible).await?;
+    let mut all_ids: Vec<Uuid> = page
+        .iter()
+        .filter_map(|entity| parse_id(&entity.id))
+        .collect();
+    let mut rendered = HashMap::new();
+    let kept = apply_filters(
+        page,
+        filters,
+        FilterContext::Notifications,
+        viewer.map(|user| user.id),
+    );
+    for entity in kept {
         let Some(id) = parse_id(&entity.id) else {
             continue;
         };
         let value = serde_json::to_value(entity).map_err(|err| {
             AppError::Internal(format!("status entity failed to serialize: {err}"))
         })?;
-        let _first = statuses.insert(id, value);
+        let _first = rendered.insert(id, value);
     }
-    Ok(statuses)
+    // What the render produced but the filtered page did not keep is what
+    // an `irreversible` match removed — invisible rows never entered the
+    // render at all, so the two hides stay distinguishable.
+    all_ids.retain(|id| !rendered.contains_key(id));
+    Ok(RenderedStatuses {
+        rendered,
+        hidden_by_filter: all_ids,
+    })
 }
 
 /// The values in order, each named once.

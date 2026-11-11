@@ -56,6 +56,7 @@ use crate::{
         user::{Flag, User},
     },
     pagination::PageParams,
+    services::filter::FilterContext,
 };
 
 /// The head of every [`TimelineQuery::fetch`] statement: the live rows
@@ -94,6 +95,11 @@ const ACCEPTED_FOLLOW_STATE: &str = " AND f.state = 'accepted'";
 /// `Hashtag` is `public` only; `Direct` is `direct` rows the viewer is a
 /// party to, the audience [`push_visibility_clause`] already restricts to
 /// the author and the mentioned accounts.
+///
+/// [`filter_context`] is the same source read as a filter listing: where
+/// the page's rendered statuses live for the viewer's phrase filters.
+///
+/// [`filter_context`]: Self::filter_context
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimelineSource {
     /// The viewer's following timeline: statuses the viewer authored, plus
@@ -166,6 +172,25 @@ pub enum TimelineSource {
         /// `replies_policy` narrows its replies.
         list_id: Uuid,
     },
+}
+
+impl TimelineSource {
+    /// The filter context this timeline's page is rendered in, or `None`
+    /// where the v1 filter contexts do not reach: [`Self::Home`] is the
+    /// `home` context, [`Self::Public`] and [`Self::Hashtag`] the `public`
+    /// one and [`Self::Account`] the `account` one — the mapping the
+    /// filter ticket gives its endpoints. [`Self::Direct`] and
+    /// [`Self::List`] name no v1 context, and the two Pleroma extensions
+    /// built on them are unfiltered pages.
+    #[must_use]
+    pub const fn filter_context(&self) -> Option<FilterContext> {
+        match self {
+            Self::Home => Some(FilterContext::Home),
+            Self::Public | Self::Hashtag { .. } => Some(FilterContext::Public),
+            Self::Account { .. } => Some(FilterContext::Account),
+            Self::Direct | Self::List { .. } => None,
+        }
+    }
 }
 
 /// Pleroma's `reply_visibility` timeline parameter
@@ -2299,6 +2324,46 @@ mod tests {
         assert!(
             nothing_newer.is_empty(),
             "nothing is newer than the newest row"
+        );
+    }
+
+    /// The filter-context map the filter ticket gives the timeline routes:
+    /// `Home` is `home`, `Public` and `Hashtag` are `public`, `Account` is
+    /// `account`, and the two sources no v1 context names — `Direct` and
+    /// `List` — answer `None` (unfiltered pages).
+    #[test]
+    fn sources_map_to_the_filter_contexts_the_endpoints_render_in() {
+        assert_eq!(
+            TimelineSource::Home.filter_context(),
+            Some(FilterContext::Home)
+        );
+        assert_eq!(
+            TimelineSource::Public.filter_context(),
+            Some(FilterContext::Public)
+        );
+        assert_eq!(
+            TimelineSource::Hashtag {
+                any: Vec::new(),
+                all: Vec::new(),
+                none: Vec::new(),
+            }
+            .filter_context(),
+            Some(FilterContext::Public)
+        );
+        assert_eq!(
+            TimelineSource::Account {
+                user_id: Uuid::now_v7()
+            }
+            .filter_context(),
+            Some(FilterContext::Account)
+        );
+        assert_eq!(TimelineSource::Direct.filter_context(), None);
+        assert_eq!(
+            TimelineSource::List {
+                list_id: Uuid::now_v7()
+            }
+            .filter_context(),
+            None
         );
     }
 }

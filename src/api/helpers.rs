@@ -26,7 +26,7 @@ use crate::{
         user::{self, User},
     },
     pagination::{link_header, set_link_header},
-    services::{render_status::render_statuses, timeline::TimelineQuery},
+    services::{filter, render_status::render_statuses, timeline::TimelineQuery},
     state::AppState,
     util::id::parse_id,
 };
@@ -167,20 +167,31 @@ pub async fn status_for_viewer_or_404(
 /// [`PageParams`]: crate::pagination::PageParams
 const CURSOR_KEYS: [&str; 4] = ["max_id", "min_id", "since_id", "offset"];
 
-/// The shared answer of every status-timeline page: one fetched, rendered
-/// and linked [`TimelineQuery`].
+/// The shared answer of every status-timeline page: one fetched, rendered,
+/// filtered and linked [`TimelineQuery`].
 ///
 /// [`fetch`](TimelineQuery::fetch) `query`, [`render_statuses`] the rows for
-/// its viewer, and answer the newest-first [`StatusEntity`] array with the
-/// `Link` header this module's own page cursor derives from the request's
-/// `uri` and the fetched rows' ids (Pleroma's `add_link_headers`). An empty
-/// page carries no `Link` header at all.
+/// its viewer, post-process the page through
+/// [`apply_active`](crate::services::filter::apply_active) in the source's
+/// filter context ([`TimelineSource::filter_context`] — `None` for the
+/// direct and list timelines, whose answer skips the pass entirely), and
+/// answer the newest-first [`StatusEntity`] array with the `Link` header
+/// this module's own page cursor derives from the request's `uri` and the
+/// fetched rows' ids (Pleroma's `add_link_headers`). An empty page carries
+/// no `Link` header at all.
 ///
 /// Every route that reads a [`TimelineQuery`] — the `/api/v1/timelines/*`
 /// endpoints and an account's status listing — builds its query and hands it
-/// here, so the rendering, cursors and headers are stated once. A route with
-/// its own order or its own header rule (the pinned profile page) fetches
-/// and renders through the same two services and simply writes no `Link`.
+/// here, so the rendering, filtering, cursors and headers are stated once.
+/// A route with its own order or its own header rule (the pinned profile
+/// page) fetches and renders through the same two services and simply writes
+/// no `Link`.
+///
+/// The filter pass runs after the render, and the `Link` keeps its meaning
+/// either way: its cursors key on the fetched rows' ids, not the page's
+/// survivors, so filtering one status off the page moves no cursor. An
+/// anonymous viewer has no filters to read and comes back unfiltered — the
+/// ticket's no-op.
 ///
 /// # Errors
 ///
@@ -189,6 +200,7 @@ const CURSOR_KEYS: [&str; 4] = ["max_id", "min_id", "since_id", "offset"];
 /// [`AppError::Internal`].
 ///
 /// [`render_statuses`]: crate::services::render_status::render_statuses
+/// [`TimelineSource::filter_context`]: crate::services::timeline::TimelineSource::filter_context
 pub async fn timeline_response(
     state: &AppState,
     query: &TimelineQuery,
@@ -196,7 +208,13 @@ pub async fn timeline_response(
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     let rows = query.fetch(&state.db).await?;
     let link = page_link(state, uri, &rows);
-    let statuses = render_statuses(state, query.viewer.as_ref(), &rows).await?;
+    let rendered = render_statuses(state, query.viewer.as_ref(), &rows).await?;
+    let statuses = match query.source.filter_context() {
+        Some(context) => {
+            filter::apply_active(state, query.viewer.as_ref(), rendered, context).await?
+        }
+        None => rendered,
+    };
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     Ok((headers, Json(statuses)))

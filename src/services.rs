@@ -66,10 +66,19 @@
 //! the pure delivery decisions (alert flags, title verbs, payload document)
 //! the [`push.deliver`](crate::jobs::web_push) job runs and the [`notify`]
 //! hook queues jobs through.
+//!
+//! [`filter`] is the read side's last pass: the pure post-processing step
+//! that applies a viewer's active v1 phrase filters to an already-rendered
+//! status page — warning matches annotated, irreversible matches removed,
+//! the viewer's own statuses exempt — which [`timeline_response`] and the
+//! notification and thread reads run between the render and the response.
+//!
+//! [`timeline_response`]: crate::api::helpers::timeline_response
 
 pub mod create_status;
 pub mod delete_status;
 pub mod emoji_packs;
+pub mod filter;
 pub mod instance_actor;
 pub mod instance_meta;
 pub mod media_processing;
