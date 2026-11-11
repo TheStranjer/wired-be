@@ -167,6 +167,7 @@ mod tests {
             hide_totals: false,
             voters_count: voters,
             votes_count: votes_cast,
+            ended_notified: crate::models::user::Flag::default(),
         }
     }
 

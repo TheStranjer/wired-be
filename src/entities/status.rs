@@ -1364,6 +1364,7 @@ mod tests {
                 hide_totals: false,
                 voters_count: 1,
                 votes_count: 1,
+                ended_notified: Flag::default(),
             },
             &[option(0, "tea", 0), option(1, "coffee", 1)],
             &[1],

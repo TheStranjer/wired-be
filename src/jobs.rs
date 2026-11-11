@@ -24,6 +24,7 @@ pub mod idempotency;
 pub mod imports;
 pub mod maintenance;
 pub mod mutes;
+pub mod polls;
 pub mod rich_media;
 pub mod scheduled_statuses;
 pub mod scheduler;

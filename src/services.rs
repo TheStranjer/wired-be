@@ -26,10 +26,12 @@
 //! and the expiration jobs, so an expiring post leaves exactly what a
 //! hand-deleted one leaves.
 //!
-//! [`notify`] is the write side of the notification inbox: the five tellings
-//! the action hooks land — follow, follow request, mention, reblog,
-//! favourite — decided by one set of rules (local recipients, no
-//! self-notifications, every insert through the skip rules of
+//! [`notify`] is the write side of the notification inbox: the ten tellings
+//! the action hooks and the poll-end sweep land — follow, follow request,
+//! mention, reblog, favourite, poll vote, poll closing, status edit,
+//! subscription and emoji reaction — decided by one set of rules (local
+//! recipients, no self-notifications but the author's own closing poll,
+//! every insert through the skip rules of
 //! [`notification::maybe_notify`](crate::models::notification::maybe_notify))
 //! and their withdrawals, so the hooks themselves stay one call long.
 //!

@@ -231,6 +231,19 @@ const REMOTE_FOLLOWERS_SQL: &str = "SELECT u.* FROM follows f
         AND u.local = false AND u.is_active = true
    ORDER BY f.id";
 
+/// [`subscribers`]: the *local*, active followers whose accepted follow of
+/// the bound account has its `notify` toggle on — Pleroma's
+/// `User.subscriber_users` (`lib/pleroma/user.ex`), the list its
+/// `get_notified_subscribers` walks to tell subscribers of every new post.
+/// Remote subscribers are deliberately absent: they are told by federation,
+/// not by a row (the rule [`crate::services::notify`] states). Oldest
+/// relationship first.
+const SUBSCRIBERS_SQL: &str = "SELECT u.* FROM follows f
+     JOIN users u ON u.id = f.follower_id
+      WHERE f.followee_id = $1 AND f.state = 'accepted'
+        AND f.notify = true AND u.local = true AND u.is_active = true
+   ORDER BY f.id";
+
 /// [`familiar_followers`]: the accounts that follow `target` (`own`, the
 /// target's own follower edges) and are themselves followed by the viewer
 /// (`theirs`, the viewer's outgoing edges), accepted on both ends. Active
@@ -869,6 +882,30 @@ pub async fn move_followers_of(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<Us
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn remote_followers(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
     let rows = sqlx::query_as::<_, User>(REMOTE_FOLLOWERS_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// The local, active users holding a *subscribed* accepted follow of
+/// `user_id`.
+///
+/// These are the accounts [`crate::services::notify`] tells `status`
+/// notifications of every post this account makes — Pleroma's
+/// `User.subscriber_users`, which its `get_notified_subscribers` reads the
+/// same way: `notify` true on a granted follow.
+///
+/// A pending request with its toggle on is not a subscriber yet, a plain
+/// accepted follow is nobody's subscriber, and a deactivated or remote
+/// account cannot be told from here.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn subscribers(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
+    let rows = sqlx::query_as::<_, User>(SUBSCRIBERS_SQL)
         .bind(user_id)
         .fetch_all(pool)
         .await?;
@@ -3266,6 +3303,97 @@ mod tests {
                 .expect("a zero cap reads")
                 .is_empty(),
             "and a cap of nothing answers nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_the_local_active_notify_flagged_followers() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let author = local_user(&pool, "author").await;
+        let subscriber = local_user(&pool, "subscriber").await;
+        let plain = local_user(&pool, "plain").await;
+
+        // The subscribed local follower: the only one the read answers.
+        let _open = follow(&pool, TEST_BASE_URL, &subscriber, &author)
+            .await
+            .expect("the subscriber's follow is granted");
+        let _toggled = set_notify(&pool, subscriber.id, author.id, true)
+            .await
+            .expect("the toggle runs")
+            .expect("the accepted pair takes the flag");
+        // A plain accepted follow of the same author stays out.
+        let _quiet = follow(&pool, TEST_BASE_URL, &plain, &author)
+            .await
+            .expect("the plain follow is granted");
+        // A remote subscriber is told by federation, never by a row.
+        let alien = remote_user(&pool, "alien").await;
+        let _mirrored = follow(&pool, TEST_BASE_URL, &alien, &author)
+            .await
+            .expect("the remote follow is granted");
+        let _alien_toggled = set_notify(&pool, alien.id, author.id, true)
+            .await
+            .expect("the remote toggle runs")
+            .expect("the remote pair takes the flag");
+        // A pending request whose toggle is on has not subscribed yet: the
+        // lock refuses `set_notify`, so the toggles write stands in.
+        let waiting = local_user(&pool, "waiting").await;
+        let gated = locked_user(&pool, "gated").await;
+        let _request = follow(&pool, TEST_BASE_URL, &waiting, &gated)
+            .await
+            .expect("the request waits");
+        let _open_toggles = set_toggles(
+            &pool,
+            waiting.id,
+            gated.id,
+            FollowToggles {
+                show_reblogs: None,
+                notify: Some(true),
+            },
+        )
+        .await
+        .expect("the toggles run")
+        .expect("the open pair takes them");
+        assert!(
+            relation(&pool, &waiting, &gated).await.notify,
+            "the pending row carries the flag the read must still refuse"
+        );
+        // A deactivated local subscriber cannot be told either.
+        let ghost = insert(
+            &pool,
+            &NewUser {
+                is_active: Flag::new(false),
+                ..local_new("ghost")
+            },
+        )
+        .await
+        .expect("the deactivated fixture inserts");
+        let _ghosted = follow(&pool, TEST_BASE_URL, &ghost, &author)
+            .await
+            .expect("the deactivated follow is granted");
+        let _ghost_toggled = set_notify(&pool, ghost.id, author.id, true)
+            .await
+            .expect("the ghost's toggle runs")
+            .expect("its accepted pair takes the flag");
+
+        assert_eq!(
+            ids(&subscribers(&pool, author.id).await.expect("the read runs")),
+            vec![subscriber.id],
+            "only the local, active, granted, notified follower"
+        );
+        assert!(
+            subscribers(&pool, gated.id)
+                .await
+                .expect("the locked account reads")
+                .is_empty(),
+            "a pending request has subscribed nobody yet"
+        );
+        assert!(
+            subscribers(&pool, new_id())
+                .await
+                .expect("an unknown id reads")
+                .is_empty(),
+            "and an account nobody follows has no subscribers"
         );
     }
 }

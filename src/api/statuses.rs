@@ -426,9 +426,11 @@
 //! or media actually changed, so an edit of nothing writes no revision and
 //! marks nothing — stamps `edited_at`, and replaces the post's mentions,
 //! hashtags and attachments. The answer is the [`Status`] entity as the
-//! author sees the edited post, `edited_at` set. The `Update` activity and
-//! the `status.update` stream push await this route's
-//! `after_status_edited` hook, the documented landing point.
+//! author sees the edited post, `edited_at` set. The route's
+//! `after_status_edited` hook already lands
+//! [`crate::services::notify`]'s `update` telling of the post's local
+//! boosters; the `Update` activity and the `status.update` stream push
+//! await the same point.
 //!
 //! `GET /api/v1/statuses/{id}/history` is Pleroma's `show_history`:
 //! optional auth (`read:statuses` on a presented user token), the same
@@ -1035,7 +1037,7 @@ async fn edit_status(
     let entity = create_status::edit_status(&state, &auth.0, &row, params)
         .await?
         .ok_or(AppError::NotFound)?;
-    after_status_edited(&state, &entity);
+    after_status_edited(&state, &row).await;
     Ok(Json(entity))
 }
 
@@ -2457,27 +2459,33 @@ async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, reblogging: 
 /// `POST …/unpin` withdrew. A withdrawal that found no pin to remove never
 /// reaches it either.
 ///
-/// Intentionally empty until then, like the reactions'
-/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
+/// Intentionally empty until then, like the blocks'
+/// [`after_block_changed`](crate::api::blocks::after_block_changed) (the
+/// reactions' `after_reaction_changed` has since landed its telling).
 const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: bool) {}
 
-/// Post-write hook of the edit route: the federation ticket that sends the
-/// `Update` activity — Pleroma's `Builder.update` run through its
-/// `CommonAPI.update` pipeline, re-delivering the object to everybody the
-/// original `Create` reached — and the streaming ticket that pushes the
-/// edited status to `status.update` wire themselves in here, and the
-/// queueing will happen through `state` (decision 11).
+/// Post-write hook of the edit route: the `update` telling of every local
+/// account still boosting the edited post — Pleroma's `Update` arm of
+/// `get_potential_receiver_ap_ids`, the object's local `Announce` actors
+/// minus the author (`lib/pleroma/notification.ex`) — is landed here from
+/// [`notify::on_status_edited`].
 ///
-/// `status` is the [`Status`] entity as the author saw the post right after
-/// the write — the new version, with the revision the write recorded behind
-/// it and the `edited_at` stamp beside it — which is what both consumers
-/// ship: the activity carries the re-rendered object, the stream push lets
-/// clients redraw the post they already show.
+/// The two consumers still waiting wire themselves in here too: the
+/// federation ticket that sends the `Update` activity — Pleroma's
+/// `Builder.update` run through its `CommonAPI.update` pipeline,
+/// re-delivering the object to everybody the original `Create` reached —
+/// and the streaming ticket that pushes the edited status to
+/// `status.update`; both ship the re-rendered entity, so they will grow
+/// this one call's signature when they land.
 ///
-/// Intentionally empty until then, like the pins' [`after_pin_changed`]
-/// above and the reactions'
-/// [`after_reaction_changed`](crate::api::emoji_reactions::after_reaction_changed).
-const fn after_status_edited(_state: &AppState, _status: &Status) {}
+/// `row` is the pre-edit stored row: the id every consumer names — the
+/// write keeps it — and the author whose boosters the telling reads off
+/// the live reblog rows.
+///
+/// [`notify::on_status_edited`]: crate::services::notify::on_status_edited
+async fn after_status_edited(state: &AppState, row: &StatusRow) {
+    notify::on_status_edited(state, row).await;
+}
 
 #[cfg(test)]
 mod tests {

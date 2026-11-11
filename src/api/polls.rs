@@ -66,10 +66,12 @@
 //! all deserializing to the same list. A value that is no integer at all
 //! is the extractor's own 422, before any poll is looked up.
 //!
-//! The telling of the poll's author and the federation of the answer
-//! activities the ballot becomes are later tickets: they land in this
-//! module's `after_vote_cast` hook, the documented empty point the way
-//! [`crate::api::reports`] leaves `after_report_created`.
+//! The telling of the poll's author is landed: the vote runs
+//! [`on_poll_vote`](crate::services::notify::on_poll_vote) through this
+//! module's `after_vote_cast` hook, one `poll` notification per voter and
+//! poll. The federation of the answer activities the ballot becomes is a
+//! later ticket, landing at the same hook the way [`crate::api::reports`]
+//! leaves `after_report_created`.
 
 use axum::{
     Json, Router,
@@ -94,6 +96,7 @@ use crate::{
         user::User,
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
+    services::notify,
     state::AppState,
     util::id::parse_id,
 };
@@ -203,7 +206,7 @@ async fn cast_poll_vote(
     let updated = poll::get_by_id(&state.db, poll.id)
         .await?
         .ok_or(AppError::NotFound)?;
-    after_vote_cast(&state, &updated, voter, &chosen);
+    after_vote_cast(&state, &updated, voter, &chosen).await;
     render_poll(&state, &updated, Some(voter)).await.map(Json)
 }
 
@@ -401,22 +404,24 @@ fn choice_index(value: &Value) -> Option<i32> {
     }
 }
 
-/// Post-write hook of `POST /api/v1/polls/{id}/votes`: the tickets that
-/// tell the poll's author of a new ballot — Pleroma's `CommonAPI.vote`
-/// runs each `Answer` through `Pipeline.common_pipeline`, which lands
-/// the notification this server's [`crate::services::notify`] grows —
-/// and federate the answers the voter's ballot becomes (decision 6's
-/// `ap_id`-bearing activities, queued through the job table, decision
-/// 11) wire themselves in here, reading the moved poll from `state`.
+/// Post-write hook of `POST /api/v1/polls/{id}/votes`: the telling of the
+/// poll's author of the ballot just cast — Pleroma's `CommonAPI.vote` runs
+/// each `Answer` through `Pipeline.common_pipeline`, which lands the
+/// notification — is landed here from [`notify::on_poll_vote`], deduplicated
+/// per voter and poll. The federation of the answer activities the ballot
+/// becomes (decision 6's `ap_id`-bearing activities, queued through the job
+/// table, decision 11) wires itself in here when that ticket lands, reading
+/// the moved poll from `state` and naming `option_ids` as the answers'
+/// `inReplyTo` choices.
 ///
 /// `poll` is the row as the transaction left it, `voter` the account
 /// that cast the ballot, and `option_ids` the options it marked — the
-/// same ids [`poll::cast_vote`] wrote, which the federation ticket will
-/// name as the answers' `inReplyTo` choices.
+/// same ids [`poll::cast_vote`] wrote.
 ///
-/// Intentionally empty until then, like the reports'
-/// [`after_report_created`](crate::api::reports) hook.
-const fn after_vote_cast(_state: &AppState, _poll: &PollRow, _voter: &User, _option_ids: &[Uuid]) {}
+/// [`notify::on_poll_vote`]: crate::services::notify::on_poll_vote
+async fn after_vote_cast(state: &AppState, poll: &PollRow, voter: &User, _option_ids: &[Uuid]) {
+    notify::on_poll_vote(state, poll, voter).await;
+}
 
 #[cfg(test)]
 mod tests {
@@ -437,6 +442,7 @@ mod tests {
             hide_totals: false,
             voters_count: 0,
             votes_count: 0,
+            ended_notified: crate::models::user::Flag::default(),
         }
     }
 
