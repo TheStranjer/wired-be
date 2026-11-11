@@ -86,10 +86,13 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// deletion job ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE)),
 /// the Web Push delivery job
 /// ([`web_push::KIND_DELIVER`](jobs::web_push::KIND_DELIVER)) and the
-/// incoming-activity stub
-/// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)), so
-/// the worker idles, sweeps, delivers, sends, pushes and drains received
-/// activities. The state's mail transport comes from
+/// federation intake pair — the incoming-activity dispatcher
+/// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)) and
+/// its daily received-activity ledger prune
+/// ([`KIND_CLEANUP_RECEIVED`](federation::dispatch::KIND_CLEANUP_RECEIVED))
+/// — so
+/// the worker idles, sweeps, delivers, sends, pushes and processes
+/// received activities. The state's mail transport comes from
 /// [`mailer::transport_from_config`]: the SMTP relay when `SMTP_HOST` is
 /// set, the disabled stand-in while it is not. An unset or blank
 /// `SECRET_KEY_BASE` is filled with a fresh random signing secret for this
@@ -246,6 +249,10 @@ fn job_registry() -> JobRegistry {
     registry.register(
         federation::dispatch::KIND_INCOMING,
         federation::dispatch::handle,
+    );
+    registry.register(
+        federation::dispatch::KIND_CLEANUP_RECEIVED,
+        federation::dispatch::handle_cleanup_received,
     );
     registry
 }
@@ -1969,6 +1976,70 @@ mod tests {
                 default.as_deref(),
                 Some("true"),
                 "accounts start opted in to email: {default:?}"
+            );
+        }
+
+        /// The received-activities migration (WBE-163) creates the dedupe
+        /// ledger the `federator.incoming` dispatcher claims through: the
+        /// activity's `ActivityPub` id as the text primary key the
+        /// `INSERT … ON CONFLICT DO NOTHING` claims against, and the
+        /// `now()`-stamped `inserted_at` the daily prune ages rows out by
+        /// — indexed, so the prune reads rather than scans.
+        #[tokio::test]
+        async fn received_activities_migration_keys_the_dedupe_ledger() {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            let columns: Vec<Described> = sqlx::query_as(
+                "SELECT column_name, data_type, is_nullable, column_default
+                   FROM information_schema.columns
+                  WHERE table_schema = 'public' AND table_name = 'received_activities'
+               ORDER BY ordinal_position",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                columns,
+                vec![
+                    ("ap_id".to_owned(), "text".to_owned(), "NO".to_owned(), None),
+                    (
+                        "inserted_at".to_owned(),
+                        "timestamp with time zone".to_owned(),
+                        "NO".to_owned(),
+                        Some("now()".to_owned())
+                    ),
+                ],
+                "the ticket's two columns, in the ticket's order"
+            );
+
+            let (primary_key, key_columns): (String, String) = sqlx::query_as(
+                "SELECT con.conname, string_agg(att.attname, ',' ORDER BY att.attname)
+                   FROM pg_constraint con
+                   JOIN pg_class cls ON cls.oid = con.conrelid
+                   JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+                  WHERE con.contype = 'p' AND cls.relname = 'received_activities'
+               GROUP BY con.conname",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                key_columns, "ap_id",
+                "the id alone is the key {primary_key}"
+            );
+
+            let indexes: Vec<(String, String)> = sqlx::query_as(
+                "SELECT indexname, indexdef FROM pg_indexes
+                  WHERE schemaname = 'public' AND tablename = 'received_activities'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert!(
+                indexes
+                    .iter()
+                    .any(|(name, _)| name == "received_activities_inserted_at_idx"),
+                "the prune's age scan is indexed: {indexes:?}"
             );
         }
     }

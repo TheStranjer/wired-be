@@ -14,11 +14,15 @@
 //! `blocks`. And one more follows the rule with a twist:
 //! [`scheduled_status`] owns a single table but keeps its payload as opaque
 //! `jsonb` — the create-status params as received — for a later slice to
-//! replay. Nothing here knows about HTTP, though every fallible function
-//! returns [`AppError`](crate::error::AppError), the crate's single error
-//! type, so handlers can use `?`.
+//! replay. [`activity`] is a second table-less reader: one `UNION ALL`
+//! across the five tables that store a federating fact under an `ap_id`,
+//! answering an activity's type and actor by id alone. Nothing here knows
+//! about HTTP, though every fallible function returns
+//! [`AppError`](crate::error::AppError), the crate's single error type, so
+//! handlers can use `?`.
 
 pub mod account_note;
+pub mod activity;
 pub mod announcement;
 pub mod block;
 pub mod bookmark;

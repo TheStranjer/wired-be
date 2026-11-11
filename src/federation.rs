@@ -19,9 +19,12 @@
 //! the `SignedActivity` extractor that authenticates a peer's inbox `POST`
 //! against its actor's key before any handler sees the activity, and
 //! [`dispatch`] is what the inbox routes do with it once authenticated —
-//! the `federator.incoming` job handler, a documented stub until the
-//! dispatcher ticket fills it in. [`note_parser`] is the dispatcher's pure
-//! front end: the reader that turns a received `Note`-family object into
+//! the `federator.incoming` job handler: normalization, containment, the
+//! dedupe ledger, the policy stage, and the registry of per-type activity
+//! handlers. [`mrf`] is that handler's policy pipeline: the
+//! accept-everything filter chain the MRF tickets will fill in.
+//! [`note_parser`] is the dispatcher's pure
+//! front end for objects: the reader that turns a received `Note`-family object into
 //! the parts of a status. [`note`] is the way back out for statuses: the
 //! pure builder of the `Note`/`Question` objects a local post federates as
 //! and of the `Create`, `Announce` and `Tombstone` documents around it,
@@ -35,6 +38,7 @@ pub mod dispatch;
 pub mod fetch_actor;
 pub mod inbox_auth;
 pub mod json;
+pub mod mrf;
 pub mod note;
 pub mod note_parser;
 pub mod remote_actor;

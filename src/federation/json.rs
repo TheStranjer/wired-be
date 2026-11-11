@@ -6,12 +6,17 @@
 //! may be a bare `id` string or the whole collection object, and a `Link`
 //! carries its target under `href` rather than `id`. The parsers in this
 //! module's neighbours ([`super::remote_actor`] and the activity readers
-//! that follow it) funnel every such field through the same three
-//! normalizers instead of hand-rolling a `match` per key: [`as_array`] for
-//! "one or many", [`value_or_id`] for "string or referencing object",
-//! [`first_string`] for "whatever string comes first".
+//! that follow it, up to [`super::dispatch`]'s `ActivityView`) funnel every
+//! such field through the same normalizers instead of hand-rolling a
+//! `match` per key: [`as_array`] for "one or many", [`value_or_id`] for
+//! "string or referencing object", [`first_string`] for "whatever string
+//! comes first", [`first_type`] for the `type` field that may itself be an
+//! array, [`references`] for an addressing property holding many
+//! references, and [`http_host`] for the host of an id that containment
+//! checks compare.
 
 use serde_json::{Map, Value};
+use url::Url;
 
 /// Object keys that name a reference on a link or `Image` object, in the
 /// order [`value_or_id`] and [`first_string`] try them: `id` (the
@@ -69,6 +74,43 @@ pub fn first_string(value: &Value) -> Option<String> {
         Value::Array(values) => values.iter().find_map(first_string),
         Value::Null | Value::Bool(_) | Value::Number(_) => None,
     }
+}
+
+/// The first string of a `type` field, which may be a plain string or an
+/// array of types (JSON-LD allows both): `["Create", "Service"]` reads as
+/// `Create`, anything with no string anywhere reads as nothing.
+#[must_use]
+pub fn first_type(value: &Value) -> Option<String> {
+    as_array(value)
+        .iter()
+        .find_map(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Every reference a value carries, as strings: an array element by
+/// element through [`value_or_id`], anything else alone.
+///
+/// A lone value becomes the one-element list of its own reference, or the
+/// empty list when it names nothing. This is the normalization of the
+/// addressing properties — `to`, `cc`, `bto`, `bcc` — which arrive as a
+/// string, an object, or a mixed array of both.
+#[must_use]
+pub fn references(value: &Value) -> Vec<String> {
+    as_array(value).iter().filter_map(value_or_id).collect()
+}
+
+/// The host of an absolute `http(s)` URL, `None` for anything else.
+///
+/// URL parsing lowercases the host, so hosts compare case-insensitively.
+/// `ActivityPub` ids are URLs, and containment ([`super::dispatch`])
+/// compares the host of one id against the host of another.
+#[must_use]
+pub fn http_host(text: &str) -> Option<String> {
+    let parsed = Url::parse(text).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.host_str().map(str::to_owned)
 }
 
 /// The first [`REFERENCE_KEYS`] entry of `map` that holds a string, resolved
@@ -188,6 +230,84 @@ mod tests {
             first_string(&json!({"id": 3})),
             None,
             "references must be strings"
+        );
+    }
+
+    #[test]
+    fn first_type_reads_strings_and_type_arrays() {
+        assert_eq!(
+            first_type(&json!("Follow")),
+            Some("Follow".to_owned()),
+            "a plain string type"
+        );
+        assert_eq!(
+            first_type(&json!(["Create", "Service"])),
+            Some("Create".to_owned()),
+            "the first of an array type"
+        );
+        assert_eq!(
+            first_type(&json!([])),
+            None,
+            "the empty array names nothing"
+        );
+        assert_eq!(
+            first_type(&json!([3, "Like"])),
+            Some("Like".to_owned()),
+            "the first string of a mixed array wins"
+        );
+        assert_eq!(first_type(&json!(7)), None, "a number is no type");
+        assert_eq!(
+            first_type(&json!({"a": "b"})),
+            None,
+            "an object carries no string itself"
+        );
+    }
+
+    #[test]
+    fn references_reads_addressing_arrays_and_lone_values() {
+        assert_eq!(
+            references(&json!(["https://x.example/a", {"id": "https://x.example/b"}])),
+            vec![
+                "https://x.example/a".to_owned(),
+                "https://x.example/b".to_owned()
+            ],
+            "a mixed addressing array keeps both references"
+        );
+        assert_eq!(
+            references(&json!("https://x.example/a")),
+            vec!["https://x.example/a".to_owned()],
+            "a lone string is the one-element list"
+        );
+        assert_eq!(
+            references(&json!([null, 3, "https://x.example/b"])),
+            vec!["https://x.example/b".to_owned()],
+            "elements that name nothing drop out"
+        );
+        assert!(
+            references(&Value::Null).is_empty(),
+            "null references nothing"
+        );
+        assert!(references(&json!([])).is_empty(), "the empty array");
+    }
+
+    #[test]
+    fn http_host_reads_absolute_http_urls_only() {
+        assert_eq!(
+            http_host("https://Peer.Example/users/alice"),
+            Some("peer.example".to_owned()),
+            "the lowercased host of an https id"
+        );
+        assert_eq!(
+            http_host("http://x.example/a"),
+            Some("x.example".to_owned()),
+            "http too"
+        );
+        assert_eq!(http_host("urn:uuid:1234"), None, "not an http url");
+        assert_eq!(http_host("not a url"), None, "not a url at all");
+        assert_eq!(
+            http_host("ftp://x.example/a"),
+            None,
+            "the wrong scheme is no host"
         );
     }
 }

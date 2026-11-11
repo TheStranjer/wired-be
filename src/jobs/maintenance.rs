@@ -29,15 +29,16 @@
 //!
 //! [`handle_jobs`] (job kind [`KIND_JOBS`]) is the third: one daily pass of
 //! batched prunes. It first deletes the `jobs` rows that reached a terminal
-//! state more than `JOBS_RETENTION_DAYS` days ago — which sweeps the expired
-//! incoming-activity deduplication rows out too, since this schema carries
-//! that bookkeeping on the queue's `incoming:{activity id}` unique key (see
-//! [`crate::api::activitypub`]) rather than in a table of its own. It then
-//! prunes the `received_activities` rows older than
+//! state more than `JOBS_RETENTION_DAYS` days ago — which sweeps the
+//! redeliverable-queue deduplication out too, since the queue keeps its
+//! `incoming:{activity id}` unique key (see [`crate::api::activitypub`]).
+//! It then prunes the `received_activities` rows older than
 //! `RECEIVED_ACTIVITIES_RETENTION_DAYS` days, existence-guarded: a probe at
-//! job time asks whether the table is there, and today it is not, so the step
-//! logs a debug and skips — while a later ticket adding that table lights the
-//! prune up with no change here. The reference is the cron purges under
+//! job time asks whether the table is there, and the dispatcher ticket
+//! ([`crate::federation::dispatch`]) has since added it, so the step
+//! reclaims the stale ledger rows beside its queue rows — the same horizon
+//! the dispatcher's own `federation.cleanup_received` pass keeps. The
+//! reference is the cron purges under
 //! Pleroma's `lib/pleroma/workers/cron/`.
 //!
 //! [`handle_purge_deleted_statuses`] (job kind [`KIND_DELETED_STATUSES`]) is
@@ -313,14 +314,15 @@ const RECEIVED_ACTIVITIES_EXISTS_SQL: &str =
     "SELECT to_regclass('public.received_activities')::text";
 
 /// The batched `DELETE` behind [`prune_received_activities`]: the same shape
-/// as [`PRUNE_JOBS_SQL`], against the replay-guard table's `id` and
-/// `inserted_at`. It is only ever sent after the existence probe found the
-/// table this pass.
+/// as [`PRUNE_JOBS_SQL`], against the replay-guard table's `ap_id` and
+/// `inserted_at` (the ledger's key, see
+/// [`crate::federation::dispatch::KIND_INCOMING`]). It is only ever sent
+/// after the existence probe found the table this pass.
 const PRUNE_RECEIVED_ACTIVITIES_SQL: &str = "DELETE FROM received_activities
-         WHERE id IN (
-             SELECT id FROM received_activities
+         WHERE ap_id IN (
+             SELECT ap_id FROM received_activities
               WHERE inserted_at < now() - make_interval(days => $1)
-              ORDER BY id
+              ORDER BY ap_id
               LIMIT $2
          )";
 
@@ -356,11 +358,9 @@ async fn prune_in_batches(
 }
 
 /// Prunes the terminal `jobs` rows past [`JOBS_RETENTION_DAYS`], reporting
-/// how many went. This is also where the expired incoming-activity
-/// deduplication rows die: this schema has no `received_activities` table,
-/// deduplication rides on the queue's `incoming:{activity id}` unique key
-/// (see [`crate::api::activitypub`]), and a finished activity job is a
-/// terminal row like any other.
+/// how many went. Queue-level deduplication — the `incoming:{activity id}`
+/// replay guard of [`crate::api::activitypub`] included — dies with these
+/// rows; the activity ledger itself is the next step's table.
 async fn prune_jobs(pool: &PgPool) -> Result<u64, sqlx::Error> {
     prune_in_batches(pool, PRUNE_JOBS_SQL, JOBS_RETENTION_DAYS, PRUNE_BATCH_SIZE).await
 }
@@ -369,9 +369,11 @@ async fn prune_jobs(pool: &PgPool) -> Result<u64, sqlx::Error> {
 /// [`RECEIVED_ACTIVITIES_RETENTION_DAYS`], guarded on the table existing.
 ///
 /// The [`RECEIVED_ACTIVITIES_EXISTS_SQL`] probe runs at job time on every
-/// pass, so nothing here assumes the table: today it does not exist, the
-/// probe answers `NULL`, the step logs a debug and reports zero rows, and
-/// once a later ticket adds the table the same pass deletes its stale rows.
+/// pass, so nothing here assumes the table; the dispatcher ticket added it,
+/// so the step prunes its stale rows. The same horizon is kept by the
+/// dedicated [`federation.cleanup_received`](crate::federation::dispatch::KIND_CLEANUP_RECEIVED)
+/// pass — two daily deletes, the same fourteen days, one table: a row any
+/// pass reclaims stays reclaimed.
 async fn prune_received_activities(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let table = query_scalar::<_, Option<String>>(RECEIVED_ACTIVITIES_EXISTS_SQL)
         .fetch_one(pool)
@@ -1375,38 +1377,68 @@ mod tests {
         );
     }
 
-    /// With today's schema the replay-guard table does not exist, and that
-    /// is a skip, not a failure: the pass completes and still prunes the
-    /// jobs table, nothing else.
+    /// How many `received_activities` rows carry `ap_id`.
+    async fn ledger_rows(pool: &PgPool, ap_id: &str) -> i64 {
+        query_scalar::<_, i64>("SELECT count(*) FROM received_activities WHERE ap_id = $1")
+            .bind(ap_id)
+            .fetch_one(pool)
+            .await
+            .expect("the ledger reads")
+    }
+
+    /// The dispatcher ticket's table lit this step up: the guarded pass
+    /// now deletes the `received_activities` rows past the retention and
+    /// leaves the fresh ones, beside its `jobs` work.
     #[tokio::test]
-    async fn the_jobs_prune_skips_the_absent_received_activities_table() {
+    async fn the_jobs_prune_cleans_the_received_activities_ledger() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let table = query_scalar::<_, Option<String>>(RECEIVED_ACTIVITIES_EXISTS_SQL)
             .fetch_one(&pool)
             .await
             .expect("the probe reads");
-        assert!(
-            table.is_none(),
-            "today's schema has no received_activities table: the premise this test guards"
+        assert_eq!(
+            table.as_deref(),
+            Some("received_activities"),
+            "the schema has the ledger this step guards on"
         );
+        let _aged = query(
+            "INSERT INTO received_activities (ap_id, inserted_at)
+             VALUES ('https://peer.example/activities/pruned', now() - make_interval(days => 15))",
+        )
+        .execute(&pool)
+        .await
+        .expect("the old ledger row inserts");
+        let _fresh = query(
+            "INSERT INTO received_activities (ap_id, inserted_at)
+             VALUES ('https://peer.example/activities/kept', now() - make_interval(days => 13))",
+        )
+        .execute(&pool)
+        .await
+        .expect("the fresh ledger row inserts");
         let stale = aged_job(&pool, "done.stale", "completed", 8).await;
         let live = aged_job(&pool, "wait.live", "available", 8).await;
 
         let outcome = handle_jobs(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
+        assert_eq!(outcome, Ok(()), "the guarded pass runs");
         assert_eq!(
-            outcome,
-            Ok(()),
-            "the absent table is a debug skip, not an error"
+            ledger_rows(&pool, "https://peer.example/activities/pruned").await,
+            0,
+            "the 15-day ledger row is reclaimed"
+        );
+        assert_eq!(
+            ledger_rows(&pool, "https://peer.example/activities/kept").await,
+            1,
+            "the 13-day ledger row stays"
         );
         assert!(
             !row_exists(&pool, "jobs", stale).await,
-            "and the pass still prunes the jobs table"
+            "the pass still prunes the jobs table"
         );
         assert!(
             row_exists(&pool, "jobs", live).await,
-            "pruning only jobs leaves the live row"
+            "pruning only reaches past the retentions"
         );
     }
 
