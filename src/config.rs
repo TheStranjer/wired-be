@@ -125,6 +125,12 @@ pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
 /// Environment variable holding the comma-separated list of frontends
 /// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
 pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
+/// Environment variable holding the comma-separated list of areas whose
+/// unauthenticated reads are refused.
+///
+/// The area names are the `RESTRICT_*` constants below and
+/// [`Config::restricts`] is how a gated endpoint asks.
+pub const RESTRICT_UNAUTHENTICATED_VAR: &str = "RESTRICT_UNAUTHENTICATED";
 /// Environment variable holding the job worker's concurrent handler count.
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.
@@ -375,6 +381,45 @@ pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
 /// So `GET /api/v1/pleroma/preferred_frontend/available` answers `[]` and
 /// `PUT /api/v1/pleroma/preferred_frontend` refuses every name.
 pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
+/// Area list used when `RESTRICT_UNAUTHENTICATED` is unset: nothing is
+/// restricted, so every unauthenticated read answers — Pleroma's own
+/// `:restrict_unauthenticated` default of all-false.
+pub const DEFAULT_RESTRICT_UNAUTHENTICATED: &str = "";
+/// `RESTRICT_UNAUTHENTICATED` area: the `local=true` read of
+/// `GET /api/v1/timelines/public`.
+///
+/// Refused to unauthenticated requests with the 403
+/// `{"error":"Authentication is required to access this resource."}` while
+/// listed (Pleroma's `restrict_unauthenticated: [timelines: [local: true]]`;
+/// see [`crate::api::timelines`]).
+pub const RESTRICT_TIMELINES_LOCAL: &str = "timelines_local";
+/// `RESTRICT_UNAUTHENTICATED` area: the federated (not `local=true`) read
+/// of `GET /api/v1/timelines/public`.
+///
+/// Refused to unauthenticated requests the same way while listed (Pleroma's
+/// `restrict_unauthenticated: [timelines: [federated: true]]`).
+pub const RESTRICT_TIMELINES_FEDERATED: &str = "timelines_federated";
+/// `RESTRICT_UNAUTHENTICATED` area: local profile reads.
+///
+/// The accounts tickets gate their endpoints on it; listing it refuses the
+/// unauthenticated read of a local profile the same way as the timelines
+/// areas (Pleroma's `profiles: [local:]`).
+pub const RESTRICT_PROFILES_LOCAL: &str = "profiles_local";
+/// `RESTRICT_UNAUTHENTICATED` area: remote profile reads.
+///
+/// The accounts tickets gate their endpoints on it (Pleroma's
+/// `profiles: [remote:]`).
+pub const RESTRICT_PROFILES_REMOTE: &str = "profiles_remote";
+/// `RESTRICT_UNAUTHENTICATED` area: reads of local statuses.
+///
+/// The status endpoints of later tickets gate on it (Pleroma's
+/// `activities: [local:]`).
+pub const RESTRICT_ACTIVITIES_LOCAL: &str = "activities_local";
+/// `RESTRICT_UNAUTHENTICATED` area: reads of remote statuses.
+///
+/// The status endpoints of later tickets gate on it (Pleroma's
+/// `activities: [remote:]`).
+pub const RESTRICT_ACTIVITIES_REMOTE: &str = "activities_remote";
 /// Worker concurrency used when `JOB_CONCURRENCY` is unset.
 pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// Streaming heartbeat period used when `STREAMING_PING_INTERVAL_SECS` is
@@ -911,6 +956,13 @@ pub struct Config {
     /// `GET /api/v1/pleroma/preferred_frontend/available` and the whitelist
     /// `PUT /api/v1/pleroma/preferred_frontend` validates against.
     pub available_frontends: Vec<String>,
+    /// The areas whose unauthenticated reads are refused, from
+    /// `RESTRICT_UNAUTHENTICATED` (a comma-separated list, empty by
+    /// default).
+    ///
+    /// The names are the `RESTRICT_*` constants of this module and
+    /// [`restricts`](Self::restricts) is how a gated endpoint asks.
+    pub restrict_unauthenticated: Vec<String>,
     /// Job handlers a single worker runs at the same time.
     pub job_concurrency: usize,
     /// Job queue names the worker drains, in claim priority order.
@@ -1050,6 +1102,7 @@ impl Config {
             search_statuses_unauthenticated: exposure.search_statuses_unauthenticated,
             oauth_providers: auth.oauth_providers,
             available_frontends: exposure.available_frontends,
+            restrict_unauthenticated: exposure.restrict_unauthenticated,
             job_concurrency,
             job_queues,
             streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
@@ -1090,6 +1143,20 @@ impl Config {
         self.oauth_providers
             .iter()
             .find(|provider| provider.name == name)
+    }
+
+    /// Whether the unauthenticated read of `area` is refused.
+    ///
+    /// `area` is one of the `RESTRICT_*` area names of this module (e.g.
+    /// [`RESTRICT_TIMELINES_LOCAL`]), matched verbatim against the
+    /// `RESTRICT_UNAUTHENTICATED` list. The empty default list restricts
+    /// nothing; a gated endpoint pairs this with the request's own
+    /// authentication state.
+    #[must_use]
+    pub fn restricts(&self, area: &str) -> bool {
+        self.restrict_unauthenticated
+            .iter()
+            .any(|restricted| restricted == area)
     }
 
     /// Configuration for tests: `BASE_URL` is `https://test.example`,
@@ -1169,6 +1236,7 @@ impl Config {
             search_statuses_unauthenticated: Toggle::new(DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED),
             oauth_providers: Vec::new(),
             available_frontends: comma_list(DEFAULT_AVAILABLE_FRONTENDS),
+            restrict_unauthenticated: comma_list(DEFAULT_RESTRICT_UNAUTHENTICATED),
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
             job_queues: comma_list(DEFAULT_JOB_QUEUES),
             streaming_ping_interval_secs: DEFAULT_STREAMING_PING_INTERVAL_SECS,
@@ -1735,10 +1803,11 @@ where
 }
 
 /// What [`client_exposure`] reads: the toggles that gate what the instance
-/// exposes to clients and the pickable-frontend list, named by what they
-/// are and hung on the [`Config`] fields in [`Config::from_lookup`]
-/// (`REGISTRATIONS_OPEN`, `INVITES_ENABLED`,
-/// `SEARCH_STATUSES_UNAUTHENTICATED`, `AVAILABLE_FRONTENDS`).
+/// exposes to clients, the pickable-frontend list and the unauthenticated
+/// restriction areas, named by what they are and hung on the [`Config`]
+/// fields in [`Config::from_lookup`] (`REGISTRATIONS_OPEN`,
+/// `INVITES_ENABLED`, `SEARCH_STATUSES_UNAUTHENTICATED`,
+/// `AVAILABLE_FRONTENDS`, `RESTRICT_UNAUTHENTICATED`).
 #[derive(Debug)]
 struct ExposureSettings {
     /// Whether new registrations are open (`REGISTRATIONS_OPEN`).
@@ -1752,16 +1821,19 @@ struct ExposureSettings {
     /// The frontends the settings endpoints let a user pick
     /// (`AVAILABLE_FRONTENDS`).
     available_frontends: Vec<String>,
+    /// The areas whose unauthenticated reads are refused
+    /// (`RESTRICT_UNAUTHENTICATED`).
+    restrict_unauthenticated: Vec<String>,
 }
 
 /// Reads the settings that gate what the instance exposes to clients:
 /// whether new registrations are open (`NodeInfo`'s `openRegistrations`),
 /// whether invite tokens substitute for open registrations
 /// (`invites_enabled` on the instance endpoints), whether anonymous
-/// requests may search statuses at the combined search, and the frontends
-/// the settings endpoints let a user pick. Grouped because each is a plain
-/// default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md).
+/// requests may search statuses at the combined search, the frontends the
+/// settings endpoints let a user pick, and the areas whose unauthenticated
+/// reads are refused. Grouped because each is a plain default-or-parse and
+/// [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
 ///
@@ -1784,11 +1856,16 @@ where
     let available_frontends = comma_list(
         &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
     );
+    let restrict_unauthenticated = comma_list(
+        &lookup(RESTRICT_UNAUTHENTICATED_VAR)
+            .unwrap_or_else(|| DEFAULT_RESTRICT_UNAUTHENTICATED.to_owned()),
+    );
     Ok(ExposureSettings {
         registrations_open,
         invites_enabled,
         search_statuses_unauthenticated,
         available_frontends,
+        restrict_unauthenticated,
     })
 }
 
@@ -2048,6 +2125,7 @@ impl fmt::Debug for Config {
             )
             .field("oauth_providers", &self.oauth_providers)
             .field("available_frontends", &self.available_frontends)
+            .field("restrict_unauthenticated", &self.restrict_unauthenticated)
             .field("job_concurrency", &self.job_concurrency)
             .field("job_queues", &self.job_queues)
             .field(
@@ -3863,6 +3941,91 @@ mod tests {
             debug.contains(r#"available_frontends: ["pleroma-fe", "mochi-pub", "x"]"#),
             "the frontend list is visible in Debug output: {debug}"
         );
+    }
+
+    /// `RESTRICT_UNAUTHENTICATED` is empty by default, so `restricts`
+    /// refuses nothing and every unauthenticated read answers.
+    #[test]
+    fn restrict_unauthenticated_defaults_to_restrictionless() {
+        let config = config_with(&[]);
+        assert!(
+            config.restrict_unauthenticated.is_empty(),
+            "nothing is restricted until the operator names areas"
+        );
+        for area in [
+            RESTRICT_TIMELINES_LOCAL,
+            RESTRICT_TIMELINES_FEDERATED,
+            RESTRICT_PROFILES_LOCAL,
+            RESTRICT_PROFILES_REMOTE,
+            RESTRICT_ACTIVITIES_LOCAL,
+            RESTRICT_ACTIVITIES_REMOTE,
+        ] {
+            assert!(!config.restricts(area), "`{area}` is open by default");
+        }
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("restrict_unauthenticated: []"),
+            "the area list is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn restrict_unauthenticated_parses_a_comma_list_and_answers_restricts() {
+        let config = config_with(&[(
+            RESTRICT_UNAUTHENTICATED_VAR,
+            " timelines_local , profiles_remote ,,junk",
+        )]);
+        assert_eq!(
+            config.restrict_unauthenticated,
+            vec![
+                "timelines_local".to_owned(),
+                "profiles_remote".to_owned(),
+                "junk".to_owned()
+            ],
+            "the list is trimmed, blanks drop and order is kept"
+        );
+        assert!(
+            config.restricts(RESTRICT_TIMELINES_LOCAL),
+            "the listed timelines area is restricted"
+        );
+        assert!(
+            config.restricts(RESTRICT_PROFILES_REMOTE),
+            "a listed area of another family is restricted too"
+        );
+        assert!(
+            config.restricts("junk"),
+            "membership answers verbatim; which names mean anything is the gated endpoints' call"
+        );
+        assert!(
+            !config.restricts(RESTRICT_TIMELINES_FEDERATED),
+            "the unlisted sibling stays open"
+        );
+        assert!(
+            !config.restricts("TIMELINES_LOCAL"),
+            "the match is case-sensitive, the way Pleroma's keywords are"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains(
+                r#"restrict_unauthenticated: ["timelines_local", "profiles_remote", "junk"]"#
+            ),
+            "the area list is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn empty_restrict_unauthenticated_reads_as_the_default() {
+        for value in ["", "   "] {
+            let config = config_with(&[(RESTRICT_UNAUTHENTICATED_VAR, value)]);
+            assert!(
+                config.restrict_unauthenticated.is_empty(),
+                "`RESTRICT_UNAUTHENTICATED={value:?}` restricts nothing"
+            );
+            assert!(
+                !config.restricts(RESTRICT_TIMELINES_LOCAL),
+                "and so answers `restricts`"
+            );
+        }
     }
 
     /// The ticket's one-provider `OAUTH_PROVIDERS` document, verbatim.
