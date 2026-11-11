@@ -40,6 +40,7 @@ pub mod follow;
 pub mod hashtag;
 pub mod hashtag_follow;
 pub mod idempotency_key;
+pub mod instance;
 pub mod instance_policy_domain;
 pub mod instance_rule;
 pub mod instance_secret;

@@ -218,6 +218,19 @@ const MOVE_FOLLOWERS_SQL: &str = "SELECT u.* FROM follows f
         AND u.local = true AND u.allow_following_move = true
    ORDER BY f.id";
 
+/// [`remote_followers`]: accepted relationships held by *remote*, active
+/// mirrors of the bound account — the followers collection exactly as the
+/// sender-side fan-out needs it (Pleroma's `User.get_external_followers`,
+/// which its publisher expands into follower inboxes). Local followers are
+/// not in it; they receive the activity through their timelines, never
+/// through an HTTP delivery, and a deactivated mirror's inbox is nobody's
+/// delivery target either. Oldest relationship first.
+const REMOTE_FOLLOWERS_SQL: &str = "SELECT u.* FROM follows f
+     JOIN users u ON u.id = f.follower_id
+      WHERE f.followee_id = $1 AND f.state = 'accepted'
+        AND u.local = false AND u.is_active = true
+   ORDER BY f.id";
+
 /// [`familiar_followers`]: the accounts that follow `target` (`own`, the
 /// target's own follower edges) and are themselves followed by the viewer
 /// (`theirs`, the viewer's outgoing edges), accepted on both ends. Active
@@ -831,6 +844,31 @@ pub async fn pending_count(pool: &PgPool, user_id: Uuid) -> AppResult<i32> {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn move_followers_of(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
     let rows = sqlx::query_as::<_, User>(MOVE_FOLLOWERS_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// The remote users with an accepted follow of `user_id`, active mirrors
+/// only, oldest relationship first.
+///
+/// This is the followers collection read from the *sending* side: when this
+/// instance publishes an activity addressed to `user_id`'s followers URL,
+/// these are the accounts standing behind it, and their inboxes are what
+/// the fan-out addresses
+/// ([`crate::federation::publisher`] expands the collection through this
+/// query). Pleroma's `User.get_external_followers` is the reference; local
+/// followers are deliberately absent — they get the activity through their
+/// timelines, not a delivery — and so are deactivated mirrors, which can
+/// receive nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remote_followers(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
+    let rows = sqlx::query_as::<_, User>(REMOTE_FOLLOWERS_SQL)
         .bind(user_id)
         .fetch_all(pool)
         .await?;

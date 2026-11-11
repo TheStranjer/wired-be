@@ -83,8 +83,10 @@ const ATTACHMENT_TYPES: [&str; 5] = ["Document", "Image", "Video", "Audio", "Lin
 /// The three spellings of the public addressing recipient: the full
 /// `ActivityStreams` iri, the prefix form Pleroma emits, and the bare word
 /// older software sends (Pleroma's `fix_addressing_public` normalizes all
-/// three to the iri).
-const PUBLIC_RECIPIENTS: [&str; 3] = [
+/// three to the iri). Shared with
+/// [`crate::federation::publisher`], which likewise never treats any of
+/// them as a deliverable recipient.
+pub(crate) const PUBLIC_RECIPIENTS: [&str; 3] = [
     "https://www.w3.org/ns/activitystreams#Public",
     "as:Public",
     "Public",

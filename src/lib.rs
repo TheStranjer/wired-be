@@ -90,9 +90,10 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)) and
 /// its daily received-activity ledger prune
 /// ([`KIND_CLEANUP_RECEIVED`](federation::dispatch::KIND_CLEANUP_RECEIVED))
-/// — so
-/// the worker idles, sweeps, delivers, sends, pushes and processes
-/// received activities. The state's mail transport comes from
+/// — and the outgoing fan-out publisher
+/// ([`publisher::KIND_PUBLISH`](federation::publisher::KIND_PUBLISH)), so
+/// the worker idles, sweeps, delivers, sends, pushes, processes received
+/// activities and fans out outgoing ones. The state's mail transport comes from
 /// [`mailer::transport_from_config`]: the SMTP relay when `SMTP_HOST` is
 /// set, the disabled stand-in while it is not. An unset or blank
 /// `SECRET_KEY_BASE` is filled with a fresh random signing secret for this
@@ -249,6 +250,10 @@ fn job_registry() -> JobRegistry {
     registry.register(
         federation::dispatch::KIND_INCOMING,
         federation::dispatch::handle,
+    );
+    registry.register(
+        federation::publisher::KIND_PUBLISH,
+        federation::publisher::handle,
     );
     registry.register(
         federation::dispatch::KIND_CLEANUP_RECEIVED,

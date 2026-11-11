@@ -31,7 +31,12 @@
 //! plus the JSON-LD schema they reference. [`collections`] builds the
 //! activity collections the actor document names — outbox, followers,
 //! following, featured and an object's replies — roots and keyset pages
-//! alike. The personal inbox `POST`s arrived with [`inbox_auth`] and
+//! alike. [`publisher`] is the fan-out in front of delivery: it turns an
+//! activity's addressing — the actor's followers collection expanded to
+//! its remote followers included — into the set of remote inboxes to
+//! deliver to and queues one [`delivery`] job each, and its
+//! `federator.publish` job kind lets API handlers hand that work to the
+//! queue instead of waiting on it. The personal inbox `POST`s arrived with [`inbox_auth`] and
 //! [`dispatch`]; `GET /users/{nickname}/inbox`, the client read of a
 //! personal inbox, belongs to a later ticket.
 
@@ -46,6 +51,7 @@ pub mod json;
 pub mod mrf;
 pub mod note;
 pub mod note_parser;
+pub mod publisher;
 pub mod remote_actor;
 pub mod signature;
 pub mod webfinger_client;
