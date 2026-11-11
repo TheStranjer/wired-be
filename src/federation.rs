@@ -28,11 +28,16 @@
 //! the parts of a status. [`note`] is the way back out for statuses: the
 //! pure builder of the `Note`/`Question` objects a local post federates as
 //! and of the `Create`, `Announce` and `Tombstone` documents around it,
-//! plus the JSON-LD schema they reference. Activity collections, inboxes
-//! and outboxes arrive in later tickets and get their modules beside them.
+//! plus the JSON-LD schema they reference. [`collections`] builds the
+//! activity collections the actor document names — outbox, followers,
+//! following, featured and an object's replies — roots and keyset pages
+//! alike. The personal inbox `POST`s arrived with [`inbox_auth`] and
+//! [`dispatch`]; `GET /users/{nickname}/inbox`, the client read of a
+//! personal inbox, belongs to a later ticket.
 
 pub mod actor;
 pub mod authorized_fetch;
+pub mod collections;
 pub mod delivery;
 pub mod dispatch;
 pub mod fetch_actor;
