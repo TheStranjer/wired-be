@@ -557,15 +557,17 @@ const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 /// The 200 body message `POST /api/v1/accounts` answers when the account
 /// landed awaiting staff approval (`REGISTRATIONS_APPROVAL_REQUIRED`),
 /// beside the `awaiting_approval` identifier (Pleroma's `create` action,
-/// `{:login, {:account_status, :approval_pending}}`).
-const REGISTERED_AWAITING_APPROVAL: &str =
+/// `{:login, {:account_status, :approval_pending}}`). The external
+/// registration page shows the same words as its HTML message.
+pub(crate) const REGISTERED_AWAITING_APPROVAL: &str =
     "You have been registered. You'll be able to log in once your account is approved.";
 
 /// The 200 body message `POST /api/v1/accounts` answers when the account
 /// landed unconfirmed (`ACCOUNT_ACTIVATION_REQUIRED`) and no approval waits
 /// ahead of it, beside the `missing_confirmed_email` identifier (Pleroma's
 /// `create` action, `{:login, {:account_status, :confirmation_pending}}`).
-const REGISTERED_AWAITING_CONFIRMATION: &str =
+/// The external registration page shows the same words as its HTML message.
+pub(crate) const REGISTERED_AWAITING_CONFIRMATION: &str =
     "You have been registered. Please check your email for further instructions.";
 
 /// The machine-readable identifier of an approval-pending registration and
@@ -707,6 +709,9 @@ impl CreateAccountParams {
             name: self.fullname,
             bio: self.bio,
             reason: self.reason,
+            // This endpoint carries no provider: the email is only ever
+            // confirmed by the link the confirmation letter sends.
+            provider_email_verified: false,
         }
     }
 }

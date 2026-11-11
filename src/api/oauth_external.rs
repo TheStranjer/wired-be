@@ -1,10 +1,12 @@
 //! External OAuth logins: `GET /oauth/prepare_request`, the provider
-//! redirect it hands the browser, and the provider's callback.
+//! redirect it hands the browser, the provider's callback, and the
+//! registration form an unlinked provider account is picked up by.
 //!
-//! The reference is Pleroma's `prepare_request`, `request` and `callback`
-//! in `lib/pleroma/web/o_auth/o_auth_controller.ex`, the Ueberauth half of
+//! The reference is Pleroma's `prepare_request`, `request`, `callback`,
+//! `registration_details` and `register` in
+//! `lib/pleroma/web/o_auth/o_auth_controller.ex`, the Ueberauth half of
 //! `/oauth`. A client that wants to log its user in through, say, GitHub runs the
-//! three endpoints here before it ever sees an authorization code:
+//! endpoints here before it ever sees an authorization code:
 //!
 //! 1. `GET /oauth/prepare_request?provider=<name>&…` takes the very
 //!    parameters `GET /oauth/authorize` takes — the same response type,
@@ -36,11 +38,30 @@
 //!    * not linked → the provider's account info is stored under the
 //!      `pending` key of the state's parameters and the browser is
 //!      redirected 302 to `{BASE_URL}/oauth/registration_details?state=…`,
-//!      where the registration form (the next ticket) takes over.
+//!      where the registration form takes over (4).
 //!    * the provider reported an `error`, or the exchange, the read or the
 //!      identification failed → 302 to the app's `redirect_uri` with
 //!      `error=access_denied` (and the client's `state`), the way Pleroma
 //!      bounces a failed Ueberauth callback back to where it came from.
+//! 4. `GET /oauth/registration_details?state=<state>` renders that form
+//!    ([`registration_page`]): the `pending` account's `nickname`, `email`
+//!    and `name` prefilled and editable, the state carried hidden, posting
+//!    to `POST /oauth/register`. There the account is created through
+//!    [`create_local_user`] with a random password nobody can ever type —
+//!    the provider is the login — the provider identity is linked in
+//!    `user_identities`, and the ORIGINAL authorization-code flow finishes
+//!    exactly as (3) finishes it for a linked user. `REGISTRATIONS_OPEN`
+//!    gates the write (a closed instance re-renders the form with the
+//!    refusal, and the invite path stays out of reach: the form carries no
+//!    token); `REGISTRATIONS_APPROVAL_REQUIRED` and
+//!    `ACCOUNT_ACTIVATION_REQUIRED` decide what the finished row waits for
+//!    and answer the matching message page instead of the login — the
+//!    provider's own email counts as the proof, so submitting it verbatim
+//!    registers confirmed. Failed validation re-renders the form with the
+//!    field messages; a success deletes the state row, expired states go
+//!    with the hourly `maintenance.tokens` sweep, and a missing, expired
+//!    or `pending`-less state is the 400 `{"error":"Invalid state"}` on
+//!    both halves.
 //!
 //! Every answer — JSON, redirect or page — carries `Cache-Control:
 //! no-store`, as the rest of `/oauth` does: a state and a code are
@@ -53,34 +74,43 @@
 //! for the three optional ones — simply means the provider does not say.
 //!
 //! [`HttpClient`]: crate::http_client::HttpClient
+//! [`create_local_user`]: crate::models::user::register::create_local_user
+//! [`registration_page`]: crate::oauth::registration_page
 
 use axum::{
     Json, Router,
     extract::{Path, State},
     response::{IntoResponse as _, Response},
-    routing::get,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{debug, warn};
 use url::form_urlencoded;
 
 use crate::{
-    api::oauth::{
-        authorize::{self, AuthorizeReply, Delivery},
-        check_account_ready,
+    api::{
+        accounts::{REGISTERED_AWAITING_APPROVAL, REGISTERED_AWAITING_CONFIRMATION},
+        oauth::{
+            authorize::{self, AuthorizeReply, Delivery},
+            check_account_ready,
+        },
     },
     config::{Config, OauthProvider},
     error::{AppError, AppResult},
-    extract::ApiParams,
+    extract::{ApiBody, ApiParams},
     http_client::{HttpClient, HttpError, HttpResponse},
     models::{
         oauth_login_state::{self, OauthLoginState},
-        user::User,
+        user::{
+            User,
+            register::{FieldErrors, RegisterError, RegisterParams, create_local_user},
+        },
         user_identity,
     },
-    oauth::scopes::Scopes,
+    oauth::{registration_page, scopes::Scopes},
     state::AppState,
+    util::token::random_token,
 };
 
 /// 404 body when the path or the `provider` parameter names a provider
@@ -101,9 +131,21 @@ const PROVIDER_PATH: &str = "/oauth/{provider}";
 const CALLBACK_PATH: &str = "/oauth/{provider}/callback";
 /// The segment under `{provider}` the provider answers to.
 const CALLBACK_SEGMENT: &str = "callback";
-/// The page an unlinked provider account is sent to; its form is the next
-/// ticket.
+/// The page an unlinked provider account is sent to, and the route that
+/// serves its form: `/oauth/registration_details`.
 const REGISTRATION_DETAILS: &str = "/oauth/registration_details";
+/// The form's submission endpoint: `/oauth/register`.
+const REGISTER_PATH: &str = "/oauth/register";
+/// The error line the form is re-rendered with while `REGISTRATIONS_OPEN`
+/// is off, the wording this ticket pins. Pleroma gates the registration
+/// the same way; here the form carries no invite token, so a closed
+/// instance simply closes external registrations too.
+const REGISTRATIONS_CLOSED_FORM: &str = "Registrations are closed";
+/// Bytes behind the random password of an externally created account —
+/// Pleroma's `create_from_registration` mints the same kind of secret
+/// nobody will ever type. The hash exists so the row simply carries an
+/// unguessable credential; every password path refuses the account.
+const EXTERNAL_PASSWORD_BYTES: usize = 64;
 /// The `Accept` both provider endpoints are asked for: the token exchange
 /// and the userinfo read are both specified as JSON here.
 const ACCEPT_JSON: &str = "application/json";
@@ -115,15 +157,21 @@ const FORM_TYPE: &str = "application/x-www-form-urlencoded";
 const USERINFO_MAX_BYTES: usize = 1024 * 1024;
 
 /// The external-login router, merged at the top level of [`crate::app`]
-/// beside [`crate::api::oauth::router`]: `/oauth/prepare_request`,
-/// `/oauth/{provider}` and `/oauth/{provider}/callback`.
+/// beside [`crate::api::oauth::router`].
 ///
-/// The sibling router's static `/oauth` paths (`/oauth/token`,
-/// `/oauth/authorize`, `/oauth/revoke`) win over the `{provider}` segment —
-/// a router tries statics first — so no provider may be named after one.
+/// It answers `/oauth/prepare_request`, `/oauth/registration_details`,
+/// `/oauth/register`, `/oauth/{provider}` and `/oauth/{provider}/callback`.
+///
+/// The static `/oauth` paths — the sibling router's (`/oauth/token`,
+/// `/oauth/authorize`, `/oauth/revoke`) and this router's
+/// `/oauth/registration_details` and `/oauth/register` — win over the
+/// `{provider}` segment: a router tries statics first — so no provider may
+/// be named after one.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(PREPARE_PATH, get(prepare_request))
+        .route(REGISTRATION_DETAILS, get(registration_details))
+        .route(REGISTER_PATH, post(register))
         .route(PROVIDER_PATH, get(request))
         .route(CALLBACK_PATH, get(callback))
 }
@@ -163,6 +211,31 @@ async fn callback(
     ApiParams(query): ApiParams<CallbackQuery>,
 ) -> Response {
     let response = match completed(&state, &name, query).await {
+        Ok(reply) => reply.into_response(),
+        Err(err) => err.into_response(),
+    };
+    authorize::no_store(response)
+}
+
+/// `GET /oauth/registration_details` — the registration form an unlinked
+/// provider account was handed: the state's `pending` account info
+/// prefilled, posting to `/oauth/register` with the state.
+async fn registration_details(
+    State(state): State<AppState>,
+    ApiParams(query): ApiParams<StateQuery>,
+) -> Response {
+    let response = match details(&state, query.state.as_deref()).await {
+        Ok(reply) => reply.into_response(),
+        Err(err) => err.into_response(),
+    };
+    authorize::no_store(response)
+}
+
+/// `POST /oauth/register` — the completed form: create the account, link
+/// the provider identity, and finish the authorization-code flow the state
+/// was prepared for.
+async fn register(State(state): State<AppState>, ApiBody(form): ApiBody<RegisterForm>) -> Response {
+    let response = match registered(&state, form).await {
         Ok(reply) => reply.into_response(),
         Err(err) => err.into_response(),
     };
@@ -230,7 +303,8 @@ struct PrepareReply {
 /// The `/oauth/authorize` parameters an `oauth_login_states` row carries
 /// across the provider round trip: what to mint the code for and where to
 /// deliver it. The `pending` key an unlinked callback stores beside these
-/// belongs to the registration ticket, so it is not a field here.
+/// is the registration flow's document ([`PendingRegistration`]), so it is
+/// not a field here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredParams {
     /// The registered application the finished login is for.
@@ -356,6 +430,278 @@ async fn completed(
     }
 }
 
+/// The `GET /oauth/registration_details` half: the state's `pending`
+/// account, prefilled into the form.
+///
+/// # Errors
+///
+/// 400 `Invalid state` from [`registrable_state`]; any database failure
+/// arrives as [`AppError::Database`].
+async fn details(state: &AppState, presented: Option<&str>) -> AppResult<AuthorizeReply> {
+    let (stored, pending, _) = registrable_state(state, presented).await?;
+    Ok(pending_form(&stored, &pending))
+}
+
+/// The registration half in order: the state that names the pending
+/// account and the stored authorize parameters, the gates, the account,
+/// the link, and the login the state was prepared for.
+///
+/// # Errors
+///
+/// 400 `Invalid state` (see [`registrable_state`]), or any database or key
+/// generation failure of the registration itself as [`AppError`].
+async fn registered(state: &AppState, form: RegisterForm) -> AppResult<AuthorizeReply> {
+    let (stored, pending, params) = registrable_state(state, form.state.as_deref()).await?;
+    if !state.config.registrations_open.get() {
+        return Ok(refused_form(
+            &form,
+            &stored.state,
+            REGISTRATIONS_CLOSED_FORM,
+        ));
+    }
+    let account = Submitted::of_form(&form, &pending);
+    let user = match create_local_user(state, account.into_register_params(), None).await {
+        Ok(user) => user,
+        Err(RegisterError::Invalid(errors)) => {
+            return Ok(refused_form(
+                &form,
+                &stored.state,
+                &validation_line(&errors),
+            ));
+        }
+        Err(RegisterError::Failed(err)) => return Err(err),
+    };
+    let linked = user_identity::link(&state.db, user.id, &pending.provider, &pending.uid).await?;
+    let _finished = oauth_login_state::delete(&state.db, &stored.state).await?;
+    debug!(
+        user = %user.id,
+        identity = %linked.id,
+        provider = %pending.provider,
+        "external registration linked a new account and finished the login"
+    );
+    finish_registration(state, &user, &params).await
+}
+
+/// What a finished external registration is answered with: the message
+/// page of an account that first waits for staff approval or for its
+/// email's confirmation — the same two messages `POST /api/v1/accounts`
+/// answers with, approval weighed first — or, for a ready account, the
+/// very login the callback gives a linked user.
+async fn finish_registration(
+    state: &AppState,
+    user: &User,
+    params: &StoredParams,
+) -> AppResult<AuthorizeReply> {
+    if user.approval_pending.get() {
+        return Ok(AuthorizeReply::Page(registration_page::render_message(
+            REGISTERED_AWAITING_APPROVAL,
+        )));
+    }
+    if !user.email_confirmed.get() {
+        return Ok(AuthorizeReply::Page(registration_page::render_message(
+            REGISTERED_AWAITING_CONFIRMATION,
+        )));
+    }
+    granted(state, user, params).await
+}
+
+/// The state the registration page may run on: live under its own key,
+/// carrying readable authorize parameters *and* the `pending` account an
+/// unlinked callback left. The registration flow does not know (or care)
+/// which provider issued it — the row says, and the `pending` document is
+/// the write's guarantee that it was this server that stored it.
+///
+/// # Errors
+///
+/// 400 `Invalid state` for a missing, unknown or expired state, or one
+/// that carries no usable `pending`; the same 400 for unreadable stored
+/// parameters. Any database failure arrives as [`AppError::Database`].
+async fn registrable_state(
+    state: &AppState,
+    presented: Option<&str>,
+) -> AppResult<(OauthLoginState, PendingRegistration, StoredParams)> {
+    let invalid = || AppError::BadRequest(INVALID_STATE.to_owned());
+    let Some(presented) = presented.filter(|text| !text.is_empty()) else {
+        return Err(invalid());
+    };
+    let stored = oauth_login_state::get_live(&state.db, presented)
+        .await?
+        .ok_or_else(invalid)?;
+    let params = StoredParams::of_state(&stored)?;
+    let pending = PendingRegistration::of_state(&stored).ok_or_else(invalid)?;
+    Ok((stored, pending, params))
+}
+
+/// The registration form as the `GET` renders it: the provider's account
+/// info prefilled — blank where the provider said nothing — and no error.
+fn pending_form(stored: &OauthLoginState, pending: &PendingRegistration) -> AuthorizeReply {
+    AuthorizeReply::Page(registration_page::render_form(
+        &registration_page::RegistrationForm {
+            nickname: pending.nickname.as_deref().unwrap_or_default(),
+            email: pending.email.as_deref().unwrap_or_default(),
+            name: pending.name.as_deref().unwrap_or_default(),
+            bio: "",
+            state: &stored.state,
+            error: None,
+        },
+    ))
+}
+
+/// The registration form as a refused submission re-renders it: what the
+/// user typed, kept, with `error` above the form.
+fn refused_form(form: &RegisterForm, state: &str, error: &str) -> AuthorizeReply {
+    AuthorizeReply::Page(registration_page::render_form(
+        &registration_page::RegistrationForm {
+            nickname: form.nickname.as_deref().unwrap_or_default(),
+            email: form.email.as_deref().unwrap_or_default(),
+            name: form.name.as_deref().unwrap_or_default(),
+            bio: form.bio.as_deref().unwrap_or_default(),
+            state,
+            error: Some(error),
+        },
+    ))
+}
+
+/// Every field-validation failure of a refused registration in one line:
+/// Pleroma's `register` action joins its changeset errors the same way,
+/// `"field message; field message"`.
+fn validation_line(errors: &FieldErrors) -> String {
+    errors
+        .iter()
+        .map(|(field, messages)| format!("{field} {}", messages.join(", ")))
+        .collect::<Vec<String>>()
+        .join("; ")
+}
+
+/// The `params.pending` document of an unlinked callback, read back by the
+/// registration flow: everything the form prefills beside the two facts
+/// that make the identity link — the provider and its account id.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct PendingRegistration {
+    /// Provider the round trip ran on; the `user_identities` key.
+    provider: String,
+    /// The provider account's stable id; the link's other key.
+    uid: String,
+    /// `nickname_field`, when the provider said it.
+    #[serde(default)]
+    nickname: Option<String>,
+    /// `email_field`, when the provider said it.
+    #[serde(default)]
+    email: Option<String>,
+    /// `name_field`, when the provider said it.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl PendingRegistration {
+    /// The `pending` document of a live state, or `None` when the state
+    /// carries none (the callback never ran on it) or names no account to
+    /// link: reading a provider account out of nothing is not this flow's
+    /// business.
+    fn of_state(stored: &OauthLoginState) -> Option<Self> {
+        let raw = stored.params.get("pending")?;
+        let pending: Self = serde_json::from_value(raw.clone()).ok()?;
+        (!pending.provider.is_empty() && !pending.uid.is_empty()).then_some(pending)
+    }
+}
+
+/// The `POST /oauth/register` form. The state rides hidden; every field
+/// the flow keeps is optional at the shape level — blank submissions fall
+/// back to the provider's info the way Pleroma's
+/// `create_from_registration` reads the form above the stored
+/// registration, and an absent nickname fails validation like a blank one.
+#[derive(Debug, Deserialize)]
+struct RegisterForm {
+    /// The state [`registration_details`] carried through the form.
+    #[serde(default)]
+    state: Option<String>,
+    /// Desired handle.
+    #[serde(default)]
+    nickname: Option<String>,
+    /// Contact email.
+    #[serde(default)]
+    email: Option<String>,
+    /// Display name.
+    #[serde(default)]
+    name: Option<String>,
+    /// Profile note as source text.
+    #[serde(default)]
+    bio: Option<String>,
+}
+
+/// The submission's fields, resolved against the provider's `pending`
+/// info: what [`RegisterForm`] says wins, the provider stands in where the
+/// form left a field blank.
+#[derive(Debug)]
+struct Submitted {
+    /// The handle to register: the form's, the provider's, or blank —
+    /// which [`create_local_user`] refuses like any other blank.
+    nickname: String,
+    /// The email to register, or `None` when neither says one.
+    email: Option<String>,
+    /// The display name, or `None` when neither says one (then the
+    /// nickname stands in, as registration always does).
+    name: Option<String>,
+    /// The profile note, verbatim from the form.
+    bio: Option<String>,
+    /// Whether the provider vouched for the registered address: its
+    /// `pending` email equals the resolved one, case-insensitively. That
+    /// is the ticket's proof — an `ACCOUNT_ACTIVATION_REQUIRED` instance
+    /// registers such an account confirmed, and no letter goes out.
+    provider_email_verified: bool,
+}
+
+impl Submitted {
+    /// Resolve `form`'s fields against `pending`'s. The nickname falls back
+    /// to the blank that validation refuses; the rest fall back to nothing.
+    fn of_form(form: &RegisterForm, pending: &PendingRegistration) -> Self {
+        let nickname =
+            first_text(form.nickname.as_deref(), pending.nickname.as_deref()).unwrap_or_default();
+        let email = first_text(form.email.as_deref(), pending.email.as_deref());
+        let provider_email_verified = email.as_deref().is_some_and(|registered| {
+            pending.email.as_deref().is_some_and(|said| {
+                !said.trim().is_empty() && said.trim().eq_ignore_ascii_case(registered)
+            })
+        });
+        Self {
+            nickname,
+            email,
+            name: first_text(form.name.as_deref(), pending.name.as_deref()),
+            bio: form.bio.clone(),
+            provider_email_verified,
+        }
+    }
+
+    /// The [`RegisterParams`] of a resolved submission: the password is a
+    /// fresh random token nobody will ever type (see
+    /// [`EXTERNAL_PASSWORD_BYTES`]), and no registration reason or invite
+    /// belongs to an external signup.
+    fn into_register_params(self) -> RegisterParams {
+        RegisterParams {
+            nickname: self.nickname,
+            email: self.email,
+            password: random_token(EXTERNAL_PASSWORD_BYTES),
+            name: self.name,
+            bio: self.bio,
+            reason: None,
+            provider_email_verified: self.provider_email_verified,
+        }
+    }
+}
+
+/// The first non-blank text of the two, trimmed: what the form said wins,
+/// the provider's `pending` value stands in when the form left the field
+/// blank — Pleroma's `create_from_registration` reads its submission above
+/// the stored registration info the same way.
+fn first_text(submitted: Option<&str>, stored: Option<&str>) -> Option<String> {
+    submitted
+        .into_iter()
+        .chain(stored)
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 /// Where one callback's identification landed.
 #[derive(Debug)]
 enum Landing {
@@ -405,7 +751,8 @@ fn offered_code<'a>(error: Option<&'a str>, code: Option<&'a str>) -> Option<&'a
     code.filter(|text| !text.is_empty())
 }
 
-/// The login the callback earned: the stored application, redirect URI and
+/// The login a finished flow earned, from the callback's linked user or a
+/// completed registration: the stored application, redirect URI and
 /// scopes re-checked the way the consent submission checks its round-tripped
 /// form, then the readiness gate, then the very same code and delivery.
 ///
@@ -758,7 +1105,7 @@ mod tests {
         assert_eq!(params.state, None, "an unstored echo is absent");
 
         // A `pending` key from an unlinked callback rides along unread: it
-        // is the registration ticket's document, not this one.
+        // is [`PendingRegistration`]'s document, not this one.
         let pending = OauthLoginState {
             params: json!({"client_id": "c", "redirect_uri": "r", "pending": {"uid": "1"}}),
             ..row
@@ -1031,6 +1378,287 @@ mod tests {
                 "`{uri}` names no live state"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_registration_pages_refuse_a_stateless_request_as_400() {
+        let get = router()
+            .with_state(test_state(&["github"]))
+            .oneshot(
+                Request::get("/oauth/registration_details")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("the router answers in process");
+        assert_eq!(get.status(), StatusCode::BAD_REQUEST, "no state, no form");
+        assert_eq!(
+            header_of(&get, header::CONTENT_TYPE).as_deref(),
+            Some("application/json"),
+            "the refusal is JSON"
+        );
+        let post = router()
+            .with_state(test_state(&["github"]))
+            .oneshot(
+                Request::post("/oauth/register")
+                    .header(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/x-www-form-urlencoded"),
+                    )
+                    .body(axum::body::Body::from("state=&nickname=octo"))
+                    .unwrap(),
+            )
+            .await
+            .expect("the router answers in process");
+        assert_eq!(
+            post.status(),
+            StatusCode::BAD_REQUEST,
+            "an empty state submits to nothing"
+        );
+    }
+
+    #[test]
+    fn the_pending_document_reads_back_out_of_a_state_row() {
+        let row = |params: Value| OauthLoginState {
+            state: "a-state".to_owned(),
+            provider: "github".to_owned(),
+            params,
+            valid_until: Utc::now(),
+        };
+        let pending = PendingRegistration::of_state(&row(json!({
+            "client_id": "c",
+            "pending": {
+                "provider": "github",
+                "uid": "4242",
+                "nickname": "octocat",
+                "email": null,
+                "name": "The Octocat",
+            },
+        })))
+        .expect("the callback's document reads");
+        assert_eq!(pending.provider, "github", "the link's provider");
+        assert_eq!(pending.uid, "4242", "the link's account id");
+        assert_eq!(pending.nickname.as_deref(), Some("octocat"), "the prefill");
+        assert_eq!(pending.email, None, "a null is the provider saying nothing");
+        assert_eq!(
+            pending.name.as_deref(),
+            Some("The Octocat"),
+            "and the rest comes through"
+        );
+
+        for unusable in [
+            json!({"client_id": "c"}),
+            json!({"pending": null}),
+            json!({"pending": "nope"}),
+            json!({"pending": {"provider": "github", "uid": ""}}),
+            json!({"pending": {"provider": "", "uid": "4242"}}),
+            json!({"pending": {"uid": "4242"}}),
+            json!({"pending": {"provider": 7, "uid": "4242"}}),
+        ] {
+            assert!(
+                PendingRegistration::of_state(&row(unusable.clone())).is_none(),
+                "`{unusable}` names no account to register: it is no state",
+            );
+        }
+    }
+
+    #[test]
+    fn submitted_fields_prefer_the_form_and_fall_back_to_the_provider() {
+        let pending = PendingRegistration {
+            provider: "github".to_owned(),
+            uid: "4242".to_owned(),
+            nickname: Some("octocat".to_owned()),
+            email: Some("OctoCat@GitHub.Example".to_owned()),
+            name: None,
+        };
+        let form: RegisterForm = crate::extract::into_params(json!({
+            "state": "s",
+            "nickname": "  chosen  ",
+            "email": "",
+            "bio": " hi ",
+        }))
+        .expect("every field is optional");
+        let submitted = Submitted::of_form(&form, &pending);
+        assert_eq!(submitted.nickname, "chosen", "the form's, trimmed");
+        assert_eq!(
+            submitted.email.as_deref(),
+            Some("OctoCat@GitHub.Example"),
+            "blank falls back to the provider's"
+        );
+        assert_eq!(submitted.name, None, "nothing says a name");
+        assert_eq!(
+            submitted.bio.as_deref(),
+            Some(" hi "),
+            "the bio is the form's"
+        );
+        assert!(
+            submitted.provider_email_verified,
+            "the fallback email IS the provider's: the address is vouched for"
+        );
+
+        let mismatch: RegisterForm = crate::extract::into_params(json!({
+            "state": "s",
+            "email": "someone-else@example.org",
+        }))
+        .expect("the optional fields may all be absent");
+        let changed = Submitted::of_form(&mismatch, &pending);
+        assert!(
+            !changed.provider_email_verified,
+            "a different email needs the confirmation click after all"
+        );
+
+        let nothing = PendingRegistration {
+            email: None,
+            ..pending
+        };
+        assert!(
+            !Submitted::of_form(&form, &nothing).provider_email_verified,
+            "a provider that said no email vouched for nothing"
+        );
+        let both_blank = Submitted::of_form(
+            &crate::extract::into_params(json!({"state": "s", "nickname": "  "}))
+                .expect("a bare submission"),
+            &PendingRegistration {
+                provider: "github".to_owned(),
+                uid: "4242".to_owned(),
+                nickname: None,
+                email: Some("   ".to_owned()),
+                name: None,
+            },
+        );
+        assert_eq!(both_blank.nickname, "", "no nickname anywhere is the blank");
+        assert_eq!(both_blank.email, None, "and a blank provider email is none");
+    }
+
+    #[test]
+    fn the_external_password_is_a_fresh_random_secret() {
+        let pending = PendingRegistration {
+            provider: "github".to_owned(),
+            uid: "4242".to_owned(),
+            nickname: Some("octocat".to_owned()),
+            email: None,
+            name: None,
+        };
+        let form: RegisterForm =
+            crate::extract::into_params(json!({"state": "s"})).expect("all optional");
+        let first = Submitted::of_form(&form, &pending).into_register_params();
+        let second = Submitted::of_form(&form, &pending).into_register_params();
+        assert_eq!(first.password.len(), 86, "64 random bytes, base64url");
+        assert_ne!(
+            first.password, second.password,
+            "and never the same secret twice"
+        );
+        assert!(
+            first
+                .password
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "URL-safe by construction: {}",
+            first.password
+        );
+        assert_eq!(
+            first.nickname, "octocat",
+            "the provider's nickname stands in"
+        );
+        assert_eq!(first.email, None, "no email is no email");
+        assert!(first.reason.is_none(), "an external signup gives no reason");
+        assert!(
+            !first.provider_email_verified,
+            "nothing was vouched for when the provider said no email"
+        );
+    }
+
+    #[test]
+    fn the_field_errors_render_as_one_line_above_the_form() {
+        let mut errors = FieldErrors::new();
+        let _new = errors.insert("nickname", vec!["has already been taken".to_owned()]);
+        assert_eq!(
+            validation_line(&errors),
+            "nickname has already been taken",
+            "Pleroma's `field message` spelling"
+        );
+        let _prior = errors.insert(
+            "email",
+            vec!["can't be blank".to_owned(), "has invalid format".to_owned()],
+        );
+        assert_eq!(
+            validation_line(&errors),
+            "email can't be blank, has invalid format; nickname has already been taken",
+            "every field, messages joined, fields ordered and separated"
+        );
+    }
+
+    #[test]
+    fn the_refused_form_keeps_the_submission_and_names_the_error() {
+        let form: RegisterForm = crate::extract::into_params(json!({
+            "state": "s",
+            "nickname": "kept",
+            "email": "a&b@example.org",
+            "bio": "</textarea><p>x</p>",
+        }))
+        .expect("a submission");
+        let AuthorizeReply::Page(html) =
+            refused_form(&form, "s", "nickname has already been taken")
+        else {
+            panic!("a refused registration re-renders a page, never a redirect")
+        };
+        assert!(html.contains("value=\"kept\""), "what the user typed stays");
+        assert!(
+            html.contains("value=\"a&amp;b@example.org\""),
+            "escaped, as ever"
+        );
+        assert!(
+            !html.contains("</textarea><p>x</p>"),
+            "a bio cannot close its textarea: {html}"
+        );
+        assert!(
+            html.contains("role=\"alert\">nickname has already been taken</p>"),
+            "the error line stands above the form"
+        );
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"state\" value=\"s\">"),
+            "and the state rides along for the retry"
+        );
+    }
+
+    #[test]
+    fn the_pending_form_prefills_the_provider_and_blanks_the_rest() {
+        let row = OauthLoginState {
+            state: "issued".to_owned(),
+            provider: "github".to_owned(),
+            params: json!({"client_id": "c"}),
+            valid_until: Utc::now(),
+        };
+        let pending = PendingRegistration {
+            provider: "github".to_owned(),
+            uid: "4242".to_owned(),
+            nickname: Some("octocat".to_owned()),
+            email: None,
+            name: Some("a\"b".to_owned()),
+        };
+        let AuthorizeReply::Page(html) = pending_form(&row, &pending) else {
+            panic!("a form is a page")
+        };
+        assert!(
+            html.contains("name=\"nickname\" value=\"octocat\""),
+            "the provider's nickname prefills"
+        );
+        assert!(
+            html.contains("name=\"email\" value=\"\""),
+            "a provider that said no email renders a blank field"
+        );
+        assert!(
+            html.contains("name=\"name\" value=\"a&quot;b\""),
+            "and the name is escaped in its attribute"
+        );
+        assert!(
+            html.contains("<input type=\"hidden\" name=\"state\" value=\"issued\">"),
+            "the state goes out hidden"
+        );
+        assert!(
+            !html.contains("role=\"alert\""),
+            "a fresh form has no error"
+        );
     }
 
     #[tokio::test]

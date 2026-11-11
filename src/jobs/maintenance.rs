@@ -16,11 +16,12 @@
 //! once per day, the window Pleroma-style retention gives them.
 //!
 //! [`handle_tokens`] (job kind [`KIND_TOKENS`]) is the second: one hourly
-//! pass over the four short-lived credential tables, deleting the rows no
+//! pass over the five short-lived credential tables, deleting the rows no
 //! read accepts any more — `oauth_tokens` expired beyond the week their
 //! refresh token buys them, spent or expired `oauth_authorizations` codes,
-//! expired `mfa_tokens` challenges, and spent or lapsed
-//! `password_reset_tokens` — summing the rows reclaimed into one count.
+//! expired `mfa_tokens` challenges, spent or lapsed
+//! `password_reset_tokens`, and expired `oauth_login_states` round-trip
+//! states — summing the rows reclaimed into one count.
 //! The reference is Pleroma's `ClearOauthTokenWorker`
 //! (`lib/pleroma/workers/cron/clear_oauth_token_worker.ex`), which clears
 //! expired tokens on a daily cron; here one sweep covers every credential
@@ -191,6 +192,18 @@ async fn delete_expired_mfa_tokens(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(deleted.rows_affected())
 }
 
+/// The `DELETE` behind [`delete_expired_login_states`]: every
+/// `oauth_login_states` round-trip state at or past its `valid_until` —
+/// the negation of the `valid_until > now()` reads
+/// [`oauth_login_state::get_valid`] and
+/// [`oauth_login_state::get_live`] answer live states by. A finished
+/// registration deletes its own row; this is the sweep for the ones its
+/// browser never came back for.
+///
+/// [`oauth_login_state::get_valid`]: crate::models::oauth_login_state::get_valid
+/// [`oauth_login_state::get_live`]: crate::models::oauth_login_state::get_live
+const DELETE_LOGIN_STATES_SQL: &str = "DELETE FROM oauth_login_states WHERE valid_until <= now()";
+
 /// Deletes the `password_reset_tokens` that are spent or outside the
 /// validity window `ttl` — the window [`handle_tokens`] reads from
 /// [`Config::password_reset_ttl_secs`](crate::config::Config::password_reset_ttl_secs)
@@ -207,7 +220,14 @@ async fn delete_dead_password_reset_tokens(
     Ok(deleted.rows_affected())
 }
 
-/// Runs one token sweep: the four table deletes, their rows-affected
+/// Deletes the `oauth_login_states` past their ten-minute window, reporting
+/// how many rows went.
+async fn delete_expired_login_states(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let deleted = query(DELETE_LOGIN_STATES_SQL).execute(pool).await?;
+    Ok(deleted.rows_affected())
+}
+
+/// Runs one token sweep: the five table deletes, their rows-affected
 /// summed into one count.
 ///
 /// Split out from [`handle_tokens`] so the handler is only the
@@ -221,17 +241,19 @@ async fn sweep_tokens(state: &AppState) -> Result<u64, sqlx::Error> {
     let authorizations = delete_dead_authorizations(&state.db).await?;
     let mfa_tokens = delete_expired_mfa_tokens(&state.db).await?;
     let reset_tokens = delete_dead_password_reset_tokens(&state.db, ttl).await?;
-    Ok(oauth_tokens + authorizations + mfa_tokens + reset_tokens)
+    let login_states = delete_expired_login_states(&state.db).await?;
+    Ok(oauth_tokens + authorizations + mfa_tokens + reset_tokens + login_states)
 }
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_TOKENS`]: one
 /// sweep of the dead credential rows, logging how many it deleted.
 ///
-/// The four deletes cover `oauth_tokens` expired beyond the
+/// The five deletes cover `oauth_tokens` expired beyond the
 /// `OAUTH_TOKEN_GRACE_DAYS`-day refresh grace, `oauth_authorizations`
-/// spent or expired, `mfa_tokens` expired, and `password_reset_tokens`
-/// spent or outside the configured ttl window. Every row they match is one
-/// no read path accepts any more, so the sweep only reclaims storage.
+/// spent or expired, `mfa_tokens` expired, `password_reset_tokens` spent
+/// or outside the configured ttl window, and `oauth_login_states` past
+/// their ten minutes. Every row they match is one no read path accepts any
+/// more, so the sweep only reclaims storage.
 ///
 /// A failed pass is a [`JobError::Retry`], and the scheduler enqueues the
 /// next hour regardless, so the same sweep runs again shortly; a pass lost
@@ -851,6 +873,35 @@ mod tests {
         id
     }
 
+    /// Inserts an `oauth_login_states` round-trip state expiring `secs`
+    /// seconds from now (negative for one already aged out), returning its
+    /// state key — the table's primary key is the text the sweep matches.
+    async fn login_state_row(pool: &PgPool, secs: i64) -> String {
+        let state = format!("state-{secs}-{}", Uuid::now_v7());
+        let written = query(
+            "INSERT INTO oauth_login_states (state, provider, params, valid_until)
+             VALUES ($1, 'github', '{}', now() + make_interval(secs => $2))",
+        )
+        .bind(&state)
+        .bind(secs)
+        .execute(pool)
+        .await
+        .expect("the fixture login state inserts");
+        assert_eq!(written.rows_affected(), 1, "one row was written");
+        state
+    }
+
+    /// Whether the `oauth_login_states` row keyed `state` is still there.
+    async fn login_state_exists(pool: &PgPool, state: &str) -> bool {
+        let rows =
+            query_scalar::<_, i64>("SELECT count(*) FROM oauth_login_states WHERE state = $1")
+                .bind(state)
+                .fetch_one(pool)
+                .await
+                .expect("the state count reads");
+        rows == 1
+    }
+
     /// Whether `table` — one of the swept tables, named by the test — still
     /// holds the row with primary key `id`. The table names are test
     /// constants, never user input, so the dynamic statement is asserted
@@ -1007,6 +1058,8 @@ mod tests {
         let spent_reset = password_reset_row(&pool, &alice, 60, true).await;
         let lapsed_reset = password_reset_row(&pool, &alice, DAY + 60, false).await;
         let fresh_reset = password_reset_row(&pool, &alice, 60, false).await;
+        let expired_state = login_state_row(&pool, -1).await;
+        let live_state = login_state_row(&pool, 300).await;
 
         let outcome = handle_tokens(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
@@ -1050,6 +1103,14 @@ mod tests {
         assert!(
             row_exists(&pool, "password_reset_tokens", fresh_reset).await,
             "a fresh unused reset token stays"
+        );
+        assert!(
+            !login_state_exists(&pool, &expired_state).await,
+            "a login state past its ten minutes goes: no read answers it any more"
+        );
+        assert!(
+            login_state_exists(&pool, &live_state).await,
+            "a round trip still inside its window stays"
         );
     }
 
