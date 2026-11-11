@@ -1,0 +1,15 @@
+{
+  "@context": ["https://www.w3.org/ns/activitystreams", "https://w3id.org/security/v1"],
+  "id": "https://remote.example/articles/on-parsing",
+  "type": "Article",
+  "attributedTo": "https://remote.example/users/bob",
+  "to": ["https://www.w3.org/ns/activitystreams#Public"],
+  "cc": ["https://remote.example/users/bob/followers"],
+  "name": "On Parsing",
+  "title": "On Parsing",
+  "url": "https://remote.example/@bob/article/1",
+  "content": "<p>Body <em>text</em> with an <a href=\"https://example.org/ref\">external reference</a>.</p>",
+  "context": "https://remote.example/contexts/article",
+  "published": "2024-02-04T12:00:00.000Z",
+  "image": { "type": "Image", "url": "https://remote.example/articles/cover.png" }
+}
