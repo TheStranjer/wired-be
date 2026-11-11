@@ -4,12 +4,12 @@
 //! this module is the producer of the rows that fire on a schedule. The
 //! [`periodic_jobs`] registry lists every recurring job (today the
 //! streaming hub's reference-table sweep, the mutes expiry sweep, the
-//! idempotency-key sweep, the status-expiry sweep, the daily
-//! dismissed-notification sweep, the hourly OAuth/MFA/password-reset
-//! token sweep, the daily jobs-table prune, the daily deleted-local-status
-//! purge and the six-hourly orphaned-local-media sweep; later tickets
-//! append one line per entry), and [`run`] ticks every ten seconds,
-//! enqueueing each registry job with the
+//! idempotency-key sweep, the status-expiry sweep, the scheduled-status
+//! fire sweep, the daily dismissed-notification sweep, the hourly
+//! OAuth/MFA/password-reset token sweep, the daily jobs-table prune, the
+//! daily deleted-local-status purge and the six-hourly orphaned-local-media
+//! sweep; later tickets append one line per entry), and [`run`] ticks every
+//! ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
 //! for the same period, so the queue's deduplication index (see
@@ -72,7 +72,14 @@ pub struct PeriodicJob {
 /// [`super::statuses::sweep_job`], on the same queue once every five minutes:
 /// the per-status [`statuses.expire`](super::statuses::KIND_EXPIRE) job is
 /// the scheduled delete proper, and this pass catches whatever a lost job
-/// row or a spent retry budget would otherwise leave posted forever. The
+/// row or a spent retry budget would otherwise leave posted forever — and
+/// the safety sweep of scheduled statuses whose `scheduled_at` has run out
+/// ([`scheduled_statuses.sweep`](super::scheduled_statuses::KIND_SWEEP)),
+/// [`super::scheduled_statuses::sweep_job`], on the same queue once every
+/// five minutes: the per-row
+/// [`scheduled_statuses.publish`](super::scheduled_statuses::KIND_PUBLISH)
+/// job is the fire proper, and this pass publishes whatever a lost job row
+/// or a spent retry budget would otherwise leave parked forever. The
 /// daily sweep of notifications dismissed beyond their retention
 /// ([`KIND_NOTIFICATIONS`](super::maintenance::KIND_NOTIFICATIONS)) sits on the
 /// same queue too: dismissal already hides those rows from every read, so a
@@ -114,6 +121,7 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             every: Duration::from_secs(600),
         },
         super::statuses::sweep_job(),
+        super::scheduled_statuses::sweep_job(),
         PeriodicJob {
             kind: super::maintenance::KIND_NOTIFICATIONS,
             queue: super::QUEUE_BACKGROUND,

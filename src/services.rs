@@ -50,6 +50,13 @@
 //! Pleroma's `RichMedia.Parser` and `RichMedia.Card`. The fetch, the storage
 //! and the job that runs them are not here.
 //!
+//! [`schedule_status`] is the same body's parked twin: it decides what a
+//! `scheduled_at` create may store — the create's own checks first, then the
+//! window, the per-account limits and the media reservation — and hands the
+//! normalised request to the
+//! [`scheduled_statuses`](crate::jobs::scheduled_statuses) queue, so the
+//! endpoint's schedule arm never re-decides any of it.
+//!
 //! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
@@ -71,6 +78,7 @@ pub mod mentions;
 pub mod notify;
 pub mod render_status;
 pub mod rich_media;
+pub mod schedule_status;
 pub mod timeline;
 pub mod translate;
 pub mod vapid;

@@ -232,6 +232,14 @@ fn job_registry() -> JobRegistry {
     registry.register(jobs::deletion::KIND_DELETE, jobs::deletion::handle_delete);
     registry.register(jobs::statuses::KIND_EXPIRE, jobs::statuses::handle_expire);
     registry.register(jobs::statuses::KIND_SWEEP, jobs::statuses::handle_sweep);
+    registry.register(
+        jobs::scheduled_statuses::KIND_PUBLISH,
+        jobs::scheduled_statuses::handle_publish,
+    );
+    registry.register(
+        jobs::scheduled_statuses::KIND_SWEEP,
+        jobs::scheduled_statuses::handle_sweep,
+    );
     registry.register(jobs::web_push::KIND_DELIVER, jobs::web_push::handle_deliver);
     registry.register(jobs::rich_media::KIND_FETCH, jobs::rich_media::handle_fetch);
     registry.register(mailer::KIND_SEND, mailer::handle);

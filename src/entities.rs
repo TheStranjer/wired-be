@@ -35,7 +35,11 @@
 //! Pleroma's `BookmarkFolder` entity, whose `emoji_url` the endpoint
 //! resolves from `custom_emojis` before the pure render. [`status_edit`] one
 //! element of the `GET /api/v1/statuses/{id}/history` answer: a status
-//! version, superseded or current.
+//! version, superseded or current. [`scheduled_status`] the Mastodon
+//! `ScheduledStatus` entity: one parked create-status request, its params
+//! jsonb re-keyed the way Pleroma's `ScheduledActivityView.status_params`
+//! renders them — unfilled keys echoed as `null` — beside the rendered
+//! attachments of its own row.
 
 pub mod account;
 pub mod announcement;
@@ -55,6 +59,7 @@ pub mod poll;
 pub mod push_subscription;
 pub mod relationship;
 pub mod report;
+pub mod scheduled_status;
 pub mod scrobble;
 pub mod status;
 pub mod status_edit;

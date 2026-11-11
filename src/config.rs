@@ -69,6 +69,15 @@ pub const MAX_PINNED_STATUSES_VAR: &str = "MAX_PINNED_STATUSES";
 /// Environment variable holding the shortest `expires_in` a status may ask
 /// for, in seconds.
 pub const MIN_EXPIRATION_SECS_VAR: &str = "MIN_EXPIRATION_SECS";
+/// Environment variable holding how far in the future a
+/// `POST /api/v1/statuses` `scheduled_at` must be, in seconds.
+pub const MIN_SCHEDULED_SECS_VAR: &str = "MIN_SCHEDULED_SECS";
+/// Environment variable holding how many pending scheduled rows one account
+/// may hold.
+pub const MAX_SCHEDULED_PER_USER_VAR: &str = "MAX_SCHEDULED_PER_USER";
+/// Environment variable holding how many pending scheduled rows one account
+/// may hold for one UTC day.
+pub const MAX_SCHEDULED_PER_USER_PER_DAY_VAR: &str = "MAX_SCHEDULED_PER_USER_PER_DAY";
 /// Environment variable holding the maximum size of one uploaded file.
 pub const UPLOAD_LIMIT_BYTES_VAR: &str = "UPLOAD_LIMIT_BYTES";
 /// Environment variable holding the maximum pixel count of an uploaded
@@ -345,6 +354,28 @@ pub const DEFAULT_MAX_PINNED_STATUSES: usize = 1;
 /// `POST /api/v1/statuses` refuses a shorter `expires_in` with 422, so a
 /// client cannot schedule a purge faster than ten minutes out.
 pub const DEFAULT_MIN_EXPIRATION_SECS: usize = 600;
+/// Scheduled-statuses window used when `MIN_SCHEDULED_SECS` is unset.
+///
+/// Pleroma's `Pleroma.ScheduledActivity` `@min_offset` ships as
+/// `:timer.minutes(5)`: the scheduled-statuses window check will refuse a
+/// `POST /api/v1/statuses` `scheduled_at` less than five minutes ahead.
+pub const DEFAULT_MIN_SCHEDULED_SECS: usize = 300;
+/// Pending scheduled rows per account used when `MAX_SCHEDULED_PER_USER` is
+/// unset.
+///
+/// Pleroma's `[:Pleroma.ScheduledActivity, :total_user_limit]` ships as 300:
+/// the per-user scheduled-status limit check will refuse a `POST
+/// /api/v1/statuses` `scheduled_at` that would take one account past this
+/// many pending rows.
+pub const DEFAULT_MAX_SCHEDULED_PER_USER: usize = 300;
+/// Pending scheduled rows per account per day used when
+/// `MAX_SCHEDULED_PER_USER_PER_DAY` is unset.
+///
+/// Pleroma's `[:Pleroma.ScheduledActivity, :daily_user_limit]` ships as 25:
+/// the per-user-per-day scheduled-status limit check will refuse a `POST
+/// /api/v1/statuses` `scheduled_at` falling on a UTC day that already holds
+/// this many pending rows for the account.
+pub const DEFAULT_MAX_SCHEDULED_PER_USER_PER_DAY: usize = 25;
 /// Upload file size used when `UPLOAD_LIMIT_BYTES` is unset: the 16 MB of
 /// Pleroma's `:upload, max_size` (decimal, so just under the middleware's
 /// 16 MiB body cap).
@@ -507,6 +538,17 @@ pub const DEFAULT_MEDIA_PROXY_ENABLED: bool = false;
 /// 50 MB, the order of magnitude Pleroma's `max_body_length` media
 /// proxying allows.
 pub const DEFAULT_MEDIA_PROXY_MAX_BYTES: usize = 50_000_000;
+/// The media-proxy defaults together as a [`MediaProxyConfig`], spelled
+/// once for [`Config::test_defaults`]'s literal; the real read of the same
+/// group is the `media_proxy_settings` function.
+#[cfg(any(test, feature = "integration-tests"))]
+const TEST_MEDIA_PROXY: MediaProxyConfig = MediaProxyConfig {
+    enabled: DEFAULT_MEDIA_PROXY_ENABLED,
+    secret: None,
+    base_url: None,
+    max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
+    blacklist: Vec::new(),
+};
 /// Minimum length, in characters, of `MEDIA_PROXY_SECRET` when the media
 /// proxy is enabled: 32 bytes of key material for HMAC-SHA256.
 pub const MIN_MEDIA_PROXY_SECRET_CHARS: usize = 32;
@@ -777,7 +819,8 @@ impl fmt::Debug for VapidConfig {
 ///
 /// [`crate::services::translate`] turns one of these into the translator the
 /// endpoints use. [`api_key`](Self::api_key) is secret material: the manual
-/// `Debug` impl below redacts it.
+/// `Debug` impl below redacts it. The [`Default`] is the unset state: no
+/// provider, no URL, no key.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct TranslationConfig {
     /// The provider to translate with, from `TRANSLATION_PROVIDER`;
@@ -954,6 +997,20 @@ pub struct Config {
     /// stores the accepted span as the status's `expires_at` (see
     /// [`crate::jobs::statuses`]).
     pub min_expiration_secs: usize,
+    /// How far in the future a `POST /api/v1/statuses` `scheduled_at` must
+    /// be, in seconds, from `MIN_SCHEDULED_SECS`; the scheduled-statuses
+    /// window check will refuse a `scheduled_at` less than this many seconds
+    /// ahead.
+    pub min_scheduled_secs: usize,
+    /// How many pending scheduled rows one account may hold, from
+    /// `MAX_SCHEDULED_PER_USER`; the per-user scheduled-status limit check
+    /// will refuse a `POST /api/v1/statuses` `scheduled_at` past this count.
+    pub max_scheduled_per_user: usize,
+    /// How many pending scheduled rows one account may hold for one UTC day,
+    /// from `MAX_SCHEDULED_PER_USER_PER_DAY`; the per-user-per-day
+    /// scheduled-status limit check will refuse a `scheduled_at` on a day
+    /// that already holds this many.
+    pub max_scheduled_per_user_per_day: usize,
     /// Per-request limits for multipart uploads, from `UPLOAD_LIMIT_BYTES`
     /// and `UPLOAD_MAX_FILES`.
     pub upload_limits: UploadLimits,
@@ -1181,16 +1238,12 @@ impl Config {
         F: Fn(&str) -> Option<String>,
     {
         let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
-        let profile = instance_profile(&lookup);
-        let limits = content_limits(&lookup)?;
-        let text = text_length_limits(&lookup)?;
+        let (profile, limits, text) = profile_and_limits(&lookup)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
-        let auth = auth_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
-        let exposure = client_exposure(&lookup)?;
         let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(&lookup)?;
-        let mailer = mailer_settings(&lookup, domain_of(&base_url))?;
+        let (auth, exposure, mailer) = signup_and_mail(&lookup, domain_of(&base_url))?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -1214,6 +1267,9 @@ impl Config {
             max_image_pixels: limits.image_pixels,
             max_pinned_statuses: limits.pinned_statuses,
             min_expiration_secs: limits.min_expiration_secs,
+            min_scheduled_secs: limits.min_scheduled_secs,
+            max_scheduled_per_user: limits.max_scheduled_per_user,
+            max_scheduled_per_user_per_day: limits.max_scheduled_per_user_per_day,
             upload_limits,
             avatar_limit_bytes,
             banner_limit_bytes,
@@ -1361,6 +1417,9 @@ impl Config {
             max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
             max_pinned_statuses: DEFAULT_MAX_PINNED_STATUSES,
             min_expiration_secs: DEFAULT_MIN_EXPIRATION_SECS,
+            min_scheduled_secs: DEFAULT_MIN_SCHEDULED_SECS,
+            max_scheduled_per_user: DEFAULT_MAX_SCHEDULED_PER_USER,
+            max_scheduled_per_user_per_day: DEFAULT_MAX_SCHEDULED_PER_USER_PER_DAY,
             upload_limits: TEST_UPLOAD_LIMITS,
             avatar_limit_bytes: DEFAULT_AVATAR_LIMIT_BYTES,
             banner_limit_bytes: DEFAULT_BANNER_LIMIT_BYTES,
@@ -1397,13 +1456,7 @@ impl Config {
             smtp_tls: SmtpTls::default(),
             mail_from: default_mail_from(domain_of(TEST_BASE_URL)),
             secret_key_base: None,
-            media_proxy: MediaProxyConfig {
-                enabled: DEFAULT_MEDIA_PROXY_ENABLED,
-                secret: None,
-                base_url: None,
-                max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
-                blacklist: Vec::new(),
-            },
+            media_proxy: TEST_MEDIA_PROXY,
             rich_media_ignore_hosts: comma_list(DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
             rich_media_remote: Toggle::new(DEFAULT_RICH_MEDIA_REMOTE),
             vapid: VapidConfig::default(),
@@ -1857,9 +1910,18 @@ struct ContentLimits {
     /// The unknown-remote mentions one status may look up
     /// (`MAX_REMOTE_MENTION_LOOKUPS`).
     max_remote_mention_lookups: usize,
+    /// How far in the future a `scheduled_at` create must be, in seconds
+    /// (`MIN_SCHEDULED_SECS`).
+    min_scheduled_secs: usize,
+    /// How many pending scheduled rows one account may hold
+    /// (`MAX_SCHEDULED_PER_USER`).
+    max_scheduled_per_user: usize,
+    /// How many pending scheduled rows one account may hold for one UTC
+    /// day (`MAX_SCHEDULED_PER_USER_PER_DAY`).
+    max_scheduled_per_user_per_day: usize,
 }
 
-/// Reads the thirteen plain numeric content limits: the maximum status length
+/// Reads the sixteen plain numeric content limits: the maximum status length
 /// (`MAX_STATUS_CHARS`), the media attachment count
 /// (`MAX_MEDIA_ATTACHMENTS`), the poll option count (`MAX_POLL_OPTIONS`),
 /// the poll option length (`MAX_POLL_OPTION_CHARS`), the shortest
@@ -1870,8 +1932,12 @@ struct ContentLimits {
 /// statuses one account may pin to its profile (`MAX_PINNED_STATUSES`),
 /// the shortest `expires_in` a status create may ask for
 /// (`MIN_EXPIRATION_SECS`), the largest inbound inbox body
-/// (`INBOX_MAX_BYTES`) and the unknown-remote mentions one status may look
-/// up (`MAX_REMOTE_MENTION_LOOKUPS`). Grouped because each is the same
+/// (`INBOX_MAX_BYTES`), the unknown-remote mentions one status may look
+/// up (`MAX_REMOTE_MENTION_LOOKUPS`) and the three settings that bound
+/// scheduled statuses: the `scheduled_at` window (`MIN_SCHEDULED_SECS`),
+/// the pending rows one account may hold (`MAX_SCHEDULED_PER_USER`) and
+/// the pending rows it may hold for one UTC day
+/// (`MAX_SCHEDULED_PER_USER_PER_DAY`). Grouped because each is the same
 /// `number` read and [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
 /// # Errors
@@ -1919,6 +1985,17 @@ where
             lookup,
             MAX_REMOTE_MENTION_LOOKUPS_VAR,
             DEFAULT_MAX_REMOTE_MENTION_LOOKUPS,
+        )?,
+        min_scheduled_secs: number(lookup, MIN_SCHEDULED_SECS_VAR, DEFAULT_MIN_SCHEDULED_SECS)?,
+        max_scheduled_per_user: number(
+            lookup,
+            MAX_SCHEDULED_PER_USER_VAR,
+            DEFAULT_MAX_SCHEDULED_PER_USER,
+        )?,
+        max_scheduled_per_user_per_day: number(
+            lookup,
+            MAX_SCHEDULED_PER_USER_PER_DAY_VAR,
+            DEFAULT_MAX_SCHEDULED_PER_USER_PER_DAY,
         )?,
     })
 }
@@ -2012,6 +2089,32 @@ where
         bio_chars: number(lookup, MAX_BIO_CHARS_VAR, DEFAULT_MAX_BIO_CHARS)?,
         profile_fields: number(lookup, MAX_PROFILE_FIELDS_VAR, DEFAULT_MAX_PROFILE_FIELDS)?,
     })
+}
+
+/// The shape [`profile_and_limits`] answers: the instance's profile, its
+/// numeric content limits and its per-field text limits, in the order the
+/// three groups feed the [`Config`] fields; factored out because a
+/// three-value tuple of structs is a very complex type to spell inline.
+type Wording = (InstanceProfile, ContentLimits, TextLengthLimits);
+
+/// Reads the three groups that shape what the instance says about itself
+/// and how much of it a client may send: the [`instance_profile`], the
+/// [`content_limits`] and the [`text_length_limits`] beside it. Grouped
+/// because [`Config::from_lookup`] has a size budget (AGENTS.md); see
+/// [`Wording`].
+///
+/// # Errors
+///
+/// Those of [`content_limits`] and [`text_length_limits`].
+fn profile_and_limits<F>(lookup: &F) -> Result<Wording, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        instance_profile(lookup),
+        content_limits(lookup)?,
+        text_length_limits(lookup)?,
+    ))
 }
 
 /// The shape [`upload_settings`] answers: the per-request multipart limits
@@ -2121,6 +2224,34 @@ where
         restrict_unauthenticated,
         available_frontends,
     })
+}
+
+/// The shape [`signup_and_mail`] answers: the account settings, what the
+/// client surface exposes and the mailer settings the confirmation mails
+/// go out over, in the order the three groups feed the [`Config`] fields;
+/// factored out because a three-value tuple of structs is a very complex
+/// type to spell inline.
+type Signup = (AuthSettings, ExposureSettings, MailerSettings);
+
+/// Reads the three groups behind who may get an account and how they are
+/// reached: the [`auth_settings`], the [`client_exposure`] the registration
+/// modes grew, and the [`mailer_settings`] the approval and confirmation
+/// mails go out over, built for `domain` — the instance's own, read off
+/// the normalized base URL. Grouped because [`Config::from_lookup`] has a
+/// size budget (AGENTS.md); see [`Signup`].
+///
+/// # Errors
+///
+/// Those of [`auth_settings`], [`client_exposure`] and [`mailer_settings`].
+fn signup_and_mail<F>(lookup: &F, domain: &str) -> Result<Signup, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok((
+        auth_settings(lookup)?,
+        client_exposure(lookup)?,
+        mailer_settings(lookup, domain)?,
+    ))
 }
 
 /// The areas [`RESTRICT_UNAUTHENTICATED_VAR`] names, as a set of the
@@ -2443,6 +2574,12 @@ impl fmt::Debug for Config {
         // past Clippy's line budget.
         let purge_days = &self.purge_deleted_statuses_days;
         let ping_secs = &self.streaming_ping_interval_secs;
+        // Bound for the same reason: these two names with their `self`
+        // paths pass rustfmt's call width and would otherwise split over
+        // three lines, together pushing the function past Clippy's line
+        // budget.
+        let max_remote_mention_lookups = &self.max_remote_mention_lookups;
+        let max_scheduled_per_day = &self.max_scheduled_per_user_per_day;
         f.debug_struct("Config")
             .field("database_url", &"<redacted>")
             .field("bind_addr", &self.bind_addr)
@@ -2466,14 +2603,14 @@ impl fmt::Debug for Config {
             .field("max_image_pixels", &self.max_image_pixels)
             .field("max_pinned_statuses", &self.max_pinned_statuses)
             .field("min_expiration_secs", &self.min_expiration_secs)
+            .field("min_scheduled_secs", &self.min_scheduled_secs)
+            .field("max_scheduled_per_user", &self.max_scheduled_per_user)
+            .field("max_scheduled_per_user_per_day", max_scheduled_per_day)
             .field("upload_limits", &self.upload_limits)
             .field("avatar_limit_bytes", &self.avatar_limit_bytes)
             .field("banner_limit_bytes", &self.banner_limit_bytes)
             .field("inbox_max_bytes", &self.inbox_max_bytes)
-            .field(
-                "max_remote_mention_lookups",
-                &self.max_remote_mention_lookups,
-            )
+            .field("max_remote_mention_lookups", max_remote_mention_lookups)
             .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
             .field("emoji_dir", &self.emoji_dir)
@@ -3413,6 +3550,65 @@ mod tests {
         assert!(
             debug.contains("max_poll_expiration_secs: 86400"),
             "the poll ceiling is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The scheduled-statuses window and the two per-user limits: Pleroma's
+    /// 300 seconds, 300 rows and 25 rows per day by default, the environment
+    /// overriding each.
+    #[test]
+    fn scheduled_status_limits_default_and_read_their_variables() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.min_scheduled_secs, 300,
+            "default MIN_SCHEDULED_SECS"
+        );
+        assert_eq!(
+            defaults.max_scheduled_per_user, 300,
+            "default MAX_SCHEDULED_PER_USER"
+        );
+        assert_eq!(
+            defaults.max_scheduled_per_user_per_day, 25,
+            "default MAX_SCHEDULED_PER_USER_PER_DAY"
+        );
+
+        let config = config_with(&[
+            (MIN_SCHEDULED_SECS_VAR, "60"),
+            (MAX_SCHEDULED_PER_USER_VAR, "10"),
+            (MAX_SCHEDULED_PER_USER_PER_DAY_VAR, "5"),
+        ]);
+        assert_eq!(config.min_scheduled_secs, 60, "custom MIN_SCHEDULED_SECS");
+        assert_eq!(
+            config.max_scheduled_per_user, 10,
+            "custom MAX_SCHEDULED_PER_USER"
+        );
+        assert_eq!(
+            config.max_scheduled_per_user_per_day, 5,
+            "custom MAX_SCHEDULED_PER_USER_PER_DAY"
+        );
+    }
+
+    /// The three scheduled-status settings are visible in `Debug` output:
+    /// they name limits, not secrets.
+    #[test]
+    fn debug_shows_the_scheduled_status_limits() {
+        let config = config_with(&[
+            (MIN_SCHEDULED_SECS_VAR, "60"),
+            (MAX_SCHEDULED_PER_USER_VAR, "10"),
+            (MAX_SCHEDULED_PER_USER_PER_DAY_VAR, "5"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("min_scheduled_secs: 60"),
+            "the scheduled-statuses window is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_scheduled_per_user: 10"),
+            "the per-user pending cap is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_scheduled_per_user_per_day: 5"),
+            "the per-user per-day cap is visible in Debug output: {debug}"
         );
     }
 
@@ -4870,6 +5066,9 @@ mod tests {
             MAX_REPORT_COMMENT_VAR,
             MAX_PINNED_STATUSES_VAR,
             MIN_EXPIRATION_SECS_VAR,
+            MIN_SCHEDULED_SECS_VAR,
+            MAX_SCHEDULED_PER_USER_VAR,
+            MAX_SCHEDULED_PER_USER_PER_DAY_VAR,
             UPLOAD_LIMIT_BYTES_VAR,
             UPLOAD_MAX_FILES_VAR,
             AVATAR_LIMIT_BYTES_VAR,

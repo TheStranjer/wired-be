@@ -22,10 +22,13 @@
 //! poll (when it carried one) in one transaction through
 //! [`status::insert_conn`] and [`crate::models::poll::create`], and answers
 //! the [`Status`] entity rendered for the author — Pleroma's `for: user`.
-//! The endpoint's remaining parameter — `scheduled_at` — joins
-//! [`CreateStatusParams`] as a further `Option` with its own ticket
-//! (decision 15), and until then a body that sends it is only a body
-//! whose known fields are checked here. `poll` has landed: the
+//! No endpoint parameter is left outstanding. `scheduled_at` has landed:
+//! an RFC3339 instant that routes the request to
+//! [`crate::services::schedule_status`] instead of a create, so the key
+//! never reaches a stored status through this module's create arms — the
+//! schedule parks the normalised params without it, and the publish
+//! replays them through [`create_status`] at the parked moment.
+//! `poll` has landed: the
 //! `poll[options]`/`poll[expires_in]`/`poll[multiple]`/`poll[hide_totals]`
 //! shape the [`ApiBody`] extractor already nests joined
 //! [`CreateStatusParams`], [`check_body`] runs Pleroma's `CommonAPI` poll
@@ -115,7 +118,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -227,43 +230,49 @@ const POLL_WITH_MEDIA: &str = "Polls cannot have attachments";
 /// store the accepted question beside the status row (`media_ids` beside a
 /// poll is the 422 `Polls cannot have attachments`; the ids themselves mean
 /// the post's attachments — see the struct's own `media_ids` field).
-/// `scheduled_at` joins the struct with its own ticket (decision 15), the
-/// same way. The `sensitive` field is a [`flex`] boolean, so a form body's
+/// `scheduled_at` joined the struct with the scheduling ticket: a body
+/// that sends it is not a create at all — see that field below. The
+/// `sensitive` field is a [`flex`] boolean, so a form body's
 /// `sensitive=on` spells what a JSON body's `true` spells.
 ///
+/// The [`Serialize`] half is the schedule's: [`crate::services::schedule_status`]
+/// stores the normalised params as the pending row's jsonb, and the
+/// [`scheduled_statuses.publish`](crate::jobs::scheduled_statuses::KIND_PUBLISH)
+/// job reads them back through this same shape.
+///
 /// [`flex`]: crate::extract::flex
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct CreateStatusParams {
     /// The post text; trimmed, and required to leave something behind.
     #[serde(default)]
-    status: Option<String>,
+    pub status: Option<String>,
     /// The content warning shown in place of the post; at most
     /// `MAX_SPOILER_CHARS` characters, and the empty string when absent.
     #[serde(default)]
-    spoiler_text: Option<String>,
+    pub spoiler_text: Option<String>,
     /// Whether the post starts folded; the author's own default when the body
     /// does not say.
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
-    sensitive: Option<bool>,
+    pub sensitive: Option<bool>,
     /// The requested audience, one of the five [`Visibility`] names; the
     /// author's default scope when absent.
     #[serde(default)]
-    visibility: Option<String>,
+    pub visibility: Option<String>,
     /// The content language tag; at most `MAX_LANGUAGE_CHARS` characters,
     /// and no tag at all when absent or empty.
     #[serde(default)]
-    language: Option<String>,
+    pub language: Option<String>,
     /// The MIME type of the `status` text; [`DEFAULT_CONTENT_TYPE`] when
     /// absent.
     #[serde(default)]
-    content_type: Option<String>,
+    pub content_type: Option<String>,
     /// Whether this is a preview: validate and render, answer the entity a
     /// create would have, write nothing — see [`preview_status`]. Absent,
     /// null and every [`flex`] false spelling are a real post.
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
-    preview: Option<bool>,
+    pub preview: Option<bool>,
     /// Pleroma's expiration extension: seconds from now after which the
     /// post deletes itself. A [`flex`] integer — a form body's
     /// `expires_in=3600` spells what JSON's `3600` spells, and anything
@@ -275,7 +284,7 @@ pub struct CreateStatusParams {
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_i64")]
-    expires_in: Option<i64>,
+    pub expires_in: Option<i64>,
     /// The status this one answers, as id text. A named parent is read
     /// with the same viewer-visibility rules as the show route's shared
     /// gate, so a malformed, unknown, deleted or poster-invisible parent
@@ -286,7 +295,7 @@ pub struct CreateStatusParams {
     /// text itself is never modified. Absent, null or empty is a root
     /// post, Pleroma's own empty-string "no reply" arm.
     #[serde(default)]
-    in_reply_to_id: Option<String>,
+    pub in_reply_to_id: Option<String>,
     /// Pleroma's conversation-reply arm: the id text of the poster's own
     /// [`conversation_participation`](crate::models::conversation::Participation)
     /// row. A named participation makes the post a `direct` reply into
@@ -299,7 +308,7 @@ pub struct CreateStatusParams {
     /// shared 404. Absent, null or empty names no conversation, and the
     /// post stands on [`in_reply_to_id`](Self::in_reply_to_id) alone.
     #[serde(default)]
-    in_reply_to_conversation_id: Option<String>,
+    pub in_reply_to_conversation_id: Option<String>,
     /// The ids of the poster's own unposted uploads this status carries,
     /// in the order they want them to render — decision 10's id-array:
     /// JSON's `["a","b"]` or the form's `media_ids[]=a&media_ids[]=b`,
@@ -316,7 +325,7 @@ pub struct CreateStatusParams {
     ///
     /// [`EditStatusParams`]: self::EditStatusParams
     #[serde(default)]
-    media_ids: Option<Vec<String>>,
+    pub media_ids: Option<Vec<String>>,
     /// The poll the body asks for, in the shape the [`ApiBody`]
     /// extractor nests out of `poll[options][]`, `poll[expires_in]`,
     /// `poll[multiple]` and `poll[hide_totals]` form keys — or out of
@@ -329,7 +338,22 @@ pub struct CreateStatusParams {
     /// [`ApiBody`]: crate::extract::ApiBody
     /// [`Poll`]: crate::entities::poll::Poll
     #[serde(default)]
-    poll: Option<PollRequest>,
+    pub poll: Option<PollRequest>,
+    /// Pleroma's scheduling arm: the instant the post should fire, as
+    /// RFC3339 text. A body that sends it is not a create at all: the
+    /// endpoint hands the whole request to
+    /// [`crate::services::schedule_status`], which validates it exactly
+    /// as a create is validated, parks the normalised params (without
+    /// this key) until that moment, and answers a
+    /// [`ScheduledStatus`](crate::entities::scheduled_status::ScheduledStatus)
+    /// entity instead of a [`Status`]. Absent or null posts now; present
+    /// text that is no RFC3339 instant is the schedule's 422. This key
+    /// is handled by that arm and never by a create — the stored params
+    /// the publish replays carry no `scheduled_at`.
+    ///
+    /// [`Status`]: crate::entities::status::Status
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
 }
 
 /// The `poll` half of a [`CreateStatusParams`] body, as the client wrote
@@ -345,15 +369,18 @@ pub struct CreateStatusParams {
 /// spell. `checked_poll` applies Pleroma's `CommonAPI.Utils` poll rules
 /// and answers the [`CheckedPoll`] both create arms store.
 ///
+/// The [`Serialize`] half is the schedule's: a parked create keeps this
+/// shape in its pending row's jsonb and the publish replays it.
+///
 /// [`ApiBody`]: crate::extract::ApiBody
 /// [`flex`]: crate::extract::flex
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PollRequest {
     /// The options as posted, in order. `#[serde(default)]` lets a poll
     /// that names no options at all reach `checked_poll`'s minimum of
     /// two rather than failing the extractor.
     #[serde(default)]
-    options: Vec<String>,
+    pub options: Vec<String>,
     /// Seconds from now until the poll closes; a [`flex`] integer, with
     /// absent or null meaning a poll that never closes. Accepted values
     /// run from [`Config::min_poll_expiration_secs`] to
@@ -361,19 +388,19 @@ pub struct PollRequest {
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_i64")]
-    expires_in: Option<i64>,
+    pub expires_in: Option<i64>,
     /// Whether one voter may mark several options; a [`flex`] boolean,
     /// `false` when absent or null.
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
-    multiple: Option<bool>,
+    pub multiple: Option<bool>,
     /// Whether the per-option counts stay hidden while the poll runs; a
     /// [`flex`] boolean, `false` when absent or null.
     ///
     /// [`flex`]: crate::extract::flex
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
-    hide_totals: Option<bool>,
+    pub hide_totals: Option<bool>,
 }
 
 /// The poll [`check_body`] accepted.
@@ -1303,8 +1330,9 @@ fn new_status(
 /// name (and a bare `Result` of it trips `type_complexity`).
 type Prepared = (NewStatus, Option<CheckedPoll>);
 
-/// The shared pre-write half of both create arms: [`check_body`] over the
-/// body, the reply's parent when the body names one, the
+/// The shared pre-write half of both create arms and of the schedule
+/// service: [`check_body`] over the body, the reply's parent when the body
+/// names one, the
 /// `in_reply_to_conversation_id` participation when the body names one,
 /// the render through [`render_status_fields`], and the [`NewStatus`] to
 /// store with every reply decision already applied — the parent's id,
@@ -1332,7 +1360,7 @@ type Prepared = (NewStatus, Option<CheckedPoll>);
 /// through [`reply_participation`] for an `in_reply_to_conversation_id`
 /// naming no participation the poster owns, plus any database failure
 /// behind the parent's mention read as [`AppError::Database`].
-async fn prepared_new_status(
+pub(crate) async fn prepared_new_status(
     state: &AppState,
     user: &User,
     app: Option<&OauthApp>,
@@ -1642,14 +1670,15 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         visibility: Some(row.visibility.as_str().to_owned()),
         language: params.language.clone().or_else(|| row.language.clone()),
         content_type: kept(params.content_type.clone(), || row.content_type.clone()),
-        // An edit is never a preview and never replays: the create's two
-        // decision parameters have no part in this merge. An edit never
-        // moves the expiry either — `expires_in` is a creation parameter,
-        // the stored `expires_at` rides along untouched (Pleroma's
-        // `make_update_data` carries it forward the same way) — and never
-        // its parent: an edit rewrites what was said in the thread it
-        // stands in, and `in_reply_to_id` is not an edit parameter. Neither
-        // is a poll: a post's question is fixed when it is asked. The
+        // An edit is never a preview, never a schedule and never replays:
+        // the create's decision parameters have no part in this merge. An
+        // edit never moves the expiry either — `expires_in` is a creation
+        // parameter, the stored `expires_at` rides along untouched
+        // (Pleroma's `make_update_data` carries it forward the same way)
+        // — and never its parent: an edit rewrites what was said in the
+        // thread it stands in, and `in_reply_to_id` is not an edit
+        // parameter. Neither is a poll: a post's question is fixed when it
+        // is asked. The
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
         // which drops what the author may not attach instead of refusing
@@ -1661,6 +1690,7 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         in_reply_to_conversation_id: None,
         poll: None,
         media_ids: None,
+        scheduled_at: None,
     }
 }
 
