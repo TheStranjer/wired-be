@@ -9,8 +9,8 @@ use crate::{
         account_lists, accounts, announcements, apps, blocks, chats, conversations, custom_emojis,
         domain_blocks, emoji_packs, emoji_reactions, endorsements, filters, follow_requests,
         instance, lists, markers, media, misc, mutes, notifications, oauth_tokens, password_reset,
-        pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, push, reports, scrobbles,
-        search, statuses, streaming, tags, timelines,
+        pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push, reports,
+        scrobbles, search, statuses, streaming, tags, timelines,
     },
     state::AppState,
 };
@@ -25,8 +25,8 @@ use crate::{
 /// a fallback panics.
 ///
 /// `state` reaches [`accounts::router`], [`apps::router`],
-/// [`reports::router`], [`search::router`] and [`statuses::router`], the
-/// merged routers whose routes mount the rate
+/// [`polls::router`], [`reports::router`], [`search::router`] and
+/// [`statuses::router`], the merged routers whose routes mount the rate
 /// limiter, and — as
 /// [`state.config`] — [`media::router`] and [`pleroma_settings::router`],
 /// whose upload routes carry their own body limit (see
@@ -57,6 +57,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(password_reset::pleroma_router())
         .merge(pleroma_accounts::router(state))
         .merge(pleroma_settings::router(&state.config))
+        .merge(polls::router(state))
         .merge(push::router())
         .merge(reports::router(state))
         .merge(scrobbles::router())
