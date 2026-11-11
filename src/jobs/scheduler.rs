@@ -4,7 +4,8 @@
 //! this module is the producer of the rows that fire on a schedule. The
 //! [`periodic_jobs`] registry lists every recurring job (today the
 //! streaming hub's reference-table sweep, the mutes expiry sweep, the
-//! idempotency-key sweep and the status-expiry sweep; later tickets append
+//! idempotency-key sweep, the status-expiry sweep and the
+//! scheduled-status fire sweep; later tickets append
 //! one line per entry), and
 //! [`run`] ticks every ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
@@ -69,7 +70,14 @@ pub struct PeriodicJob {
 /// [`super::statuses::sweep_job`], on the same queue once every five minutes:
 /// the per-status [`statuses.expire`](super::statuses::KIND_EXPIRE) job is
 /// the scheduled delete proper, and this pass catches whatever a lost job
-/// row or a spent retry budget would otherwise leave posted forever.
+/// row or a spent retry budget would otherwise leave posted forever — and
+/// the safety sweep of scheduled statuses whose `scheduled_at` has run out
+/// ([`scheduled_statuses.sweep`](super::scheduled_statuses::KIND_SWEEP)),
+/// [`super::scheduled_statuses::sweep_job`], on the same queue once every
+/// five minutes: the per-row
+/// [`scheduled_statuses.publish`](super::scheduled_statuses::KIND_PUBLISH)
+/// job is the fire proper, and this pass publishes whatever a lost job row
+/// or a spent retry budget would otherwise leave parked forever.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -89,6 +97,7 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             every: Duration::from_secs(600),
         },
         super::statuses::sweep_job(),
+        super::scheduled_statuses::sweep_job(),
     ]
 }
 
