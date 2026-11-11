@@ -176,6 +176,26 @@ pub fn test_app_with_upload_limits(
     test_app_with_config(pool, config)
 }
 
+/// [`test_config`] with `RESTRICT_UNAUTHENTICATED` set to `areas`.
+///
+/// The gated endpoints refuse unauthenticated reads of those areas with
+/// 403. The area names are the entries of
+/// [`wired_be::config::RESTRICT_UNAUTHENTICATED_AREAS`]; an empty slice
+/// restricts nothing.
+#[must_use]
+pub fn test_config_with_restricted_areas(areas: &[&str]) -> Config {
+    let mut config = test_config();
+    config.restrict_unauthenticated = areas.iter().map(|area| (*area).to_owned()).collect();
+    config
+}
+
+/// The real application router, serving over `pool` with the
+/// unauthenticated restriction areas set to `areas` (see
+/// [`test_config_with_restricted_areas`]).
+pub fn test_app_with_restricted_areas(pool: PgPool, areas: &[&str]) -> Router {
+    test_app_with_config(pool, test_config_with_restricted_areas(areas))
+}
+
 /// The shared [`AppState`] every test router is built on, and every job
 /// handler is handed: `pool` plus `config`, with the hub, HTTP client,
 /// uploader, stats cache and recording mailer the app needs.
