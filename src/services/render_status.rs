@@ -8,11 +8,11 @@
 //! everything they render from — authors, media attachments, mentions,
 //! hashtags, emoji reactions, favourites, the viewer's own reblogs,
 //! bookmarks, the viewer's own pins, the viewer's muted threads, the
-//! viewer's direct-message participations, reblogged originals, quoted
-//! originals and polls — with a FIXED set of batched
+//! viewer's direct-message participations, rich-media cards, reblogged
+//! originals, quoted originals and polls — with a FIXED set of batched
 //! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
 //! never a query per row. The count does not grow with the page size:
-//! seventeen statement groups whatever the batch —
+//! eighteen statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`];
@@ -57,22 +57,27 @@
 //! 14. the viewer's relationships to the page's authors — the one fixed
 //!     [`Relationship::load_many`] set, run only for an authenticated
 //!     viewer;
-//! 15. the page's polls — one [`poll::for_statuses`] read keyed by every
+//! 15. the page's rich-media cards — one [`link_card::for_statuses`] read
+//!     keyed by each row's *own* id (`status_cards` keys on the row, so a
+//!     reblog row renders its own id's card); it runs for every viewer,
+//!     because a card is a fact about the post's link, not about who is
+//!     looking;
+//! 16. the page's polls — one [`poll::for_statuses`] read keyed by every
 //!     rendered id (reblogged originals included, so a reblog nests its
 //!     original's poll); a row the read does not answer renders `poll:
 //!     null`;
-//! 16. the options of those polls — one [`poll::options_for_statuses`]
+//! 17. the options of those polls — one [`poll::options_for_statuses`]
 //!     read over the same ids, each entry in position order;
-//! 17. the viewer's marks on the page's polls — one
+//! 18. the viewer's marks on the page's polls — one
 //!     [`poll::votes_by_status`] read over the same ids, run only for an
 //!     authenticated viewer; it answers every poll entity's `voted` flag
 //!     and `own_votes` array.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
-//! page of plain posts costs seven queries (the two poll reads answer
-//! empty for it), and a viewer adds the favourite, reblog, bookmark, pin,
-//! thread-mute, participation and poll-vote reads and the relationship
-//! set.
+//! page of plain posts costs eight queries (the cards read rides with the
+//! rendered ids, and the two poll reads answer empty for it), and a viewer
+//! adds the favourite, reblog, bookmark, pin, thread-mute, participation
+//! and poll-vote reads and the relationship set.
 //!
 //! # Extension points
 //!
@@ -96,8 +101,12 @@
 //! - `pleroma.direct_conversation_id`: *filled by the
 //!   conversation-participations ticket* (step 13 above), from the one
 //!   [`conversation::participation_ids`] read.
-//! - `card`: the rich-media cards table, one read keyed by status id.
-//! - `poll`: *filled by the polls render ticket* (steps 15–17 above);
+//! - `card`: *filled by the rich-media ticket* (step 15 above), from the
+//!   one [`link_card::for_statuses`] read keyed to each row's *own* id;
+//!   the cached [`card_json`] output renders verbatim, and the deprecated
+//!   `GET /api/v1/statuses/{id}/card` endpoint in [`crate::api::statuses`]
+//!   answers the same stored row.
+//! - `poll`: *filled by the polls render ticket* (steps 16–18 above);
 //!   [`crate::entities::poll::Poll::build`] renders the poll row, its
 //!   options and the viewer's marks into the entity, and the row's own
 //!   absence from the poll read is the entity's `null`.
@@ -117,6 +126,7 @@
 //! [`Status`]: crate::entities::status::Status
 //! [`StatusSource`]: crate::entities::status::StatusSource
 //! [`Relationship::load_many`]: crate::entities::relationship::Relationship::load_many
+//! [`card_json`]: crate::services::rich_media::card_json
 //! [`conversation_mute::muted_conversation_ids`]: crate::models::conversation_mute::muted_conversation_ids
 
 use std::collections::{HashMap, HashSet};
@@ -140,6 +150,7 @@ use crate::{
         emoji_reaction::{self, ReactionSummary},
         favourite,
         hashtag::{self, Hashtag},
+        link_card::{self, LinkCard},
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mention, pinned_status,
         poll::{self, Poll as PollRow, PollOption as PollOptionRow},
@@ -290,6 +301,14 @@ struct Batch<'a> {
     /// The viewer's relationships to the page's authors, keyed by account
     /// id; `None` for an anonymous viewer.
     relationships: Option<RelationshipMap>,
+    /// The rich-media cards of the rows on the page (and of the originals
+    /// nested in reblogs), keyed by status — one
+    /// [`link_card::for_statuses`] read keyed by every rendered id. A
+    /// status that links no cached card is absent, and a card renders the
+    /// same for every viewer: it is a fact about the post's link, not
+    /// about who is looking. Keyed to each row's *own* id, because
+    /// `status_cards` keys on the row.
+    cards: HashMap<Uuid, LinkCard>,
 }
 
 impl<'a> Batch<'a> {
@@ -370,6 +389,7 @@ impl<'a> Batch<'a> {
             poll_options,
             poll_votes,
             relationships: load_relationships(pool, viewer, &author_ids).await?,
+            cards: load_cards(pool, &rendered_ids).await?,
         })
     }
 
@@ -429,7 +449,9 @@ impl<'a> Batch<'a> {
     /// read at the row's *own* id, with its options and the viewer's marks
     /// from the same-keyed mates — and because the batch loaded over the
     /// rendered ids, originals included, the nested render of a reblog
-    /// carries the original's poll.
+    /// carries the original's poll. The `card` is the cards map read at
+    /// the row's *own* id — `status_cards` keys on the row, so a reblog
+    /// row renders its own id's card and the nested original its own.
     fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
         let subject_id = row.reblog_of_id.unwrap_or(row.id);
@@ -447,6 +469,7 @@ impl<'a> Batch<'a> {
             mentions: self.mentions.get(&row.id).map_or(&[], Vec::as_slice),
             tags: self.tags.get(&row.id).map_or(&[], Vec::as_slice),
             reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
+            card: self.cards.get(&row.id),
             favourited: self.favourites.contains(&subject_id),
             reblogged: JsonBool(self.reblogs.contains(&subject_id)),
             bookmarked: bookmark.is_some(),
@@ -698,6 +721,18 @@ async fn load_poll_votes(
     poll::votes_by_status(pool, ids, viewer.id).await
 }
 
+/// [`link_card::for_statuses`]: one query for the rich-media card of every
+/// row on the page and of the originals nested in reblogs (the rendered
+/// id list covers both), keyed to each row's *own* id — `status_cards`
+/// keys on the row. Rows that link no cached card are simply absent from
+/// the map, and an empty id list skips the database — no query at all.
+async fn load_cards(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, LinkCard>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    link_card::for_statuses(pool, ids).await
+}
+
 /// The viewer's relationships to the page's authors, keyed by account id:
 /// [`Relationship::load_many`] runs its own fixed set of queries once per
 /// page; an anonymous viewer has none to load, and an empty author list
@@ -856,6 +891,11 @@ mod tests {
         assert_eq!(value["application"]["website"], "https://wired.example");
         assert_eq!(value["language"], "en");
         assert_eq!(value["reblog"], Value::Null, "a root post nests nothing");
+        assert_eq!(
+            value["card"],
+            Value::Null,
+            "no card cached for this row renders null"
+        );
         assert_eq!(
             value["pleroma"]["content"],
             json!({ "text/plain": "hello #world" }),
@@ -1881,6 +1921,88 @@ mod tests {
         assert_eq!(value["poll"]["id"], hidden.id.to_string());
         assert_eq!(value["poll"]["multiple"], json!(false));
         assert_eq!(value["poll"]["voters_count"], 0);
+    }
+
+    /// The rich-media ticket's loader inside the fixed query set: one
+    /// batched read keys each row's card to its *own* id — a reblog row
+    /// renders its own card beside the original nested in it, a status
+    /// linked only to a failed fetch renders null, and cards are nobody's
+    /// private fact: the same row renders the same card for every viewer.
+    #[tokio::test]
+    async fn the_card_follows_one_batched_read() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "https://example.test/post").await;
+        let dead = post(&pool, &bob, "https://dead.test/").await;
+        let (boost, made) = status::create_reblog(&pool, BASE, &bob, &original, Visibility::Public)
+            .await
+            .expect("a reblog of a stored post inserts");
+        assert!(made, "the fixture boost is a fresh row");
+        let card = json!({
+            "url": "https://example.test/post",
+            "title": "Example",
+            "type": "link",
+            "pleroma": { "opengraph": { "og:title": "Example" } },
+        });
+        link_card::store(&pool, "https://example.test/post", "ok", Some(&card))
+            .await
+            .expect("the fixture card stores");
+        link_card::link_status(&pool, original.id, "https://example.test/post")
+            .await
+            .expect("the original links its card");
+        let own = json!({"url": "https://boost.test", "title": "Boost page", "type": "link"});
+        link_card::store(&pool, "https://boost.test", "ok", Some(&own))
+            .await
+            .expect("the boost's card stores");
+        link_card::link_status(&pool, boost.id, "https://boost.test")
+            .await
+            .expect("the reblog row links its own card");
+        link_card::store(&pool, "https://dead.test/", "failed", None)
+            .await
+            .expect("the failed fetch caches");
+        link_card::link_status(&pool, dead.id, "https://dead.test/")
+            .await
+            .expect("the dead status links its failure");
+
+        let card_of = |entity: &Status| {
+            serde_json::to_value(entity).expect("a rendered status serializes")["card"].clone()
+        };
+        let page = [original.clone(), dead.clone(), boost.clone()];
+        let anonymous = render_statuses(&state, None, &page)
+            .await
+            .expect("the page renders anonymously");
+        assert_eq!(
+            card_of(&anonymous[0]),
+            card,
+            "the original renders its card"
+        );
+        assert_eq!(
+            card_of(&anonymous[1]),
+            Value::Null,
+            "a status linked only to a failed fetch renders null"
+        );
+        let boost_json = serde_json::to_value(&anonymous[2]).expect("the reblog serializes");
+        assert_eq!(
+            boost_json["card"], own,
+            "the reblog row renders its own id's card — status_cards keys \
+             on the row"
+        );
+        assert_eq!(
+            boost_json["reblog"]["card"], card,
+            "and the nested original its own, from the same batch"
+        );
+
+        let for_alice = render_statuses(&state, Some(&alice), std::slice::from_ref(&original))
+            .await
+            .expect("the post renders for alice");
+        assert_eq!(
+            card_of(&for_alice[0]),
+            card,
+            "the viewer's page renders the same card"
+        );
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]

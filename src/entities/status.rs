@@ -24,7 +24,7 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `card` (rich-media cards); `emojis` (custom emojis);
+//! `emojis` (custom emojis);
 //! and `quote` (the quoting ticket, whose original rows the service
 //! already batch-loads).
 //! `pleroma.direct_conversation_id` is filled by the
@@ -38,6 +38,14 @@
 //! full [`Poll`] entity — options in position
 //! order, and the viewer's marks as `voted` and `own_votes` — while a
 //! poll-less row renders JSON `null`.
+//! `card` is filled by the rich-media ticket, from
+//! [`for_statuses`](crate::models::link_card::for_statuses) — one
+//! batched read per page keyed to each row's *own* id (`status_cards`
+//! keys on the row, so a reblog row renders its own id's card, not its
+//! original's); the cached [`card_json`](crate::services::rich_media::card_json)
+//! output renders verbatim, and a status linking no card — or only a
+//! failed fetch — renders `null`, the same reading the deprecated
+//! `GET /api/v1/statuses/{id}/card` endpoint answers with.
 //! `pleroma.bookmark_folder` is filled by the folders ticket, from
 //! [`bookmarked_folders`](crate::models::bookmark::bookmarked_folders) —
 //! the one read that also answers `bookmarked`: a bookmarked row renders
@@ -92,10 +100,11 @@ use crate::{
         tag::Tag,
     },
     models::{
-        emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag,
+        emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag, link_card::LinkCard,
         media_attachment::MediaAttachment as AttachmentRow, status::Status as StatusRow,
         user::User,
     },
+    services::rich_media::stored_card_json,
     util::sanitize::strip_html,
 };
 
@@ -232,6 +241,17 @@ pub struct StatusSource<'a> {
     /// order; feeds `pleroma.emoji_reactions`. A row nobody reacted to (and a
     /// nested original nobody reacted to) comes in with the empty slice.
     pub reactions: &'a [SummaryRow],
+    /// This row's rich-media card as the [`link_card`] cache stores it,
+    /// `None` when the status links no card: the value of the one
+    /// [`for_statuses`] read the batch runs for the page, keyed to the
+    /// row's *own* id — `status_cards` keys on the row, so a reblog row
+    /// renders its own id's card. [`Status::card`] answers the cached
+    /// JSON verbatim; an absent row, a `failed` one and a row storing no
+    /// card all render JSON `null`.
+    ///
+    /// [`link_card`]: crate::models::link_card
+    /// [`for_statuses`]: crate::models::link_card::for_statuses
+    pub card: Option<&'a LinkCard>,
     /// Whether the viewer favourited this row: membership in the one
     /// [`favourited_status_ids`](crate::models::favourite::favourited_status_ids)
     /// read the batch runs for the page. The renderer keys a reblog row's
@@ -376,8 +396,11 @@ pub struct Status {
     pub in_reply_to_account_id: Option<String>,
     /// The `BCP 47` language tag the poster stated, or `null`.
     pub language: Option<String>,
-    /// The rich-media card for the post's first link; `null` until the
-    /// link-preview ticket renders it from one more batched loader.
+    /// The rich-media card for the post's first link: the JSON the
+    /// [`link_card`] cache stored for this row's id, rendered verbatim;
+    /// `null` for a status that links no card, or only a failed fetch.
+    ///
+    /// [`link_card`]: crate::models::link_card
     pub card: Option<Value>,
     /// The poll attached to the post, as the [`Poll`] entity; `null` for a
     /// row the batch found no poll on. The polls render ticket's batched
@@ -446,6 +469,7 @@ impl Status {
             mentions,
             tags,
             reactions,
+            card,
             favourited,
             reblogged,
             bookmarked,
@@ -484,7 +508,7 @@ impl Status {
             in_reply_to_id: row.in_reply_to_id.map(|id| id.to_string()),
             in_reply_to_account_id: row.in_reply_to_account_id.map(|id| id.to_string()),
             language: row.language.clone(),
-            card: None,
+            card: card.and_then(stored_card_json),
             poll,
             edited_at: row.edited_at,
             favourited: JsonBool(favourited),
@@ -628,6 +652,8 @@ mod tests {
     const REACTOR_ID: &str = "01934567-89ab-7cde-f012-3456789abcee";
     /// A custom emoji's image URL, for the reaction entries.
     const CAT_IMAGE: &str = "https://test.example/emoji/cats/cat.png";
+    /// The URL a link card is cached under, for the card entries.
+    const CARD_URL: &str = "https://example.test/post";
     /// Every JSON key the entity must emit, sorted.
     const EXPECTED_KEYS: [&str; 31] = [
         "account",
@@ -825,6 +851,10 @@ mod tests {
         tags: Vec<Hashtag>,
         /// The row's emoji reactions.
         reactions: Vec<SummaryRow>,
+        /// The row's cached link card, `None` when the batch's cards
+        /// read found nothing: the row the rich-media batch would hand
+        /// the renderer.
+        card: Option<LinkCard>,
         /// Whether the viewer favourited the row.
         favourited: bool,
         /// Whether the viewer reblogged the row, in the same [`JsonBool`]
@@ -859,6 +889,7 @@ mod tests {
                 mentions: Vec::new(),
                 tags: Vec::new(),
                 reactions: Vec::new(),
+                card: None,
                 favourited: false,
                 reblogged: JsonBool(false),
                 bookmarked: false,
@@ -898,6 +929,37 @@ mod tests {
         /// Sets [`reactions`](Self::reactions).
         fn reacted(self, reactions: Vec<SummaryRow>) -> Self {
             Self { reactions, ..self }
+        }
+
+        /// Sets [`card`](Self::card) to a cached `ok` row holding `json`:
+        /// the card the rich-media batch's [`for_statuses`] read would
+        /// hand the renderer for a linked status.
+        ///
+        /// [`for_statuses`]: crate::models::link_card::for_statuses
+        fn with_card(self, json: Value) -> Self {
+            Self {
+                card: Some(LinkCard {
+                    url: CARD_URL.to_owned(),
+                    status: "ok".to_owned(),
+                    card: Some(json),
+                    fetched_at: stamped(),
+                }),
+                ..self
+            }
+        }
+
+        /// Sets [`card`](Self::card) to the `failed` row a dead URL
+        /// leaves in the cache: linked, but holding no card.
+        fn with_failed_card(self) -> Self {
+            Self {
+                card: Some(LinkCard {
+                    url: CARD_URL.to_owned(),
+                    status: "failed".to_owned(),
+                    card: None,
+                    fetched_at: stamped(),
+                }),
+                ..self
+            }
         }
 
         /// Sets [`favourited`](Self::favourited): the viewer's flag, which
@@ -983,6 +1045,7 @@ mod tests {
             mentions: &parts.mentions,
             tags: &parts.tags,
             reactions: &parts.reactions,
+            card: parts.card.as_ref(),
             favourited: parts.favourited,
             reblogged: parts.reblogged.clone(),
             bookmarked: parts.bookmarked,
@@ -1009,6 +1072,7 @@ mod tests {
                 mentions: &[],
                 tags: &[],
                 reactions: &[],
+                card: None,
                 favourited: false,
                 reblogged: JsonBool(false),
                 bookmarked: false,
@@ -1102,7 +1166,11 @@ mod tests {
         assert_eq!(value["in_reply_to_id"], Value::Null);
         assert_eq!(value["in_reply_to_account_id"], Value::Null);
         assert_eq!(value["language"], Value::Null);
-        assert_eq!(value["card"], Value::Null, "cards are a later ticket");
+        assert_eq!(
+            value["card"],
+            Value::Null,
+            "a page whose cards read found nothing renders null"
+        );
         assert_eq!(
             value["poll"],
             Value::Null,
@@ -1132,6 +1200,36 @@ mod tests {
             "a page whose bookmarks read found nothing renders the flag false"
         );
         assert_eq!(value["quote"], Value::Null, "quotes are a later ticket");
+    }
+
+    #[test]
+    fn a_linked_ok_card_renders_the_stored_json_verbatim() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let stored = json!({
+            "url": CARD_URL,
+            "title": "Example Domain",
+            "type": "link",
+            "image": null,
+            "pleroma": { "opengraph": { "og:title": "Example Domain" } },
+        });
+        let value = render(&row, &Parts::of(&alice).with_card(stored.clone()), None);
+        assert_eq!(
+            value["card"], stored,
+            "the card the fetch job stored renders exactly as cached"
+        );
+    }
+
+    #[test]
+    fn a_failed_card_row_renders_null() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let value = render(&row, &Parts::of(&alice).with_failed_card(), None);
+        assert_eq!(
+            value["card"],
+            Value::Null,
+            "a linked but failed fetch renders no card, like no link at all"
+        );
     }
 
     #[test]

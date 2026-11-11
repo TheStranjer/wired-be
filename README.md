@@ -80,6 +80,8 @@ All configuration comes from environment variables. For local development, copy 
 | `MEDIA_PROXY_BASE_URL` | no | `BASE_URL` | Base URL proxy links are built from (no trailing slash), e.g. a CDN fronting `/proxy` |
 | `MEDIA_PROXY_MAX_BYTES` | no | `50000000` | Hard cap on the bytes served for one proxied media file; the fetch aborts beyond it |
 | `MEDIA_PROXY_BLACKLIST` | no | *(empty)* | Comma-separated hosts the media proxy never proxies; their URLs pass through unchanged |
+| `RICH_MEDIA_IGNORE_HOSTS` | no | *(empty)* | Comma-separated hosts rich media card fetching never visits; a link to one of them is never fetched and gets no card |
+| `RICH_MEDIA_REMOTE` | no | `false` | Whether preview cards are fetched for the remote URLs statuses link to; while off the card cache stays empty (`true`/`false`, or `1`/`0`) |
 | `TRANSLATION_PROVIDER` | no | `none` | Status translation: `none` turns it off (`POST /api/v1/statuses/{id}/translate` answers 503), `libretranslate` and `deepl` send the status content to that provider's API |
 | `TRANSLATION_API_URL` | no | | The provider's API base URL (no trailing slash), e.g. `https://translate.example` or `https://api-free.deepl.com`; a selected provider without it is left unused, like `none` |
 | `TRANSLATION_API_KEY` | no | | The provider's API key, redacted in logs; `deepl` has no unauthenticated mode and is left unused without one, a self-hosted `libretranslate` usually needs none |
