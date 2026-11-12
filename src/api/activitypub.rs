@@ -2,14 +2,23 @@
 //! collections at (`docs/ARCHITECTURE.md` decision 3).
 //!
 //! This router is merged at the top level of [`crate::app`], not under
-//! `/api`: the URLs it serves are the actor ids that go out in activities,
-//! so they must stay exactly `{BASE_URL}/users/{nickname}`.
+//! `/api`: the URLs it serves are the actor ids and object ids that go out
+//! in activities, so they must stay exactly `{BASE_URL}/users/{nickname}`
+//! and `{BASE_URL}/objects/{uuid}`.
 //!
 //! Today it is the actor document, `GET /users/{nickname}` — Pleroma's
 //! `ActivityPubController.user/2`
 //! (`lib/pleroma/web/activity_pub/activity_pub_controller.ex`) rendering
 //! `UserView.render("user.json", …)`
-//! (`lib/pleroma/web/activity_pub/views/user_view.ex`), the instance
+//! (`lib/pleroma/web/activity_pub/views/user_view.ex`), the object reads —
+//! `GET /objects/{uuid}` and its nickname-scoped twin
+//! `GET /users/{nickname}/statuses/{uuid}`, one shared core
+//! (`object_core`) behind Pleroma's `OStatusController.object/2` and
+//! `ActivityPubController.object/2` rendering
+//! `ObjectView.render("object.json", …)`, and `GET /notice/{id}`, the same
+//! core for an `ActivityPub` request and Pleroma's frontend redirect for a
+//! browser, keyed on the status id the model writes into
+//! [`Status::url`](crate::models::status::Status::url) —, the instance
 //! actor document, `GET /internal/fetch` — Pleroma's same controller's
 //! `internal_fetch/2` action, the JSON-LD schema document,
 //! `GET /schemas/litepub-0.1.jsonld` — Pleroma's static
@@ -31,8 +40,27 @@
 //! carries `Vary: Accept`, since the header decides which of the three the
 //! client sees.
 //!
-//! With `AUTHORIZED_FETCH` on, the user actor route additionally demands a
-//! valid HTTP Signature (see [`fetch_allowed`]).
+//! The object reads negotiate differently: an object is a document, so a
+//! `GET /objects/{uuid}` whose `Accept` names no `ActivityPub` media type
+//! is a plain 404 even from a browser — unlike the actor route it never
+//! redirects (see `object_core`, step 2). Only `GET /notice/{id}` has a
+//! browser arm: an `Accept` naming `text/html` (and no `ActivityPub` type)
+//! gets the 302 to `{FRONTEND_BASE_URL}/notice/{id}`, the same path on the
+//! frontend origin. Within the core an unparsable uuid, a status this
+//! instance does not own, a reblog row (an `Announce`, served under its
+//! `{BASE_URL}/activities/{uuid}` id by the `/activities` slice), and a
+//! nickname that does not name the live local author are all the same 404;
+//! a soft-deleted status answers 410 with its `Tombstone` document
+//! ([`tombstone_json`]) instead of the `{"error":"Gone"}` [`AppError::Gone`]
+//! would render; a `local`-visibility status is 404 always, a `private` or
+//! `direct` one is served only to a request whose HTTP Signature
+//! [`fetch_signer`] proves and [`status_visibility::can_view`] admits, and
+//! everyone else — anonymous, unaddressed signer, blocked viewer — gets
+//! the same 404. What remains is served as [`note_json`]'s `Note` or
+//! `Question`.
+//!
+//! With `AUTHORIZED_FETCH` on, the user actor route and the object reads
+//! additionally demand a valid HTTP Signature (see [`fetch_allowed`]).
 //! `/internal/fetch` is not gated: it is the document a peer reads to
 //! learn the key it has to sign with, so gating it would deadlock the
 //! first fetch from any instance that never saw this one's actor.
@@ -76,14 +104,18 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         actor::actor_json,
-        authorized_fetch::fetch_allowed,
+        authorized_fetch::{fetch_allowed, fetch_signer},
         dispatch::KIND_INCOMING,
         inbox_auth::{InboxAuthError, SignedActivity},
-        note::{LITEPUB_SCHEMA_PATH, litepub_context_json},
+        note::{
+            LITEPUB_SCHEMA_PATH, litepub_context_json, load_note_context, note_json, tombstone_json,
+        },
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
         job::{NewJob, enqueue},
+        status::{self, Status, Visibility},
+        status_visibility,
         user::{User, get_by_nickname},
     },
     services::instance_actor,
@@ -125,13 +157,17 @@ pub const RATE_LIMIT_BUCKET: &str = "ap_routes";
 
 /// The top-level `ActivityPub` router, merged by [`crate::app`].
 ///
-/// It serves the actor documents peers fetch and the three inbox routes
-/// that accept their deliveries (`POST /inbox`, `POST /users/{nickname}/inbox`
-/// and `POST /internal/fetch/inbox`). `GET /users/{nickname}/inbox` is the
-/// C2S ticket's, not this router's.
+/// It serves the actor documents peers fetch, the object reads
+/// (`get_object`, `get_scoped_object` and `get_notice`) and the
+/// three inbox routes that accept their deliveries (`POST /inbox`,
+/// `POST /users/{nickname}/inbox` and `POST /internal/fetch/inbox`).
+/// `GET /users/{nickname}/inbox` is the C2S ticket's, not this router's.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/users/{nickname}", get(get_actor))
+        .route("/objects/{uuid}", get(get_object))
+        .route("/users/{nickname}/statuses/{uuid}", get(get_scoped_object))
+        .route("/notice/{id}", get(get_notice))
         .route("/internal/fetch", get(get_instance_actor))
         .route(LITEPUB_SCHEMA_PATH, get(litepub_schema))
         .route("/inbox", post(inbox))
@@ -186,6 +222,182 @@ async fn negotiated_actor(
         return Err(AppError::Gone);
     }
     Ok(actor_response(&user, &state.config))
+}
+
+/// `GET /objects/{uuid}` — the status document with the `ActivityPub`
+/// object id `{BASE_URL}/objects/{uuid}` (decision 6), whatever `Accept`
+/// names an `ActivityPub` media type; anything else is the plain 404. No
+/// OAuth: peers dereference objects anonymously — or, once
+/// `AUTHORIZED_FETCH` is on, with HTTP Signatures.
+async fn get_object(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(uuid): Path<String>,
+) -> Response {
+    let outcome = object_core(&state, &uuid, None, &headers, &uri).await;
+    with_vary(outcome)
+}
+
+/// `GET /users/{nickname}/statuses/{uuid}` — the same document as
+/// [`get_object`], reached through the nickname-scoped path Pleroma
+/// answers with the shared `object/2` action: the named account must
+/// actually be the status' live local author, or the read is the plain 404.
+async fn get_scoped_object(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((nickname, uuid)): Path<(String, String)>,
+) -> Response {
+    let outcome = object_core(&state, &uuid, Some(&nickname), &headers, &uri).await;
+    with_vary(outcome)
+}
+
+/// `GET /notice/{id}` — the human-facing post URL whose `{id}` is the
+/// status uuid the model writes into [`Status::url`]. An `Accept` naming
+/// an `ActivityPub` media type is a federating client and gets the very
+/// document [`get_object`] serves; an `Accept` naming `text/html` (and no
+/// `ActivityPub` type) is a browser and gets the 302 to the same path on
+/// the frontend origin (see [`notice_redirect`]); anything else, the 404.
+async fn get_notice(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(id): Path<String>,
+) -> Response {
+    let outcome = if wants_activity_json(&headers) {
+        object_core(&state, &id, None, &headers, &uri).await
+    } else if wants_html(&headers) {
+        notice_redirect(&state.config, &id)
+    } else {
+        Err(AppError::RouteNotFound)
+    };
+    with_vary(outcome)
+}
+
+/// The shared object-read core of the three routes above, the steps in
+/// the order the ticket fixes them: an unparsable uuid is the 404 (the
+/// route cannot name a document it cannot address); only `ActivityPub`
+/// clients get documents here — unlike the actor route, no browser is
+/// redirected; then the `AUTHORIZED_FETCH` gate, in the same position
+/// [`negotiated_actor`] runs it, so an unsigned read under the gate is the
+/// 401 before any status is read; then the row, which must be a live
+/// original this instance owns (no remote mirror, no reblog row — an
+/// `Announce` is served by its `/activities/{uuid}` id); then, for the
+/// nickname-scoped twin, the author check; a soft-deleted row answers 410
+/// with its `Tombstone` document; `local` visibility is never an `ActivityPub`
+/// document, and `private`/`direct` are served only to a signature the
+/// gate proves *and* [`status_visibility::can_view`] admits; and the
+/// survivor is rendered by [`note_json`].
+async fn object_core(
+    state: &AppState,
+    id_text: &str,
+    nickname: Option<&str>,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Response> {
+    let Some(id) = Uuid::parse_str(id_text).ok() else {
+        return Err(AppError::RouteNotFound);
+    };
+    if !wants_activity_json(headers) {
+        return Err(AppError::RouteNotFound);
+    }
+    fetch_allowed(state, &Method::GET, uri, headers).await?;
+    let Some(status) = status::get_by_id_including_deleted(&state.db, id).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    if !status.local || status.reblog_of_id.is_some() {
+        return Err(AppError::RouteNotFound);
+    }
+    if !nickname_owns(state, nickname, &status).await? {
+        return Err(AppError::RouteNotFound);
+    }
+    if status.deleted_at.is_some() {
+        return Ok(tombstone_response(&status));
+    }
+    if !read_admitted(state, &status, headers, uri).await? {
+        return Err(AppError::RouteNotFound);
+    }
+    let context = load_note_context(&state.db, &state.config, status.id).await?;
+    let Some(note) = note_json(&context) else {
+        // Unreachable: `note_json` is `None` only for `local`, which the
+        // check above already refused. A document this route cannot render
+        // is the same 404 as one it cannot find.
+        return Err(AppError::RouteNotFound);
+    };
+    Ok(document_response(note))
+}
+
+/// Whether `nickname` names the status' author: the live local account it
+/// names must be the one who wrote the row. `None` — the unscoped paths —
+/// always owns the read; an unknown, remote, deactivated or different
+/// author is a `false`, and the caller answers the plain 404 either way.
+async fn nickname_owns(
+    state: &AppState,
+    nickname: Option<&str>,
+    status: &Status,
+) -> AppResult<bool> {
+    let Some(nickname) = nickname else {
+        return Ok(true);
+    };
+    let owner = get_by_nickname(&state.db, nickname).await?;
+    Ok(owner.is_some_and(|owner| {
+        owner.id == status.user_id && owner.local.get() && owner.is_active.get()
+    }))
+}
+
+/// Whether the visibility admits this read: `public` and `unlisted` answer
+/// anyone, `local` is never federated and answers nobody, and `private`
+/// and `direct` are served only when an HTTP Signature proves a reader —
+/// with `AUTHORIZED_FETCH` off, unsigned reads answer `Ok(None)` for that
+/// reader — and [`status_visibility::can_view`] admits the one it proved.
+/// A signature that fails to verify is `fetch_signer`'s 401, not a 404:
+/// the requester claimed an identity and could not back it.
+async fn read_admitted(
+    state: &AppState,
+    status: &Status,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<bool> {
+    match status.visibility {
+        Visibility::Local => Ok(false),
+        Visibility::Public | Visibility::Unlisted => Ok(true),
+        Visibility::Private | Visibility::Direct => {
+            let Some(signer) = fetch_signer(state, &Method::GET, uri, headers).await? else {
+                return Ok(false);
+            };
+            status_visibility::can_view(&state.db, status, Some(&signer)).await
+        }
+    }
+}
+
+/// The `Tombstone` a soft-deleted status is served as: the 410 whose body
+/// is [`tombstone_json`]'s document. Built by hand rather than through
+/// [`AppError::Gone`], which would answer `{"error":"Gone"}` where a
+/// federating reader expects the tombstone.
+fn tombstone_response(status: &Status) -> Response {
+    (
+        StatusCode::GONE,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(ACTIVITY_JSON),
+        )],
+        Json(tombstone_json(status)),
+    )
+        .into_response()
+}
+
+/// A rendered `ActivityPub` document — the `Note` or `Question` — as the
+/// `application/activity+json` response the routes serve it in.
+fn document_response(document: Value) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(ACTIVITY_JSON),
+        )],
+        Json(document),
+    )
+        .into_response()
 }
 
 /// `GET /internal/fetch` — the instance actor document, served by the
@@ -381,6 +593,22 @@ fn html_redirect(config: &Config, nickname: &str) -> AppResult<Response> {
     Ok((StatusCode::FOUND, [(header::LOCATION, value)]).into_response())
 }
 
+/// The 302 a browser gets on `GET /notice/{id}`: the same path on the
+/// frontend origin, `{FRONTEND_BASE_URL}/notice/{id}` — the notice lives
+/// on the frontend, and this instance serves no HTML of its own
+/// (decision 1). `FRONTEND_BASE_URL` defaults to `BASE_URL`, so without a
+/// separate frontend this is the redirect to this server's own path, and
+/// the frontend decides whether that notice exists. An `{id}` whose text
+/// cannot ride a `Location` header names no page either, and answers the
+/// 404.
+fn notice_redirect(config: &Config, id: &str) -> AppResult<Response> {
+    let location = format!("{}/notice/{id}", config.frontend_base_url);
+    let value = HeaderValue::from_str(&location)
+        .ok()
+        .ok_or(AppError::RouteNotFound)?;
+    Ok((StatusCode::FOUND, [(header::LOCATION, value)]).into_response())
+}
+
 /// The actor document for `user` as an `ActivityPub` response.
 fn actor_response(user: &User, config: &Config) -> Response {
     (
@@ -546,6 +774,38 @@ mod tests {
     fn a_nickname_no_header_can_carry_is_the_plain_404() {
         let config = Config::for_tests();
         let err = html_redirect(&config, "bad\nnickname")
+            .expect_err("no Location header can carry a newline");
+        assert_eq!(
+            err.to_string(),
+            "Not found",
+            "and then the route answers like any other unrouted request"
+        );
+    }
+
+    #[test]
+    fn browsers_on_the_notice_route_are_redirected_to_the_frontend_origin() {
+        let config = Config::for_tests();
+        let response = notice_redirect(&config, "01934568-1111-7000-8000-abcdef012345")
+            .expect("a uuid redirects");
+        assert_eq!(
+            response.status(),
+            StatusCode::FOUND,
+            "the redirect is a 302"
+        );
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&HeaderValue::from_static(
+                "https://test.example/notice/01934568-1111-7000-8000-abcdef012345"
+            )),
+            "the Location is the same path on the frontend origin, which the \
+             test config defaults onto the base URL"
+        );
+    }
+
+    #[test]
+    fn a_notice_id_no_header_can_carry_is_the_plain_404() {
+        let config = Config::for_tests();
+        let err = notice_redirect(&config, "bad\nid")
             .expect_err("no Location header can carry a newline");
         assert_eq!(
             err.to_string(),

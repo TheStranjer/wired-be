@@ -42,6 +42,10 @@ mod accounts;
 /// The `ActivityPub` actor document (`GET /users/{nickname}`).
 mod activitypub;
 
+/// The object reads over HTTP: `GET /objects/{uuid}`, its nickname-scoped
+/// twin `GET /users/{nickname}/statuses/{uuid}` and `GET /notice/{id}`.
+mod ap_objects;
+
 /// Announcements over HTTP (`/api/v1/announcements`).
 mod announcements;
 
