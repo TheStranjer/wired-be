@@ -28,11 +28,11 @@
 //!    activities are dropped with a debug log;
 //! 5. dispatch through the [`Handlers`] registry, keyed by activity type;
 //!    unknown types are ignored, logged at debug. Later tickets add one
-//!    line each to [`Handlers::default`]. `Update` and `Delete` route one
-//!    level deeper, by the type of the *object* they carry, through their
-//!    own object-type tables; a `Delete` whose object no entry of that kind
-//!    claims falls back to the one route that can tell a bare id naming an
-//!    account from one naming a status;
+//!    line each to [`Handlers::default`]. `Create`, `Update` and `Delete`
+//!    route one level deeper, by the type of the *object* they carry,
+//!    through their own object-type tables; a `Delete` whose object no
+//!    entry of that kind claims falls back to the one route that can tell
+//!    a bare id naming an account from one naming a status;
 //! 6. `Undo` routes through its own table by the *inner* activity's type:
 //!    an embedded inner object says so itself, a bare id is looked up
 //!    among the stored remote activities ([`crate::models::activity`]),
@@ -97,6 +97,14 @@ const UPDATE_TYPE: &str = "Update";
 /// [`Handlers::delete_by_object_type`] with [`Handlers::delete_fallback`]
 /// behind it.
 const DELETE_TYPE: &str = "Delete";
+
+/// The `ActivityStreams` type of announcement activities: the third
+/// object-type arm of [`route`], keyed through
+/// [`Handlers::create_by_object_type`] — the code that folds a created
+/// `Note` and the code that will fold a created `ChatMessage` have nothing
+/// in common beyond the `Create` around them, so the object's own type
+/// routes.
+const CREATE_TYPE: &str = "Create";
 
 /// Activity types whose `object` is by design a reference to content that
 /// lives somewhere else — someone else's note, actor, or custom emoji —
@@ -279,6 +287,11 @@ pub struct Handlers {
     /// `Delete` routes, keyed the same way, for the peers that send an
     /// embedded document.
     delete_by_object_type: HashMap<&'static str, HandlerFn>,
+    /// `Create` routes, keyed the same way: which code folds a delivered
+    /// object depends on the object's own `type`, so a `Create` of a
+    /// `Note` and the later `Create` of a `ChatMessage` register one
+    /// entry each beside each other.
+    create_by_object_type: HashMap<&'static str, HandlerFn>,
     /// The `Delete` route for an object [`Handlers::delete_by_object_type`]
     /// does not claim — a bare id, or an embedded document of a type nobody
     /// registered. An id is the only thing that can tell a peer deleting
@@ -304,6 +317,7 @@ impl Handlers {
             undo_by_type: HashMap::new(),
             update_by_object_type: HashMap::new(),
             delete_by_object_type: HashMap::new(),
+            create_by_object_type: HashMap::new(),
             delete_fallback: None,
         }
     }
@@ -328,6 +342,21 @@ impl Handlers {
     /// registry's `delete_by_object_type` table.
     pub fn register_delete(&mut self, object_type: &'static str, handler: HandlerFn) {
         let _previous = self.delete_by_object_type.insert(object_type, handler);
+    }
+
+    /// Binds one `Create`d object type to its handler, filling the
+    /// registry's `create_by_object_type` table.
+    pub fn register_create(&mut self, object_type: &'static str, handler: HandlerFn) {
+        let _previous = self.create_by_object_type.insert(object_type, handler);
+    }
+
+    /// Whether the `Create` sub-registry claims `object_type` — the read
+    /// the handler modules' own tests use to check what they registered
+    /// without reaching into the table.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn handles_create(&self, object_type: &str) -> bool {
+        self.create_by_object_type.contains_key(object_type)
     }
 
     /// Sets the fallback the `Delete` route reaches when no entry of the
@@ -630,6 +659,7 @@ async fn route(
         UNDO_TYPE => route_undo(state, view, signer, handlers).await,
         UPDATE_TYPE => route_update(state, view, signer, handlers).await,
         DELETE_TYPE => route_delete(state, view, signer, handlers).await,
+        CREATE_TYPE => route_create(state, view, signer, handlers).await,
         _ => route_by_type(state, view, signer, handlers).await,
     }
 }
@@ -705,13 +735,42 @@ async fn route_delete(
     }
 }
 
-/// The `type` an activity's object declares, `None` when the object is a
+/// The type an activity's object declares, `None` when the object is a
 /// bare reference: the key both object-type sub-registries route on.
 fn object_type(view: &ActivityView) -> Option<String> {
     view.object
         .embedded()
         .and_then(|object| object.get("type"))
         .and_then(json::first_type)
+}
+
+/// The `Create` arm: the embedded object's own type decides which code
+/// folds it — a `Note` becomes a status, a later ticket's `ChatMessage`
+/// becomes a chat message — through [`Handlers::create_by_object_type`].
+/// An object that is a bare reference declares no type and is ignored, and
+/// so is any type no ticket has registered a route for yet; the create
+/// handler itself reports the same for documents of a registered kind it
+/// cannot use.
+async fn route_create(
+    state: &AppState,
+    view: ActivityView,
+    signer: User,
+    handlers: &Handlers,
+) -> Result<(), JobError> {
+    let declared = object_type(&view);
+    let handler = declared
+        .as_deref()
+        .and_then(|kind| handlers.create_by_object_type.get(kind))
+        .copied();
+    if let Some(handler) = handler {
+        call_handler(handler, state, view, signer).await
+    } else {
+        debug!(
+            object_type = declared.as_deref().unwrap_or("<reference>"),
+            "no Create handler for this object type; ignoring"
+        );
+        Ok(())
+    }
 }
 
 /// The `Undo` arm: resolve what is being undone, refuse an `Undo` whose
@@ -955,11 +1014,12 @@ mod tests {
     }
 
     /// The registry the dispatch tests run: fake handlers on every type
-    /// they deliver.
+    /// they deliver. `Create` routes by its object's type through the
+    /// sub-registry, like the live one does.
     fn test_handlers() -> Handlers {
         let mut handlers = Handlers::new();
         handlers.register("Follow", ok_handler);
-        handlers.register("Create", ok_handler);
+        handlers.register_create("Note", ok_handler);
         handlers.register("Announce", ok_handler);
         handlers.register("Like", transient_handler);
         handlers.register("Block", permanent_handler);
@@ -1097,10 +1157,13 @@ mod tests {
         );
     }
 
-    /// The live registry holds the actor routes and nothing else: the
-    /// `Update` table is keyed by the five actor object types, `Delete` runs
-    /// through the fallback that resolves an object id, and both tables are
-    /// the entry points the note and status tickets add their own keys to.
+    /// The live registry holds the actor routes and the note-create routes
+    /// and nothing else: the `Update` table is keyed by the five actor
+    /// object types, `Delete` runs through the fallback that resolves an
+    /// object id, and the `Create` table is keyed by the eight
+    /// `Note`-family object types the parser accepts. The object-type
+    /// tables are also the entry points later tickets add their own keys
+    /// to.
     #[test]
     fn the_live_registry_holds_the_actor_routes() {
         let handlers = Handlers::default();
@@ -1130,6 +1193,17 @@ mod tests {
         assert!(
             handlers.delete_fallback.is_some(),
             "the Delete fallback is registered: it is what tells a peer deleting itself from one deleting a post"
+        );
+        for object_type in crate::federation::note_parser::OBJECT_TYPES {
+            assert!(
+                handlers.create_by_object_type.contains_key(object_type),
+                "a Create of a {object_type} folds through the note-ingest handler"
+            );
+        }
+        assert_eq!(
+            handlers.create_by_object_type.len(),
+            crate::federation::note_parser::OBJECT_TYPES.len(),
+            "the note family only: later tickets (ChatMessage, polls) add their own keys"
         );
     }
 
@@ -1726,6 +1800,70 @@ mod tests {
             ),
             0,
             "and reached no handler"
+        );
+    }
+
+    /// The `Create` arm of the dispatch: the embedded object's own type
+    /// decides the route, a bare reference and an unclaimed type reach
+    /// nobody, and the activity type table is never consulted for a
+    /// `Create` either.
+    #[tokio::test]
+    async fn a_create_routes_by_its_objects_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let mut handlers = Handlers::new();
+        handlers.register("Create", ok_handler);
+        handlers.register_create("Note", ok_handler);
+        let embedded_note = json!({
+            "id": "https://peer.example/activities/create-note",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/posts/cn",
+                "type": "Note",
+                "content": "a note to fold",
+            },
+        });
+        let bare = json!({
+            "id": "https://peer.example/activities/create-bare",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "object": "https://peer.example/posts/cb",
+        });
+        let unclaimed = json!({
+            "id": "https://peer.example/activities/create-chat",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/posts/cc",
+                "type": "ChatMessage",
+                "content": "no chat ticket has claimed this yet",
+            },
+        });
+        let state = app_state(&pool);
+
+        let folded = deliver(&state, &alice, &embedded_note, &handlers).await;
+        let referenced = deliver(&state, &alice, &bare, &handlers).await;
+        let unknown = deliver(&state, &alice, &unclaimed, &handlers).await;
+
+        assert_eq!(folded, Ok(()), "the registered object type ran its handler");
+        assert_eq!(
+            referenced,
+            Ok(()),
+            "a bare reference completes as an ignore"
+        );
+        assert_eq!(unknown, Ok(()), "and so does an unclaimed object type");
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/create-note"),
+            1,
+            "the object's own type decided the route"
+        );
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/create-bare")
+                + seen("ok", "https://peer.example/activities/create-chat"),
+            0,
+            "neither the reference nor the unclaimed type reached a handler"
         );
     }
 

@@ -57,6 +57,7 @@ All configuration comes from environment variables. For local development, copy 
 | `SIGN_FETCHES` | no | `true` | Sign outgoing actor `GET`s with the instance actor's HTTP Signature so peers in authorized-fetch mode answer them (`true`/`false`, or `1`/`0`) |
 | `AUTHORIZED_FETCH` | no | `false` | Require a valid HTTP Signature on `GET`s of the ActivityPub actor and collection routes; while off they answer anonymous requests (`true`/`false`, or `1`/`0`) |
 | `FEDERATION_ENABLED` | no | `true` | Whether the instance federates at all; while off every ActivityPub inbox `POST` is refused with 403 `{"error":"Federation is disabled"}` and outbound delivery queues nothing (`true`/`false`, or `1`/`0`) |
+| `ACCEPT_UNSOLICITED_PUBLIC` | no | `true` | Whether public and unlisted remote statuses are stored even from authors no local account follows; while off the ingest path drops such a post unless a local user is mentioned in it or it answers a local status (`private`, `direct` and followers-addressed posts are never gated) (`true`/`false`, or `1`/`0`) |
 | `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop` today; policy tickets add more) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |

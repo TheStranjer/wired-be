@@ -945,6 +945,7 @@ async fn store_poll(
             expires_at: poll.expires_at,
             multiple: poll.multiple,
             hide_totals: poll.hide_totals,
+            ..PollParams::default()
         },
     )
     .await
@@ -1200,6 +1201,7 @@ fn preview_row(
         in_reply_to_account_id: None,
         in_reply_to_ap_id: None,
         conversation_id: id,
+        ap_context: None,
         direct_conversation_id: None,
         reblog_of_id: None,
         quote_of_id: None,
@@ -1597,7 +1599,14 @@ const fn visibility_width(visibility: Visibility) -> u8 {
 /// signature when they land.
 ///
 /// [`notify::on_mention`]: crate::services::notify::on_mention
-async fn after_status_created(state: &AppState, status: &status::Status) {
+///
+/// `pub(crate)`, not private: the federation ingest path
+/// ([`crate::services::ingest`] step 9) runs a freshly mirrored remote
+/// status through exactly this hook once its write commits — a new post is
+/// a new post for the notifications, cards and conversation arms whoever
+/// authored it, and every arm here already decides on the *recipient's*
+/// locality, never the author's.
+pub(crate) async fn after_status_created(state: &AppState, status: &status::Status) {
     notify::on_mention(state, status).await;
     notify::on_subscribed_status(state, status).await;
     crate::jobs::rich_media::schedule_fetch(state, status).await;

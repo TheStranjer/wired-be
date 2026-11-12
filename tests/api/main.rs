@@ -119,6 +119,11 @@ mod health;
 /// page builders).
 mod html_pages;
 
+/// Remote-note ingestion over HTTP: fixture `Create` activities run through
+/// the real dispatcher and the statuses they land, seen from the client
+/// API.
+mod ingest;
+
 /// The public instance endpoints (`src/api/instance.rs`).
 mod instance;
 

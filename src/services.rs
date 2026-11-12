@@ -75,12 +75,22 @@
 //! the viewer's own statuses exempt — which [`timeline_response`] and the
 //! notification and thread reads run between the render and the response.
 //!
+//! [`ingest`] is the inbound half of the same post lifecycle: it folds a
+//! remote `Note`-family object a `Create` delivered into a stored status —
+//! the dedupe on its `uri`, the reply/quote/context links resolved against
+//! what this instance already stores, the mentions settled against the
+//! `users` table (with capped network lookups), the emojis, media and poll
+//! written beside the status in its transaction — and runs the fresh row
+//! through the create path's own post-write hook, so a mirrored post
+//! notifies, cards and groups exactly as a local one does.
+//!
 //! [`timeline_response`]: crate::api::helpers::timeline_response
 
 pub mod create_status;
 pub mod delete_status;
 pub mod emoji_packs;
 pub mod filter;
+pub mod ingest;
 pub mod instance_actor;
 pub mod instance_meta;
 pub mod media_processing;
