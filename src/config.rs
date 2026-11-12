@@ -22,6 +22,8 @@ pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 pub const BIND_ADDR_VAR: &str = "BIND_ADDR";
 /// Environment variable holding the public origin of this instance.
 pub const BASE_URL_VAR: &str = "BASE_URL";
+/// Environment variable holding the origin the frontend pages are served from.
+pub const FRONTEND_BASE_URL_VAR: &str = "FRONTEND_BASE_URL";
 /// Environment variable holding the instance display name.
 pub const INSTANCE_NAME_VAR: &str = "INSTANCE_NAME";
 /// Environment variable holding the instance description.
@@ -926,6 +928,11 @@ pub struct Config {
     /// Public origin of this instance, normalized to e.g.
     /// `https://social.example` (no path, query or trailing slash).
     pub base_url: String,
+    /// Origin the frontend pages are served from, from `FRONTEND_BASE_URL`;
+    /// [`base_url`](Self::base_url) when unset or blank. A set value is
+    /// trimmed and loses its trailing slashes, so a browser redirect such as
+    /// `/notice/{id}` (a later slice) can hang its path straight onto it.
+    pub frontend_base_url: String,
     /// Display name of the instance.
     pub instance_name: String,
     /// Short description of the instance.
@@ -1247,6 +1254,8 @@ impl Config {
         Ok(Self {
             database_url,
             bind_addr,
+            // Read before `base_url` is moved below: it defaults onto it.
+            frontend_base_url: frontend_base_url(&lookup, &base_url),
             base_url,
             instance_name: profile.name,
             instance_description: profile.description,
@@ -1398,6 +1407,7 @@ impl Config {
             database_url: TEST_DATABASE_URL.to_owned(),
             bind_addr: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4000)),
             base_url: TEST_BASE_URL.to_owned(),
+            frontend_base_url: TEST_BASE_URL.to_owned(),
             instance_name: DEFAULT_INSTANCE_NAME.to_owned(),
             instance_description: DEFAULT_INSTANCE_DESCRIPTION.to_owned(),
             contact_email: None,
@@ -1851,6 +1861,24 @@ where
         .map(|url| url.trim().trim_end_matches('/').to_owned())
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"))
+}
+
+/// Reads `FRONTEND_BASE_URL`: the origin the frontend pages are served
+/// from, trimmed and with its trailing slashes dropped, or `base_url` — the
+/// normalized origin — when unset or blank. The `/notice/{id}` browser
+/// redirect (a later slice) hangs its path onto this value, so it gets the
+/// same trimmed, slash-stripped reading as the media base URL and the media
+/// proxy's base URL: nothing unusable ever reaches a `Location` header.
+/// Factored out of [`Config::from_lookup`], which has a size budget
+/// (AGENTS.md), because it defaults onto the origin `endpoints` normalizes.
+fn frontend_base_url<F>(lookup: &F, base_url: &str) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(FRONTEND_BASE_URL_VAR)
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| base_url.to_owned())
 }
 
 /// Reads the three feature toggles that gate the endpoints of
@@ -2554,24 +2582,29 @@ fn comma_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The `Debug` rendering of an optional secret: `Some("<redacted>")` when
+/// set, `None` when not, never the value itself. Factored out so the
+/// [`Config`] `Debug` impl keeps the `secret_key_base` field call inside
+/// rustfmt's call width, and so the impl as a whole stays within Clippy's
+/// line budget.
+fn redacted(is_set: bool) -> Option<&'static str> {
+    is_set.then_some("<redacted>")
+}
+
 /// Redacts `database_url`, which usually contains a password.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Bound so the `secret_key_base` field renders on one line: the
-        // closure that hides the value keeps the call past rustfmt's call
-        // width when it sits in the chain.
-        let secret_base = self.secret_key_base.as_ref().map(|_| "<redacted>");
-        // Bound for the same reason: these three field names and their
-        // `self` paths together pass rustfmt's call width, and each would
-        // otherwise split over three lines and push the function past
+        // Bound so each field call stays inside rustfmt's call width: these
+        // three field names with their `self` paths pass it, and unwrapped
+        // each would split over three lines and push the function past
         // Clippy's line budget.
         let activation = &self.account_activation_required;
         let approval = &self.registrations_approval_required;
         let anonymous_search = &self.search_statuses_unauthenticated;
-        // Bound for the same reason as above: each of these two names
-        // with its `self` path passes rustfmt's call width and would
-        // otherwise split over three lines, together pushing the function
-        // past Clippy's line budget.
+        // Bound for the same reason: these two names with their `self`
+        // paths pass rustfmt's call width and would otherwise split over
+        // three lines, together pushing the function past Clippy's line
+        // budget.
         let purge_days = &self.purge_deleted_statuses_days;
         let ping_secs = &self.streaming_ping_interval_secs;
         // Bound for the same reason: these two names with their `self`
@@ -2584,6 +2617,7 @@ impl fmt::Debug for Config {
             .field("database_url", &"<redacted>")
             .field("bind_addr", &self.bind_addr)
             .field("base_url", &self.base_url)
+            .field("frontend_base_url", &self.frontend_base_url)
             .field("instance_name", &self.instance_name)
             .field("instance_description", &self.instance_description)
             .field("contact_email", &self.contact_email)
@@ -2641,7 +2675,7 @@ impl fmt::Debug for Config {
             .field("smtp_password", &"<redacted>")
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
-            .field("secret_key_base", &secret_base)
+            .field("secret_key_base", &redacted(self.secret_key_base.is_some()))
             .field("media_proxy", &self.media_proxy)
             .field("rich_media_ignore_hosts", &self.rich_media_ignore_hosts)
             .field("rich_media_remote", &self.rich_media_remote)
@@ -4074,6 +4108,50 @@ mod tests {
         );
     }
 
+    /// `FRONTEND_BASE_URL`: unset or blank falls back to the normalized
+    /// `BASE_URL`, a set value wins with its surrounding whitespace and
+    /// trailing slashes stripped (the reading shared with `MEDIA_BASE_URL`
+    /// and the media proxy's base URL, so nothing unusable can reach a
+    /// `Location` header), and the field shows in Debug output.
+    #[test]
+    fn frontend_base_url_is_trimmed_and_defaults_to_the_base_url() {
+        let unset = config_with(&[]);
+        assert_eq!(
+            unset.frontend_base_url, unset.base_url,
+            "unset FRONTEND_BASE_URL equals BASE_URL"
+        );
+        assert_eq!(
+            unset.frontend_base_url, ORIGIN,
+            "the default is the normalized origin"
+        );
+        for (value, want) in [
+            ("https://frontend.example", "https://frontend.example"),
+            (" https://frontend.example/// ", "https://frontend.example"),
+            ("https://frontend.example/", "https://frontend.example"),
+            ("", ORIGIN),
+            ("/", ORIGIN),
+        ] {
+            let config = config_with(&[(FRONTEND_BASE_URL_VAR, value)]);
+            assert_eq!(
+                config.frontend_base_url, want,
+                "FRONTEND_BASE_URL={value:?} means {want}"
+            );
+        }
+        let with_port = config_with(&[(BASE_URL_VAR, "http://localhost:4000")]);
+        assert_eq!(
+            with_port.frontend_base_url, "http://localhost:4000",
+            "the default follows BASE_URL, port included"
+        );
+        let debug = format!(
+            "{:?}",
+            config_with(&[(FRONTEND_BASE_URL_VAR, " https://frontend.example/ ")])
+        );
+        assert!(
+            debug.contains(r#"frontend_base_url: "https://frontend.example""#),
+            "frontend_base_url is visible in Debug output: {debug}"
+        );
+    }
+
     #[test]
     fn uploads_dir_is_trimmed_and_defaults_to_uploads() {
         for (value, want) in [
@@ -5120,6 +5198,10 @@ mod tests {
     fn for_tests_is_the_fixed_lookup_config() {
         let config = Config::for_tests();
         assert_eq!(config.base_url, TEST_BASE_URL, "test base_url");
+        assert_eq!(
+            config.frontend_base_url, "https://test.example",
+            "test frontend_base_url defaults onto the test base_url"
+        );
         assert_eq!(config.database_url, TEST_DATABASE_URL, "placeholder url");
         assert_eq!(config.domain(), "test.example", "test domain");
         assert!(config.is_https(), "test base_url is https");
