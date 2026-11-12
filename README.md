@@ -58,7 +58,7 @@ All configuration comes from environment variables. For local development, copy 
 | `AUTHORIZED_FETCH` | no | `false` | Require a valid HTTP Signature on `GET`s of the ActivityPub actor and collection routes; while off they answer anonymous requests (`true`/`false`, or `1`/`0`) |
 | `FEDERATION_ENABLED` | no | `true` | Whether the instance federates at all; while off every ActivityPub inbox `POST` is refused with 403 `{"error":"Federation is disabled"}` and outbound delivery queues nothing (`true`/`false`, or `1`/`0`) |
 | `ACCEPT_UNSOLICITED_PUBLIC` | no | `true` | Whether public and unlisted remote statuses are stored even from authors no local account follows; while off the ingest path drops such a post unless a local user is mentioned in it or it answers a local status (`private`, `direct` and followers-addressed posts are never gated) (`true`/`false`, or `1`/`0`) |
-| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
+| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`, `anti_link_spam`, `normalize_markup`, `tag`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
 | `AVATAR_LIMIT_BYTES` | no | `2000000` | Maximum size of the `avatar` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
@@ -147,6 +147,39 @@ turned away at the door and never sent anything, exactly as a `reject` row of
 published in the federation block of `GET /api/v1/instance`,
 `GET /api/v2/instance` and NodeInfo as `SimplePolicy` beside an `mrf_simple`
 transparency object.
+
+`anti_link_spam` is Pleroma's `AntiLinkSpamPolicy`
+(`lib/pleroma/web/activity_pub/mrf/anti_link_spam_policy.ex`). It refuses a
+`Create` of a note from a remote author whose `content` carries a link — an
+`<a href>` whose classes name neither `mention` nor `hashtag` — while the
+author has zero followers and zero statuses; one follower or one earlier
+post, a note without links, or a local author and the activity passes.
+
+`normalize_markup` is Pleroma's `NormalizeMarkupPolicy`
+(`lib/pleroma/web/activity_pub/mrf/normalize_markup_policy.ex`). It replaces
+the `content` of every note the chain sees (the embedded object of a
+`Create` or `Update`) with the output of the instance's HTML sanitizer, so
+what is stored and re-served is already in the shape this instance writes.
+
+`tag` is Pleroma's `TagPolicy` (`lib/pleroma/web/activity_pub/mrf/tag_policy.ex`).
+It acts on the `users.tags` of the actor an activity speaks about, which the
+chain runner preloads only while the policy is enabled — an account's tags
+switch these on for its own activities:
+
+| Tag | Effect |
+|---|---|
+| `mrf_tag:media-force-nsfw` | The account's notes that carry attachments are marked `sensitive` |
+| `mrf_tag:media-strip` | The `attachment` entries of those notes are dropped |
+| `mrf_tag:force-unlisted` | A public note becomes unlisted: the public address moves from `to` into `cc` and the followers collection takes its place |
+| `mrf_tag:sandbox` | A public note becomes followers-only: the public address goes and the author's followers collection joins `to` |
+
+The last two switches are read off the tags of the **target** of a `Follow`
+(the local account being followed):
+
+| Tag | Effect |
+|---|---|
+| `mrf_tag:disable-remote-subscription` | `Follow` requests for the tagged account from remote users are refused |
+| `mrf_tag:disable-any-subscription` | `Follow` requests for the tagged account are refused, whoever sends them |
 
 ## Development
 

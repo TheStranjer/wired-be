@@ -76,7 +76,7 @@ const FLAG_TYPE: &str = "Flag";
 /// The public address as this policy writes it back: the full
 /// `ActivityStreams` iri, the spelling every reader accepts
 /// ([`PUBLIC_RECIPIENTS`] covers the two shorthands it may arrive as).
-const PUBLIC_ADDRESS: &str = "https://www.w3.org/ns/activitystreams#Public";
+pub(super) const PUBLIC_ADDRESS: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// The addressing properties the note rules rewrite.
 const ADDRESS_FIELDS: [&str; 2] = ["to", "cc"];
 /// The actor-document field each removal list strips, beside its list.
@@ -683,14 +683,14 @@ fn refusal_text(list: List, host: &str, reason: Option<&Reason>) -> String {
 }
 
 /// The first string of a document's `type`, which may itself be an array.
-fn activity_type(document: &Value) -> Option<String> {
+pub(super) fn activity_type(document: &Value) -> Option<String> {
     document.get("type").and_then(json::first_type)
 }
 
 /// The host of an activity's `actor` — the origin every list of this policy
 /// compares against. `None` for a document that names no actor, or whose
 /// actor is not an `http(s)` URL.
-fn activity_host(activity: &Value) -> Option<String> {
+pub(super) fn activity_host(activity: &Value) -> Option<String> {
     reference_host(activity.get("actor"))
 }
 
@@ -710,7 +710,7 @@ fn reference_host(value: Option<&Value>) -> Option<String> {
 
 /// Whether the document is a `Create`/`Update` whose `object` is embedded
 /// and of a note-family type: the shape the content rules speak about.
-fn is_note_activity(activity: &Value) -> bool {
+pub(super) fn is_note_activity(activity: &Value) -> bool {
     let wraps = activity_type(activity).is_some_and(|kind| WRAPPING_TYPES.contains(&kind.as_str()));
     let note = activity
         .get("object")
@@ -722,7 +722,7 @@ fn is_note_activity(activity: &Value) -> bool {
 }
 
 /// The embedded note object of such an activity, mutably; nothing else.
-fn note_object_mut(activity: &mut Value) -> Option<&mut Map<String, Value>> {
+pub(super) fn note_object_mut(activity: &mut Value) -> Option<&mut Map<String, Value>> {
     if !is_note_activity(activity) {
         return None;
     }
@@ -731,7 +731,7 @@ fn note_object_mut(activity: &mut Value) -> Option<&mut Map<String, Value>> {
 
 /// Whether a note carries attachments: a `null` and an empty array are
 /// none, anything else — one entry or many — is at least one.
-fn has_attachments(object: &Map<String, Value>) -> bool {
+pub(super) fn has_attachments(object: &Map<String, Value>) -> bool {
     object
         .get("attachment")
         .is_some_and(|value| !value.is_null() && !json::as_array(value).is_empty())
@@ -743,7 +743,7 @@ fn has_attachments(object: &Map<String, Value>) -> bool {
 /// Mastodon and this instance's own actors use, and the one
 /// [`parse_note`](crate::federation::note_parser::parse_note) compares the
 /// author's stored `followers_url` against.
-fn followers_collection(activity: &Value) -> String {
+pub(super) fn followers_collection(activity: &Value) -> String {
     let actor = activity
         .get("actor")
         .and_then(json::value_or_id)
@@ -774,7 +774,7 @@ fn is_followers_of(address: &str, host: Option<&str>) -> bool {
 
 /// Applies one document-level rewrite to the embedded object and then to
 /// the activity itself: the two places a peer spells a note's addressing.
-fn rewrite_each_document<F>(activity: &mut Value, mut rewrite: F)
+pub(super) fn rewrite_each_document<F>(activity: &mut Value, mut rewrite: F)
 where
     F: FnMut(&mut Map<String, Value>),
 {
@@ -802,7 +802,7 @@ fn unlist_document(document: &mut Map<String, Value>) {
 /// A note nobody public was addressed (a direct one) keeps its recipients:
 /// widening a private post to the whole follower set is not what limiting
 /// it means.
-fn limit_document(document: &mut Map<String, Value>, followers: &str) {
+pub(super) fn limit_document(document: &mut Map<String, Value>, followers: &str) {
     let public = addresses_public(document, "to") || addresses_public(document, "cc");
     if !public {
         return;
@@ -813,7 +813,7 @@ fn limit_document(document: &mut Map<String, Value>, followers: &str) {
 }
 
 /// Whether `field` of `document` names the public address.
-fn addresses_public(document: &Map<String, Value>, field: &str) -> bool {
+pub(super) fn addresses_public(document: &Map<String, Value>, field: &str) -> bool {
     document
         .get(field)
         .is_some_and(|value| json::as_array(value).iter().any(is_public_address))
@@ -823,7 +823,7 @@ fn addresses_public(document: &Map<String, Value>, field: &str) -> bool {
 /// as a single value is first normalized into the one-element array it
 /// stands for, so the bare `"to": "…#Public"` spelling goes empty rather
 /// than staying behind.
-fn remove_public(document: &mut Map<String, Value>, field: &str) {
+pub(super) fn remove_public(document: &mut Map<String, Value>, field: &str) {
     let Some(value) = document.get_mut(field) else {
         return;
     };
@@ -837,7 +837,7 @@ fn remove_public(document: &mut Map<String, Value>, field: &str) {
 
 /// Adds `address` to one document's `field` unless it already names it,
 /// creating the field as an array when the document carries none.
-fn add_address(document: &mut Map<String, Value>, field: &str, address: &str) {
+pub(super) fn add_address(document: &mut Map<String, Value>, field: &str, address: &str) {
     let mut entries = document
         .get(field)
         .map_or_else(Vec::new, |value| json::as_array(value).to_vec());
@@ -894,7 +894,8 @@ mod tests {
     }
 
     /// The context of an instance whose own domain is [`LOCAL`], over the
-    /// same configuration the policy under test was built from.
+    /// same configuration the policy under test was built from. The
+    /// per-actor facts stay unloaded: `simple` reads none.
     fn ctx(lists: &Value) -> MrfContext {
         MrfContext {
             config: Arc::new(MrfConfig::assemble(
@@ -903,6 +904,10 @@ mod tests {
             )),
             now: Utc::now(),
             local_domain: LOCAL.to_owned(),
+            author_follower_count: None,
+            author_status_count: None,
+            author_tags: Vec::new(),
+            target_tags: Vec::new(),
         }
     }
 
