@@ -76,8 +76,9 @@
 //! Neither write federates anything yet: Pleroma's `react_with_emoji` runs the
 //! `EmojiReact` activity through its pipeline, which delivers it and broadcasts
 //! the `pleroma:emoji_reaction` socket event. Both routes call this module's
-//! `after_reaction_changed` hook as that ticket's documented empty landing
-//! point.
+//! `after_reaction_changed` hook, which lands the author's notification through
+//! [`crate::services::notify`] and waits on the federation and streaming
+//! tickets for the delivery and the broadcast beside it.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //! [`CustomEmoji`]: crate::models::custom_emoji::CustomEmoji
@@ -114,7 +115,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    services::render_status::render_status,
+    services::{notify, render_status::render_status},
     state::AppState,
     util::emoji::Emoji,
 };
@@ -219,7 +220,7 @@ async fn react(
         emoji = %stored.emoji,
         "status reacted to"
     );
-    after_reaction_changed(&state, &stored, true);
+    after_reaction_changed(&state, &stored, true).await;
     rendered_status(&state, &auth.0, &row).await
 }
 
@@ -253,7 +254,7 @@ async fn unreact(
             emoji = %removed.emoji,
             "reaction withdrawn"
         );
-        after_reaction_changed(&state, &removed, false);
+        after_reaction_changed(&state, &removed, false).await;
     }
     rendered_status(&state, &auth.0, &row).await
 }
@@ -499,13 +500,18 @@ async fn local_emoji(pool: &PgPool, shortcode: &str) -> AppResult<Option<CustomE
     Ok(found.into_iter().find(|emoji| !emoji.disabled))
 }
 
-/// Post-write hook of both reaction routes: the federation ticket that sends an
-/// `EmojiReact` activity (and its `Undo`, when a reaction is withdrawn) wires
-/// the delivery in here — the activity to send is [`ReactionRow::ap_id`], the
-/// triple it names is [`ReactionRow::user_id`], [`ReactionRow::status_id`] and
-/// [`ReactionRow::emoji`], and the queueing happens through `state` (decision
-/// 11). The same hook is where Pleroma's `pleroma:emoji_reaction` socket
-/// broadcast will land.
+/// Post-write hook of both reaction routes: the notification telling the
+/// [`notify`] module owns runs through here — a `PUT` tells the reacted-to
+/// status's author [`pleroma:emoji_reaction`](notification::TYPE_EMOJI_REACTION)
+/// once (the idempotent repeat restates the same telling, Pleroma's
+/// no-second-activity fact), a `DELETE` takes exactly that emoji's telling
+/// back — and the federation ticket that sends an `EmojiReact` activity
+/// (and its `Undo`, when a reaction is withdrawn) wires the delivery into
+/// the same body: the activity to send is [`ReactionRow::ap_id`], the
+/// triple it names is [`ReactionRow::user_id`], [`ReactionRow::status_id`]
+/// and [`ReactionRow::emoji`], and the queueing happens through `state`
+/// (decision 11). The same ticket lands Pleroma's `pleroma:emoji_reaction`
+/// socket broadcast, which waits on the streaming ticket beside it.
 ///
 /// `reacting` states which way the write moved the fact: `true` for the reaction
 /// a `PUT` left behind — including a repeat, which restates the same fact
@@ -513,10 +519,11 @@ async fn local_emoji(pool: &PgPool, shortcode: &str) -> AppResult<Option<CustomE
 /// a `DELETE` removed. A withdrawal that found no row to remove never reaches
 /// this hook.
 ///
-/// Intentionally empty until then, like the blocks'
-/// [`after_block_changed`](crate::api::blocks::after_block_changed) and the
-/// reports' [`after_report_created`](crate::api::reports::after_report_created).
-const fn after_reaction_changed(_state: &AppState, _reaction: &ReactionRow, _reacting: bool) {}
+/// [`notify`]: crate::services::notify
+/// [`pleroma:emoji_reaction`]: crate::models::notification::TYPE_EMOJI_REACTION
+async fn after_reaction_changed(state: &AppState, reaction: &ReactionRow, reacting: bool) {
+    notify::on_reaction(state, reaction, reacting).await;
+}
 
 #[cfg(test)]
 mod tests {

@@ -6,7 +6,7 @@
 //! ends in one telling of the affected local account, with the same rules
 //! Pleroma's `skip?` list applies. This module is the single place those
 //! tellings are decided, and the action hooks in [`crate::api`] and
-//! [`crate::services`] are thin landings that call exactly one of its five
+//! [`crate::services`] are thin landings that call exactly one of its six
 //! functions:
 //!
 //! - [`on_follow`] — the follow endpoint's telling: `follow` when the
@@ -26,6 +26,11 @@
 //!   status (the group key Pleroma groups boosts and likes on is the
 //!   object id, and the entity renders the post that was acted on). The
 //!   withdrawal of either takes that one telling back.
+//! - [`on_reaction`] — the emoji-reaction telling of the reacted-to
+//!   status's author, carrying the emoji beside the status so two emojis of
+//!   one actor are two tellings; the reaction write's idempotent repeat is
+//!   deduplicated and the withdrawal takes exactly that emoji's telling
+//!   back.
 //!
 //! Every creation runs through [`notification::maybe_notify`], so the
 //! recipient's `block_from_strangers` setting withholds what it withholds
@@ -53,12 +58,13 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::{
+        emoji_reaction::EmojiReaction,
         favourite::Favourite,
         follow::{Follow, FollowState},
         mention,
         notification::{
-            self, NewNotification, TYPE_FAVOURITE, TYPE_FOLLOW, TYPE_FOLLOW_REQUEST, TYPE_MENTION,
-            TYPE_REBLOG,
+            self, NewNotification, TYPE_EMOJI_REACTION, TYPE_FAVOURITE, TYPE_FOLLOW,
+            TYPE_FOLLOW_REQUEST, TYPE_MENTION, TYPE_REBLOG,
         },
         status::{self, Status as StatusRow},
         user::{self, User},
@@ -70,14 +76,12 @@ use crate::{
 /// Tell `recipient` (a [`User`] row already in hand) that `actor_id` did
 /// `event_type` about `status_id`.
 ///
-/// The shared create arm of every rule above: a recipient who is the actor
-/// (self-action) or who is not local is nobody to tell from here, and
-/// everyone else's row is decided by [`notification::maybe_notify`]'s own
-/// skip rules. A row that lands also queues the recipient's Web Push
-/// deliveries (one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
-/// job per subscription, decision 11); the queueing is best-effort beside
-/// the telling itself — a notification that exists but fails to wake a
-/// browser is logged, never an error back to the endpoint.
+/// The shared create arm of every rule above, spelling the
+/// [`NewNotification`] the status-less and emoji-less tellings carry; see
+/// [`tell_new`] for the arm that decides, and [`on_reaction`] for the one
+/// telling that carries an emoji.
+///
+/// [`tell_new`]: tell_new
 async fn tell(
     state: &AppState,
     recipient: &User,
@@ -85,11 +89,9 @@ async fn tell(
     event_type: &str,
     status_id: Option<Uuid>,
 ) -> AppResult<()> {
-    if recipient.id == actor_id || !recipient.local.get() {
-        return Ok(());
-    }
-    let created = notification::maybe_notify(
-        &state.db,
+    tell_new(
+        state,
+        recipient,
         &NewNotification {
             user_id: recipient.id,
             from_account_id: actor_id,
@@ -99,7 +101,23 @@ async fn tell(
             report_id: None,
         },
     )
-    .await?;
+    .await
+}
+
+/// The create arm in full: a recipient who is the actor (self-action) or
+/// who is not local is nobody to tell from here, and everyone else's row —
+/// the whole telling as `new` spells it, its `user_id` being
+/// `recipient`'s id — is decided by [`notification::maybe_notify`]'s own
+/// skip rules. A row that lands also queues the recipient's Web Push
+/// deliveries (one [`push.deliver`](crate::jobs::web_push::KIND_DELIVER)
+/// job per subscription, decision 11); the queueing is best-effort beside
+/// the telling itself — a notification that exists but fails to wake a
+/// browser is logged, never an error back to the endpoint.
+async fn tell_new(state: &AppState, recipient: &User, new: &NewNotification<'_>) -> AppResult<()> {
+    if recipient.id == new.from_account_id || !recipient.local.get() {
+        return Ok(());
+    }
+    let created = notification::maybe_notify(&state.db, new).await?;
     if let Some(note) = created
         && let Err(err) = web_push::enqueue_deliveries(&state.db, note.id, recipient.id).await
     {
@@ -257,6 +275,81 @@ async fn resolution_telling(
     )
     .await?;
     tell_once(state, resolver, request.follower_id, TYPE_FOLLOW).await
+}
+
+/// The reaction endpoint's notification, landed from
+/// `after_reaction_changed` in [`crate::api::emoji_reactions`].
+///
+/// A reaction tells the reacted-to status's author [`TYPE_EMOJI_REACTION`],
+/// naming the status and carrying the emoji — Pleroma's `EmojiReact`
+/// telling, whose notification is the reacted-to post and whose group key
+/// distinguishes one emoji from another. The reaction write is idempotent
+/// and re-fires the hook for a repeat, so the telling is deduplicated
+/// through [`notification::already_notified_reaction`], the follow's way;
+/// the withdrawal takes exactly that emoji's telling back, leaving a second
+/// emoji's row standing.
+pub async fn on_reaction(state: &AppState, reaction: &EmojiReaction, reacting: bool) {
+    if let Err(err) = reaction_telling(state, reaction, reacting).await {
+        warn!(
+            status = %reaction.status_id,
+            %err,
+            "could not tell a reacted-to post's author about the reaction"
+        );
+    }
+}
+
+/// [`on_reaction`]'s work: the reacted-to status is read for its author — a
+/// row that cannot be read back is a deleted status whose notifications
+/// [`notification::delete_for_status`] already took with it (see
+/// [`reblog_telling`] for the same arm) — and the emoji rides along in the
+/// telling and in the withdrawal.
+async fn reaction_telling(
+    state: &AppState,
+    reaction: &EmojiReaction,
+    reacting: bool,
+) -> AppResult<()> {
+    let Some(reacted_to) = status::get_by_id(&state.db, reaction.status_id).await? else {
+        return Ok(());
+    };
+    if !reacting {
+        notification::delete_matching_reaction(
+            &state.db,
+            reacted_to.user_id,
+            reaction.user_id,
+            reaction.status_id,
+            &reaction.emoji,
+        )
+        .await
+        .map(drop)?;
+        return Ok(());
+    }
+    let Some(recipient) = user::get_by_id(&state.db, reacted_to.user_id).await? else {
+        return Ok(());
+    };
+    if notification::already_notified_reaction(
+        &state.db,
+        recipient.id,
+        reaction.user_id,
+        reaction.status_id,
+        &reaction.emoji,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    tell_new(
+        state,
+        &recipient,
+        &NewNotification {
+            user_id: recipient.id,
+            from_account_id: reaction.user_id,
+            notification_type: TYPE_EMOJI_REACTION,
+            status_id: Some(reaction.status_id),
+            emoji: Some(&reaction.emoji),
+            report_id: None,
+        },
+    )
+    .await
 }
 
 /// The create service's mention notifications, landed from
@@ -418,6 +511,7 @@ mod tests {
         config::Config,
         http_client::HttpClient,
         models::{
+            emoji_reaction::{self, NewReaction},
             favourite, follow,
             oauth_app::{self, NewOauthApp},
             oauth_token::{self, NewToken},
@@ -928,6 +1022,120 @@ mod tests {
         assert!(
             rows(pool, alice.id).await.is_empty(),
             "a status the reads cannot answer tells nobody and errors nowhere"
+        );
+    }
+
+    /// A reaction by `reactor` to `target` with `emoji`, straight through
+    /// the reaction model: the row the endpoint hands its hook.
+    async fn react_note(
+        pool: &PgPool,
+        reactor: &User,
+        target: &StatusRow,
+        emoji: &str,
+    ) -> EmojiReaction {
+        emoji_reaction::react(
+            pool,
+            BASE,
+            &NewReaction {
+                user_id: reactor.id,
+                status_id: target.id,
+                emoji,
+                url: None,
+            },
+        )
+        .await
+        .expect("the reaction fixture writes")
+    }
+
+    #[tokio::test]
+    async fn a_reaction_tells_the_author_once_per_emoji_and_undo_retires_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "rc-alice").await;
+        let bob = local(pool, "rc-bob").await;
+        let mallory = remote(pool, "rc-mallory", "remote.example").await;
+        let original = post(pool, &alice, "react to me").await;
+
+        let thumb = react_note(pool, &bob, &original, "👍").await;
+        on_reaction(&state, &thumb, true).await;
+        let told = rows(pool, alice.id).await;
+        assert_eq!(
+            facts(pool, alice.id).await,
+            vec![(TYPE_EMOJI_REACTION.to_owned(), bob.id, Some(original.id))],
+            "the reaction is told to the reacted-to author"
+        );
+        assert_eq!(
+            told.first().expect("one row").emoji.as_deref(),
+            Some("👍"),
+            "the telling carries the emoji"
+        );
+        assert_eq!(
+            told.first().expect("one row").group_key.as_deref(),
+            notification::grouped_key(TYPE_EMOJI_REACTION, Some(original.id), Some("👍"))
+                .as_deref(),
+            "and the group key that distinguishes it"
+        );
+
+        // The endpoint re-fires the hook for the idempotent repeat; the
+        // emoji-scoped deduplication keeps the second call silent.
+        let again = react_note(pool, &bob, &original, "👍").await;
+        on_reaction(&state, &again, true).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            1,
+            "a repeat of the same emoji tells once"
+        );
+
+        let party = react_note(pool, &bob, &original, "🎉").await;
+        on_reaction(&state, &party, true).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            2,
+            "a second emoji is a second telling"
+        );
+
+        let withdrawn = emoji_reaction::unreact(pool, bob.id, original.id, "👍")
+            .await
+            .expect("the withdrawal runs")
+            .expect("the reaction was there to remove");
+        on_reaction(&state, &withdrawn, false).await;
+        let left = rows(pool, alice.id).await;
+        assert_eq!(left.len(), 1, "only that emoji's telling went");
+        assert_eq!(
+            left.first().expect("the row").emoji.as_deref(),
+            Some("🎉"),
+            "and the standing one is the other emoji's"
+        );
+
+        // Self-reaction and a remote author tell nobody, and a deleted
+        // status leaves the hook arm silent both ways.
+        let own = react_note(pool, &alice, &original, "🎉").await;
+        on_reaction(&state, &own, true).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            1,
+            "liking yourself is not telling yourself"
+        );
+        let mirror = post(pool, &mallory, "their post").await;
+        let on_mirror = react_note(pool, &bob, &mirror, "👍").await;
+        on_reaction(&state, &on_mirror, true).await;
+        assert!(
+            rows(pool, mallory.id).await.is_empty(),
+            "a remote author is not ours to tell"
+        );
+        let doomed = post(pool, &alice, "doomed").await;
+        let _tombstone = status::soft_delete(pool, doomed.id)
+            .await
+            .expect("the delete runs")
+            .expect("the row was live");
+        let doomed_reaction = react_note(pool, &bob, &doomed, "👍").await;
+        on_reaction(&state, &doomed_reaction, true).await;
+        on_reaction(&state, &doomed_reaction, false).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            1,
+            "a deleted status tells nobody and errors nowhere"
         );
     }
 

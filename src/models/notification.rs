@@ -30,10 +30,12 @@
 //! Pleroma's `set_read_up_to` performs, [`delete_for_status`] the
 //! cleanup that takes a deleted status's notifications with it,
 //! [`already_notified`] the deduplication read [`crate::services::notify`]
-//! asks before telling a recipient the same fact twice, and
+//! asks before telling a recipient the same fact twice, whose
+//! emoji-keyed [`already_notified_reaction`] guards the reaction write, and
 //! [`delete_matching`] the withdrawal write that takes one telling back —
 //! a favourited post un-favourited, a boost withdrawn, a follow request
-//! granted.
+//! granted — with the emoji-scoped [`delete_matching_reaction`] its
+//! un-reacting counterpart.
 //!
 //! Dismissal is soft: the writes stamp [`dismissed_at`](Notification::dismissed_at)
 //! and every read hides the stamped rows rather than deleting them. Every
@@ -319,6 +321,41 @@ pub async fn already_notified(
     Ok(found)
 }
 
+/// Whether `user_id` already holds a live (undismissed)
+/// [`TYPE_EMOJI_REACTION`] notification of `status_id` caused by
+/// `from_account_id` carrying exactly `emoji`.
+///
+/// [`already_notified`] narrowed to the one type whose telling is keyed by
+/// the emoji beside the status: the reaction endpoint re-fires its hook for
+/// an idempotent repeat, and two emojis of one actor on one status are two
+/// tellings (their group keys differ — see [`grouped_key`]). A dismissed
+/// row does not count, exactly as in [`already_notified`].
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn already_notified_reaction(
+    pool: &PgPool,
+    user_id: Uuid,
+    from_account_id: Uuid,
+    status_id: Uuid,
+    emoji: &str,
+) -> AppResult<bool> {
+    let (found,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM notifications \
+          WHERE user_id = $1 AND from_account_id = $2 AND type = $3 \
+            AND status_id = $4 AND emoji = $5 AND dismissed_at IS NULL)",
+    )
+    .bind(user_id)
+    .bind(from_account_id)
+    .bind(TYPE_EMOJI_REACTION)
+    .bind(status_id)
+    .bind(emoji)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
 /// The stored notification `id` of `user_id`, whatever its state.
 ///
 /// Pleroma's `Notification.get/2`, which only asks who the row belongs
@@ -486,6 +523,39 @@ pub async fn delete_matching(
     .bind(from_account_id)
     .bind(notification_type)
     .bind(status_id)
+    .execute(pool)
+    .await?;
+    Ok(outcome.rows_affected())
+}
+
+/// Removes every `pleroma:emoji_reaction` notification naming exactly this
+/// recipient, actor, status and emoji, returning how many rows went.
+///
+/// The withdrawal [`delete_matching`] cannot spell: un-reacting with one
+/// emoji takes back only that emoji's telling, so a second emoji of the same
+/// actor on the same status stands (the two rows carry different group keys
+/// — see [`grouped_key`]). Like [`delete_matching`], dismissed rows go too.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn delete_matching_reaction(
+    pool: &PgPool,
+    user_id: Uuid,
+    from_account_id: Uuid,
+    status_id: Uuid,
+    emoji: &str,
+) -> AppResult<u64> {
+    let outcome = sqlx::query(
+        "DELETE FROM notifications \
+          WHERE user_id = $1 AND from_account_id = $2 AND type = $3 \
+            AND status_id = $4 AND emoji = $5",
+    )
+    .bind(user_id)
+    .bind(from_account_id)
+    .bind(TYPE_EMOJI_REACTION)
+    .bind(status_id)
+    .bind(emoji)
     .execute(pool)
     .await?;
     Ok(outcome.rows_affected())
@@ -2035,6 +2105,137 @@ mod tests {
                 .expect("the read runs")
                 .is_none(),
             "a dismissed row hides"
+        );
+    }
+
+    /// A `pleroma:emoji_reaction` notification carrying `emoji`.
+    async fn reaction_note(
+        pool: &PgPool,
+        recipient: Uuid,
+        actor: Uuid,
+        status_id: Uuid,
+        emoji: &str,
+    ) -> Notification {
+        create(
+            pool,
+            &NewNotification {
+                user_id: recipient,
+                from_account_id: actor,
+                notification_type: TYPE_EMOJI_REACTION,
+                status_id: Some(status_id),
+                emoji: Some(emoji),
+                report_id: None,
+            },
+        )
+        .await
+        .expect("the reaction fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn the_reaction_dedup_keys_on_the_emoji_and_hides_dismissed_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (recipient, actor, status_id) = trio(pool).await;
+        assert!(
+            !already_notified_reaction(pool, recipient, actor, status_id, "🎉")
+                .await
+                .expect("the read runs"),
+            "nothing told yet"
+        );
+        let party = reaction_note(pool, recipient, actor, status_id, "🎉").await;
+        assert!(
+            already_notified_reaction(pool, recipient, actor, status_id, "🎉")
+                .await
+                .expect("the read runs"),
+            "the live row says it"
+        );
+        for (who, case) in [
+            ((recipient, actor, status_id, "❤️"), "the other emoji"),
+            (
+                (Uuid::now_v7(), actor, status_id, "🎉"),
+                "another recipient",
+            ),
+            (
+                (recipient, Uuid::now_v7(), status_id, "🎉"),
+                "another actor",
+            ),
+            ((recipient, actor, Uuid::now_v7(), "🎉"), "another status"),
+        ] {
+            assert!(
+                !already_notified_reaction(pool, who.0, who.1, who.2, who.3)
+                    .await
+                    .expect("the read runs"),
+                "{case} is not told"
+            );
+        }
+        let _dismissed = dismiss(pool, recipient, party.id)
+            .await
+            .expect("the dismissal runs");
+        assert!(
+            !already_notified_reaction(pool, recipient, actor, status_id, "🎉")
+                .await
+                .expect("the read runs"),
+            "a dismissed row does not count, the `already_notified` rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reaction_withdrawal_takes_only_that_emoji() {
+        use crate::{
+            config::TEST_BASE_URL,
+            models::user::{NewUser, insert, local_ap_id},
+        };
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (recipient, actor, status_id) = trio(pool).await;
+        let stranger = insert(
+            pool,
+            &NewUser::local(
+                "notif-reaction-stranger",
+                &local_ap_id(TEST_BASE_URL, "notif-reaction-stranger"),
+            ),
+        )
+        .await
+        .expect("the stranger fixture inserts");
+        let party = reaction_note(pool, recipient, actor, status_id, "🎉").await;
+        let heart = reaction_note(pool, recipient, actor, status_id, "❤️").await;
+        // This recipient's dismissed ❤️ row and a stranger's 🎉 row of the
+        // same triple: the first stands because the withdrawal speaks the
+        // other emoji, the second because it speaks the other recipient.
+        let _dismissed = dismiss(pool, recipient, heart.id).await.expect("dismiss");
+        let foreign = reaction_note(pool, stranger.id, actor, status_id, "🎉").await;
+
+        let gone = delete_matching_reaction(pool, recipient, actor, status_id, "🎉")
+            .await
+            .expect("the withdrawal runs");
+        assert_eq!(gone, 1, "only this recipient's own 🎉 row went");
+        assert!(
+            get(pool, recipient, party.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "and it is gone, not stamped"
+        );
+        assert!(
+            get(pool, recipient, heart.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "the other emoji's row stands, dismissed though it is"
+        );
+        assert!(
+            get(pool, stranger.id, foreign.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "the foreign recipient's same-emoji row is scoped out"
+        );
+        assert_eq!(
+            delete_matching_reaction(pool, recipient, actor, status_id, "🎉")
+                .await
+                .expect("the repeat runs"),
+            0,
+            "withdrawing what is already gone changes nothing"
         );
     }
 }
