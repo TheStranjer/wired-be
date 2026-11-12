@@ -41,6 +41,12 @@ pub struct AppState {
     /// [`LANGUAGES_TTL`](crate::services::translate::LANGUAGES_TTL)).
     /// Construct it with `Arc::default()`, which applies that TTL.
     pub translation_languages_cache: Arc<TranslationLanguagesCache>,
+    /// The in-memory cache behind the MRF pipeline's configuration read:
+    /// the `mrf` instance setting is re-read only after the window lapses
+    /// (see [`crate::util::cache::TimedCache`] and
+    /// [`MRF_CONFIG_TTL`](crate::federation::mrf::MRF_CONFIG_TTL)).
+    /// Construct it with `Arc::default()`, which applies that TTL.
+    pub mrf_config_cache: Arc<crate::federation::mrf::MrfConfigCache>,
     /// The in-memory fixed-window rate limiter shared by every throttled
     /// route (see [`crate::rate_limit`]): one instance per process, so a
     /// bucket counts one budget across the routes that mount it. Build it

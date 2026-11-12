@@ -1139,3 +1139,58 @@ async fn the_sub_resources_are_v1_only() {
         "the v2 document itself stays served"
     );
 }
+
+/// The `pleroma.metadata.federation` block reports the live MRF chain:
+/// the `mrf` instance setting's policy names in Pleroma formatting
+/// beside each policy's sanitized `mrf_<policy>` transparency object, on
+/// both document versions. Unknown names drop out of the chain, not into
+/// the document.
+#[tokio::test]
+async fn federation_reports_the_enabled_mrf_policies() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    wired_be::models::instance_setting::set(&pool, "mrf", &json!({"policies": ["ghost", "noop"]}))
+        .await
+        .expect("the setting writes");
+    let app = common::test_app(pool);
+    for path in ["/api/v1/instance", "/api/v2/instance"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::OK, "{path} answers");
+        let federation = response.json_value()["pleroma"]["metadata"]["federation"].clone();
+        assert_eq!(
+            federation["mrf_policies"],
+            json!(["NoOpPolicy"]),
+            "{path}: the chain's names, the unknown one dropped"
+        );
+        assert_eq!(
+            federation["mrf_noop"],
+            json!({}),
+            "{path}: the shipped policy describes itself empty"
+        );
+        assert_eq!(federation["enabled"], true, "{path}: still federating");
+        assert_eq!(
+            federation["exclusions"], false,
+            "{path}: the empty transparency lists exclude nothing"
+        );
+    }
+}
+
+/// `MRF_POLICIES` enables the advertised chain with no database row: the
+/// env fallback reaches the very same metadata block.
+#[tokio::test]
+async fn mrf_policies_env_enables_the_federation_block() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let mut config = common::test_config();
+    config.mrf_policies = vec!["noop".to_owned()];
+    let app = common::test_app_with_config(pool, config);
+    let response = common::TestRequest::get("/api/v1/instance")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the document answers");
+    assert_eq!(
+        response.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
+        json!(["NoOpPolicy"]),
+        "the env list builds the advertised chain"
+    );
+}

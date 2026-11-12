@@ -65,6 +65,7 @@
 
 use std::collections::HashSet;
 
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -77,6 +78,7 @@ use crate::{
     federation::{
         delivery::{best_inbox, enqueue_delivery},
         json,
+        mrf::{self, MrfDecision},
         note_parser::PUBLIC_RECIPIENTS,
     },
     jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_FEDERATOR_OUTGOING},
@@ -128,6 +130,11 @@ struct PublishArgs {
     activity: Value,
 }
 
+/// The kind of the reject-stage seam of [`publish`]: a `fn` pointer so a
+/// test can drive the reject path with a fake, the same way the
+/// dispatcher's pipeline takes its [`mrf`](super::mrf) stage.
+type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
+
 /// Computes the delivery targets of `activity` as addressed by `actor` and
 /// queues one [`enqueue_delivery`] per unique inbox, answering how many
 /// deliveries were enqueued.
@@ -141,6 +148,11 @@ struct PublishArgs {
 /// [`PublishOpts::extra_inboxes`] added, and everything undeliverable —
 /// local, refused, rejected, unreachable, unknown, already counted —
 /// dropped.
+///
+/// Before any of that, the activity passes the outgoing half of the
+/// [MRF](super::mrf) chain: a rejection delivers nothing (the answer is
+/// `0`, the reason goes to the debug log), and a rewrite is what gets
+/// addressed and delivered.
 ///
 /// While `FEDERATION_ENABLED` is off nothing is computed or queued and the
 /// answer is `0`, the same no-op [`enqueue_delivery`] performs per inbox.
@@ -157,22 +169,41 @@ pub async fn publish(
     activity: &Value,
     opts: PublishOpts,
 ) -> AppResult<usize> {
+    publish_filtered(state, actor, activity, opts, mrf::filter_outgoing_boxed).await
+}
+
+/// [`publish`] over an injected policy stage — the real one for callers,
+/// a fake for the tests of the reject path.
+async fn publish_filtered(
+    state: &AppState,
+    actor: &User,
+    activity: &Value,
+    opts: PublishOpts,
+    mrf_filter: OutgoingFilter,
+) -> AppResult<usize> {
     if !state.config.federation_enabled.get() {
         debug!("publish skipped: federation is disabled");
         return Ok(0);
     }
+    let activity = match mrf_filter(state.clone(), activity.clone()).await {
+        MrfDecision::Reject(reason) => {
+            debug!(reason = %reason, "the policy pipeline rejected the outgoing activity; nothing is delivered");
+            return Ok(0);
+        }
+        MrfDecision::Accept(filtered) => filtered,
+    };
     let addresses = opts
         .only_to
         .as_ref()
-        .map_or_else(|| addressed_to(activity), Clone::clone);
+        .map_or_else(|| addressed_to(&activity), Clone::clone);
     let mut candidates = expand_recipients(&state.db, actor, &addresses).await?;
-    if includes_public(&addresses) || relays_should_see(activity, &actor.ap_id) {
+    if includes_public(&addresses) || relays_should_see(&activity, &actor.ap_id) {
         candidates.extend(instance::relay_inboxes(&state.db).await?);
     }
     candidates.extend(opts.extra_inboxes);
     let targets = deliverable_inboxes(&state.db, actor, candidates).await?;
     for inbox in &targets {
-        enqueue_delivery(&state.db, &state.config, inbox, actor, activity).await?;
+        enqueue_delivery(&state.db, &state.config, inbox, actor, &activity).await?;
     }
     Ok(targets.len())
 }
@@ -445,6 +476,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
             translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
@@ -586,6 +618,137 @@ mod tests {
             attempts: 1,
             max_attempts: 5,
         }
+    }
+
+    /// The fake rejecting policy stage: the MRF arm answers `Reject`
+    /// without looking at the document.
+    fn reject_outgoing(_state: AppState, _activity: Value) -> BoxFuture<'static, MrfDecision> {
+        Box::pin(async { MrfDecision::Reject("test policy".to_owned()) })
+    }
+
+    /// The fake rewriting policy stage: it stamps `content` into the
+    /// activity and accepts the rewrite.
+    fn rewrite_outgoing(_state: AppState, mut activity: Value) -> BoxFuture<'static, MrfDecision> {
+        Box::pin(async move {
+            activity["published"] = json!("1970-01-01T00:00:00.000Z");
+            MrfDecision::Accept(activity)
+        })
+    }
+
+    /// The MRF reject path on the way out: a rejected activity queues
+    /// nothing at all — not even for a follower that would otherwise
+    /// receive it.
+    #[tokio::test]
+    async fn a_rejected_outgoing_activity_delivers_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = alice(&pool).await;
+        let erin = mirror(
+            &pool,
+            "erin",
+            "other.example",
+            "https://other.example/users/erin/inbox",
+            None,
+        )
+        .await;
+        followed(&pool, &erin, &alice).await;
+        let state = test_state(&pool);
+
+        let count = publish_filtered(
+            &state,
+            &alice,
+            &public_activity(&alice),
+            PublishOpts::default(),
+            reject_outgoing,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 0, "the rejection stops the fan-out");
+        assert_eq!(job_count(&pool).await, 0, "and no delivery is queued");
+    }
+
+    /// The rewritten document is what the fan-out addresses and
+    /// delivers: the chain's answer replaces the input.
+    #[tokio::test]
+    async fn the_accepted_rewrite_is_what_gets_delivered() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = alice(&pool).await;
+        let erin = mirror(
+            &pool,
+            "erin",
+            "other.example",
+            "https://other.example/users/erin/inbox",
+            None,
+        )
+        .await;
+        let state = test_state(&pool);
+        let activity = json!({
+            "id": ACTIVITY_ID,
+            "type": "Create",
+            "actor": alice.ap_id,
+            "to": [erin.ap_id],
+        });
+
+        let count = publish_filtered(
+            &state,
+            &alice,
+            &activity,
+            PublishOpts::default(),
+            rewrite_outgoing,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1, "the accepted rewrite is delivered");
+        let delivered: (Value,) = sqlx::query_as("SELECT args->'body' FROM jobs WHERE kind = $1")
+            .bind(KIND_DELIVER)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered.0["published"],
+            json!("1970-01-01T00:00:00.000Z"),
+            "and the queued delivery carries the rewritten document, not the original"
+        );
+    }
+
+    /// The real policy stage on a default configuration accepts, so the
+    /// ordinary [`publish`] path is unchanged by the pipeline hook.
+    #[tokio::test]
+    async fn the_default_chain_publishes_everything_unchanged() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = alice(&pool).await;
+        let erin = mirror(
+            &pool,
+            "erin",
+            "other.example",
+            "https://other.example/users/erin/inbox",
+            None,
+        )
+        .await;
+        followed(&pool, &erin, &alice).await;
+        let state = test_state(&pool);
+
+        let count = publish_ok(
+            &state,
+            &alice,
+            &public_activity(&alice),
+            PublishOpts::default(),
+        )
+        .await;
+
+        assert_eq!(
+            count, 1,
+            "the accept-everything default lets the fan-out run"
+        );
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://other.example/users/erin/inbox"],
+            "with the document untouched"
+        );
     }
 
     /// How a [`handle`] run reads in a test message: the handler's own

@@ -514,6 +514,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
             translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(mailbox.clone()),
@@ -537,6 +538,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
             translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: transport,
@@ -607,8 +609,10 @@ mod tests {
         assert_eq!(decoded, email, "html_body is optional when decoding");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deliver_later_enqueues_a_mailer_send_job(pool: PgPool) {
+    #[tokio::test]
+    async fn deliver_later_enqueues_a_mailer_send_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let (state, _mailbox) = state_with_mailbox(pool.clone(), enabled_config());
         let email = sample_email();
 
@@ -620,8 +624,10 @@ mod tests {
         assert_eq!(job.args, json_expected(&email), "the email as arguments");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deliver_later_without_smtp_host_queues_nothing(pool: PgPool) {
+    #[tokio::test]
+    async fn deliver_later_without_smtp_host_queues_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let (state, _mailbox) = state_with_mailbox(pool.clone(), Config::for_tests());
 
         deliver_later(&state, sample_email()).await.unwrap();

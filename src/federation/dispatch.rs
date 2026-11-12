@@ -318,7 +318,7 @@ impl Error for FederationError {}
 /// attempt. Containment and policy drops are not errors: the activity is
 /// discarded and the job completes.
 pub async fn handle_incoming(state: AppState, args: Value) -> Result<(), JobError> {
-    dispatch_activity(&state, args, default_handlers(), mrf::filter_incoming).await
+    dispatch_activity(&state, args, default_handlers(), mrf::filter_incoming_boxed).await
 }
 
 /// The [`HandlerFn`](crate::jobs::HandlerFn) [`crate::serve`] binds to
@@ -740,6 +740,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
             translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
@@ -1070,8 +1071,9 @@ mod tests {
         let args = incoming_args(&activity, &alice);
         let handlers = test_handlers();
 
-        let first = dispatch_activity(&state, args.clone(), &handlers, mrf::filter_incoming).await;
-        let second = dispatch_activity(&state, args, &handlers, mrf::filter_incoming).await;
+        let first =
+            dispatch_activity(&state, args.clone(), &handlers, mrf::filter_incoming_boxed).await;
+        let second = dispatch_activity(&state, args, &handlers, mrf::filter_incoming_boxed).await;
 
         assert_eq!(first, Ok(()), "the first delivery completes");
         assert_eq!(second, Ok(()), "the redelivery completes too");
@@ -1104,8 +1106,9 @@ mod tests {
         let args = incoming_args(&activity, &alice);
         let handlers = test_handlers();
 
-        let first = dispatch_activity(&state, args.clone(), &handlers, mrf::filter_incoming).await;
-        let second = dispatch_activity(&state, args, &handlers, mrf::filter_incoming).await;
+        let first =
+            dispatch_activity(&state, args.clone(), &handlers, mrf::filter_incoming_boxed).await;
+        let second = dispatch_activity(&state, args, &handlers, mrf::filter_incoming_boxed).await;
 
         assert!(
             matches!(&first, Err(JobError::Retry(detail)) if detail == "injected"),
@@ -1146,7 +1149,7 @@ mod tests {
             &state,
             incoming_args(&activity, &alice),
             &test_handlers(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 
@@ -1184,7 +1187,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&activity, &alice),
             &test_handlers(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 
@@ -1222,7 +1225,7 @@ mod tests {
             &state,
             incoming_args(&wrong_id, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(dropped_id, Ok(()), "a mismatched activity id is dropped");
@@ -1241,7 +1244,7 @@ mod tests {
             &state,
             incoming_args(&foreign_create, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(
@@ -1264,7 +1267,7 @@ mod tests {
             &state,
             incoming_args(&foreign_announce, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(announced, Ok(()), "an Announce of a foreign object passes");
@@ -1298,7 +1301,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&activity, &alice),
             &Handlers::new(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 
@@ -1366,7 +1369,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&activity, &alice),
             &test_handlers(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 
@@ -1401,7 +1404,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&activity, &alice),
             &test_handlers(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 
@@ -1461,7 +1464,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&undo_follow, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(follow_outcome, Ok(()), "the follow undo completes");
@@ -1472,7 +1475,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&undo_announce, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(announce_outcome, Ok(()), "the announce undo completes");
@@ -1522,7 +1525,7 @@ mod tests {
             &state,
             incoming_args(&foreign, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(
@@ -1536,7 +1539,7 @@ mod tests {
             &state,
             incoming_args(&unknown, &alice),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(unknown_outcome, Ok(()), "and so does the unknown id");
@@ -1557,7 +1560,7 @@ mod tests {
         let handlers = Handlers::new();
 
         let missing_activity =
-            dispatch_activity(&state, json!({}), &handlers, mrf::filter_incoming).await;
+            dispatch_activity(&state, json!({}), &handlers, mrf::filter_incoming_boxed).await;
         assert!(
             matches!(missing_activity, Err(JobError::Discard(_))),
             "no activity at all is a discard: {missing_activity:?}"
@@ -1567,7 +1570,7 @@ mod tests {
             &state,
             json!({"activity": {"id": "x"}, "signer_id": "not-a-uuid"}),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert!(
@@ -1582,7 +1585,7 @@ mod tests {
                 Uuid::now_v7(),
             ),
             &handlers,
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
         assert_eq!(
@@ -1611,7 +1614,7 @@ mod tests {
             &app_state(&pool),
             incoming_args(&activity, &alice),
             &test_handlers(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 
@@ -1632,7 +1635,7 @@ mod tests {
             &state,
             args_with(&activity, Uuid::now_v7()),
             &Handlers::new(),
-            mrf::filter_incoming,
+            mrf::filter_incoming_boxed,
         )
         .await;
 

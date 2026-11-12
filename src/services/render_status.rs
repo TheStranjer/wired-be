@@ -798,6 +798,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
             translation_languages_cache: Arc::default(),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(MemoryTransport::new()),
@@ -857,8 +858,10 @@ mod tests {
         serde_json::to_value(&rendered[0]).unwrap()
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_plain_status_renders_its_stored_facts(pool: PgPool) {
+    #[tokio::test]
+    async fn a_plain_status_renders_its_stored_facts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let alice = user(&pool, "alice").await;
         let status = insert(
@@ -920,8 +923,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn replies_mentions_and_media_render_their_links(pool: PgPool) {
+    #[tokio::test]
+    async fn replies_mentions_and_media_render_their_links() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
@@ -2005,8 +2010,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn twenty_statuses_by_five_authors_render_in_one_batch(pool: PgPool) {
+    #[tokio::test]
+    async fn twenty_statuses_by_five_authors_render_in_one_batch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let mut authors = Vec::new();
         for n in 0..5 {
@@ -2108,27 +2115,34 @@ mod tests {
     /// structural guarantee behind the fixed query set — the maps are
     /// keyed by id, so a row cannot leak its page-mates' media, mentions,
     /// tags or nested reblog into another entry.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_batched_page_equals_row_by_row_rendering(pool: PgPool) {
+    #[tokio::test]
+    async fn the_batched_page_equals_row_by_row_rendering() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let (alice, page) = mixed_page(&pool).await;
 
-        for viewer in [None, Some(&alice)] {
-            let batched = render_statuses(&state, viewer, &page).await.unwrap();
-            assert_eq!(batched.len(), 4, "every live row of the page renders");
-            for (entry, row) in batched.iter().zip(&page) {
-                let alone = render_status(&state, viewer, row)
-                    .await
-                    .unwrap()
-                    .expect("each row also renders alone");
-                assert_eq!(
-                    serde_json::to_value(entry).unwrap(),
-                    serde_json::to_value(alone).unwrap(),
-                    "the batch entry of {} equals its single render for \
-                     the same viewer",
-                    row.id
-                );
-            }
+        assert_page_equals_rows(&state, None, &page).await;
+        assert_page_equals_rows(&state, Some(&alice), &page).await;
+    }
+
+    /// Batch-render `page` for `viewer` and compare entry for entry with
+    /// the same rows rendered one at a time: the two paths must agree.
+    async fn assert_page_equals_rows(state: &AppState, viewer: Option<&User>, page: &[StatusRow]) {
+        let batched = render_statuses(state, viewer, page).await.unwrap();
+        assert_eq!(batched.len(), 4, "every live row of the page renders");
+        for (entry, row) in batched.iter().zip(page) {
+            let alone = render_status(state, viewer, row)
+                .await
+                .unwrap()
+                .expect("each row also renders alone");
+            assert_eq!(
+                serde_json::to_value(entry).unwrap(),
+                serde_json::to_value(alone).unwrap(),
+                "the batch entry of {} equals its single render for \
+                 the same viewer",
+                row.id
+            );
         }
     }
 
@@ -2141,8 +2155,10 @@ mod tests {
         assert!(distinct(std::iter::empty()).is_empty(), "nothing in");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_reblog_nests_the_original_and_keeps_its_own_identity(pool: PgPool) {
+    #[tokio::test]
+    async fn a_reblog_nests_the_original_and_keeps_its_own_identity() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
@@ -2209,8 +2225,10 @@ mod tests {
         assert_eq!(counted.0, 1, "the original is the one counted");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn tombstones_and_reblogs_of_gone_originals_are_skipped(pool: PgPool) {
+    #[tokio::test]
+    async fn tombstones_and_reblogs_of_gone_originals_are_skipped() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
@@ -2251,8 +2269,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn the_viewers_relationship_lands_in_the_account_entity(pool: PgPool) {
+    #[tokio::test]
+    async fn the_viewers_relationship_lands_in_the_account_entity() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
@@ -2295,8 +2315,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn remote_mirrors_render_their_stored_urls_and_text(pool: PgPool) {
+    #[tokio::test]
+    async fn remote_mirrors_render_their_stored_urls_and_text() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let mallory = user(&pool, "mallory").await;
         let published = Utc
@@ -2345,8 +2367,10 @@ mod tests {
     /// The two degenerate pages: an empty slice and a slice of nothing
     /// but tombstones both render empty, and the renderer returns before
     /// any loader (or the database) is needed.
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn empty_and_tombstone_pages_render_empty(pool: PgPool) {
+    #[tokio::test]
+    async fn empty_and_tombstone_pages_render_empty() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let state = test_state(&pool);
         let alice = user(&pool, "alice").await;
         let status = post(&pool, &alice, "gone").await;
