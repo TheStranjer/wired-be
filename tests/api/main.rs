@@ -97,8 +97,10 @@ mod e2e_scheduled;
 /// The end-to-end posting matrix (WBE-223): the fixture world built over
 /// HTTP, the show-route sweep of every single-status kind past every
 /// viewer role, the thread-kind posts with their per-viewer `context`
-/// reads, and the account statuses filter sweep — pinning the visibility
-/// model's audience, the `parent_visible` holes and the one shared 404.
+/// reads, the account statuses filter sweep, and the membership sweep of
+/// every posted kind across all five timelines per viewer — pinning the
+/// visibility model's audience, the `parent_visible` holes and the one
+/// shared 404.
 mod e2e_statuses;
 
 /// The emoji-pack endpoints of `src/api/emoji_packs.rs`.
