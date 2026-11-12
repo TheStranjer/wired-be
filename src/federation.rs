@@ -28,9 +28,14 @@
 //! the parts of a status. [`note`] is the way back out for statuses: the
 //! pure builder of the `Note`/`Question` objects a local post federates as
 //! and of the `Create`, `Announce` and `Tombstone` documents around it,
-//! plus the JSON-LD schema they reference. Activity collections, inboxes
-//! and outboxes arrive in later tickets and get their modules beside them.
+//! plus the JSON-LD schema they reference. [`activities`] is the same
+//! pure build for the facts that are not statuses: the `Like`,
+//! `EmojiReact`, `Follow`, `Block`, `Undo`, `Accept` and `Reject`
+//! documents minted at `{BASE_URL}/activities/{uuid}`, ahead of the
+//! route that will serve them. Activity collections, inboxes and
+//! outboxes arrive in later tickets and get their modules beside them.
 
+pub mod activities;
 pub mod actor;
 pub mod authorized_fetch;
 pub mod delivery;
