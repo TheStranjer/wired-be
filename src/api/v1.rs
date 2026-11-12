@@ -76,5 +76,8 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .nest("/pleroma/chats", chats::router())
         .nest("/pleroma/conversations", conversations::pleroma_router())
         .nest("/pleroma/emoji", emoji_packs::router())
-        .nest("/pleroma/statuses", emoji_reactions::router())
+        .nest(
+            "/pleroma/statuses",
+            emoji_reactions::router().merge(statuses::pleroma_router()),
+        )
 }

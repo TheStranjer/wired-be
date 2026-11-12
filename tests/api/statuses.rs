@@ -1,8 +1,10 @@
 //! The status endpoints over HTTP: the write `POST /api/v1/statuses` (WBE-76),
 //! the reads `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=…` (WBE-77), the thread read
-//! `GET /api/v1/statuses/{id}/context` (WBE-78) and the write
-//! `DELETE /api/v1/statuses/{id}` (WBE-79).
+//! `GET /api/v1/statuses/{id}/context` (WBE-78), the write
+//! `DELETE /api/v1/statuses/{id}` (WBE-79) and the quoting listing
+//! `GET /api/v1/statuses/{id}/quotes` with its Pleroma twin
+//! `GET /api/v1/pleroma/statuses/{id}/quotes` (WBE-91).
 //!
 //! The show route answers the `Status` entity to everyone the visibility
 //! model admits: a public post to its author, a stranger and the anonymous
@@ -14,7 +16,12 @@
 //! learns that somebody's private post exists. A reblog's own id answers
 //! the reblog entity — the reblogger's row, empty content, the original
 //! nested in `reblog` — and a reblog of a post the viewer may not see is
-//! invisible itself.
+//! invisible itself. A quoting status renders the quoted original it may
+//! see nested in `quote` — mirrored in `pleroma.quote` with
+//! `pleroma.quote_visible` true — one level deep: a quoted status's own
+//! quote never renders. What the viewer may not see renders `quote` and
+//! `pleroma.quote` null with `quote_visible` false, while `quote_id`
+//! still names the quoted row.
 //!
 //! The batch route answers the entities of the ids this viewer may see in
 //! the order they were requested: it reads `id[]` and Pleroma's deprecated
@@ -88,6 +95,14 @@
 //! carrying at least one attachment may leave `status` empty, and
 //! attachments ride every visibility, `direct` included.
 //!
+//! A body may also name a status to quote under `quote_id` (Pleroma's
+//! `quoted_status_id` alias accepted): the target must be live and visible to
+//! the poster — a malformed, unknown, deleted or unseen one is the shared
+//! 404 — and public or unlisted unless it is the poster's own, and the stored
+//! row carries the quotable original's id (a reblog target resolves through
+//! to what it boosts) with the original's `quotes_count` stepped by the
+//! insert.
+//!
 //! `DELETE /api/v1/statuses/{id}` (WBE-79) is Pleroma's `delete`: a user
 //! token with `write:statuses`, on the same `statuses_actions` bucket the
 //! favourite writes ride, behind the same status gate — a malformed, unknown,
@@ -116,8 +131,18 @@
 //! poster's own participation id, which forces the post to `direct`, adds
 //! that participation's recipients as its mentions and lands it in the same
 //! thread — a malformed, unknown or foreign id is the shared 404.
+//!
+//! Both mounts of `GET …/quotes` (WBE-91) answer the live quoters of the
+//! named status, newest quoter first, paged by `limit`/`max_id`/`min_id`/
+//! `since_id` with a `Link` header keyed on the first and last rendered
+//! quoter row ids. The listing runs the show route's optional-auth gate —
+//! `read:statuses` on a presented user token — and drops quoters the viewer
+//! may not see; the malformed, unknown, deleted and invisible target is the
+//! shared 404, and an unquoted status is the empty array with no `Link`.
 
 #![cfg(test)]
+
+use std::cmp::Reverse;
 
 use axum::{Router, http::StatusCode};
 use chrono::Utc;
@@ -1784,6 +1809,9 @@ const OVER_LIMIT: &str = "The status is over the character limit";
 const BAD_VISIBILITY: &str = "Invalid visibility";
 /// 422 body for a `content_type` outside the three advertised formats.
 const BAD_CONTENT_TYPE: &str = "Invalid content_type";
+/// 422 body for quoting a status the poster may see but may not quote —
+/// somebody else's `private`, `direct` or `local` post.
+const QUOTE_NOT_ALLOWED: &str = "You can only quote public or unlisted statuses";
 
 /// `POST /api/v1/statuses` with the JSON `body` as `token` (`None`: no
 /// credential at all).
@@ -1923,6 +1951,10 @@ async fn a_minimal_post_creates_the_status_it_answers() {
             Visibility::Public
         ),
         "and the row holds what the body said"
+    );
+    assert!(
+        row.quote_of_id.is_none(),
+        "a body that names no quote stores no quote"
     );
 }
 
@@ -2522,6 +2554,407 @@ async fn a_form_body_posts_like_the_json_one() {
         false,
         "`0` is the flag off, whatever the account defaults to"
     );
+}
+
+/// A post naming a live, visible, quotable `quote_id` is stored as a quote
+/// of the original, and the original's `pleroma.quotes_count` answers the
+/// insert-time bump through the show route.
+#[tokio::test]
+async fn a_post_can_quote_a_public_status() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE_AND_READ).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let original = common::create_status(&pool, &bob, "quote me", Visibility::Public).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "look at this", "quote_id": original.id.to_string()}),
+    )
+    .await;
+    let row = created_row(&pool, &value).await;
+    assert_eq!(
+        row.quote_of_id,
+        Some(original.id),
+        "the quoting row carries the original's id"
+    );
+    assert_eq!(row.user_id, alice.id, "and the post is the caller's own");
+
+    let shown = show(&app, Some(&token), &original.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the quoted original");
+    assert_eq!(
+        shown.json_value()["pleroma"]["quotes_count"],
+        1,
+        "status::insert stepped the original's counter with the row"
+    );
+}
+
+/// Pleroma's older `quoted_status_id` key names the same target as
+/// `quote_id`, from a JSON body and from a form body alike (decision 10).
+#[tokio::test]
+async fn the_quoted_status_id_alias_names_the_same_quote() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let original = common::create_status(&pool, &bob, "quote me", Visibility::Unlisted).await;
+    let app = common::test_app(pool.clone());
+    let id = original.id.to_string();
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "alias quote", "quoted_status_id": &id}),
+    )
+    .await;
+    assert_eq!(
+        created_row(&pool, &value).await.quote_of_id,
+        Some(original.id),
+        "the alias is the same parameter under a different key"
+    );
+
+    let form = common::TestRequest::post(STATUSES)
+        .bearer(&token)
+        .form(&[("status", "form quote"), ("quote_id", id.as_str())])
+        .send(&app)
+        .await;
+    common::assert_answer(&form, StatusCode::OK, "a form body quoting a post");
+    assert_eq!(
+        created_row(&pool, &form.json_value()).await.quote_of_id,
+        Some(original.id),
+        "and the form spelling quotes it exactly the same way"
+    );
+}
+
+/// A `quote_id` naming nothing the poster may address is the shared 404:
+/// malformed text, an unknown id, a deleted target and a target the poster
+/// cannot see are indistinguishable from each other, and none of them
+/// posts.
+#[tokio::test]
+async fn an_unusable_quote_target_is_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let doomed = common::create_status(&pool, &bob, "doomed", Visibility::Public).await;
+    deleted(&pool, &doomed).await;
+    let secret = common::create_status(&pool, &carol, "not for you", Visibility::Private).await;
+    let app = common::test_app(pool.clone());
+
+    let doomed_id = doomed.id.to_string();
+    let secret_id = secret.id.to_string();
+    for id in [
+        "not-an-id",
+        UNKNOWN_ID,
+        doomed_id.as_str(),
+        secret_id.as_str(),
+    ] {
+        let response = publish(
+            &app,
+            Some(&token),
+            json!({"status": "quoting nothing", "quote_id": id}),
+        )
+        .await;
+        common::assert_answer(
+            &response,
+            StatusCode::NOT_FOUND,
+            &format!("quote target `{id}`"),
+        );
+        common::assert_error(&response, NOT_FOUND, &format!("quote target `{id}`"));
+    }
+    assert_eq!(
+        stored_count(&pool).await,
+        2,
+        "the two fixtures are all the table holds: no refusal wrote a row"
+    );
+}
+
+/// A target the poster may see but may not quote — somebody else's `private`
+/// post, as an accepted follower, and a `direct` addressed to the poster —
+/// is refused 422 in the pinned wording, where the poster's own `private`
+/// post is quotable.
+#[tokio::test]
+async fn only_public_and_unlisted_posts_may_be_quoted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    followed(&pool, &alice, &bob).await;
+    let private = common::create_status(&pool, &bob, "followers only", Visibility::Private).await;
+    let dm = direct_to(&pool, &bob, &alice).await;
+    let mine = common::create_status(&pool, &alice, "my own secret", Visibility::Private).await;
+    let app = common::test_app(pool.clone());
+
+    for target in [&private, &dm] {
+        refused(
+            &app,
+            &token,
+            json!({"status": "over my station", "quote_id": target.id.to_string()}),
+            QUOTE_NOT_ALLOWED,
+        )
+        .await;
+    }
+    assert_eq!(stored_count(&pool).await, 3, "both 422s wrote nothing");
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "quoting myself", "quote_id": mine.id.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        created_row(&pool, &value).await.quote_of_id,
+        Some(mine.id),
+        "an author may quote their own private post"
+    );
+}
+
+/// A `quote_id` naming a reblog row quotes through to the original it
+/// boosts: the stored id is the original's, the original's counter steps,
+/// and the reblog row stays uncounted.
+#[tokio::test]
+async fn quoting_a_reblog_stores_the_original_it_boosts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE_AND_READ).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let original = common::create_status(&pool, &carol, "the source", Visibility::Public).await;
+    let boost = reblog_of(&pool, &bob, &original).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "quoting a boost", "quote_id": boost.id.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        created_row(&pool, &value).await.quote_of_id,
+        Some(original.id),
+        "the quote links the original, not the boost row"
+    );
+    assert_eq!(
+        stored(&pool, boost.id).await.quotes_count,
+        0,
+        "the reblog row counts no quotes of its own"
+    );
+
+    let shown = show(&app, Some(&token), &original.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the quoted original");
+    assert_eq!(
+        shown.json_value()["pleroma"]["quotes_count"],
+        1,
+        "the original takes the bump"
+    );
+}
+
+/// The show route of a quoting status renders the quoted original nested in
+/// `quote` — its own id, content and account — mirrored identically in
+/// `pleroma.quote` with `pleroma.quote_visible` true, and names the target
+/// in `quote_id`; the original's own entity carries the counter bump.
+#[tokio::test]
+async fn a_quoting_status_renders_the_quoted_original_nested() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let original = common::create_status(&pool, &bob, "quote me", Visibility::Public).await;
+    let quote = quote_of(&pool, &alice, &original, Visibility::Public).await;
+    let app = common::test_app(pool);
+
+    let shown = show(&app, None, &quote.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the quoting status");
+    let value = shown.json_value();
+    assert_eq!(
+        value["quote_id"],
+        original.id.to_string(),
+        "the quoted target's id (decision 4), visible one or not"
+    );
+    assert_eq!(
+        value["quote"]["id"],
+        original.id.to_string(),
+        "the nested entity is the quoted row's own"
+    );
+    assert_eq!(
+        value["quote"]["content"], "<p>quote me</p>",
+        "rendered as the author wrote it"
+    );
+    assert_eq!(
+        value["quote"]["account"]["acct"], "bob",
+        "with the quoted row's own author"
+    );
+    assert_eq!(
+        value["pleroma"]["quote"], value["quote"],
+        "pleroma mirrors the same rendered object"
+    );
+    assert_eq!(
+        value["pleroma"]["quote_visible"],
+        json!(true),
+        "and says the viewer may see it"
+    );
+
+    let original_shown = show(&app, None, &original.id.to_string()).await;
+    common::assert_answer(&original_shown, StatusCode::OK, "the quoted original");
+    assert_eq!(
+        original_shown.json_value()["pleroma"]["quotes_count"],
+        1,
+        "the original counts the quote on its own entity"
+    );
+}
+
+/// Depth limit, one nested render: A quotes B quotes C answers
+/// `A.quote.quote == null` — a quoted status's own quote never renders,
+/// though its `quote_id` still names its target and its `quote_visible`
+/// is false — while B's own entity renders B.quote == C fully.
+#[tokio::test]
+async fn a_rendered_quote_nests_exactly_one_level_deep() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let c = common::create_status(&pool, &carol, "the source", Visibility::Public).await;
+    let b = quote_of(&pool, &bob, &c, Visibility::Public).await;
+    let a = quote_of(&pool, &alice, &b, Visibility::Public).await;
+    let app = common::test_app(pool);
+
+    let shown = show(&app, None, &a.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the outer quote");
+    let value = shown.json_value();
+    assert_eq!(value["quote"]["id"], b.id.to_string(), "A nests B");
+    assert_eq!(
+        value["quote"]["quote"],
+        Value::Null,
+        "and the nested render's own quote is forced null"
+    );
+    assert_eq!(
+        value["quote"]["quote_id"],
+        c.id.to_string(),
+        "while its quote_id still names C"
+    );
+    assert_eq!(
+        value["quote"]["pleroma"]["quote_visible"],
+        json!(false),
+        "the mirror's flag follows the null render"
+    );
+
+    let middle = show(&app, None, &b.id.to_string()).await;
+    common::assert_answer(&middle, StatusCode::OK, "the middle quote");
+    let middle_value = middle.json_value();
+    assert_eq!(
+        middle_value["quote"]["id"],
+        c.id.to_string(),
+        "B nests C fully"
+    );
+    assert_eq!(middle_value["quote"]["content"], "<p>the source</p>");
+    assert_eq!(middle_value["quote"]["account"]["acct"], "carol");
+    assert_eq!(middle_value["pleroma"]["quote_visible"], json!(true));
+}
+
+/// A quote of somebody else's `private` post (seeded straight through the
+/// model — the write endpoint would have refused it): a viewer who may not
+/// see the target renders `quote: null` with `pleroma.quote_visible` false
+/// while `quote_id` still names it, and the target's own author always sees
+/// it rendered.
+#[tokio::test]
+async fn an_invisible_quote_renders_null_and_keeps_its_id() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, alice_token) = user_with_token(&pool, "alice", SCOPES).await;
+    let (carol, carol_token) = user_with_token(&pool, "carol", SCOPES).await;
+    let secret = common::create_status(&pool, &carol, "followers only", Visibility::Private).await;
+    let quote = quote_of(&pool, &alice, &secret, Visibility::Public).await;
+    let app = common::test_app(pool);
+
+    for (who, token) in [
+        ("anonymous", None),
+        ("a stranger", Some(alice_token.as_str())),
+    ] {
+        let shown = show(&app, token, &quote.id.to_string()).await;
+        common::assert_answer(&shown, StatusCode::OK, &format!("the public quoter, {who}"));
+        let value = shown.json_value();
+        assert_eq!(
+            value["quote_id"],
+            secret.id.to_string(),
+            "{who}: quote_id is emitted regardless of visibility"
+        );
+        assert_eq!(value["quote"], Value::Null, "{who}: the render is withheld");
+        assert_eq!(
+            value["pleroma"]["quote"],
+            Value::Null,
+            "{who}: the mirror too"
+        );
+        assert_eq!(
+            value["pleroma"]["quote_visible"],
+            json!(false),
+            "{who}: false exactly when quote is null"
+        );
+    }
+
+    let as_author = show(&app, Some(carol_token.as_str()), &quote.id.to_string()).await;
+    common::assert_answer(
+        &as_author,
+        StatusCode::OK,
+        "the quoter, seen by the quoted author",
+    );
+    let value = as_author.json_value();
+    assert_eq!(
+        value["quote"]["id"],
+        secret.id.to_string(),
+        "the author of the private original always sees their own quoted post"
+    );
+    assert_eq!(value["quote"]["visibility"], "private");
+    assert_eq!(value["pleroma"]["quote_visible"], json!(true));
+}
+
+/// A context page whose thread carries a quoting reply renders the nested
+/// quote from the same batch the page already runs: the descendants arm's
+/// entry names the quoted target and carries its full render, with the
+/// `pleroma` mirror beside it.
+#[tokio::test]
+async fn a_thread_page_renders_the_nested_quote_from_its_batch() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let root = common::create_status(&pool, &alice, "root", Visibility::Public).await;
+    let source = common::create_status(&pool, &carol, "look at this", Visibility::Public).await;
+    let quoter = status::insert(
+        &pool,
+        TEST_BASE_URL,
+        &NewStatus {
+            in_reply_to_id: Some(root.id),
+            in_reply_to_account_id: Some(alice.id),
+            quote_of_id: Some(source.id),
+            ..NewStatus::local(&bob, "a quoting reply")
+        },
+    )
+    .await
+    .expect("a quoting reply inserts");
+    let app = common::test_app(pool);
+
+    let shown = context(&app, None, &root.id.to_string()).await;
+    common::assert_answer(&shown, StatusCode::OK, "the thread around the root");
+    let body = shown.json_value();
+    assert_eq!(context_ids(&body, "descendants"), [quoter.id.to_string()]);
+    let entry = &body["descendants"][0];
+    assert_eq!(
+        entry["quote"]["id"],
+        source.id.to_string(),
+        "the page's own batch brought the quoted original along"
+    );
+    assert_eq!(entry["quote"]["content"], "<p>look at this</p>");
+    assert_eq!(entry["quote"]["account"]["acct"], "carol");
+    assert_eq!(
+        entry["pleroma"]["quote"], entry["quote"],
+        "the mirror rides the nested render too"
+    );
+    assert_eq!(entry["pleroma"]["quote_visible"], json!(true));
 }
 
 /// The write route runs the whole `AuthUser` + `write:statuses` pipeline: no
@@ -4257,4 +4690,444 @@ async fn deleting_direct_statuses_repoints_then_withdraws_the_participations() {
         0,
         "and her badge has nothing to count"
     );
+}
+
+/// The quoting listing's two mounts: the path prefix and a name for the
+/// assertions, so one test body runs both routes.
+const QUOTES_MOUNTS: [(&str, &str); 2] = [
+    ("/api/v1", "the Mastodon route"),
+    ("/api/v1/pleroma", "the Pleroma twin"),
+];
+
+/// The quoting listing's path on `mount` for status id `id`, with an
+/// optional query suffix. The id stays text so the miss probes can feed any
+/// spelling as the path segment.
+fn quotes_path(mount: &str, id: &str, query: &str) -> String {
+    let base = format!("{mount}/statuses/{id}/quotes");
+    if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{query}")
+    }
+}
+
+/// `GET {path}` as `token` (`None`: anonymous).
+async fn fetch(app: &Router, path: &str, token: Option<&str>) -> common::TestResponse {
+    let request = common::TestRequest::get(path);
+    match token {
+        Some(found) => request.bearer(found).send(app).await,
+        None => request.send(app).await,
+    }
+}
+
+/// Inserts `author`'s quote of `original` at `visibility`, straight through
+/// the model — the harness's rule for quote fixtures — and returns its row.
+async fn quote_of(
+    pool: &PgPool,
+    author: &User,
+    original: &Status,
+    visibility: Visibility,
+) -> Status {
+    status::insert(
+        pool,
+        TEST_BASE_URL,
+        &NewStatus {
+            visibility,
+            quote_of_id: Some(original.id),
+            ..NewStatus::local(author, "quoting this")
+        },
+    )
+    .await
+    .expect("a quote fixture inserts")
+}
+
+/// The ids as the wire spells them, for an expectation.
+fn texts(ids: &[Uuid]) -> Vec<String> {
+    ids.iter().map(ToString::to_string).collect()
+}
+
+/// The fixture rows' ids newest-first: same-millisecond `UUIDv7`s sort by
+/// their random bits, not by the order the fixtures ran in, so the expected
+/// page order comes from the ids (decision 4), never from the seeding order.
+fn newest_first(rows: &[&Status]) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    ids.sort_unstable_by_key(|id| Reverse(*id));
+    ids
+}
+
+/// A `Link` header keyed on quoter row ids: `next` walks to `oldest`, `prev`
+/// back to `newest`, both on the route's own `path`.
+fn assert_quoter_keyed_link(link: Option<&str>, path: &str, newest: Uuid, oldest: Uuid) {
+    let value = link.expect("a non-empty page carries a Link header");
+    assert!(
+        value.contains(&format!(
+            "{TEST_BASE_URL}{path}?max_id={oldest}>; rel=\"next\""
+        )),
+        "next keys on the oldest rendered quoter row id: {value}"
+    );
+    assert!(
+        value.contains(&format!(
+            "{TEST_BASE_URL}{path}?min_id={newest}>; rel=\"prev\""
+        )),
+        "prev keys on the newest rendered quoter row id: {value}"
+    );
+}
+
+/// Both mounts answer every live quoter of the named status as a rendered
+/// [`Status`] entity, newest quoter first.
+#[tokio::test]
+async fn the_quotes_routes_answer_the_quoters_newest_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, _token) = user_with_token(&pool, "alice", SCOPES).await;
+    let original = common::create_status(&pool, &alice, "quote me", Visibility::Public).await;
+    let id = original.id.to_string();
+    let mut quoters: Vec<(Status, String)> = Vec::new();
+    for n in 0..3 {
+        let nickname = format!("quoter{n}");
+        let author = common::create_local_user(&pool, &nickname).await;
+        let quote = quote_of(&pool, &author, &original, Visibility::Public).await;
+        quoters.push((quote, nickname));
+    }
+    quoters.sort_unstable_by_key(|(row, _)| Reverse(row.id));
+    let want_ids: Vec<String> = quoters.iter().map(|(row, _)| row.id.to_string()).collect();
+    let want_accts: Vec<&str> = quoters
+        .iter()
+        .map(|(_, nickname)| nickname.as_str())
+        .collect();
+
+    for (mount, route) in QUOTES_MOUNTS {
+        let page = fetch(&app, &quotes_path(mount, &id, ""), None).await;
+        common::assert_answer(&page, StatusCode::OK, route);
+        let body = page.json_value();
+        assert_eq!(
+            entity_ids(&body),
+            want_ids,
+            "{route}: every quoter, newest first"
+        );
+        let accts: Vec<&str> = body
+            .as_array()
+            .expect("the answer is an array")
+            .iter()
+            .map(|entry| entry["account"]["acct"].as_str().expect("an account"))
+            .collect();
+        assert_eq!(
+            accts, want_accts,
+            "{route}: each entry speaks as its own author"
+        );
+        assert_eq!(
+            body[0]["uri"],
+            format!("{TEST_BASE_URL}/objects/{}", want_ids[0]),
+            "{route}: an entry is the quoter row's own entity"
+        );
+    }
+}
+
+/// The quoting page is narrowed for the viewer: somebody else's `private`
+/// quoter drops out, the viewer's own stays, and the anonymous request sees
+/// only the `public` and `unlisted` quoters.
+#[tokio::test]
+async fn the_quotes_page_drops_what_the_viewer_may_not_see() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, alice_token) = user_with_token(&pool, "alice", SCOPES).await;
+    let original = common::create_status(&pool, &alice, "quote me", Visibility::Public).await;
+    let id = original.id.to_string();
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let dave = common::create_local_user(&pool, "dave").await;
+    let public = quote_of(&pool, &bob, &original, Visibility::Public).await;
+    let quiet = quote_of(&pool, &carol, &original, Visibility::Unlisted).await;
+    let hidden = quote_of(&pool, &dave, &original, Visibility::Private).await;
+    let own = quote_of(&pool, &alice, &original, Visibility::Private).await;
+
+    let as_alice = fetch(
+        &app,
+        &quotes_path("/api/v1", &id, ""),
+        Some(alice_token.as_str()),
+    )
+    .await;
+    common::assert_answer(&as_alice, StatusCode::OK, "alice reads her post's quoters");
+    let alice_page = entity_ids(&as_alice.json_value());
+    assert_eq!(
+        alice_page,
+        texts(&newest_first(&[&public, &quiet, &own])),
+        "the stranger's private quoter drops out and alice's own quote stays"
+    );
+    assert!(
+        !alice_page.contains(&hidden.id.to_string()),
+        "dave's private quote is nobody's page entry"
+    );
+
+    let anonymous = fetch(&app, &quotes_path("/api/v1/pleroma", &id, ""), None).await;
+    common::assert_answer(&anonymous, StatusCode::OK, "the anonymous Pleroma twin");
+    assert_eq!(
+        entity_ids(&anonymous.json_value()),
+        texts(&newest_first(&[&public, &quiet])),
+        "the anonymous page carries only the public and unlisted quoters"
+    );
+}
+
+/// Three public quotes of `original` by fresh accounts, the rows in
+/// newest-first order (decision 4: the id is the order, and same-millisecond
+/// `UUIDv7`s sort by their random bits, not by the seeding order).
+async fn quoted_three_times(pool: &PgPool, original: &Status) -> Vec<Status> {
+    let mut rows: Vec<Status> = Vec::new();
+    for n in 0..3 {
+        let author = common::create_local_user(pool, &format!("quoter{n}")).await;
+        rows.push(quote_of(pool, &author, original, Visibility::Public).await);
+    }
+    rows.sort_unstable_by_key(|row| Reverse(row.id));
+    rows
+}
+
+/// Both mounts page the quoting listing with `limit` and `max_id`, carry the
+/// `Link` header keyed on the first and last rendered quoter row ids, and
+/// answer a walk past the end with the empty page and no link.
+#[tokio::test]
+async fn the_quotes_routes_page_with_limit_and_max_id_and_link_their_pages() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, _token) = user_with_token(&pool, "alice", SCOPES).await;
+    let original = common::create_status(&pool, &alice, "quote me", Visibility::Public).await;
+    let id = original.id.to_string();
+    let all: Vec<Uuid> = quoted_three_times(&pool, &original)
+        .await
+        .iter()
+        .map(|row| row.id)
+        .collect();
+
+    for (mount, route) in QUOTES_MOUNTS {
+        let base = quotes_path(mount, &id, "");
+        let page = fetch(&app, &base, None).await;
+        common::assert_answer(&page, StatusCode::OK, route);
+        assert_eq!(
+            entity_ids(&page.json_value()),
+            texts(&all),
+            "{route}: the whole page"
+        );
+        assert_quoter_keyed_link(page.header("link"), &base, all[0], all[2]);
+
+        let first = fetch(&app, &quotes_path(mount, &id, "limit=2"), None).await;
+        assert_eq!(
+            entity_ids(&first.json_value()),
+            texts(&all[..2]),
+            "{route}: the limit cuts the page at the newest two"
+        );
+        assert_quoter_keyed_link(first.header("link"), &base, all[0], all[1]);
+
+        let tail = fetch(
+            &app,
+            &quotes_path(mount, &id, &format!("max_id={}", all[1])),
+            None,
+        )
+        .await;
+        assert_eq!(
+            entity_ids(&tail.json_value()),
+            texts(&all[2..]),
+            "{route}: max_id walks to the older quoters, keyed on quoter row ids"
+        );
+
+        let past = fetch(
+            &app,
+            &quotes_path(mount, &id, &format!("max_id={}", all[2])),
+            None,
+        )
+        .await;
+        assert_eq!(
+            past.json_value(),
+            json!([]),
+            "{route}: a walk past the oldest is empty"
+        );
+        assert_eq!(
+            past.header("link"),
+            None,
+            "{route}: an empty page sends no Link header"
+        );
+    }
+}
+
+/// The forward cursors answer on both mounts — `min_id` and `since_id` give
+/// the newer quoters, newest-first — a malformed cursor is the shared 400,
+/// and a tombstoned quoter leaves the page and its `Link` edges alike: the
+/// cursors name only the rows that actually came back.
+#[tokio::test]
+async fn the_quotes_routes_walk_the_forward_cursors_and_the_link_edges() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, _token) = user_with_token(&pool, "alice", SCOPES).await;
+    let original = common::create_status(&pool, &alice, "quote me", Visibility::Public).await;
+    let id = original.id.to_string();
+    let rows = quoted_three_times(&pool, &original).await;
+    let all: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+
+    for (mount, route) in QUOTES_MOUNTS {
+        let forward = fetch(
+            &app,
+            &quotes_path(mount, &id, &format!("min_id={}", all[2])),
+            None,
+        )
+        .await;
+        assert_eq!(
+            entity_ids(&forward.json_value()),
+            texts(&all[..2]),
+            "{route}: min_id answers the newer page, still newest-first"
+        );
+
+        let fresh = fetch(
+            &app,
+            &quotes_path(mount, &id, &format!("since_id={}", all[1])),
+            None,
+        )
+        .await;
+        assert_eq!(
+            entity_ids(&fresh.json_value()),
+            texts(&all[..1]),
+            "{route}: since_id polls the newer rows, descending like a first page"
+        );
+
+        let malformed = fetch(&app, &quotes_path(mount, &id, "min_id=nope"), None).await;
+        common::assert_answer(&malformed, StatusCode::BAD_REQUEST, "a bogus cursor");
+        common::assert_error(&malformed, "Invalid id", "a bogus cursor");
+    }
+
+    deleted(&pool, &rows[2]).await;
+    let base = quotes_path("/api/v1", &id, "");
+    let rest = fetch(&app, &base, None).await;
+    assert_eq!(
+        entity_ids(&rest.json_value()),
+        texts(&all[..2]),
+        "a tombstoned quoter leaves the page"
+    );
+    assert_quoter_keyed_link(rest.header("link"), &base, all[0], all[1]);
+}
+
+/// A status nobody quotes answers the empty array with no `Link` header, on
+/// both mounts.
+#[tokio::test]
+async fn the_quotes_routes_answer_the_empty_page() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, _token) = user_with_token(&pool, "alice", SCOPES).await;
+    let quiet = common::create_status(&pool, &alice, "unquoted", Visibility::Public).await;
+    let id = quiet.id.to_string();
+
+    for (mount, route) in QUOTES_MOUNTS {
+        let empty = fetch(&app, &quotes_path(mount, &id, ""), None).await;
+        common::assert_answer(&empty, StatusCode::OK, route);
+        assert_eq!(
+            empty.json_value(),
+            json!([]),
+            "{route}: the empty page is []"
+        );
+        assert_eq!(
+            empty.header("link"),
+            None,
+            "{route}: and it sends no Link header"
+        );
+    }
+}
+
+/// The target resolves through the shared status gate: the malformed id, the
+/// unknown id, a deleted target and one the caller may not see are the one
+/// 404 `{"error":"Record not found"}` on both mounts, quoters or not.
+#[tokio::test]
+async fn the_quotes_routes_answer_the_shared_gate_with_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, alice_token) = user_with_token(&pool, "alice", SCOPES).await;
+    let (bob, _token) = user_with_token(&pool, "bob", SCOPES).await;
+    let quoted = common::create_status(&pool, &alice, "quote me", Visibility::Public).await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let _live = quote_of(&pool, &carol, &quoted, Visibility::Public).await;
+    let doomed = common::create_status(&pool, &alice, "was quoted", Visibility::Public).await;
+    let dave = common::create_local_user(&pool, "dave").await;
+    let _kept = quote_of(&pool, &dave, &doomed, Visibility::Public).await;
+    deleted(&pool, &doomed).await;
+    let secret = common::create_status(&pool, &bob, "not for you", Visibility::Private).await;
+
+    let probes: Vec<(String, &str)> = vec![
+        ("not-an-id".to_owned(), "text that is not a UUID"),
+        (UNKNOWN_ID.to_owned(), "a well-formed id that names nothing"),
+        (doomed.id.to_string(), "a deleted target with a live quoter"),
+        (secret.id.to_string(), "a target the caller may not see"),
+    ];
+    for (mount, route) in QUOTES_MOUNTS {
+        for (probe, who) in &probes {
+            let anonymous = fetch(&app, &quotes_path(mount, probe, ""), None).await;
+            let as_alice = fetch(
+                &app,
+                &quotes_path(mount, probe, ""),
+                Some(alice_token.as_str()),
+            )
+            .await;
+            common::assert_all_refused(
+                &[anonymous, as_alice],
+                StatusCode::NOT_FOUND,
+                NOT_FOUND,
+                &format!("{route} for {who}"),
+            );
+        }
+    }
+}
+
+/// Both mounts run the show route's optional-auth gate: the scoped user
+/// token and the anonymous request answer, an app-only token proceeds
+/// unauthenticated, a user token without `read:statuses` is the 403, and a
+/// token that does not resolve is the 401.
+#[tokio::test]
+async fn the_quotes_routes_run_the_optional_read_statuses_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, alice_token) = user_with_token(&pool, "alice", SCOPES).await;
+    let (_stranger, narrow_token) = user_with_token(&pool, "stranger", "read:accounts").await;
+    let app_only = common::create_app_only_token(&pool, SCOPES).await;
+    let app = common::test_app(pool.clone());
+    let original = common::create_status(&pool, &alice, "quote me", Visibility::Public).await;
+    let id = original.id.to_string();
+    let quoter = common::create_local_user(&pool, "quoter").await;
+    let quote = quote_of(&pool, &quoter, &original, Visibility::Public).await;
+
+    for (mount, route) in QUOTES_MOUNTS {
+        let path = quotes_path(mount, &id, "");
+        let scoped = fetch(&app, &path, Some(alice_token.as_str())).await;
+        common::assert_answer(&scoped, StatusCode::OK, route);
+        assert_eq!(
+            entity_ids(&scoped.json_value()),
+            vec![quote.id.to_string()],
+            "{route}: the scoped token's page"
+        );
+
+        let anonymous = fetch(&app, &path, None).await;
+        common::assert_answer(&anonymous, StatusCode::OK, "no token proceeds");
+
+        let ownerless = fetch(&app, &path, Some(app_only.as_str())).await;
+        common::assert_answer(
+            &ownerless,
+            StatusCode::OK,
+            "an app-only token proceeds unauthenticated",
+        );
+
+        let refused = fetch(&app, &path, Some(narrow_token.as_str())).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            "a user token without the scope",
+        );
+        common::assert_error(&refused, NO_SCOPE, "a user token without the scope");
+
+        let invalid = fetch(&app, &path, Some("token-that-was-never-minted")).await;
+        common::assert_answer(
+            &invalid,
+            StatusCode::UNAUTHORIZED,
+            "a token that does not resolve",
+        );
+        common::assert_error(&invalid, INVALID_TOKEN, "a token that does not resolve");
+    }
 }

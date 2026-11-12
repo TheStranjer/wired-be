@@ -52,7 +52,13 @@
 //!
 //! Counts move by whole steps only, through [`insert`], [`soft_delete`] and
 //! [`bump_counter`], and are clamped at zero in SQL, so they can neither go
-//! negative nor be lost to a concurrent write.
+//! negative nor be lost to a concurrent write. The linked counters —
+//! [`replies_count`](Status::replies_count), [`reblogs_count`](Status::reblogs_count)
+//! and [`quotes_count`](Status::quotes_count) — move with the row that links:
+//! writing a status that answers, reblogs or quotes another steps its
+//! target's counter up in the same transaction, and tombstoning that row
+//! steps it back down, so [`bump_counter`] is left to the counters no status
+//! row links to (favourites).
 
 use std::collections::HashSet;
 use std::{fmt, str::FromStr};
@@ -227,7 +233,9 @@ pub struct Status {
     pub reblogs_count: i32,
     /// Favourites of this post; moved by [`bump_counter`].
     pub favourites_count: i32,
-    /// Quotes of this post; moved by [`bump_counter`].
+    /// Quotes of this post; moved by [`insert`] and [`soft_delete`] with the
+    /// quoting row, like [`replies_count`](Self::replies_count), and by
+    /// [`bump_counter`] like any other.
     pub quotes_count: i32,
     /// When the content last changed; `None` until an edit.
     pub edited_at: Option<DateTime<Utc>>,
@@ -630,6 +638,13 @@ const REBLOGGERS_PAGE_SQL: &str = "SELECT s.id AS reblog_id, u.* FROM statuses s
      JOIN users u ON u.id = s.user_id
       WHERE s.reblog_of_id = ";
 
+/// [`quoting_page`]: the live rows quoting one original, newest id first.
+/// As in [`REBLOGGERS_PAGE_SQL`], the text stops where its one placeholder
+/// belongs, because that is where [`quoting_page`] pushes its bind; the
+/// live-row filter and the keyset then run on the quoter row id `s.id`.
+const QUOTING_PAGE_SQL: &str = "SELECT s.* FROM statuses s
+      WHERE s.quote_of_id = ";
+
 /// [`soft_delete`]: a live row becomes a tombstone once, which is what makes
 /// the counter steps of the same transaction run exactly once per status.
 const SOFT_DELETE_SQL: &str = "UPDATE statuses
@@ -678,9 +693,9 @@ const CLEAR_PINS_SQL: &str = "DELETE FROM pinned_statuses WHERE status_id = $1";
 /// In the same transaction the author's `statuses_count` goes up by one and
 /// their `last_status_at` moves forward to this status's creation time (never
 /// back, so importing an old remote post leaves a newer one on the books),
-/// the parent's `replies_count` goes up for a reply and the original's
-/// `reblogs_count` for a reblog — exactly what [`soft_delete`] steps back
-/// down — and every account in [`mentioned_user_ids`](NewStatus::mentioned_user_ids)
+/// the parent's `replies_count` goes up for a reply, the original's
+/// `reblogs_count` for a reblog and the original's `quotes_count` for a quote
+/// — exactly what [`soft_delete`] steps back down — and every account in [`mentioned_user_ids`](NewStatus::mentioned_user_ids)
 /// is linked to the new row (see [`crate::models::mention`]) and every
 /// usable tag in [`hashtags`](NewStatus::hashtags) is upserted and linked
 /// (see [`crate::models::hashtag`]), so a status and its mentions and tags
@@ -1058,8 +1073,9 @@ pub async fn descendant_tree(
 ///
 /// Its text is cleared and its `uri` reserved, the counters it fed step
 /// back down in the same transaction — its author's `statuses_count`, its
-/// parent's `replies_count` and, for a reblog, the original's
-/// `reblogs_count` — and every account's pin of it is removed there too,
+/// parent's `replies_count` and, for a reblog or a quote, the original's
+/// `reblogs_count` or `quotes_count` — and every account's pin of it is
+/// removed there too,
 /// the soft twin of the cascade a hard delete rides (see
 /// [`crate::models::pinned_status`]).
 ///
@@ -1211,10 +1227,10 @@ pub async fn fetch_expired(pool: &PgPool, limit: i64) -> AppResult<Vec<Status>> 
 /// Adds `delta` to `counter` of status `id`, clamped at zero, and refreshes
 /// its `updated_at`. An unknown id matches no row and changes nothing.
 ///
-/// [`insert`] and [`soft_delete`] keep `replies_count` and `reblogs_count` in
-/// step with the rows they write; this is how everything else that counts
-/// against a status moves its number (favourites, quotes) without reading the
-/// row before writing it.
+/// [`insert`] and [`soft_delete`] keep the linked counters — `replies_count`,
+/// `reblogs_count` and `quotes_count` — in step with the rows they write;
+/// this is how everything else that counts against a status moves its number
+/// (favourites) without reading the row before writing it.
 ///
 /// # Errors
 ///
@@ -1386,6 +1402,39 @@ pub async fn reblogger_page(
     Ok(page.finish(entries))
 }
 
+/// The statuses quoting `quoted_id`, newest quote first and `page`'s
+/// `limit` at a time, as full [`Status`] rows.
+///
+/// This is the raw read behind a `GET /api/v1/statuses/{id}/quotes` style
+/// listing (Pleroma walks the quoted object's quoting activities in
+/// `lib/pleroma/web/common_api.ex`): the page keys on the *quoter row* id,
+/// so its `max_id`/`min_id`/`since_id` cursors and `Link` header carry
+/// quoter row ids (decision 4: `UUIDv7` text order is creation order). A
+/// tombstoned quote is off the page — a deleted quoter quotes nothing.
+/// Which of the rows a given viewer may see is the caller's
+/// [`crate::models::status_visibility`] check, not this query's, per the
+/// `render_statuses` contract: this answers live rows, capped at the page
+/// limit, unfiltered.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn quoting_page(
+    pool: &PgPool,
+    quoted_id: Uuid,
+    page: PageParams,
+) -> AppResult<Vec<Status>> {
+    let mut builder = QueryBuilder::<Postgres>::new(QUOTING_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(quoted_id);
+    let _live: &mut _ = builder.push(" AND s.deleted_at IS NULL");
+    page.apply_keyset(&mut builder, "s.id");
+    let statuses = builder.build_query_as::<Status>().fetch_all(pool).await?;
+    Ok(page.finish(statuses))
+}
+
 /// [`local_reblogger_ids`]: the accounts behind the *live* reblog rows of
 /// one original, restricted to users this instance owns — the boosters the
 /// [`crate::services::notify`] edit telling can reach with a row. The
@@ -1539,15 +1588,20 @@ async fn step_author(conn: &mut PgConnection, status: &Status, delta: i32) -> Ap
 }
 
 /// Steps the counter this status feeds on another row: `replies_count` of the
-/// status it answers, `reblogs_count` of the one it reblogs. Quotes count
-/// themselves through [`bump_counter`], because the row that holds
-/// `quotes_count` is written after the quote.
+/// status it answers, `reblogs_count` of the one it reblogs and
+/// `quotes_count` of the one it quotes. The three links are independent, so
+/// a row that (say) answers one status and quotes another steps both, and
+/// [`insert`] and [`soft_delete`] ride this on the row in hand, so no
+/// counter is read before it is stepped.
 async fn bump_linked(conn: &mut PgConnection, status: &Status, delta: i32) -> AppResult<()> {
     if let Some(parent_id) = status.in_reply_to_id {
         step_counter(conn, parent_id, Counter::Replies, delta).await?;
     }
     if let Some(original_id) = status.reblog_of_id {
         step_counter(conn, original_id, Counter::Reblogs, delta).await?;
+    }
+    if let Some(quoted_id) = status.quote_of_id {
+        step_counter(conn, quoted_id, Counter::Quotes, delta).await?;
     }
     Ok(())
 }
@@ -1677,6 +1731,20 @@ mod tests {
         )
         .await
         .expect("a reblog of a stored status inserts")
+    }
+
+    /// `author`'s quote of the status `original`, as its row.
+    async fn quote(pool: &PgPool, author: &User, original: Uuid, text: &str) -> Status {
+        insert(
+            pool,
+            BASE,
+            &NewStatus {
+                quote_of_id: Some(original),
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("a quote of a stored status inserts")
     }
 
     /// One media attachment of `author` posted on `status`: the row a
@@ -1970,29 +2038,196 @@ mod tests {
     /// A mirrored post cannot name a quote that is not stored here, so this
     /// covers `quote_of_id` against a real row.
     #[tokio::test]
-    async fn a_quote_names_its_original_and_leaves_the_count_alone() {
+    async fn a_quote_names_its_original_and_counts_on_it() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         let original = post(&pool, &alice, "quote me").await;
 
-        let quote = insert(
-            &pool,
-            BASE,
-            &NewStatus {
-                quote_of_id: Some(original.id),
-                ..NewStatus::local(&bob, "I second that")
-            },
-        )
-        .await
-        .unwrap();
+        let quote = quote(&pool, &bob, original.id, "I second that").await;
 
         assert_eq!(quote.quote_of_id, Some(original.id), "the link is kept");
         assert_eq!(
             counter(&pool, original.id, Counter::Quotes).await,
+            1,
+            "insert counts the quote on the original, like replies and reblogs"
+        );
+    }
+
+    /// The same quote row tombstoned steps its own +1 back down, and a
+    /// second delete finds nothing to step twice.
+    #[tokio::test]
+    async fn deleting_a_quote_steps_the_original_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "quote me").await;
+        let quote = quote(&pool, &bob, original.id, "I second that").await;
+
+        let tombstone = soft_delete(&pool, quote.id)
+            .await
+            .unwrap()
+            .expect("the quote was live");
+        assert_eq!(
+            tombstone.quote_of_id,
+            Some(original.id),
+            "the tombstone still names what it quoted"
+        );
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
             0,
-            "insert counts no quote: the quoting ticket bumps it itself"
+            "and the original no longer counts it"
+        );
+
+        assert!(
+            soft_delete(&pool, quote.id).await.unwrap().is_none(),
+            "deleting the tombstone again finds nothing"
+        );
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            0,
+            "so the quote step does not run twice"
+        );
+    }
+
+    /// `quote_of_id` is `ON DELETE SET NULL`: hard-deleting the original
+    /// unlinks the quoting rows with it — the counter's row is simply gone,
+    /// and the later deletion of a quoter has nothing left to step.
+    #[tokio::test]
+    async fn hard_deleting_the_original_leaves_the_quoter_nothing_to_count() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "gone quoted").await;
+        let quote = quote(&pool, &bob, original.id, "I second that").await;
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            1,
+            "the quote counts while the original is there"
+        );
+
+        let dropped = sqlx::query("DELETE FROM statuses WHERE id = $1")
+            .bind(original.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(dropped.rows_affected(), 1, "the fixture original existed");
+
+        let survivor = get_by_id(&pool, quote.id)
+            .await
+            .unwrap()
+            .expect("the quoter row is not deleted with what it quoted");
+        assert_eq!(
+            survivor.quote_of_id, None,
+            "the foreign key's SET NULL unlinks the quoter with its target"
+        );
+        assert!(
+            get_by_id_including_deleted(&pool, original.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the counted row is gone, so there is nothing to count"
+        );
+        assert!(
+            soft_delete(&pool, quote.id).await.unwrap().is_some(),
+            "the quoter's own delete runs clean with no link to step"
+        );
+    }
+
+    /// A step down with no step up before it — the drift the clamp exists
+    /// for — stops at zero instead of going under.
+    #[tokio::test]
+    async fn quote_steps_never_take_the_counter_below_zero() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let original = post(&pool, &alice, "quote me").await;
+        // A quoting row written beside [`insert`]: the counter never saw the
+        // +1 that the delete now steps back.
+        let quote_id = new_id();
+        let written = sqlx::query(
+            "INSERT INTO statuses (id, uri, user_id, conversation_id, local, visibility, quote_of_id)
+             VALUES ($1, $2, $3, $1, true, 'public', $4)",
+        )
+        .bind(quote_id)
+        .bind(format!("{BASE}/objects/{quote_id}"))
+        .bind(bob.id)
+        .bind(original.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            written.rows_affected(),
+            1,
+            "the uncounted quote row was written"
+        );
+
+        assert!(
+            soft_delete(&pool, quote_id).await.unwrap().is_some(),
+            "the uncounted quoter was live"
+        );
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            0,
+            "the step lands on zero, not below it"
+        );
+    }
+
+    /// Several quotes and several tombstones: the counter is the live
+    /// quoters, never the rows that ever quoted.
+    #[tokio::test]
+    async fn quotes_and_tombstones_add_up() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let original = post(&pool, &alice, "quote me a lot").await;
+        let mut quotes = Vec::new();
+        for n in 0..3 {
+            let author = user(&pool, &format!("quoter{n}")).await;
+            quotes.push(quote(&pool, &author, original.id, &format!("quote {n}")).await);
+        }
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            3,
+            "three live quotes count three"
+        );
+
+        assert!(
+            soft_delete(&pool, quotes[0].id).await.unwrap().is_some(),
+            "the first quote was live"
+        );
+        assert!(
+            soft_delete(&pool, quotes[2].id).await.unwrap().is_some(),
+            "the last quote was live"
+        );
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            1,
+            "two tombstones leave one"
+        );
+
+        let late = user(&pool, "again").await;
+        let again = quote(&pool, &late, original.id, "a late quote").await;
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            2,
+            "and a fresh quote steps back up"
+        );
+
+        for survivor in [&quotes[1], &again] {
+            assert!(
+                soft_delete(&pool, survivor.id).await.unwrap().is_some(),
+                "the remaining quotes were live"
+            );
+        }
+        assert_eq!(
+            counter(&pool, original.id, Counter::Quotes).await,
+            0,
+            "tombstone them all and the original counts none"
         );
     }
 
@@ -3693,6 +3928,141 @@ mod tests {
                 .status_id
                 .is_none(),
             "and touched nothing else either"
+        );
+    }
+
+    /// The live quoting rows of `quoted`, newest id first, straight from the
+    /// database: two `UUIDv7`s minted in one millisecond sort by their
+    /// random bits, not by the moment they were asked for, so the quoting
+    /// page tests take their expected order from the store, not from the
+    /// order the fixtures ran in.
+    async fn live_quoter_ids(pool: &PgPool, quoted: Uuid) -> Vec<Uuid> {
+        sqlx::query_as::<_, (Uuid,)>(
+            "SELECT id FROM statuses
+              WHERE quote_of_id = $1 AND deleted_at IS NULL
+           ORDER BY id DESC",
+        )
+        .bind(quoted)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id,)| id)
+        .collect()
+    }
+
+    /// An original quoted three times by fresh accounts, with the database
+    /// order of those live quoting rows newest-first.
+    async fn quoted_three_times(pool: &PgPool) -> (Status, Vec<Uuid>) {
+        let alice = user(pool, "alice").await;
+        let original = post(pool, &alice, "quote me").await;
+        for n in 0..3 {
+            let author = user(pool, &format!("quoter{n}")).await;
+            let _quote = quote(pool, &author, original.id, &format!("quote {n}")).await;
+        }
+        let all = live_quoter_ids(pool, original.id).await;
+        assert_eq!(all.len(), 3, "three live quotes of the one original");
+        (original, all)
+    }
+
+    /// [`quoting_page`] answers full live [`Status`] rows keyed on the
+    /// quoter row id, newest first: the limit cuts the page and `max_id`
+    /// walks it, exactly as the reblogger page's do — and another status's
+    /// quote is on no page.
+    #[tokio::test]
+    async fn the_quoting_page_walks_the_quoter_row_ids() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (original, all) = quoted_three_times(&pool).await;
+        let carol = user(&pool, "carol").await;
+        let other = post(&pool, &carol, "quoted once").await;
+        let lonely = user(&pool, "lonely").await;
+        let _elsewhere = quote(&pool, &lonely, other.id, "somewhere else").await;
+
+        assert_eq!(
+            ids(&quoting_page(&pool, original.id, page("")).await.unwrap()),
+            all,
+            "every live quoter, newest first, as full rows"
+        );
+        assert_eq!(
+            ids(&quoting_page(&pool, original.id, page("limit=2"))
+                .await
+                .unwrap()),
+            vec![all[0], all[1]],
+            "the limit cuts the page"
+        );
+        assert_eq!(
+            ids(
+                &quoting_page(&pool, original.id, page(&format!("max_id={}", all[1])))
+                    .await
+                    .unwrap()
+            ),
+            vec![all[2]],
+            "max_id continues where the page ended, and `other`'s quote is on no page"
+        );
+        assert!(
+            quoting_page(&pool, original.id, page(&format!("max_id={}", all[2])))
+                .await
+                .unwrap()
+                .is_empty(),
+            "past the oldest quote the page is empty"
+        );
+    }
+
+    /// The same page read the other way and after a loss: `min_id` answers
+    /// the newer page flipped newest-first, `since_id` polls descending
+    /// like a first page, a tombstoned quoter drops off the page, and a
+    /// status nobody quotes (or that is not stored at all) is the empty
+    /// page.
+    #[tokio::test]
+    async fn the_quoting_page_flips_newer_pages_and_drops_tombstones() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (original, all) = quoted_three_times(&pool).await;
+        let carol = user(&pool, "carol").await;
+        let silent = post(&pool, &carol, "nobody quotes this").await;
+
+        assert_eq!(
+            ids(
+                &quoting_page(&pool, original.id, page(&format!("min_id={}", all[2])))
+                    .await
+                    .unwrap()
+            ),
+            vec![all[0], all[1]],
+            "min_id answers the newer page, newest-first after the flip"
+        );
+        assert_eq!(
+            ids(
+                &quoting_page(&pool, original.id, page(&format!("since_id={}", all[1])))
+                    .await
+                    .unwrap()
+            ),
+            vec![all[0]],
+            "since_id polls the newer rows, descending like a first page"
+        );
+
+        assert!(
+            soft_delete(&pool, all[1]).await.unwrap().is_some(),
+            "the middle quoter deletes their quote"
+        );
+        assert_eq!(
+            ids(&quoting_page(&pool, original.id, page("")).await.unwrap()),
+            vec![all[0], all[2]],
+            "a tombstoned quoter leaves the page"
+        );
+        assert!(
+            quoting_page(&pool, silent.id, page(""))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a status nobody quotes is the empty page"
+        );
+        assert!(
+            quoting_page(&pool, new_id(), page(""))
+                .await
+                .unwrap()
+                .is_empty(),
+            "an unknown id has no quoters either"
         );
     }
 }

@@ -5,8 +5,10 @@
 //! The routes are the write `POST /api/v1/statuses`, the lookups
 //! `GET /api/v1/statuses/{id}` and the batch
 //! `GET /api/v1/statuses?id[]=a&id[]=b`, the thread read
-//! `GET /api/v1/statuses/{id}/context` and the card read
-//! `GET /api/v1/statuses/{id}/card`, the favourite writes
+//! `GET /api/v1/statuses/{id}/context`, the card read
+//! `GET /api/v1/statuses/{id}/card`, the quoting listing
+//! `GET /api/v1/statuses/{id}/quotes` and its Pleroma twin
+//! `GET /api/v1/pleroma/statuses/{id}/quotes`, the favourite writes
 //! `POST /api/v1/statuses/{id}/favourite` and its `…/unfavourite` twin,
 //! the state listing `GET /api/v1/statuses/{id}/favourited_by`, the
 //! caller's own favourites list `GET /api/v1/favourites`, the reblog
@@ -641,6 +643,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/statuses/{id}/context", get(get_status_context))
         .route("/statuses/{id}/history", get(get_status_history))
         .route("/statuses/{id}/source", get(get_status_source))
+        .route("/statuses/{id}/quotes", get(list_quotes))
         .route(
             "/statuses/{id}",
             delete(delete_status).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
@@ -676,6 +679,18 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/statuses/{id}/mute", post(mute_conversation))
         .route("/statuses/{id}/unmute", post(unmute_conversation))
         .route("/statuses/{id}/translate", post(translate_status))
+}
+
+/// The `/api/v1/pleroma/statuses` side of the statuses router, nested in
+/// [`crate::api::v1`] alongside [`crate::api::emoji_reactions`]'s router.
+///
+/// Pleroma serves the quoting listing under both prefixes
+/// (`lib/pleroma/web/mastodon_api/controllers/status_controller.ex`'s
+/// `quotes` action, routed in the mastodon and the pleroma scopes alike),
+/// so this one route is the counterpart of the `/api/v1` path's listing.
+/// Like the Mastodon mount it is a read and rides no throttle bucket.
+pub fn pleroma_router() -> Router<AppState> {
+    Router::new().route("/{id}/quotes", get(list_quotes))
 }
 
 /// `POST /api/v1/statuses` — create the status the body describes and answer
@@ -1770,6 +1785,60 @@ async fn list_reblogged_by(
         .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
         .collect();
     Ok((headers, Json(accounts)))
+}
+
+/// `GET /api/v1/statuses/{id}/quotes` (and its Pleroma twin, mounted by
+/// [`pleroma_router`]) — the [`Status`] entities quoting the status `id`,
+/// newest quoter first, one [`PageParams`] page at a time with the `Link`
+/// header over the *quoter row ids*.
+///
+/// Auth is optional: a presented user token must grant `read:statuses` and
+/// decides whose view the quoters render for, an anonymous request sees the
+/// public and unlisted ones. The status resolves through
+/// [`status_for_viewer_or_404`], so an invisible post hides its quoters
+/// behind the shared 404; [`status::quoting_page`] answers the live quoting
+/// rows newest-first and [`filter_visible`] then drops what this viewer may
+/// not see — the same narrowing step as [`list_favourites`]'s, keeping the
+/// page's order. Being a read, the route rides no throttle bucket.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] when a presented user token lacks
+/// `read:statuses`; [`AppError::Unauthorized`] for a token that does not
+/// resolve; [`AppError::NotFound`] for a status this route may not answer;
+/// [`AppError::BadRequest`] from the page parameters for a malformed
+/// cursor. Any database failure arrives through `?` as
+/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`].
+async fn list_quotes(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Path(id): Path<String>,
+    page: PageParams,
+    OriginalUri(uri): OriginalUri,
+) -> AppResult<(HeaderMap, Json<Vec<Status>>)> {
+    auth.require_user_scope(READ_STATUSES)?;
+    let viewer = auth.0.as_ref();
+    let target = status_for_viewer_or_404(&state, viewer, &id).await?;
+    let rows = status::quoting_page(&state.db, target.id, page).await?;
+    let visible = status_visibility::filter_visible(&state.db, rows, viewer).await?;
+    debug!(
+        status = %target.id,
+        quoters = visible.len(),
+        "status quoters listed"
+    );
+    // The cursors key on the quoter row itself, so the first and last
+    // rendered rows name the page edges directly.
+    let ids: Vec<Uuid> = visible.iter().map(|row| row.id).collect();
+    let mut headers = HeaderMap::new();
+    set_link_header(
+        &mut headers,
+        page_link(&state.config.base_url, uri.path(), &ids).as_deref(),
+    )?;
+    Ok((
+        headers,
+        Json(render_statuses(&state, viewer, &visible).await?),
+    ))
 }
 
 /// The body of `POST /api/v1/statuses/{id}/reblog`.

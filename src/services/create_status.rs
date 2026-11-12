@@ -96,24 +96,34 @@
 //! would have answered is built in memory from a minted id, `now()` and
 //! zero counters, and its `poll` is the `null` of a question nothing was
 //! stored for.
+//! A body may also name a status to quote under `quote_id` (and under
+//! Pleroma's older `quoted_status_id` spelling): the private `quote_target`
+//! step resolves it to the live, viewable original before the write, the
+//! row stores that original's id as `quote_of_id`, and the counter bump
+//! comes from [`status::insert`] itself.
 //!
 //! [`Status`]: crate::entities::status::Status
 //! [`Poll`]: crate::entities::poll::Poll
 //! [`status::insert_conn`]: crate::models::status::insert_conn
 //!
-//! Every refusal is an [`AppError::Unprocessable`] — a 422 whose body is
-//! `{"error":"…"}` (decision 8) — in Pleroma's or Mastodon's own wording,
-//! pinned by the tests below: the two limit messages, the poll refusals of
-//! `checked_poll` — `Poll must contain at least 2 options`, `Poll can't
-//! contain more than <max> options`, `Poll options cannot be longer than
-//! <chars> characters`, `Expiration date is too soon`, `Expiration date is
-//! too far in the future` and `Polls cannot have attachments`, `Invalid
+//! Every refusal of the body's own content is an [`AppError::Unprocessable`]
+//! — a 422 whose body is `{"error":"…"}` (decision 8) — in Pleroma's or
+//! Mastodon's own wording, pinned by the tests below: the two limit
+//! messages, the poll refusals of `checked_poll` — `Poll must contain at
+//! least 2 options`, `Poll can't contain more than <max> options`, `Poll
+//! options cannot be longer than <chars> characters`, `Expiration date is
+//! too soon`, `Expiration date is too far in the future` and `Polls cannot
+//! have attachments`, `Invalid
 //! visibility` for a submitted scope outside the five [`Visibility`] names,
 //! `Invalid content_type` for a MIME type outside `CONTENT_TYPES`, Rails'
 //! too-long sentence for a content warning or a language tag past its cap,
 //! and the `expires_in` pair — `expires_in must be at least <floor> seconds`
 //! naming this instance's floor for a shorter span, `expires_in is too
 //! large` for a span no timestamp can hold.
+//! An unusable quote target is decision 8's other half: a `quote_id` naming
+//! a malformed, unknown, deleted or unseen status is [`AppError::NotFound`]
+//! — the shared `{"error":"Record not found"}` — and only a target that is
+//! visible but not quotable is the 422 above.
 
 use std::collections::HashMap;
 
@@ -221,6 +231,11 @@ const POLL_EXPIRATION_TOO_SOON: &str = "Expiration date is too soon";
 /// is not posted with pictures.
 const POLL_WITH_MEDIA: &str = "Polls cannot have attachments";
 
+/// 422 body for quoting a status the poster may see but may not quote:
+/// somebody else's `private`, `direct` or `local` post, Pleroma's quote
+/// rule restated in this ticket's wording.
+const QUOTE_NOT_ALLOWED: &str = "You can only quote public or unlisted statuses";
+
 /// The body of `POST /api/v1/statuses`, as the client wrote it.
 ///
 /// Every field is an `Option` with a serde `default`, so a key the body omits
@@ -266,6 +281,15 @@ pub struct CreateStatusParams {
     /// absent.
     #[serde(default)]
     pub content_type: Option<String>,
+    /// The status to quote, named by id; absent or `null` posts no quote.
+    /// Pleroma's older `quoted_status_id` spelling is accepted as an alias,
+    /// in JSON and form bodies alike through the [`ApiBody`] extractor
+    /// (decision 10). The service's private `quote_target` step checks the
+    /// target and hands the original's id to the stored row's `quote_of_id`.
+    ///
+    /// [`ApiBody`]: crate::extract::ApiBody
+    #[serde(default, alias = "quoted_status_id")]
+    pub quote_id: Option<String>,
     /// Whether this is a preview: validate and render, answer the entity a
     /// create would have, write nothing — see [`preview_status`]. Absent,
     /// null and every [`flex`] false spelling are a real post.
@@ -869,12 +893,15 @@ pub struct RenderedFields {
 /// supplies the author's own two defaults — the row's
 /// [`default_scope`](User::default_scope) and
 /// [`sensitive_default`](User::sensitive_default), Pleroma reads the same
-/// pair off the user — and [`create_status`] does the rest: the render and
-/// the entity lists (the [`render_status_fields`] step below), the stored
-/// row with its mention and hashtag links, its claimed attachments and the
-/// author's moved counters, the body's poll stored beside it when it
-/// carried one (the `store_poll` step below), and the render for the
-/// author. `app` — the client
+/// pair off the user — and [`create_status`] does the rest: the quote
+/// target (the private `quote_target` step in the shared
+/// `prepared_new_status` below, resolved before anything is written), the
+/// render and the entity lists (the [`render_status_fields`] step below),
+/// the stored row with its mention and hashtag links, its claimed
+/// attachments and the author's moved counters, the body's poll stored
+/// beside it when it carried one (the `store_poll` step below) — and the
+/// quoted original's `quotes_count`, stepped by [`status::insert`] along
+/// with the row — and the render for the author. `app` — the client
 /// that issued the presenting
 /// token, `None` when the caller names none — is recorded as the post's
 /// `application` pair, Pleroma's `put_application`.
@@ -897,8 +924,11 @@ pub struct RenderedFields {
 /// [`AppError::Unprocessable`] for the body's own refusals, through
 /// [`check_body`] — attachments included, both the
 /// [`Config::max_media_attachments`] cap and the write's `Media not found`
-/// gate — [`AppError::NotFound`] for an `in_reply_to_id` that names
-/// no status the poster may see; [`AppError::Internal`] for the one row this
+/// gate — and for a quote target that is visible but not quotable, through
+/// the private `quote_target` step; [`AppError::NotFound`] for an
+/// `in_reply_to_id` that names no status the poster may see and likewise for
+/// a `quote_id` naming a malformed, unknown, deleted or unseen status,
+/// through `quote_target`; [`AppError::Internal`] for the one row this
 /// function wrote that the renderer refuses to answer (unreachable for a
 /// fresh local post, which is neither a tombstone nor a reblog). Any
 /// database failure arrives through `?` as [`AppError::Database`].
@@ -982,6 +1012,67 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
         .ok_or_else(|| AppError::Internal(format!("the status {} did not render", row.id)))?;
     after_status_created(state, &row).await;
     Ok(entity)
+}
+
+/// The `quote_of_id` a body's `quote_id` names: `None` when the body named no
+/// target (absent or `null` — posting without a quote is untouched), the id
+/// of the quotable original once the target has been read and checked.
+///
+/// The checks run in the order the ticket pins them, and every miss on the
+/// target is decision 8's shared 404 so a probe learns nothing:
+/// [`parse_id`] refuses text that is not an id, [`status::get_by_id`] hides
+/// unknown rows and tombstones alike, a reblog row is walked through to the
+/// original it boosts — the quote is always of the post underneath, and that
+/// is the id stored — and [`status_visibility::can_view`] hides what the
+/// poster may not see. Past the gate, only a [`Visibility::Public`] or
+/// [`Visibility::Unlisted`] original may be quoted, its own author excepted:
+/// whoever may see their own `private`, `direct` or `local` post may quote
+/// it, and anybody quoting somebody else's gets the 422 wording of
+/// [`QUOTE_NOT_ALLOWED`].
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] for a malformed, unknown, deleted or unseen
+/// target, [`AppError::Unprocessable`] with [`QUOTE_NOT_ALLOWED`] for a
+/// visible but unquotable one. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn quote_target(
+    state: &AppState,
+    user: &User,
+    quote_id: Option<&str>,
+) -> AppResult<Option<Uuid>> {
+    let Some(text) = quote_id else {
+        return Ok(None);
+    };
+    let id = parse_id(text).ok_or(AppError::NotFound)?;
+    let row = status::get_by_id(&state.db, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let target = quoted_original(state, row).await?;
+    if !status_visibility::can_view(&state.db, &target, Some(user)).await? {
+        return Err(AppError::NotFound);
+    }
+    if !matches!(target.visibility, Visibility::Public | Visibility::Unlisted)
+        && target.user_id != user.id
+    {
+        return Err(AppError::Unprocessable(QUOTE_NOT_ALLOWED.to_owned()));
+    }
+    Ok(Some(target.id))
+}
+
+/// Follows `row`'s reblog links through to the original a quote of it names:
+/// reblogs are rows too (decision 6), a client that names a boost means the
+/// post underneath it, and a broken or tombstoned link is the same 404 any
+/// other miss on the target is. Chains longer than one link do not occur in
+/// stored data, but the loop walks one to its end all the same.
+async fn quoted_original(state: &AppState, row: status::Status) -> AppResult<status::Status> {
+    let mut current = row;
+    while let Some(original_id) = current.reblog_of_id {
+        current = status::get_by_id(&state.db, original_id)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    }
+    Ok(current)
 }
 
 /// Creates the status `params` describes under the request's
@@ -1141,6 +1232,7 @@ pub async fn preview_status(
             pinned_at: None,
             muted: JsonBool(false),
             direct_participation: None,
+            quote: None,
             reblog: None,
             poll: None,
         },
@@ -1293,17 +1385,20 @@ fn mention_key(mention: &MentionRef) -> String {
     mention.acct().to_lowercase()
 }
 
-/// The [`NewStatus`] of one checked body: a `local` post by `user` with its
+/// [`NewStatus`] of one checked body: a `local` post by `user` with its
 /// rendered content and source text, its warning and flags, the two entity
 /// lists [`status::insert`] links in its transaction, the attachments
-/// [`status::insert`] claims on the same transaction with, and the client
-/// `app` recorded as the post's application — Pleroma's `put_application`,
-/// which is what makes the entity's `application` block come back.
+/// [`status::insert`] claims on the same transaction with, the client `app`
+/// recorded as the post's application — Pleroma's `put_application`, which
+/// is what makes the entity's `application` block come back — and the
+/// original [`quote_target`] resolved the body's `quote_id` to, `None` for a
+/// post quoting nothing.
 fn new_status(
     user: &User,
     app: Option<&OauthApp>,
     checked: &Checked<'_>,
     entities: &RenderedFields,
+    quote_of_id: Option<Uuid>,
 ) -> NewStatus {
     NewStatus {
         user_id: user.id,
@@ -1319,6 +1414,7 @@ fn new_status(
         hashtags: entities.hashtags.clone(),
         media_ids: checked.media_ids.clone(),
         local: true,
+        quote_of_id,
         application_name: app.map(|found| found.client_name.clone()),
         application_website: app.and_then(|found| found.website.clone()),
         ..NewStatus::default()
@@ -1336,6 +1432,7 @@ type Prepared = (NewStatus, Option<CheckedPoll>);
 /// service: [`check_body`] over the body, the reply's parent when the body
 /// names one, the
 /// `in_reply_to_conversation_id` participation when the body names one,
+/// the quote target when the body names one,
 /// the render through [`render_status_fields`], and the [`NewStatus`] to
 /// store with every reply decision already applied — the parent's id,
 /// author and thread, the [`inherited_visibility`] audience, the parent's
@@ -1360,7 +1457,8 @@ type Prepared = (NewStatus, Option<CheckedPoll>);
 /// [`AppError::NotFound`] through [`reply_parent`] for an `in_reply_to_id`
 /// naming no status the poster may see, plus [`AppError::NotFound`]
 /// through [`reply_participation`] for an `in_reply_to_conversation_id`
-/// naming no participation the poster owns, plus any database failure
+/// naming no participation the poster owns, plus those of
+/// [`quote_target`] for the body's `quote_id`, plus any database failure
 /// behind the parent's mention read as [`AppError::Database`].
 pub(crate) async fn prepared_new_status(
     state: &AppState,
@@ -1376,8 +1474,9 @@ pub(crate) async fn prepared_new_status(
     )?;
     let parent = reply_parent(state, user, params).await?;
     let participation = reply_participation(state, user, params).await?;
+    let quote_of_id = quote_target(state, user, params.quote_id.as_deref()).await?;
     let entities = render_status_fields(state, checked.text, checked.content_type).await?;
-    let mut new = new_status(user, app, &checked, &entities);
+    let mut new = new_status(user, app, &checked, &entities, quote_of_id);
     if let Some(parent) = parent {
         let inherited = inherited_mentions(
             parent.user_id,
@@ -1691,12 +1790,14 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // — and never its parent: an edit rewrites what was said in the
         // thread it stands in, and `in_reply_to_id` is not an edit
         // parameter. Neither is a poll: a post's question is fixed when it
-        // is asked. The
+        // is asked, and neither is a quote: `quote_id` is a creation
+        // parameter, the stored `quote_of_id` rides along untouched. The
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
         // which drops what the author may not attach instead of refusing
         // it, so the merge carries none and [`check_body`] never sees the
         // create's attachment rules.
+        quote_id: None,
         preview: None,
         expires_in: None,
         in_reply_to_id: None,
@@ -1996,6 +2097,33 @@ mod tests {
         assert!(!accepted(&zero).sensitive, "`\"0\"` means false");
         let null = params(json!({"status": "hi", "sensitive": null}));
         assert!(!accepted(&null).sensitive, "a null is as absent as no key");
+    }
+
+    #[test]
+    fn a_quote_id_accepts_both_spellings_and_its_absence() {
+        let id = "01934567-89ab-7cde-f012-3456789abcde";
+        let quoted = params(json!({"status": "hi", "quote_id": id}));
+        assert_eq!(
+            quoted.quote_id.as_deref(),
+            Some(id),
+            "the Mastodon spelling arrives"
+        );
+        let alias = params(json!({"status": "hi", "quoted_status_id": id}));
+        assert_eq!(
+            alias.quote_id.as_deref(),
+            Some(id),
+            "and so does Pleroma's older alias, into the same field"
+        );
+        for value in [
+            json!({"status": "hi"}),
+            json!({"status": "hi", "quote_id": null}),
+        ] {
+            let body = params(value);
+            assert!(
+                body.quote_id.is_none(),
+                "an absent or null key is no quote at all"
+            );
+        }
     }
 
     #[test]
