@@ -23,11 +23,26 @@
 //! query per window.
 //!
 //! The pipeline ships Pleroma's no-op policy
-//! (`lib/pleroma/web/activity_pub/mrf/noop_policy.ex`) and its domain lists
+//! ([`NoOpPolicy`], `lib/pleroma/web/activity_pub/mrf/noop_policy.ex`) and
+//! four real ones: the domain lists
 //! (`lib/pleroma/web/activity_pub/mrf/simple_policy.ex`, in
-//! [`simple`]); further policy tickets add one `match` arm to
-//! [`build_chain`] each. Unknown names are warned about and skipped, so a
-//! configuration written ahead of a deploy never drops traffic.
+//! [`simple`]), the first-post link gate
+//! (`lib/pleroma/web/activity_pub/mrf/anti_link_spam_policy.ex`, in
+//! [`anti_link_spam`]), the markup normalizer
+//! (`lib/pleroma/web/activity_pub/mrf/normalize_markup_policy.ex`, in
+//! [`normalize_markup`]) and the user-tag switches
+//! (`lib/pleroma/web/activity_pub/mrf/tag_policy.ex`, in [`tag`]);
+//! further policy tickets add one `match` arm to [`build_chain`] each.
+//! Unknown names are warned about and skipped, so a configuration written
+//! ahead of a deploy never drops traffic.
+//!
+//! Two of those policies read facts about the actors an activity speaks
+//! about — follower and status counters, profile tags — that live in the
+//! database, and policies perform no IO: the chain runner therefore
+//! preloads them into [`MrfContext`]’s `author_follower_count`,
+//! `author_status_count`, `author_tags` and `target_tags` fields before
+//! the chain runs, one query each, and only while the policy that reads
+//! them is enabled.
 //!
 //! Actor documents — the profiles this instance mirrors — are not
 //! activities, so they run through the chain's other stage,
@@ -41,17 +56,23 @@
 //! active policies as `"SimplePolicy"`-style names beside `mrf_simple`
 //! transparency objects.
 
+pub mod anti_link_spam;
+pub mod normalize_markup;
 pub mod simple;
+pub mod tag;
 
 use std::{fmt, sync::Arc};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
 use serde_json::{Map, Value, json};
+use sqlx::PgPool;
 use tracing::warn;
 
 use crate::{
-    federation::dispatch::ActivityView, models::instance_setting, state::AppState,
+    federation::{dispatch::ActivityView, json},
+    models::{instance_setting, user},
+    state::AppState,
     util::cache::TimedCache,
 };
 
@@ -124,6 +145,23 @@ pub struct MrfContext {
     /// This instance's domain ([`Config::domain`](crate::config::Config::domain)):
     /// the "local" a policy compares activity hosts against.
     pub local_domain: String,
+    /// The activity actor's `users.followers_count`, preloaded by the
+    /// chain runner while `anti_link_spam` is enabled. `None` says the
+    /// fact was never fetched or the actor has no row here — the
+    /// [`anti_link_spam`] policy weighs both readings as a newcomer.
+    pub author_follower_count: Option<i32>,
+    /// The activity actor's `users.statuses_count`, preloaded beside
+    /// [`MrfContext::author_follower_count`] under the same condition.
+    pub author_status_count: Option<i32>,
+    /// The `users.tags` of the activity's actor, preloaded while the `tag`
+    /// policy is enabled; empty when the fact was not fetched, the actor
+    /// has no row, or the row carries no tags.
+    pub author_tags: Vec<String>,
+    /// The `users.tags` of the LOCAL user a `Follow` is addressed to,
+    /// preloaded while the `tag` policy is enabled; empty for any other
+    /// activity, for a target with no local row, and for a row without
+    /// tags.
+    pub target_tags: Vec<String>,
 }
 
 /// The `mrf` instance setting, resolved against the `MRF_POLICIES`
@@ -182,6 +220,14 @@ impl MrfConfig {
     #[must_use]
     pub fn policies(&self) -> &[String] {
         &self.policies
+    }
+
+    /// Whether the policy named `name` is one of the enabled ones: the
+    /// chain runner asks this before preloading the facts only that
+    /// policy reads, so a disabled policy costs no query.
+    #[must_use]
+    pub fn enabled(&self, name: &str) -> bool {
+        self.policies.iter().any(|policy| policy == name)
     }
 
     /// The parameter block the policy named `name` was configured with,
@@ -248,6 +294,10 @@ impl Default for TimedCache<Arc<MrfConfig>> {
 
 /// The instance setting row the configuration is stored under.
 const SETTING_KEY: &str = "mrf";
+
+/// The `ActivityStreams` type whose target the `tag` policy's subscription
+/// rules address: the only activity shape that preloads `target_tags`.
+const FOLLOW_TYPE: &str = "Follow";
 
 /// The chain the pipeline runs: enabled policies in configured order.
 pub struct PolicyChain {
@@ -329,6 +379,15 @@ pub fn build_chain(config: &MrfConfig) -> PolicyChain {
             "simple" => Some(Box::new(simple::SimplePolicy::new(Arc::clone(
                 &config.simple,
             )))),
+            "anti_link_spam" => Some(Box::new(anti_link_spam::AntiLinkSpamPolicy::new(
+                config.params_for(anti_link_spam::PARAMS_KEY).cloned(),
+            ))),
+            "normalize_markup" => Some(Box::new(normalize_markup::NormalizeMarkupPolicy::new(
+                config.params_for(normalize_markup::PARAMS_KEY).cloned(),
+            ))),
+            "tag" => Some(Box::new(tag::TagPolicy::new(
+                config.params_for(tag::PARAMS_KEY).cloned(),
+            ))),
             other => {
                 warn!(
                     policy = other,
@@ -452,19 +511,98 @@ pub async fn filter_actor(state: &AppState, actor: Value) -> Value {
 }
 
 /// The context one pipeline run preloads: the current configuration beside
-/// the chain's single shared "now" and this instance's own domain.
+/// the chain's single shared "now" and this instance's own domain. The
+/// per-actor facts stay at their unloaded defaults here — an activity run
+/// fills them through [`preload_facts`] on top of this base, and the
+/// actor-document stage has no activity to fill them from.
 async fn context(state: &AppState) -> MrfContext {
     MrfContext {
         config: load_config(state).await,
         now: Utc::now(),
         local_domain: state.config.domain().to_owned(),
+        author_follower_count: None,
+        author_status_count: None,
+        author_tags: Vec::new(),
+        target_tags: Vec::new(),
     }
 }
 
-/// One pipeline run: the current configuration preloads into the context,
-/// and the chain answers for the document.
+/// The context of one ACTIVITY run: [`context`] with the per-actor facts
+/// the enabled policies read, preloaded from the database first.
+async fn activity_context(state: &AppState, activity: &Value) -> MrfContext {
+    let mut ctx = context(state).await;
+    preload_facts(&state.db, &mut ctx, activity).await;
+    ctx
+}
+
+/// Preloads the per-activity facts: one query each, and only while the
+/// policy that reads the fact is enabled, so a chain that has no use for
+/// a counter never pays for it. A failed read leaves the fact unloaded —
+/// the policies weigh a missing fact conservatively rather than the
+/// pipeline ending on a database error.
+async fn preload_facts(db: &PgPool, ctx: &mut MrfContext, activity: &Value) {
+    let actor = activity.get("actor").and_then(json::value_or_id);
+    if ctx.config.enabled(anti_link_spam::PARAMS_KEY) {
+        preload_counts(db, ctx, actor.as_deref()).await;
+    }
+    if ctx.config.enabled(tag::PARAMS_KEY) {
+        preload_tags(db, ctx, activity, actor.as_deref()).await;
+    }
+}
+
+/// The `anti_link_spam` query: the author row's two denormalized counters.
+async fn preload_counts(db: &PgPool, ctx: &mut MrfContext, actor: Option<&str>) {
+    let Some(ap_id) = actor else { return };
+    match user::counts_by_ap_id(db, ap_id).await {
+        Ok(Some((followers, statuses))) => {
+            ctx.author_follower_count = Some(followers);
+            ctx.author_status_count = Some(statuses);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(%err, "the author-counts preload failed; the counts stay unloaded");
+        }
+    }
+}
+
+/// The `tag` queries: the actor's tags on every activity, and — for a
+/// `Follow` — the local target's.
+async fn preload_tags(db: &PgPool, ctx: &mut MrfContext, activity: &Value, actor: Option<&str>) {
+    if let Some(ap_id) = actor {
+        ctx.author_tags = preload_user_tags(db, ap_id, false).await;
+    }
+    let follows = simple::activity_type(activity).is_some_and(|kind| kind == FOLLOW_TYPE);
+    let target = follows
+        .then(|| activity.get("object").and_then(json::value_or_id))
+        .flatten();
+    if let Some(ap_id) = target {
+        ctx.target_tags = preload_user_tags(db, &ap_id, true).await;
+    }
+}
+
+/// One tags read: the row's tags; the empty list for an actor this
+/// instance does not store, or a `Follow` target it does not own; and the
+/// empty list, beside the warning, for a failed read.
+async fn preload_user_tags(db: &PgPool, ap_id: &str, local_only: bool) -> Vec<String> {
+    let read = if local_only {
+        user::local_tags_by_ap_id(db, ap_id).await
+    } else {
+        user::tags_by_ap_id(db, ap_id).await
+    };
+    match read {
+        Ok(Some(tags)) => tags,
+        Ok(None) => Vec::new(),
+        Err(err) => {
+            warn!(%err, "an MRF tags preload failed; the tags stay unloaded");
+            Vec::new()
+        }
+    }
+}
+
+/// One pipeline run: the current configuration and the enabled policies'
+/// facts preload into the context, and the chain answers for the document.
 async fn run_chain(state: &AppState, activity: Value) -> MrfDecision {
-    let ctx = context(state).await;
+    let ctx = activity_context(state, &activity).await;
     build_chain(ctx.config.as_ref()).apply(&ctx, activity)
 }
 
@@ -573,6 +711,10 @@ mod tests {
             config: Arc::new(MrfConfig::assemble(Vec::new(), Map::new())),
             now: fixed_now(),
             local_domain: "test.example".to_owned(),
+            author_follower_count: None,
+            author_status_count: None,
+            author_tags: Vec::new(),
+            target_tags: Vec::new(),
         }
     }
 
@@ -1075,6 +1217,10 @@ mod tests {
             config,
             now: Utc::now(),
             local_domain: state.config.domain().to_owned(),
+            author_follower_count: None,
+            author_status_count: None,
+            author_tags: Vec::new(),
+            target_tags: Vec::new(),
         };
 
         assert_eq!(ctx.local_domain, "test.example", "the preloaded domain");
@@ -1082,6 +1228,248 @@ mod tests {
             ctx.config.params_for("noop"),
             Some(&json!({"probe": true})),
             "and the preloaded setting document"
+        );
+    }
+
+    /// The remote author the preload fixtures post as: stored with
+    /// standing and one moderation tag.
+    async fn preloaded_author(pool: &PgPool) -> user::User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                nickname: "alice@peer.example".to_owned(),
+                ap_id: "https://peer.example/users/alice".to_owned(),
+                local: user::Flag::new(false),
+                domain: Some("peer.example".to_owned()),
+                followers_count: 7,
+                statuses_count: 3,
+                tags: vec!["mrf_tag:media-strip".to_owned()],
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("the author fixture inserts")
+    }
+
+    /// The local account the `Follow` fixture addresses, tagged so its
+    /// subscription rule is visible in the preload.
+    async fn preloaded_target(pool: &PgPool) -> user::User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                tags: vec!["mrf_tag:disable-any-subscription".to_owned()],
+                ..user::NewUser::local("carol", "https://test.example/users/carol")
+            },
+        )
+        .await
+        .expect("the target fixture inserts")
+    }
+
+    /// A `Create` of a linked note by `actor`.
+    fn create_note(actor: &str) -> Value {
+        json!({
+            "id": "https://peer.example/activities/preload-1",
+            "type": "Create",
+            "actor": actor,
+            "object": {
+                "id": "https://peer.example/objects/preload-1",
+                "type": "Note",
+                "attributedTo": actor,
+                "content": "<p><a href=\"https://spam.example/x\">x</a></p>",
+            },
+        })
+    }
+
+    /// A `Follow` of `target` by `actor`.
+    fn follow_of(actor: &str, target: &str) -> Value {
+        json!({
+            "id": "https://peer.example/activities/preload-2",
+            "type": "Follow",
+            "actor": actor,
+            "object": target,
+        })
+    }
+
+    /// The per-activity facts preload from the database only while the
+    /// policy that reads them is enabled: nothing enabled reads nothing
+    /// although both rows would answer, `anti_link_spam` reads the two
+    /// counters and no tags, `tag` reads the author's tags on every
+    /// activity and the LOCAL `Follow` target's, and the counts stay
+    /// unread.
+    #[tokio::test]
+    async fn the_preload_fills_only_the_enabled_policies_facts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = preloaded_author(&pool).await;
+        let carol = preloaded_target(&pool).await;
+        let create = create_note(&alice.ap_id);
+        let follow = follow_of(&alice.ap_id, &carol.ap_id);
+
+        instance_setting::set(&pool, "mrf", &json!({"policies": []}))
+            .await
+            .expect("the setting writes");
+        let bare = activity_context(&test_state(&pool), &create).await;
+        assert_eq!(bare.author_follower_count, None, "no policy, no counts");
+        assert_eq!(bare.author_status_count, None, "nor their twin");
+        assert!(bare.author_tags.is_empty(), "nor any tags");
+        let bare_follow = activity_context(&test_state(&pool), &follow).await;
+        assert!(bare_follow.target_tags.is_empty(), "nor a Follow target's");
+
+        instance_setting::set(&pool, "mrf", &json!({"policies": ["anti_link_spam"]}))
+            .await
+            .expect("the rewrite writes");
+        let counted = activity_context(&test_state(&pool), &create).await;
+        assert_eq!(counted.author_follower_count, Some(7), "the counters load");
+        assert_eq!(counted.author_status_count, Some(3), "and only they");
+        assert!(counted.author_tags.is_empty(), "the tag facts stay unread");
+
+        instance_setting::set(&pool, "mrf", &json!({"policies": ["tag"]}))
+            .await
+            .expect("the rewrite writes");
+        let tagged = activity_context(&test_state(&pool), &create).await;
+        assert_eq!(
+            tagged.author_tags,
+            vec!["mrf_tag:media-strip".to_owned()],
+            "the actor's tags load"
+        );
+        assert_eq!(tagged.author_follower_count, None, "the counts stay unread");
+        assert!(
+            tagged.target_tags.is_empty(),
+            "a `Create` addresses no `Follow` target"
+        );
+
+        let following = activity_context(&test_state(&pool), &follow).await;
+        assert_eq!(
+            following.target_tags,
+            vec!["mrf_tag:disable-any-subscription".to_owned()],
+            "the local target of a `Follow` reads as its tags"
+        );
+
+        let remote_target =
+            activity_context(&test_state(&pool), &follow_of(&alice.ap_id, &alice.ap_id)).await;
+        assert!(
+            remote_target.target_tags.is_empty(),
+            "a remote target is nobody's subscription subject: the local row is the only one read"
+        );
+
+        let stranger = activity_context(
+            &test_state(&pool),
+            &create_note("https://nowhere.example/users/x"),
+        )
+        .await;
+        assert!(
+            stranger.author_tags.is_empty(),
+            "and an actor with no row preloads no tags rather than failing"
+        );
+    }
+
+    /// The whole pipeline with `anti_link_spam` enabled: the preload
+    /// reaches the policy, a brand-new remote author's linked note is
+    /// rejected and the same note with standing passes.
+    #[tokio::test]
+    async fn the_incoming_filter_rejects_a_linked_note_from_a_new_author() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        instance_setting::set(&pool, "mrf", &json!({"policies": ["anti_link_spam"]}))
+            .await
+            .expect("the setting writes");
+        let newcomer = user::insert(
+            &pool,
+            &user::NewUser {
+                nickname: "eve@peer.example".to_owned(),
+                ap_id: "https://peer.example/users/eve".to_owned(),
+                local: user::Flag::new(false),
+                domain: Some("peer.example".to_owned()),
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("the newcomer fixture inserts");
+        let state = test_state(&pool);
+
+        let spam = create_note(&newcomer.ap_id);
+        let view = ActivityView::parse(&spam).expect("the fixture parses");
+        assert_eq!(
+            filter_incoming(state.clone(), &view).await,
+            MrfDecision::Reject(
+                "[AntiLinkSpamPolicy] the author has no posts nor followers".to_owned()
+            ),
+            "the preloaded zeroes reach the policy"
+        );
+
+        let mentioned = json!({
+            "id": "https://peer.example/activities/preload-3",
+            "type": "Create",
+            "actor": &newcomer.ap_id,
+            "object": {
+                "id": "https://peer.example/objects/preload-3",
+                "type": "Note",
+                "attributedTo": &newcomer.ap_id,
+                "content": "<p><a class=\"mention\" href=\"https://test.example/users/bob\">@bob</a></p>",
+            },
+        });
+        let mention_view = ActivityView::parse(&mentioned).expect("the fixture parses");
+        assert_eq!(
+            filter_incoming(state, &mention_view).await,
+            MrfDecision::Accept(mentioned),
+            "a mention anchor is not a link"
+        );
+    }
+
+    /// The whole pipeline with `tag` enabled: the preloaded target tags
+    /// refuse a remote `Follow` of the tagged local account.
+    #[tokio::test]
+    async fn the_incoming_filter_rejects_a_follow_of_a_tagged_local_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        instance_setting::set(&pool, "mrf", &json!({"policies": ["tag"]}))
+            .await
+            .expect("the setting writes");
+        let alice = preloaded_author(&pool).await;
+        let carol = preloaded_target(&pool).await;
+        let state = test_state(&pool);
+
+        let follow = follow_of(&alice.ap_id, &carol.ap_id);
+        let view = ActivityView::parse(&follow).expect("the fixture parses");
+        assert_eq!(
+            filter_incoming(state, &view).await,
+            MrfDecision::Reject(format!(
+                "[TagPolicy] Follow from {} tagged with mrf_tag:disable-any-subscription",
+                alice.ap_id
+            )),
+            "the preloaded target tags reach the policy"
+        );
+    }
+
+    /// `build_chain` resolves the three actor-fact policies beside the
+    /// domain lists: their Pleroma names come out in configured order, and
+    /// each gets the parameter block stored under its own key.
+    #[test]
+    fn build_chain_resolves_the_actor_fact_policies() {
+        let config = config_with(
+            &["anti_link_spam", "normalize_markup", "tag"],
+            &json!({"tag": {"echo": true}}),
+        );
+
+        let chain = build_chain(&config);
+
+        assert_eq!(
+            describe_policies(&chain),
+            vec![
+                "AntiLinkSpamPolicy".to_owned(),
+                "NormalizeMarkupPolicy".to_owned(),
+                "TagPolicy".to_owned(),
+            ],
+            "the three names build their policies in order"
+        );
+        assert_eq!(
+            describe_transparency(&chain),
+            Map::from_iter([
+                ("mrf_antilinkspam".to_owned(), json!({})),
+                ("mrf_normalizemarkup".to_owned(), json!({})),
+                ("mrf_tag".to_owned(), json!({"echo": true})),
+            ]),
+            "each policy describes back its own configured subset"
         );
     }
 
