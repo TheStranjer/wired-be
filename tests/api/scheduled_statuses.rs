@@ -278,6 +278,7 @@ async fn assert_row_parks_the_request(
             "expires_in": 3600,
             "in_reply_to_id": null,
             "in_reply_to_conversation_id": null,
+            "quote_id": null,
             "media_ids": [],
             "poll": null,
             "idempotency": "K-1",

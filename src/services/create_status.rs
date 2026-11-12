@@ -64,7 +64,16 @@
 //! and names its `direct_conversation_id`, so the post answers into that
 //! DM thread; the create's `after_status_created` hook then records every
 //! local participant's side of the conversation through
-//! [`conversation::participate_for_status`].
+//! [`conversation::participate_for_status`]. And `quote_id` has landed:
+//! the named original is read through exactly [`status_for_viewer_or_404`]
+//! against the poster — a malformed, unknown, deleted or poster-invisible
+//! original is the one shared 404 with nothing written, and a reblog id
+//! folds to the original it boosts — stored on the new row as
+//! [`quote_of_id`](crate::models::status::Status::quote_of_id), with the
+//! original's `quotes_count` stepped by exactly one when a real create
+//! commits (a preview writes neither row nor counter, and a replayed
+//! idempotency key never counts twice). The created answer's nested
+//! `quote` stays `null` until the render ticket fills it.
 //!
 //! [`ApiBody`]: crate::extract::ApiBody
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
@@ -309,6 +318,20 @@ pub struct CreateStatusParams {
     /// post stands on [`in_reply_to_id`](Self::in_reply_to_id) alone.
     #[serde(default)]
     pub in_reply_to_conversation_id: Option<String>,
+    /// The status this one quotes, as id text. A named original is read
+    /// through exactly the show route's shared gate — the same rules
+    /// [`in_reply_to_id`](Self::in_reply_to_id) reads a parent with — so a
+    /// malformed, unknown, deleted or poster-invisible original is the
+    /// shared 404, and a reblog row folds to the original it boosts. The
+    /// accepted original is stored on the new row as
+    /// [`quote_of_id`](crate::models::status::Status::quote_of_id), and a
+    /// real create steps the original's `quotes_count` by exactly one — a
+    /// preview writes nothing and a replayed idempotency key never counts
+    /// twice. The created entity's nested `quote` renders `null` until the
+    /// quoting ticket renders it. Absent, null or empty quotes nothing,
+    /// the same "nothing named" spelling as [`in_reply_to_id`](Self::in_reply_to_id).
+    #[serde(default)]
+    pub quote_id: Option<String>,
     /// The ids of the poster's own unposted uploads this status carries,
     /// in the order they want them to render — decision 10's id-array:
     /// JSON's `["a","b"]` or the form's `media_ids[]=a&media_ids[]=b`,
@@ -892,13 +915,22 @@ pub struct RenderedFields {
 /// `ActivityDraft` reply arms), with the parent's own `replies_count`
 /// stepped by [`status::insert`].
 ///
+/// When the body names a `quote_id`, the same step resolves the original
+/// through the same gate before anything renders — an unquotable original
+/// is the shared 404 with nothing written, a reblog id folds to its
+/// original, and an accepted one is stored on the new row as
+/// [`quote_of_id`](status::Status::quote_of_id) and counts itself on the
+/// original exactly once, when the create's transaction has committed (see
+/// `count_quoted_original`).
+///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] for the body's own refusals, through
 /// [`check_body`] — attachments included, both the
 /// [`Config::max_media_attachments`] cap and the write's `Media not found`
 /// gate — [`AppError::NotFound`] for an `in_reply_to_id` that names
-/// no status the poster may see; [`AppError::Internal`] for the one row this
+/// no status the poster may see, or a `quote_id` that names no status the
+/// poster may quote; [`AppError::Internal`] for the one row this
 /// function wrote that the renderer refuses to answer (unreachable for a
 /// fresh local post, which is neither a tombstone nor a reblog). Any
 /// database failure arrives through `?` as [`AppError::Database`].
@@ -951,11 +983,12 @@ async fn store_poll(
     .map(drop)
 }
 
-/// The shared tail of both create arms: the fresh row's log line, the
-/// [`statuses.expire`](crate::jobs::statuses::KIND_EXPIRE) job a row carrying
-/// an expiry schedules for itself (see [`schedule_expiration`]), its
-/// [`Status`] entity as `user` — the author — sees it, and the
-/// [`after_status_created`] hook every consumer of a new post hangs off.
+/// The shared tail of both create arms: the quote step below, the fresh
+/// row's log line, the [`statuses.expire`](crate::jobs::statuses::KIND_EXPIRE)
+/// job a row carrying an expiry schedules for itself (see
+/// [`schedule_expiration`]), its [`Status`] entity as `user` — the author —
+/// sees it, and the [`after_status_created`] hook every consumer of a new
+/// post hangs off.
 ///
 /// [`schedule_expiration`]: crate::jobs::statuses::schedule_expiration
 ///
@@ -964,8 +997,9 @@ async fn store_poll(
 /// [`AppError::Internal`] for the one row this module wrote that the
 /// renderer refuses to answer (unreachable for a fresh local post, which is
 /// neither a tombstone nor a reblog); any database failure behind the render
-/// arrives through `?` as [`AppError::Database`].
+/// or the quote step arrives through `?` as [`AppError::Database`].
 async fn created_entity(state: &AppState, user: &User, row: status::Status) -> AppResult<Status> {
+    count_quoted_original(state, &row).await?;
     debug!(
         status = %row.id,
         user = %user.id,
@@ -981,6 +1015,28 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
         .ok_or_else(|| AppError::Internal(format!("the status {} did not render", row.id)))?;
     after_status_created(state, &row).await;
     Ok(entity)
+}
+
+/// The quoting arm of the create's committed write: the original named by
+/// the row's [`quote_of_id`](status::Status::quote_of_id) counts this quote
+/// through [`status::bump_counter`] with [`Counter::Quotes`], by exactly
+/// one. A row that quotes nothing moves nothing. The step lives in this
+/// tail — the half both create arms reach only after their transaction
+/// committed — so a preview never counts, a replayed idempotency key
+/// restates the stored row without counting it again, and a create that
+/// lost its key race rolled its quote row back without ever getting here.
+///
+/// [`Counter::Quotes`]: status::Counter::Quotes
+///
+/// # Errors
+///
+/// Any database failure of the counter step arrives through `?` as
+/// [`AppError::Database`].
+async fn count_quoted_original(state: &AppState, row: &status::Status) -> AppResult<()> {
+    let Some(original_id) = row.quote_of_id else {
+        return Ok(());
+    };
+    status::bump_counter(&state.db, original_id, status::Counter::Quotes, 1).await
 }
 
 /// Creates the status `params` describes under the request's
@@ -1001,7 +1057,9 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
 /// the winner's entity. The third arm — the pair is taken but its status has
 /// been deleted since — moves the key onto the fresh status
 /// ([`idempotency_key::reassign`]), because a dead post is not a
-/// replay-able answer.
+/// replay-able answer. A body naming a `quote_id` is a create like any
+/// other through this arm: the one committed write counts the original
+/// exactly once, and a replay or a lost race never counts it again.
 ///
 /// # Errors
 ///
@@ -1094,7 +1152,9 @@ async fn replayed_entity(state: &AppState, user: &User, row: &status::Status) ->
 /// is previewed, never stored. The one read the preview does perform is
 /// the mention lookup — [`render_status_fields`]'s own, network fetch of
 /// an unknown remote account included, since the rendered content is only
-/// honest if the mention links are.
+/// honest if the mention links are. A body naming a `quote_id` previews
+/// the same way: the in-memory row quotes nothing, the original is not
+/// gated, and no `quotes_count` moves.
 ///
 /// # Errors
 ///
@@ -1334,6 +1394,7 @@ type Prepared = (NewStatus, Option<CheckedPoll>);
 /// service: [`check_body`] over the body, the reply's parent when the body
 /// names one, the
 /// `in_reply_to_conversation_id` participation when the body names one,
+/// the `quote_id` original when the body names one,
 /// the render through [`render_status_fields`], and the [`NewStatus`] to
 /// store with every reply decision already applied — the parent's id,
 /// author and thread, the [`inherited_visibility`] audience, the parent's
@@ -1342,7 +1403,11 @@ type Prepared = (NewStatus, Option<CheckedPoll>);
 /// (`status_mentions` only; the text is not modified and no mention span
 /// is inserted) — and, for a conversation reply, the `direct` visibility
 /// forced, the participation's recipients merged into the mentions, and
-/// its thread recorded for the insert ([`apply_conversation_reply`]).
+/// its thread recorded for the insert ([`apply_conversation_reply`]). A
+/// named quote arrives through [`quote_original`] — the same gate as the
+/// parent, folded to the original a reblog id names — and lands on the
+/// row's [`quote_of_id`](NewStatus::quote_of_id) for the insert; counting
+/// it on the original is the committed create's, not this step's.
 /// The checked body's poll comes back beside the row: it belongs to no
 /// `NewStatus` column, and both create arms hand it to `store_poll` on
 /// the insert's own transaction.
@@ -1358,8 +1423,10 @@ type Prepared = (NewStatus, Option<CheckedPoll>);
 /// [`AppError::NotFound`] through [`reply_parent`] for an `in_reply_to_id`
 /// naming no status the poster may see, plus [`AppError::NotFound`]
 /// through [`reply_participation`] for an `in_reply_to_conversation_id`
-/// naming no participation the poster owns, plus any database failure
-/// behind the parent's mention read as [`AppError::Database`].
+/// naming no participation the poster owns, plus [`AppError::NotFound`]
+/// through [`quote_original`] for a `quote_id` naming no status the poster
+/// may quote, plus any database failure behind the parent's mention read
+/// as [`AppError::Database`].
 pub(crate) async fn prepared_new_status(
     state: &AppState,
     user: &User,
@@ -1374,6 +1441,7 @@ pub(crate) async fn prepared_new_status(
     )?;
     let parent = reply_parent(state, user, params).await?;
     let participation = reply_participation(state, user, params).await?;
+    let quoted = quote_original(state, user, params).await?;
     let entities = render_status_fields(state, checked.text, checked.content_type).await?;
     let mut new = new_status(user, app, &checked, &entities);
     if let Some(parent) = parent {
@@ -1397,6 +1465,9 @@ pub(crate) async fn prepared_new_status(
     }
     if let Some(participation) = participation {
         apply_conversation_reply(state, &participation, &mut new).await?;
+    }
+    if let Some(quoted) = quoted {
+        new.quote_of_id = Some(quoted.id);
     }
     Ok((new, checked.poll))
 }
@@ -1467,6 +1538,45 @@ async fn reply_parent(
 ) -> AppResult<Option<status::Status>> {
     let Some(text) = params
         .in_reply_to_id
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(id) = parse_id(text) else {
+        return Err(AppError::NotFound);
+    };
+    let Some(row) = status::get_by_id(&state.db, id).await? else {
+        return Err(AppError::NotFound);
+    };
+    if !status_visibility::can_view(&state.db, &row, Some(poster)).await? {
+        return Err(AppError::NotFound);
+    }
+    let Some(original_id) = row.reblog_of_id else {
+        return Ok(Some(row));
+    };
+    let original = status::get_by_id(&state.db, original_id).await?;
+    original.map(Some).ok_or(AppError::NotFound)
+}
+
+/// The status the body's `quote_id` names, read with exactly the
+/// [`crate::api::helpers::status_for_viewer_or_404`] rules run against the
+/// poster — the very gate [`reply_parent`] puts a parent through: a
+/// malformed, unknown, deleted or poster-invisible original is the shared
+/// [`AppError::NotFound`], so a quote can never probe whether somebody's
+/// private post exists. A reblog row folds to the original it boosts, for
+/// the same reason and by the same single read as the parent arm's: the
+/// quote links, and is counted on, the object under the boost. `None` when
+/// the body named no original at all, or named the empty string — the same
+/// "nothing named" spelling as
+/// [`in_reply_to_id`](CreateStatusParams::in_reply_to_id).
+async fn quote_original(
+    state: &AppState,
+    poster: &User,
+    params: &CreateStatusParams,
+) -> AppResult<Option<status::Status>> {
+    let Some(text) = params
+        .quote_id
         .as_deref()
         .filter(|text| !text.trim().is_empty())
     else {
@@ -1675,9 +1785,11 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // edit never moves the expiry either — `expires_in` is a creation
         // parameter, the stored `expires_at` rides along untouched
         // (Pleroma's `make_update_data` carries it forward the same way)
-        // — and never its parent: an edit rewrites what was said in the
-        // thread it stands in, and `in_reply_to_id` is not an edit
-        // parameter. Neither is a poll: a post's question is fixed when it
+        // — and never its parent or its original: an edit rewrites what
+        // was said in the thread it stands in and quotes whatever it
+        // quoted when it posted, so neither `in_reply_to_id` nor
+        // `quote_id` is an edit parameter. Neither is a poll: a post's
+        // question is fixed when it
         // is asked. The
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
@@ -1688,6 +1800,7 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         expires_in: None,
         in_reply_to_id: None,
         in_reply_to_conversation_id: None,
+        quote_id: None,
         poll: None,
         media_ids: None,
         scheduled_at: None,
@@ -3490,7 +3603,7 @@ mod tests {
     }
 
     /// The live row behind a status id, for the counters and links a reply
-    /// moved on its parent.
+    /// or a quote moved on the row it names.
     async fn parent_row(pool: &PgPool, id: Uuid) -> status::Status {
         status::get_by_id(pool, id)
             .await
@@ -3507,7 +3620,7 @@ mod tests {
     }
 
     /// The `{"error": …}` body of the shared 404, plus its status code:
-    /// what an unanswerable reply parent owes the client.
+    /// what an unanswerable reply parent or quote original owes the client.
     async fn missed(err: AppError) {
         let (code, body) = wire(err).await;
         assert_eq!(code, StatusCode::NOT_FOUND, "the parent miss is a 404");
@@ -5125,5 +5238,303 @@ mod tests {
             .unwrap()
             .expect("the author exists");
         assert_eq!(counted.statuses_count, 0, "and no count moved");
+    }
+
+    // ─────────────────────────────  quotes (quote_id)  ─────────────────────────────
+
+    /// A body quoting the status `original_id`, with `text` as its post.
+    fn quoting(text: &str, original_id: Uuid) -> CreateStatusParams {
+        CreateStatusParams {
+            quote_id: Some(original_id.to_string()),
+            ..posted(text)
+        }
+    }
+
+    /// The parameter arrives as id text or not at all: absent, null and the
+    /// form body's plain string all deserialize into the optional field.
+    #[test]
+    fn the_quote_parameter_deserializes_as_id_text() {
+        let absent = params(json!({"status": "hi"}));
+        assert_eq!(absent.quote_id, None, "no key is a plain post's parameter");
+        let null = params(json!({"status": "hi", "quote_id": null}));
+        assert_eq!(null.quote_id, None, "a null is as absent as no key");
+        let one = params(json!({
+            "status": "hi",
+            "quote_id": "01934567-89ab-7cde-f012-3456789abcde",
+        }));
+        assert_eq!(
+            one.quote_id.as_deref(),
+            Some("01934567-89ab-7cde-f012-3456789abcde"),
+            "id text is stored as written"
+        );
+    }
+
+    /// Quoting a public post stores the link on the new row, steps the
+    /// original's `quotes_count` by exactly one, and leaves the created
+    /// answer's nested `quote` null — the render is the quoting entity
+    /// ticket's, not this one's.
+    #[tokio::test]
+    async fn a_quote_links_its_original_and_counts_it_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "quoter").await;
+        let bob = user(pool, "bob").await;
+        let original = created(&app_state, &bob, posted("quote me")).await;
+        let original_id = Uuid::parse_str(&original.id).expect("an id");
+
+        let entity = created(&app_state, &alice, quoting("look at this", original_id)).await;
+        let row = stored(pool, &entity).await;
+
+        assert_eq!(
+            row.quote_of_id,
+            Some(original_id),
+            "the row names its original"
+        );
+        assert_eq!(row.in_reply_to_id, None, "a quote is not a reply");
+        assert_eq!(row.conversation_id, row.id, "and stands in its own thread");
+        let counted = parent_row(pool, original_id).await;
+        assert_eq!(counted.quotes_count, 1, "the original counts the quote");
+        assert_eq!(counted.replies_count, 0, "and nothing else moved");
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["quote"],
+            Value::Null,
+            "the nested quote stays null in this slice"
+        );
+    }
+
+    /// Everything that cannot be quoted — malformed text, an id that names
+    /// no row, a tombstone, and a private post whose author the poster does
+    /// not follow — is the one shared 404, with no row written and no
+    /// counter moved: the probe never learns that the original exists. The
+    /// blank string, like the parent arm's, is the "nothing named" spelling.
+    #[tokio::test]
+    async fn an_unquotable_original_is_the_shared_not_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "stranger").await;
+        let bob = user(pool, "bob").await;
+
+        let gone = plain_post(pool, &bob, "doomed").await;
+        let tombstone = status::soft_delete(pool, gone.id)
+            .await
+            .expect("the delete runs")
+            .expect("the row was live");
+        assert!(
+            tombstone.deleted_at.is_some(),
+            "the original is a tombstone"
+        );
+        let hidden = created(
+            &app_state,
+            &bob,
+            CreateStatusParams {
+                visibility: Some("private".to_owned()),
+                ..posted("not for you")
+            },
+        )
+        .await;
+        let hidden_id = Uuid::parse_str(&hidden.id).expect("an id");
+
+        let mut malformed = posted("hi");
+        malformed.quote_id = Some("not-an-id".to_owned());
+        let misses: Vec<CreateStatusParams> = vec![
+            malformed,
+            quoting("hi", Uuid::now_v7()),
+            quoting("hi", gone.id),
+            quoting("hi", hidden_id),
+        ];
+        let before = live_ids(pool).await;
+        for params in misses {
+            let err = create_status(&app_state, &alice, None, params)
+                .await
+                .expect_err("the original above cannot be quoted");
+            missed(err).await;
+        }
+        assert_eq!(
+            live_ids(pool).await,
+            before,
+            "not one refused quote wrote a row"
+        );
+        assert_eq!(
+            parent_row(pool, hidden_id).await.quotes_count,
+            0,
+            "the invisible original never learned of the probe"
+        );
+        let gone_after = status::get_by_id_including_deleted(pool, gone.id)
+            .await
+            .unwrap()
+            .expect("the tombstone row still stands");
+        assert_eq!(
+            gone_after.quotes_count, 0,
+            "and neither did the deleted original"
+        );
+
+        let root = created(
+            &app_state,
+            &alice,
+            CreateStatusParams {
+                quote_id: Some("  ".to_owned()),
+                ..posted("a plain post after all")
+            },
+        )
+        .await;
+        let row = stored(pool, &root).await;
+        assert!(
+            row.quote_of_id.is_none(),
+            "a blank original parameter is no quote at all"
+        );
+        assert_eq!(
+            live_ids(pool).await.len(),
+            before.len() + 1,
+            "and the blank is the only row the whole test wrote"
+        );
+    }
+
+    /// A reblog id folds to the original it boosts: the link and the count
+    /// both land on the original, never on the boost row the id named.
+    #[tokio::test]
+    async fn a_quote_of_a_reblog_names_the_original() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "quoter").await;
+        let bob = user(pool, "original-author").await;
+        let carol = user(pool, "booster").await;
+        let original = created(&app_state, &bob, posted("the original")).await;
+        let original_id = Uuid::parse_str(&original.id).expect("an id");
+        let reblog = status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(original_id),
+                ..NewStatus::local(&carol, "")
+            },
+        )
+        .await
+        .expect("a reblog row inserts");
+
+        let entity = created(&app_state, &alice, quoting("quoting a boost", reblog.id)).await;
+        let row = stored(pool, &entity).await;
+
+        assert_eq!(
+            row.quote_of_id,
+            Some(original_id),
+            "the quote names the boosted original, not the boost"
+        );
+        assert_eq!(
+            parent_row(pool, original_id).await.quotes_count,
+            1,
+            "the original counts the quote"
+        );
+        assert_eq!(
+            parent_row(pool, reblog.id).await.quotes_count,
+            0,
+            "the boost row counts nothing"
+        );
+    }
+
+    /// A preview naming a `quote_id` runs the plain preview arm: the entity
+    /// builds, no row is written, and the original's counter — and the
+    /// previewer's — stay exactly where they were.
+    #[tokio::test]
+    async fn a_preview_with_a_quote_writes_no_row_and_moves_no_counter() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "look-but-dont-quote").await;
+        let bob = user(pool, "quoted").await;
+        let original = created(&app_state, &bob, posted("preview me")).await;
+        let original_id = Uuid::parse_str(&original.id).expect("an id");
+        let before = live_ids(pool).await;
+
+        let entity = preview_status(
+            &app_state,
+            &alice,
+            None,
+            &params(json!({
+                "status": "looking, not posting",
+                "preview": true,
+                "quote_id": original_id.to_string(),
+            })),
+        )
+        .await
+        .expect("the preview builds");
+
+        assert_eq!(live_ids(pool).await, before, "the preview wrote no row");
+        let preview_id = Uuid::parse_str(&entity.id).expect("the preview carries its id");
+        assert!(
+            status::get_by_id(pool, preview_id).await.unwrap().is_none(),
+            "and the previewed id names no row"
+        );
+        assert_eq!(
+            parent_row(pool, original_id).await.quotes_count,
+            0,
+            "the quoted original counted nothing"
+        );
+        let counted = crate::models::user::get_by_id(pool, alice.id)
+            .await
+            .unwrap()
+            .expect("the previewer exists");
+        assert_eq!(counted.statuses_count, 0, "and no count moved");
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["quote"],
+            Value::Null,
+            "the preview answers no nested quote either"
+        );
+    }
+
+    /// The keyed arm quotes like any other create and counts like any
+    /// other replay: the key's one committed write steps the original by
+    /// exactly one, and restating the key moves nothing further.
+    #[tokio::test]
+    async fn a_replayed_key_bumps_the_quotes_count_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "keyed-quoter").await;
+        let bob = user(pool, "bob").await;
+        let original = created(&app_state, &bob, posted("quote me once")).await;
+        let original_id = Uuid::parse_str(&original.id).expect("an id");
+
+        let first = create_status_idempotent(
+            &app_state,
+            &alice,
+            None,
+            quoting("keyed quote", original_id),
+            "k1",
+        )
+        .await
+        .expect("the keyed quote creates");
+        let again = create_status_idempotent(
+            &app_state,
+            &alice,
+            None,
+            quoting("an ignored body", original_id),
+            "k1",
+        )
+        .await
+        .expect("the replay answers");
+
+        assert_eq!(again.id, first.id, "one key, one quote");
+        let row = stored(pool, &first).await;
+        assert_eq!(
+            row.quote_of_id,
+            Some(original_id),
+            "the stored quote names its original"
+        );
+        assert_eq!(
+            live_ids(pool).await.len(),
+            2,
+            "the original and exactly one quote row stand"
+        );
+        assert_eq!(
+            parent_row(pool, original_id).await.quotes_count,
+            1,
+            "and the replayed key bumped it exactly once"
+        );
     }
 }
