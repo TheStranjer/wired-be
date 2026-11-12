@@ -37,7 +37,8 @@
 //!   the empty placeholder until the relay ticket lands) join the set for
 //!   activities with public addressing and for the actor's own
 //!   `Delete`/`Undo`/`Update`, so relays keep their copies fresh;
-//! - inboxes whose host instance policy rejects or the (later) unreachable
+//! - inboxes whose host instance policy rejects — by its own table or by
+//!   the [`mrf`] domain lists — or that the (later) unreachable
 //!   ledger marks unreachable are dropped
 //!   ([`is_host_unreachable`](crate::models::instance::is_host_unreachable)),
 //!   and so is everything that is not an `http(s)` inbox URL on a foreign
@@ -196,14 +197,15 @@ async fn publish_filtered(
         .only_to
         .as_ref()
         .map_or_else(|| addressed_to(&activity), Clone::clone);
+    let policy = mrf::load_config(state).await;
     let mut candidates = expand_recipients(&state.db, actor, &addresses).await?;
     if includes_public(&addresses) || relays_should_see(&activity, &actor.ap_id) {
         candidates.extend(instance::relay_inboxes(&state.db).await?);
     }
     candidates.extend(opts.extra_inboxes);
-    let targets = deliverable_inboxes(&state.db, actor, candidates).await?;
+    let targets = deliverable_inboxes(&state.db, policy.as_ref(), actor, candidates).await?;
     for inbox in &targets {
-        enqueue_delivery(&state.db, &state.config, inbox, actor, &activity).await?;
+        enqueue_delivery(state, inbox, actor, &activity).await?;
     }
     Ok(targets.len())
 }
@@ -396,9 +398,14 @@ fn names_reference(value: Option<&Value>, ap_id: &str) -> bool {
 
 /// The final target set: candidates deduplicated by URL, each kept only
 /// when it is an `http(s)` inbox on a foreign authority whose host neither
-/// instance policy rejects nor the unreachable ledger marks.
+/// instance policy rejects — by table row nor by the [`mrf`] domain lists
+/// ([`MrfConfig::rejected`]) — nor the unreachable ledger marks.
+///
+/// [`mrf`]: crate::federation::mrf
+/// [`MrfConfig::rejected`]: crate::federation::mrf::MrfConfig::rejected
 async fn deliverable_inboxes(
     pool: &PgPool,
+    policy: &mrf::MrfConfig,
     actor: &User,
     candidates: Vec<String>,
 ) -> AppResult<Vec<String>> {
@@ -412,6 +419,7 @@ async fn deliverable_inboxes(
             continue;
         };
         if instance_policy_domain::is_rejected(pool, &host).await?
+            || policy.rejected(&host)
             || instance::is_host_unreachable(pool, &host).await?
         {
             debug!(inbox = %candidate, "delivery target dropped: the host is refused");
@@ -454,6 +462,7 @@ mod tests {
         http_client::HttpClient,
         models::{
             follow::FollowState,
+            instance_setting,
             job::Job,
             user::{NewUser, insert, local_ap_id},
         },
@@ -983,6 +992,60 @@ mod tests {
             delivered_inboxes(&pool).await,
             vec!["https://other.example/users/erin/inbox"],
             "only the reachable follower receives a job"
+        );
+    }
+
+    /// A follower whose host the MRF domain lists reject is dropped the
+    /// same way: allowlist mode means this instance fans out only to the
+    /// hosts it chose, and the enqueue would refuse the others anyway.
+    #[tokio::test]
+    async fn a_domain_the_mrf_lists_reject_is_excluded() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        instance_setting::set(
+            &pool,
+            "mrf",
+            &json!({
+                "policies": ["simple"],
+                "simple": {"accept": [["other.example", "the one we talk to"]]},
+            }),
+        )
+        .await
+        .unwrap();
+        let alice = alice(&pool).await;
+        let stranger = mirror(
+            &pool,
+            "stranger",
+            "spam.example",
+            "https://spam.example/inbox",
+            None,
+        )
+        .await;
+        followed(&pool, &stranger, &alice).await;
+        let erin = mirror(
+            &pool,
+            "erin",
+            "other.example",
+            "https://other.example/users/erin/inbox",
+            None,
+        )
+        .await;
+        followed(&pool, &erin, &alice).await;
+        let state = test_state(&pool);
+
+        let count = publish_ok(
+            &state,
+            &alice,
+            &public_activity(&alice),
+            PublishOpts::default(),
+        )
+        .await;
+
+        assert_eq!(count, 1, "the allowlisted host is the only target");
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://other.example/users/erin/inbox"],
+            "the local publisher itself still federates: the chain exempts its own domain"
         );
     }
 

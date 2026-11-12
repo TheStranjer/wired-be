@@ -38,7 +38,7 @@ use wired_be::{
     config::Config,
     federation::dispatch::handle_incoming,
     models::{
-        follow,
+        follow, instance_setting,
         status::{self, Status},
         user::User,
     },
@@ -489,6 +489,85 @@ async fn a_pleroma_create_lands_unlisted_with_its_context() {
         !unlisted_shown,
         "an unlisted post stays out of the public timeline"
     );
+}
+
+/// The [MRF chain](wired_be::federation::mrf) runs inside the dispatcher,
+/// so what a policy rewrites is what gets folded: a `Create` from a host on
+/// `followers_only` lands private, the same post from a host on
+/// `media_removal` lands with no attachments, and from a host on `reject`
+/// it lands nowhere at all.
+#[tokio::test]
+async fn the_simple_lists_rewrite_what_the_dispatcher_folds() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let signer = bob(&pool).await;
+    let _carol = common::create_remote_user(&pool, "carol", "remote.example").await;
+
+    set_simple(&pool, &json!({"followers_only": ["remote.example"]})).await;
+    deliver(
+        &delivering_state(&pool),
+        &mastodon_named("mrf-private"),
+        &signer,
+    )
+    .await;
+    let private = stored(&pool, &status_uri("mrf-private")).await;
+    assert_eq!(
+        private.visibility,
+        status::Visibility::Private,
+        "the note reaches this instance followers-only"
+    );
+
+    set_simple(&pool, &json!({"media_removal": ["remote.example"]})).await;
+    deliver(
+        &delivering_state(&pool),
+        &mastodon_named("mrf-nomedia"),
+        &signer,
+    )
+    .await;
+    let stripped = stored(&pool, &status_uri("mrf-nomedia")).await;
+    assert_eq!(
+        media_count(&pool, stripped.id).await,
+        0,
+        "the fixture's two documents were stripped before the fold"
+    );
+
+    set_simple(&pool, &json!({"reject": [["remote.example", "bots"]]})).await;
+    deliver(
+        &delivering_state(&pool),
+        &mastodon_named("mrf-rejected"),
+        &signer,
+    )
+    .await;
+    assert_eq!(
+        rows_for_uri(&pool, &status_uri("mrf-rejected")).await,
+        0,
+        "a rejected host's post is never stored"
+    );
+}
+
+/// The object uri `mastodon_named` gives a post renamed under `n`.
+fn status_uri(n: &str) -> String {
+    format!("https://remote.example/users/bob/statuses/{n}")
+}
+
+/// How many `media_attachments` rows the status `status_id` carries.
+async fn media_count(pool: &PgPool, status_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM media_attachments WHERE status_id = $1")
+        .bind(status_id)
+        .fetch_one(pool)
+        .await
+        .expect("the media count reads")
+}
+
+/// Enables the `simple` policy with the domain lists `lists` configures.
+async fn set_simple(pool: &PgPool, lists: &Value) {
+    instance_setting::set(
+        pool,
+        "mrf",
+        &json!({"policies": ["simple"], "simple": lists}),
+    )
+    .await
+    .expect("the mrf setting writes");
 }
 
 /// Two `direct` statuses answering the same unstored parent under one

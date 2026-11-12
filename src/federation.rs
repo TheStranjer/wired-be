@@ -26,8 +26,11 @@
 //! create/note tickets add their files to that module's registry as they
 //! arrive. [`mrf`] is that handler's policy pipeline: the filter chain
 //! of [`MrfPolicy`](mrf::MrfPolicy) policies configured by the `mrf`
-//! instance setting — today only its no-op stage, with the MRF policy
-//! tickets registering one name each.
+//! instance setting — the no-op stage and [`mrf::simple`], the domain
+//! lists that reject, quarantine and strip by origin host — with further
+//! MRF policy tickets registering one name each. Actor documents run
+//! through that chain's other stage, [`filter_actor`](mrf::filter_actor),
+//! before they are mirrored.
 //! [`note_parser`] is the dispatcher's pure
 //! front end for objects: the reader that turns a received `Note`-family object into
 //! the parts of a status. [`note`] is the way back out for statuses: the

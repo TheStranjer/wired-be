@@ -33,9 +33,12 @@
 //!    are rejected the same way (401 `Signature actor does not match
 //!    activity actor`). A `Delete` of an actor that answers `410 Gone` and
 //!    is about itself is answered `202 Accepted` and dropped;
-//! 7. a signer whose host is on the instance-policy `reject` list (see
-//!    [`crate::models::instance_policy_domain`]) is refused (403
-//!    `Rejected`).
+//! 7. a signer whose host the instance refuses — a row of the
+//!    instance-policy `reject` list
+//!    ([`crate::models::instance_policy_domain`]) or a host the
+//!    [`mrf`] configuration's domain lists reject
+//!    ([`MrfConfig::rejected`](crate::federation::mrf::MrfConfig::rejected))
+//!    — is refused (403 `Rejected`).
 //!
 //! Every failure is an [`AppError`], rendered by [`InboxAuthError`]; the
 //! request body is never logged.
@@ -66,6 +69,7 @@ use crate::{
     federation::{
         fetch_actor::{FetchError, fetch_actor_json, get_or_fetch_by_ap_id, refresh_user},
         json::{as_array, value_or_id},
+        mrf,
         signature::verify::{
             ParsedSignature, SignedRequestParts, parse_signature_header, verify, verify_digest,
         },
@@ -97,7 +101,8 @@ const INVALID_SIGNATURE: &str = "Invalid signature";
 /// 401 body when the activity's `actor` is not the authenticated signer:
 /// `LD`-signature forwarding is not supported yet.
 const ACTOR_MISMATCH: &str = "Signature actor does not match activity actor";
-/// 403 body when the signer's host is on the instance-policy reject list.
+/// 403 body when the signer's host is on a reject list — the instance's
+/// own table or the [`mrf`](crate::federation::mrf) domain lists.
 const REJECTED: &str = "Rejected";
 /// The `ActivityStreams` type of the one activity accepted while unsigned:
 /// an actor's own deletion (see the [module docs](self) step 6).
@@ -580,13 +585,17 @@ fn require_containment(json: &Value, signer: &User) -> Result<(), InboxAuthError
 }
 
 /// Step 7 of the [module docs](self): the signer's instance may not be on
-/// the instance-policy reject list (the `MRF` rejector's table). An
-/// unparsable `keyId` names no host to check — such a signer never got
-/// past resolution anyway, so it cannot smuggle a blocked delivery in.
+/// a reject list — neither the instance-policy table nor the domain lists
+/// of the [`mrf`](super::mrf) configuration. An unparsable `keyId` names no
+/// host to check — such a signer never got past resolution anyway, so it
+/// cannot smuggle a blocked delivery in.
 async fn require_unblocked(state: &AppState, key_id: &str) -> Result<(), InboxAuthError> {
-    if let Some(host) = signer_host(key_id)
-        && instance_policy_domain::is_rejected(&state.db, &host).await?
-    {
+    let Some(host) = signer_host(key_id) else {
+        return Ok(());
+    };
+    let listed = instance_policy_domain::is_rejected(&state.db, &host).await?;
+    let refused = listed || mrf::load_config(state).await.rejected(&host);
+    if refused {
         debug!(key_id, "inbox delivery from a rejected instance");
         return Err(InboxAuthError::blocked());
     }
@@ -630,7 +639,10 @@ mod tests {
         config::Config,
         federation::signature::{SigningKey, sign_request},
         http_client::HttpClient,
-        models::user::{NewUser, get_by_ap_id, insert},
+        models::{
+            instance_setting,
+            user::{NewUser, get_by_ap_id, insert},
+        },
         uploads::UploaderBackend,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
@@ -638,6 +650,9 @@ mod tests {
     /// The origin test requests are addressed to and sign their `Host` as:
     /// the [`Config::for_tests`] base url, matching what a real peer signs.
     const INBOX_URL: &str = "https://test.example/inbox";
+    /// The host every loopback mock is served from: the domain of the peer
+    /// a delivery here is signed as, and the one a reject list names.
+    const LOOPBACK_HOST: &str = "127.0.0.1";
     /// A five-byte body, for the size-cap test with a four-byte limit.
     const BODY: &[u8] = b"hello";
     /// The `publicKeyPem` a mirror row seeds with when it must not verify.
@@ -852,6 +867,19 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
         .await
         .unwrap();
         assert_eq!(inserted.rows_affected(), 1, "the policy row is there");
+    }
+
+    /// Enables the `simple` policy with the domain lists `lists` configure:
+    /// the row the pipeline reads as its policy, beside the table the
+    /// extractor also consults.
+    async fn set_mrf_lists(pool: &PgPool, lists: &Value) {
+        instance_setting::set(
+            pool,
+            "mrf",
+            &json!({"policies": ["simple"], "simple": lists}),
+        )
+        .await
+        .unwrap();
     }
 
     /// Seeds a remote mirror row for actor `ap_id` holding `public_pem`:
@@ -1626,6 +1654,87 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
         .await;
         assert_eq!(answer.status, StatusCode::FORBIDDEN, "the block answers");
         assert_eq!(answer.error, REJECTED, "with the ticket wording");
+        server.abort();
+    }
+
+    /// The MRF domain lists are the same gate at the same step: a host the
+    /// configured `simple` policy rejects is refused with the very 403, and
+    /// a host its allowlist does not name is refused with it too — the
+    /// extractor asks [`MrfConfig::rejected`] beside the table, so an
+    /// instance that federates with a chosen few turns everyone else away
+    /// at the door.
+    #[tokio::test]
+    async fn a_domain_the_mrf_lists_reject_is_refused() {
+        for lists in [
+            json!({"reject": [LOOPBACK_HOST]}),
+            json!({"accept": ["friend.example"]}),
+        ] {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let pool = db.pool().clone();
+            set_mrf_lists(&pool, &lists).await;
+            let listener = bind().await;
+            let base = origin(&listener);
+            let ap_id = format!("{base}/users/alice");
+            let peer = peer(base.clone(), FIXTURE_PUBLIC_PKCS1_PEM.to_owned());
+            let server = spawn(listener, peer_app(peer));
+            let app = inbox_app(test_state(pool.clone()));
+
+            let body = activity(&ap_id, "https://test.example/users/bob");
+            let answer = send(
+                &app,
+                &deliver(
+                    &format!("{ap_id}#main-key"),
+                    FIXTURE_PRIVATE_PKCS1_PEM,
+                    &body,
+                ),
+            )
+            .await;
+            assert_eq!(
+                answer.status,
+                StatusCode::FORBIDDEN,
+                "the domain lists refuse the delivery: {lists}"
+            );
+            assert_eq!(answer.error, REJECTED, "the same wording the table gives");
+            server.abort();
+        }
+    }
+
+    /// The same delivery is admitted when the configured policy is not
+    /// enabled: lists behind a switched-off policy govern nothing.
+    #[tokio::test]
+    async fn a_disabled_mrf_policy_leaves_the_door_open() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        instance_setting::set(
+            &pool,
+            "mrf",
+            &json!({"policies": ["noop"], "simple": {"reject": [LOOPBACK_HOST]}}),
+        )
+        .await
+        .unwrap();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let peer = peer(base.clone(), FIXTURE_PUBLIC_PKCS1_PEM.to_owned());
+        let server = spawn(listener, peer_app(peer));
+        let app = inbox_app(test_state(pool.clone()));
+
+        let body = activity(&ap_id, "https://test.example/users/bob");
+        let answer = send(
+            &app,
+            &deliver(
+                &format!("{ap_id}#main-key"),
+                FIXTURE_PRIVATE_PKCS1_PEM,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "the noop chain admits the delivery: {}",
+            answer.error
+        );
         server.abort();
     }
 }
