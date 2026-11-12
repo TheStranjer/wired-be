@@ -1,5 +1,6 @@
-//! End-to-end posting matrix, part 1 (WBE-223): the fixture world and the
-//! show-route sweep.
+//! End-to-end posting matrix (WBE-223): the fixture world, the show-route
+//! sweep of the single-status kinds, and the thread-context reads with the
+//! account statuses filter sweep.
 //!
 //! One author posts every single-status kind over HTTP — `public`,
 //! `unlisted`, `private`, a `direct` addressed by an @-mention of
@@ -22,12 +23,25 @@
 //! author blocked (their own aside), so a probe never learns that a
 //! hidden status exists.
 //!
-//! Reply chains, conversation directs and quote statuses are the matrix's
-//! later slices and are not posted here; a tombstone and a reblog — the
-//! model's rules 1 and 7 — are `e2e_interactions.rs`'s delete and boost
-//! scenarios. The per-endpoint parameter refusals stay pinned by the area
-//! files (`statuses.rs`, `media_upload.rs`, `polls.rs`, …); this module
-//! owns the kind × viewer matrix on the show route.
+//! Reply chains and the conversation direct are the matrix's second slice,
+//! posted through the same create route and read back per viewer through
+//! `GET /api/v1/statuses/{id}/context` as `wired_be::api::statuses`'s
+//! handler documents it: ancestors root-first (oldest first), descendants
+//! flat in chronological thread order, an invisible link skipped but walked
+//! past rather than truncating the walk, and every descendant's
+//! `pleroma.parent_visible` answering whether its own direct parent came
+//! back in this very answer. The same slice then sweeps
+//! `GET /api/v1/accounts/{author}/statuses` with every real `StatusesParams`
+//! filter — `pinned`, `only_media`, `exclude_replies`, `exclude_reblogs`,
+//! `with_muted`, `tagged`, `exclude_visibilities[]` — across the six sweep
+//! viewers, asserting each page's membership by id set. Quote statuses are
+//! still not posted here; a tombstone and a reblog — the model's rules 1
+//! and 7 — are `e2e_interactions.rs`'s delete and boost scenarios (the
+//! sweep's one boost is the author's own, posted here to be filtered). The
+//! per-endpoint parameter refusals stay pinned by the area files
+//! (`statuses.rs`, `account_statuses.rs`, `media_upload.rs`, `polls.rs`, …);
+//! this module owns the kind × viewer matrix on the show route, the thread
+//! reads, and the filter sweep on the account's page.
 
 #![cfg(test)]
 
@@ -778,4 +792,1041 @@ async fn the_blocked_viewer_reads_nothing_of_the_author_and_their_own_everything
         8,
         "every viewer reaches the blockee's own post"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Part 2: the thread kinds over HTTP, the context reads, and the account
+// statuses filter sweep.
+// ---------------------------------------------------------------------------
+
+/// The conversation listing the matrix reads a participation id back from.
+const CONVERSATIONS: &str = "/api/v1/conversations";
+
+/// The thread kinds, posted by the author through the create route: the
+/// `public` root, the `private` reply to it, the `direct` reply-of-reply
+/// that @-addresses `mentioned`, the `direct` post that continues the
+/// thread through `in_reply_to_conversation_id`, and that arm's id — read
+/// from the API's own conversation listing, never from the database.
+#[derive(Debug)]
+struct Thread {
+    /// The `public` root of the chain.
+    root: String,
+    /// The `private` answer to the root.
+    reply: String,
+    /// The `direct` answer to `reply`, addressing `mentioned`.
+    deep: String,
+    /// The `direct` conversation continuation — threaded by its
+    /// conversation id, so it answers no status.
+    dm: String,
+    /// The author's own participation id the `dm` names.
+    side: String,
+}
+
+/// The account sweep's exhibit: a [`Thread`] plus the kinds the filters key
+/// on — the attached warning post, the `#E2ETag` post, a plain post pinned
+/// to the profile, and the author's boost of `mentioned`'s own original.
+#[derive(Debug)]
+struct Exhibit {
+    /// The thread legs the `exclude_replies` and visibility filters ride.
+    thread: Thread,
+    /// The one status carrying a media attachment (with a warning).
+    media: String,
+    /// The one status carrying `#E2ETag`.
+    tagpost: String,
+    /// The plain post pinned through the pin write.
+    extra: String,
+    /// The author's reblog row, id-wise.
+    reblog: String,
+}
+
+/// `POST /api/v1/statuses/{id}/pin` as `token`, asserted 200 and answered
+/// as the status entity with its new `pinned` flag.
+async fn pinned(app: &Router, token: &str, id: &str) -> Value {
+    let response = common::TestRequest::post(&format!("{STATUSES}/{id}/pin"))
+        .bearer(token)
+        .send(app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "the pin write lands");
+    response.json_value()
+}
+
+/// `POST /api/v1/statuses/{id}/reblog` as `token`, asserted 200 and
+/// answered as the boost entity — the reblog row's own id.
+async fn reblogged(app: &Router, token: &str, id: &str) -> Value {
+    let response = common::TestRequest::post(&format!("{STATUSES}/{id}/reblog"))
+        .bearer(token)
+        .send(app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "the boost lands");
+    response.json_value()
+}
+
+/// The caller's own participation whose `last_status` is the status
+/// `last_id`: [`wired_be::api::conversations`]'s listing answers it, and
+/// its `id` — which the entity also renders as
+/// `pleroma.direct_conversation_id` — is exactly what a create's
+/// `in_reply_to_conversation_id` takes.
+async fn own_participation(app: &Router, token: &str, last_id: &str) -> Value {
+    let response = get(app, Some(token), CONVERSATIONS).await;
+    common::assert_answer(
+        &response,
+        StatusCode::OK,
+        "the conversation listing answers",
+    );
+    let body = response.json_value();
+    let rows = body.as_array().expect("the listing is an array");
+    let found = rows
+        .iter()
+        .find(|row| row["last_status"]["id"] == json!(last_id))
+        .expect("the author's own side of the thread they addressed is listed");
+    (*found).clone()
+}
+
+/// Post the thread kinds as the author, over HTTP only: root, private
+/// reply, direct reply-of-reply addressed to `mentioned` — then read the
+/// author's own participation back from `GET /api/v1/conversations` and
+/// post a `direct` continuation naming it as `in_reply_to_conversation_id`.
+async fn post_thread(app: &Router, world: &World) -> Thread {
+    let root = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "the thread root"}),
+        )
+        .await,
+    );
+    let reply = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "a private answer", "visibility": "private", "in_reply_to_id": &root}),
+        )
+        .await,
+    );
+    let deep = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "@mentioned, between us below", "visibility": "direct", "in_reply_to_id": &reply}),
+        )
+        .await,
+    );
+    let participation = own_participation(app, &world.author.token, &deep).await;
+    let side = participation["id"]
+        .as_str()
+        .expect("the participation answers its id")
+        .to_owned();
+    assert_eq!(
+        participation["last_status"]["pleroma"]["direct_conversation_id"],
+        json!(&side),
+        "the entity renders its own side id"
+    );
+    let dm = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "still between us", "visibility": "direct", "in_reply_to_conversation_id": &side}),
+        )
+        .await,
+    );
+    Thread {
+        root,
+        reply,
+        deep,
+        dm,
+        side,
+    }
+}
+
+/// Post the whole [`Exhibit`]: the [`Thread`] legs first, then the media
+/// post carrying a content warning, the hashtag post, the plain post
+/// pinned through the pin write, and the author's boost of `mentioned`'s
+/// public original — every one through the client API.
+async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
+    let thread = post_thread(app, world).await;
+    let attachment = uploaded(app, &world.author.token).await;
+    let media = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({
+                "status": "a warned tune",
+                "media_ids": [entity_id(&attachment)],
+                "spoiler_text": "audio inside",
+                "sensitive": true,
+            }),
+        )
+        .await,
+    );
+    let tagpost = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "tagged #E2ETag on the sweep"}),
+        )
+        .await,
+    );
+    let extra = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "the featured word"}),
+        )
+        .await,
+    );
+    let pin = pinned(app, &world.author.token, &extra).await;
+    assert_eq!(
+        pin["pinned"],
+        json!(true),
+        "the pin write answers the entity flagged"
+    );
+    let original = entity_id(
+        &posted(
+            app,
+            &world.mentioned.token,
+            json!({"status": "the original the author boosts"}),
+        )
+        .await,
+    );
+    let boost = reblogged(app, &world.author.token, &original).await;
+    Exhibit {
+        thread,
+        media,
+        tagpost,
+        extra,
+        reblog: entity_id(&boost),
+    }
+}
+
+/// The exhibit stage: the uploads-backed world of [`world_with_uploads`]
+/// with [`post_exhibit`]'s full exhibit posted onto it.
+async fn exhibit(pool: &PgPool, dir: &Path) -> (Router, World, Exhibit) {
+    let (app, world) = world_with_uploads(pool, dir).await;
+    let shown = post_exhibit(&app, &world).await;
+    (app, world, shown)
+}
+
+/// `GET /api/v1/statuses/{id}/context` as `token` (`None`: the anonymous
+/// caller).
+async fn context(app: &Router, token: Option<&str>, id: &str) -> common::TestResponse {
+    get(app, token, &format!("{STATUSES}/{id}/context")).await
+}
+
+/// A context answer's shape and both arms' ids, in the order they were
+/// answered: an object of exactly `ancestors` and `descendants`.
+fn context_arms(body: &Value, who: &str) -> (Vec<String>, Vec<String>) {
+    let arms: Vec<&String> = body
+        .as_object()
+        .unwrap_or_else(|| panic!("the context answer for {who} is an object"))
+        .keys()
+        .collect();
+    assert_eq!(
+        arms,
+        vec!["ancestors", "descendants"],
+        "{who}: the answer carries the two arms"
+    );
+    (arm_ids(body, "ancestors"), arm_ids(body, "descendants"))
+}
+
+/// The `id` values of one arm of a context answer, in answer order.
+fn arm_ids(body: &Value, arm: &str) -> Vec<String> {
+    body[arm]
+        .as_array()
+        .unwrap_or_else(|| panic!("the `{arm}` arm is an array"))
+        .iter()
+        .map(|status| {
+            status["id"]
+                .as_str()
+                .expect("an arm entry carries its id")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The answer's `pleroma.parent_visible` for the descendant `id`.
+fn parent_visible(body: &Value, id: &str) -> bool {
+    body["descendants"]
+        .as_array()
+        .expect("the descendants arm is an array")
+        .iter()
+        .find(|status| status["id"] == json!(id))
+        .unwrap_or_else(|| panic!("`{id}` is listed under `descendants`"))["pleroma"]["parent_visible"]
+        .as_bool()
+        .expect("parent_visible is a bool")
+}
+
+/// The `id` values of one answered status page, in answer order.
+fn page_ids(response: &common::TestResponse) -> Vec<String> {
+    let body = response.json_value();
+    body.as_array()
+        .expect("the page is a JSON array")
+        .iter()
+        .map(|status| {
+            status["id"]
+                .as_str()
+                .expect("every entity carries its id")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The ids in the order a statuses page answers them: newest first, because
+/// `UUIDv7` text is creation order (decision 4).
+fn newest_first(ids: &[&str]) -> Vec<String> {
+    let mut sorted: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    sorted.sort_by(|a, b| b.cmp(a));
+    sorted
+}
+
+/// The sweep's six viewers, in one fixed order: the author, the accepted
+/// follower, the unrelated stranger, the blocked account, the account the
+/// author muted, and the anonymous caller.
+fn sweep_viewers(world: &World) -> [(&'static str, Option<&str>); 6] {
+    [
+        ("author", Some(world.author.token.as_str())),
+        ("follower", Some(world.follower.token.as_str())),
+        ("stranger", Some(world.stranger.token.as_str())),
+        ("blocker", Some(world.blocker.token.as_str())),
+        ("muter", Some(world.muter.token.as_str())),
+        ("anonymous", None),
+    ]
+}
+
+/// One filter row of the account sweep: `GET /api/v1/accounts/{author}
+/// /statuses{query}` as every [`sweep_viewers`] role — the six `answers`,
+/// paired in order, name exactly the ids that role must read newest-first.
+/// Every role answered empty must read the byte-identical body of the same
+/// request run against `pending`, an account that posted nothing: no
+/// filter, exclusion or silence ever leaks that a hidden row exists.
+async fn sweep_page(app: &Router, world: &World, query: &str, answers: [Vec<String>; 6]) {
+    let author = world.author.user.id.to_string();
+    let anchor = get(
+        app,
+        Some(world.blocker.token.as_str()),
+        &format!("{ACCOUNTS}/{}/statuses{query}", world.pending.user.id),
+    )
+    .await;
+    for (index, (who, token)) in sweep_viewers(world).into_iter().enumerate() {
+        let response = get(app, token, &format!("{ACCOUNTS}/{author}/statuses{query}")).await;
+        common::assert_answer(&response, StatusCode::OK, &format!("{who} reads the page"));
+        assert_eq!(
+            page_ids(&response),
+            answers[index],
+            "{who}: the membership of the {query} page"
+        );
+        if answers[index].is_empty() {
+            assert_eq!(
+                response.body, anchor.body,
+                "{who}: the empty answer to {query} is the never-posted account's"
+            );
+        }
+    }
+}
+
+/// The author reads their own thread whole, from every leg: ancestors
+/// root-first, descendants in flat chronological order, and every
+/// descendant's `parent_visible` true because the chain's direct parents
+/// all came back (or are the named status itself).
+#[tokio::test]
+async fn the_author_reads_their_whole_thread_back_in_both_arms() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let thread = post_thread(&app, &world).await;
+    let author = Some(world.author.token.as_str());
+
+    {
+        let response = context(&app, author, &thread.root).await;
+        common::assert_answer(&response, StatusCode::OK, "the author at the root");
+        let body = response.json_value();
+        let (ancestors, descendants) = context_arms(&body, "the author at the root");
+        assert!(
+            ancestors.is_empty(),
+            "the root answers nothing above itself"
+        );
+        assert_eq!(
+            descendants,
+            vec![thread.reply.clone(), thread.deep.clone()],
+            "the descent is flat and chronological"
+        );
+        assert!(
+            parent_visible(&body, &thread.reply),
+            "the reply's parent is the named root"
+        );
+        assert!(
+            parent_visible(&body, &thread.deep),
+            "the reply-of-reply's parent came back too"
+        );
+    }
+
+    {
+        let response = context(&app, author, &thread.reply).await;
+        common::assert_answer(&response, StatusCode::OK, "the author at the reply");
+        let body = response.json_value();
+        let (ancestors, descendants) = context_arms(&body, "the author at the reply");
+        assert_eq!(ancestors, vec![thread.root.clone()], "root first");
+        assert_eq!(
+            descendants,
+            vec![thread.deep.clone()],
+            "and the rest of the chain below"
+        );
+        assert!(
+            parent_visible(&body, &thread.deep),
+            "the whole chain is visible to its author"
+        );
+    }
+
+    {
+        let response = context(&app, author, &thread.deep).await;
+        common::assert_answer(&response, StatusCode::OK, "the author at the leaf");
+        let body = response.json_value();
+        let (ancestors, descendants) = context_arms(&body, "the author at the leaf");
+        assert_eq!(
+            ancestors,
+            vec![thread.root.clone(), thread.reply.clone()],
+            "the chain above a reply-of-reply arrives oldest first"
+        );
+        assert!(descendants.is_empty(), "nothing answered the leaf");
+    }
+}
+
+/// The accepted follower — invisible to neither the root nor the private
+/// reply — reads both, and loses the `direct` leg: the reply-of-reply is
+/// the shared 404 named directly, and drops out below the private reply
+/// without breaking anything above it.
+#[tokio::test]
+async fn the_follower_reads_the_private_leg_and_loses_the_direct_one() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let thread = post_thread(&app, &world).await;
+
+    let from_root = context(&app, Some(&world.follower.token), &thread.root).await;
+    let root_body = from_root.json_value();
+    let (_ancestors, descendants) = context_arms(&root_body, "the follower at the root");
+    assert_eq!(
+        descendants,
+        vec![thread.reply.clone()],
+        "the private reply is the follower's, the direct one is not"
+    );
+    assert!(
+        parent_visible(&root_body, &thread.reply),
+        "whose parent — the named root — came back"
+    );
+
+    let reply_read = context(&app, Some(&world.follower.token), &thread.reply).await;
+    let reply_body = reply_read.json_value();
+    let (reply_ancestors, reply_descendants) =
+        context_arms(&reply_body, "the follower at the reply");
+    assert_eq!(reply_ancestors, vec![thread.root.clone()], "up to the root");
+    assert!(
+        reply_descendants.is_empty(),
+        "the direct leg below drops for them"
+    );
+
+    let hidden = context(&app, Some(&world.follower.token), &thread.deep).await;
+    let absent = context(&app, Some(&world.follower.token), UNKNOWN_ID).await;
+    assert_eq!(
+        hidden.body, absent.body,
+        "one body for the hidden leg and a never-stored id"
+    );
+    common::assert_all_refused(
+        &[hidden, absent],
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "the follower's direct-leg probe",
+    );
+}
+
+/// The addressed reader of the `direct` reply-of-reply: the `private` link
+/// between them and the root is invisible — but the walk passes *through*
+/// it. From the root their descendants list carries the direct leg alone
+/// with `parent_visible` false, because its own direct parent was dropped;
+/// from the leg the ancestors list still reaches the root past the hole.
+#[tokio::test]
+async fn the_addressed_reader_walks_past_the_hidden_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let thread = post_thread(&app, &world).await;
+
+    let from_root = context(&app, Some(&world.mentioned.token), &thread.root).await;
+    let root_body = from_root.json_value();
+    let (_ancestors, descendants) = context_arms(&root_body, "the addressed reader at the root");
+    assert_eq!(
+        descendants,
+        vec![thread.deep.clone()],
+        "the private reply drops and the direct leg below it stays"
+    );
+    assert!(
+        !parent_visible(&root_body, &thread.deep),
+        "its direct parent was dropped from this answer"
+    );
+
+    let deep_read = context(&app, Some(&world.mentioned.token), &thread.deep).await;
+    let deep_body = deep_read.json_value();
+    let (deep_ancestors, deep_descendants) =
+        context_arms(&deep_body, "the addressed reader at the leaf");
+    assert_eq!(
+        deep_ancestors,
+        vec![thread.root.clone()],
+        "the walk passes through the hidden link to the root"
+    );
+    assert!(deep_descendants.is_empty(), "nothing answered the leaf");
+
+    let hidden = context(&app, Some(&world.mentioned.token), &thread.reply).await;
+    let absent = context(&app, Some(&world.mentioned.token), UNKNOWN_ID).await;
+    assert_eq!(
+        hidden.body, absent.body,
+        "the hidden middle is the absent id for this reader"
+    );
+    common::assert_all_refused(
+        &[hidden, absent],
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "the addressed reader's private-leg probe",
+    );
+}
+
+/// A viewer the thread's private and direct legs are closed to — the
+/// stranger, the still-pending requester, the account the author muted
+/// (a mute is no visibility rule, but grants nothing either), and the
+/// anonymous caller alike — reads the public root's context as two empty
+/// arms, and every other leg as the shared 404, byte-identical to a
+/// never-stored id.
+#[tokio::test]
+async fn closed_readers_of_the_thread_reach_only_the_root_arms() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let thread = post_thread(&app, &world).await;
+
+    for (who, token) in [
+        ("the stranger", Some(world.stranger.token.as_str())),
+        ("the pending requester", Some(world.pending.token.as_str())),
+        ("the muter", Some(world.muter.token.as_str())),
+        ("anonymous", None),
+    ] {
+        let from_root = context(&app, token, &thread.root).await;
+        common::assert_answer(&from_root, StatusCode::OK, &format!("{who} at the root"));
+        let body = from_root.json_value();
+        let (ancestors, descendants) = context_arms(&body, who);
+        assert!(ancestors.is_empty(), "{who}: the root stands alone");
+        assert!(
+            descendants.is_empty(),
+            "{who}: the private and direct legs never arrive"
+        );
+        let mut probes = Vec::new();
+        for leg in [&thread.reply, &thread.deep, &thread.dm] {
+            probes.push(context(&app, token, leg).await);
+        }
+        probes.push(context(&app, token, UNKNOWN_ID).await);
+        let absent = probes
+            .pop()
+            .expect("the probe list carries the never-stored id");
+        for probe in &probes {
+            assert_eq!(
+                probe.body, absent.body,
+                "{who}: one body for hidden legs and absent ids"
+            );
+        }
+        probes.push(absent);
+        common::assert_all_refused(
+            &probes,
+            StatusCode::NOT_FOUND,
+            NOT_FOUND,
+            &format!("{who} probing the closed legs"),
+        );
+    }
+}
+
+/// The conversation continuation: the `direct` post naming the author's
+/// own participation id arrives threaded into the thread (`pleroma
+/// .direct_conversation_id`, every participant's own side id) yet answers
+/// *no status*, so its context is two empty arms — it is a new root, not a
+/// reply — and its listing moved to it for both the author and the
+/// addressee, who reads their own distinct side id on it.
+#[tokio::test]
+async fn a_conversation_post_continues_the_thread_without_replying() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let thread = post_thread(&app, &world).await;
+
+    let shown = get(
+        &app,
+        Some(&world.author.token),
+        &format!("{STATUSES}/{}", thread.dm),
+    )
+    .await;
+    common::assert_answer(
+        &shown,
+        StatusCode::OK,
+        "the author reads their conversation post",
+    );
+    let entity = shown.json_value();
+    assert_eq!(
+        entity["visibility"],
+        json!("direct"),
+        "the conversation arm forces the private scope"
+    );
+    assert_eq!(
+        entity["in_reply_to_id"],
+        Value::Null,
+        "it answers the thread, not a status"
+    );
+    assert_eq!(
+        entity["pleroma"]["direct_conversation_id"],
+        json!(&thread.side),
+        "the author's read renders the author's side id"
+    );
+    assert_eq!(
+        entity["mentions"][0]["acct"],
+        json!("mentioned"),
+        "the participation's recipients ride the mentions"
+    );
+
+    // The thread's listing moved to the continuation for both sides — and
+    // each side names the thread with its OWN participation id.
+    let own_row = own_participation(&app, &world.author.token, &thread.dm).await;
+    assert_eq!(own_row["id"], json!(&thread.side), "the side keeps its id");
+    let their_row = own_participation(&app, &world.mentioned.token, &thread.dm).await;
+    assert_ne!(
+        their_row["id"],
+        json!(&thread.side),
+        "the addressee's side of the same thread is a different id"
+    );
+
+    // Participants read it as a root of its own: neither walk reaches it.
+    for (who, token) in [
+        ("the author", Some(world.author.token.as_str())),
+        ("the addressee", Some(world.mentioned.token.as_str())),
+    ] {
+        let arms = context(&app, token, &thread.dm).await.json_value();
+        let (ancestors, descendants) = context_arms(&arms, who);
+        assert!(
+            ancestors.is_empty(),
+            "{who}: a conversation continuation hangs from no status"
+        );
+        assert!(descendants.is_empty(), "{who}: nothing answered it");
+    }
+
+    let mut closed = Vec::new();
+    for token in [
+        Some(world.follower.token.as_str()),
+        Some(world.stranger.token.as_str()),
+        None,
+    ] {
+        closed.push(context(&app, token, &thread.dm).await);
+    }
+    common::assert_all_refused(
+        &closed,
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "the conversation post read by non-participants",
+    );
+}
+
+/// Rule 2 holds on the context route too: the account the author blocked
+/// reads every leg of the thread — the public root included — as the same
+/// shared 404, byte-identical to a never-stored id.
+#[tokio::test]
+async fn the_blocked_viewer_reads_no_context_of_the_thread() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let thread = post_thread(&app, &world).await;
+
+    let mut probes = Vec::new();
+    for leg in [&thread.root, &thread.reply, &thread.deep, &thread.dm] {
+        probes.push(context(&app, Some(world.blocker.token.as_str()), leg).await);
+    }
+    let absent = context(&app, Some(world.blocker.token.as_str()), UNKNOWN_ID).await;
+    for probe in &probes {
+        assert_eq!(
+            probe.body, absent.body,
+            "the thread's own legs answer like a never-stored id"
+        );
+    }
+    probes.push(absent);
+    common::assert_all_refused(
+        &probes,
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "the blocked reader of every thread leg",
+    );
+}
+
+/// The sweep's unfiltered page: the author reads all eight rows; the
+/// accepted follower adds nothing over `public` but the `private` reply;
+/// the stranger, the muter and the anonymous caller reach exactly the
+/// five open rows; the blocked account reads the byte-identical empty
+/// page of a never-posting account (rules 3-6, again, by id set).
+#[tokio::test]
+async fn the_unfiltered_page_answers_every_viewer_exactly_what_visibility_allows() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+    let thread = &show.thread;
+
+    let author = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &thread.deep,
+        &thread.dm,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    let follower = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    let open = newest_first(&[
+        &thread.root,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    sweep_page(
+        &app,
+        &world,
+        "",
+        [author, follower, open.clone(), vec![], open.clone(), open],
+    )
+    .await;
+}
+
+/// `pinned=true` answers the account's one pin — and ignores the
+/// pagination keys it was sent: a `limit` of one and a `max_id` older than
+/// the pinned status would page it away on the ordinary route. No `Link`
+/// header rides a pinned answer, for any viewer; the blocked reader still
+/// gets the shared empty page.
+#[tokio::test]
+async fn pinned_answers_the_one_pin_ignoring_the_pagination_keys() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+
+    let query = format!("?pinned=true&limit=1&max_id={}", show.thread.root);
+    let author = Some(world.author.token.as_str());
+    let page = get(
+        &app,
+        author,
+        &format!("{ACCOUNTS}/{}/statuses{query}", world.author.user.id),
+    )
+    .await;
+    common::assert_answer(&page, StatusCode::OK, "the author's pinned page");
+    assert_eq!(
+        page_ids(&page),
+        vec![show.extra.clone()],
+        "the key that pages the ordinary route away is ignored"
+    );
+    assert_eq!(
+        page.header("link"),
+        None,
+        "a pinned answer sends no Link header"
+    );
+    let one = vec![show.extra.clone()];
+    sweep_page(
+        &app,
+        &world,
+        &query,
+        [
+            one.clone(),
+            one.clone(),
+            one.clone(),
+            vec![],
+            one.clone(),
+            one,
+        ],
+    )
+    .await;
+}
+
+/// `only_media=true` keeps exactly the one status carrying an attachment —
+/// the warning post — for every viewer that reaches it at all.
+#[tokio::test]
+async fn only_media_keeps_the_attached_post_alone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+
+    let one = vec![show.media.clone()];
+    sweep_page(
+        &app,
+        &world,
+        "?only_media=true",
+        [
+            one.clone(),
+            one.clone(),
+            one.clone(),
+            vec![],
+            one.clone(),
+            one,
+        ],
+    )
+    .await;
+}
+
+/// `exclude_replies=true` drops the whole reply chain — the private reply
+/// and the direct reply-of-reply — while the conversation continuation
+/// stays: it threads by conversation id and answers no status, so it is no
+/// reply. The boost, the media post, the tag post, the pin and the root
+/// are all roots.
+#[tokio::test]
+async fn exclude_replies_drops_the_chain_but_not_the_conversation_leg() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+    let thread = &show.thread;
+
+    let author = newest_first(&[
+        &thread.root,
+        &thread.dm,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    let open = newest_first(&[
+        &thread.root,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    sweep_page(
+        &app,
+        &world,
+        "?exclude_replies=true",
+        [
+            author,
+            open.clone(),
+            open.clone(),
+            vec![],
+            open.clone(),
+            open,
+        ],
+    )
+    .await;
+}
+
+/// `exclude_reblogs=true` takes the author's boost out and nothing else:
+/// the page loses exactly the reblog row's id, original untouched.
+#[tokio::test]
+async fn exclude_reblogs_drops_the_boost() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+    let thread = &show.thread;
+
+    let author = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &thread.deep,
+        &thread.dm,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+    ]);
+    let follower = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+    ]);
+    let open = newest_first(&[&thread.root, &show.media, &show.tagpost, &show.extra]);
+    sweep_page(
+        &app,
+        &world,
+        "?exclude_reblogs=true",
+        [author, follower, open.clone(), vec![], open.clone(), open],
+    )
+    .await;
+}
+
+/// `with_muted=true` brings back exactly the rows the *viewer's own* mute
+/// of the author silenced: the muter's page empties first, then fills
+/// again — the author's own read of their page never needed it, and the
+/// blocked reader's blindness is not the viewer's silence to lift.
+#[tokio::test]
+async fn with_muted_returns_the_viewers_own_exclusions() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+    let thread = &show.thread;
+
+    let author_full = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &thread.deep,
+        &thread.dm,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    let follower = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    let open = newest_first(&[
+        &thread.root,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+
+    // The muter mutes the author: the author's whole page goes silent.
+    let account = world.author.user.id.to_string();
+    let wrote = relate(&app, &world.muter.token, &account, "mute").await;
+    assert_eq!(
+        wrote["muting"],
+        json!(true),
+        "the muter mutes the author in turn"
+    );
+    sweep_page(
+        &app,
+        &world,
+        "",
+        [
+            author_full.clone(),
+            follower.clone(),
+            open.clone(),
+            vec![],
+            vec![],
+            open.clone(),
+        ],
+    )
+    .await;
+
+    // `with_muted=true` restates exactly what the mute silenced.
+    sweep_page(
+        &app,
+        &world,
+        "?with_muted=true",
+        [
+            author_full,
+            follower,
+            open.clone(),
+            vec![],
+            open.clone(),
+            open,
+        ],
+    )
+    .await;
+}
+
+/// `tagged=E2ETag` keeps the one hashtag post for every viewer that
+/// reaches it; the folded name answers either spelling, and the blockee's
+/// page stays the shared empty one.
+#[tokio::test]
+async fn tagged_keeps_the_hashtagged_post() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+
+    let one = vec![show.tagpost.clone()];
+    sweep_page(
+        &app,
+        &world,
+        "?tagged=E2ETag",
+        [
+            one.clone(),
+            one.clone(),
+            one.clone(),
+            vec![],
+            one.clone(),
+            one,
+        ],
+    )
+    .await;
+}
+
+/// `exclude_visibilities[]`: naming `private` takes the follower-visible
+/// reply out of the author's and the follower's pages alike; naming
+/// `direct` takes both DM legs out of the author's page and changes
+/// nothing for readers who never reached them.
+#[tokio::test]
+async fn exclude_visibilities_drops_named_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (app, world, show) = exhibit(&pool, dir.path()).await;
+    let thread = &show.thread;
+
+    let open = newest_first(&[
+        &thread.root,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+
+    let no_private = newest_first(&[
+        &thread.root,
+        &thread.deep,
+        &thread.dm,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    sweep_page(
+        &app,
+        &world,
+        "?exclude_visibilities[]=private",
+        [
+            no_private,
+            open.clone(),
+            open.clone(),
+            vec![],
+            open.clone(),
+            open.clone(),
+        ],
+    )
+    .await;
+
+    let no_direct = newest_first(&[
+        &thread.root,
+        &thread.reply,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+        &show.reblog,
+    ]);
+    sweep_page(
+        &app,
+        &world,
+        "?exclude_visibilities[]=direct",
+        [
+            no_direct.clone(),
+            no_direct,
+            open.clone(),
+            vec![],
+            open.clone(),
+            open,
+        ],
+    )
+    .await;
 }

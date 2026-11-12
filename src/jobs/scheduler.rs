@@ -437,6 +437,23 @@ mod tests {
     async fn run_ticks_the_periodic_schedule_under_a_paused_clock() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
+        // The scheduler runs on its own pool, established right here with
+        // two eager connections. The slot pool opens lazily and closes any
+        // connection idled past one second — and one virtual second passes
+        // in fifty steps of this test's clock, so a tick landing ten
+        // virtual seconds after its predecessor always pays a real Postgres
+        // handshake on it. That handshake, burned through faster than the
+        // 30 real-second guard sees it, is what let the second period's
+        // row slip past the step budget on a loaded suite — the "never
+        // turned over a period" flakes. This pool keeps sqlx's default
+        // 600-second idle window, which the test's 18 virtual seconds
+        // never cross, so every tick is one warm round trip.
+        let scheduler_pool = PgPoolOptions::new()
+            .min_connections(2)
+            .max_connections(2)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .expect("the scheduler's warm pool opens");
         // Drive the paused clock by hand. A running blocking task inhibits
         // tokio's auto-advance, so the virtual clock moves only where this
         // test calls `advance`: every real Postgres round trip lands while
@@ -456,18 +473,31 @@ mod tests {
             every: Duration::from_secs(1),
         }];
 
-        // The first tick fires at once; the next lands only 10 s of virtual
-        // time later. Stepping 20 ms at a time wakes the shutdown future's
-        // poll on that rhythm — and the poll's own round trip is what hands
-        // the scheduler's inserts real time to land — while 900 steps still
-        // stop short of a third tick, so the finished scheduler holds
-        // exactly the two periods the keys below are asserted on.
-        let watched = pool.clone();
-        let scheduler = tokio::spawn(run(pool.clone(), jobs, async move {
+        let watched = scheduler_pool.clone();
+        let scheduler = tokio::spawn(run(scheduler_pool, jobs, async move {
             wait_for_count(&watched, "heartbeat", 2).await;
         }));
         let started = std::time::Instant::now();
         let mut steps = 0_u32;
+        // Even the immediate first tick only fires once the frozen clock
+        // moves, so the warm-up steps forward (still far short of the 10 s
+        // interval deadline) until that first row lands.
+        while count_jobs(&pool, "heartbeat").await < 1 {
+            assert!(
+                steps < 400,
+                "the scheduler's first tick never enqueued: {steps} steps"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the scheduler wedged in real time"
+            );
+            steps += 1;
+            tokio::time::advance(Duration::from_millis(20)).await;
+        }
+        // Stepping 20 ms at a time wakes the shutdown future's poll on that
+        // rhythm, and the budget still stops short of a third interval
+        // deadline, so the finished scheduler holds exactly the two periods
+        // the keys below are asserted on.
         while !scheduler.is_finished() {
             assert!(
                 steps < 900,
