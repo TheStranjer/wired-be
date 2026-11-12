@@ -1,10 +1,11 @@
-//! `ActivityPub` routes: the URLs other instances fetch actors and
-//! collections at (`docs/ARCHITECTURE.md` decision 3).
+//! `ActivityPub` routes: the URLs other instances fetch actors, objects
+//! and activities at (`docs/ARCHITECTURE.md` decision 3).
 //!
 //! This router is merged at the top level of [`crate::app`], not under
-//! `/api`: the URLs it serves are the actor ids and object ids that go out
-//! in activities, so they must stay exactly `{BASE_URL}/users/{nickname}`
-//! and `{BASE_URL}/objects/{uuid}`.
+//! `/api`: the URLs it serves are the actor ids, object ids and activity
+//! ids that go out in documents, so they must stay exactly
+//! `{BASE_URL}/users/{nickname}`, `{BASE_URL}/objects/{uuid}` and
+//! `{BASE_URL}/activities/{uuid}`.
 //!
 //! Today it is the actor document, `GET /users/{nickname}` — Pleroma's
 //! `ActivityPubController.user/2`
@@ -18,7 +19,11 @@
 //! `ObjectView.render("object.json", …)`, and `GET /notice/{id}`, the same
 //! core for an `ActivityPub` request and Pleroma's frontend redirect for a
 //! browser, keyed on the status id the model writes into
-//! [`Status::url`](crate::models::status::Status::url) —, the instance
+//! [`Status::url`](crate::models::status::Status::url) —, the activity
+//! reads — `GET /activities/{uuid}` (Pleroma's
+//! `ActivityPubController.activity/2`) and
+//! `GET /users/{nickname}/statuses/{uuid}/activity` (its
+//! `notice_activity`) —, the instance
 //! actor document, `GET /internal/fetch` — Pleroma's same controller's
 //! `internal_fetch/2` action, the JSON-LD schema document,
 //! `GET /schemas/litepub-0.1.jsonld` — Pleroma's static
@@ -59,8 +64,33 @@
 //! the same 404. What remains is served as [`note_json`]'s `Note` or
 //! `Question`.
 //!
-//! With `AUTHORIZED_FETCH` on, the user actor route and the object reads
-//! additionally demand a valid HTTP Signature (see [`fetch_allowed`]).
+//! The activity reads serve the documents whose ids decision 6 mints as
+//! `{BASE_URL}/activities/{uuid}` — Pleroma's `activity/2` and
+//! `notice_activity` actions. `GET /activities/{uuid}` runs
+//! [`find_local_by_id`](crate::models::activity::find_local_by_id), which
+//! keys on the activity row's own `UUIDv7` and answers everything the
+//! builders need, and renders [`like_json`], [`emoji_react_json`],
+//! [`follow_json`] or [`block_json`] for a relation row, or the status'
+//! [`note_json`] wrapped in [`create_activity_json`] /
+//! [`announce_activity_json`] for a status row. Both routes negotiate like
+//! the object reads — an `Accept` naming no `ActivityPub` media type is the
+//! plain 404, no HTML branch on either. A `Create`/`Announce` follows its
+//! status' visibility exactly as the object core does (`local` is 404,
+//! `public`/`unlisted` open, `private`/`direct` only to an addressed
+//! signer); a soft-deleted status resolves to no arm at all, so it is 404
+//! here, never a `Tombstone`. A `Like`, `EmojiReact`, `Follow` or `Block`
+//! is served only to a signed fetch [`fetch_signer`] proves whose
+//! `users.id` is either the activity's actor or its target; everyone else —
+//! unsigned, unrelated — gets the 404.
+//! `GET /users/{nickname}/statuses/{uuid}/activity` serves the `Create` of
+//! that live, non-reblog, local status: the object core's checks run first
+//! (the nickname must name the author), and unknown id, remote row, reblog
+//! row, tombstone, `local`, a mismatched nickname and an unsigned private
+//! read are all the same 404 JSON.
+//!
+//! With `AUTHORIZED_FETCH` on, the user actor route, the object reads and
+//! the activity reads additionally demand a valid HTTP Signature (see
+//! [`fetch_allowed`]).
 //! `/internal/fetch` is not gated: it is the document a peer reads to
 //! learn the key it has to sign with, so gating it would deadlock the
 //! first fetch from any instance that never saw this one's actor.
@@ -103,20 +133,23 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
+        activities::{EmojiReactContext, block_json, emoji_react_json, follow_json, like_json},
         actor::actor_json,
         authorized_fetch::{fetch_allowed, fetch_signer},
         dispatch::KIND_INCOMING,
         inbox_auth::{InboxAuthError, SignedActivity},
         note::{
-            LITEPUB_SCHEMA_PATH, litepub_context_json, load_note_context, note_json, tombstone_json,
+            LITEPUB_SCHEMA_PATH, announce_activity_json, create_activity_json,
+            litepub_context_json, load_note_context, note_json, tombstone_json,
         },
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
+        activity::{self, LocalActivity, LocalActivityKind},
         job::{NewJob, enqueue},
         status::{self, Status, Visibility},
         status_visibility,
-        user::{User, get_by_nickname},
+        user::{User, get_by_id, get_by_nickname},
     },
     services::instance_actor,
     state::AppState,
@@ -158,7 +191,8 @@ pub const RATE_LIMIT_BUCKET: &str = "ap_routes";
 /// The top-level `ActivityPub` router, merged by [`crate::app`].
 ///
 /// It serves the actor documents peers fetch, the object reads
-/// (`get_object`, `get_scoped_object` and `get_notice`) and the
+/// (`get_object`, `get_scoped_object` and `get_notice`), the activity
+/// reads (`get_activity` and `get_notice_activity`) and the
 /// three inbox routes that accept their deliveries (`POST /inbox`,
 /// `POST /users/{nickname}/inbox` and `POST /internal/fetch/inbox`).
 /// `GET /users/{nickname}/inbox` is the C2S ticket's, not this router's.
@@ -168,6 +202,11 @@ pub fn router() -> Router<AppState> {
         .route("/objects/{uuid}", get(get_object))
         .route("/users/{nickname}/statuses/{uuid}", get(get_scoped_object))
         .route("/notice/{id}", get(get_notice))
+        .route("/activities/{uuid}", get(get_activity))
+        .route(
+            "/users/{nickname}/statuses/{uuid}/activity",
+            get(get_notice_activity),
+        )
         .route("/internal/fetch", get(get_instance_actor))
         .route(LITEPUB_SCHEMA_PATH, get(litepub_schema))
         .route("/inbox", post(inbox))
@@ -369,6 +408,236 @@ async fn read_admitted(
             status_visibility::can_view(&state.db, status, Some(&signer)).await
         }
     }
+}
+
+/// `GET /activities/{uuid}` — the local activity whose row `UUIDv7` names
+/// it (Pleroma's `ActivityPubController.activity/2`): the `Create` or
+/// `Announce` of a status row, or the `Like`, `EmojiReact`, `Follow` or
+/// `Block` behind a relation row, at the `{BASE_URL}/activities/{uuid}` id
+/// decision 6 mints. Negotiation and gates as the object reads: `Accept`
+/// must name an `ActivityPub` media type, and `AUTHORIZED_FETCH` demands
+/// the signature before anything resolves.
+async fn get_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(uuid): Path<String>,
+) -> Response {
+    let outcome = activity_core(&state, &uuid, &headers, &uri).await;
+    with_vary(outcome)
+}
+
+/// `GET /users/{nickname}/statuses/{uuid}/activity` — Pleroma's
+/// `notice_activity`: the `Create` activity of that live, non-reblog,
+/// local status, the object core's document wrapped. No HTML branch: like
+/// the activity route it answers only `ActivityPub` clients.
+async fn get_notice_activity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path((nickname, uuid)): Path<(String, String)>,
+) -> Response {
+    let outcome = notice_activity_core(&state, &uuid, &nickname, &headers, &uri).await;
+    with_vary(outcome)
+}
+
+/// The shared `GET /activities/{uuid}` core, in the order the ticket fixes
+/// it: an `Accept` naming no `ActivityPub` media type is the plain 404, the
+/// `AUTHORIZED_FETCH` gate runs next, an unparsable uuid names no row, and
+/// an id no activity table carries resolves to nothing. What does resolve
+/// is a status arm (`Create`/`Announce`), gated exactly like the object
+/// core, or a relation arm (`Like`/`EmojiReact`/`Follow`/`Block`), served
+/// only to the activity's two parties over a signature.
+async fn activity_core(
+    state: &AppState,
+    id_text: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Response> {
+    if !wants_activity_json(headers) {
+        return Err(AppError::RouteNotFound);
+    }
+    fetch_allowed(state, &Method::GET, uri, headers).await?;
+    let Some(id) = Uuid::parse_str(id_text).ok() else {
+        return Err(AppError::RouteNotFound);
+    };
+    let Some(resolved) = activity::find_local_by_id(&state.db, id).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    let document = match resolved.kind {
+        LocalActivityKind::Create | LocalActivityKind::Announce => {
+            status_activity_document(state, &resolved, headers, uri).await?
+        }
+        LocalActivityKind::Like
+        | LocalActivityKind::EmojiReact
+        | LocalActivityKind::Follow
+        | LocalActivityKind::Block => {
+            relation_activity_document(state, &resolved, headers, uri).await?
+        }
+    };
+    Ok(document_response(document))
+}
+
+/// The `Create` or `Announce` behind a resolved status arm. The row goes
+/// through the object core's checks on the re-read the gate and the
+/// builders work from: a row this instance does not own, a deletion that
+/// raced in since the arm resolved (a soft-deleted status never resolves
+/// to an arm, and this route answers its id 404, never a `Tombstone`), and
+/// a visibility [`read_admitted`] refuses are all the plain 404.
+async fn status_activity_document(
+    state: &AppState,
+    resolved: &LocalActivity,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Value> {
+    let Some(stored) = status::get_by_id_including_deleted(&state.db, resolved.id).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    if !stored.local || stored.deleted_at.is_some() {
+        return Err(AppError::RouteNotFound);
+    }
+    if !read_admitted(state, &stored, headers, uri).await? {
+        return Err(AppError::RouteNotFound);
+    }
+    if stored.reblog_of_id.is_some() {
+        announce_document(state, resolved, &stored).await
+    } else {
+        create_document(state, &stored).await
+    }
+}
+
+/// The status' `Create`: the very [`note_json`] document [`object_core`]
+/// serves, wrapped by [`create_activity_json`]. Its `id` is
+/// `{BASE_URL}/activities/{status id}` (decision 6), exactly
+/// [`activity_id`](crate::federation::activities::activity_id) of the row
+/// that resolved. [`note_json`]'s `None` is a `local` status, which
+/// [`read_admitted`] has just refused, so the unrenderable case is the
+/// same 404 as on the object read.
+async fn create_document(state: &AppState, stored: &Status) -> AppResult<Value> {
+    let context = load_note_context(&state.db, &state.config, stored.id).await?;
+    let Some(note) = note_json(&context) else {
+        return Err(AppError::RouteNotFound);
+    };
+    Ok(create_activity_json(&note, stored, &state.config))
+}
+
+/// The reblog's `Announce`: the row in hand and its author, naming the
+/// boosted original's `uri` and its author's `ap_id` — both carried by the
+/// resolved arm, so no second read of the original. The builder's `None`
+/// is a `local` reblog, which [`read_admitted`] has just refused.
+async fn announce_document(
+    state: &AppState,
+    resolved: &LocalActivity,
+    stored: &Status,
+) -> AppResult<Value> {
+    let Some(author) = get_by_id(&state.db, stored.user_id).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    let Some(original_author_ap_id) = resolved.target_ap_id.as_deref() else {
+        return Err(AppError::RouteNotFound);
+    };
+    announce_activity_json(
+        stored,
+        &author,
+        &resolved.object_ap_id,
+        original_author_ap_id,
+        &state.config,
+    )
+    .ok_or(AppError::RouteNotFound)
+}
+
+/// The `Like`, `EmojiReact`, `Follow` or `Block` behind a resolved
+/// relation arm, served only to a signed fetch whose reader is one of the
+/// activity's two parties: [`fetch_signer`]'s `None` — the anonymous read
+/// with `AUTHORIZED_FETCH` off — is a 404 like any unrelated reader's, and
+/// a signature that fails to verify is its 401.
+async fn relation_activity_document(
+    state: &AppState,
+    resolved: &LocalActivity,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Value> {
+    let Some(signer) = fetch_signer(state, &Method::GET, uri, headers).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    let party = signer.id == resolved.actor_user_id
+        || resolved
+            .target_user_id
+            .is_some_and(|target| target == signer.id);
+    if !party {
+        return Err(AppError::RouteNotFound);
+    }
+    relation_json(state, resolved)
+}
+
+/// The relation document rendered straight from the resolved row's
+/// columns — the ids, the object, the publication moment, and the emoji
+/// pair only the `EmojiReact` arm carries — with no further read. The
+/// status arms never reach here; should one, its id names no relation
+/// document and the plain 404 answers.
+fn relation_json(state: &AppState, resolved: &LocalActivity) -> AppResult<Value> {
+    let config = &state.config;
+    let id = resolved.id;
+    let actor = resolved.actor_ap_id.as_str();
+    let object = resolved.object_ap_id.as_str();
+    let published = &resolved.inserted_at;
+    match resolved.kind {
+        LocalActivityKind::Like => Ok(like_json(config, id, actor, object, published)),
+        LocalActivityKind::EmojiReact => {
+            let Some(emoji) = resolved.emoji.as_deref() else {
+                return Err(AppError::RouteNotFound);
+            };
+            let context = EmojiReactContext {
+                config,
+                id,
+                actor_ap_id: actor,
+                object_uri: object,
+                emoji,
+                emoji_url: resolved.emoji_url.as_deref(),
+                published,
+            };
+            Ok(emoji_react_json(&context))
+        }
+        LocalActivityKind::Follow => Ok(follow_json(config, id, actor, object, published)),
+        LocalActivityKind::Block => Ok(block_json(config, id, actor, object, published)),
+        LocalActivityKind::Create | LocalActivityKind::Announce => Err(AppError::RouteNotFound),
+    }
+}
+
+/// The `/users/{nickname}/statuses/{uuid}/activity` core: [`object_core`]'s
+/// checks in [`object_core`]'s order — unparsable uuid, non-`ActivityPub`
+/// client, `AUTHORIZED_FETCH` gate, then a row this instance does not own,
+/// a reblog row, or a nickname that is not the live local author — with
+/// one difference: a soft-deleted status is the 404 JSON here, not a
+/// `Tombstone`. The survivor's [`note_json`] document rides out wrapped in
+/// [`create_activity_json`].
+async fn notice_activity_core(
+    state: &AppState,
+    id_text: &str,
+    nickname: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Response> {
+    let Some(id) = Uuid::parse_str(id_text).ok() else {
+        return Err(AppError::RouteNotFound);
+    };
+    if !wants_activity_json(headers) {
+        return Err(AppError::RouteNotFound);
+    }
+    fetch_allowed(state, &Method::GET, uri, headers).await?;
+    let Some(stored) = status::get_by_id_including_deleted(&state.db, id).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    if !stored.local || stored.reblog_of_id.is_some() || stored.deleted_at.is_some() {
+        return Err(AppError::RouteNotFound);
+    }
+    if !nickname_owns(state, Some(nickname), &stored).await? {
+        return Err(AppError::RouteNotFound);
+    }
+    if !read_admitted(state, &stored, headers, uri).await? {
+        return Err(AppError::RouteNotFound);
+    }
+    Ok(document_response(create_document(state, &stored).await?))
 }
 
 /// The `Tombstone` a soft-deleted status is served as: the 410 whose body
