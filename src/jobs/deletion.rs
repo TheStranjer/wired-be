@@ -1,9 +1,10 @@
-//! The account-deletion job: clearing a departed account's data.
+//! The account-deletion jobs: clearing a departed account's data.
 //!
 //! `POST /api/pleroma/delete_account` (WBE-136, `delete_account` in
 //! [`crate::api::pleroma_account_settings`]) marks the account deleted and
-//! queues this job on [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND) — the
-//! counterpart of Pleroma's `User.delete` enqueueing its `DeleteWorker`
+//! queues [`users.delete`](KIND_DELETE) on
+//! [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND) — the counterpart of
+//! Pleroma's `User.delete` enqueueing its `DeleteWorker`
 //! (`lib/pleroma/user.ex`). The endpoint answers immediately; everything
 //! slow happens here.
 //!
@@ -21,6 +22,19 @@
 //!    hangs mirrors, activities and relationships off it — but its
 //!    personal data (email, password hash, display name) is replaced with
 //!    empty values, Pleroma's `purge` step.
+//!
+//! [`users.delete_remote`](KIND_DELETE_REMOTE) is the same sweep for an
+//! account that was never ours: the inbound `Delete` of a peer's own actor
+//! ([`crate::federation::handlers::actor`]) marks the mirror inactive and
+//! queues it. The differences are the ones the mirror forces — there is no
+//! personal data to purge, no list to own and no upload to unlink, but the
+//! peers whose follow rows go are live accounts whose denormalised counters
+//! have to be stepped, so the follow half runs through
+//! [`delete_all_for_user_with_counts`](crate::models::follow::delete_all_for_user_with_counts)
+//! and the reaction half through
+//! [`delete_all_for_user`](crate::models::emoji_reaction::delete_all_for_user)
+//! (a local account's reactions leave with its row's cascade; a kept mirror
+//! row keeps them alive until this sweeps them).
 //!
 //! Every write is idempotent — tombstoning a tombstone clears nothing,
 //! deleting a missing row deletes nothing — so a retried pass converges on
@@ -40,7 +54,10 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     jobs::{AttemptInfo, HandlerFuture, JobError},
-    models::{bookmark, favourite, follow, list, media_attachment, notification, status, user},
+    models::{
+        bookmark, emoji_reaction, favourite, follow, list, media_attachment, notification, status,
+        user,
+    },
     state::AppState,
 };
 
@@ -48,17 +65,25 @@ use crate::{
 /// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND).
 pub const KIND_DELETE: &str = "users.delete";
 
-/// The `{user_id}` arguments of the delete job, as [`job_args`] writes and
-/// [`handle_delete`] reads them.
+/// The job kind of a *remote* account's deletion — a peer's `Delete` of its
+/// own actor — handled by [`handle_delete_remote`] on
+/// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND).
+pub const KIND_DELETE_REMOTE: &str = "users.delete_remote";
+
+/// The `{user_id}` arguments of a delete job, as [`job_args`] writes and
+/// both [`handle_delete`] and [`handle_delete_remote`] read them.
 #[derive(Debug, Deserialize)]
 struct DeleteArgs {
     /// The account whose data the job clears.
     user_id: Uuid,
 }
 
-/// The `{user_id}` job-arguments document for account `user_id`: the one
-/// shape [`crate::api::pleroma_account_settings`] enqueues and
-/// [`handle_delete`] deserialises.
+/// The `{user_id}` job-arguments document for account `user_id`.
+///
+/// Both delete jobs take this one shape:
+/// [`crate::api::pleroma_account_settings`] enqueues it for [`KIND_DELETE`],
+/// [`crate::federation::handlers::actor`] for [`KIND_DELETE_REMOTE`], and
+/// [`handle_delete`] and [`handle_delete_remote`] both deserialise it.
 #[must_use]
 pub fn job_args(user_id: Uuid) -> Value {
     json!({ "user_id": user_id })
@@ -159,6 +184,67 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
     Ok(())
 }
 
+/// The [`JobRegistry`](super::JobRegistry) handler for
+/// [`KIND_DELETE_REMOTE`]: the sweep a peer's `Delete` of its own actor
+/// queues ([`crate::federation::handlers::actor`]), for an account this
+/// instance only ever mirrored.
+///
+/// The handler that queued it has already marked the mirror inactive with
+/// `deleted_at` stamped, so the row arrives here as a tombstone and stays
+/// one: nothing of a remote actor is personal data, and decision 7 keeps
+/// the row for the activities and relationships that name it. A vanished
+/// row or an unparsable payload is discarded; every database failure
+/// retries, the writes being idempotent.
+pub fn handle_delete_remote(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let user_id = parse_args(&args)?;
+        let account = load_account(&state, user_id).await?;
+        clear_remote_data(&state, &account).await?;
+        debug!(account = %account.nickname, "remote account deletion finished");
+        Ok(())
+    })
+}
+
+/// The remote sweep: the mirror's posts tombstone in batches of 100, every
+/// relationship naming it goes with its live peers' counters stepped, its
+/// own likes, reactions and marks go, and every notification naming it in
+/// either role goes — including the ones local accounts received from the
+/// now-dead actor. What is *not* here is the local sweep's tail: a mirror
+/// owns no list, uploads no media, and has no email, password hash or
+/// display name to purge, so the row stays exactly as it was, inactive.
+///
+/// # Errors
+///
+/// [`JobError::Retry`] on any database failure (see [`retry`]).
+async fn clear_remote_data(state: &AppState, account: &user::User) -> Result<(), JobError> {
+    let db = &state.db;
+    let id = account.id;
+    let statuses = status::soft_delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let follows = follow::delete_all_for_user_with_counts(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let favourites = favourite::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let reactions = emoji_reaction::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let bookmarks = bookmark::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let notifications = notification::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    debug!(
+        account = %account.nickname,
+        statuses, follows, favourites, reactions, bookmarks, notifications,
+        "remote account deletion cleared"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -174,11 +260,12 @@ mod tests {
         http_client::HttpClient,
         jobs::QUEUE_BACKGROUND,
         models::{
+            emoji_reaction::{self, NewReaction},
             favourite::Favourite,
             list::{self, List, NewList},
             notification::{self, NewNotification, Notification},
             status::{NewStatus, Status},
-            user::{NewUser, User, insert, local_ap_id},
+            user::{Flag, NewUser, User, insert, local_ap_id},
         },
         uploads::UploaderBackend,
     };
@@ -666,5 +753,374 @@ mod tests {
         let id = Uuid::now_v7();
         assert_eq!(job_args(id), json!({ "user_id": id }));
         assert_eq!(QUEUE_BACKGROUND, "background", "the ticket's queue");
+    }
+
+    /// Inserts a mirror of `nickname` on `peer.example`: a remote account,
+    /// which owns none of this instance's local data.
+    async fn remote_user(pool: &PgPool, nickname: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("{nickname}@peer.example"),
+                ap_id: format!("https://peer.example/users/{nickname}"),
+                local: Flag::new(false),
+                domain: Some("peer.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts")
+    }
+
+    /// Posts one status authored by the remote `author`, at the `uri` the
+    /// peer named (decision 6).
+    async fn remote_post(pool: &PgPool, author: &User, text: &str) -> Status {
+        let id = Uuid::now_v7();
+        status::insert(
+            pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                user_id: author.id,
+                uri: Some(format!("https://peer.example/objects/{id}")),
+                content: text.to_owned(),
+                raw_text: text.to_owned(),
+                ..NewStatus::default()
+            },
+        )
+        .await
+        .expect("the remote status fixture inserts")
+    }
+
+    /// `follower` follows `target` *and* the request is granted through the
+    /// model's own [`follow::accept`], the only way a follow of a remote
+    /// account ever counts: the answer a peer's `Accept` activity would
+    /// bring, applied to the fixture directly.
+    async fn accepted_follow(pool: &PgPool, follower: &User, target: &User) {
+        let requested = follow::follow(pool, TEST_BASE_URL, follower, target)
+            .await
+            .expect("the follow fixture is recorded");
+        let _granted = follow::accept(pool, requested.id)
+            .await
+            .expect("the fixture grants the request");
+    }
+
+    /// `who` reacts to `status_id` with `emoji`.
+    async fn reacts(pool: &PgPool, who: &User, status_id: Uuid, emoji: &str) {
+        let _stored = emoji_reaction::react(
+            pool,
+            TEST_BASE_URL,
+            &NewReaction {
+                user_id: who.id,
+                status_id,
+                emoji,
+                url: None,
+            },
+        )
+        .await
+        .expect("the reaction fixture writes");
+    }
+
+    /// User `id` as it stands now, for reading the kept row and its counters
+    /// back.
+    async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
+        user::get_by_id(pool, id)
+            .await
+            .unwrap()
+            .expect("the user exists")
+    }
+
+    /// Runs [`handle_delete_remote`] to completion on `state` for `user_id`.
+    async fn run_remote(state: &AppState, user_id: Uuid) -> Result<(), JobError> {
+        let attempt = AttemptInfo {
+            attempts: 1,
+            max_attempts: 5,
+        };
+        handle_delete_remote(state.clone(), attempt, job_args(user_id)).await
+    }
+
+    /// The remote-deletion fixture, as the inbound `Delete` hands it over: a
+    /// departed mirror past a batch boundary of statuses, followed and
+    /// following in accepted relationships, with likes, marks and reactions
+    /// of its own and a reaction of another account on its post, a
+    /// notification it caused and one of someone else's, its row already
+    /// marked deleted by the handler.
+    struct Departed {
+        /// The mirror the sweep clears.
+        alice: User,
+        /// A local account that follows alice and carol.
+        bob: User,
+        /// A local account alice follows.
+        carol: User,
+        /// One of alice's posts, named by the assertions.
+        alices_post: Status,
+        /// Bob's own post, which alice liked.
+        bobs_post: Status,
+        /// A notification of bob's about carol, nobody else's to clear.
+        bobs_notification: Notification,
+    }
+
+    /// Builds the [`Departed`] fixture.
+    async fn departed_mirror(pool: &PgPool) -> Departed {
+        let alice = remote_user(pool, "alice").await;
+        let bob = local_user(pool, "bob").await;
+        let carol = local_user(pool, "carol").await;
+        let alices_post = remote_post(pool, &alice, "alice posts").await;
+        post_many(pool, &alice, BATCH_OVERSHOOT).await;
+        let bobs_post = post(pool, &bob, "bob posts").await;
+        accepted_follow(pool, &bob, &alice).await;
+        accepted_follow(pool, &alice, &carol).await;
+        accepted_follow(pool, &bob, &carol).await;
+        let _alices_like = likes(pool, &alice, bobs_post.id).await;
+        marks(pool, &alice, bobs_post.id).await;
+        reacts(pool, &alice, bobs_post.id, "\u{1f44d}").await;
+        reacts(pool, &bob, alices_post.id, "\u{1f389}").await;
+        let _to_bob = notify(pool, &bob, &alice).await;
+        let bobs_notification = notify(pool, &carol, &bob).await;
+        user::mark_deleted(pool, alice.id)
+            .await
+            .expect("the delete handler marks the mirror first");
+        Departed {
+            alice,
+            bob,
+            carol,
+            alices_post,
+            bobs_post,
+            bobs_notification,
+        }
+    }
+
+    /// The remote sweep, past a batch boundary: every post the mirror made is
+    /// a tombstone while the rows stay, and the row itself survives as the
+    /// inactive, still-named mirror the `Delete` handler left.
+    #[tokio::test]
+    async fn the_remote_handler_tombstones_statuses_and_keeps_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let fixture = departed_mirror(&pool).await;
+        let Departed {
+            alice,
+            alices_post,
+            bobs_post,
+            ..
+        } = &fixture;
+
+        run_remote(&app_state(&pool), alice.id)
+            .await
+            .expect("the remote delete job runs");
+
+        assert_eq!(
+            live_statuses(&pool, alice.id).await,
+            0,
+            "all 121 of the mirror's statuses tombstoned, across the 100-row batch"
+        );
+        assert!(
+            status_deleted_at(&pool, alices_post.id).await.is_some(),
+            "the one post it made over the fixture batch is a tombstone too"
+        );
+        assert_eq!(
+            count_where(&pool, "statuses", "user_id", alice.id).await,
+            121,
+            "the rows stay, tombstoned"
+        );
+        assert!(
+            status_deleted_at(&pool, bobs_post.id).await.is_none(),
+            "bob's post is not alice's to tombstone"
+        );
+
+        let kept = fresh_user(&pool, alice.id).await;
+        assert!(!kept.is_active.get(), "the row stays inactive");
+        assert!(kept.deleted_at.is_some(), "and stays marked deleted");
+        assert_eq!(
+            kept.nickname, "alice@peer.example",
+            "the mirror is intact: the remote sweep purges nothing"
+        );
+    }
+
+    /// The remote sweep's relationship and interaction half: both directions
+    /// of every follow naming the account, its own likes, marks and reactions,
+    /// and the notifications that name it, with the live peers' counters
+    /// stepped and nobody else's rows touched.
+    #[tokio::test]
+    async fn the_remote_handler_clears_relationships_and_interactions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let fixture = departed_mirror(&pool).await;
+        let Departed {
+            alice,
+            bob,
+            carol,
+            bobs_notification,
+            ..
+        } = &fixture;
+
+        run_remote(&app_state(&pool), alice.id)
+            .await
+            .expect("the remote delete job runs");
+
+        assert!(
+            !has_follow(&pool, bob, alice).await,
+            "bob's follow of the departed account is gone"
+        );
+        assert!(
+            !has_follow(&pool, alice, carol).await,
+            "and alice's follow of carol"
+        );
+        assert!(
+            has_follow(&pool, bob, carol).await,
+            "bob and carol keep their relationship"
+        );
+        assert_eq!(
+            fresh_user(&pool, bob.id).await.following_count,
+            1,
+            "bob counts the follow that is left, not the one that went"
+        );
+        assert_eq!(
+            fresh_user(&pool, carol.id).await.followers_count,
+            1,
+            "and carol counts her remaining follower"
+        );
+        let departed = fresh_user(&pool, alice.id).await;
+        assert_eq!(
+            (departed.followers_count, departed.following_count),
+            (0, 0),
+            "the departed mirror's own counters describe what is left of them"
+        );
+
+        assert_eq!(
+            count_where(&pool, "favourites", "user_id", alice.id).await,
+            0
+        );
+        assert_eq!(
+            count_where(&pool, "bookmarks", "user_id", alice.id).await,
+            0
+        );
+        assert_eq!(
+            count_where(&pool, "emoji_reactions", "user_id", alice.id).await,
+            0,
+            "its kept row would otherwise keep its likes, marks and reactions alive"
+        );
+        assert_eq!(
+            count_where(&pool, "emoji_reactions", "user_id", bob.id).await,
+            1,
+            "bob's reaction on alice's (tombstoned) status is bob's own row"
+        );
+        assert_eq!(
+            count_where(&pool, "notifications", "from_account_id", alice.id).await,
+            0,
+            "nobody is told about a departed account any more"
+        );
+        assert_eq!(
+            count_where(&pool, "notifications", "id", bobs_notification.id).await,
+            1,
+            "carol's notification about bob is nobody else's to clear"
+        );
+    }
+
+    /// The remote sweep is idempotent and keeps its hands off the local
+    /// sweep's writes: a rerun removes nothing further and purges no
+    /// personal data, because a mirror has none.
+    #[tokio::test]
+    async fn a_second_remote_pass_clears_nothing_and_purges_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = remote_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let bobs_post = post(&pool, &bob, "bob posts").await;
+        let _liked = likes(&pool, &alice, bobs_post.id).await;
+        let state = app_state(&pool);
+
+        run_remote(&state, alice.id)
+            .await
+            .expect("the first pass runs");
+        run_remote(&state, alice.id)
+            .await
+            .expect("the second pass runs");
+
+        assert_eq!(
+            count_where(&pool, "favourites", "user_id", alice.id).await,
+            0,
+            "the like went on the first pass and nothing more on the second"
+        );
+        assert_eq!(
+            fresh_user(&pool, alice.id).await.nickname,
+            "alice@peer.example",
+            "the row keeps its handle: the remote sweep has no purge step"
+        );
+    }
+
+    /// The remote job's unusable payload and vanished row discard, exactly
+    /// as the local job's do.
+    #[tokio::test]
+    async fn the_remote_handler_discards_unusable_args_and_a_gone_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+
+        let bad = handle_delete_remote(
+            state.clone(),
+            AttemptInfo {
+                attempts: 1,
+                max_attempts: 5,
+            },
+            json!({ "user": "not-an-id" }),
+        )
+        .await;
+        assert!(
+            matches!(&bad, Err(JobError::Discard(detail)) if detail.contains("unusable")),
+            "unusable arguments discard: {bad:?}"
+        );
+
+        let missing = run_remote(&state, Uuid::now_v7()).await;
+        assert!(
+            matches!(&missing, Err(JobError::Discard(detail)) if detail.contains("no longer exists")),
+            "a vanished account discards: {missing:?}"
+        );
+    }
+
+    /// A database that cannot answer retries the remote sweep too.
+    #[tokio::test]
+    async fn an_unreachable_database_retries_the_remote_sweep() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = remote_user(&pool, "alice").await;
+
+        let outcome = run_remote(&broken_state().await, alice.id).await;
+        assert!(
+            matches!(&outcome, Err(JobError::Retry(detail)) if detail.starts_with("account delete pass failed")),
+            "a closed pool retries: {outcome:?}"
+        );
+    }
+
+    /// The remote kind is wired into the worker's registry, and the handler
+    /// behind it is this module's remote sweep.
+    #[tokio::test]
+    async fn the_remote_kind_is_registered_to_this_handler() {
+        let registry = crate::job_registry();
+        let handler = registry
+            .get(KIND_DELETE_REMOTE)
+            .expect("the remote delete kind is registered");
+        assert_eq!(
+            KIND_DELETE_REMOTE, "users.delete_remote",
+            "the ticket's kind"
+        );
+
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = remote_user(&pool, "alice").await;
+        let _posted = remote_post(&pool, &alice, "one post").await;
+        handler(
+            app_state(&pool),
+            AttemptInfo {
+                attempts: 1,
+                max_attempts: 5,
+            },
+            job_args(alice.id),
+        )
+        .await
+        .expect("the registered handler runs");
+        assert_eq!(
+            live_statuses(&pool, alice.id).await,
+            0,
+            "and it is this module's remote sweep: the mirror's post is a tombstone"
+        );
     }
 }

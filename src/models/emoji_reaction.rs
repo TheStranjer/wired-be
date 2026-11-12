@@ -29,8 +29,10 @@
 //! reads the same wherever it is rendered.
 //!
 //! Deleting a user or a status takes its reactions through the foreign key's
-//! cascade. The [`EmojiReaction::ap_id`] awaits the federation ticket that
-//! sends the `EmojiReact` activity (decision 6); [`react`] mints a local one.
+//! cascade, and [`delete_all_for_user`] is the sweep for the accounts whose
+//! row survives deletion. The [`EmojiReaction::ap_id`] awaits the federation
+//! ticket that sends the `EmojiReact` activity (decision 6); [`react`] mints
+//! a local one.
 
 use std::collections::HashMap;
 
@@ -305,6 +307,34 @@ pub async fn unreact(
         .fetch_optional(pool)
         .await?;
     Ok(removed)
+}
+
+/// The `DELETE` behind [`delete_all_for_user`]: the account's own reactions.
+const DELETE_ALL_FOR_USER_SQL: &str = "DELETE FROM emoji_reactions WHERE user_id = $1";
+
+/// Removes every reaction made by user `user_id`: the reaction step of the
+/// [`users.delete_remote`](crate::jobs::deletion::KIND_DELETE_REMOTE) job.
+///
+/// That job keeps the account's row, so it cannot rely on the `user_id`
+/// foreign key's cascade the way a hard delete does.
+///
+/// Reactions *on* the account's statuses are other accounts' rows and stay:
+/// their targets are tombstones by the time this runs, and every read filters
+/// those out, exactly as [`crate::models::favourite::delete_all_for_user`]
+/// leaves the likes of a purged account's posts.
+///
+/// Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
 }
 
 /// The reaction roll-ups of every status in `status_ids`, keyed by status.
@@ -1090,6 +1120,43 @@ mod tests {
         assert!(
             !group.into_summary(None).me,
             "an anonymous viewer is never `me`"
+        );
+    }
+
+    /// The sweep of an account whose row is kept: its own reactions go,
+    /// another account's reaction on the same status stays, and an account
+    /// that never reacted removes nothing.
+    #[tokio::test]
+    async fn delete_all_for_user_takes_only_the_accounts_own_reactions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let status = post(&pool, &alice).await;
+        react_with(&pool, &alice, status, THUMBS, None).await;
+        react_with(&pool, &alice, status, HEART, None).await;
+        react_with(&pool, &bob, status, CAT, Some(CAT_URL)).await;
+
+        let removed = delete_all_for_user(&pool, alice.id)
+            .await
+            .expect("the sweep runs");
+
+        assert_eq!(removed, 2, "both of alice's reactions went");
+        let left = reactors(&pool, status, None)
+            .await
+            .expect("the reactors read");
+        assert_eq!(left.len(), 1, "only the custom emoji is left");
+        assert_eq!(
+            left[0].reactor_ids,
+            vec![bob.id],
+            "and it is bob's row on alice's status"
+        );
+        assert_eq!(
+            delete_all_for_user(&pool, alice.id)
+                .await
+                .expect("the rerun runs"),
+            0,
+            "and a second pass removes nothing"
         );
     }
 

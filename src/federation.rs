@@ -21,7 +21,10 @@
 //! [`dispatch`] is what the inbox routes do with it once authenticated —
 //! the `federator.incoming` job handler: normalization, containment, the
 //! dedupe ledger, the policy stage, and the registry of per-type activity
-//! handlers. [`mrf`] is that handler's policy pipeline: the filter chain
+//! handlers, whose code lives beside it in [`handlers`]: [`handlers::actor`]
+//! folds the inbound `Update` and `Delete` of a remote account, and the
+//! create/note tickets add their files to that module's registry as they
+//! arrive. [`mrf`] is that handler's policy pipeline: the filter chain
 //! of [`MrfPolicy`](mrf::MrfPolicy) policies configured by the `mrf`
 //! instance setting — today only its no-op stage, with the MRF policy
 //! tickets registering one name each.
@@ -48,6 +51,7 @@ pub mod collections;
 pub mod delivery;
 pub mod dispatch;
 pub mod fetch_actor;
+pub mod handlers;
 pub mod inbox_auth;
 pub mod json;
 pub mod mrf;

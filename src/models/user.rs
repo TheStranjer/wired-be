@@ -1246,6 +1246,36 @@ pub async fn mark_moved(pool: &PgPool, id: Uuid, target_ap_id: &str) -> AppResul
     Ok(())
 }
 
+/// The `UPDATE` behind [`set_moved_to`]: writes the move target and
+/// refreshes `updated_at`, and nothing else — the cooldown stamp
+/// [`mark_moved`] writes is deliberately out of this statement.
+const SET_MOVED_TO_SQL: &str =
+    "UPDATE users SET moved_to_ap_id = $2, updated_at = now() WHERE id = $1";
+
+/// Mirrors what a remote actor's document says about its move: stores
+/// `target_ap_id` as user `id`'s [`moved_to_ap_id`](User::moved_to_ap_id),
+/// or clears it again when the document no longer names a target.
+///
+/// This is the mirror writer, for the inbound `Update` of a remote account:
+/// unlike [`mark_moved`] it stamps no [`last_move_at`](User::last_move_at),
+/// because that column is the cooldown of a move *this* instance performed,
+/// and a mirror only records what its peer declared. Unknown ids match no
+/// row and change nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_moved_to(pool: &PgPool, id: Uuid, target_ap_id: Option<&str>) -> AppResult<()> {
+    sqlx::query(SET_MOVED_TO_SQL)
+        .bind(id)
+        .bind(target_ap_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
 /// The `UPDATE` behind [`set_settings_store`]: writes the whole client
 /// settings blob in one statement and refreshes `updated_at`.
 const SET_SETTINGS_STORE_SQL: &str =
@@ -2712,6 +2742,34 @@ mod tests {
             moved.last_move_at.is_some(),
             "the cooldown stamp is set to the move time"
         );
+    }
+
+    #[tokio::test]
+    async fn set_moved_to_mirrors_the_target_without_a_stamp() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        let target = "https://other.example/users/alice";
+        set_moved_to(&pool, alice.id, Some(target)).await.unwrap();
+        let moved = fetch(&pool, alice.id).await;
+        assert_eq!(
+            moved.moved_to_ap_id.as_deref(),
+            Some(target),
+            "the mirrored target is recorded"
+        );
+        assert!(
+            moved.last_move_at.is_none(),
+            "a mirror write is not a move this instance performed, so no cooldown stamp"
+        );
+
+        set_moved_to(&pool, alice.id, None).await.unwrap();
+        assert!(
+            fetch(&pool, alice.id).await.moved_to_ap_id.is_none(),
+            "None clears the target again"
+        );
+
+        // An unknown id matches no row and is not an error.
+        set_moved_to(&pool, new_id(), Some(target)).await.unwrap();
     }
 
     #[tokio::test]
