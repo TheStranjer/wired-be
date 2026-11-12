@@ -1,0 +1,24 @@
+{
+  "id": "https://remote.example/activities/create-PLEROMAFIX",
+  "type": "Create",
+  "actor": "https://remote.example/users/bob",
+  "to": ["https://remote.example/users/bob/followers"],
+  "cc": ["as:Public"],
+  "object": {
+    "@context": [
+      "https://www.w3.org/ns/activitystreams",
+      { "ostatus": "http://ostatus.org#", "conversation": "ostatus:conversation" }
+    ],
+    "id": "https://remote.example/objects/PLEROMAFIX",
+    "type": "Note",
+    "attributedTo": [{ "id": "https://remote.example/users/bob", "type": "Person" }],
+    "to": ["https://remote.example/users/bob/followers"],
+    "cc": ["as:Public"],
+    "contentMap": { "en": "<div><p>A Pleroma-flavoured note</p></div>" },
+    "published": "2024-05-02T09:00:00Z",
+    "url": [{ "type": "Link", "href": "https://remote.example/notice/PLEROMAFIX" }],
+    "context": null,
+    "ostatus:conversation": { "href": "https://remote.example/contexts/PLEROMAFIX" },
+    "tag": { "type": "Mention", "href": "https://remote.example/users/carol", "name": "@carol" }
+  }
+}

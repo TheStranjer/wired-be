@@ -201,6 +201,11 @@ pub struct Status {
     /// Thread group id: every status of one conversation shares it, and a
     /// root status's is its own id.
     pub conversation_id: Uuid,
+    /// The `ActivityPub` thread collection (`context` / `conversation` /
+    /// `ostatus:conversation`) a mirrored status names, `None` for a local
+    /// status and for a remote one whose document carried no context (see
+    /// [`crate::services::ingest`]).
+    pub ap_context: Option<String>,
     /// The `conversations` row this `direct` status posts into, `None` for
     /// every other visibility and for a direct status written outside the
     /// participation hook (see [`crate::models::conversation`]).
@@ -296,6 +301,12 @@ pub struct NewStatus {
     /// Thread group id; `None` lets [`insert`] take the parent's
     /// conversation, or the new id when there is no parent.
     pub conversation_id: Option<Uuid>,
+    /// The `ActivityPub` thread collection a remote status's document
+    /// names; [`insert`] stores it verbatim, and `None` — every local
+    /// status's answer — leaves the column empty (see
+    /// [`crate::services::ingest`] for the read that groups a context's
+    /// statuses under one `conversation_id`).
+    pub ap_context: Option<String>,
     /// The `conversations` row a `direct` post answers into: only
     /// `POST /api/v1/statuses`'s `in_reply_to_conversation_id` arm names
     /// one; every other direct status gets its thread row from
@@ -358,6 +369,7 @@ impl Default for NewStatus {
             in_reply_to_account_id: None,
             in_reply_to_ap_id: None,
             conversation_id: None,
+            ap_context: None,
             direct_conversation_id: None,
             reblog_of_id: None,
             quote_of_id: None,
@@ -412,10 +424,11 @@ const INSERT_SQL: &str = "INSERT INTO statuses (
      sensitive, visibility, language, in_reply_to_id,
      in_reply_to_account_id, in_reply_to_ap_id, conversation_id,
      direct_conversation_id, reblog_of_id, quote_of_id, local,
-     application_name, application_website, edited_at, expires_at, inserted_at
+     application_name, application_website, edited_at, expires_at,
+     ap_context, inserted_at
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-     $17, $18, $19, $20, $21, $22, $23, COALESCE($24, now())
+     $17, $18, $19, $20, $21, $22, $23, $24, COALESCE($25, now())
 ) RETURNING *";
 
 /// The conversation the status being replied to belongs to, read from the
@@ -554,6 +567,17 @@ const ANY_BY_ID_SQL: &str = "SELECT * FROM statuses WHERE id = $1";
 /// [`get_by_uri`]: one row by its `ActivityPub` id, tombstone or not —
 /// federation dedupes on this, and a deleted post's `uri` stays reserved.
 const BY_URI_SQL: &str = "SELECT * FROM statuses WHERE uri = $1";
+
+/// [`conversation_id_for_context`]: the conversation of the oldest live
+/// status stored under an `ap_context` — the `ORDER BY id LIMIT 1` pick the
+/// ingest reply arm inherits when the parent is not here yet. Tombstones
+/// keep their `ap_context` but answer no conversation, and the walk is
+/// served by `statuses_ap_context_idx` (see
+/// `migrations/1795800000_statuses_ap_context.sql`).
+const CONTEXT_CONVERSATION_SQL: &str = "SELECT conversation_id FROM statuses
+       WHERE ap_context = $1 AND deleted_at IS NULL
+    ORDER BY id
+        LIMIT 1";
 
 /// The `INSERT` behind [`create_reblog`]: a reblog row is decision 6's
 /// `Announce` wearing status clothing — no text of its own (the `content`,
@@ -797,6 +821,28 @@ pub async fn get_by_uri(pool: &PgPool, uri: &str) -> AppResult<Option<Status>> {
         .fetch_optional(pool)
         .await?;
     Ok(status)
+}
+
+/// The conversation of the oldest live status stored under `ap_context`.
+///
+/// This is the ingest reply arm's conversation inheritance when the parent
+/// itself is not here: `ORDER BY id LIMIT 1` makes the pick deterministic —
+/// the oldest status carrying the context, the one that minted the
+/// `conversation_id` every later status of the thread joined.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn conversation_id_for_context(
+    pool: &PgPool,
+    ap_context: &str,
+) -> AppResult<Option<Uuid>> {
+    let conversation = sqlx::query_as::<_, (Uuid,)>(CONTEXT_CONVERSATION_SQL)
+        .bind(ap_context)
+        .fetch_optional(pool)
+        .await?;
+    Ok(conversation.map(|row| row.0))
 }
 
 /// Fetches the live statuses whose ids are in `ids`, in `id` order (`UUIDv7`
@@ -1437,6 +1483,7 @@ async fn write_status(
         .bind(new_status.application_website.as_deref())
         .bind(new_status.edited_at)
         .bind(new_status.expires_at)
+        .bind(new_status.ap_context.as_deref())
         .bind(new_status.inserted_at)
         .fetch_one(conn)
         .await?;

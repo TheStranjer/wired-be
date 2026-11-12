@@ -164,6 +164,15 @@ const IS_FOLLOWING_SQL: &str = "SELECT EXISTS (
      WHERE follower_id = $1 AND followee_id = $2 AND state = 'accepted'
 )";
 
+/// [`has_local_followers`]: whether one of `followee_id`'s accepted
+/// followers is an account this instance owns — the existence check the
+/// ingest path's `ACCEPT_UNSOLICITED_PUBLIC` gate runs.
+const HAS_LOCAL_FOLLOWERS_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM follows f
+      JOIN users u ON u.id = f.follower_id
+     WHERE f.followee_id = $1 AND f.state = 'accepted' AND u.local
+)";
+
 /// The incoming side of [`followers_page`]: the users whose follow of the
 /// bound account was accepted, each entry led by the `follow_id` of the
 /// relationship row behind it — the id the page keys on. The text stops
@@ -813,6 +822,31 @@ pub async fn has_accepted_follow(
 ) -> AppResult<bool> {
     let row = sqlx::query_as::<_, (bool,)>(IS_FOLLOWING_SQL)
         .bind(follower_id)
+        .bind(target_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// Whether any local account has an accepted follow of `target_id`.
+///
+/// This is the one read the ingest path's `ACCEPT_UNSOLICITED_PUBLIC` gate
+/// asks when a remote post's audience is not settled by a mention or a
+/// replied-to local status (see [`crate::services::ingest`]).
+///
+/// A pending request does not count: the relationship is not open yet, so
+/// the follower has not asked to see this account's posts. The follower's
+/// own activation is not checked — deactivating an account does not delete
+/// its follows, and an operator who suspends a mirror's follower and wants
+/// the mirror's posts to stop arriving should block the domain, not
+/// deactivate one account.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn has_local_followers(pool: &PgPool, target_id: Uuid) -> AppResult<bool> {
+    let row = sqlx::query_as::<_, (bool,)>(HAS_LOCAL_FOLLOWERS_SQL)
         .bind(target_id)
         .fetch_one(pool)
         .await?;

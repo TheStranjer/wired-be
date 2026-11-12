@@ -1,0 +1,64 @@
+{
+  "id": "https://remote.example/activities/create-01MASTOFIX",
+  "type": "Create",
+  "actor": "https://remote.example/users/bob",
+  "to": ["https://www.w3.org/ns/activitystreams#Public"],
+  "cc": ["https://remote.example/users/bob/followers"],
+  "object": {
+    "@context": [
+      "https://www.w3.org/ns/activitystreams",
+      "https://w3id.org/security/v1",
+      {
+        "toot": "http://joinmastodon.org/ns#",
+        "Hashtag": "as:Hashtag",
+        "blurhash": "toot:blurhash",
+        "focalPoint": {"@container": "@list", "@id": "toot:focalPoint"}
+      }
+    ],
+    "id": "https://remote.example/users/bob/statuses/01MASTOFIX",
+    "type": "Note",
+    "attributedTo": "https://remote.example/users/bob",
+    "to": ["https://www.w3.org/ns/activitystreams#Public"],
+    "cc": ["https://remote.example/users/bob/followers"],
+    "content": "<p>Hello <span class=\"h-card\"><a href=\"https://remote.example/users/carol\" class=\"u-url mention\">@<span>carol</span></a></span> <a href=\"https://remote.example/tags/rust\" class=\"mention hashtag\" rel=\"tag\">#<span>rust</span></a> <a href=\"https://remote.example/emoji/ralph.png\" class=\"mention\"><img src=\"https://remote.example/emoji/ralph.png\" class=\"emoji\" alt=\":ralph:\" title=\":ralph:\"></a></p>",
+    "published": "2024-05-01T10:00:00.000Z",
+    "url": "https://remote.example/@bob/01MASTOFIX",
+    "context": "https://remote.example/contexts/01MASTOFIX",
+    "tag": [
+      {
+        "type": "Mention",
+        "href": "https://remote.example/users/carol",
+        "name": "@carol@remote.example"
+      },
+      { "type": "Hashtag", "href": "https://remote.example/tags/rust", "name": "#Rust" },
+      {
+        "type": "Emoji",
+        "name": ":ralph:",
+        "updated": "2015-01-01T00:00:00Z",
+        "icon": {
+          "type": "Image",
+          "mediaType": "image/png",
+          "url": "https://remote.example/emoji/ralph.png"
+        }
+      }
+    ],
+    "attachment": [
+      {
+        "type": "Document",
+        "mediaType": "image/png",
+        "url": "https://remote.example/media/fix-a.png",
+        "previewUrl": "https://remote.example/media/fix-a_small.png",
+        "name": "A chart",
+        "blurhash": "eEZjQaxtcPtOt1aeWCoLKlxZe1ayyZa}OHWC",
+        "width": 1280,
+        "height": 720
+      },
+      {
+        "type": "Document",
+        "mediaType": "video/mp4",
+        "url": "https://remote.example/media/fix-b.mp4",
+        "name": "A clip"
+      }
+    ]
+  }
+}

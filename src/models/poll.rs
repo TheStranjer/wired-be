@@ -65,27 +65,32 @@ use crate::{
 };
 
 /// The `INSERT` behind [`create`]: the minted id, the status named, and what
-/// [`PollParams`] holds, with `inserted_at` stamped by the database's `now()`
-/// (the column has no default) and the eight read columns brought back as
-/// stored — the two counters at their column defaults, since a fresh poll has
-/// no votes, and [`ended_notified`](Poll::ended_notified) at its default,
-/// since a fresh poll has not closed.
+/// [`PollParams`] holds — including the two counters, which a local create
+/// leaves at their zero defaults and the ingest path fills from the remote's
+/// reported numbers — with `inserted_at` stamped by the database's `now()`
+/// (the column has no default) and [`ended_notified`](Poll::ended_notified)
+/// at its default, since a fresh poll has not closed.
 const INSERT_POLL_SQL: &str = "INSERT INTO polls (
-     id, status_id, expires_at, multiple, hide_totals, inserted_at
+     id, status_id, expires_at, multiple, hide_totals,
+     voters_count, votes_count, inserted_at
 ) VALUES (
-     $1, $2, $3, $4, $5, now()
+     $1, $2, $3, $4, $5, $6, $7, now()
 ) RETURNING id, status_id, expires_at, multiple, hide_totals,
             voters_count, votes_count, ended_notified";
 
 /// The option rows behind [`create`]: one per title, in the order given, each
-/// with the id minted for it and a `position` counting from zero — `(ord - 1)`
-/// of [`WITH ORDINALITY`]. The whole list goes in one statement, so a poll's
-/// options appear all at once with it.
+/// with the id minted for it, a `position` counting from zero — `(ord - 1)`
+/// of [`WITH ORDINALITY`] — and its opening vote count. [`create`] hands the
+/// third array one count per option (all zeroes for a local create, the
+/// remote's per-option tallies for a mirrored poll), so the whole list still
+/// goes in one statement and a poll's options appear all at once with it.
 ///
 /// [`WITH ORDINALITY`]: https://www.postgresql.org/docs/current/functions-array.html
-const INSERT_OPTIONS_SQL: &str = "INSERT INTO poll_options (id, poll_id, position, title)
-     SELECT o.id, $1, (o.ord - 1)::integer, o.title
-       FROM unnest($2::uuid[], $3::text[]) WITH ORDINALITY AS o(id, title, ord)";
+const INSERT_OPTIONS_SQL: &str =
+    "INSERT INTO poll_options (id, poll_id, position, title, votes_count)
+     SELECT o.id, $1, (o.ord - 1)::integer, o.title, o.votes
+       FROM unnest($2::uuid[], $3::text[], $4::integer[])
+            WITH ORDINALITY AS o(id, title, votes, ord)";
 
 /// One row of `polls`: the poll a status carries, without its options or its
 /// voters.
@@ -137,8 +142,13 @@ pub struct PollOption {
 }
 
 /// What to create a poll from: every column of `polls` except the id
-/// [`create`] mints, the `status_id` it is handed and the counters the
-/// database starts at zero.
+/// [`create`] mints, the `status_id` it is handed and the timestamps the
+/// database stamps.
+///
+/// The counters default to zero — what a locally created poll starts with —
+/// and the ingest path (see [`crate::services::ingest`]) fills them from a
+/// remote `Question`'s reported numbers, because a mirrored poll has
+/// already been voted on somewhere and its counters arrive with it.
 #[derive(Clone, Debug, Default)]
 pub struct PollParams {
     /// The choices, in the order voters see them — [`create`] writes one
@@ -154,6 +164,16 @@ pub struct PollParams {
     /// Whether per-option counts stay hidden until the poll closes; `false`
     /// by default.
     pub hide_totals: bool,
+    /// Per-option vote counts, index-aligned with
+    /// [`options`](Self::options); positions past the end of this list
+    /// start at `0`, which is what every local create leaves it.
+    pub option_votes: Vec<i32>,
+    /// Distinct accounts that have voted; `0` for a fresh poll, the
+    /// remote's `votersCount` for a mirrored one.
+    pub voters_count: i32,
+    /// Votes cast in total; `0` for a fresh poll, the remote's reported
+    /// sum (or the option counts' total) for a mirrored one.
+    pub votes_count: i32,
 }
 
 /// Creates the poll `params` describes for status `status_id`, on `conn`, and
@@ -163,8 +183,11 @@ pub struct PollParams {
 /// options are written in the order given, at positions counting from zero, in
 /// one statement on `conn` — so a caller that inserts a status there gets
 /// status, poll and options in one transaction, and a rollback takes all three
-/// back. Both counters start at the column defaults (`0`), and `inserted_at` is
-/// the database's `now()`.
+/// back. The two counters and the per-option counts are `params`' values:
+/// [`PollParams::default`] leaves every one at zero, which is what a poll
+/// born from `POST /api/v1/statuses` starts with, and the ingest path hands
+/// over the numbers a remote `Question` reports beside its mirrored rows.
+/// `inserted_at` is the database's `now()`.
 ///
 /// # Errors
 ///
@@ -184,13 +207,22 @@ pub async fn create(
         .bind(params.expires_at)
         .bind(params.multiple)
         .bind(params.hide_totals)
+        .bind(params.voters_count)
+        .bind(params.votes_count)
         .fetch_one(&mut *conn)
         .await?;
     let ids: Vec<Uuid> = params.options.iter().map(|_| new_id()).collect();
+    let option_votes: Vec<i32> = params
+        .options
+        .iter()
+        .enumerate()
+        .map(|(index, _)| params.option_votes.get(index).copied().unwrap_or(0))
+        .collect();
     sqlx::query(INSERT_OPTIONS_SQL)
         .bind(poll.id)
         .bind(&ids)
         .bind(&params.options)
+        .bind(&option_votes)
         .execute(&mut *conn)
         .await
         .map(drop)?;
@@ -828,6 +860,7 @@ mod tests {
                 expires_at: Some(expires),
                 multiple: true,
                 hide_totals: true,
+                ..PollParams::default()
             },
         )
         .await;

@@ -48,8 +48,10 @@ use crate::{
 /// Object `type`s this parser accepts: the eight document kinds Mastodon,
 /// Pleroma and Misskey deliver as createable posts (Pleroma's transmogrifier
 /// object arm accepts these plus `Answer` and `ChatMessage`, which this
-/// instance's ticket folds in later).
-const OBJECT_TYPES: [&str; 8] = [
+/// instance's ticket folds in later). The same list is the key set of the
+/// dispatcher's `Create` sub-registry: exactly these types are what
+/// [`crate::federation::handlers::create`] registers for.
+pub(crate) const OBJECT_TYPES: [&str; 8] = [
     TYPE_NOTE,
     TYPE_QUESTION,
     TYPE_ARTICLE,

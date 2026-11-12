@@ -148,15 +148,22 @@ const INSERT_SQL: &str = "INSERT INTO media_attachments (
 /// The id is a fresh `UUIDv7` (decision 4); every other column comes from
 /// `new_attachment`. Both `user_id` and `status_id` have foreign keys, so an
 /// uploader that does not exist or a status that is not stored is rejected.
+/// The executor is the pool or the caller's open transaction: an ingest
+/// that writes a status and its media together hands this in on the same
+/// connection [`crate::models::status::insert_conn`] runs on, so a
+/// rollback takes the attachments down with the status.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn insert(
-    pool: &PgPool,
+pub async fn insert<'e, E>(
+    executor: E,
     new_attachment: &NewMediaAttachment,
-) -> AppResult<MediaAttachment> {
+) -> AppResult<MediaAttachment>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let attachment = sqlx::query_as::<_, MediaAttachment>(INSERT_SQL)
         .bind(new_id())
         .bind(new_attachment.user_id)
@@ -178,7 +185,7 @@ pub async fn insert(
         .bind(new_attachment.focus_y)
         .bind(new_attachment.file_size)
         .bind(new_attachment.sensitive_hint)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
     Ok(attachment)
 }

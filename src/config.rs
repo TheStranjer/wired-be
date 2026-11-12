@@ -260,6 +260,13 @@ pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
 /// while off the `ActivityPub` inbox routes answer 403 and outbound
 /// delivery queues nothing.
 pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
+/// Environment variable holding whether uninvited public remote posts are
+/// stored, as `ACCEPT_UNSOLICITED_PUBLIC`.
+///
+/// While off, public and unlisted statuses from authors no local account
+/// follows are dropped at ingestion, unless a local user is mentioned or
+/// the status replies to a local one.
+pub const ACCEPT_UNSOLICITED_PUBLIC_VAR: &str = "ACCEPT_UNSOLICITED_PUBLIC";
 /// Environment variable holding the comma-separated list of MRF policy
 /// names enabled without any `mrf` instance setting: the fallback of
 /// [`crate::federation::mrf`]'s configuration load.
@@ -577,6 +584,17 @@ pub const DEFAULT_AUTHORIZED_FETCH: bool = false;
 /// federates, the way Pleroma's `[:federator, :enabled]` default does;
 /// going quiet is an explicit operator decision.
 pub const DEFAULT_FEDERATION_ENABLED: bool = true;
+/// Unsolicited-public state used when `ACCEPT_UNSOLICITED_PUBLIC` is unset:
+/// public and unlisted remote statuses are stored even from authors nobody
+/// follows.
+///
+/// This is Mastodon's and Pleroma's behaviour — a remote public post
+/// arrives because *something* (a relay, a follower of a follower, a
+/// quote) delivered it, and refusing to store it hides content local users
+/// can legitimately reach through a thread. Turning it off is the explicit
+/// anti-spam decision, Pleroma's
+/// `[:instance, :limit]`-style gate spelled as one switch.
+pub const DEFAULT_ACCEPT_UNSOLICITED_PUBLIC: bool = true;
 /// Rate limiting used when `RATE_LIMITS_ENABLED` is unset: routes that
 /// mount a bucket throttle, like Pleroma's `RateLimiterPlug`.
 pub const DEFAULT_RATE_LIMITS_ENABLED: bool = true;
@@ -1216,6 +1234,15 @@ pub struct Config {
     /// and [`enqueue_delivery`](crate::federation::delivery::enqueue_delivery)
     /// queues nothing (see [`crate::federation::delivery`]).
     pub federation_enabled: Toggle,
+    /// Whether uninvited public remote posts are stored, from
+    /// `ACCEPT_UNSOLICITED_PUBLIC`.
+    ///
+    /// While off, [`crate::services::ingest`] drops a `public` or
+    /// `unlisted` status from an author no local account follows, unless a
+    /// local user is mentioned in it or it replies to a local status
+    /// (`private`, `direct` and the author's followers-addressed posts are
+    /// never gated — they were aimed at somebody here).
+    pub accept_unsolicited_public: Toggle,
     /// The MRF policy names from `MRF_POLICIES` (comma list): the fallback
     /// chain configuration of [`crate::federation::mrf`], used whenever
     /// the `mrf` instance setting carries no `policies` array of its own.
@@ -1241,17 +1268,13 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError`] if a required variable is missing or a value is invalid.
-    pub fn from_lookup<F>(lookup: F) -> Result<Self, ConfigError>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
+    pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, ConfigError> {
         let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
-        let (profile, limits, text) = profile_and_limits(&lookup)?;
+        let (profile, limits, text, auth, exposure, mail) = wording_and_mail(&lookup, &base_url)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(&lookup)?;
-        let (auth, exposure, mailer) = signup_and_mail(&lookup, domain_of(&base_url))?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -1307,12 +1330,12 @@ impl Config {
             job_queues,
             purge_deleted_statuses_days,
             streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
-            smtp_host: mailer.host,
-            smtp_port: mailer.port,
-            smtp_username: mailer.username,
-            smtp_password: mailer.password,
-            smtp_tls: mailer.tls,
-            mail_from: mailer.from,
+            smtp_host: mail.host,
+            smtp_port: mail.port,
+            smtp_username: mail.username,
+            smtp_password: mail.password,
+            smtp_tls: mail.tls,
+            mail_from: mail.from,
             secret_key_base: secret_key_base(&lookup),
             media_proxy: media_proxy_settings(&lookup)?,
             rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
@@ -1322,6 +1345,7 @@ impl Config {
             sign_fetches,
             authorized_fetch,
             federation_enabled: federation_enabled(&lookup)?,
+            accept_unsolicited_public: accept_unsolicited_public(&lookup)?,
             mrf_policies: mrf_policies(&lookup),
             rate_limit: rate_limit_settings(&lookup)?,
         })
@@ -1473,6 +1497,7 @@ impl Config {
             sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
+            accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
             mrf_policies: Vec::new(),
             rate_limit: RateLimitConfig {
                 enabled: Toggle::new(false),
@@ -2054,6 +2079,21 @@ where
     Ok(boolean(lookup, FEDERATION_ENABLED_VAR, DEFAULT_FEDERATION_ENABLED)?.into())
 }
 
+/// Reads `ACCEPT_UNSOLICITED_PUBLIC`, [`DEFAULT_ACCEPT_UNSOLICITED_PUBLIC`]
+/// when unset: the ingest gate on public and unlisted posts from authors
+/// nobody follows (see [`crate::services::ingest`]).
+fn accept_unsolicited_public<F>(lookup: &F) -> Result<Toggle, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(boolean(
+        lookup,
+        ACCEPT_UNSOLICITED_PUBLIC_VAR,
+        DEFAULT_ACCEPT_UNSOLICITED_PUBLIC,
+    )?
+    .into())
+}
+
 /// Reads `MRF_POLICIES`: the comma-separated list of MRF policy names
 /// enabled without a database setting, empty when unset or blank (see
 /// [`crate::federation::mrf`]).
@@ -2252,6 +2292,32 @@ where
 /// factored out because a three-value tuple of structs is a very complex
 /// type to spell inline.
 type Signup = (AuthSettings, ExposureSettings, MailerSettings);
+
+/// What [`wording_and_mail`] answers: [`Wording`] and [`Signup`] flattened
+/// into one six-value tuple, so [`Config::from_lookup`] binds all six
+/// groups with a single `let` and stays inside Clippy's line budget.
+type Groups = (
+    InstanceProfile,
+    ContentLimits,
+    TextLengthLimits,
+    AuthSettings,
+    ExposureSettings,
+    MailerSettings,
+);
+
+/// [`profile_and_limits`] and [`signup_and_mail`] in one call: the
+/// instance-wording trio followed by the signup, exposure and mailer
+/// trio, flattened. `base_url` is the instance origin, whose domain the
+/// mailer's `From:` default is derived from (the pair the two grouped
+/// readers used to take apart).
+fn wording_and_mail<F>(lookup: &F, base_url: &str) -> Result<Groups, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let (profile, limits, text) = profile_and_limits(lookup)?;
+    let (auth, exposure, mail) = signup_and_mail(lookup, domain_of(base_url))?;
+    Ok((profile, limits, text, auth, exposure, mail))
+}
 
 /// Reads the three groups behind who may get an account and how they are
 /// reached: the [`auth_settings`], the [`client_exposure`] the registration
@@ -2577,10 +2643,6 @@ fn comma_list(value: &str) -> Vec<String> {
 /// Redacts `database_url`, which usually contains a password.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Bound so the `secret_key_base` field renders on one line: the
-        // closure that hides the value keeps the call past rustfmt's call
-        // width when it sits in the chain.
-        let secret_base = self.secret_key_base.as_ref().map(|_| "<redacted>");
         // Bound for the same reason: these three field names and their
         // `self` paths together pass rustfmt's call width, and each would
         // otherwise split over three lines and push the function past
@@ -2594,11 +2656,9 @@ impl fmt::Debug for Config {
         // past Clippy's line budget.
         let purge_days = &self.purge_deleted_statuses_days;
         let ping_secs = &self.streaming_ping_interval_secs;
-        // Bound for the same reason: these two names with their `self`
-        // paths pass rustfmt's call width and would split over three
-        // lines each, pushing the function past Clippy's line budget.
         let max_remote_mention_lookups = &self.max_remote_mention_lookups;
         let max_scheduled_per_day = &self.max_scheduled_per_user_per_day;
+        let fed = (self.federation_enabled, self.accept_unsolicited_public);
         let mut debug = f.debug_struct("Config");
         let debug = debug
             .field("database_url", &"<redacted>")
@@ -2661,7 +2721,7 @@ impl fmt::Debug for Config {
             .field("smtp_password", &"<redacted>")
             .field("smtp_tls", &self.smtp_tls)
             .field("mail_from", &self.mail_from)
-            .field("secret_key_base", &secret_base)
+            .field("secret_key_base", &hide_secret(self))
             .field("media_proxy", &self.media_proxy)
             .field("rich_media_ignore_hosts", &self.rich_media_ignore_hosts)
             .field("rich_media_remote", &self.rich_media_remote)
@@ -2670,26 +2730,37 @@ impl fmt::Debug for Config {
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
             .field("rate_limit", &self.rate_limit);
-        // The federation pair — the toggle and the new policy-name list —
-        // closes the chain from a helper: with all 71 fields in this one
-        // function its body passes Clippy's line budget, and this is the
-        // documented split rather than a loosened lint. The fields stay
-        // named in `fmt`'s body, as the call's arguments.
-        debug_federation(debug, self.federation_enabled, &self.mrf_policies)
+        // The federation trio — the enabled toggle, the unsolicited-public
+        // toggle and the policy-name list — closes the chain from a
+        // helper: the documented split that holds `fmt` inside Clippy's
+        // line budget. The fields stay named in `fmt`'s body, as the
+        // binding's and the call's arguments.
+        debug_federation(debug, fed, self.mrf_policies.as_slice())
     }
 }
 
-/// Completes the [`Config`] `Debug` struct: the federation toggle and the
-/// enabled MRF policy names, then the whole document. Factored out of the
-/// [`Debug`] impl above to hold that function's line count inside
-/// Clippy's budget.
+/// The `secret_key_base` rendered for `Debug`: the marker string in place
+/// of the secret, `None` staying `None`. A function rather than the inline
+/// closure the impl used to bind: the closure's text pushed the chain's
+/// call past rustfmt's call width, splitting the field over lines the
+/// [`Debug`] impl's line budget could not spend.
+fn hide_secret(config: &Config) -> Option<&'static str> {
+    config.secret_key_base.as_ref().map(|_| "<redacted>")
+}
+
+/// Completes the [`Config`] `Debug` struct: the federation toggles — the
+/// enabled switch and the unsolicited-public gate — and the enabled MRF
+/// policy names, then the whole document. Factored out of the [`Debug`]
+/// impl above to hold that function's line count inside Clippy's budget.
 fn debug_federation(
     debug: &mut fmt::DebugStruct<'_, '_>,
-    federation_enabled: Toggle,
+    toggles: (Toggle, Toggle),
     mrf_policies: &[String],
 ) -> fmt::Result {
+    let (federation_enabled, accept_unsolicited_public) = toggles;
     debug
         .field("federation_enabled", &federation_enabled)
+        .field("accept_unsolicited_public", &accept_unsolicited_public)
         .field("mrf_policies", &mrf_policies)
         .finish()
 }
@@ -4108,6 +4179,46 @@ mod tests {
         assert!(
             debug.contains("federation_enabled: Toggle(false)"),
             "the federation toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn accept_unsolicited_public_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("TRUE", true),
+            (" 1 ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("", true),
+        ] {
+            let config = config_with(&[(ACCEPT_UNSOLICITED_PUBLIC_VAR, value)]);
+            assert_eq!(
+                config.accept_unsolicited_public.get(),
+                want,
+                "ACCEPT_UNSOLICITED_PUBLIC={value:?} means {want} (unset accepts)"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_accept_unsolicited_public_is_an_error() {
+        let err = try_config_with(&[(ACCEPT_UNSOLICITED_PUBLIC_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(ACCEPT_UNSOLICITED_PUBLIC_VAR),
+            "error variant"
+        );
+    }
+
+    #[test]
+    fn debug_shows_accept_unsolicited_public() {
+        let config = config_with(&[(ACCEPT_UNSOLICITED_PUBLIC_VAR, "false")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("accept_unsolicited_public: Toggle(false)"),
+            "the ingest gate toggle is visible in Debug output: {debug}"
         );
     }
 
