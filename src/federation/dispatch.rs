@@ -28,7 +28,11 @@
 //!    activities are dropped with a debug log;
 //! 5. dispatch through the [`Handlers`] registry, keyed by activity type;
 //!    unknown types are ignored, logged at debug. Later tickets add one
-//!    line each to [`Handlers::default`];
+//!    line each to [`Handlers::default`]. `Update` and `Delete` route one
+//!    level deeper, by the type of the *object* they carry, through their
+//!    own object-type tables; a `Delete` whose object no entry of that kind
+//!    claims falls back to the one route that can tell a bare id naming an
+//!    account from one naming a status;
 //! 6. `Undo` routes through its own table by the *inner* activity's type:
 //!    an embedded inner object says so itself, a bare id is looked up
 //!    among the stored remote activities ([`crate::models::activity`]),
@@ -82,6 +86,17 @@ const RECEIVED_MAX_AGE: TimeDelta = TimeDelta::days(14);
 /// dispatcher does not route by its own name but by the type of the
 /// activity it undoes.
 const UNDO_TYPE: &str = "Undo";
+
+/// The `ActivityStreams` type of editing activities: like `Undo`, routed
+/// one level deeper than its own name — by the type of the object it
+/// carries, through [`Handlers::update_by_object_type`].
+const UPDATE_TYPE: &str = "Update";
+
+/// The `ActivityStreams` type of deletion activities, the other
+/// object-type arm of [`route`], keyed through
+/// [`Handlers::delete_by_object_type`] with [`Handlers::delete_fallback`]
+/// behind it.
+const DELETE_TYPE: &str = "Delete";
 
 /// Activity types whose `object` is by design a reference to content that
 /// lives somewhere else — someone else's note, actor, or custom emoji —
@@ -245,23 +260,52 @@ type MrfFn = fn(AppState, &ActivityView) -> BoxFuture<'static, mrf::MrfDecision>
 
 /// The type-to-handler tables the dispatcher routes through.
 ///
-/// [`Handlers::default`] is the registry the live dispatcher runs; every
-/// ticket that teaches the instance a new activity type adds one line
-/// there, and nothing else. [`Handlers::new`] is the seam the tests build
-/// fake registries with.
-#[derive(Debug, Default)]
+/// [`Handlers::default`] is the registry the live dispatcher runs: the
+/// composition of every handler module in
+/// [`crate::federation::handlers`]. A ticket that teaches the instance a
+/// new activity type adds its routes to its own handler module, and nothing
+/// here. [`Handlers::new`] is the seam the tests build fake registries with.
+#[derive(Debug)]
 pub struct Handlers {
     /// Routes keyed by the activity's own type.
     by_type: HashMap<&'static str, HandlerFn>,
     /// `Undo` routes, keyed by the inner activity's type.
     undo_by_type: HashMap<&'static str, UndoFn>,
+    /// `Update` routes, keyed by the type of the *object* the activity
+    /// carries: updating a `Person` and updating a `Note` are different
+    /// code, and only the object's own type says which one a delivery
+    /// needs.
+    update_by_object_type: HashMap<&'static str, HandlerFn>,
+    /// `Delete` routes, keyed the same way, for the peers that send an
+    /// embedded document.
+    delete_by_object_type: HashMap<&'static str, HandlerFn>,
+    /// The `Delete` route for an object [`Handlers::delete_by_object_type`]
+    /// does not claim — a bare id, or an embedded document of a type nobody
+    /// registered. An id is the only thing that can tell a peer deleting
+    /// its own account from one deleting a status, so that is where this
+    /// resolution belongs.
+    delete_fallback: Option<HandlerFn>,
+}
+
+/// The live registry, built by the handler modules themselves.
+impl Default for Handlers {
+    fn default() -> Self {
+        crate::federation::handlers::registry()
+    }
 }
 
 impl Handlers {
-    /// An empty registry: dispatching through it ignores everything.
+    /// An empty registry: dispatching through it ignores everything. The
+    /// tests' seam; [`Handlers::default`] is the one the worker runs.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            by_type: HashMap::new(),
+            undo_by_type: HashMap::new(),
+            update_by_object_type: HashMap::new(),
+            delete_by_object_type: HashMap::new(),
+            delete_fallback: None,
+        }
     }
 
     /// Binds one activity type to its handler.
@@ -272,6 +316,24 @@ impl Handlers {
     /// Binds the `Undo` of one inner activity type to its handler.
     pub fn register_undo(&mut self, inner_type: &'static str, handler: UndoFn) {
         let _previous = self.undo_by_type.insert(inner_type, handler);
+    }
+
+    /// Binds one `Update`d object type to its handler, filling the
+    /// registry's `update_by_object_type` table.
+    pub fn register_update(&mut self, object_type: &'static str, handler: HandlerFn) {
+        let _previous = self.update_by_object_type.insert(object_type, handler);
+    }
+
+    /// Binds one `Delete`d object type to its handler, filling the
+    /// registry's `delete_by_object_type` table.
+    pub fn register_delete(&mut self, object_type: &'static str, handler: HandlerFn) {
+        let _previous = self.delete_by_object_type.insert(object_type, handler);
+    }
+
+    /// Sets the fallback the `Delete` route reaches when no entry of the
+    /// `delete_by_object_type` table claims the delivered object.
+    pub fn register_delete_fallback(&mut self, handler: HandlerFn) {
+        self.delete_fallback = Some(handler);
     }
 }
 
@@ -556,16 +618,29 @@ async fn policy_rejects(state: &AppState, view: &ActivityView) -> Result<bool, J
 }
 
 /// The registry dispatch: `Undo` routes by its inner activity's type,
-/// every other type by its own name; an unregistered type is ignored.
+/// `Update` and `Delete` by the type of the object they carry, and every
+/// other type by its own name; an unregistered type is ignored.
 async fn route(
     state: &AppState,
     view: ActivityView,
     signer: User,
     handlers: &Handlers,
 ) -> Result<(), JobError> {
-    if view.kind == UNDO_TYPE {
-        return route_undo(state, view, signer, handlers).await;
+    match view.kind.as_str() {
+        UNDO_TYPE => route_undo(state, view, signer, handlers).await,
+        UPDATE_TYPE => route_update(state, view, signer, handlers).await,
+        DELETE_TYPE => route_delete(state, view, signer, handlers).await,
+        _ => route_by_type(state, view, signer, handlers).await,
     }
+}
+
+/// The plain arm of the dispatch: the activity's own type, or nothing.
+async fn route_by_type(
+    state: &AppState,
+    view: ActivityView,
+    signer: User,
+    handlers: &Handlers,
+) -> Result<(), JobError> {
     match handlers.by_type.get(view.kind.as_str()) {
         None => {
             debug!(kind = %view.kind, "no handler for this activity type; ignoring");
@@ -573,6 +648,70 @@ async fn route(
         }
         Some(handler) => call_handler(*handler, state, view, signer).await,
     }
+}
+
+/// The `Update` arm: the embedded object's own type decides which code
+/// folds it, because an updated actor and an updated status have nothing in
+/// common beyond the activity around them. An object that is a bare
+/// reference declares no type and is ignored, and so is any type no ticket
+/// has registered a route for yet.
+async fn route_update(
+    state: &AppState,
+    view: ActivityView,
+    signer: User,
+    handlers: &Handlers,
+) -> Result<(), JobError> {
+    let declared = object_type(&view);
+    let handler = declared
+        .as_deref()
+        .and_then(|kind| handlers.update_by_object_type.get(kind))
+        .copied();
+    if let Some(handler) = handler {
+        call_handler(handler, state, view, signer).await
+    } else {
+        debug!(
+            object_type = declared.as_deref().unwrap_or("<reference>"),
+            "no Update handler for this object type; ignoring"
+        );
+        Ok(())
+    }
+}
+
+/// The `Delete` arm: an embedded document whose type a sub-registry entry
+/// claims goes to that entry; everything else — a bare id, a `Tombstone`, a
+/// type nobody registered — goes to [`Handlers::delete_fallback`], which
+/// resolves the id and decides whether it names an account. With no
+/// fallback registered the activity is ignored.
+async fn route_delete(
+    state: &AppState,
+    view: ActivityView,
+    signer: User,
+    handlers: &Handlers,
+) -> Result<(), JobError> {
+    let declared = object_type(&view);
+    let handler = declared
+        .as_deref()
+        .and_then(|kind| handlers.delete_by_object_type.get(kind))
+        .or(handlers.delete_fallback.as_ref())
+        .copied();
+    if let Some(handler) = handler {
+        call_handler(handler, state, view, signer).await
+    } else {
+        debug!(
+            object_type = declared.as_deref().unwrap_or("<reference>"),
+            "no Delete handler for this object; ignoring"
+        );
+        Ok(())
+    }
+}
+
+/// The `type` an activity's object declares, `None` when the object is a
+/// bare reference: the key both object-type sub-registries route on.
+fn object_type(view: &ActivityView) -> Option<String> {
+    view.object
+        .embedded()
+        .and_then(|object| object.get("type"))
+        .and_then(json::first_type)
 }
 
 /// The `Undo` arm: resolve what is being undone, refuse an `Undo` whose
@@ -865,6 +1004,42 @@ mod tests {
         })
     }
 
+    /// The `Update` fake for an actor object.
+    fn update_person_handler(
+        _state: AppState,
+        view: ActivityView,
+        _signer: User,
+    ) -> BoxFuture<'static, Result<Outcome, FederationError>> {
+        Box::pin(async move {
+            record("update-person", &view);
+            Ok(Outcome::Handled)
+        })
+    }
+
+    /// The `Delete` fake for an object type the sub-registry claims.
+    fn delete_tombstone_handler(
+        _state: AppState,
+        view: ActivityView,
+        _signer: User,
+    ) -> BoxFuture<'static, Result<Outcome, FederationError>> {
+        Box::pin(async move {
+            record("delete-tombstone", &view);
+            Ok(Outcome::Handled)
+        })
+    }
+
+    /// The `Delete` fake for the fallback: the route that resolves an id.
+    fn delete_fallback_handler(
+        _state: AppState,
+        view: ActivityView,
+        _signer: User,
+    ) -> BoxFuture<'static, Result<Outcome, FederationError>> {
+        Box::pin(async move {
+            record("delete-fallback", &view);
+            Ok(Outcome::Handled)
+        })
+    }
+
     /// The `Undo` fake for a stored `Follow`.
     fn undo_follow_handler(
         _state: AppState,
@@ -922,12 +1097,39 @@ mod tests {
         );
     }
 
+    /// The live registry holds the actor routes and nothing else: the
+    /// `Update` table is keyed by the five actor object types, `Delete` runs
+    /// through the fallback that resolves an object id, and both tables are
+    /// the entry points the note and status tickets add their own keys to.
     #[test]
-    fn the_live_registry_starts_empty_for_later_tickets_to_fill() {
+    fn the_live_registry_holds_the_actor_routes() {
         let handlers = Handlers::default();
         assert!(
             handlers.by_type.is_empty() && handlers.undo_by_type.is_empty(),
-            "Handlers::default is the one line per type the later tickets append to"
+            "no activity type is routed by its own name yet, and no Undo either"
+        );
+        for object_type in ["Person", "Service", "Group", "Organization", "Application"] {
+            assert!(
+                handlers.update_by_object_type.contains_key(object_type),
+                "an Update of a {object_type} folds through the actor handler"
+            );
+        }
+        assert_eq!(
+            handlers.update_by_object_type.len(),
+            5,
+            "actor objects only: the note-edit ticket adds `Note` beside them"
+        );
+        assert!(
+            !handlers.update_by_object_type.contains_key("Note"),
+            "and has not"
+        );
+        assert!(
+            handlers.delete_by_object_type.is_empty(),
+            "no object type claims a Delete yet — the status-delete ticket registers its entry point there"
+        );
+        assert!(
+            handlers.delete_fallback.is_some(),
+            "the Delete fallback is registered: it is what tells a peer deleting itself from one deleting a post"
         );
     }
 
@@ -1318,6 +1520,215 @@ mod tests {
         );
     }
 
+    /// Delivers `activity` authenticated by `who` through `handlers`, the
+    /// way the `federator.incoming` job does, and answers the job's outcome.
+    async fn deliver(
+        state: &AppState,
+        who: &User,
+        activity: &Value,
+        handlers: &Handlers,
+    ) -> Result<(), JobError> {
+        dispatch_activity(
+            state,
+            incoming_args(activity, who),
+            handlers,
+            mrf::filter_incoming_boxed,
+        )
+        .await
+    }
+
+    /// The `Update` arm of the dispatch: the type of the embedded object
+    /// decides the route, and the activity's own type table is never
+    /// consulted for it.
+    #[tokio::test]
+    async fn an_update_routes_by_its_objects_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let mut handlers = Handlers::new();
+        handlers.register("Update", ok_handler);
+        handlers.register_update("Person", update_person_handler);
+        let activity = json!({
+            "id": "https://peer.example/activities/update-person",
+            "type": "Update",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/users/alice",
+                "type": "Person",
+                "name": "Alice again",
+            },
+        });
+
+        let folded = deliver(&app_state(&pool), &alice, &activity, &handlers).await;
+
+        assert_eq!(folded, Ok(()), "the actor update completes");
+        assert_eq!(
+            seen(
+                "update-person",
+                "https://peer.example/activities/update-person"
+            ),
+            1,
+            "the object's own type decided the route"
+        );
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/update-person"),
+            0,
+            "the activity type table was not consulted for an Update"
+        );
+    }
+
+    /// An `Update` of an object type no ticket has registered a route for —
+    /// or of an object that is only a reference and so declares no type —
+    /// reaches nobody and completes the job.
+    #[tokio::test]
+    async fn an_update_of_an_unclaimed_object_is_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let handlers = Handlers::new();
+        let note_update = json!({
+            "id": "https://peer.example/activities/update-note",
+            "type": "Update",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/posts/1",
+                "type": "Note",
+                "content": "edited, but nobody here folds notes yet",
+            },
+        });
+        let bare_update = json!({
+            "id": "https://peer.example/activities/update-bare",
+            "type": "Update",
+            "actor": "https://peer.example/users/alice",
+            "object": "https://peer.example/users/alice",
+        });
+        let state = app_state(&pool);
+
+        let unfolded = deliver(&state, &alice, &note_update, &handlers).await;
+        let unreferenced = deliver(&state, &alice, &bare_update, &handlers).await;
+
+        assert_eq!(
+            unfolded,
+            Ok(()),
+            "an unregistered object type completes as an ignore"
+        );
+        assert_eq!(
+            unreferenced,
+            Ok(()),
+            "and so does an object that declares no type"
+        );
+        assert_eq!(
+            seen(
+                "update-person",
+                "https://peer.example/activities/update-note"
+            ) + seen("ok", "https://peer.example/activities/update-note")
+                + seen(
+                    "update-person",
+                    "https://peer.example/activities/update-bare"
+                )
+                + seen("ok", "https://peer.example/activities/update-bare"),
+            0,
+            "neither delivery reached a handler"
+        );
+    }
+
+    /// The `Delete` arm: an embedded document whose type the sub-registry
+    /// claims goes to that claimant; one it does not claim — an unclaimed
+    /// type or a bare id — falls to the route that resolves the id.
+    #[tokio::test]
+    async fn a_delete_routes_by_its_objects_type_or_through_the_fallback() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let mut handlers = Handlers::new();
+        handlers.register_delete("Tombstone", delete_tombstone_handler);
+        handlers.register_delete_fallback(delete_fallback_handler);
+        let claimed_type = json!({
+            "id": "https://peer.example/activities/delete-tombstone",
+            "type": "Delete",
+            "actor": "https://peer.example/users/alice",
+            "object": {"type": "Tombstone", "id": "https://peer.example/posts/1"},
+        });
+        let unclaimed_type = json!({
+            "id": "https://peer.example/activities/delete-article",
+            "type": "Delete",
+            "actor": "https://peer.example/users/alice",
+            "object": {"type": "Article", "id": "https://peer.example/articles/1"},
+        });
+        let bare = json!({
+            "id": "https://peer.example/activities/delete-bare",
+            "type": "Delete",
+            "actor": "https://peer.example/users/alice",
+            "object": "https://peer.example/users/alice",
+        });
+        let state = app_state(&pool);
+
+        let claimed = deliver(&state, &alice, &claimed_type, &handlers).await;
+        let other = deliver(&state, &alice, &unclaimed_type, &handlers).await;
+        let resolved = deliver(&state, &alice, &bare, &handlers).await;
+
+        assert_eq!(claimed, Ok(()), "the claimed type's route ran");
+        assert_eq!(other, Ok(()), "an unclaimed type still falls back");
+        assert_eq!(resolved, Ok(()), "and so does a bare id");
+        assert_eq!(
+            seen(
+                "delete-tombstone",
+                "https://peer.example/activities/delete-tombstone"
+            ),
+            1,
+            "the embedded document went to its type's entry"
+        );
+        assert_eq!(
+            seen(
+                "delete-fallback",
+                "https://peer.example/activities/delete-bare"
+            ) + seen(
+                "delete-fallback",
+                "https://peer.example/activities/delete-article"
+            ),
+            2,
+            "the id and the unclaimed type both reached the fallback"
+        );
+        assert_eq!(
+            seen(
+                "delete-tombstone",
+                "https://peer.example/activities/delete-bare"
+            ) + seen(
+                "delete-tombstone",
+                "https://peer.example/activities/delete-article"
+            ),
+            0,
+            "and neither reached the wrong entry"
+        );
+    }
+
+    /// A `Delete` arriving at a registry with no route for it — neither a
+    /// type claim nor a fallback — is ignored, not failed.
+    #[tokio::test]
+    async fn a_delete_without_any_route_is_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let activity = json!({
+            "id": "https://peer.example/activities/delete-no-routes",
+            "type": "Delete",
+            "actor": "https://peer.example/users/alice",
+            "object": "https://peer.example/users/alice",
+        });
+
+        let outcome = deliver(&app_state(&pool), &alice, &activity, &Handlers::new()).await;
+
+        assert_eq!(outcome, Ok(()), "an unroutable Delete completes the job");
+        assert_eq!(
+            seen(
+                "delete-fallback",
+                "https://peer.example/activities/delete-no-routes"
+            ),
+            0,
+            "and reached no handler"
+        );
+    }
+
     /// The MRF reject path: a rejected activity is dropped, with the
     /// handler never reached.
     #[tokio::test]
@@ -1689,9 +2100,9 @@ mod tests {
     }
 
     /// The registered job handler drives the same pipeline
-    /// [`handle_incoming`] does: over the live (still empty) registry a
-    /// real `Follow` runs containment, claims its ledger row, and
-    /// completes as an unknown-type ignore.
+    /// [`handle_incoming`] does: over the live registry a real `Follow` — a
+    /// type no handler module has claimed — runs containment, claims its
+    /// ledger row, and completes as an unknown-type ignore.
     #[tokio::test]
     async fn the_job_handler_drives_the_pipeline() {
         let db = crate::test_db::test_db().await.expect("test database slot");
