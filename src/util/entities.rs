@@ -57,6 +57,23 @@ const ANCHOR_CLOSE: &str = "</a>";
 /// rather than a panic, which the lint gate forbids outside tests).
 static MENTION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(MENTION_PATTERN).ok());
 
+/// The mention pattern of [`linkify_entities`]: [`MENTION_PATTERN`] with one
+/// extra lead — the `>` that closes an HTML tag. The linkifier runs on
+/// rendered HTML, where a mention that opens the post sits right behind the
+/// `<p>` even though [`extract_mentions`], reading the same words as plain
+/// text, finds it at the start of the text; a literal `>` can never forge
+/// that lead, because [`escape_html`](crate::util::sanitize::escape_html)
+/// turns every `>` the source holds into `&gt;` before the HTML renders. So
+/// a `>` at a match's start is always a tag's close, granting it keeps the
+/// renderer's matches the extractor's: a leading mention is linked exactly
+/// when it is stored.
+const MENTION_LINK_PATTERN: &str = r"(?<lead>^|[\s(\[{>])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9]))?";
+
+/// The compiled [`MENTION_LINK_PATTERN`], with the same `None` fallback as
+/// [`MENTION_RE`].
+static MENTION_LINK_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(MENTION_LINK_PATTERN).ok());
+
 /// The compiled [`HASHTAG_PATTERN`], with the same `None` fallback as
 /// [`MENTION_RE`].
 static HASHTAG_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(HASHTAG_PATTERN).ok());
@@ -191,7 +208,10 @@ pub fn hashtag_html(base_url: &str, tag: &str) -> String {
 /// with [`mention_html`] naming its local part; unknown mentions stay as
 /// they were written. The match rules are those of [`extract_mentions`] and
 /// [`extract_hashtags`]: in-URL mentions and digits-only tags are left
-/// alone, and the character that led a match stays in the text.
+/// alone, and the character that led a match stays in the text. One mention
+/// rule is the linkifier's own: on HTML input a tag's close leads a match
+/// the way start-of-text leads it on plain input, so the mention that opens
+/// a post links after its `<p>` too.
 #[must_use]
 pub fn linkify_entities(
     html_or_text: &str,
@@ -245,9 +265,12 @@ fn replace_hashtags(text: &str, base_url: &str) -> String {
 }
 
 /// Rewrites every mention match the callback resolves; unknown mentions and
-/// in-URL candidates stay as written.
+/// in-URL candidates stay as written. The lead set is
+/// [`MENTION_LINK_PATTERN`]'s — [`MENTION_PATTERN`]'s plus a tag's close —
+/// so the mention that opens the rendered text links just as the mention the
+/// extractor found at the head of the source does.
 fn replace_mentions(text: &str, mentions: MentionResolver<'_>) -> String {
-    let Some(re) = MENTION_RE.as_ref() else {
+    let Some(re) = MENTION_LINK_RE.as_ref() else {
         return text.to_owned();
     };
     re.replace_all(text, |caps: &Captures<'_>| {
@@ -615,6 +638,30 @@ mod tests {
                 hashtag_html("https://example.com", "rust")
             ),
             "the known mention becomes its h-card, the unknown stays text, the tag links lowercased"
+        );
+    }
+
+    #[test]
+    fn linkify_links_a_leading_mention_behind_the_opening_tag() {
+        let resolver = &|m: &MentionRef| {
+            m.domain.is_none().then(|| {
+                let nick = &m.nickname;
+                format!("https://example.com/users/{nick}")
+            })
+        };
+        assert_eq!(
+            linkify_entities("<p>@bob, a word</p>", resolver, "https://example.com"),
+            format!(
+                "<p>{}, a word</p>",
+                mention_html("https://example.com/users/bob", "bob")
+            ),
+            "the mention that opens the post links behind its <p>, the way \
+             extract_mentions already counts it at the head of the text"
+        );
+        assert_eq!(
+            linkify_entities("<p>a&gt;@bob</p>", resolver, "https://example.com"),
+            "<p>a&gt;@bob</p>",
+            "an escaped greater-than is no tag close and never leads a mention"
         );
     }
 
