@@ -73,7 +73,8 @@
 //! original's `quotes_count` stepped by exactly one when a real create
 //! commits (a preview writes neither row nor counter, and a replayed
 //! idempotency key never counts twice). The created answer's nested
-//! `quote` stays `null` until the render ticket fills it.
+//! `quote` is the shared renderer's: the poster may see the original
+//! (the gate above just checked it), so the render nests it.
 //!
 //! [`ApiBody`]: crate::extract::ApiBody
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
@@ -327,8 +328,9 @@ pub struct CreateStatusParams {
     /// [`quote_of_id`](crate::models::status::Status::quote_of_id), and a
     /// real create steps the original's `quotes_count` by exactly one — a
     /// preview writes nothing and a replayed idempotency key never counts
-    /// twice. The created entity's nested `quote` renders `null` until the
-    /// quoting ticket renders it. Absent, null or empty quotes nothing,
+    /// twice. The created entity's nested `quote` renders the original
+    /// itself, one level deep, through the shared render batch's quoting
+    /// arm. Absent, null or empty quotes nothing,
     /// the same "nothing named" spelling as [`in_reply_to_id`](Self::in_reply_to_id).
     #[serde(default)]
     pub quote_id: Option<String>,
@@ -1202,6 +1204,7 @@ pub async fn preview_status(
             direct_participation: None,
             reblog: None,
             poll: None,
+            quote: None,
         },
         Some(user),
         None,
@@ -5270,9 +5273,10 @@ mod tests {
     }
 
     /// Quoting a public post stores the link on the new row, steps the
-    /// original's `quotes_count` by exactly one, and leaves the created
-    /// answer's nested `quote` null — the render is the quoting entity
-    /// ticket's, not this one's.
+    /// original's `quotes_count` by exactly one, and answers the created
+    /// entity with the quoted original nested in `quote` — the render
+    /// arm the quoting ticket filled, seen through the poster's own
+    /// gate (they just passed it, so the nest is there).
     #[tokio::test]
     async fn a_quote_links_its_original_and_counts_it_once() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -5299,9 +5303,23 @@ mod tests {
 
         let value = serde_json::to_value(&entity).expect("the entity serializes");
         assert_eq!(
-            value["quote"],
+            value["quote"]["id"],
+            original_id.to_string(),
+            "the render arm nests the quoted original for the poster"
+        );
+        assert_eq!(
+            value["quote"]["content"],
+            json!(original.content),
+            "as the full entity the batch renders, not a stub"
+        );
+        assert_eq!(
+            value["quote"]["account"]["acct"], "bob",
+            "with the original's own author"
+        );
+        assert_eq!(
+            value["quote"]["quote"],
             Value::Null,
-            "the nested quote stays null in this slice"
+            "one nested level: the original quotes nothing"
         );
     }
 

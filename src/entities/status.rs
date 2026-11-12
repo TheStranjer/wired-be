@@ -24,9 +24,14 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `emojis` (custom emojis);
-//! and `quote` (the quoting ticket, whose original rows the service
-//! already batch-loads).
+//! `emojis` (custom emojis).
+//! `quote` is filled by the quoting ticket: the quoted original the
+//! service already batch-loads renders as one nested entity through the
+//! very per-row path the page itself uses, and
+//! [`can_view`](crate::models::status_visibility::can_view) decides it
+//! per viewer — an original that is gone (deleted or never stored) or
+//! fails that check leaves the key JSON `null`, an answer no different
+//! from a row that quotes nothing.
 //! `pleroma.direct_conversation_id` is filled by the
 //! conversation-participations ticket, from
 //! [`participation_ids`](crate::models::conversation::participation_ids)
@@ -135,8 +140,8 @@ pub struct StatusApplication {
 /// keys of `StatusView.render("show.json", …)`.
 ///
 /// `quote_id`, `quote_url` and `quote_visible` are not part of this
-/// shape (ticket decision); `quote` lives at the entity's top level until
-/// the quoting ticket renders it.
+/// shape (ticket decision); the rendered quote lives at the entity's top
+/// level as [`Status::quote`].
 #[derive(Clone, Debug, Serialize)]
 pub struct PleromaMetadata {
     /// `content`: the post as its author wrote it — see the renderer's
@@ -219,8 +224,9 @@ pub struct PleromaMetadata {
 ///
 /// [`Status::from_source`] consumes it. Later tickets add one field (and
 /// the service's one loader feeding it) per rendered extension: the
-/// viewer's flags for this row, its card, its emojis, its rendered quote.
-/// The polls ticket added [`poll`](Self::poll); the render batch fills it.
+/// viewer's flags for this row, its card, its emojis.
+/// The polls ticket added [`poll`](Self::poll) and the quoting ticket
+/// added [`quote`](Self::quote); the render batch fills both.
 #[derive(Debug)]
 pub struct StatusSource<'a> {
     /// The `statuses` row being rendered.
@@ -326,6 +332,17 @@ pub struct StatusSource<'a> {
     /// `None` for a row the batch found no poll on, and for a preview that
     /// has stored nothing. Feeds the entity's [`poll`](Status::poll) key.
     pub poll: Option<Poll>,
+    /// The row's quoted original, already rendered by
+    /// [`crate::services::render_status`] as one nested [`Status`]
+    /// entity from the row its batch already loaded — the very per-row
+    /// path the page itself uses, and no query of its own.
+    /// [`can_view`](crate::models::status_visibility::can_view) gates
+    /// it: `None` — the entity's `quote: null` — for a row that quotes
+    /// nothing, a quoted original that is gone (deleted or never
+    /// stored), and one the viewer may not see (its rule 2, the
+    /// original's author having blocked them, included). Feeds the
+    /// entity's [`quote`](Status::quote) key.
+    pub quote: Option<Value>,
 }
 
 /// The Mastodon `Status` entity (core fields plus the `pleroma` block).
@@ -435,9 +452,15 @@ pub struct Status {
     /// viewer, for a post they have not pinned, and — since a pin is
     /// always the author's own act — for anybody else's post.
     pub pinned: JsonBool,
-    /// The quoted status as a nested entity; `null` until the quoting
-    /// ticket renders it — from the originals the service already
-    /// batch-loads. (`quote_id` is not emitted at all.)
+    /// The quoted original as one nested entity, rendered by
+    /// [`crate::services::render_status`] from the row it already
+    /// batch-loads; `null` when the row quotes nothing, when the quoted
+    /// original is gone (deleted or never stored), and when
+    /// [`can_view`](crate::models::status_visibility::can_view) refuses
+    /// it to this viewer — rule 2, its author having blocked them,
+    /// included. Every `null` is the answer of a row that quotes
+    /// nothing: no id, no text, no count of its own. (`quote_id` is not
+    /// emitted at all.)
     pub quote: Option<Value>,
     /// Pleroma's extension block (see [`PleromaMetadata`]).
     pub pleroma: PleromaMetadata,
@@ -479,6 +502,7 @@ impl Status {
             direct_participation,
             reblog,
             poll,
+            quote,
         } = source;
         Self {
             id: row.id.to_string(),
@@ -516,7 +540,7 @@ impl Status {
             muted: muted.clone(),
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
-            quote: None,
+            quote,
             pleroma: pleroma_block(
                 row,
                 reply_author,
@@ -877,6 +901,13 @@ mod tests {
         /// field carries (what the polls batch's three reads would hand the
         /// renderer, already built).
         poll: Option<Poll>,
+        /// The row's rendered quote entity, in the same [`Option<Value>`]
+        /// the source field carries (what the quoting batch's already
+        /// loaded original, gated by [`can_view`], would hand the
+        /// renderer, already built).
+        ///
+        /// [`can_view`]: crate::models::status_visibility::can_view
+        quote: Option<Value>,
     }
 
     impl<'a> Parts<'a> {
@@ -897,6 +928,7 @@ mod tests {
                 pinned_at: None,
                 muted: JsonBool(false),
                 poll: None,
+                quote: None,
             }
         }
 
@@ -1031,6 +1063,16 @@ mod tests {
                 ..self
             }
         }
+
+        /// Sets [`quote`](Self::quote): the nested quote entity the
+        /// quoting ticket's batch-loaded original, admitted by its
+        /// viewer gate, would hand the renderer already serialized.
+        fn with_quote(self, quote: Value) -> Self {
+            Self {
+                quote: Some(quote),
+                ..self
+            }
+        }
     }
 
     /// `row` rendered as an anonymous viewer sees it, with `reblog`
@@ -1055,6 +1097,7 @@ mod tests {
             direct_participation: None,
             reblog: reblog.map(Box::new),
             poll: parts.poll.clone(),
+            quote: parts.quote.clone(),
         };
         serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
     }
@@ -1082,6 +1125,7 @@ mod tests {
                 direct_participation: None,
                 reblog: None,
                 poll: None,
+                quote: None,
             },
             None,
             None,
@@ -1199,7 +1243,11 @@ mod tests {
             value["bookmarked"], false,
             "a page whose bookmarks read found nothing renders the flag false"
         );
-        assert_eq!(value["quote"], Value::Null, "quotes are a later ticket");
+        assert_eq!(
+            value["quote"],
+            Value::Null,
+            "a row that quotes nothing renders quote: null"
+        );
     }
 
     #[test]
@@ -1378,6 +1426,27 @@ mod tests {
             EXPECTED_KEYS,
             "and the entity's key set is unchanged by filling the slot"
         );
+    }
+
+    #[test]
+    fn a_rendered_quote_lands_in_the_entity_verbatim() {
+        let alice = base_user("alice");
+        let row = base_row();
+        let nested = render_nested(&row, &alice);
+        let quote = serde_json::to_value(&nested).unwrap();
+        let value = render(&row, &Parts::of(&alice).with_quote(quote.clone()), None);
+        assert_eq!(
+            value["quote"], quote,
+            "the nested entity the quoting batch renders reaches the wire \
+             whole, key for key"
+        );
+        assert_eq!(
+            json_keys(&value),
+            EXPECTED_KEYS,
+            "and the entity's key set is unchanged by filling the slot — \
+             quote_id, quote_url and quote_visible stay out"
+        );
+        assert_eq!(json_keys(&value["pleroma"]), PLEROMA_KEYS);
     }
 
     #[test]

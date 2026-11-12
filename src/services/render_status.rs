@@ -15,7 +15,10 @@
 //! eighteen statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
-//! 2. quoted originals — one [`status::get_many`];
+//! 2. quoted originals — one [`status::get_many`]; each one
+//!    [`can_view`](crate::models::status_visibility::can_view) admits to
+//!    this viewer renders as the row's nested `quote`, and every other
+//!    says no more about the original than a row quoting nothing does;
 //! 3. authors and replied-to authors — one [`user::get_many`];
 //! 4. media attachments — one [`media_attachment::for_statuses`];
 //! 5. mentions — one [`mention::for_statuses`];
@@ -63,9 +66,9 @@
 //!     because a card is a fact about the post's link, not about who is
 //!     looking;
 //! 16. the page's polls — one [`poll::for_statuses`] read keyed by every
-//!     rendered id (reblogged originals included, so a reblog nests its
-//!     original's poll); a row the read does not answer renders `poll:
-//!     null`;
+//!     rendered id (reblogged and quoted originals included, so a reblog
+//!     nests its original's poll and a quote nests its original's one);
+//!     a row the read does not answer renders `poll: null`;
 //! 17. the options of those polls — one [`poll::options_for_statuses`]
 //!     read over the same ids, each entry in position order;
 //! 18. the viewer's marks on the page's polls — one
@@ -73,11 +76,20 @@
 //!     authenticated viewer; it answers every poll entity's `voted` flag
 //!     and `own_votes` array.
 //!
+//! Every loader keys to the *rendered ids*: the page's rows, the
+//! reblogged originals and the quoted originals — every row a nested
+//! render reaches, so a nested entity is a lookup too, never a fetch of
+//! its own. [`can_view`]'s per-quote gate is the same check every
+//! endpoint runs through the visibility module, not one of these
+//! loaders; the quoted original itself is never read twice.
+//!
 //! Loaders whose id list came out empty skip the database entirely, so a
 //! page of plain posts costs eight queries (the cards read rides with the
 //! rendered ids, and the two poll reads answer empty for it), and a viewer
 //! adds the favourite, reblog, bookmark, pin, thread-mute, participation
 //! and poll-vote reads and the relationship set.
+//!
+//! [`can_view`]: crate::models::status_visibility::can_view
 //!
 //! # Extension points
 //!
@@ -118,9 +130,13 @@
 //!   [`MAX_SUMMARY_REACTORS`](crate::models::emoji_reaction::MAX_SUMMARY_REACTORS)
 //!   reactor ids per emoji. Reactions a viewer must not see are the
 //!   reactions endpoint's filter, not this renderer's.
-//! - `quote`: the quoted originals are *already* batch-loaded here
-//!   (step 2 above); the quoting ticket renders them into the entity —
-//!   one nested render, no new query — and decides its visibility.
+//! - `quote`: *filled by the quoting ticket* (step 2 above); the already
+//!   batch-loaded original is rendered by the very per-row path the page
+//!   itself uses — one nested entity, no new query — and
+//!   [`can_view`](crate::models::status_visibility::can_view) decides it:
+//!   an original that is gone (deleted or never stored) or fails that
+//!   check for this viewer leaves the entity's `quote` JSON `null`, an
+//!   answer that says no more about it than a row quoting nothing does.
 //!
 //! [`models::status`]: crate::models::status
 //! [`Status`]: crate::entities::status::Status
@@ -132,6 +148,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
@@ -144,7 +161,7 @@ use crate::{
         relationship::{Relationship, RelationshipMap},
         status::{Status, StatusSource},
     },
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{
         bookmark, conversation, conversation_mute,
         emoji_reaction::{self, ReactionSummary},
@@ -155,6 +172,7 @@ use crate::{
         mention, pinned_status,
         poll::{self, Poll as PollRow, PollOption as PollOptionRow},
         status::{self, Status as StatusRow},
+        status_visibility,
         user::{self, User},
     },
     state::AppState,
@@ -175,6 +193,12 @@ use crate::{
 ///   of a gone post is invisible by rule 7 of
 ///   [`crate::models::status_visibility`].
 ///
+/// A quoting row is never dropped for its quote's sake: when the quoted
+/// original is gone, or [`can_view`] refuses it to this viewer (rule 2's
+/// block of them by the original's author included), the row renders
+/// with `quote: null` — the very answer a row quoting nothing gets,
+/// naming no id, carrying no text and adding no count of its own.
+///
 /// All batch loading happens once per call, whatever the page size — see
 /// the [module docs](self) for the fixed query set and where each later
 /// flag's loader goes.
@@ -184,6 +208,7 @@ use crate::{
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 ///
+/// [`can_view`]: crate::models::status_visibility::can_view
 /// [`filter_visible`]: crate::models::status_visibility::filter_visible
 pub async fn render_statuses(
     state: &AppState,
@@ -198,7 +223,7 @@ pub async fn render_statuses(
         return Ok(Vec::new());
     }
     let batch = Batch::load(state, viewer, &rows).await?;
-    Ok(batch.render_all(&rows))
+    batch.render_all(&rows).await
 }
 
 /// Renders the single `status`, delegating to [`render_statuses`]: `None`
@@ -221,6 +246,12 @@ pub async fn render_status(
 /// loader was asked about, so a row's render is a lookup, never a query.
 #[derive(Debug)]
 struct Batch<'a> {
+    /// The database the nested quote's [`can_view`] gate consults — the
+    /// batch's own pool, held for that per-viewer check alone; every
+    /// load is already done by [`Batch::load`].
+    ///
+    /// [`can_view`]: crate::models::status_visibility::can_view
+    pool: &'a PgPool,
     /// The instance configuration the [`Account`] and tag URLs render
     /// from.
     ///
@@ -228,10 +259,19 @@ struct Batch<'a> {
     config: &'a Config,
     /// The account whose view is being rendered, if any.
     viewer: Option<&'a User>,
-    /// Every author and replied-to author on the page, keyed by id.
+    /// Every author and replied-to author on the page (and on the rows
+    /// it nests), keyed by id.
     users: HashMap<Uuid, User>,
     /// The reblogged originals, keyed by id.
     originals: HashMap<Uuid, StatusRow>,
+    /// The quoted originals, keyed by id — the batch's second
+    /// [`status::get_many`] (step 2 of the [module docs](self)), which
+    /// excludes tombstones. A quoting row renders its hit here as the
+    /// entity's nested `quote` when
+    /// [`can_view`](crate::models::status_visibility::can_view) admits
+    /// it to this viewer; an id the read did not answer is a gone
+    /// original, which is that row's `quote: null`.
+    quoted: HashMap<Uuid, StatusRow>,
     /// Media attachments, keyed by status, in position order.
     media: HashMap<Uuid, Vec<AttachmentRow>>,
     /// Mentions, keyed by status, in mention order.
@@ -314,7 +354,8 @@ struct Batch<'a> {
 impl<'a> Batch<'a> {
     /// Runs the fixed query set of the [module docs](self) for `rows` and
     /// keeps the results together. Every loader is handed its id list
-    /// deduplicated, and each one skips the database when the list is
+    /// deduplicated — the [`PageIds`] the page and its nested renders
+    /// amount to — and each one skips the database when the list is
     /// empty.
     async fn load(
         state: &'a AppState,
@@ -322,48 +363,27 @@ impl<'a> Batch<'a> {
         rows: &[&'a StatusRow],
     ) -> AppResult<Self> {
         let pool = &state.db;
-        let reblog_ids = distinct(rows.iter().copied().filter_map(|row| row.reblog_of_id));
-        let originals = load_statuses_by_id(pool, &reblog_ids).await?;
         let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
         let quoted = load_statuses_by_id(pool, &quote_ids).await?;
         debug!(
             quotes = quoted.len(),
-            "quoted originals batch-loaded; the quoting ticket renders them"
+            "quoted originals batch-loaded for the nested quote render"
         );
-        let rendered_ids = distinct(
+        // A quoted original is itself a renderable row: were it a reblog
+        // (the create path folds a quoted boost to the original, so
+        // stored chains stop here), its original rides the same single
+        // `status::get_many` as the page's own boosts.
+        let reblog_ids = distinct(
             rows.iter()
                 .copied()
-                .map(|row| row.id)
-                .chain(originals.keys().copied()),
+                .chain(quoted.values())
+                .filter_map(|row| row.reblog_of_id),
         );
-        let account_ids = distinct(
-            rows.iter()
-                .copied()
-                .chain(originals.values())
-                .flat_map(|row| [Some(row.user_id), row.in_reply_to_account_id])
-                .flatten(),
-        );
-        let author_ids = distinct(
-            rows.iter()
-                .copied()
-                .map(|row| row.user_id)
-                .chain(originals.values().map(|row| row.user_id)),
-        );
-        let conversation_ids = distinct(
-            rows.iter()
-                .copied()
-                .chain(originals.values())
-                .map(|row| row.conversation_id),
-        );
-        let direct_ids = distinct(
-            rows.iter()
-                .copied()
-                .chain(originals.values())
-                .filter_map(|row| row.direct_conversation_id),
-        );
-        let polls = load_polls(pool, &rendered_ids).await?;
-        let poll_options = load_poll_options(pool, &rendered_ids).await?;
-        let poll_votes = load_poll_votes(pool, &rendered_ids, viewer).await?;
+        let originals = load_statuses_by_id(pool, &reblog_ids).await?;
+        let ids = PageIds::gather(rows, &originals, &quoted);
+        let polls = load_polls(pool, &ids.rendered).await?;
+        let poll_options = load_poll_options(pool, &ids.rendered).await?;
+        let poll_votes = load_poll_votes(pool, &ids.rendered, viewer).await?;
         debug!(
             polls = polls.len(),
             options = poll_options.len(),
@@ -371,43 +391,82 @@ impl<'a> Batch<'a> {
             "polls batch-loaded with their options and the viewer's marks"
         );
         Ok(Self {
+            pool,
             config: state.config.as_ref(),
             viewer,
-            users: load_users(pool, &account_ids).await?,
+            users: load_users(pool, &ids.accounts).await?,
             originals,
-            media: load_media(pool, &rendered_ids).await?,
-            mentions: load_mentions(pool, &rendered_ids).await?,
-            tags: load_tags(pool, &rendered_ids).await?,
-            reactions: load_reactions(pool, &rendered_ids, viewer).await?,
-            favourites: load_favourites(pool, &rendered_ids, viewer).await?,
-            reblogs: load_reblogs(pool, &rendered_ids, viewer).await?,
-            bookmarks: load_bookmarks(pool, &rendered_ids, viewer).await?,
-            pins: load_pins(pool, &rendered_ids, viewer).await?,
-            thread_mutes: load_thread_mutes(pool, &conversation_ids, viewer).await?,
-            direct_participations: load_direct_participations(pool, &direct_ids, viewer).await?,
+            quoted,
+            media: load_media(pool, &ids.rendered).await?,
+            mentions: load_mentions(pool, &ids.rendered).await?,
+            tags: load_tags(pool, &ids.rendered).await?,
+            reactions: load_reactions(pool, &ids.rendered, viewer).await?,
+            favourites: load_favourites(pool, &ids.rendered, viewer).await?,
+            reblogs: load_reblogs(pool, &ids.rendered, viewer).await?,
+            bookmarks: load_bookmarks(pool, &ids.rendered, viewer).await?,
+            pins: load_pins(pool, &ids.rendered, viewer).await?,
+            thread_mutes: load_thread_mutes(pool, &ids.conversations, viewer).await?,
+            direct_participations: load_direct_participations(pool, &ids.directs, viewer).await?,
             polls,
             poll_options,
             poll_votes,
-            relationships: load_relationships(pool, viewer, &author_ids).await?,
-            cards: load_cards(pool, &rendered_ids).await?,
+            relationships: load_relationships(pool, viewer, &ids.authors).await?,
+            cards: load_cards(pool, &ids.rendered).await?,
         })
     }
 
     /// Renders every row of `rows` in order, nesting the original of a
-    /// reblog and dropping the rows the [`render_statuses`] contract
-    /// cannot answer for.
-    fn render_all(&self, rows: &[&StatusRow]) -> Vec<Status> {
+    /// reblog, rendering the quoted original of a quote, and dropping the
+    /// rows the [`render_statuses`] contract cannot answer for.
+    async fn render_all(&self, rows: &[&StatusRow]) -> AppResult<Vec<Status>> {
         let mut rendered = Vec::with_capacity(rows.len());
         for row in rows {
             let reblog = self.render_reblog(row);
             if row.reblog_of_id.is_some() && reblog.is_none() {
                 continue;
             }
-            if let Some(entity) = self.render_entity(row, reblog) {
+            let quote = self.render_quote(row).await?;
+            if let Some(entity) = self.render_entity(row, reblog, quote) {
                 rendered.push(entity);
             }
         }
-        rendered
+        Ok(rendered)
+    }
+
+    /// The nested `quote` entity of `row`: `None` — the entity's
+    /// `quote: null` — when the row quotes nothing, when the quoted
+    /// original is gone (the batch's read answers tombstones and absent
+    /// ids with absence), and when [`can_view`] refuses that original to
+    /// this viewer, its rule 2 (the author's block of them) included.
+    /// Each `None` is the very answer of a row quoting nothing: no id,
+    /// no text, no count of its own.
+    ///
+    /// A visible original is rendered by [`Batch::render_entity`] — the
+    /// very per-row path the page itself uses, boost of a quoted boost
+    /// included — from the maps the batch already loaded, one level deep
+    /// and no new query: the only read this method runs is [`can_view`]'s
+    /// own visibility check, the same gate every endpoint applies to a
+    /// row it answers.
+    ///
+    /// [`can_view`]: crate::models::status_visibility::can_view
+    async fn render_quote(&self, row: &StatusRow) -> AppResult<Option<Value>> {
+        let Some(original) = row.quote_of_id.and_then(|id| self.quoted.get(&id)) else {
+            return Ok(None);
+        };
+        if !status_visibility::can_view(self.pool, original, self.viewer).await? {
+            return Ok(None);
+        }
+        let reblog = self.render_reblog(original);
+        if original.reblog_of_id.is_some() && reblog.is_none() {
+            return Ok(None);
+        }
+        let Some(nested) = self.render_entity(original, reblog, None) else {
+            return Ok(None);
+        };
+        let value = serde_json::to_value(&nested).map_err(|err| {
+            AppError::Internal(format!("the nested quote does not serialize: {err}"))
+        })?;
+        Ok(Some(value))
     }
 
     /// The nested render of the original `row` reblogs: `None` when the
@@ -417,7 +476,7 @@ impl<'a> Batch<'a> {
     /// do not occur in stored data (see [`crate::models::status_visibility`]).
     fn render_reblog(&self, row: &StatusRow) -> Option<Box<Status>> {
         let original = self.originals.get(&row.reblog_of_id?)?;
-        Some(Box::new(self.render_entity(original, None)?))
+        Some(Box::new(self.render_entity(original, None, None)?))
     }
 
     /// Renders one `row` from the loaded maps, attaching `reblog` as its
@@ -452,7 +511,17 @@ impl<'a> Batch<'a> {
     /// carries the original's poll. The `card` is the cards map read at
     /// the row's *own* id — `status_cards` keys on the row, so a reblog
     /// row renders its own id's card and the nested original its own.
-    fn render_entity(&self, row: &StatusRow, reblog: Option<Box<Status>>) -> Option<Status> {
+    /// The `quote` value rides in from the caller, produced by
+    /// [`Batch::render_quote`] — the per-viewer gate and the nested
+    /// render live there, so this stays a pure lookup even for the
+    /// quoting row; the nested renders of a reblog and of a quote carry
+    /// `None`, one level deep each, exactly like the entity's own `null`.
+    fn render_entity(
+        &self,
+        row: &StatusRow,
+        reblog: Option<Box<Status>>,
+        quote: Option<Value>,
+    ) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
         let subject_id = row.reblog_of_id.unwrap_or(row.id);
         let pinned_at = self.pins.get(&row.id).copied();
@@ -481,6 +550,7 @@ impl<'a> Batch<'a> {
                 .and_then(|thread| self.direct_participations.get(&thread).copied()),
             reblog,
             poll: self.render_poll(row),
+            quote,
         };
         Some(Status::from_source(
             source,
@@ -508,6 +578,75 @@ impl<'a> Batch<'a> {
             self.poll_votes.get(&row.id).map_or(&[], Vec::as_slice),
             Utc::now(),
         ))
+    }
+}
+
+/// The page's id lists, one per batch loader group: the page's rows and
+/// every row a nested render reaches — the reblogged originals and the
+/// quoted originals — so a nested entity is a lookup in the same maps a
+/// top-level one is, and no loader needs a query of its own.
+#[derive(Debug)]
+struct PageIds {
+    /// Every rendered row's id: the page, the reblogged originals and
+    /// the quoted originals together — the key all the per-status
+    /// loaders take.
+    rendered: Vec<Uuid>,
+    /// Every author and replied-to author among the rendered rows — the
+    /// one [`user::get_many`] list, so even a nested quote knows its
+    /// author.
+    accounts: Vec<Uuid>,
+    /// The rendered rows' authors — the list [`Relationship::load_many`]
+    /// answers, so the account nested in a reblog or a quote carries the
+    /// viewer's relationship too.
+    ///
+    /// [`Relationship::load_many`]: crate::entities::relationship::Relationship::load_many
+    authors: Vec<Uuid>,
+    /// The rendered rows' conversation ids — the thread-mute read's
+    /// list, because a mute is a fact about the thread any render names.
+    conversations: Vec<Uuid>,
+    /// The rendered rows' `direct_conversation_id`s — the participation
+    /// read's list, for the same reason.
+    directs: Vec<Uuid>,
+}
+
+impl PageIds {
+    /// Collects the five lists for `rows` and the batch's loaded
+    /// `originals` and `quoted`, each deduplicated in order of first
+    /// appearance.
+    fn gather(
+        rows: &[&StatusRow],
+        originals: &HashMap<Uuid, StatusRow>,
+        quoted: &HashMap<Uuid, StatusRow>,
+    ) -> Self {
+        let rendered_rows: Vec<&StatusRow> = rows
+            .iter()
+            .copied()
+            .chain(originals.values())
+            .chain(quoted.values())
+            .collect();
+        let rendered = distinct(rendered_rows.iter().copied().map(|row| row.id));
+        let accounts = distinct(
+            rendered_rows
+                .iter()
+                .copied()
+                .flat_map(|row| [Some(row.user_id), row.in_reply_to_account_id])
+                .flatten(),
+        );
+        let authors = distinct(rendered_rows.iter().copied().map(|row| row.user_id));
+        let conversations = distinct(rendered_rows.iter().copied().map(|row| row.conversation_id));
+        let directs = distinct(
+            rendered_rows
+                .iter()
+                .copied()
+                .filter_map(|row| row.direct_conversation_id),
+        );
+        Self {
+            rendered,
+            accounts,
+            authors,
+            conversations,
+            directs,
+        }
     }
 }
 
@@ -766,7 +905,7 @@ mod tests {
         http_client::HttpClient,
         mailer::MemoryTransport,
         models::{
-            bookmark_folder,
+            block, bookmark_folder,
             emoji_reaction::{self, NewReaction},
             follow,
             media_attachment::NewMediaAttachment,
@@ -819,6 +958,30 @@ mod tests {
         insert(pool, BASE, &NewStatus::local(author, text))
             .await
             .expect("a plain local post inserts")
+    }
+
+    /// Inserts a local public status of `author` quoting `original`,
+    /// built at the model layer exactly as
+    /// [`crate::models::status::NewStatus`]'s own quote test does: a
+    /// quoting status needs the model (`quote_of_id` is not something
+    /// the plain-post helper passes), per the note on
+    /// `tests/api/common.rs`'s `create_status`.
+    async fn quote_of(pool: &PgPool, author: &User, original: &StatusRow, text: &str) -> StatusRow {
+        insert(
+            pool,
+            BASE,
+            &NewStatus {
+                quote_of_id: Some(original.id),
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("a quoting status inserts")
+    }
+
+    /// The rendered entity's top-level JSON.
+    fn entity_json(entity: &Status) -> Value {
+        serde_json::to_value(entity).expect("a rendered status serializes")
     }
 
     /// Every stored status, live or not, oldest id first.
@@ -2005,6 +2168,301 @@ mod tests {
         );
     }
 
+    /// Asserts `value` nests `original` — posted with the text `text` —
+    /// as its `quote`: the full entity through the page's own per-row
+    /// path, one level deep.
+    fn assert_nests(value: &Value, original: &StatusRow, text: &str) {
+        assert_eq!(
+            value["quote"]["id"],
+            original.id.to_string(),
+            "the nested entity is the quoted original itself"
+        );
+        assert_eq!(
+            value["quote"]["content"],
+            format!("<p>{text}</p>"),
+            "rendered through the same per-row path the page uses, HTML and all"
+        );
+        assert_eq!(
+            value["quote"]["quote"],
+            Value::Null,
+            "one nested entity: the quote's own quote slot stays null"
+        );
+    }
+
+    /// Asserts `value` answers a hidden original with exactly the
+    /// `quote: null` of a row quoting nothing: the null itself, no id or
+    /// text of the original anywhere in the answer, and none of the
+    /// `quote_id` / `quote_url` / `quote_visible` keys whose absence is
+    /// the recorded decision.
+    fn assert_hidden(value: &Value, original: &StatusRow, hidden_text: &str) {
+        assert_eq!(
+            value["quote"],
+            Value::Null,
+            "the hidden quote renders the plain null"
+        );
+        let wire = value.to_string();
+        assert!(
+            !wire.contains(&original.id.to_string()),
+            "the answer names no id of the hidden original"
+        );
+        assert!(
+            !wire.contains(hidden_text),
+            "the answer carries no text of the hidden original"
+        );
+        assert!(
+            value["pleroma"]
+                .as_object()
+                .expect("every render carries the pleroma block")
+                .keys()
+                .all(|key| !key.starts_with("quote_")),
+            "no pleroma-level quote_ key rides along — their absence is the decision"
+        );
+    }
+
+    /// The quoting ticket's render arm: a public quote of a public
+    /// original nests the rendered entity for the original's author, its
+    /// accepted follower, a stranger and the anonymous caller alike —
+    /// rule 3 admits public content to everyone, and `pleroma.quote_id`
+    /// never rides any of these answers.
+    #[tokio::test]
+    async fn a_public_quote_nests_for_every_viewer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let dave = user(&pool, "dave").await;
+        let following = follow::follow(&pool, BASE, &bob, &alice)
+            .await
+            .expect("bob follows alice");
+        assert_eq!(
+            following.state,
+            follow::FollowState::Accepted,
+            "alice is unlocked, so the follow is granted"
+        );
+        let original = post(&pool, &alice, "the quoted one").await;
+        let quoting = quote_of(&pool, &carol, &original, "look at this").await;
+
+        let page = std::slice::from_ref(&quoting);
+        for (who, viewer) in [
+            ("its author", Some(&alice)),
+            ("an accepted follower", Some(&bob)),
+            ("a stranger", Some(&dave)),
+            ("nobody", None),
+        ] {
+            let rendered = render_statuses(&state, viewer, page)
+                .await
+                .expect("the quoting row renders");
+            assert_eq!(
+                rendered_ids(&rendered),
+                [quoting.id.to_string()],
+                "{who} still sees the quoting row itself"
+            );
+            let value = entity_json(&rendered[0]);
+            assert_nests(&value, &original, "the quoted one");
+            assert_eq!(
+                value["account"]["acct"], "carol",
+                "the outer entity stays the quoter's, for {who}"
+            );
+        }
+    }
+
+    /// Per-viewer visibility at the quote arm: a quote of a private
+    /// original nests for the original author's accepted follower (rule 5
+    /// admits them to it) and renders the plain null for a non-follower
+    /// and for the anonymous caller — the same row, three viewers, two
+    /// answers, and neither null says anything about what it hides.
+    #[tokio::test]
+    async fn a_quote_of_a_private_original_follows_the_viewers_visibility() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let dave = user(&pool, "dave").await;
+        let following = follow::follow(&pool, BASE, &bob, &alice)
+            .await
+            .expect("bob follows alice");
+        assert_eq!(
+            following.state,
+            follow::FollowState::Accepted,
+            "alice is unlocked, so the follow is granted"
+        );
+        let original = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                visibility: Visibility::Private,
+                ..NewStatus::local(&alice, "followers only")
+            },
+        )
+        .await
+        .expect("a private post inserts");
+        let quoting = quote_of(&pool, &dave, &original, "carried around").await;
+        let page = std::slice::from_ref(&quoting);
+
+        let for_follower = render_statuses(&state, Some(&bob), page)
+            .await
+            .expect("the quoting row renders for the follower");
+        assert_nests(&entity_json(&for_follower[0]), &original, "followers only");
+
+        for (who, viewer) in [("a non-follower", Some(&carol)), ("nobody", None)] {
+            let rendered = render_statuses(&state, viewer, page)
+                .await
+                .expect("the quoting row renders for everyone");
+            assert_eq!(
+                rendered_ids(&rendered),
+                [quoting.id.to_string()],
+                "{who} still sees the quoting row — only the nest is withheld"
+            );
+            assert_hidden(&entity_json(&rendered[0]), &original, "followers only");
+        }
+    }
+
+    /// A quote whose original has been deleted renders the plain null:
+    /// the batch's read skips tombstones (rule 1, visible to nobody, not
+    /// even the author), so there is nothing to nest — while the quoting
+    /// row itself keeps its place on the page, unlike a reblog of a gone
+    /// original, which the renderer drops outright.
+    #[tokio::test]
+    async fn a_quote_of_a_deleted_original_renders_null() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let carol = user(&pool, "carol").await;
+        let original = post(&pool, &alice, "doomed original").await;
+        let quoting = quote_of(&pool, &carol, &original, "kept quote").await;
+        let tombstone = soft_delete(&pool, original.id)
+            .await
+            .expect("the delete runs")
+            .expect("the original was live");
+        assert!(tombstone.deleted_at.is_some(), "the row is a tombstone");
+
+        for (who, viewer) in [("the author", Some(&alice)), ("nobody", None)] {
+            let rendered = render_statuses(&state, viewer, std::slice::from_ref(&quoting))
+                .await
+                .expect("the quoting row renders");
+            assert_eq!(
+                rendered_ids(&rendered),
+                [quoting.id.to_string()],
+                "{who} still sees the quoting row itself"
+            );
+            assert_hidden(&entity_json(&rendered[0]), &original, "doomed original");
+        }
+    }
+
+    /// Rule 2 at the quote arm: the original's author having blocked the
+    /// viewer leaves that viewer's `quote` the plain null — while the
+    /// very same render nests the original for everybody else, so the
+    /// null is the viewer's own, never a fact about the post.
+    #[tokio::test]
+    async fn a_quote_the_original_author_blocked_renders_null_for_that_viewer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let blocked = block::block(&pool, BASE, &alice, &carol)
+            .await
+            .expect("alice's block of carol stores");
+        assert_eq!(
+            blocked.blocked_id, carol.id,
+            "the fixture block is alice's on carol"
+        );
+        let original = post(&pool, &alice, "blocked away").await;
+        let quoting = quote_of(&pool, &bob, &original, "look, alice").await;
+        let page = std::slice::from_ref(&quoting);
+
+        let for_carol = render_statuses(&state, Some(&carol), page)
+            .await
+            .expect("the quoting row renders for the blocked viewer");
+        assert_hidden(&entity_json(&for_carol[0]), &original, "blocked away");
+
+        let for_bob = render_statuses(&state, Some(&bob), page)
+            .await
+            .expect("the quoting row renders for the quoter");
+        assert_nests(&entity_json(&for_bob[0]), &original, "blocked away");
+
+        let anonymous = render_statuses(&state, None, page)
+            .await
+            .expect("the quoting row renders anonymously");
+        assert_nests(&entity_json(&anonymous[0]), &original, "blocked away");
+    }
+
+    /// The quoting arm inside the fixed query set: one call over a
+    /// multi-row page — an original, two quoting rows, and a boost that
+    /// quotes another original in its own row — answers the whole page
+    /// from the maps the batch loaded. This is the structural bound of
+    /// the 20-strong test above with quotes riding along: ids in,
+    /// entities out, one call. Every nested `quote` is a lookup in the
+    /// second `status::get_many` and the same per-status reads (and the
+    /// outer boost nests its original from the first one); no quoted
+    /// original is ever fetched a second time. The only per-quote work
+    /// is [`can_view`]'s own visibility gate, which is the shared check,
+    /// not a loader.
+    ///
+    /// [`can_view`]: crate::models::status_visibility::can_view
+    #[tokio::test]
+    async fn a_page_of_quotes_renders_in_the_same_fixed_batch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let first = post(&pool, &alice, "first original").await;
+        let second = post(&pool, &alice, "second original").await;
+        let quoting_first = quote_of(&pool, &bob, &first, "quoting the first").await;
+        let boost_quoting_second = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                reblog_of_id: Some(second.id),
+                quote_of_id: Some(first.id),
+                ..NewStatus::local(&carol, "")
+            },
+        )
+        .await
+        .expect("a boost that also quotes inserts");
+        let quoting_second = quote_of(&pool, &bob, &second, "quoting the second").await;
+
+        let page = [
+            first.clone(),
+            quoting_first.clone(),
+            boost_quoting_second.clone(),
+            quoting_second.clone(),
+        ];
+        for (who, viewer) in [("bob", Some(&bob)), ("nobody", None)] {
+            let rendered = render_statuses(&state, viewer, &page)
+                .await
+                .expect("the whole page renders in one call");
+            assert_eq!(
+                rendered_ids(&rendered),
+                id_strings(&page),
+                "{who}: one entity per row, in the input order — no per-row round"
+            );
+            let values: Vec<Value> = rendered.iter().map(entity_json).collect();
+            assert_eq!(
+                values[0]["quote"],
+                Value::Null,
+                "the plain original quotes nothing"
+            );
+            assert_nests(&values[1], &first, "first original");
+            let boost = &values[2];
+            assert_eq!(
+                boost["reblog"]["id"],
+                second.id.to_string(),
+                "{who}: the boost still nests its own original"
+            );
+            assert_nests(boost, &first, "first original");
+            assert_nests(&values[3], &second, "second original");
+        }
+    }
+
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn twenty_statuses_by_five_authors_render_in_one_batch(pool: PgPool) {
         let state = test_state(&pool);
@@ -2039,8 +2497,9 @@ mod tests {
     }
 
     /// The mixed page for the equivalence check below: a plain post with
-    /// a mention and a tag, an answer to it, a reblog of it, and a remote
-    /// mirror — every render branch in one batch.
+    /// a mention and a tag, an answer to it, a reblog of it, a remote
+    /// mirror, and a quote of the plain post — every render branch in one
+    /// batch.
     async fn mixed_page(pool: &PgPool) -> (User, Vec<StatusRow>) {
         let alice = user(pool, "alice").await;
         let bob = user(pool, "bob").await;
@@ -2099,7 +2558,23 @@ mod tests {
         )
         .await
         .unwrap();
-        (alice, vec![root, answer, reblog, mirror])
+        // A quote of the plain root, so the equivalence check below walks
+        // the nested-quote render on both the batched and the row-by-row
+        // path.
+        let quoting = {
+            let carol = user(pool, "carol").await;
+            insert(
+                pool,
+                BASE,
+                &NewStatus {
+                    quote_of_id: Some(root.id),
+                    ..NewStatus::local(&carol, "quoting that")
+                },
+            )
+            .await
+            .unwrap()
+        };
+        (alice, vec![root, answer, reblog, mirror, quoting])
     }
 
     /// The batch renderer and the single-row helper must agree entry for
@@ -2107,7 +2582,7 @@ mod tests {
     /// rendered one at a time, produce byte-identical JSON. That is the
     /// structural guarantee behind the fixed query set — the maps are
     /// keyed by id, so a row cannot leak its page-mates' media, mentions,
-    /// tags or nested reblog into another entry.
+    /// tags, nested reblog or nested quote into another entry.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn the_batched_page_equals_row_by_row_rendering(pool: PgPool) {
         let state = test_state(&pool);
@@ -2115,7 +2590,7 @@ mod tests {
 
         for viewer in [None, Some(&alice)] {
             let batched = render_statuses(&state, viewer, &page).await.unwrap();
-            assert_eq!(batched.len(), 4, "every live row of the page renders");
+            assert_eq!(batched.len(), 5, "every live row of the page renders");
             for (entry, row) in batched.iter().zip(&page) {
                 let alone = render_status(&state, viewer, row)
                     .await
