@@ -44,6 +44,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         actor::MAIN_KEY_FRAGMENT,
+        mrf,
         remote_actor::{ActorError, parse_actor, upsert_remote_user},
         signature::{SignedHeaders, SigningKey, sign_request},
         webfinger_client::{WebfingerError, resolve_acct_with_base, strip_finger_prefixes},
@@ -454,8 +455,9 @@ async fn serve_or_refresh(state: &AppState, stored: User, ap_id: &str) -> Result
     }
 }
 
-/// Dereferences `ap_id`, parses the actor document and stores the mirror
-/// row (see [`crate::federation::remote_actor`]).
+/// Dereferences `ap_id`, runs the actor document through the instance's
+/// [filter chain](mrf::filter_actor), parses it and stores the mirror row
+/// (see [`crate::federation::remote_actor`]).
 ///
 /// With `SIGN_FETCHES` on (the default) every `GET` carries the instance
 /// actor's HTTP Signature, so peers in authorized-fetch mode answer; with
@@ -463,6 +465,7 @@ async fn serve_or_refresh(state: &AppState, stored: User, ap_id: &str) -> Result
 async fn fetch_and_store(state: &AppState, ap_id: &str) -> Result<User, FetchError> {
     let signer = fetch_signer(state).await?;
     let document = fetch_actor_json(&state.http_client, ap_id, signer.as_ref()).await?;
+    let document = mrf::filter_actor(state, document).await;
     let new_user = parse_actor(&document).map_err(FetchError::from)?;
     let user = upsert_remote_user(&state.db, new_user)
         .await
@@ -545,7 +548,10 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         federation::signature::signing_string,
-        models::user::{INSTANCE_ACTOR_NICKNAME, NewUser, get_by_nickname, insert, local_ap_id},
+        models::{
+            instance_setting,
+            user::{INSTANCE_ACTOR_NICKNAME, NewUser, get_by_nickname, insert, local_ap_id},
+        },
         uploads::UploaderBackend,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM, verify_sha256},
     };
@@ -758,6 +764,70 @@ mod tests {
             .strip_prefix(prefix.as_str())
             .unwrap_or_else(|| panic!("the {name} parameter is quoted: {header}"));
         value.trim_end_matches('"').to_owned()
+    }
+
+    /// A peer serving an actor document that carries the profile images
+    /// the removal lists are about: an `icon` and an `image`.
+    async fn profiled_actor(State(peer): State<Peer>) -> Response {
+        let id = format!("{}/users/alice", peer.base);
+        let mut document = actor_document(&id);
+        let _icon = document
+            .as_object_mut()
+            .expect("the fixture document is an object")
+            .insert(
+                "icon".to_owned(),
+                json!({"type": "Image", "url": format!("{id}/avatar.png")}),
+            );
+        let _image = document
+            .as_object_mut()
+            .expect("the fixture document is an object")
+            .insert(
+                "image".to_owned(),
+                json!({"type": "Image", "url": format!("{id}/banner.png")}),
+            );
+        json_response(&document)
+    }
+
+    /// The actor stage of the chain runs over a fetched document before it
+    /// is mirrored: what the domain lists strip never reaches the row, and
+    /// what they leave alone does.
+    #[tokio::test]
+    async fn a_fetched_document_is_stripped_by_the_mrf_actor_lists() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let server = spawn(
+            listener,
+            Router::new()
+                .route("/users/alice", get(profiled_actor))
+                .with_state(peer_at(&base)),
+        );
+        instance_setting::set(
+            &pool,
+            "mrf",
+            &json!({
+                "policies": ["simple"],
+                "simple": {"avatar_removal": ["127.0.0.1"]},
+            }),
+        )
+        .await
+        .expect("the setting writes");
+        let state = test_state(pool);
+
+        let mirrored = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();
+        server.abort();
+
+        assert_eq!(mirrored.name, "First", "the document was mirrored");
+        assert!(
+            mirrored.avatar_url.is_none(),
+            "the avatar the lists strip never lands"
+        );
+        assert!(
+            mirrored.banner_url.is_some(),
+            "the banner no list names is stored"
+        );
     }
 
     #[tokio::test]

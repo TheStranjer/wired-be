@@ -22,17 +22,26 @@
 //! cached in memory for [`MRF_CONFIG_TTL`], so a busy inbox costs one
 //! query per window.
 //!
-//! This ticket lays the pipe and ships Pleroma's no-op policy
-//! (`lib/pleroma/web/activity_pub/mrf/noop_policy.ex`) as the only
-//! registered policy; the policy tickets add one `match` arm to
+//! The pipeline ships Pleroma's no-op policy
+//! (`lib/pleroma/web/activity_pub/mrf/noop_policy.ex`) and its domain lists
+//! (`lib/pleroma/web/activity_pub/mrf/simple_policy.ex`, in
+//! [`simple`]); further policy tickets add one `match` arm to
 //! [`build_chain`] each. Unknown names are warned about and skipped, so a
 //! configuration written ahead of a deploy never drops traffic.
+//!
+//! Actor documents — the profiles this instance mirrors — are not
+//! activities, so they run through the chain's other stage,
+//! [`filter_actor`], which only the domain-list policy touches and which
+//! never rejects: [`upsert_remote_user`](crate::federation::remote_actor::upsert_remote_user)'s
+//! callers and the inbound `Update` of an account fold what it answers.
 //!
 //! The chain's shape is also public metadata: [`describe_policies`] and
 //! [`describe_transparency`] feed the `pleroma.metadata.federation` block
 //! of the instance endpoints and `NodeInfo`, where Pleroma reports its
 //! active policies as `"SimplePolicy"`-style names beside `mrf_simple`
 //! transparency objects.
+
+pub mod simple;
 
 use std::{fmt, sync::Arc};
 
@@ -89,6 +98,19 @@ pub trait MrfPolicy: Send + Sync {
     fn describe(&self) -> Value {
         json!({})
     }
+
+    /// Rewrites an actor document on its way into a mirror row.
+    ///
+    /// An actor document is not an activity, so the chain's
+    /// [`filter`](Self::filter) stage never sees one: the policies that
+    /// strip a profile's `icon` or `image` implement this instead. It
+    /// cannot reject — a stripped profile is still a profile, and dropping
+    /// the account over one avatar would strand the posts already stored
+    /// under it — so the answer is the document. The default hands it back
+    /// untouched.
+    fn filter_actor(&self, _ctx: &MrfContext, actor: Value) -> Value {
+        actor
+    }
 }
 
 /// Everything a policy may consult, preloaded before the chain runs.
@@ -114,6 +136,13 @@ pub struct MrfConfig {
     /// The whole setting object as stored; each policy reads its own key
     /// through [`params_for`](Self::params_for).
     params: Map<String, Value>,
+    /// The domain lists of the `simple` policy, compiled once here: the
+    /// chain's policy and [`rejected`](Self::rejected) share these rules,
+    /// so a match is never computed twice from the same JSON.
+    simple: Arc<simple::SimpleConfig>,
+    /// Whether `simple` is one of the enabled policies: lists that are
+    /// configured but switched off govern nothing, here or anywhere.
+    simple_enabled: bool,
 }
 
 impl MrfConfig {
@@ -128,15 +157,24 @@ impl MrfConfig {
                     "the `mrf` instance setting is not a JSON object; falling back to MRF_POLICIES"
                 );
             }
-            return Self {
-                policies: env_policies.to_vec(),
-                params: Map::new(),
-            };
+            return Self::assemble(env_policies.to_vec(), Map::new());
         };
         let policies = policy_names(params).unwrap_or_else(|| env_policies.to_vec());
+        Self::assemble(policies, params.clone())
+    }
+
+    /// One resolved chain: the names and the document as configured, with
+    /// the domain lists the `simple` key holds compiled beside them.
+    fn assemble(policies: Vec<String>, params: Map<String, Value>) -> Self {
+        let simple_enabled = policies.iter().any(|name| name == simple::PARAMS_KEY);
+        let simple = Arc::new(simple::SimpleConfig::from_params(
+            params.get(simple::PARAMS_KEY),
+        ));
         Self {
             policies,
-            params: params.clone(),
+            params,
+            simple,
+            simple_enabled,
         }
     }
 
@@ -151,6 +189,23 @@ impl MrfConfig {
     #[must_use]
     pub fn params_for(&self, name: &str) -> Option<&Value> {
         self.params.get(name)
+    }
+
+    /// Whether the instance refuses `host` outright: the `simple` policy's
+    /// `reject` list naming it, or its `accept` allowlist being in force
+    /// without naming it.
+    ///
+    /// This is the single source of truth for "rejected domain" beside the
+    /// [`instance_policy_domains`](crate::models::instance_policy_domain)
+    /// table: the inbox extractor, the delivery enqueue and the publisher
+    /// ask it, so an allowlist federation refuses a host everywhere the
+    /// table does and not only inside the chain. It answers `false` while
+    /// `simple` is not one of the enabled policies, and it knows nothing of
+    /// this instance's own domain — every caller asks about a foreign host,
+    /// and the chain's own policy adds the local exemption.
+    #[must_use]
+    pub fn rejected(&self, host: &str) -> bool {
+        self.simple_enabled && self.simple.rejected(host)
     }
 }
 
@@ -215,6 +270,19 @@ impl PolicyChain {
         }
         MrfDecision::Accept(current)
     }
+
+    /// Runs one actor document through every policy's
+    /// [`filter_actor`](MrfPolicy::filter_actor) in order: the mirror half
+    /// of the chain, where rewrites propagate the same way and nothing can
+    /// be rejected.
+    #[must_use]
+    pub fn apply_actor(&self, ctx: &MrfContext, actor: Value) -> Value {
+        let mut current = actor;
+        for policy in &self.policies {
+            current = policy.filter_actor(ctx, current);
+        }
+        current
+    }
 }
 
 /// Reports the chain's policies by their Pleroma-style names, in chain
@@ -258,6 +326,9 @@ pub fn build_chain(config: &MrfConfig) -> PolicyChain {
     for name in config.policies() {
         let policy: Option<Box<dyn MrfPolicy + Send + Sync>> = match name.as_str() {
             "noop" => Some(Box::new(NoOpPolicy)),
+            "simple" => Some(Box::new(simple::SimplePolicy::new(Arc::clone(
+                &config.simple,
+            )))),
             other => {
                 warn!(
                     policy = other,
@@ -365,15 +436,35 @@ pub fn filter_outgoing_boxed(state: AppState, activity: Value) -> BoxFuture<'sta
     Box::pin(async move { run_chain(&state, activity).await })
 }
 
+/// Runs one actor document through the instance's chain's actor stage.
+///
+/// This is what [`upsert_remote_user`](crate::federation::remote_actor::upsert_remote_user)'s
+/// callers store and what the inbound `Update` of an account folds, after
+/// the policies that strip a profile had their way with it. An actor
+/// document cannot be rejected — see
+/// [`filter_actor`](MrfPolicy::filter_actor) — so the answer is the
+/// document, and a chain that strips nothing hands back exactly what it
+/// was given.
+#[must_use]
+pub async fn filter_actor(state: &AppState, actor: Value) -> Value {
+    let ctx = context(state).await;
+    build_chain(ctx.config.as_ref()).apply_actor(&ctx, actor)
+}
+
+/// The context one pipeline run preloads: the current configuration beside
+/// the chain's single shared "now" and this instance's own domain.
+async fn context(state: &AppState) -> MrfContext {
+    MrfContext {
+        config: load_config(state).await,
+        now: Utc::now(),
+        local_domain: state.config.domain().to_owned(),
+    }
+}
+
 /// One pipeline run: the current configuration preloads into the context,
 /// and the chain answers for the document.
 async fn run_chain(state: &AppState, activity: Value) -> MrfDecision {
-    let config = load_config(state).await;
-    let ctx = MrfContext {
-        config,
-        now: Utc::now(),
-        local_domain: state.config.domain().to_owned(),
-    };
+    let ctx = context(state).await;
     build_chain(ctx.config.as_ref()).apply(&ctx, activity)
 }
 
@@ -479,13 +570,23 @@ mod tests {
     /// The context the chain tests run: nothing a fake policy reads.
     fn ctx() -> MrfContext {
         MrfContext {
-            config: Arc::new(MrfConfig {
-                policies: Vec::new(),
-                params: Map::new(),
-            }),
+            config: Arc::new(MrfConfig::assemble(Vec::new(), Map::new())),
             now: fixed_now(),
             local_domain: "test.example".to_owned(),
         }
+    }
+
+    /// The configuration of `policies` over the parameter document `params`.
+    fn config_with(policies: &[&str], params: &Value) -> MrfConfig {
+        let mut fields: Map<String, Value> = params.as_object().cloned().unwrap_or_default();
+        let _previous = fields.insert(
+            "policies".to_owned(),
+            Value::Array(policies.iter().map(|name| json!(name)).collect()),
+        );
+        MrfConfig::assemble(
+            policies.iter().map(|name| (*name).to_owned()).collect(),
+            fields,
+        )
     }
 
     /// The fixed instant test contexts carry: 2026-11-11T12:00:00Z.
@@ -636,18 +737,133 @@ mod tests {
     /// policy this server does not have yet accepts everything the way an
     /// empty one does.
     #[test]
-    fn build_chain_knows_noop_and_skips_unknown_names() {
-        let config = MrfConfig {
-            policies: vec!["ghost".to_owned(), "noop".to_owned(), "simple".to_owned()],
-            params: Map::new(),
-        };
+    fn build_chain_knows_its_policies_and_skips_unknown_names() {
+        let config = config_with(&["ghost", "noop", "simple"], &Value::Null);
 
         let chain = build_chain(&config);
 
         assert_eq!(
             describe_policies(&chain),
-            vec!["NoOpPolicy".to_owned()],
-            "`noop` built its policy and the unknown names dropped out"
+            vec!["NoOpPolicy".to_owned(), "SimplePolicy".to_owned()],
+            "`noop` and `simple` built their policies in order and the unknown name dropped out"
+        );
+    }
+
+    /// The `simple` arm builds its policy from the domain lists the
+    /// configuration compiled, so the chain and [`MrfConfig::rejected`]
+    /// read one precompilation of one document.
+    #[test]
+    fn the_simple_policy_gets_the_compiled_lists() {
+        let config = config_with(
+            &["simple"],
+            &json!({"simple": {"reject": ["evil.example"]}}),
+        );
+        let mut activity = follow_activity();
+        let _previous = activity
+            .as_object_mut()
+            .expect("the fixture is an object")
+            .insert(
+                "actor".to_owned(),
+                json!("https://evil.example/users/alice"),
+            );
+
+        let decision = build_chain(&config).apply(&ctx(), activity);
+
+        assert!(
+            config.rejected("evil.example"),
+            "the configuration refuses the host"
+        );
+        assert_eq!(
+            decision,
+            MrfDecision::Reject(
+                "[SimplePolicy] the host evil.example is on the `reject` list".to_owned()
+            ),
+            "and so does the policy built from it"
+        );
+    }
+
+    /// [`MrfConfig::rejected`] is the allowlist and the reject list read as
+    /// one fact: a host the `reject` list names, and every host an active
+    /// `accept` list does not name, are refused; the local domain and the
+    /// configured peers are not.
+    #[test]
+    fn rejected_answers_from_the_domain_lists() {
+        let reject = config_with(
+            &["simple"],
+            &json!({"simple": {"reject": ["*.evil.example"]}}),
+        );
+        assert!(reject.rejected("evil.example"), "the apex of the list");
+        assert!(
+            reject.rejected("cdn.evil.example"),
+            "and everything below it"
+        );
+        assert!(
+            !reject.rejected("friend.example"),
+            "a host no list names is free"
+        );
+
+        let allowlist = config_with(
+            &["simple"],
+            &json!({"simple": {"accept": [["peer.example", "our only peer"]]}}),
+        );
+        assert!(
+            !allowlist.rejected("peer.example"),
+            "the listed peer federates"
+        );
+        assert!(
+            allowlist.rejected("test.example"),
+            "allowlist mode federates with nobody else — not even this instance, \
+             whose own exemption is the chain's to add"
+        );
+
+        let off = config_with(&["noop"], &json!({"simple": {"reject": ["evil.example"]}}));
+        assert!(
+            !off.rejected("evil.example"),
+            "a configured list behind a disabled policy governs nothing"
+        );
+        let empty = config_with(&["simple"], &Value::Null);
+        assert!(
+            !empty.rejected("anyone.example"),
+            "and no lists at all refuse nobody"
+        );
+    }
+
+    /// The actor stage of the chain: a policy that does not implement
+    /// [`MrfPolicy::filter_actor`] hands the document back, and the one
+    /// that does has its rewrite propagated like any other.
+    #[test]
+    fn the_actor_stage_passes_a_document_through_every_policy() {
+        let person = json!({"id": "https://peer.example/users/alice", "type": "Person"});
+        let empty = PolicyChain {
+            policies: Vec::new(),
+        };
+        assert_eq!(
+            empty.apply_actor(&ctx(), person.clone()),
+            person,
+            "the empty chain hands it back"
+        );
+        let noop = PolicyChain {
+            policies: vec![Box::new(NoOpPolicy)],
+        };
+        assert_eq!(
+            noop.apply_actor(&ctx(), person.clone()),
+            person,
+            "and a policy that says nothing about actors changes nothing"
+        );
+
+        let config = config_with(
+            &["simple"],
+            &json!({"simple": {"avatar_removal": ["peer.example"]}}),
+        );
+        let mut with_avatar = person.clone();
+        let _previous = with_avatar
+            .as_object_mut()
+            .expect("the fixture is an object")
+            .insert("icon".to_owned(), json!("https://peer.example/alice.png"));
+        assert_eq!(
+            build_chain(&config).apply_actor(&ctx(), with_avatar),
+            person,
+            "the domain lists strip the avatar the configuration asks for"
         );
     }
 

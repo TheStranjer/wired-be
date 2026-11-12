@@ -13,6 +13,7 @@
 //!
 //! * [`update_actor`], registered for the five actor object types
 //!   [`parse_actor`] accepts, folds the embedded document through the same
+//!   [`filter_actor`](crate::federation::mrf::filter_actor) and
 //!   parse-and-upsert pair the
 //!   fetcher uses, so profile, keys, endpoints and fields move together —
 //!   plus the two columns that upsert deliberately leaves alone,
@@ -46,6 +47,7 @@ use crate::{
     error::AppError,
     federation::{
         dispatch::{ActivityView, FederationError, Handlers, Outcome},
+        mrf,
         remote_actor::{ActorError, NewRemoteUser, parse_actor, upsert_remote_user},
     },
     jobs::{
@@ -149,7 +151,8 @@ async fn apply_update(
             "an Update inside the minimum interval since the last write",
         ));
     }
-    let parsed = match parse_actor(object) {
+    let document = mrf::filter_actor(&state, object.clone()).await;
+    let parsed = match parse_actor(&document) {
         Ok(parsed) => parsed,
         Err(err) => return refused(err),
     };
@@ -298,6 +301,7 @@ mod tests {
         jobs::AttemptInfo,
         models::{
             follow::{self, Follow},
+            instance_setting,
             status::{self, NewStatus, Status},
             user::{Flag, NewUser, insert},
         },
@@ -562,6 +566,55 @@ mod tests {
         assert!(
             within_update_interval(stored.last_fetched_at),
             "the write is stamped as fresh, which is what arms the flood guard"
+        );
+    }
+
+    /// The MRF actor stage on the inbound half of the mirror: an `Update`
+    /// whose profile the domain lists strip lands without the fields they
+    /// name — the same rewrite a fetch folds, applied to what a peer
+    /// announces about itself.
+    #[tokio::test]
+    async fn an_update_lands_stripped_by_the_mrf_actor_lists() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        instance_setting::set(
+            &pool,
+            "mrf",
+            &json!({
+                "policies": ["simple"],
+                "simple": {"avatar_removal": ["peer.example"], "banner_removal": ["*.example"]},
+            }),
+        )
+        .await
+        .expect("the setting writes");
+        let state = app_state(&pool);
+        let alice = mirror(&pool).await;
+        let alice_id = alice.id;
+        assert!(
+            alice.avatar_url.is_some(),
+            "the fixture mirror holds an avatar to lose"
+        );
+
+        let mut document = person();
+        document["name"] = json!("Alice stripped");
+        document["icon"] = json!({"type": "Image", "url": "https://peer.example/avatar/new.png"});
+        document["image"] = json!({"type": "Image", "url": "https://peer.example/banner.png"});
+
+        let folded =
+            update_actor(state, view("Update", "profile-mrf", ALICE, document), alice).await;
+        assert_handled(&folded);
+
+        let stored = fresh_user(&pool, alice_id).await;
+        assert_eq!(stored.name, "Alice stripped", "the profile still folded");
+        assert!(
+            stored.avatar_url.is_none(),
+            "the avatar the lists strip never reaches the row: {:?}",
+            stored.avatar_url
+        );
+        assert!(
+            stored.banner_url.is_none(),
+            "nor does the banner: {:?}",
+            stored.banner_url
         );
     }
 

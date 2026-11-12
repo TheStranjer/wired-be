@@ -467,9 +467,9 @@ struct Federation {
     mrf_policies: Vec<String>,
     /// Instances whose posts are held back; none is configured.
     quarantined_instances: Vec<String>,
-    /// Whether the MRF transparency lists exclude anything; the shipped
-    /// policies carry no lists, so nothing is excluded (Pleroma derives
-    /// this from `:mrf_simple`).
+    /// Whether the MRF transparency lists exclude anything; no exclusions
+    /// are configured, so every policy publishes its lists whole (Pleroma
+    /// derives this from `:mrf_simple`).
     exclusions: bool,
     /// Each policy's sanitized transparency block under its `mrf_<name>`
     /// key, flattened into this object beside the fixed keys.

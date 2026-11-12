@@ -58,7 +58,7 @@ All configuration comes from environment variables. For local development, copy 
 | `AUTHORIZED_FETCH` | no | `false` | Require a valid HTTP Signature on `GET`s of the ActivityPub actor and collection routes; while off they answer anonymous requests (`true`/`false`, or `1`/`0`) |
 | `FEDERATION_ENABLED` | no | `true` | Whether the instance federates at all; while off every ActivityPub inbox `POST` is refused with 403 `{"error":"Federation is disabled"}` and outbound delivery queues nothing (`true`/`false`, or `1`/`0`) |
 | `ACCEPT_UNSOLICITED_PUBLIC` | no | `true` | Whether public and unlisted remote statuses are stored even from authors no local account follows; while off the ingest path drops such a post unless a local user is mentioned in it or it answers a local status (`private`, `direct` and followers-addressed posts are never gated) (`true`/`false`, or `1`/`0`) |
-| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop` today; policy tickets add more) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` |
+| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
 | `AVATAR_LIMIT_BYTES` | no | `2000000` | Maximum size of the `avatar` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
@@ -95,6 +95,58 @@ All configuration comes from environment variables. For local development, copy 
 | `RATE_LIMITS_ENABLED` | no | `true` | Whether routes that mount a rate-limit bucket throttle their requests; while off they answer uncounted and without `x-ratelimit-*` headers (`true`/`false`, or `1`/`0`) |
 | `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60`; a bucket off the table is unlimited |
 | `TRUST_PROXY_HEADERS` | no | `false` | Let the leftmost `X-Forwarded-For` entry name the client a rate-limit window counts against; while off the socket peer always does (`true`/`false`, or `1`/`0`) |
+
+## Moderation filters (MRF)
+
+Every activity this instance receives or is about to send runs the policy
+chain configured by the `mrf` row of the `instance_settings` table — written
+directly until the admin-API ticket owns it, read cached for 30 s — with
+`MRF_POLICIES` as the fallback list of names:
+
+```json
+{
+  "policies": ["simple"],
+  "simple": {
+    "accept": [["peer.example", "the only instance we talk to"]],
+    "reject": [["*.evil.example", "bots"]],
+    "reject_deletes": ["retired.example"],
+    "federated_timeline_removal": ["noisy.example"],
+    "followers_only": ["press.example"],
+    "media_removal": ["leech.example"],
+    "media_nsfw": ["nsfw.example"],
+    "report_removal": ["spammer.example"],
+    "avatar_removal": ["faceless.example"],
+    "banner_removal": ["loud-banners.example"],
+    "background_removal": ["busy-backgrounds.example"]
+  }
+}
+```
+
+`simple` is Pleroma's `SimplePolicy` (`lib/pleroma/web/activity_pub/mrf/simple_policy.ex`).
+Every list holds domain patterns — an exact host, or `*.example.com` for that
+domain and everything below it, compared case-insensitively — and each entry
+may carry the operator's reason as a `[pattern, reason]` pair. The host a rule
+compares is the host of the activity's `actor`:
+
+| List | Effect |
+|---|---|
+| `accept` | When non-empty, only these hosts federate: every other host's activity is refused, this instance's own domain excepted |
+| `reject` | Every activity from a matching host is refused, deletions included |
+| `reject_deletes` | `Delete` activities from matching hosts are dropped, so what is already stored stays |
+| `federated_timeline_removal` | A matching host's notes lose the public address in `to` and gain it in `cc`: they arrive as unlisted |
+| `followers_only` | The public address goes and the author's followers collection takes it in `to`: the note arrives followers-only |
+| `media_removal` | The `attachment` entries of matching hosts' notes are dropped |
+| `media_nsfw` | Matching hosts' notes that carry attachments are marked `sensitive` |
+| `report_removal` | `Flag` activities (reports) from matching hosts are dropped |
+| `avatar_removal` / `banner_removal` / `background_removal` | `icon` / `image` / `background` are stripped from matching hosts' actor documents, on fetch and on an inbound `Update` |
+
+`reject` and `accept` are also the answer `MrfConfig::rejected` gives the
+inbox extractor, the delivery enqueue and the publisher, so a refused host is
+turned away at the door and never sent anything, exactly as a `reject` row of
+`instance_policy_domains` does. Enabled policies and their lists are
+published in the federation block of `GET /api/v1/instance`,
+`GET /api/v2/instance` and NodeInfo as `SimplePolicy` beside an `mrf_simple`
+transparency object.
 
 ## Development
 

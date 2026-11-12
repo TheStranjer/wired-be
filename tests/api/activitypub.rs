@@ -41,6 +41,7 @@ use wired_be::{
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
+        instance_setting,
         job::Job,
         user::{Flag, NewUser, User},
     },
@@ -54,6 +55,9 @@ use crate::common;
 const ACTIVITY_JSON: &str = "application/activity+json; charset=utf-8";
 /// The instance origin of [`common::test_config`].
 const BASE: &str = "https://test.example";
+/// The host of [`BASE`]: the one a delivery here is signed from, and the
+/// one the reject lists below name.
+const HOST: &str = "test.example";
 /// Public key material a fixture row can be checked against.
 const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIB-FIXTURE\n-----END PUBLIC KEY-----\n";
 /// Every key of an actor document that carries neither avatar nor banner.
@@ -904,4 +908,74 @@ async fn a_disabled_federation_refuses_every_inbox_post() {
         incoming_jobs(&pool).await.is_empty(),
         "a disabled instance queues no activity at all"
     );
+}
+
+/// The `mrf` domain lists gate the inbox the way the instance's own policy
+/// table does: a delivery signed by an actor whose host `simple` rejects —
+/// or one its `accept` allowlist leaves out — is refused with 403
+/// `{"error":"Rejected"}` and queues nothing, while the same lists behind a
+/// policy that is not enabled let it through.
+#[tokio::test]
+async fn a_delivery_from_an_mrf_rejected_host_is_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let signer = instance_signer(&pool).await;
+
+    for lists in [
+        json!({"reject": [[HOST, "bots"]]}),
+        json!({"accept": [["other.example", "the only peer"]]}),
+    ] {
+        set_mrf(&pool, &json!({"policies": ["simple"], "simple": lists})).await;
+        let app = common::test_app(pool.clone());
+        let response = deliver(
+            &app,
+            &signer,
+            "/inbox",
+            &follow(&signer, "https://peer.example/activities/blocked"),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "the lists refuse the signer's host: {lists}"
+        );
+        assert_eq!(
+            response.json_value(),
+            json!({"error": "Rejected"}),
+            "the same body the policy table gives"
+        );
+    }
+    assert!(
+        incoming_jobs(&pool).await.is_empty(),
+        "a refused delivery queues no job"
+    );
+
+    set_mrf(
+        &pool,
+        &json!({"policies": ["noop"], "simple": {"reject": [HOST]}}),
+    )
+    .await;
+    let app = common::test_app(pool.clone());
+    let allowed = deliver(
+        &app,
+        &signer,
+        "/inbox",
+        &follow(&signer, "https://peer.example/activities/allowed"),
+    )
+    .await;
+    assert_eq!(
+        allowed.status,
+        StatusCode::ACCEPTED,
+        "lists behind a policy that is not enabled govern nothing"
+    );
+    assert_eq!(incoming_jobs(&pool).await.len(), 1, "and the job is queued");
+}
+
+/// Writes the `mrf` instance setting: the pipeline reads it (uncached: each
+/// phase of the test builds a fresh state) as its policy chain.
+async fn set_mrf(pool: &PgPool, setting: &Value) {
+    instance_setting::set(pool, "mrf", setting)
+        .await
+        .expect("the mrf setting writes");
 }

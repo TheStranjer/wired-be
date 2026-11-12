@@ -12,11 +12,12 @@
 //! one, registered under [`KIND_DELIVER`] by [`crate::serve`]. Enqueue never
 //! talks to the peer: it refuses an inbox this instance serves itself (the
 //! activity is already here), one that is not an `http(s)` URL, and one whose
-//! host the instance's own policy rejects, and in every one of those cases it
-//! reports `Ok(())` without queueing anything — refusing to federate is not a
-//! failure. While `FEDERATION_ENABLED` is off it is a plain no-op: an
-//! instance that does not federate queues no deliveries at all. The same
-//! `(activity, inbox)` pair is enqueued once: the job's `unique_key`
+//! host the instance refuses — its own policy table or the
+//! [`mrf`] domain lists — and in every one of those
+//! cases it reports `Ok(())` without queueing anything — refusing to
+//! federate is not a failure. While `FEDERATION_ENABLED` is off it is a plain
+//! no-op: an instance that does not federate queues no deliveries at all. The
+//! same `(activity, inbox)` pair is enqueued once: the job's `unique_key`
 //! (`deliver:{activity_id}:{inbox}`) makes the queue's dedup index swallow a
 //! repeated call while a delivery for it is still live.
 //!
@@ -39,15 +40,16 @@ use chrono::Utc;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
     error::{AppError, AppResult},
-    federation::signature::{SignedHeaders, SigningKey, sign_request},
+    federation::{
+        mrf,
+        signature::{SignedHeaders, SigningKey, sign_request},
+    },
     http_client::HttpError,
     jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_FEDERATOR_OUTGOING},
     models::{
@@ -127,15 +129,20 @@ pub fn best_inbox(actor: &User) -> Option<String> {
 /// key `deliver:{activity_id}:{inbox}`, so calling this twice for the same
 /// pair while a delivery is live queues nothing the second time.
 ///
-/// While `config` says federation is off ([`Config::federation_enabled`]),
+/// While the instance's configuration says federation is off
+/// ([`Config::federation_enabled`](crate::config::Config::federation_enabled)),
 /// the call is a no-op: an instance that does not federate sends nothing,
 /// and refusing to federate is not a failure.
 ///
 /// Three inboxes are refused without an error and without a job: one this
 /// instance serves itself (its authority is the actor's own, so the activity
 /// needs no round trip through HTTP), one that is not an `http(s)` URL with a
-/// host, and one whose host [`instance_policy_domain`] rejects.
+/// host, and one whose host the instance refuses — a `reject` row of
+/// [`instance_policy_domain`] or a host its [`mrf`] domain lists reject
+/// ([`MrfConfig::rejected`]).
 ///
+/// [`mrf`]: crate::federation::mrf
+/// [`MrfConfig::rejected`]: crate::federation::mrf::MrfConfig::rejected
 /// [`instance_policy_domain`]: crate::models::instance_policy_domain::is_rejected
 ///
 /// # Errors
@@ -145,13 +152,12 @@ pub fn best_inbox(actor: &User) -> Option<String> {
 /// failure arrives through `?` as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn enqueue_delivery(
-    pool: &PgPool,
-    config: &Config,
+    state: &AppState,
     inbox: &str,
     actor: &User,
     activity: &Value,
 ) -> AppResult<()> {
-    if !config.federation_enabled.get() {
+    if !state.config.federation_enabled.get() {
         debug!(inbox, "delivery skipped: federation is disabled");
         return Ok(());
     }
@@ -164,14 +170,15 @@ pub async fn enqueue_delivery(
         return Ok(());
     }
     let host = target.host_str().unwrap_or_default();
-    if instance_policy_domain::is_rejected(pool, host).await? {
+    let listed = instance_policy_domain::is_rejected(&state.db, host).await?;
+    if listed || mrf::load_config(state).await.rejected(host) {
         debug!(inbox, "delivery refused: instance policy rejects {host}");
         return Ok(());
     }
     let activity_id = activity_id_of(activity)?;
     let unique_key = format!("{UNIQUE_KEY_PREFIX}:{activity_id}:{inbox}");
     let queued = enqueue(
-        pool,
+        &state.db,
         NewJob {
             queue: QUEUE_FEDERATOR_OUTGOING,
             kind: KIND_DELIVER,
@@ -431,8 +438,11 @@ mod tests {
             verify::{SignedRequestParts, parse_signature_header, verify, verify_digest},
         },
         http_client::HttpClient,
-        models::job::Job,
-        models::user::{NewUser, insert, local_ap_id},
+        models::{
+            instance_setting,
+            job::Job,
+            user::{NewUser, insert, local_ap_id},
+        },
         uploads::UploaderBackend,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
@@ -450,7 +460,13 @@ mod tests {
     /// The state under test: `pool`, the test config, and a client that may
     /// reach the loopback mocks.
     fn test_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
+        state_with(pool, Config::for_tests())
+    }
+
+    /// The state under test: `pool` over `config`, with a client that may
+    /// reach the loopback mocks.
+    fn state_with(pool: &PgPool, config: Config) -> AppState {
+        let config = Arc::new(config);
         AppState {
             db: pool.clone(),
             hub: crate::streaming::hub::Hub::new(pool),
@@ -1279,8 +1295,7 @@ mod tests {
         let alice = actor(&pool).await;
 
         enqueue_delivery(
-            &pool,
-            &Config::for_tests(),
+            &test_state(&pool),
             "https://test.example/users/bob/inbox",
             &alice,
             &activity(),
@@ -1307,7 +1322,7 @@ mod tests {
             ("https://spam.example/inbox", 0),
             ("https://quiet.example/inbox", 1),
         ] {
-            enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
+            enqueue_delivery(&test_state(&pool), inbox, &alice, &activity())
                 .await
                 .unwrap();
             assert_eq!(
@@ -1319,13 +1334,49 @@ mod tests {
         }
     }
 
+    /// The MRF domain lists refuse a delivery the way a table row does:
+    /// a host on the `reject` list, and — allowlist mode — every host the
+    /// `accept` list does not name, queue nothing.
+    #[tokio::test]
+    async fn a_domain_the_mrf_lists_reject_is_refused_without_a_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        instance_setting::set(
+            &pool,
+            "mrf",
+            &json!({
+                "policies": ["simple"],
+                "simple": {"reject": ["*.evil.example"], "accept": [["peer.example", "our peer"]]},
+            }),
+        )
+        .await
+        .unwrap();
+        let alice = actor(&pool).await;
+
+        for (inbox, expected) in [
+            ("https://cdn.evil.example/inbox", 0),
+            ("https://peer.example/inbox", 1),
+            ("https://someone-else.example/inbox", 1),
+        ] {
+            enqueue_delivery(&test_state(&pool), inbox, &alice, &activity())
+                .await
+                .unwrap();
+            assert_eq!(
+                job_count(&pool).await,
+                expected,
+                "`{inbox}` leaves the queue at {expected} job(s): the reject list names \
+                 the evil host, the allowlist keeps only the peer"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_non_http_inbox_is_refused_without_a_job() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = actor(&pool).await;
         for inbox in ["ftp://peer.example/inbox", "not a url", "https://", ""] {
-            enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
+            enqueue_delivery(&test_state(&pool), inbox, &alice, &activity())
                 .await
                 .unwrap_or_else(|err| panic!("`{inbox}` refuses without an error: {err}"));
         }
@@ -1340,10 +1391,10 @@ mod tests {
         let alice = actor(&pool).await;
         let inbox = "https://peer.example/inbox";
 
-        enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
+        enqueue_delivery(&test_state(&pool), inbox, &alice, &activity())
             .await
             .unwrap();
-        enqueue_delivery(&pool, &Config::for_tests(), inbox, &alice, &activity())
+        enqueue_delivery(&test_state(&pool), inbox, &alice, &activity())
             .await
             .unwrap();
 
@@ -1372,8 +1423,7 @@ mod tests {
         );
 
         enqueue_delivery(
-            &pool,
-            &Config::for_tests(),
+            &test_state(&pool),
             "https://other.example/inbox",
             &alice,
             &activity(),
@@ -1395,8 +1445,7 @@ mod tests {
         config.federation_enabled = Toggle::new(false);
 
         enqueue_delivery(
-            &pool,
-            &config,
+            &state_with(&pool, config),
             "https://peer.example/inbox",
             &alice,
             &activity(),
@@ -1419,8 +1468,7 @@ mod tests {
         let keyless = json!({"type": "Create"});
 
         let err = enqueue_delivery(
-            &pool,
-            &Config::for_tests(),
+            &test_state(&pool),
             "https://peer.example/inbox",
             &alice,
             &keyless,
