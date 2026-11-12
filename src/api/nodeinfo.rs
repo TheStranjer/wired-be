@@ -30,12 +30,13 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::{
     config::{Config, Toggle},
     error::{AppError, AppResult},
+    federation::mrf,
     models::user::NOT_INSTANCE_ACTOR,
     services::instance_meta,
     state::AppState,
@@ -139,8 +140,27 @@ async fn nodeinfo(
     let users = read_user_counts(&state.db).await?;
     let local_posts = read_local_post_count(&state.db).await?;
     let staff_accounts = read_staff_accounts(&state.db).await?;
-    let document = NodeInfo::build(version, &state.config, users, local_posts, staff_accounts);
+    let federation = federation_block(&state).await;
+    let document = NodeInfo::build(
+        version,
+        &state.config,
+        Usage { users, local_posts },
+        Metadata::build(&state.config, staff_accounts, federation),
+    );
     document_response(version, &document)
+}
+
+/// The `metadata.federation` block as the live [MRF
+/// chain](crate::federation::mrf) describes itself: Pleroma-style policy
+/// names beside each policy's sanitized `mrf_<policy>` transparency
+/// object. The configuration read is the pipeline's own cached one —
+/// the same answer [`crate::api::instance`] serves.
+async fn federation_block(state: &AppState) -> Federation {
+    let chain = mrf::active_chain(state).await;
+    Federation::with_mrf(
+        mrf::describe_policies(&chain),
+        mrf::describe_transparency(&chain),
+    )
 }
 
 /// The two `NodeInfo` schema versions this server documents, the values the
@@ -252,24 +272,19 @@ struct NodeInfo {
 }
 
 impl NodeInfo {
-    /// The document for `version`, describing the instance `config` serves
-    /// with the database-read `users` counts, `local_posts` total and
-    /// `staff_accounts` actor ids.
-    fn build(
-        version: SchemaVersion,
-        config: &Config,
-        users: UserCounts,
-        local_posts: i64,
-        staff_accounts: Vec<String>,
-    ) -> Self {
+    /// The document for `version`, describing the instance `config`
+    /// serves with the database-read `usage` counters and the built
+    /// `metadata` block (its `federation` half reads live state, so the
+    /// endpoint assembles it).
+    fn build(version: SchemaVersion, config: &Config, usage: Usage, metadata: Metadata) -> Self {
         Self {
             version: version.as_str(),
             software: Software::for_version(version),
             protocols: &PROTOCOLS,
             services: Services::empty(),
             open_registrations: config.registrations_open,
-            usage: Usage { users, local_posts },
-            metadata: Metadata::build(config, staff_accounts),
+            usage,
+            metadata,
         }
     }
 }
@@ -406,8 +421,9 @@ struct Metadata {
 
 impl Metadata {
     /// The metadata block of the instance `config` serves, with
-    /// `staff_accounts` as its staff actor ids.
-    fn build(config: &Config, staff_accounts: Vec<String>) -> Self {
+    /// `staff_accounts` as its staff actor ids and the given
+    /// `federation` state.
+    fn build(config: &Config, staff_accounts: Vec<String>, federation: Federation) -> Self {
         Self {
             node_name: config.instance_name.clone(),
             node_description: config.instance_description.clone(),
@@ -416,7 +432,7 @@ impl Metadata {
                 enabled: Toggle::new(false),
             },
             staff_accounts,
-            federation: Federation::federating(),
+            federation,
             poll_limits: PollLimits::for_config(config),
             post_formats: &POST_FORMATS,
             upload_limits: UploadLimits::for_config(config),
@@ -444,25 +460,43 @@ struct Suggestions {
 struct Federation {
     /// Whether this instance federates.
     enabled: bool,
-    /// The moderation rewrite filters in force; this server runs none
-    /// (Pleroma's `mrf, transparency` answer lists its policy modules).
-    mrf_policies: Vec<&'static str>,
+    /// The moderation filters in force, Pleroma-style names in chain
+    /// order (Pleroma's `mrf, transparency` answer lists its policy
+    /// modules; this server reports the [MRF
+    /// chain](crate::federation::mrf)'s own names).
+    mrf_policies: Vec<String>,
     /// Instances whose posts are held back; none is configured.
     quarantined_instances: Vec<String>,
-    /// Whether the MRF transparency lists exclude anything; with no MRF
-    /// there is nothing to exclude (Pleroma derives this from
-    /// `:mrf_simple`).
+    /// Whether the MRF transparency lists exclude anything; the shipped
+    /// policies carry no lists, so nothing is excluded (Pleroma derives
+    /// this from `:mrf_simple`).
     exclusions: bool,
+    /// Each policy's sanitized transparency block under its `mrf_<name>`
+    /// key, flattened into this object beside the fixed keys.
+    #[serde(flatten)]
+    mrf_descriptions: Map<String, Value>,
 }
 
 impl Federation {
-    /// A plain federating instance with no moderation filters.
-    const fn federating() -> Self {
+    /// A plain federating instance with no moderation filters: the block
+    /// an empty chain describes itself as — what the live
+    /// [`federation_block`] collapses to on a chain with no policies.
+    /// Test support for the document builders; production always reads
+    /// the live chain.
+    #[cfg(test)]
+    fn federating() -> Self {
+        Self::with_mrf(Vec::new(), Map::new())
+    }
+
+    /// The block of an instance whose MRF chain reports `policies` and
+    /// the transparency `descriptions` (see [`federation_block`]).
+    const fn with_mrf(policies: Vec<String>, descriptions: Map<String, Value>) -> Self {
         Self {
             enabled: true,
-            mrf_policies: Vec::new(),
+            mrf_policies: policies,
             quarantined_instances: Vec::new(),
             exclusions: false,
+            mrf_descriptions: descriptions,
         }
     }
 }
@@ -684,13 +718,15 @@ mod tests {
         let document = NodeInfo::build(
             version,
             &config,
-            UserCounts {
-                total: 0,
-                active_month: 0,
-                active_halfyear: 0,
+            Usage {
+                users: UserCounts {
+                    total: 0,
+                    active_month: 0,
+                    active_halfyear: 0,
+                },
+                local_posts: 0,
             },
-            0,
-            Vec::new(),
+            Metadata::build(&config, Vec::new(), Federation::federating()),
         );
         serde_json::to_value(&document).unwrap()
     }
@@ -888,13 +924,23 @@ mod tests {
     fn invites_enabled_mirrors_the_config() {
         let mut config = Config::for_tests();
         config.invites_enabled = Toggle::new(true);
-        let on = serde_json::to_value(Metadata::build(&config, Vec::new())).unwrap();
+        let on = serde_json::to_value(Metadata::build(
+            &config,
+            Vec::new(),
+            Federation::federating(),
+        ))
+        .unwrap();
         assert_eq!(
             on["invitesEnabled"], true,
             "INVITES_ENABLED=true is reported"
         );
         config.invites_enabled = Toggle::new(false);
-        let off = serde_json::to_value(Metadata::build(&config, Vec::new())).unwrap();
+        let off = serde_json::to_value(Metadata::build(
+            &config,
+            Vec::new(),
+            Federation::federating(),
+        ))
+        .unwrap();
         assert_eq!(off["invitesEnabled"], false, "and off stays off");
     }
 
@@ -904,13 +950,23 @@ mod tests {
     fn account_activation_required_mirrors_the_config() {
         let mut config = Config::for_tests();
         config.account_activation_required = Toggle::new(true);
-        let on = serde_json::to_value(Metadata::build(&config, Vec::new())).unwrap();
+        let on = serde_json::to_value(Metadata::build(
+            &config,
+            Vec::new(),
+            Federation::federating(),
+        ))
+        .unwrap();
         assert_eq!(
             on["accountActivationRequired"], true,
             "ACCOUNT_ACTIVATION_REQUIRED=true is reported"
         );
         config.account_activation_required = Toggle::new(false);
-        let off = serde_json::to_value(Metadata::build(&config, Vec::new())).unwrap();
+        let off = serde_json::to_value(Metadata::build(
+            &config,
+            Vec::new(),
+            Federation::federating(),
+        ))
+        .unwrap();
         assert_eq!(off["accountActivationRequired"], false, "and off stays off");
     }
 
@@ -920,13 +976,19 @@ mod tests {
         let document = NodeInfo::build(
             SchemaVersion::V20,
             &config,
-            UserCounts {
-                total: 12,
-                active_month: 4,
-                active_halfyear: 9,
+            Usage {
+                users: UserCounts {
+                    total: 12,
+                    active_month: 4,
+                    active_halfyear: 9,
+                },
+                local_posts: 77,
             },
-            77,
-            vec!["https://test.example/users/alice".to_owned()],
+            Metadata::build(
+                &config,
+                vec!["https://test.example/users/alice".to_owned()],
+                Federation::federating(),
+            ),
         );
         let value = serde_json::to_value(&document).unwrap();
         assert_eq!(

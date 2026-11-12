@@ -514,3 +514,30 @@ async fn registrations_toggle_and_shared_metadata_follow_the_builders() {
         "the shared access restrictions"
     );
 }
+
+/// `metadata.federation` reports the live MRF chain — the instance
+/// setting's policy names in Pleroma formatting beside each policy's
+/// `mrf_<policy>` transparency object — the same answer the instance
+/// endpoints give.
+#[tokio::test]
+async fn federation_reports_the_enabled_mrf_policies() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    wired_be::models::instance_setting::set(&pool, "mrf", &json!({"policies": ["noop"]}))
+        .await
+        .expect("the setting writes");
+    let app = common::test_app(pool);
+    let document = get_document(&app, "/nodeinfo/2.0").await;
+    let federation = &document["metadata"]["federation"];
+    assert_eq!(
+        federation["mrf_policies"],
+        json!(["NoOpPolicy"]),
+        "the chain's names in Pleroma formatting"
+    );
+    assert_eq!(
+        federation["mrf_noop"],
+        json!({}),
+        "the shipped policy describes itself empty"
+    );
+    assert_eq!(federation["enabled"], true, "still federating");
+}

@@ -201,8 +201,10 @@ mod tests {
         assert_eq!(outcome.rows_affected(), 1, "the expiry update hit the row");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn create_round_trips_the_stored_row(pool: PgPool) {
+    #[tokio::test]
+    async fn create_round_trips_the_stored_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let alice = insert_user(&pool, "alice").await;
         let app = insert_app(&pool, "Client").await;
         let authorization = oauth_token::create_authorization(&pool, alice.id, app.id, "read")
@@ -241,8 +243,10 @@ mod tests {
         assert!(unlinked.authorization_id.is_none(), "NULL links nothing");
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn unknown_and_expired_challenges_are_none(pool: PgPool) {
+    #[tokio::test]
+    async fn unknown_and_expired_challenges_are_none() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let bob = insert_user(&pool, "bob").await;
         let token = create(&pool, bob.id, None).await.unwrap();
         assert!(
@@ -256,8 +260,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn delete_retires_the_challenge(pool: PgPool) {
+    #[tokio::test]
+    async fn delete_retires_the_challenge() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let carol = insert_user(&pool, "carol").await;
         let token = create(&pool, carol.id, None).await.unwrap();
         delete(&pool, token.id).await.unwrap();
@@ -270,8 +276,10 @@ mod tests {
         delete(&pool, new_id()).await.unwrap();
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn deleting_the_user_or_the_authorization_cascades(pool: PgPool) {
+    #[tokio::test]
+    async fn deleting_the_user_or_the_authorization_cascades() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let dave = insert_user(&pool, "dave").await;
         let app = insert_app(&pool, "Cascade").await;
         let authorization = oauth_token::create_authorization(&pool, dave.id, app.id, "read")
@@ -307,8 +315,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn debug_redacts_the_challenge_token(pool: PgPool) {
+    #[tokio::test]
+    async fn debug_redacts_the_challenge_token() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let erin = insert_user(&pool, "erin").await;
         let token = create(&pool, erin.id, None).await.unwrap();
         let debug = format!("{token:?}");

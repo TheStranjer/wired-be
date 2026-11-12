@@ -21,8 +21,10 @@
 //! [`dispatch`] is what the inbox routes do with it once authenticated —
 //! the `federator.incoming` job handler: normalization, containment, the
 //! dedupe ledger, the policy stage, and the registry of per-type activity
-//! handlers. [`mrf`] is that handler's policy pipeline: the
-//! accept-everything filter chain the MRF tickets will fill in.
+//! handlers. [`mrf`] is that handler's policy pipeline: the filter chain
+//! of [`MrfPolicy`](mrf::MrfPolicy) policies configured by the `mrf`
+//! instance setting — today only its no-op stage, with the MRF policy
+//! tickets registering one name each.
 //! [`note_parser`] is the dispatcher's pure
 //! front end for objects: the reader that turns a received `Note`-family object into
 //! the parts of a status. [`note`] is the way back out for statuses: the

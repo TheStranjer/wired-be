@@ -260,6 +260,10 @@ pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
 /// while off the `ActivityPub` inbox routes answer 403 and outbound
 /// delivery queues nothing.
 pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
+/// Environment variable holding the comma-separated list of MRF policy
+/// names enabled without any `mrf` instance setting: the fallback of
+/// [`crate::federation::mrf`]'s configuration load.
+pub const MRF_POLICIES_VAR: &str = "MRF_POLICIES";
 /// Environment variable holding whether routes that mount a rate-limit
 /// bucket throttle their requests.
 pub const RATE_LIMITS_ENABLED_VAR: &str = "RATE_LIMITS_ENABLED";
@@ -1212,6 +1216,10 @@ pub struct Config {
     /// and [`enqueue_delivery`](crate::federation::delivery::enqueue_delivery)
     /// queues nothing (see [`crate::federation::delivery`]).
     pub federation_enabled: Toggle,
+    /// The MRF policy names from `MRF_POLICIES` (comma list): the fallback
+    /// chain configuration of [`crate::federation::mrf`], used whenever
+    /// the `mrf` instance setting carries no `policies` array of its own.
+    pub mrf_policies: Vec<String>,
     /// The rate limiter settings, from `RATE_LIMITS_ENABLED`, `RATE_LIMITS`
     /// and `TRUST_PROXY_HEADERS` (see [`crate::rate_limit`]).
     pub rate_limit: RateLimitConfig,
@@ -1314,6 +1322,7 @@ impl Config {
             sign_fetches,
             authorized_fetch,
             federation_enabled: federation_enabled(&lookup)?,
+            mrf_policies: mrf_policies(&lookup),
             rate_limit: rate_limit_settings(&lookup)?,
         })
     }
@@ -1464,6 +1473,7 @@ impl Config {
             sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
+            mrf_policies: Vec::new(),
             rate_limit: RateLimitConfig {
                 enabled: Toggle::new(false),
                 limits: rate_limit::default_limits(),
@@ -2044,6 +2054,16 @@ where
     Ok(boolean(lookup, FEDERATION_ENABLED_VAR, DEFAULT_FEDERATION_ENABLED)?.into())
 }
 
+/// Reads `MRF_POLICIES`: the comma-separated list of MRF policy names
+/// enabled without a database setting, empty when unset or blank (see
+/// [`crate::federation::mrf`]).
+fn mrf_policies<F>(lookup: &F) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    comma_list(&lookup(MRF_POLICIES_VAR).unwrap_or_default())
+}
+
 /// What [`text_length_limits`] reads: the four default-or-parse profile
 /// limits, named by what they cap and hung on the [`Config`] fields in
 /// [`Config::from_lookup`] (`MAX_MEDIA_DESCRIPTION`,
@@ -2575,12 +2595,12 @@ impl fmt::Debug for Config {
         let purge_days = &self.purge_deleted_statuses_days;
         let ping_secs = &self.streaming_ping_interval_secs;
         // Bound for the same reason: these two names with their `self`
-        // paths pass rustfmt's call width and would otherwise split over
-        // three lines, together pushing the function past Clippy's line
-        // budget.
+        // paths pass rustfmt's call width and would split over three
+        // lines each, pushing the function past Clippy's line budget.
         let max_remote_mention_lookups = &self.max_remote_mention_lookups;
         let max_scheduled_per_day = &self.max_scheduled_per_user_per_day;
-        f.debug_struct("Config")
+        let mut debug = f.debug_struct("Config");
+        let debug = debug
             .field("database_url", &"<redacted>")
             .field("bind_addr", &self.bind_addr)
             .field("base_url", &self.base_url)
@@ -2649,10 +2669,29 @@ impl fmt::Debug for Config {
             .field("translation", &self.translation)
             .field("sign_fetches", &self.sign_fetches)
             .field("authorized_fetch", &self.authorized_fetch)
-            .field("federation_enabled", &self.federation_enabled)
-            .field("rate_limit", &self.rate_limit)
-            .finish()
+            .field("rate_limit", &self.rate_limit);
+        // The federation pair — the toggle and the new policy-name list —
+        // closes the chain from a helper: with all 71 fields in this one
+        // function its body passes Clippy's line budget, and this is the
+        // documented split rather than a loosened lint. The fields stay
+        // named in `fmt`'s body, as the call's arguments.
+        debug_federation(debug, self.federation_enabled, &self.mrf_policies)
     }
+}
+
+/// Completes the [`Config`] `Debug` struct: the federation toggle and the
+/// enabled MRF policy names, then the whole document. Factored out of the
+/// [`Debug`] impl above to hold that function's line count inside
+/// Clippy's budget.
+fn debug_federation(
+    debug: &mut fmt::DebugStruct<'_, '_>,
+    federation_enabled: Toggle,
+    mrf_policies: &[String],
+) -> fmt::Result {
+    debug
+        .field("federation_enabled", &federation_enabled)
+        .field("mrf_policies", &mrf_policies)
+        .finish()
 }
 
 /// A configuration value is missing or invalid.
@@ -3979,6 +4018,40 @@ mod tests {
         assert!(
             debug.contains("authorized_fetch: Toggle(true)"),
             "the authorized-fetch toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    /// `MRF_POLICIES` is unset by default: an instance runs no policy
+    /// chain until a setting or the variable enables one.
+    #[test]
+    fn mrf_policies_default_to_the_empty_chain() {
+        let config = config_with(&[]);
+        assert!(
+            config.mrf_policies.is_empty(),
+            "no MRF policies without MRF_POLICIES or the `mrf` setting"
+        );
+    }
+
+    /// `MRF_POLICIES` is a comma list: trimmed, empties dropped.
+    #[test]
+    fn mrf_policies_parses_a_comma_list() {
+        let config = config_with(&[(MRF_POLICIES_VAR, "simple, keyword ,")]);
+        assert_eq!(
+            config.mrf_policies,
+            vec!["simple".to_owned(), "keyword".to_owned()],
+            "MRF_POLICIES lists the chain in order"
+        );
+    }
+
+    /// `Debug` renders the MRF policy names (through the `Debug` chain's
+    /// federation helper, beside the toggle the helper also prints).
+    #[test]
+    fn debug_shows_the_mrf_policies() {
+        let config = config_with(&[(MRF_POLICIES_VAR, "noop,simple")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains(r#"mrf_policies: ["noop", "simple"]"#),
+            "the policy-name list is visible in Debug output: {debug}"
         );
     }
 

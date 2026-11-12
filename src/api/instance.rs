@@ -45,6 +45,7 @@ use crate::{
     config::{Config, Toggle},
     entities::account::Account,
     error::AppResult,
+    federation::mrf,
     models::{
         instance_policy_domain::{self, InstancePolicyDomain},
         instance_rule,
@@ -263,13 +264,26 @@ async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
     let vapid_key = vapid::vapid_public_key(&state.db).await?;
+    let pleroma = PleromaBlock::build(&state.config, &vapid_key, federation_block(&state).await);
     Ok(Json(Instance::build(
         &state.config,
         &counters,
         &rules,
         contact.as_ref(),
-        &vapid_key,
+        pleroma,
     )))
+}
+
+/// The `pleroma.metadata.federation` block as the live [MRF
+/// chain](crate::federation::mrf) describes itself: Pleroma-style policy
+/// names beside each policy's sanitized `mrf_<policy>` transparency
+/// object. The configuration read is the pipeline's own cached one.
+async fn federation_block(state: &AppState) -> Federation {
+    let chain = mrf::active_chain(state).await;
+    Federation::with_mrf(
+        mrf::describe_policies(&chain),
+        mrf::describe_transparency(&chain),
+    )
 }
 
 /// The [`Instance`] `stats` counters, read live.
@@ -312,11 +326,13 @@ async fn show_instance_v2(State(state): State<AppState>) -> AppResult<Json<Insta
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
     let vapid_key = vapid::vapid_public_key(&state.db).await?;
+    let pleroma = PleromaBlock::build(&state.config, &vapid_key, federation_block(&state).await);
     Ok(Json(InstanceV2::build(
         &state.config,
         &rules,
         contact.as_ref(),
         &vapid_key,
+        pleroma,
     )))
 }
 
@@ -517,7 +533,8 @@ struct Instance {
 impl Instance {
     /// The document for the instance `config` serves, with the cached
     /// `stats` counters, the stored `rules`, `contact` as the account to
-    /// advertise and the instance `vapid_key` in the push places.
+    /// advertise, and the built `pleroma` extension block (the endpoint
+    /// assembles it because its `federation` metadata reads live state).
     ///
     /// Pure (decision 3): every value comes from one of the five inputs
     /// or a documented constant.
@@ -526,7 +543,7 @@ impl Instance {
         stats: &InstanceStats,
         rules: &[InstanceRule],
         contact: Option<&User>,
-        vapid_key: &str,
+        pleroma: PleromaBlock,
     ) -> Self {
         Self {
             uri: config.domain().to_owned(),
@@ -555,7 +572,7 @@ impl Instance {
             banner_upload_limit: BANNER_UPLOAD_LIMIT,
             description_limit: DESCRIPTION_LIMIT,
             configuration: Configuration::for_config(config),
-            pleroma: PleromaBlock::pleroma(config, vapid_key),
+            pleroma,
         }
     }
 }
@@ -756,11 +773,12 @@ struct PleromaBlock {
 
 impl PleromaBlock {
     /// The block of a plain public instance: the shared capability lists
-    /// and `config`'s registration modes, the instance's
-    /// `vapid_public_key`, and the zeroed extra counters.
-    fn pleroma(config: &Config, vapid_public_key: &str) -> Self {
+    /// and `config`'s registration modes with the live `federation`
+    /// state, the instance's `vapid_public_key`, and the zeroed extra
+    /// counters.
+    fn build(config: &Config, vapid_public_key: &str, federation: Federation) -> Self {
         Self {
-            metadata: PleromaMetadata::build(config),
+            metadata: PleromaMetadata::build(config, federation),
             stats: PleromaStats {
                 mau: MONTHLY_ACTIVE_USERS,
             },
@@ -807,15 +825,15 @@ struct PleromaMetadata {
 
 impl PleromaMetadata {
     /// The metadata of a plain public instance: the shared feature and
-    /// access lists, no moderation filters, Pleroma's shipped limits, and
-    /// `config`'s activation mode.
-    fn build(config: &Config) -> Self {
+    /// access lists, no moderation filters, Pleroma's shipped limits,
+    /// `config`'s activation mode, and the given `federation` state.
+    fn build(config: &Config, federation: Federation) -> Self {
         Self {
             account_activation_required: config.account_activation_required.get(),
             birthday_required: false,
             birthday_min_age: 0,
             features: instance_meta::features(),
-            federation: Federation::federating(),
+            federation,
             fields_limits: FieldsLimits::pleroma_defaults(),
             post_formats: &POST_FORMATS,
             restrict_unauthenticated: instance_meta::restrict_unauthenticated(),
@@ -824,29 +842,48 @@ impl PleromaMetadata {
     }
 }
 
-/// The `pleroma.metadata.federation` block — the same shape and answer
-/// `NodeInfo` reports (a plain federating instance with no MRF).
+/// The `pleroma.metadata.federation` block — the same shape `NodeInfo`
+/// reports: a federating instance plus whatever the live MRF chain
+/// describes itself as.
 #[derive(Debug, Serialize)]
 struct Federation {
     /// Whether this instance federates.
     enabled: bool,
-    /// The moderation rewrite filters in force; this server runs none.
-    mrf_policies: Vec<&'static str>,
+    /// The moderation filters in force, Pleroma-style names in chain
+    /// order (the [MRF](crate::federation::mrf) chain's
+    /// [`describe_policies`](crate::federation::mrf::describe_policies)).
+    mrf_policies: Vec<String>,
     /// Instances whose posts are held back; none is configured.
     quarantined_instances: Vec<&'static str>,
-    /// Whether the MRF transparency lists exclude anything; with no MRF
-    /// there is nothing to exclude.
+    /// Whether the MRF transparency lists exclude anything; the shipped
+    /// policies carry no lists, so nothing is excluded.
     exclusions: bool,
+    /// Each policy's sanitized transparency block under its `mrf_<name>`
+    /// key, flattened into this object beside the fixed keys.
+    #[serde(flatten)]
+    mrf_descriptions: Map<String, Value>,
 }
 
 impl Federation {
-    /// A plain federating instance with no moderation filters.
-    const fn federating() -> Self {
+    /// A plain federating instance with no moderation filters: the block
+    /// an empty chain describes itself as — what the live
+    /// [`federation_block`] collapses to on a
+    /// chain with no policies. Test support for the document builders;
+    /// production always reads the live chain.
+    #[cfg(test)]
+    fn federating() -> Self {
+        Self::with_mrf(Vec::new(), Map::new())
+    }
+
+    /// The block of an instance whose MRF chain reports `policies` and
+    /// the transparency `descriptions` (see [`federation_block`](federation_block)).
+    const fn with_mrf(policies: Vec<String>, descriptions: Map<String, Value>) -> Self {
         Self {
             enabled: true,
-            mrf_policies: Vec::new(),
+            mrf_policies: policies,
             quarantined_instances: Vec::new(),
             exclusions: false,
+            mrf_descriptions: descriptions,
         }
     }
 }
@@ -953,17 +990,19 @@ struct InstanceV2 {
 
 impl InstanceV2 {
     /// The document for the instance `config` serves, with the stored
-    /// `rules`, `contact` as the account to advertise and the instance
-    /// `vapid_key` in the push places. The `usage` counter needs no
-    /// database read while no activity counter exists.
+    /// `rules`, `contact` as the account to advertise, the instance
+    /// `vapid_key` in the push places, and the built `pleroma` extension
+    /// block (its `federation` metadata reads live state). The `usage`
+    /// counter needs no database read while no activity counter exists.
     ///
-    /// Pure (decision 3): every value comes from one of the four inputs
+    /// Pure (decision 3): every value comes from one of the five inputs
     /// or a documented constant.
     fn build(
         config: &Config,
         rules: &[InstanceRule],
         contact: Option<&User>,
         vapid_key: &str,
+        pleroma: PleromaBlock,
     ) -> Self {
         Self {
             domain: config.domain().to_owned(),
@@ -978,7 +1017,7 @@ impl InstanceV2 {
             registrations: RegistrationsV2::for_config(config),
             contact: Contact::build(config, contact),
             rules: rules.iter().map(Rule::from_model).collect(),
-            pleroma: PleromaBlock::pleroma(config, vapid_key),
+            pleroma,
         }
     }
 }
@@ -1306,6 +1345,15 @@ mod tests {
     /// `instance_secrets`; the endpoints read the real one.
     const TEST_VAPID_KEY: &str = "BTESTvapidPUBLICkey_TEST";
 
+    /// The `pleroma` block the document builders are tested with: the one
+    /// `config` produces with the stand-in [`TEST_VAPID_KEY`] and a
+    /// plain, filter-free federation state — the endpoints describe the
+    /// live [MRF chain](crate::federation::mrf) instead, which is empty
+    /// on the test configuration.
+    fn pleroma_block(config: &Config) -> PleromaBlock {
+        PleromaBlock::build(config, TEST_VAPID_KEY, Federation::federating())
+    }
+
     /// A fixed instant for the rules fixture rows; the timestamps are not
     /// part of the document, so any valid one works.
     fn stamped() -> DateTime<Utc> {
@@ -1333,7 +1381,14 @@ mod tests {
             statuses: 0,
             domains: 0,
         };
-        serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY)).unwrap()
+        serde_json::to_value(Instance::build(
+            &config,
+            &stats,
+            &[],
+            None,
+            pleroma_block(&config),
+        ))
+        .unwrap()
     }
 
     /// The sorted object keys of `value`, for key-set assertions.
@@ -1522,15 +1577,27 @@ mod tests {
         };
         let mut config = Config::for_tests();
         config.invites_enabled = Toggle::new(true);
-        let on = serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
-            .unwrap();
+        let on = serde_json::to_value(Instance::build(
+            &config,
+            &stats,
+            &[],
+            None,
+            pleroma_block(&config),
+        ))
+        .unwrap();
         assert_eq!(
             on["invites_enabled"], true,
             "INVITES_ENABLED=true is advertised"
         );
         config.invites_enabled = Toggle::new(false);
-        let off = serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
-            .unwrap();
+        let off = serde_json::to_value(Instance::build(
+            &config,
+            &stats,
+            &[],
+            None,
+            pleroma_block(&config),
+        ))
+        .unwrap();
         assert_eq!(off["invites_enabled"], false, "and the off state stays off");
     }
 
@@ -1549,11 +1616,22 @@ mod tests {
         for (approval, activation) in [(false, false), (true, false), (false, true), (true, true)] {
             config.registrations_approval_required = Toggle::new(approval);
             config.account_activation_required = Toggle::new(activation);
-            let v1 =
-                serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
-                    .unwrap();
-            let v2 = serde_json::to_value(InstanceV2::build(&config, &[], None, TEST_VAPID_KEY))
-                .unwrap();
+            let v1 = serde_json::to_value(Instance::build(
+                &config,
+                &stats,
+                &[],
+                None,
+                pleroma_block(&config),
+            ))
+            .unwrap();
+            let v2 = serde_json::to_value(InstanceV2::build(
+                &config,
+                &[],
+                None,
+                TEST_VAPID_KEY,
+                pleroma_block(&config),
+            ))
+            .unwrap();
             assert_eq!(
                 v1["approval_required"], approval,
                 "v1 approval_required follows REGISTRATIONS_APPROVAL_REQUIRED={approval}"
@@ -1694,9 +1772,14 @@ mod tests {
             statuses: 11,
             domains: 3,
         };
-        let document =
-            serde_json::to_value(Instance::build(&config, &stats, &[], None, TEST_VAPID_KEY))
-                .unwrap();
+        let document = serde_json::to_value(Instance::build(
+            &config,
+            &stats,
+            &[],
+            None,
+            pleroma_block(&config),
+        ))
+        .unwrap();
         assert_eq!(
             document["uri"], "snatter.example:4000",
             "the domain with port"
@@ -1759,14 +1842,21 @@ mod tests {
             statuses: 0,
             domains: 0,
         };
-        Instance::build(&config, &stats, rules, None, TEST_VAPID_KEY)
+        Instance::build(&config, &stats, rules, None, pleroma_block(&config))
     }
 
     /// The empty-instance v2 document on the test config: zeroed usage,
     /// no rules, no contact.
     fn empty_document_v2() -> Value {
         let config = Config::for_tests();
-        serde_json::to_value(InstanceV2::build(&config, &[], None, TEST_VAPID_KEY)).unwrap()
+        serde_json::to_value(InstanceV2::build(
+            &config,
+            &[],
+            None,
+            TEST_VAPID_KEY,
+            pleroma_block(&config),
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -1924,8 +2014,14 @@ mod tests {
         config.max_poll_options = 12;
         config.upload_limits.max_file_bytes = 1_048_576;
         config.registrations_open = Toggle::new(false);
-        let document =
-            serde_json::to_value(InstanceV2::build(&config, &[], None, TEST_VAPID_KEY)).unwrap();
+        let document = serde_json::to_value(InstanceV2::build(
+            &config,
+            &[],
+            None,
+            TEST_VAPID_KEY,
+            pleroma_block(&config),
+        ))
+        .unwrap();
         assert_eq!(
             document["domain"], "snatter.example:4000",
             "the domain with port"

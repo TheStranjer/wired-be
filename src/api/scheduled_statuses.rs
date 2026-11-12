@@ -434,6 +434,7 @@ mod tests {
             http_client: HttpClient::from(config.as_ref()),
             uploader: UploaderBackend::from(config.as_ref()),
             instance_stats_cache: std::sync::Arc::default(),
+            mrf_config_cache: std::sync::Arc::default(),
             translation_languages_cache: std::sync::Arc::default(),
             rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::from_config(
                 config.as_ref(),
