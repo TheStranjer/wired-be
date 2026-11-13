@@ -169,6 +169,11 @@ mod mutes;
 /// NodeInfo (`/.well-known/nodeinfo` and `/nodeinfo/{version}`).
 mod nodeinfo;
 
+/// Federated note edits and deletions over HTTP: inbound `Update` and
+/// `Delete` activities run through the real dispatcher and what the status,
+/// its history, its poll and its parent's counter then say.
+mod note_edits;
+
 /// Notification generation over HTTP: the follow, mention, reblog and
 /// favourite actions and the recipient's `GET /api/v1/notifications`.
 mod notification_generation;

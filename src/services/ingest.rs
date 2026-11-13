@@ -274,7 +274,11 @@ async fn resolve_quote(
 /// status, each under its own [`MENTION_LOOKUP_TIMEOUT`] — and whatever is
 /// still unknown afterwards is dropped: the mention stays text, the post
 /// stands.
-async fn resolve_mentions(
+///
+/// The inbound edit handler resolves an edited post's mentions through this
+/// same function ([`crate::federation::handlers::note`]), so a mention the
+/// edit adds lands on exactly the account the create's path would find.
+pub(crate) async fn resolve_mentions(
     state: &AppState,
     hrefs: &[String],
 ) -> Result<Vec<User>, FederationError> {
@@ -453,7 +457,11 @@ async fn write_ingested(
 /// proxy mirrors from) and `url` (what the entity serves until it has),
 /// with the stated content type, description, `blurhash` and dimensions
 /// kept as the parse read them. `position` is the document order.
-async fn insert_media(
+///
+/// The inbound edit handler writes an edited post's attachments through this
+/// same function ([`crate::federation::handlers::note`]), so a mirror's
+/// media looks the same whichever activity brought it.
+pub(crate) async fn insert_media(
     conn: &mut PgConnection,
     status_id: Uuid,
     attachments: &[ParsedAttachment],
@@ -489,7 +497,11 @@ async fn insert_media(
 /// a mirrored poll carries the counts the remote reported: each option its
 /// `replies.totalItems`, the poll its `votersCount` and the options' sum.
 /// A document that carried no poll writes nothing here.
-async fn insert_poll(
+///
+/// The inbound edit handler grows a poll on a mirrored `Question` that
+/// arrived without one through this same arm
+/// ([`crate::federation::handlers::note`]).
+pub(crate) async fn insert_poll(
     conn: &mut PgConnection,
     status_id: Uuid,
     question: Option<&ParsedPoll>,

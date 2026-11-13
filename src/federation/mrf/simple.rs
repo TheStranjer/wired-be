@@ -675,7 +675,7 @@ fn refusal_text(list: List, host: &str, reason: Option<&Reason>) -> String {
     } else {
         "is on"
     };
-    let suffix = reason.map(Reason::suffix).unwrap_or_default();
+    let suffix = reason.map_or_default(Reason::suffix);
     format!(
         "[SimplePolicy] the host {host} {relation} the `{}` list{suffix}",
         list.key()

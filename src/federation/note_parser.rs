@@ -406,8 +406,7 @@ fn object_id(json: &Value) -> Result<(String, String), ParseError> {
 fn check_containment(json: &Value, author: &User, id_host: &str) -> Result<(), ParseError> {
     let attributed = json
         .get("attributedTo")
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or_default(as_array)
         .iter()
         .find_map(value_or_id)
         .ok_or_else(|| {
@@ -577,8 +576,7 @@ fn parse_visibility(json: &Value, author: &User) -> Visibility {
 /// [`value_or_id`].
 fn recipients(json: &Value, field: &str) -> Vec<String> {
     json.get(field)
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or_default(as_array)
         .iter()
         .filter_map(value_or_id)
         .collect()
@@ -606,8 +604,7 @@ fn parse_tags(json: &Value, author: &User) -> TagSets {
     let mut sets = TagSets::default();
     for entry in json
         .get("tag")
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or_default(as_array)
         .iter()
         .take(MAX_TAGS)
     {
@@ -648,8 +645,7 @@ fn parse_emoji(entry: &Value, author: &User) -> Option<RemoteEmoji> {
     }
     let url = entry
         .get("icon")
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or_default(as_array)
         .iter()
         .filter_map(first_string)
         .find(|candidate| is_http_url(candidate))?;
@@ -664,8 +660,7 @@ fn parse_emoji(entry: &Value, author: &User) -> Option<RemoteEmoji> {
 /// document order.
 fn parse_attachments(json: &Value) -> Vec<ParsedAttachment> {
     json.get("attachment")
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or_default(as_array)
         .iter()
         .filter_map(parse_attachment)
         .take(MAX_ATTACHMENTS)
@@ -757,7 +752,7 @@ pub(crate) fn pixel_dimension(value: Option<&Value>) -> Option<i32> {
 /// width the media columns store, so strings and other shapes drop the
 /// axis rather than failing the entry.
 fn focal_point(value: Option<&Value>) -> (Option<f32>, Option<f32>) {
-    let points = value.map(as_array).unwrap_or_default();
+    let points = value.map_or_default(as_array);
     let axis = |index: usize| {
         points
             .get(index)
