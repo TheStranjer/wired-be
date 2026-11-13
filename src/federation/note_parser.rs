@@ -742,8 +742,9 @@ fn guess_content_type(url: &str) -> Option<String> {
 }
 
 /// A positive whole pixel measure, `None` for a missing, non-numeric,
-/// zero, negative or unrepresentable value.
-fn pixel_dimension(value: Option<&Value>) -> Option<i32> {
+/// zero, negative or unrepresentable value. Also read by the chat handler,
+/// whose attachment entries state dimensions the same way.
+pub(crate) fn pixel_dimension(value: Option<&Value>) -> Option<i32> {
     let whole = value?.as_i64()?;
     if whole <= 0 {
         return None;

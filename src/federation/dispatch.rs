@@ -359,6 +359,15 @@ impl Handlers {
         self.create_by_object_type.contains_key(object_type)
     }
 
+    /// Whether the `Delete` sub-registry claims `object_type` — the
+    /// [`handles_create`](Self::handles_create) question one level deeper,
+    /// for the handler modules that register both arms of a type.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn handles_delete(&self, object_type: &str) -> bool {
+        self.delete_by_object_type.contains_key(object_type)
+    }
+
     /// Sets the fallback the `Delete` route reaches when no entry of the
     /// `delete_by_object_type` table claims the delivered object.
     pub fn register_delete_fallback(&mut self, handler: HandlerFn) {
@@ -1157,13 +1166,14 @@ mod tests {
         );
     }
 
-    /// The live registry holds the actor routes and the note-create routes
-    /// and nothing else: the `Update` table is keyed by the five actor
-    /// object types, `Delete` runs through the fallback that resolves an
-    /// object id, and the `Create` table is keyed by the eight
-    /// `Note`-family object types the parser accepts. The object-type
-    /// tables are also the entry points later tickets add their own keys
-    /// to.
+    /// The live registry holds the actor routes, the note-create routes and
+    /// the chat routes and nothing else: the `Update` table is keyed by the
+    /// five actor object types, `Delete` runs through the object-type entry
+    /// the chat handler claims and the fallback that resolves an object id,
+    /// and the `Create` table is keyed by the eight `Note`-family object
+    /// types the parser accepts plus the chat handler's `ChatMessage`. The
+    /// object-type tables are also the entry points later tickets add their
+    /// own keys to.
     #[test]
     fn the_live_registry_holds_the_actor_routes() {
         let handlers = Handlers::default();
@@ -1187,8 +1197,17 @@ mod tests {
             "and has not"
         );
         assert!(
-            handlers.delete_by_object_type.is_empty(),
-            "no object type claims a Delete yet — the status-delete ticket registers its entry point there"
+            handlers.delete_by_object_type.contains_key("ChatMessage"),
+            "a Delete of an embedded `ChatMessage` withdraws through the chat handler"
+        );
+        assert_eq!(
+            handlers.delete_by_object_type.len(),
+            1,
+            "chat only so far: the status-delete ticket registers its entry beside it"
+        );
+        assert!(
+            !handlers.delete_by_object_type.contains_key("Note"),
+            "and has not"
         );
         assert!(
             handlers.delete_fallback.is_some(),
@@ -1200,10 +1219,14 @@ mod tests {
                 "a Create of a {object_type} folds through the note-ingest handler"
             );
         }
+        assert!(
+            handlers.create_by_object_type.contains_key("ChatMessage"),
+            "and a Create of a `ChatMessage` folds through the chat handler"
+        );
         assert_eq!(
             handlers.create_by_object_type.len(),
-            crate::federation::note_parser::OBJECT_TYPES.len(),
-            "the note family only: later tickets (ChatMessage, polls) add their own keys"
+            crate::federation::note_parser::OBJECT_TYPES.len() + 1,
+            "the note family plus the chat ticket's key: later tickets (polls) add their own"
         );
     }
 

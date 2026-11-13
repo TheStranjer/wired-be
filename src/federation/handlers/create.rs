@@ -114,7 +114,11 @@ async fn apply_create(
 /// and [`json::value_or_id`] settle the cardinality) must equal the
 /// activity's `actor` id. A document without the field names nobody, and
 /// fails the same check.
-fn names_actor(object: &Value, actor: &str) -> bool {
+///
+/// The chat handler shares the rule — a peer may create its own objects, of
+/// whatever family, never somebody else's — so it reaches this through the
+/// module boundary rather than restating it.
+pub(crate) fn names_actor(object: &Value, actor: &str) -> bool {
     object
         .get("attributedTo")
         .map(json::as_array)
@@ -221,7 +225,7 @@ mod tests {
         );
         assert!(
             !handlers.handles_create("ChatMessage"),
-            "and the chat-create ticket has not claimed its key yet"
+            "and this module's table alone stays the note family: the chat handler claims `ChatMessage` beside it"
         );
     }
 

@@ -28,7 +28,8 @@
 //! and the mute exclusions, [`dismiss`] / [`dismiss_all`] / [`dismiss_ids`]
 //! the three dismissal shapes, [`mark_read_through_id`] the read marking
 //! Pleroma's `set_read_up_to` performs, [`delete_for_status`] the
-//! cleanup that takes a deleted status's notifications with it,
+//! cleanup that takes a deleted status's notifications with it (and
+//! [`delete_for_chat_message`] its twin for a withdrawn chat message),
 //! [`already_notified`] the deduplication read [`crate::services::notify`]
 //! asks before telling a recipient the same fact twice, and
 //! [`delete_matching`] the withdrawal write that takes one telling back —
@@ -45,7 +46,7 @@
 //! its group.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
@@ -82,6 +83,12 @@ pub const TYPE_POLL: &str = "poll";
 pub const TYPE_STATUS: &str = "status";
 /// The update type: a post the recipient boosted was edited. Ungrouped.
 pub const TYPE_UPDATE: &str = "update";
+/// The Pleroma chat-mention type: a chat message delivered to its recipient.
+///
+/// Ungrouped, and it names no status — its subject is the
+/// [`chat_message_id`](Notification::chat_message_id) row, which the entity
+/// renders under `chat_message` (Pleroma's `put_chat_message`).
+pub const TYPE_CHAT_MENTION: &str = "pleroma:chat_mention";
 
 /// The types the grouped API merges across notifications.
 ///
@@ -189,6 +196,10 @@ pub struct Notification {
     pub emoji: Option<String>,
     /// The report of a `pleroma:report` notification; `None` otherwise.
     pub report_id: Option<Uuid>,
+    /// The chat message of a `pleroma:chat_mention` notification; `None`
+    /// for every other type. A chat mention names no status: the message
+    /// this key holds is the notification's whole subject.
+    pub chat_message_id: Option<Uuid>,
     /// The stored group key ([`grouped_key`]); `None` exactly when the type
     /// is not groupable.
     pub group_key: Option<String>,
@@ -202,7 +213,8 @@ pub struct Notification {
 }
 
 /// The columns [`create`] writes; the rest are this module's own doing
-/// (the id) or column defaults (`seen`, `dismissed_at`, `inserted_at`).
+/// (the id and the computed group key) or column defaults (`seen`,
+/// `dismissed_at`, `inserted_at`).
 #[derive(Clone, Debug)]
 pub struct NewNotification<'a> {
     /// The recipient account.
@@ -217,21 +229,34 @@ pub struct NewNotification<'a> {
     pub emoji: Option<&'a str>,
     /// The report, for a `pleroma:report`.
     pub report_id: Option<Uuid>,
+    /// The chat message, for a [`TYPE_CHAT_MENTION`].
+    pub chat_message_id: Option<Uuid>,
 }
 
 /// Inserts one notification — its [`grouped_key`] computed from the parts
 /// of `new`, `None` for an ungroupable type — and returns the stored row.
 ///
+/// The executor is the pool or the caller's open transaction, so a telling
+/// that belongs with another write commits together with it — the federation
+/// chat handler inserts the delivered message, its references and this
+/// notification on one [`chat::add_message`](super::chat::add_message)
+/// transaction.
+///
 /// # Errors
 ///
 /// Any database failure (connection, encoding, a foreign key naming no
-/// user or status) arrives as [`AppError::Database`](crate::error::AppError).
-pub async fn create(pool: &PgPool, new: &NewNotification<'_>) -> AppResult<Notification> {
+/// user, status, report or chat message) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn create<'e, E>(executor: E, new: &NewNotification<'_>) -> AppResult<Notification>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let group_key = grouped_key(new.notification_type, new.status_id, new.emoji);
     let row = sqlx::query_as::<_, Notification>(
         "INSERT INTO notifications
-             (id, user_id, from_account_id, type, status_id, emoji, report_id, group_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             (id, user_id, from_account_id, type, status_id, emoji, report_id, chat_message_id,
+              group_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING *",
     )
     .bind(new_id())
@@ -241,8 +266,9 @@ pub async fn create(pool: &PgPool, new: &NewNotification<'_>) -> AppResult<Notif
     .bind(new.status_id)
     .bind(new.emoji)
     .bind(new.report_id)
+    .bind(new.chat_message_id)
     .bind(group_key)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row)
 }
@@ -461,6 +487,26 @@ pub async fn mark_read_through_id(
 pub async fn delete_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<u64> {
     let outcome = sqlx::query("DELETE FROM notifications WHERE status_id = $1")
         .bind(status_id)
+        .execute(pool)
+        .await?;
+    Ok(outcome.rows_affected())
+}
+
+/// Removes every notification about the chat message `chat_message_id`.
+///
+/// The cleanup the federated sender's `Delete` runs beside the message's
+/// withdrawal ([`chat::withdraw`](super::chat::withdraw)): the
+/// `pleroma:chat_mention` telling of a withdrawn message is the one
+/// notification whose whole subject just lost its text, and — like
+/// [`delete_for_status`] — the row survives as a tombstone, so the schema's
+/// `ON DELETE CASCADE` never fires for it either. Returns how many rows went.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn delete_for_chat_message(pool: &PgPool, chat_message_id: Uuid) -> AppResult<u64> {
+    let outcome = sqlx::query("DELETE FROM notifications WHERE chat_message_id = $1")
+        .bind(chat_message_id)
         .execute(pool)
         .await?;
     Ok(outcome.rows_affected())
@@ -1222,6 +1268,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1246,6 +1293,7 @@ mod tests {
                 status_id: None,
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1267,6 +1315,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1331,6 +1380,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1344,6 +1394,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1357,6 +1408,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1400,6 +1452,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1413,6 +1466,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1457,6 +1511,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1470,6 +1525,7 @@ mod tests {
                 status_id: None,
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -1646,6 +1702,7 @@ mod tests {
             status_id: None,
             emoji: None,
             report_id: None,
+            chat_message_id: None,
         }
     }
 
@@ -1793,6 +1850,7 @@ mod tests {
             status_id: None,
             emoji: None,
             report_id: None,
+            chat_message_id: None,
         };
         let err = maybe_notify(pool, &orphan)
             .await
@@ -1867,6 +1925,7 @@ mod tests {
                 status_id,
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -2167,6 +2226,7 @@ mod tests {
                 status_id: Some(status_id),
                 emoji: Some(emoji),
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await
@@ -2403,5 +2463,88 @@ mod tests {
         .await
         .expect("the rerun runs");
         assert_eq!(repeat, 0, "a withdrawn telling withdraws nothing twice");
+    }
+
+    /// A stored chat message from a local `chat-mention-sender` to a local
+    /// `chat-mention-recipient`, beside its two accounts: the subject pair
+    /// of the chat-mention fixtures.
+    async fn chat_mention_subject(pool: &PgPool) -> (user::User, user::User, Uuid) {
+        use crate::{
+            config::TEST_BASE_URL,
+            models::{
+                chat::{self, NewChatMessage},
+                user::{NewUser, insert, local_ap_id},
+            },
+        };
+        let sender = insert(
+            pool,
+            &NewUser::local(
+                "chat-mention-sender",
+                &local_ap_id(TEST_BASE_URL, "chat-mention-sender"),
+            ),
+        )
+        .await
+        .expect("chat sender fixture");
+        let recipient = insert(
+            pool,
+            &NewUser::local(
+                "chat-mention-recipient",
+                &local_ap_id(TEST_BASE_URL, "chat-mention-recipient"),
+            ),
+        )
+        .await
+        .expect("chat recipient fixture");
+        let mut conn = pool.begin().await.expect("a transaction begins");
+        let (message, _, _) = chat::add_message(
+            &mut conn,
+            &sender,
+            &recipient,
+            &NewChatMessage::text("a delivered chat message"),
+        )
+        .await
+        .expect("the chat fixture writes");
+        conn.commit().await.expect("the fixture commits");
+        (sender, recipient, message.id)
+    }
+
+    #[tokio::test]
+    async fn a_chat_mention_names_its_message_and_stays_ungrouped() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (sender, recipient, message_id) = chat_mention_subject(pool).await;
+
+        let row = create(
+            pool,
+            &NewNotification {
+                user_id: recipient.id,
+                from_account_id: sender.id,
+                notification_type: TYPE_CHAT_MENTION,
+                status_id: None,
+                emoji: None,
+                report_id: None,
+                chat_message_id: Some(message_id),
+            },
+        )
+        .await
+        .expect("the chat mention inserts");
+        assert_eq!(
+            row.chat_message_id,
+            Some(message_id),
+            "the message rides on the row"
+        );
+        assert_eq!(row.status_id, None, "and the notification names no status");
+        assert_eq!(row.group_key, None, "the type is not groupable");
+
+        let gone = delete_for_chat_message(pool, message_id)
+            .await
+            .expect("the cleanup runs");
+        assert_eq!(gone, 1, "the telling goes with the message");
+        assert_eq!(
+            delete_for_chat_message(pool, message_id)
+                .await
+                .expect("the rerun runs"),
+            0,
+            "and cleaning twice changes nothing, as with a deleted status"
+        );
     }
 }

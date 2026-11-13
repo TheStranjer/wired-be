@@ -119,11 +119,31 @@ const UNREAD_COUNT_SQL: &str = "SELECT count(*) FROM chat_message_references
      WHERE chat_id = $1 AND unread";
 
 /// The `INSERT` behind [`add_message`]: the id this module mints (decision 4)
-/// and what the caller decided, with `inserted_at` left to the column default.
-/// `RETURNING *` brings the row back with the timestamps the database stamped.
+/// and what the caller decided. `inserted_at` is the caller's when a mirrored
+/// remote message arrived with a `published` time, and the column default
+/// otherwise — `COALESCE` is both of those in one statement. `RETURNING *`
+/// brings the row back with the timestamps the database stamped.
 const INSERT_MESSAGE_SQL: &str = "INSERT INTO chat_messages (
-     id, sender_id, content, raw_text, attachment_media_id, ap_id, idempotency_key
-) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *";
+     id, sender_id, content, raw_text, attachment_media_id, ap_id, idempotency_key, inserted_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now())) RETURNING *";
+
+/// [`message_by_ap_id`]: the stored message under an `ActivityPub` object id,
+/// tombstone included — the row a redelivered `Create` must not duplicate and
+/// the one a federated `Delete` withdraws.
+const MESSAGE_BY_AP_ID_SQL: &str = "SELECT * FROM chat_messages WHERE ap_id = $1";
+
+/// [`message_reference_for_user`]: one participant's view of a message named
+/// by the message's own id rather than by the reference's — Pleroma's
+/// `MessageReference.for_chat_and_object`, whose `chat` is read as "the
+/// viewer's chat holding this message" instead of by id. The columns are
+/// [`REFERENCE_SELECT_SQL`]'s, with the `chats` join added for the owner.
+const USER_REFERENCE_SQL: &str = "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
+           m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
+           m.idempotency_key, m.inserted_at AS message_inserted_at
+      FROM chat_message_references r
+      JOIN chat_messages m ON m.id = r.message_id
+      JOIN chats uc ON uc.id = r.chat_id
+     WHERE uc.user_id = $1 AND r.message_id = $2";
 
 /// One side's link between a chat and a message. `ON CONFLICT DO NOTHING` keeps
 /// a redelivered message from being listed twice in the same chat; the row is
@@ -310,6 +330,10 @@ pub struct NewChatMessage {
     /// The `Idempotency-Key` of the request that creates this message, kept
     /// for [`sender_reference_for_key`]'s replay; `None` posts as usual.
     pub idempotency_key: Option<String>,
+    /// The message's creation time: the `published` timestamp a mirrored
+    /// remote message arrived with. `None` lets the database stamp `now()`,
+    /// which is what every locally posted message gets.
+    pub inserted_at: Option<DateTime<Utc>>,
 }
 
 impl NewChatMessage {
@@ -326,6 +350,7 @@ impl NewChatMessage {
             attachment_media_id: None,
             ap_id: None,
             idempotency_key: None,
+            inserted_at: None,
         }
     }
 }
@@ -655,6 +680,73 @@ pub async fn delete_message_for(pool: &PgPool, user_id: Uuid, ref_id: Uuid) -> A
     Ok(true)
 }
 
+/// The stored message whose [`ap_id`](ChatMessage::ap_id) is `ap_id`,
+/// tombstone included, `None` when this instance never imported the object.
+///
+/// This is the federation dedupe read: a live row means a second `Create` of
+/// the same object restates a delivered message, and a tombstone means a
+/// withdrawn one is never re-imported (its `ap_id` stays reserved, see the
+/// column's note in the migration).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn message_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<ChatMessage>> {
+    let message = sqlx::query_as::<_, ChatMessage>(MESSAGE_BY_AP_ID_SQL)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(message)
+}
+
+/// Withdraws message `message_id` — the sender's federated `Delete`: the row
+/// becomes a tombstone exactly like [`delete_message_for`]'s sender arm does.
+///
+/// The answer says whether *this* call struck (`false` when the message is
+/// withdrawn already, which keeps a redelivered `Delete` idempotent). Both
+/// participants' references survive and read the absence through
+/// [`messages_page`]'s live filter.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn withdraw(pool: &PgPool, message_id: Uuid) -> AppResult<bool> {
+    let stamped = sqlx::query(SOFT_DELETE_MESSAGE_SQL)
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+    Ok(stamped.rows_affected() > 0)
+}
+
+/// `user_id`'s own view of `message_id`: the reference their chat holds to the
+/// message, `None` when the pair has no chat or the user took the message out
+/// of their list.
+///
+/// The id the reference answers by is the *reader's*, which is why
+/// [`crate::entities::notification`] expands a `pleroma:chat_mention` through
+/// this read rather than through any id the notification itself stores —
+/// Pleroma's `put_chat_message` asks the same `for_chat_and_object` question of
+/// the reading user.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn message_reference_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    message_id: Uuid,
+) -> AppResult<Option<ChatMessageReference>> {
+    let reference = sqlx::query_as::<_, ChatMessageReference>(USER_REFERENCE_SQL)
+        .bind(user_id)
+        .bind(message_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(reference)
+}
+
 /// Marks the messages of chat `chat_id` read, up to and including reference
 /// `last_read_id`, and returns how many references went from unread to read.
 ///
@@ -775,6 +867,7 @@ async fn write_message(
         .bind(new_message.attachment_media_id)
         .bind(new_message.ap_id.as_deref())
         .bind(new_message.idempotency_key.as_deref())
+        .bind(new_message.inserted_at)
         .fetch_one(conn)
         .await?;
     Ok(message)
@@ -2364,6 +2457,126 @@ mod tests {
                 .attachment_media_id
                 .is_none(),
             "only its attachment is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mirrored_message_keeps_the_published_time_it_arrived_with() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let published = DateTime::parse_from_rfc3339("2024-05-01T10:00:00Z")
+            .expect("the fixture time")
+            .with_timezone(&Utc);
+        let new = NewChatMessage {
+            ap_id: Some("https://remote.example/objects/old-chat".to_owned()),
+            inserted_at: Some(published),
+            ..NewChatMessage::text("an old thread surfaces")
+        };
+
+        let (mirrored, _, _) = send_with(&pool, &alice, &bob, &new).await;
+        assert_eq!(
+            mirrored.inserted_at, published,
+            "the remote `published` timestamp is the creation time"
+        );
+
+        let (fresh, _, _) = send(&pool, &alice, &bob, "brand new").await;
+        assert!(
+            fresh.inserted_at <= Utc::now(),
+            "a message that states no time is stamped by the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_by_ap_id_reads_the_live_row_and_its_tombstone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        assert!(
+            message_by_ap_id(&pool, "https://remote.example/objects/missing")
+                .await
+                .unwrap()
+                .is_none(),
+            "an object this instance never imported is no message"
+        );
+
+        let new = NewChatMessage {
+            ap_id: Some("https://remote.example/objects/twice".to_owned()),
+            ..NewChatMessage::text("mirrored")
+        };
+        let (message, _, _) = send_with(&pool, &alice, &bob, &new).await;
+        let found = message_by_ap_id(&pool, "https://remote.example/objects/twice")
+            .await
+            .unwrap()
+            .expect("the mirrored row answers its ActivityPub id");
+        assert_eq!(found.id, message.id, "the same row add_message wrote");
+        assert!(found.deleted_at.is_none(), "and live so far");
+
+        assert!(
+            withdraw(&pool, message.id).await.unwrap(),
+            "the withdrawal strikes a live row"
+        );
+        assert!(
+            !withdraw(&pool, message.id).await.unwrap(),
+            "and finds nothing to do the second time"
+        );
+        let tombstone = message_by_ap_id(&pool, "https://remote.example/objects/twice")
+            .await
+            .unwrap()
+            .expect("the id stays reserved past the delete, so a redelivery cannot re-import");
+        assert!(
+            tombstone.deleted_at.is_some(),
+            "the row survives as a tombstone"
+        );
+        assert!(
+            tombstone.content.is_empty() && tombstone.raw_text.is_empty(),
+            "with its text cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_reference_for_user_reads_each_sides_own_view() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+
+        let (message, alice_ref, bob_ref) = send(&pool, &alice, &bob, "hi bob").await;
+        let bob_ref = bob_ref.expect("bob is local, so his reference exists");
+
+        let as_bob = message_reference_for_user(&pool, bob.id, message.id)
+            .await
+            .unwrap()
+            .expect("bob's side holds the message");
+        assert_eq!(as_bob.id, bob_ref.id, "the reader's own reference id");
+        assert!(as_bob.unread, "which on his side is the unread one");
+
+        let as_alice = message_reference_for_user(&pool, alice.id, message.id)
+            .await
+            .unwrap()
+            .expect("alice's side holds it too");
+        assert_eq!(
+            as_alice.id, alice_ref.id,
+            "the sender's reference, not the recipient's"
+        );
+        assert!(!as_alice.unread, "and already read");
+
+        assert!(
+            message_reference_for_user(&pool, carol.id, message.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a bystander has no view of somebody else's conversation"
+        );
+        assert!(
+            message_reference_for_user(&pool, bob.id, Uuid::now_v7())
+                .await
+                .unwrap()
+                .is_none(),
+            "and an unknown message answers nothing"
         );
     }
 }

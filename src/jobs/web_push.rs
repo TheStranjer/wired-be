@@ -616,6 +616,7 @@ mod tests {
                 status_id,
                 emoji: None,
                 report_id: None,
+                chat_message_id: None,
             },
         )
         .await

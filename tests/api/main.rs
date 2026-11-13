@@ -64,6 +64,12 @@ mod blocks;
 /// (`/api/v1/statuses/{id}/bookmark` and `GET /api/v1/bookmarks`).
 mod bookmarks;
 
+/// Inbound `Create`/`Delete` of a `ChatMessage` through the federation
+/// dispatcher (`src/federation/handlers/chat.rs`): the chat, message,
+/// unread mark and `pleroma:chat_mention` a delivery lands, and the gates
+/// that refuse it.
+mod chat_federation;
+
 /// The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 twin).
 mod chats;
 

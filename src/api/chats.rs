@@ -683,12 +683,14 @@ async fn chat_recipient(state: &AppState, row: &chat::Chat) -> AppResult<User> {
 /// other end is what fans the message into the pair's chat sockets (the
 /// `chat_message_created` event), into the recipient's notifications, and
 /// out to the recipient's inbox. None of those transports exists here yet —
-/// the streaming, notification and federation tickets own them — so this
-/// hook takes the created [`ChatMessage`] entity as the sender sees it, the
-/// `sender`, and the local-or-remote `recipient` the message is addressed
-/// to, and does nothing until those tickets fill in exactly this one
-/// function.
-const fn after_chat_message_created(
+/// the streaming and federation tickets own them — so this hook takes the
+/// created [`ChatMessage`] entity as the recipient's side sees it (the
+/// posting endpoint passes the sender's own view; the federation chat
+/// handler, [`crate::federation::handlers::chat`], passes the recipient's),
+/// the `sender`, and the local-or-remote `recipient` the message is
+/// addressed to, and does nothing until those tickets fill in exactly this
+/// one function.
+pub(crate) const fn after_chat_message_created(
     _state: &AppState,
     _message: &ChatMessage,
     _sender: &User,

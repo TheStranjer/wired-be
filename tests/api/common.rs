@@ -475,6 +475,7 @@ pub async fn create_notification(
             status_id: status_row.map(|found| found.id),
             emoji: None,
             report_id: None,
+            chat_message_id: None,
         },
     )
     .await
@@ -507,6 +508,7 @@ pub async fn create_reaction(
             status_id: Some(status_row.id),
             emoji: Some(emoji),
             report_id: None,
+            chat_message_id: None,
         },
     )
     .await
