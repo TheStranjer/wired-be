@@ -9,7 +9,8 @@
 //! dismissed-notification sweep, the hourly
 //! OAuth/MFA/password-reset token sweep, the daily jobs-table prune, the
 //! daily deleted-local-status purge, the six-hourly orphaned-local-media
-//! sweep and the daily received-activity-ledger prune; later tickets
+//! sweep, the six-hourly unreachable-host `nodeinfo` probe and the daily
+//! received-activity-ledger prune; later tickets
 //! append one line per entry), and [`run`] ticks every
 //! ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
@@ -109,7 +110,13 @@ pub struct PeriodicJob {
 /// ([`KIND_MEDIA`](super::maintenance::KIND_MEDIA)) shares it too: media
 /// no status, and no chat message, claims within the two-day window is
 /// storage nothing can read back, so the period only decides how long the
-/// file and its row outlive that window. The daily prune of the
+/// file and its row outlive that window. The six-hourly probe of hosts
+/// unreachable longer than a day
+/// ([`KIND_PROBE`](super::instances::KIND_PROBE)),
+/// [`super::instances::handle_probe`], shares it too: a peer whose
+/// `/.well-known/nodeinfo` answers again is delivery material again, and the
+/// period only decides how long a host that recovered quietly stays skipped
+/// by the publisher. The daily prune of the
 /// received-activity ledger
 /// ([`federation.cleanup_received`](crate::federation::dispatch::KIND_CLEANUP_RECEIVED))
 /// shares it too: past two weeks an id is beyond any inbox retry chain
@@ -160,6 +167,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
             kind: super::maintenance::KIND_MEDIA,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_secs(21_600),
+        },
+        PeriodicJob {
+            kind: super::instances::KIND_PROBE,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_hours(6),
         },
         PeriodicJob {
             kind: crate::federation::dispatch::KIND_CLEANUP_RECEIVED,
