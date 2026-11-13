@@ -5,7 +5,11 @@
 //! the remote-actor parser and mirror ([`remote_actor`]), the outbound
 //! [`webfinger_client`] that resolves an `acct:` handle to an actor URL,
 //! [`fetch_actor`], which dereferences remote actor documents over HTTP and
-//! keeps the user mirrors fresh, plus the [`signature`] module holding the
+//! keeps the user mirrors fresh, [`fetch_object`], its object counterpart:
+//! the signed dereference of a remote `Note`-family document, the resolver
+//! that turns such a fetch into a stored status, and the
+//! `federator.backfill` job that walks a fetched reply's ancestry to close
+//! deferred thread links, plus the [`signature`] module holding the
 //! HTTP Signatures (draft-cavage-http-signatures-12) Mastodon and Pleroma
 //! expect on every fetch and delivery, both directions:
 //! [`signature::sign_request`] signs outbound requests, [`signature::verify`]
@@ -54,6 +58,7 @@ pub mod collections;
 pub mod delivery;
 pub mod dispatch;
 pub mod fetch_actor;
+pub mod fetch_object;
 pub mod handlers;
 pub mod inbox_auth;
 pub mod json;

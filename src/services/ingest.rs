@@ -65,8 +65,13 @@
 //!     `unlisted` statuses from authors no local account follows, unless a
 //!     local user is mentioned or the status answers a local one — the
 //!     explicit anti-spam gate, evaluated after mentions and the reply
-//!     link are known and before anything is written.
+//!     link are known and before anything is written;
+//! 11. a created row that carries an unresolved `in_reply_to_ap_id` gets a
+//!     [`federator.backfill`] job on the `background` queue (deduped per
+//!     status id), so the thread closes on its own once the parent is
+//!     fetchable — see [`crate::federation::fetch_object`].
 //!
+//! [`federator.backfill`]: crate::federation::fetch_object::KIND_BACKFILL
 //! Database failures are [`FederationError::Transient`]: the dispatcher
 //! releases the dedupe row and the retry folds the activity again — safe
 //! because the whole write is one transaction and a status committed
@@ -76,7 +81,7 @@ use std::{collections::HashSet, fmt, time::Duration};
 
 use chrono::Utc;
 use futures::future::join_all;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgConnection;
 use tracing::debug;
 use uuid::Uuid;
@@ -85,11 +90,14 @@ use crate::{
     federation::{
         dispatch::FederationError,
         fetch_actor::get_or_fetch_by_ap_id,
+        fetch_object::{BACKFILL_MAX_ATTEMPTS, KIND_BACKFILL, backfill_key},
         note_parser::{self, ParsedAttachment, ParsedNote, ParsedPoll, RemoteEmoji},
     },
+    jobs::QUEUE_BACKGROUND,
     models::{
         custom_emoji::{self, NewCustomEmoji},
         follow,
+        job::{self, NewJob},
         media_attachment::{self, NewMediaAttachment},
         poll::{self, PollParams},
         status::{self, NewStatus, Status, Visibility},
@@ -186,12 +194,42 @@ pub async fn ingest_note(
     let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
     let row = write_ingested(state, &new, &parsed).await?;
     after_status_created(state, &row).await;
+    enqueue_backfill(state, &row).await;
     debug!(
         status = %row.id,
         visibility = %row.visibility,
         "a remote note was ingested"
     );
     Ok(IngestOutcome::Created(row))
+}
+
+/// Step 11: a remote reply stored with an unresolved parent id gets the
+/// [`federator.backfill`] job that closes the thread once the parent can
+/// be fetched (see [`crate::federation::fetch_object`]). A row without a
+/// deferred link has nothing to backfill; an enqueue the database refuses
+/// is logged and swallowed — losing one backfill pass is cheaper than
+/// refusing a post whose row is already committed, and the same unique
+/// key keeps a redelivered `Create` from queueing the work twice.
+///
+/// [`federator.backfill`]: crate::federation::fetch_object::KIND_BACKFILL
+async fn enqueue_backfill(state: &AppState, row: &Status) {
+    let Some(parent_ap_id) = row.in_reply_to_ap_id.as_deref() else {
+        return;
+    };
+    let unique_key = backfill_key(row.id);
+    let args = json!({ "status_id": row.id.to_string(), "depth": 0 });
+    debug!(status = %row.id, parent = %parent_ap_id, "queueing the thread backfill of a deferred reply");
+    let new_job = NewJob {
+        queue: QUEUE_BACKGROUND,
+        kind: KIND_BACKFILL,
+        args,
+        run_at: None,
+        max_attempts: Some(BACKFILL_MAX_ATTEMPTS),
+        unique_key: Some(&unique_key),
+    };
+    if let Err(err) = job::enqueue(&state.db, new_job).await {
+        debug!(status = %row.id, %err, "the backfill enqueue failed");
+    }
 }
 
 /// Step 2: what a repeat sight of `uri` answers — the tombstone's refusal,

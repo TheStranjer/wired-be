@@ -81,7 +81,7 @@ impl HttpClient {
     /// degrades to a rebuilt configuration without that `User-Agent`.
     #[must_use]
     pub fn new(user_agent: &str) -> Self {
-        Self::configured(Some(user_agent), false, TOTAL_TIMEOUT)
+        Self::configured(Some(user_agent), false, TOTAL_TIMEOUT, MAX_REDIRECTS)
     }
 
     /// Builds the client a test talking to local mini-servers needs: the
@@ -91,7 +91,26 @@ impl HttpClient {
     #[cfg(any(test, feature = "integration-tests"))]
     #[must_use]
     pub fn new_for_tests(user_agent: &str) -> Self {
-        Self::configured(Some(user_agent), true, TOTAL_TIMEOUT)
+        Self::configured(Some(user_agent), true, TOTAL_TIMEOUT, MAX_REDIRECTS)
+    }
+
+    /// Builds the client a federation object fetch runs on: the same
+    /// outbound rules as [`new`] (or [`new_for_tests`](Self::new_for_tests)
+    /// when `allow_private` disables the SSRF guard), except that at most
+    /// `max_redirects` redirects are followed instead of [`MAX_REDIRECTS`]
+    /// — the tighter budget [`crate::federation::fetch_object`] keeps.
+    #[must_use]
+    pub(crate) fn with_redirect_limit(
+        user_agent: &str,
+        allow_private: bool,
+        max_redirects: usize,
+    ) -> Self {
+        Self::configured(
+            Some(user_agent),
+            allow_private,
+            TOTAL_TIMEOUT,
+            max_redirects,
+        )
     }
 
     /// Test-only client overriding the total timeout, so a timeout test
@@ -101,24 +120,31 @@ impl HttpClient {
     #[cfg(test)]
     #[must_use]
     fn with_timeout(user_agent: &str, total: Duration) -> Self {
-        Self::configured(Some(user_agent), true, total)
+        Self::configured(Some(user_agent), true, total, MAX_REDIRECTS)
     }
 
     /// Assembles the real client for the given knobs, degrading in two
     /// steps rather than panicking if `reqwest` rejects the configuration
     /// (which only happens for a `User-Agent` no header value can carry).
-    fn configured(user_agent: Option<&str>, allow_private: bool, total: Duration) -> Self {
-        match Self::try_configured(user_agent, allow_private, total) {
+    fn configured(
+        user_agent: Option<&str>,
+        allow_private: bool,
+        total: Duration,
+        max_redirects: usize,
+    ) -> Self {
+        match Self::try_configured(user_agent, allow_private, total, max_redirects) {
             Ok(client) => client,
             Err(err) => {
                 error!(%err, "outbound client rejected its User-Agent; rebuilding without it");
-                Self::try_configured(None, allow_private, total).unwrap_or_else(|fallback| {
-                    error!(%fallback, "outbound client rejected its configuration; using reqwest defaults");
-                    Self {
-                        inner: Client::default(),
-                        ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
-                    }
-                })
+                Self::try_configured(None, allow_private, total, max_redirects).unwrap_or_else(
+                    |fallback| {
+                        error!(%fallback, "outbound client rejected its configuration; using reqwest defaults");
+                        Self {
+                            inner: Client::default(),
+                            ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
+                        }
+                    },
+                )
             }
         }
     }
@@ -126,11 +152,13 @@ impl HttpClient {
     /// Builds the `reqwest` client, installing the SSRF guard — both its
     /// pre-flight half (kept on `Self`) and its connect-time halves (the
     /// pinned DNS resolver and the redirect policy) — unless
-    /// `allow_private` disables it.
+    /// `allow_private` disables it. `max_redirects` caps the redirects
+    /// both policies follow.
     fn try_configured(
         user_agent: Option<&str>,
         allow_private: bool,
         total: Duration,
+        max_redirects: usize,
     ) -> Result<Self, reqwest::Error> {
         let mut builder = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -140,12 +168,12 @@ impl HttpClient {
         }
         let inner = if allow_private {
             builder
-                .redirect(redirect::Policy::limited(MAX_REDIRECTS))
+                .redirect(redirect::Policy::limited(max_redirects))
                 .build()?
         } else {
             builder
                 .dns_resolver(ssrf::SsrfGuard)
-                .redirect(ssrf::redirect_policy())
+                .redirect(ssrf::redirect_policy(max_redirects))
                 .build()?
         };
         Ok(Self {
@@ -281,7 +309,7 @@ impl HttpClient {
 
 /// The [`HttpClient`] the instance ships with: the public origin and
 /// contact email from `config` formatted per [`user_agent`], with the
-/// SSRF guard enabled unless `config.http_allow_private_hosts` (the
+/// SSRF guard enabled unless `config.fetch.http_allow_private_hosts` (the
 /// `HTTP_ALLOW_PRIVATE_HOSTS` environment variable) disables it.
 impl From<&Config> for HttpClient {
     fn from(config: &Config) -> Self {
@@ -290,8 +318,9 @@ impl From<&Config> for HttpClient {
                 &config.base_url,
                 config.contact_email.as_deref(),
             )),
-            config.http_allow_private_hosts,
+            config.fetch.http_allow_private_hosts,
             TOTAL_TIMEOUT,
+            MAX_REDIRECTS,
         )
     }
 }
@@ -769,7 +798,7 @@ mod tests {
         })
         .unwrap();
         assert!(
-            !guarded.http_allow_private_hosts,
+            !guarded.fetch.http_allow_private_hosts,
             "the default config keeps the guard on"
         );
 
@@ -979,7 +1008,7 @@ mod tests {
         // A control character is illegal in a header value, so the builder
         // rejects the configuration; `configured` must degrade, not panic.
         // Guard off: the degraded client still fetches the loopback peer.
-        let client = HttpClient::configured(Some("bad\nagent"), true, TOTAL_TIMEOUT);
+        let client = HttpClient::configured(Some("bad\nagent"), true, TOTAL_TIMEOUT, MAX_REDIRECTS);
 
         let response = client.get_limited(&url, &[], 1024).await.unwrap();
 
@@ -998,7 +1027,8 @@ mod tests {
         let server = spawn_server(listener, Router::new().route("/ua", get(echo_user_agent)));
         // Same rejected `User-Agent`, but with the guard on: the rebuild
         // without it must not quietly drop address filtering.
-        let client = HttpClient::configured(Some("bad\nagent"), false, TOTAL_TIMEOUT);
+        let client =
+            HttpClient::configured(Some("bad\nagent"), false, TOTAL_TIMEOUT, MAX_REDIRECTS);
 
         let result = client.get_limited(&url, &[], 1024).await;
 

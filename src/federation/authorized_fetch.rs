@@ -51,7 +51,7 @@ pub async fn fetch_allowed(
     uri: &Uri,
     headers: &HeaderMap,
 ) -> AppResult<()> {
-    if !state.config.authorized_fetch.get() {
+    if !state.config.fetch.authorized_fetch.get() {
         return Ok(());
     }
     let Some(signature) = received_signature(headers) else {
@@ -177,7 +177,7 @@ mod tests {
     /// [`Config::for_tests`] with authorized fetch switched on.
     fn gate_on() -> Config {
         let mut config = Config::for_tests();
-        config.authorized_fetch = true.into();
+        config.fetch.authorized_fetch = true.into();
         config
     }
 

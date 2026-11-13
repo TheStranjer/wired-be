@@ -1084,7 +1084,7 @@ async fn authorized_fetch_gates_every_collection_route() {
     let alice = common::create_local_user(&pool, "alice").await;
     let post = common::create_status(&pool, &alice, "hi", Visibility::Public).await;
     let mut config = common::test_config();
-    config.authorized_fetch = Toggle::new(true);
+    config.fetch.authorized_fetch = Toggle::new(true);
     let app = common::test_app_with_config(pool.clone(), config.clone());
 
     let gated = [

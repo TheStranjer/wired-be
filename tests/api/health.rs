@@ -273,7 +273,7 @@ fn test_config_is_the_fixed_configuration() {
     .expect("the fixed test values are valid");
     assert_eq!(config, expected, "test_config equals the fixed lookup");
     assert!(
-        config.http_allow_private_hosts,
+        config.fetch.http_allow_private_hosts,
         "the harness disables the SSRF guard so integration tests can reach local servers"
     );
     assert!(

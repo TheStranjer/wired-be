@@ -676,6 +676,20 @@ const SOFT_DELETE_REBLOGS_SQL: &str = "UPDATE statuses
 /// [`crate::models::pinned_status`]).
 const CLEAR_PINS_SQL: &str = "DELETE FROM pinned_statuses WHERE status_id = $1";
 
+/// [`link_backfilled_reply`]: closes a deferred reply link — the shape
+/// [`crate::services::ingest`] leaves behind when a remote note answers an
+/// object this instance does not store yet. The live-and-unlinked guard is
+/// what makes the write idempotent: a second pass matches no row and steps
+/// no counter, and a tombstoned child is not re-linked at all.
+const LINK_BACKFILLED_SQL: &str = "UPDATE statuses
+      SET in_reply_to_id = $2,
+          in_reply_to_account_id = $3,
+          conversation_id = $4,
+          in_reply_to_ap_id = NULL,
+          updated_at = now()
+    WHERE id = $1 AND deleted_at IS NULL AND in_reply_to_id IS NULL
+  RETURNING id";
+
 /// Inserts `new_status` and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4) and, for a local status, `uri` and
@@ -1286,6 +1300,47 @@ pub async fn fetch_expired(pool: &PgPool, limit: i64) -> AppResult<Vec<Status>> 
 pub async fn bump_counter(pool: &PgPool, id: Uuid, counter: Counter, delta: i32) -> AppResult<()> {
     let mut conn = pool.acquire().await?;
     step_counter(&mut conn, id, counter, delta).await
+}
+
+/// Closes the deferred reply link of `child_id` once the answered status
+/// `parent` is stored.
+///
+/// [`crate::services::ingest`] stores a remote reply answering an object
+/// id it does not have; when that parent arrives, the row's
+/// `in_reply_to_id`, `in_reply_to_account_id` and `conversation_id` take
+/// the parent's values, its `in_reply_to_ap_id` clears, and the parent's
+/// `replies_count` steps up, all on one transaction.
+///
+/// The write is idempotent by construction: the update only matches a
+/// live row that is still unlinked (see `LINK_BACKFILLED_SQL`), so a
+/// repeat pass — a redelivered backfill job, a second activity naming the
+/// same parent — links nothing and steps nothing. `true` says this call
+/// wrote the link.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError); the rollback leaves the
+/// child deferred and the counter untouched.
+pub async fn link_backfilled_reply(
+    pool: &PgPool,
+    child_id: Uuid,
+    parent: &Status,
+) -> AppResult<bool> {
+    let mut tx = pool.begin().await?;
+    let linked = sqlx::query_scalar::<_, Uuid>(LINK_BACKFILLED_SQL)
+        .bind(child_id)
+        .bind(parent.id)
+        .bind(parent.user_id)
+        .bind(parent.conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+    if linked {
+        step_counter(&mut tx, parent.id, Counter::Replies, 1).await?;
+    }
+    tx.commit().await?;
+    Ok(linked)
 }
 
 /// Records `user`'s reblog of `original` at `visibility` and answers the

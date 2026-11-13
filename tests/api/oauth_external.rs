@@ -1054,7 +1054,7 @@ async fn the_provider_calls_pass_the_ssrf_guard() {
     let state = prepare(&site.http, &site.app, "").await;
 
     let mut guarded = site.provider.config();
-    guarded.http_allow_private_hosts = false;
+    guarded.fetch.http_allow_private_hosts = false;
     let guarded_http = common::test_app_with_config(pool.clone(), guarded);
     let response = common::TestRequest::get(&format!(
         "/oauth/{PROVIDER}/callback?code={LINKED_UID}&state={state}"

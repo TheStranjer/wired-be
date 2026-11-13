@@ -94,6 +94,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// ([`dispatch::KIND_INCOMING`](federation::dispatch::KIND_INCOMING)) and
 /// its daily received-activity ledger prune
 /// ([`KIND_CLEANUP_RECEIVED`](federation::dispatch::KIND_CLEANUP_RECEIVED))
+/// , the fetched-thread backfill
+/// ([`KIND_BACKFILL`](federation::fetch_object::KIND_BACKFILL))
 /// — and the outgoing fan-out publisher
 /// ([`publisher::KIND_PUBLISH`](federation::publisher::KIND_PUBLISH)), so
 /// the worker idles, sweeps, delivers, sends, pushes, processes received
@@ -268,6 +270,10 @@ fn job_registry() -> JobRegistry {
     registry.register(
         federation::dispatch::KIND_CLEANUP_RECEIVED,
         federation::dispatch::handle_cleanup_received,
+    );
+    registry.register(
+        federation::fetch_object::KIND_BACKFILL,
+        federation::fetch_object::handle,
     );
     registry
 }
