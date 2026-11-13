@@ -32,7 +32,7 @@ const REFUSAL: &str = "This instance requires authenticated fetches";
 /// [`common::test_config`] with `AUTHORIZED_FETCH` switched to `on`.
 fn gated(on: bool) -> Config {
     let mut config = common::test_config();
-    config.authorized_fetch = Toggle::new(on);
+    config.fetch.authorized_fetch = Toggle::new(on);
     config
 }
 

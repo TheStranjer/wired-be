@@ -256,6 +256,14 @@ pub const SIGN_FETCHES_VAR: &str = "SIGN_FETCHES";
 /// Environment variable holding whether incoming `GET`s to the
 /// `ActivityPub` actor routes must carry a valid HTTP signature.
 pub const AUTHORIZED_FETCH_VAR: &str = "AUTHORIZED_FETCH";
+/// Environment variable holding how far up a fetched thread
+/// `federator.backfill` walks to link a remote reply to its ancestors
+/// (see [`crate::federation::fetch_object`]).
+pub const THREAD_FETCH_DEPTH_VAR: &str = "THREAD_FETCH_DEPTH";
+/// Environment variable holding how many remote object fetches one
+/// incoming activity may trigger at most
+/// (see [`crate::federation::fetch_object`]).
+pub const MAX_FETCHES_PER_ACTIVITY_VAR: &str = "MAX_FETCHES_PER_ACTIVITY";
 /// Environment variable holding whether this instance federates at all:
 /// while off the `ActivityPub` inbox routes answer 403 and outbound
 /// delivery queues nothing.
@@ -580,6 +588,14 @@ pub const DEFAULT_SIGN_FETCHES: bool = true;
 /// instance serves `ActivityPub` `GET`s to unsigned requests too; Pleroma's
 /// `[:federator, :authorized_fetch]`-style gate is an explicit opt-in.
 pub const DEFAULT_AUTHORIZED_FETCH: bool = false;
+/// Thread-backfill depth used when `THREAD_FETCH_DEPTH` is unset: the
+/// job walks up to 20 ancestors of a fetched reply, Pleroma's
+/// `fix_in_reply_to` recursion limit spelled as one number.
+pub const DEFAULT_THREAD_FETCH_DEPTH: usize = 20;
+/// Remote object fetches used when `MAX_FETCHES_PER_ACTIVITY` is unset:
+/// one incoming activity may trigger at most 20 object dereferences before
+/// the fetch code refuses to make more.
+pub const DEFAULT_MAX_FETCHES_PER_ACTIVITY: usize = 20;
 /// Federation state used when `FEDERATION_ENABLED` is unset: this instance
 /// federates, the way Pleroma's `[:federator, :enabled]` default does;
 /// going quiet is an explicit operator decision.
@@ -907,6 +923,73 @@ pub struct RateLimitConfig {
     pub trust_proxy_headers: Toggle,
 }
 
+/// The two numbers that bound how far federation fetching may go, from
+/// `THREAD_FETCH_DEPTH` and `MAX_FETCHES_PER_ACTIVITY` (see
+/// [`crate::federation::fetch_object`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchLimits {
+    /// How far up a fetched thread [`federator.backfill`] walks to link a
+    /// remote reply to its ancestors; a deeper thread stays linked only as
+    /// far as this.
+    ///
+    /// [`federator.backfill`]: crate::federation::fetch_object::KIND_BACKFILL
+    pub thread_fetch_depth: usize,
+    /// The most remote objects one incoming activity (or one resolver run)
+    /// may dereference; a fetch past the cap fails instead of fanning out
+    /// further.
+    pub max_fetches_per_activity: usize,
+}
+
+/// The settings that govern how this instance fetches and is fetched by
+/// peers.
+///
+/// Grouped because [`Config::from_lookup`] has a size budget
+/// (AGENTS.md) and all four describe one outbound `GET`: the
+/// `HTTP_ALLOW_PRIVATE_HOSTS`, `SIGN_FETCHES` and `AUTHORIZED_FETCH`
+/// toggles and the two numbers of [`FetchLimits`] (`THREAD_FETCH_DEPTH`,
+/// `MAX_FETCHES_PER_ACTIVITY`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchSettings {
+    /// Whether outbound HTTP may connect to private, loopback and other
+    /// reserved addresses, i.e. the SSRF guard is disabled, from
+    /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
+    pub http_allow_private_hosts: bool,
+    /// Whether outgoing actor `GET`s are HTTP-signed with the instance
+    /// actor's key, from `SIGN_FETCHES` (see
+    /// [`crate::federation::fetch_actor`]).
+    pub sign_fetches: Toggle,
+    /// Whether incoming `GET`s to the `ActivityPub` actor routes must carry
+    /// a valid HTTP signature, from `AUTHORIZED_FETCH` (see
+    /// [`crate::federation::authorized_fetch`]).
+    pub authorized_fetch: Toggle,
+    /// How far federation fetching may go, from `THREAD_FETCH_DEPTH` and
+    /// `MAX_FETCHES_PER_ACTIVITY` (see [`crate::federation::fetch_object`]).
+    pub limits: FetchLimits,
+}
+
+/// The unset-everything shape: each variable's documented default.
+impl Default for FetchSettings {
+    fn default() -> Self {
+        Self {
+            http_allow_private_hosts: DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
+            sign_fetches: DEFAULT_SIGN_FETCHES.into(),
+            authorized_fetch: DEFAULT_AUTHORIZED_FETCH.into(),
+            limits: FetchLimits::default(),
+        }
+    }
+}
+
+/// The unset-everything shape of the two fetch bounds: the documented
+/// defaults of `THREAD_FETCH_DEPTH` and `MAX_FETCHES_PER_ACTIVITY`.
+impl Default for FetchLimits {
+    fn default() -> Self {
+        Self {
+            thread_fetch_depth: DEFAULT_THREAD_FETCH_DEPTH,
+            max_fetches_per_activity: DEFAULT_MAX_FETCHES_PER_ACTIVITY,
+        }
+    }
+}
+
 /// How the SMTP relay connection is encrypted, the value of `SMTP_TLS`.
 ///
 /// Parsed by the `SMTP_TLS` reader in `mailer_settings`; the unset or blank
@@ -1063,10 +1146,6 @@ pub struct Config {
     /// `MEDIA_BASE_URL`; defaults to `{base_url}/media` and never ends in a
     /// slash, so `/{key}` appends cleanly.
     pub media_base_url: String,
-    /// Whether outbound HTTP may connect to private, loopback and other
-    /// reserved addresses, i.e. the SSRF guard is disabled, from
-    /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
-    pub http_allow_private_hosts: bool,
     /// Whether registration may omit the email address, from
     /// `ACCOUNTS_EMAIL_OPTIONAL`. See
     /// [`create_local_user`](crate::models::user::register::create_local_user).
@@ -1220,14 +1299,11 @@ pub struct Config {
     /// The status-translation settings, from the `TRANSLATION_*` variables
     /// (see [`crate::services::translate`]).
     pub translation: TranslationConfig,
-    /// Whether outgoing actor `GET`s are HTTP-signed with the instance
-    /// actor's key, from `SIGN_FETCHES` (see
-    /// [`crate::federation::fetch_actor`]).
-    pub sign_fetches: Toggle,
-    /// Whether incoming `GET`s to the `ActivityPub` actor routes must carry
-    /// a valid HTTP signature, from `AUTHORIZED_FETCH` (see
-    /// [`crate::federation::authorized_fetch`]).
-    pub authorized_fetch: Toggle,
+    /// The settings that govern fetching, from the `HTTP_ALLOW_PRIVATE_HOSTS`,
+    /// `SIGN_FETCHES`, `AUTHORIZED_FETCH`, `THREAD_FETCH_DEPTH` and
+    /// `MAX_FETCHES_PER_ACTIVITY` variables (see
+    /// [`crate::federation::fetch_object`] and [`crate::http_client`]).
+    pub fetch: FetchSettings,
     /// Whether this instance federates at all, from `FEDERATION_ENABLED`:
     /// while off the `ActivityPub` inbox routes answer 403
     /// `{"error":"Federation is disabled"}` (see [`crate::api::activitypub`])
@@ -1272,7 +1348,7 @@ impl Config {
         let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
         let (profile, limits, text, auth, exposure, mail) = wording_and_mail(&lookup, &base_url)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
-        let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
+        let fetch = fetch_settings(&lookup)?;
         let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(&lookup)?;
         Ok(Self {
@@ -1309,7 +1385,6 @@ impl Config {
             uploads_dir: directory(&lookup, UPLOADS_DIR_VAR, DEFAULT_UPLOADS_DIR),
             emoji_dir: directory(&lookup, EMOJI_DIR_VAR, DEFAULT_EMOJI_DIR),
             media_base_url,
-            http_allow_private_hosts,
             accounts_email_optional: auth.accounts_email_optional,
             min_password_length: auth.min_password_length,
             oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
@@ -1342,8 +1417,7 @@ impl Config {
             rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup),
             translation: translation_settings(&lookup)?,
-            sign_fetches,
-            authorized_fetch,
+            fetch,
             federation_enabled: federation_enabled(&lookup)?,
             accept_unsolicited_public: accept_unsolicited_public(&lookup)?,
             mrf_policies: mrf_policies(&lookup),
@@ -1461,7 +1535,6 @@ impl Config {
             uploads_dir: PathBuf::from(DEFAULT_UPLOADS_DIR),
             emoji_dir: PathBuf::from(DEFAULT_EMOJI_DIR),
             media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
-            http_allow_private_hosts: true,
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
             oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
@@ -1494,8 +1567,10 @@ impl Config {
             rich_media_remote: Toggle::new(DEFAULT_RICH_MEDIA_REMOTE),
             vapid: VapidConfig::default(),
             translation: TranslationConfig::default(),
-            sign_fetches: Toggle::new(DEFAULT_SIGN_FETCHES),
-            authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
+            fetch: FetchSettings {
+                http_allow_private_hosts: true,
+                ..FetchSettings::default()
+            },
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
             accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
             mrf_policies: Vec::new(),
@@ -2035,31 +2110,63 @@ where
     })
 }
 
-/// Reads the three settings that govern how this instance fetches and is
+/// Reads the settings that govern how this instance fetches and is
 /// fetched by peers: whether the client may reach private/loopback hosts
 /// (`HTTP_ALLOW_PRIVATE_HOSTS`), whether it signs its outgoing actor
-/// `GET`s, and whether it demands signatures on incoming `ActivityPub`
-/// `GET`s. Grouped because each is a plain default-or-parse and
-/// [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple comes
-/// back in field order.
+/// `GET`s (`SIGN_FETCHES`), whether it demands signatures on incoming
+/// `ActivityPub` `GET`s (`AUTHORIZED_FETCH`), and the two numbers that
+/// bound how far fetching may go (`THREAD_FETCH_DEPTH`,
+/// `MAX_FETCHES_PER_ACTIVITY`, read through [`fetch_limits`]). Grouped
+/// into one [`FetchSettings`] because each is a plain default-or-parse
+/// and [`Config::from_lookup`] has a size budget (AGENTS.md) — and
+/// because the settings belong together on the wire: they are the shape
+/// of this instance's outbound `GET`.
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidBoolean`] for whichever variable holds a
-/// value that is neither spelling.
-fn fetch_settings<F>(lookup: &F) -> Result<(bool, Toggle, Toggle), ConfigError>
+/// Returns [`ConfigError::InvalidBoolean`] for whichever boolean variable
+/// holds a value that is neither spelling, and
+/// [`ConfigError::InvalidNumber`] for whichever fetch-limit variable holds
+/// a value that is not a whole number.
+fn fetch_settings<F>(lookup: &F) -> Result<FetchSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    Ok((
-        boolean(
+    Ok(FetchSettings {
+        http_allow_private_hosts: boolean(
             lookup,
             HTTP_ALLOW_PRIVATE_HOSTS_VAR,
             DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS,
         )?,
-        boolean(lookup, SIGN_FETCHES_VAR, DEFAULT_SIGN_FETCHES)?.into(),
-        boolean(lookup, AUTHORIZED_FETCH_VAR, DEFAULT_AUTHORIZED_FETCH)?.into(),
-    ))
+        sign_fetches: boolean(lookup, SIGN_FETCHES_VAR, DEFAULT_SIGN_FETCHES)?.into(),
+        authorized_fetch: boolean(lookup, AUTHORIZED_FETCH_VAR, DEFAULT_AUTHORIZED_FETCH)?.into(),
+        limits: fetch_limits(lookup)?,
+    })
+}
+
+/// Reads the two numbers that bound how far federation fetching may go:
+/// how deep the [`federator.backfill`] job walks a thread
+/// (`THREAD_FETCH_DEPTH`) and how many object dereferences one run may
+/// trigger (`MAX_FETCHES_PER_ACTIVITY`).
+///
+/// [`federator.backfill`]: crate::federation::fetch_object::KIND_BACKFILL
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] for whichever variable holds a
+/// value that is not a whole number.
+fn fetch_limits<F>(lookup: &F) -> Result<FetchLimits, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(FetchLimits {
+        thread_fetch_depth: number(lookup, THREAD_FETCH_DEPTH_VAR, DEFAULT_THREAD_FETCH_DEPTH)?,
+        max_fetches_per_activity: number(
+            lookup,
+            MAX_FETCHES_PER_ACTIVITY_VAR,
+            DEFAULT_MAX_FETCHES_PER_ACTIVITY,
+        )?,
+    })
 }
 
 /// Reads `FEDERATION_ENABLED`: whether this instance federates at all,
@@ -2691,7 +2798,6 @@ impl fmt::Debug for Config {
             .field("banner_limit_bytes", &self.banner_limit_bytes)
             .field("inbox_max_bytes", &self.inbox_max_bytes)
             .field("max_remote_mention_lookups", max_remote_mention_lookups)
-            .field("http_allow_private_hosts", &self.http_allow_private_hosts)
             .field("uploads_dir", &self.uploads_dir)
             .field("emoji_dir", &self.emoji_dir)
             .field("media_base_url", &self.media_base_url)
@@ -2727,8 +2833,7 @@ impl fmt::Debug for Config {
             .field("rich_media_remote", &self.rich_media_remote)
             .field("vapid", &self.vapid)
             .field("translation", &self.translation)
-            .field("sign_fetches", &self.sign_fetches)
-            .field("authorized_fetch", &self.authorized_fetch)
+            .field("fetch", &self.fetch)
             .field("rate_limit", &self.rate_limit);
         // The federation trio — the enabled toggle, the unsolicited-public
         // toggle and the policy-name list — closes the chain from a
@@ -3013,7 +3118,7 @@ mod tests {
             "default UPLOAD_MAX_FILES"
         );
         assert!(
-            !config.http_allow_private_hosts,
+            !config.fetch.http_allow_private_hosts,
             "the SSRF guard is on by default"
         );
         assert_eq!(
@@ -3150,7 +3255,7 @@ mod tests {
         );
         assert_eq!(config.upload_limits.max_files, 4, "custom UPLOAD_MAX_FILES");
         assert!(
-            config.http_allow_private_hosts,
+            config.fetch.http_allow_private_hosts,
             "custom HTTP_ALLOW_PRIVATE_HOSTS"
         );
         assert_eq!(
@@ -4040,8 +4145,8 @@ mod tests {
             ] {
                 let config = config_with(&[(var, value)]);
                 let got = match var {
-                    SIGN_FETCHES_VAR => config.sign_fetches,
-                    _ => config.authorized_fetch,
+                    SIGN_FETCHES_VAR => config.fetch.sign_fetches,
+                    _ => config.fetch.authorized_fetch,
                 };
                 assert_eq!(got.get(), want, "{var}={value:?} means {want}");
             }
@@ -4052,16 +4157,16 @@ mod tests {
     fn fetch_toggle_defaults_apply_when_unset_or_empty() {
         let unset = config_with(&[]);
         assert!(
-            unset.sign_fetches.get() && !unset.authorized_fetch.get(),
+            unset.fetch.sign_fetches.get() && !unset.fetch.authorized_fetch.get(),
             "unset toggles sit at their defaults"
         );
         let config = config_with(&[(SIGN_FETCHES_VAR, ""), (AUTHORIZED_FETCH_VAR, "")]);
         assert!(
-            config.sign_fetches.get(),
+            config.fetch.sign_fetches.get(),
             "empty SIGN_FETCHES stays at the default"
         );
         assert!(
-            !config.authorized_fetch.get(),
+            !config.fetch.authorized_fetch.get(),
             "empty AUTHORIZED_FETCH stays at the default"
         );
     }
@@ -4089,6 +4194,49 @@ mod tests {
         assert!(
             debug.contains("authorized_fetch: Toggle(true)"),
             "the authorized-fetch toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    #[test]
+    fn fetch_bounds_default_to_twenty() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.fetch.limits.thread_fetch_depth, 20,
+            "default THREAD_FETCH_DEPTH is twenty ancestors"
+        );
+        assert_eq!(
+            config.fetch.limits.max_fetches_per_activity, 20,
+            "default MAX_FETCHES_PER_ACTIVITY is twenty dereferences"
+        );
+    }
+
+    #[test]
+    fn fetch_bounds_parse_numbers() {
+        let config = config_with(&[
+            (THREAD_FETCH_DEPTH_VAR, "8"),
+            (MAX_FETCHES_PER_ACTIVITY_VAR, "3"),
+        ]);
+        assert_eq!(
+            config.fetch.limits.thread_fetch_depth, 8,
+            "custom THREAD_FETCH_DEPTH"
+        );
+        assert_eq!(
+            config.fetch.limits.max_fetches_per_activity, 3,
+            "custom MAX_FETCHES_PER_ACTIVITY"
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_fetch_bounds() {
+        let config = config_with(&[(THREAD_FETCH_DEPTH_VAR, "6")]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("thread_fetch_depth: 6"),
+            "the thread-fetch depth is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("max_fetches_per_activity: 20"),
+            "the per-activity fetch cap is visible in Debug output: {debug}"
         );
     }
 
@@ -4305,7 +4453,7 @@ mod tests {
         ] {
             let config = config_with(&[(HTTP_ALLOW_PRIVATE_HOSTS_VAR, value)]);
             assert_eq!(
-                config.http_allow_private_hosts, want,
+                config.fetch.http_allow_private_hosts, want,
                 "HTTP_ALLOW_PRIVATE_HOSTS={value:?} means {want}"
             );
         }
@@ -5266,6 +5414,8 @@ mod tests {
             PURGE_DELETED_STATUSES_DAYS_VAR,
             STREAMING_PING_INTERVAL_SECS_VAR,
             MEDIA_PROXY_MAX_BYTES_VAR,
+            THREAD_FETCH_DEPTH_VAR,
+            MAX_FETCHES_PER_ACTIVITY_VAR,
         ] {
             let err = try_config_with(&[(var, "many")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidNumber(var), "error for {var}");
@@ -5308,7 +5458,7 @@ mod tests {
         assert_eq!(config.domain(), "test.example", "test domain");
         assert!(config.is_https(), "test base_url is https");
         assert!(
-            config.http_allow_private_hosts,
+            config.fetch.http_allow_private_hosts,
             "test config disables the SSRF guard for local mini-servers"
         );
         assert_eq!(

@@ -321,6 +321,12 @@ pub struct Handlers {
     /// `Note` and the later `Create` of a `ChatMessage` register one
     /// entry each beside each other.
     create_by_object_type: HashMap<&'static str, HandlerFn>,
+    /// The `Create` route for an object that is only a reference: an
+    /// embedded document declares a `type` to route on, a bare id declares
+    /// nothing, and exactly one handler can take the whole shape — the one
+    /// that dereferences the id and folds what it answers (see
+    /// [`crate::federation::fetch_object`]).
+    create_by_reference: Option<HandlerFn>,
     /// `Create` pre-checks, in registration order: a delivered object of a
     /// keyed type is put to each of their guards before that type's entry in
     /// [`Handlers::create_by_object_type`] folds it, which is how one `type`
@@ -354,6 +360,7 @@ impl Handlers {
             update_by_object_type: HashMap::new(),
             delete_by_object_type: HashMap::new(),
             create_by_object_type: HashMap::new(),
+            create_by_reference: None,
             create_prechecks: Vec::new(),
             delete_fallback: None,
         }
@@ -385,6 +392,15 @@ impl Handlers {
     /// registry's `create_by_object_type` table.
     pub fn register_create(&mut self, object_type: &'static str, handler: HandlerFn) {
         let _previous = self.create_by_object_type.insert(object_type, handler);
+    }
+
+    /// Sets the handler a `Create` whose object is only a reference goes
+    /// to — the [`register_delete_fallback`] of the `Create` route, for
+    /// the code that dereferences the id instead of ignoring it.
+    ///
+    /// [`register_delete_fallback`]: Handlers::register_delete_fallback
+    pub fn register_create_reference(&mut self, handler: HandlerFn) {
+        self.create_by_reference = Some(handler);
     }
 
     /// Binds a guarded `Create` route: `check` puts the embedded document of
@@ -440,6 +456,15 @@ impl Handlers {
     #[must_use]
     pub(crate) fn handles_create(&self, object_type: &str) -> bool {
         self.create_by_object_type.contains_key(object_type)
+    }
+
+    /// Whether the registry takes a `Create` whose object is only a
+    /// reference — the [`handles_create`](Self::handles_create) question
+    /// asked of the `create_by_reference` route.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn takes_create_reference(&self) -> bool {
+        self.create_by_reference.is_some()
     }
 
     /// Whether the `Update` sub-registry claims `object_type` — the
@@ -864,15 +889,23 @@ fn object_type(view: &ActivityView) -> Option<String> {
 /// A type that carries more than one kind of thing is put to its
 /// [pre-checks](Handlers::register_create_prechecked) first, in registration
 /// order, and a claimed document leaves through the guard's own handler.
-/// An object that is a bare reference declares no type and so neither guard
-/// nor table, and is ignored; so is any type no ticket has registered a
-/// route for yet.
+/// An object that is a bare reference declares no type; it goes to
+/// [`Handlers::create_by_reference`], whose handler dereferences the id and
+/// folds what answers — with no reference handler registered such a
+/// `Create` is ignored, as is any type no ticket has routed yet.
 async fn route_create(
     state: &AppState,
     view: ActivityView,
     signer: User,
     handlers: &Handlers,
 ) -> Result<(), JobError> {
+    if view.object.embedded().is_none() {
+        if let Some(handler) = handlers.create_by_reference {
+            return call_handler(handler, state, view, signer).await;
+        }
+        debug!("no Create handler takes a bare object reference; ignoring");
+        return Ok(());
+    }
     let declared = object_type(&view);
     let claimed = match (declared.as_deref(), view.object.embedded()) {
         (Some(kind), Some(object)) => handlers.claimed_create(kind, state, object).await,
@@ -889,7 +922,7 @@ async fn route_create(
         call_handler(handler, state, view, signer).await
     } else {
         debug!(
-            object_type = declared.as_deref().unwrap_or("<reference>"),
+            object_type = declared.as_deref().unwrap_or("<untyped>"),
             "no Create handler for this object type; ignoring"
         );
         Ok(())
@@ -2036,6 +2069,37 @@ mod tests {
                 + seen("ok", "https://peer.example/activities/create-chat"),
             0,
             "neither the reference nor the unclaimed type reached a handler"
+        );
+    }
+
+    /// The reference arm of the `Create` dispatch once a ticket registers
+    /// it: a bare-id object reaches the `create_by_reference` handler.
+    #[tokio::test]
+    async fn a_create_of_a_bare_reference_reaches_the_registered_reference_handler() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let mut handlers = Handlers::new();
+        handlers.register_create_reference(ok_handler);
+        let activity = json!({
+            "id": "https://peer.example/activities/create-ref",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "object": "https://peer.example/posts/ref",
+        });
+        let state = app_state(&pool);
+
+        let delivered = deliver(&state, &alice, &activity, &handlers).await;
+
+        assert_eq!(
+            delivered,
+            Ok(()),
+            "the reference handler completing ends the job"
+        );
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/create-ref"),
+            1,
+            "the bare-id Create reached the reference route"
         );
     }
 

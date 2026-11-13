@@ -58,10 +58,12 @@ use crate::{
 /// Cap on one fetched actor document: 1 MiB. Actor documents are profiles;
 /// anything larger is an attack or a mistake.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
-/// The `Accept` header every actor fetch asks for: both `ActivityPub` JSON
-/// media types, the `ld+json` one pinned to the `ActivityStreams` profile
-/// (Mastodon and Pleroma serve on either spelling).
-const ACTOR_ACCEPT: &str = "application/activity+json, application/ld+json; \
+/// The `Accept` header every federation `GET` asks with: both
+/// `ActivityPub` JSON media types, the `ld+json` one pinned to the
+/// `ActivityStreams` profile (Mastodon and Pleroma serve on either
+/// spelling). Shared with the object fetcher (see
+/// [`crate::federation::fetch_object`]), which asks the same way.
+pub(crate) const ACTOR_ACCEPT: &str = "application/activity+json, application/ld+json; \
                             profile=\"https://www.w3.org/ns/activitystreams\"";
 /// How long a stored remote mirror answers without a refetch: Pleroma's
 /// `needs_update?/1` 24-hour window.
@@ -248,7 +250,7 @@ pub async fn fetch_actor_json(
     url: &str,
     signer: Option<&Signer>,
 ) -> Result<Value, FetchError> {
-    let document = fetch_document(http, url, signer).await?;
+    let document = fetch_document(http, url, signer, MAX_BODY_BYTES).await?;
     let claimed = document_id(&document)?;
     if claimed == url {
         return Ok(document);
@@ -256,7 +258,7 @@ pub async fn fetch_actor_json(
     // The document names a different id than the URL it was fetched from
     // (or the peer redirected elsewhere): follow the claim exactly once
     // and accept only a document that names itself.
-    let refetched = fetch_document(http, claimed, signer).await?;
+    let refetched = fetch_document(http, claimed, signer, MAX_BODY_BYTES).await?;
     let refetched_id = document_id(&refetched)?;
     if refetched_id != claimed {
         return Err(FetchError::Invalid(format!(
@@ -368,12 +370,16 @@ pub async fn refresh_user(state: &AppState, user: &User) -> Result<User, FetchEr
     fetch_and_store(state, &user.ap_id).await
 }
 
-/// `GET`s `url` once and reads the actor document it answers, applying the
-/// status, size, content-type and JSON rules of [`fetch_actor_json`].
-async fn fetch_document(
+/// `GET`s `url` once and reads the document it answers, applying the
+/// status, size, content-type and JSON rules of [`fetch_actor_json`] with
+/// the body cap at `max_bytes`. Shared with the object fetcher (see
+/// [`crate::federation::fetch_object`]), which caps at its own 2 MiB and
+/// folds the error into its own vocabulary.
+pub(crate) async fn fetch_document(
     http: &HttpClient,
     url: &str,
     signer: Option<&Signer>,
+    max_bytes: usize,
 ) -> Result<Value, FetchError> {
     let signed_request = signer.map(|key| sign_get(url, key)).transpose()?;
     let mut headers = vec![("accept", ACTOR_ACCEPT)];
@@ -384,7 +390,7 @@ async fn fetch_document(
         headers.push(("date", &signed.date));
         headers.push(("signature", &signed.signature));
     }
-    let response = http.get_limited(url, &headers, MAX_BODY_BYTES).await?;
+    let response = http.get_limited(url, &headers, max_bytes).await?;
     if response.status == STATUS_GONE {
         return Err(FetchError::Gone);
     }
@@ -475,9 +481,10 @@ async fn fetch_and_store(state: &AppState, ap_id: &str) -> Result<User, FetchErr
 
 /// The identity to sign this fetch with: the instance actor while
 /// `SIGN_FETCHES` is on (provisioned on first use), [`None`] when the
-/// operator switched signed fetches off.
-async fn fetch_signer(state: &AppState) -> Result<Option<Signer>, FetchError> {
-    if !state.config.sign_fetches.get() {
+/// operator switched signed fetches off. Shared with the object fetcher
+/// (see [`crate::federation::fetch_object`]), which signs the same way.
+pub(crate) async fn fetch_signer(state: &AppState) -> Result<Option<Signer>, FetchError> {
+    if !state.config.fetch.sign_fetches.get() {
         return Ok(None);
     }
     match Signer::instance(state).await {
@@ -497,7 +504,10 @@ fn fresh_since(stamp: Option<DateTime<Utc>>) -> bool {
 /// served from this database, never fetched from the network (a lookup
 /// that misses is plain [`FetchError::NotFound`]). The comparison is on
 /// the parsed URL authority, so a look-alike prefix host cannot pass.
-fn is_local_ap_id(config: &Config, ap_id: &str) -> bool {
+/// Shared with the object resolver (see [`crate::federation::fetch_object`]),
+/// which answers an unknown local object id without touching the network
+/// too.
+pub(crate) fn is_local_ap_id(config: &Config, ap_id: &str) -> bool {
     let Ok(base) = Url::parse(&config.base_url) else {
         return false;
     };
@@ -1037,7 +1047,7 @@ mod tests {
                 .with_state(peer),
         );
         let mut config = Config::for_tests();
-        config.sign_fetches = false.into();
+        config.fetch.sign_fetches = false.into();
         let state = test_state_with_config(pool, config);
 
         let _mirrored = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();

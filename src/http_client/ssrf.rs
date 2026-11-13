@@ -25,7 +25,7 @@ use reqwest::{
 use tokio::net::lookup_host;
 use url::{Host, Url};
 
-use super::{HttpError, MAX_REDIRECTS};
+use super::HttpError;
 
 /// The suffix of every block reason: what kind of address was refused.
 const BLOCKED_ADDRESS_TEXT: &str = "is loopback, private, or otherwise reserved";
@@ -193,10 +193,10 @@ pub(crate) fn blocked_reason(err: &(dyn Error + 'static)) -> Option<String> {
 
 /// The redirect policy the guarded client installs: refuses every hop whose
 /// target is a blocked IP literal (those bypass the DNS resolver when
-/// `hyper` connects to them) and otherwise follows `reqwest`'s standard
-/// [`MAX_REDIRECTS`]-hop limit.
-pub(crate) fn redirect_policy() -> redirect::Policy {
-    let limited = redirect::Policy::limited(MAX_REDIRECTS);
+/// `hyper` connects to them) and otherwise follows the caller's
+/// `max_redirects`-hop limit.
+pub(crate) fn redirect_policy(max_redirects: usize) -> redirect::Policy {
+    let limited = redirect::Policy::limited(max_redirects);
     redirect::Policy::custom(move |attempt| {
         let target = attempt.url().clone();
         if let Some(reason) = blocked_redirect_reason(&target) {
