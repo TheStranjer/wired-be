@@ -1193,6 +1193,53 @@ pub async fn soft_delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult
     }
 }
 
+/// The [`insert_tombstone`] write: a status row that is born a tombstone.
+/// Everything the column defaults can answer — the emptied text, the plain
+/// content type, the zeroed counters — is left to the table; the statement
+/// names only what has no default. `ON CONFLICT (uri) DO NOTHING` keeps the
+/// write idempotent, and the missing `RETURNING` row is how the caller
+/// learns somebody else already reserved that `uri`.
+const INSERT_TOMBSTONE_SQL: &str = "INSERT INTO statuses (
+     id, uri, user_id, visibility, conversation_id, local, deleted_at
+) VALUES (
+     $1, $2, $3, 'public', $1, false, now()
+) ON CONFLICT (uri) DO NOTHING
+  RETURNING *";
+
+/// Reserves object uri `uri` as a tombstone of author `user_id`: the row a
+/// [`Delete`](crate::federation::handlers::note) for a status this instance
+/// never stored leaves behind.
+///
+/// The point is the unique `uri`: a later `Create` of the same object meets
+/// [`insert_tombstone`]'s row in the ingest's tombstone check and is
+/// ignored, so a post deleted before it arrived never arrives at all. The
+/// row carries nothing else — no text, no counters, no author-count bump,
+/// since it was never a post — and shares a soft delete's reads: hidden
+/// from every timeline and visibility check that filters `deleted_at`.
+///
+/// `conversation_id` is the new row's own id, the root-status convention
+/// [`insert`] keeps; a tombstone is its own (empty) conversation.
+///
+/// Returns the stored row, or `None` when a row — tombstone or live —
+/// already carried `uri`.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn insert_tombstone(
+    pool: &PgPool,
+    uri: &str,
+    user_id: Uuid,
+) -> AppResult<Option<Status>> {
+    Ok(sqlx::query_as::<_, Status>(INSERT_TOMBSTONE_SQL)
+        .bind(new_id())
+        .bind(uri)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?)
+}
+
 /// The `SELECT` behind [`fetch_expired`]: live statuses whose expiration has
 /// run out, soonest-expiring first, at most `limit` of them.
 const EXPIRED_SQL: &str = "SELECT * FROM statuses
@@ -2594,6 +2641,60 @@ mod tests {
             "23505",
             "the unique uri is what rejects the re-import"
         );
+    }
+
+    #[tokio::test]
+    async fn an_inserted_tombstone_reserves_the_uri_and_hides_itself() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mallory = remote_user(&pool, "tombstoner").await;
+        let uri = "https://remote.example/posts/deleted-before-arrival";
+
+        let born_deleted = insert_tombstone(&pool, uri, mallory.id)
+            .await
+            .expect("the tombstone inserts")
+            .expect("the uri was free");
+        assert_eq!(
+            born_deleted.uri, uri,
+            "the row keeps the deleted object's id"
+        );
+        assert_eq!(born_deleted.user_id, mallory.id, "and names its author");
+        assert!(born_deleted.deleted_at.is_some(), "it is born a tombstone");
+        assert_eq!(born_deleted.content, "", "with nothing to read");
+        assert_eq!(
+            born_deleted.conversation_id, born_deleted.id,
+            "and its own id as its (empty) conversation"
+        );
+        assert!(
+            get_by_id(&pool, born_deleted.id).await.unwrap().is_none(),
+            "no live read answers it"
+        );
+
+        let again = insert_tombstone(&pool, uri, mallory.id)
+            .await
+            .expect("the second pass runs");
+        assert!(again.is_none(), "the reserved uri inserts nothing twice");
+    }
+
+    #[tokio::test]
+    async fn a_tombstone_insert_does_not_move_the_author_count() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mallory = remote_user(&pool, "counter-checked").await;
+
+        let reserved = insert_tombstone(
+            &pool,
+            "https://remote.example/posts/never-lived",
+            mallory.id,
+        )
+        .await
+        .expect("the tombstone inserts");
+        assert!(reserved.is_some(), "the row was written");
+        let after = user::get_by_id(&pool, mallory.id)
+            .await
+            .expect("the account read")
+            .expect("the account is stored");
+        assert_eq!(after.statuses_count, 0, "a born-tombstone posts nothing");
     }
 
     #[tokio::test]

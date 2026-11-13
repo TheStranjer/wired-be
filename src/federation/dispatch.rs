@@ -442,6 +442,15 @@ impl Handlers {
         self.create_by_object_type.contains_key(object_type)
     }
 
+    /// Whether the `Update` sub-registry claims `object_type` — the
+    /// [`handles_create`](Self::handles_create) question for the edit
+    /// routes, asked by the handler modules that register them.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn handles_update(&self, object_type: &str) -> bool {
+        self.update_by_object_type.contains_key(object_type)
+    }
+
     /// Whether a `Create` of `object_type` is put to a pre-check before it
     /// reaches the object type's own handler — the [`handles_create`]
     /// question asked of the guarded half of the sub-registry.
@@ -1315,27 +1324,31 @@ mod tests {
                 "an Update of a {object_type} folds through the actor handler"
             );
         }
+        for object_type in ["Note", "Question", "Article", "Page"] {
+            assert!(
+                handlers.update_by_object_type.contains_key(object_type),
+                "an Update of a {object_type} folds through the note-edit handler"
+            );
+        }
         assert_eq!(
             handlers.update_by_object_type.len(),
-            5,
-            "actor objects only: the note-edit ticket adds `Note` beside them"
-        );
-        assert!(
-            !handlers.update_by_object_type.contains_key("Note"),
-            "and has not"
+            9,
+            "the actor objects plus the note family's editable four"
         );
         assert!(
             handlers.delete_by_object_type.contains_key("ChatMessage"),
             "a Delete of an embedded `ChatMessage` withdraws through the chat handler"
         );
+        for object_type in ["Note", "Question", "Article", "Page", "Tombstone"] {
+            assert!(
+                handlers.delete_by_object_type.contains_key(object_type),
+                "a Delete of an embedded `{object_type}` withdraws through the note handler"
+            );
+        }
         assert_eq!(
             handlers.delete_by_object_type.len(),
-            1,
-            "chat only so far: the status-delete ticket registers its entry beside it"
-        );
-        assert!(
-            !handlers.delete_by_object_type.contains_key("Note"),
-            "and has not"
+            6,
+            "the chat entry plus the note family's deletable five"
         );
         assert!(
             handlers.delete_fallback.is_some(),

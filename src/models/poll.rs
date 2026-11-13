@@ -235,6 +235,81 @@ pub async fn create(
     Ok(poll)
 }
 
+/// The totals a remote instance reports for one of its own polls, as the
+/// inbound `Update` of a `Question` carries them
+/// ([`crate::federation::handlers::note`]).
+#[derive(Clone, Debug, Default)]
+pub struct RemoteTotals {
+    /// Each stored option's title with the vote count the remote gives it.
+    /// A title that matches no stored option writes nothing — the options
+    /// of a running poll are not the update's to replace.
+    pub options: Vec<(String, i32)>,
+    /// The remote's distinct-voter count for the poll.
+    pub voters_count: i32,
+    /// The remote's total-votes count for the poll.
+    pub votes_count: i32,
+    /// The remote's voting deadline; `None` leaves the stored one alone —
+    /// an update that stops naming `endTime` is not a poll that stops
+    /// expiring.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// [`record_remote_totals`]'s poll write: the totals as the remote states
+/// them, the deadline only when the update names one.
+const REMOTE_TOTALS_SQL: &str = "UPDATE polls
+     SET votes_count = $2,
+         voters_count = $3,
+         expires_at = COALESCE($4, expires_at)
+   WHERE id = $1";
+
+/// [`record_remote_totals`]'s option write: one option's count, keyed by
+/// the title the remote repeats; a vote cast here on that option is left
+/// in place, this restates the remote's total and nothing else.
+const REMOTE_OPTION_SQL: &str = "UPDATE poll_options
+     SET votes_count = $3
+   WHERE poll_id = $1 AND title = $2";
+
+/// Overwrites poll `poll_id`'s numbers with the totals its remote author
+/// reports — the remote-poll-results path of the inbound `Question` update.
+///
+/// This is not [`cast_vote`]: nothing was cast here. A mirrored poll's
+/// counts are whatever the author's instance last said they were, and the
+/// update replaces them wholesale, so a peer whose count went *down* moves
+/// this one's down too. Both statements run on one transaction; a poll id
+/// naming no stored poll matches nothing and changes nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError); the rollback leaves the
+/// poll and its options exactly as they were.
+pub async fn record_remote_totals(
+    pool: &PgPool,
+    poll_id: Uuid,
+    totals: &RemoteTotals,
+) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(REMOTE_TOTALS_SQL)
+        .bind(poll_id)
+        .bind(totals.votes_count)
+        .bind(totals.voters_count)
+        .bind(totals.expires_at)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    for (title, votes) in &totals.options {
+        sqlx::query(REMOTE_OPTION_SQL)
+            .bind(poll_id)
+            .bind(title)
+            .bind(*votes)
+            .execute(&mut *tx)
+            .await
+            .map(drop)?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Fetches the poll of status `status_id`, `None` when that status carries
 /// none (or is not stored at all).
 ///
@@ -2010,5 +2085,85 @@ mod tests {
                 .is_empty(),
             "a poll nobody voted on has no voters"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_totals_overwrite_the_counts_by_title_and_keep_the_deadline() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let author = create_user(&pool, "remote_poll_author").await;
+        let posted = create_status(&pool, &author).await;
+        let stand = create_for(&pool, posted.id, &params(&["Tea", "Coffee"])).await;
+
+        // A local mark exists; the remote restatement is not asked to keep
+        // it, and a title it does not name moves nothing.
+        record_remote_totals(
+            &pool,
+            stand.id,
+            &RemoteTotals {
+                options: vec![
+                    ("Tea".to_owned(), 30),
+                    ("Coffee".to_owned(), 15),
+                    ("Nobody".to_owned(), 99),
+                ],
+                voters_count: 42,
+                votes_count: 45,
+                expires_at: None,
+            },
+        )
+        .await
+        .expect("the remote totals write");
+
+        let reloaded = get_for_status(&pool, posted.id)
+            .await
+            .expect("the poll read")
+            .expect("the poll is stored");
+        assert_eq!(reloaded.voters_count, 42, "the voter count is replaced");
+        assert_eq!(reloaded.votes_count, 45, "and the total");
+        let rows = options(&pool, stand.id).await.expect("the options read");
+        let counts: Vec<i32> = rows.iter().map(|option| option.votes_count).collect();
+        assert_eq!(counts, vec![30, 15], "each named option, title by title");
+        // A further update names a deadline: it lands, and a lower count
+        // restates downward — the remote's word is authoritative.
+        let deadline = Utc.with_ymd_and_hms(2026, 12, 2, 12, 0, 0).unwrap();
+        record_remote_totals(
+            &pool,
+            stand.id,
+            &RemoteTotals {
+                options: vec![("Tea".to_owned(), 5)],
+                voters_count: 6,
+                votes_count: 6,
+                expires_at: Some(deadline),
+            },
+        )
+        .await
+        .expect("the second restatement writes");
+        let restated = get_for_status(&pool, posted.id)
+            .await
+            .expect("the poll read")
+            .expect("the poll is stored");
+        assert_eq!(restated.votes_count, 6, "a total may go down");
+        assert_eq!(restated.expires_at, Some(deadline), "and a deadline lands");
+        let options = options(&pool, stand.id).await.expect("the options read");
+        assert_eq!(
+            options[1].votes_count, 15,
+            "an option the update omits is left alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_totals_move_nothing_for_an_unknown_poll() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        record_remote_totals(
+            &pool,
+            new_id(),
+            &RemoteTotals {
+                options: vec![("Tea".to_owned(), 1)],
+                ..RemoteTotals::default()
+            },
+        )
+        .await
+        .expect("the write runs against no row");
     }
 }

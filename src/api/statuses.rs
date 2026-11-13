@@ -2538,20 +2538,22 @@ const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: 
 /// minus the author (`lib/pleroma/notification.ex`) — is landed here from
 /// [`notify::on_status_edited`].
 ///
-/// The two consumers still waiting wire themselves in here too: the
-/// federation ticket that sends the `Update` activity — Pleroma's
-/// `Builder.update` run through its `CommonAPI.update` pipeline,
-/// re-delivering the object to everybody the original `Create` reached —
-/// and the streaming ticket that pushes the edited status to
-/// `status.update`; both ship the re-rendered entity, so they will grow
-/// this one call's signature when they land.
+/// The federated edit handler runs it too
+/// ([`crate::federation::handlers::note`]): an inbound `Update` of a
+/// mirrored status is an edit like any other, and the boosters of the post
+/// are told from either door alike.
+///
+/// The one consumer still waiting wires itself in here: the streaming
+/// ticket that pushes the edited status to `status.update`; it ships the
+/// re-rendered entity, so it will grow this one call's signature when it
+/// lands.
 ///
 /// `row` is the pre-edit stored row: the id every consumer names — the
 /// write keeps it — and the author whose boosters the telling reads off
 /// the live reblog rows.
 ///
 /// [`notify::on_status_edited`]: crate::services::notify::on_status_edited
-async fn after_status_edited(state: &AppState, row: &StatusRow) {
+pub(crate) async fn after_status_edited(state: &AppState, row: &StatusRow) {
     notify::on_status_edited(state, row).await;
 }
 

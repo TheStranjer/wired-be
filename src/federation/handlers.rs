@@ -27,6 +27,7 @@
 pub mod actor;
 pub mod chat;
 pub mod create;
+pub mod note;
 pub mod vote;
 
 use crate::federation::dispatch::Handlers;
@@ -46,5 +47,9 @@ pub fn registry() -> Handlers {
     create::register(&mut handlers);
     chat::register(&mut handlers);
     vote::register(&mut handlers);
+    // Last, because its `Delete` fallback answers for every object the
+    // earlier `register_delete_fallback` calls left unrouted: it hands the
+    // actor's own id back to the actor handler and folds the rest.
+    note::register(&mut handlers);
     handlers
 }
