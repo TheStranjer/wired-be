@@ -10,8 +10,9 @@
 //! (`lib/pleroma/web/mastodon_api/views/notification_view.ex`): the row's
 //! `id`, `group_key` (stored key or derived `ungrouped-<id>`), `type` and
 //! `created_at`, the actor expanded to a full [`Account`], the `pleroma`
-//! block with its `is_muted` and `is_seen` flags, and the named status and
-//! reaction emoji when there is one to render. [`Notification::from_row`]
+//! block with its `is_muted` and `is_seen` flags, and the named status,
+//! reaction emoji or chat message when there is one to render.
+//! [`Notification::from_row`]
 //! is pure (decision 3): the caller runs every read that fills the
 //! expansions.
 //!
@@ -34,6 +35,8 @@
 //! aggregate, deduplicating the sample exactly where Pleroma's view runs
 //! its `Enum.uniq_by` — over the up-to-eight newest members' actors, in
 //! that order.
+//!
+//! [`ChatMessage`]: crate::entities::chat::ChatMessage
 
 use serde::Serialize;
 use serde_json::Value;
@@ -54,9 +57,12 @@ use crate::{
 /// and Mastodon-format `created_at`, the actor expanded to a full
 /// [`Account`], the `pleroma` block with its `is_muted` and `is_seen`
 /// flags, and, when the notification names one, the named status rendered
-/// (and the reaction's `emoji`). A status the reader may no longer see
-/// leaves the [`status`](Self::status) key out entirely, like Pleroma's
+/// (and the reaction's `emoji`) or the named chat message rendered as the
+/// reader's own [`ChatMessage`] entity. A status the reader may no longer
+/// see leaves the [`status`](Self::status) key out entirely, like Pleroma's
 /// `put_status` of a nothing render.
+///
+/// [`ChatMessage`]: crate::entities::chat::ChatMessage
 #[derive(Debug, Serialize)]
 pub struct Notification {
     /// The notification's id as the hyphenated lowercase `UUIDv7` string
@@ -89,6 +95,14 @@ pub struct Notification {
     /// type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji: Option<String>,
+    /// The chat message a `pleroma:chat_mention` names, rendered as the
+    /// reader sees it (a [`ChatMessage`](crate::entities::chat::ChatMessage)
+    /// entity built from the reader's own
+    /// reference); absent for every other type, and for a message the reader
+    /// has taken out of their chat — Pleroma's `put_chat_message` likewise
+    /// keys the entity it can render.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_message: Option<Value>,
     /// Pleroma's extension block (see [`NotificationPleroma`]).
     pub pleroma: NotificationPleroma,
 }
@@ -107,14 +121,17 @@ pub struct NotificationPleroma {
 impl Notification {
     /// Renders `row` beside its expansions: `account` is the actor as the
     /// reader sees it, `status` the rendered named status (`None` when the
-    /// row names none or the reader may not see it), and `is_muted`
-    /// whether the reader mutes the actor. Pure (decision 3): every
-    /// database read that fills these parts happens in the caller.
+    /// row names none or the reader may not see it), `chat_message` the
+    /// named chat message rendered as the reader's own entity (`None` when
+    /// the row names none or the reader holds no reference to it), and
+    /// `is_muted` whether the reader mutes the actor. Pure (decision 3):
+    /// every database read that fills these parts happens in the caller.
     #[must_use]
     pub fn from_row(
         row: &NotificationRow,
         account: Account,
         status: Option<Value>,
+        chat_message: Option<Value>,
         is_muted: bool,
     ) -> Self {
         let group_key = row
@@ -129,6 +146,7 @@ impl Notification {
             account,
             status,
             emoji: row.emoji.clone(),
+            chat_message,
             pleroma: NotificationPleroma {
                 is_muted: JsonBool(is_muted),
                 is_seen: JsonBool(row.seen),
@@ -372,6 +390,7 @@ mod tests {
             status_id: Some(id(STATUS_ID)),
             emoji: None,
             report_id: None,
+            chat_message_id: None,
             group_key: Some(format!("favourite-{}", id(STATUS_ID))),
             seen: false,
             dismissed_at: None,
@@ -461,7 +480,7 @@ mod tests {
     /// flag, to a JSON value; these structs always serialize.
     fn render_flat(row: &NotificationRow, is_muted: bool) -> Value {
         let account = Account::from_user(&actor(), &Config::for_tests());
-        serde_json::to_value(Notification::from_row(row, account, None, is_muted))
+        serde_json::to_value(Notification::from_row(row, account, None, None, is_muted))
             .expect("an entity serializes")
     }
 
@@ -541,6 +560,63 @@ mod tests {
             value["group_key"],
             format!("favourite-{STATUS_ID}"),
             "the key is the stored one whatever the type spelled"
+        );
+    }
+
+    #[test]
+    fn a_chat_mention_renders_its_message_and_no_status() {
+        let mut row = notification_row();
+        row.event_type = "pleroma:chat_mention".to_owned();
+        row.group_key = None;
+        row.status_id = None;
+        row.chat_message_id = Some(id(STATUS_ID));
+        let message = json!({
+            "id": NOTIFICATION_ID,
+            "content": "<p>hi there</p>",
+            "chat_id": STATUS_ID,
+            "account_id": ACTOR_ID,
+            "unread": true,
+        });
+        let account = Account::from_user(&actor(), &Config::for_tests());
+        let value = serde_json::to_value(Notification::from_row(
+            &row,
+            account,
+            None,
+            Some(message.clone()),
+            false,
+        ))
+        .expect("the entity serializes");
+
+        assert_eq!(value["type"], "pleroma:chat_mention", "the stored type");
+        assert_eq!(
+            value["group_key"],
+            format!("ungrouped-{NOTIFICATION_ID}"),
+            "the chat mention is ungroupable: the derived key"
+        );
+        assert_eq!(
+            value["chat_message"], message,
+            "the ChatMessage entity the caller expanded"
+        );
+        assert!(
+            value.get("status").is_none(),
+            "a chat mention names no status"
+        );
+        assert!(
+            value.get("emoji").is_none(),
+            "and carries no reaction emoji"
+        );
+        assert!(
+            json_keys(&value).contains(&"chat_message"),
+            "the key rides the entity's key set"
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_chat_message_leaves_the_key_out() {
+        let value = render_flat(&notification_row(), false);
+        assert!(
+            value.get("chat_message").is_none(),
+            "a favourite renders no chat message"
         );
     }
 }

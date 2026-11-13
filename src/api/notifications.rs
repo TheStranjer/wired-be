@@ -86,13 +86,16 @@ use crate::{
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
+        chat::ChatMessage as ChatMessageEntity,
         notification::Notification as NotificationEntity,
         relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
     models::{
+        chat,
         filter::{Filter, list_active},
+        media_attachment,
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
@@ -620,8 +623,10 @@ async fn read_up_to(state: &AppState, viewer: &User, max_text: &str) -> AppResul
 /// actor expanded once into an [`Account`] with the viewer's relationship
 /// embedded, every distinct status the rows name rendered for the viewer
 /// through the shared batched path (a status that is gone or hidden from
-/// this reader simply leaves the entity's `status` key out), and the
-/// viewer's mutes read from the same relationship load that feeds the
+/// this reader simply leaves the entity's `status` key out), every chat
+/// message the rows name read as the viewer's own reference and rendered
+/// into the entity's `chat_message` (see [`rendered_chat_messages`]), and
+/// the viewer's mutes read from the same relationship load that feeds the
 /// account embeds. `filters` are the viewer's active phrase filters,
 /// applied to every rendered status in the `notifications` context: a
 /// warning match rides its entity's `filtered` array, and a status an
@@ -632,7 +637,7 @@ async fn read_up_to(state: &AppState, viewer: &User, max_text: &str) -> AppResul
 /// # Errors
 ///
 /// [`Database`](crate::error::AppError::Database) from the account,
-/// relationship, status and visibility reads.
+/// relationship, status, chat-message and visibility reads.
 async fn render_notifications(
     state: &AppState,
     viewer: &User,
@@ -656,6 +661,7 @@ async fn render_notifications(
         .map(|(relationship, target)| (target, relationship))
         .collect::<RelationshipMap>();
     let statuses = visible_statuses(state, Some(viewer), &status_ids, filters).await?;
+    let chat_messages = rendered_chat_messages(state, viewer, rows).await?;
     let mut entities = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(actor) = users.get(&row.from_account_id) else {
@@ -670,16 +676,86 @@ async fn render_notifications(
         let status = row
             .status_id
             .and_then(|id| statuses.rendered.get(&id).cloned());
+        let chat_message = row
+            .chat_message_id
+            .and_then(|id| chat_messages.get(&id).cloned());
         entities.push(NotificationEntity::from_row(
             row,
             Account::from_user_for(Some(viewer), actor, &state.config, Some(&relationships)),
             status,
+            chat_message,
             relationships
                 .get(&row.from_account_id)
                 .is_some_and(|found| found.muting.0),
         ));
     }
     Ok(entities)
+}
+
+/// The notification render's chat half: every chat message the rows name,
+/// read as the viewer's own reference and rendered through the shared
+/// chat-message path (see [`chat_message_entity`]) — serialized and keyed
+/// by the message row's id (the entity's own `id` is the *reference* id,
+/// the viewer's own, so the map keys on the id the notification stores).
+/// A message the viewer holds no reference to — they took it out of their
+/// chat — is not in the map, and its notification renders without the
+/// `chat_message` key.
+///
+/// [`ChatMessage`]: crate::entities::chat::ChatMessage
+///
+/// # Errors
+///
+/// [`Database`](crate::error::AppError::Database) from the reference and
+/// attachment reads;
+/// [`Internal`](crate::error::AppError::Internal) if an entity would not
+/// serialize.
+async fn rendered_chat_messages(
+    state: &AppState,
+    viewer: &User,
+    rows: &[NotificationRow],
+) -> AppResult<HashMap<Uuid, Value>> {
+    let mut rendered = HashMap::new();
+    for message_id in distinct_ids(rows.iter().filter_map(|row| row.chat_message_id)) {
+        let Some(value) = chat_message_entity(state, viewer.id, message_id).await? else {
+            continue;
+        };
+        let _first = rendered.insert(message_id, value);
+    }
+    Ok(rendered)
+}
+
+/// The viewer's own [`ChatMessage`] entity for message `message_id`: their
+/// reference read through [`chat::message_reference_for_user`] (Pleroma's
+/// `MessageReference.for_chat_and_object` of the reader's chat), rendered
+/// with its attachment row when it carries one, and serialized; `None` when
+/// the viewer holds no reference to the message.
+///
+/// [`ChatMessage`]: crate::entities::chat::ChatMessage
+///
+/// # Errors
+///
+/// [`Database`](crate::error::AppError::Database) from the reference and
+/// media reads; [`Internal`](crate::error::AppError::Internal) if the entity
+/// would not serialize.
+async fn chat_message_entity(
+    state: &AppState,
+    viewer_id: Uuid,
+    message_id: Uuid,
+) -> AppResult<Option<Value>> {
+    let Some(reference) =
+        chat::message_reference_for_user(&state.db, viewer_id, message_id).await?
+    else {
+        return Ok(None);
+    };
+    let attachment = match reference.attachment_media_id {
+        Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await?,
+        None => None,
+    };
+    let entity = ChatMessageEntity::from_reference(&reference, attachment.as_ref(), &state.config);
+    let value = serde_json::to_value(entity).map_err(|err| {
+        AppError::Internal(format!("chat message entity failed to serialize: {err}"))
+    })?;
+    Ok(Some(value))
 }
 
 /// The notification render's status half: every visible row rendered,

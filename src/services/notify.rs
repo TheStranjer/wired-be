@@ -152,6 +152,7 @@ async fn tell(
             status_id,
             emoji: None,
             report_id: None,
+            chat_message_id: None,
         },
     )
     .await
@@ -552,6 +553,7 @@ const fn told_row<'a>(telling: &Telling<'a>) -> NewNotification<'a> {
         status_id: telling.status_id,
         emoji: None,
         report_id: None,
+        chat_message_id: None,
     }
 }
 
@@ -714,6 +716,7 @@ async fn reaction_telling(
             status_id: Some(reaction.status_id),
             emoji: Some(reaction.emoji.as_str()),
             report_id: None,
+            chat_message_id: None,
         },
     )
     .await

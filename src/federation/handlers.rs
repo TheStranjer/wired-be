@@ -25,6 +25,7 @@
 //! for a retry, anything else discarding it.
 
 pub mod actor;
+pub mod chat;
 pub mod create;
 
 use crate::federation::dispatch::Handlers;
@@ -42,5 +43,6 @@ pub fn registry() -> Handlers {
     let mut handlers = Handlers::new();
     actor::register(&mut handlers);
     create::register(&mut handlers);
+    chat::register(&mut handlers);
     handlers
 }
