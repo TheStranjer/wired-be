@@ -27,6 +27,7 @@
 pub mod actor;
 pub mod chat;
 pub mod create;
+pub mod vote;
 
 use crate::federation::dispatch::Handlers;
 
@@ -44,5 +45,6 @@ pub fn registry() -> Handlers {
     actor::register(&mut handlers);
     create::register(&mut handlers);
     chat::register(&mut handlers);
+    vote::register(&mut handlers);
     handlers
 }

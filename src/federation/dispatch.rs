@@ -30,9 +30,13 @@
 //!    unknown types are ignored, logged at debug. Later tickets add one
 //!    line each to [`Handlers::default`]. `Create`, `Update` and `Delete`
 //!    route one level deeper, by the type of the *object* they carry,
-//!    through their own object-type tables; a `Delete` whose object no
-//!    entry of that kind claims falls back to the one route that can tell
-//!    a bare id naming an account from one naming a status;
+//!    through their own object-type tables; a `Create` of a type that
+//!    carries two different kinds of thing — an ordinary post and, say, one
+//!    option of a poll vote, both `Note`s — runs its type's pre-checks
+//!    ([`Handlers::register_create_prechecked`]) before its table entry, and a
+//!    `Delete` whose object no entry of that kind claims falls back to the
+//!    one route that can tell a bare id naming an account from one naming a
+//!    status;
 //! 6. `Undo` routes through its own table by the *inner* activity's type:
 //!    an embedded inner object says so itself, a bare id is looked up
 //!    among the stored remote activities ([`crate::models::activity`]),
@@ -262,6 +266,31 @@ pub type HandlerFn =
 /// same contract as a [`HandlerFn`], registered per inner type.
 pub type UndoFn = HandlerFn;
 
+/// What a `Create` pre-check decides about an embedded object: `true` claims
+/// the activity for the handler registered beside the guard, `false` leaves
+/// it to the object type's own entry.
+///
+/// A guard that must consult the database takes the cheap `AppState` by
+/// value and copies whatever it needs out of the document before its first
+/// `await`, exactly like [`mrf::filter_incoming_boxed`] — that is why the
+/// document arrives borrowed while the future may not be.
+///
+/// [`mrf::filter_incoming_boxed`]: crate::federation::mrf::filter_incoming_boxed
+pub type CreatePreCheck = fn(AppState, &Value) -> BoxFuture<'static, bool>;
+
+/// One guarded `Create` route: the object type whose entry it runs ahead of,
+/// the guard, and the handler the guard hands a claimed activity to.
+#[derive(Clone, Copy, Debug)]
+struct CreateGuard {
+    /// The declared object `type` this guard is consulted for — the same key
+    /// [`Handlers::register_create`] binds.
+    object_type: &'static str,
+    /// Whether the delivered document is the specialised shape.
+    check: CreatePreCheck,
+    /// The handler a claimed document routes to.
+    handler: HandlerFn,
+}
+
 /// The policy stage of the pipeline, as a function pointer so the
 /// dispatcher's test seam can hand it a rejecting filter.
 type MrfFn = fn(AppState, &ActivityView) -> BoxFuture<'static, mrf::MrfDecision>;
@@ -292,6 +321,13 @@ pub struct Handlers {
     /// `Note` and the later `Create` of a `ChatMessage` register one
     /// entry each beside each other.
     create_by_object_type: HashMap<&'static str, HandlerFn>,
+    /// `Create` pre-checks, in registration order: a delivered object of a
+    /// keyed type is put to each of their guards before that type's entry in
+    /// [`Handlers::create_by_object_type`] folds it, which is how one `type`
+    /// that carries two different kinds of thing — a `Note` that is a post
+    /// and a `Note` that is one option of a poll vote — reaches two
+    /// different handlers.
+    create_prechecks: Vec<CreateGuard>,
     /// The `Delete` route for an object [`Handlers::delete_by_object_type`]
     /// does not claim — a bare id, or an embedded document of a type nobody
     /// registered. An id is the only thing that can tell a peer deleting
@@ -318,6 +354,7 @@ impl Handlers {
             update_by_object_type: HashMap::new(),
             delete_by_object_type: HashMap::new(),
             create_by_object_type: HashMap::new(),
+            create_prechecks: Vec::new(),
             delete_fallback: None,
         }
     }
@@ -350,6 +387,52 @@ impl Handlers {
         let _previous = self.create_by_object_type.insert(object_type, handler);
     }
 
+    /// Binds a guarded `Create` route: `check` puts the embedded document of
+    /// a `Create`d `object_type` to its shape test, and a claimed
+    /// activity goes to `handler` instead of to the type's entry in
+    /// [`Handlers::register_create`].
+    ///
+    /// This is the "before" half of a shared object `type`: a poll vote
+    /// arrives as a plain `Create` of a `Note` and only a read of the
+    /// document (and, through its `inReplyTo`, of the database) tells it
+    /// apart from the post it superficially is, so the note ticket's
+    /// unguarded entry stays the fallback and the specialised ticket runs its
+    /// guard first. Guards of one type run in registration order, and the
+    /// first that claims the document ends the walk.
+    pub fn register_create_prechecked(
+        &mut self,
+        object_type: &'static str,
+        check: CreatePreCheck,
+        handler: HandlerFn,
+    ) {
+        self.create_prechecks.push(CreateGuard {
+            object_type,
+            check,
+            handler,
+        });
+    }
+
+    /// The guarded route that claims this `Create`, `None` when no guard of
+    /// `object_type` does: [`route_create`] runs the walk through here so the
+    /// unguarded type table is consulted only once nothing claimed the
+    /// document.
+    async fn claimed_create(
+        &self,
+        object_type: &str,
+        state: &AppState,
+        object: &Value,
+    ) -> Option<HandlerFn> {
+        for guard in &self.create_prechecks {
+            if guard.object_type != object_type {
+                continue;
+            }
+            if (guard.check)(state.clone(), object).await {
+                return Some(guard.handler);
+            }
+        }
+        None
+    }
+
     /// Whether the `Create` sub-registry claims `object_type` — the read
     /// the handler modules' own tests use to check what they registered
     /// without reaching into the table.
@@ -357,6 +440,19 @@ impl Handlers {
     #[must_use]
     pub(crate) fn handles_create(&self, object_type: &str) -> bool {
         self.create_by_object_type.contains_key(object_type)
+    }
+
+    /// Whether a `Create` of `object_type` is put to a pre-check before it
+    /// reaches the object type's own handler — the [`handles_create`]
+    /// question asked of the guarded half of the sub-registry.
+    ///
+    /// [`handles_create`]: Self::handles_create
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn pre_checks_create(&self, object_type: &str) -> bool {
+        self.create_prechecks
+            .iter()
+            .any(|guard| guard.object_type == object_type)
     }
 
     /// Whether the `Delete` sub-registry claims `object_type` — the
@@ -756,10 +852,12 @@ fn object_type(view: &ActivityView) -> Option<String> {
 /// The `Create` arm: the embedded object's own type decides which code
 /// folds it — a `Note` becomes a status, a later ticket's `ChatMessage`
 /// becomes a chat message — through [`Handlers::create_by_object_type`].
-/// An object that is a bare reference declares no type and is ignored, and
-/// so is any type no ticket has registered a route for yet; the create
-/// handler itself reports the same for documents of a registered kind it
-/// cannot use.
+/// A type that carries more than one kind of thing is put to its
+/// [pre-checks](Handlers::register_create_prechecked) first, in registration
+/// order, and a claimed document leaves through the guard's own handler.
+/// An object that is a bare reference declares no type and so neither guard
+/// nor table, and is ignored; so is any type no ticket has registered a
+/// route for yet.
 async fn route_create(
     state: &AppState,
     view: ActivityView,
@@ -767,6 +865,13 @@ async fn route_create(
     handlers: &Handlers,
 ) -> Result<(), JobError> {
     let declared = object_type(&view);
+    let claimed = match (declared.as_deref(), view.object.embedded()) {
+        (Some(kind), Some(object)) => handlers.claimed_create(kind, state, object).await,
+        (Some(_), None) | (None, _) => None,
+    };
+    if let Some(handler) = claimed {
+        return call_handler(handler, state, view, signer).await;
+    }
     let handler = declared
         .as_deref()
         .and_then(|kind| handlers.create_by_object_type.get(kind))
@@ -1085,6 +1190,28 @@ mod tests {
         })
     }
 
+    /// The `Create` pre-check fake of the vote ticket's guard: it claims every
+    /// document that names an option and passes over every other one.
+    fn claims_named(_state: AppState, object: &Value) -> BoxFuture<'static, bool> {
+        let named = object
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty());
+        Box::pin(async move { named })
+    }
+
+    /// The handler the [`claims_named`] guard routes to.
+    fn prechecked_handler(
+        _state: AppState,
+        view: ActivityView,
+        _signer: User,
+    ) -> BoxFuture<'static, Result<Outcome, FederationError>> {
+        Box::pin(async move {
+            record("prechecked", &view);
+            Ok(Outcome::Handled)
+        })
+    }
+
     /// The `Delete` fake for an object type the sub-registry claims.
     fn delete_tombstone_handler(
         _state: AppState,
@@ -1166,14 +1293,15 @@ mod tests {
         );
     }
 
-    /// The live registry holds the actor routes, the note-create routes and
-    /// the chat routes and nothing else: the `Update` table is keyed by the
-    /// five actor object types, `Delete` runs through the object-type entry
-    /// the chat handler claims and the fallback that resolves an object id,
-    /// and the `Create` table is keyed by the eight `Note`-family object
-    /// types the parser accepts plus the chat handler's `ChatMessage`. The
-    /// object-type tables are also the entry points later tickets add their
-    /// own keys to.
+    /// The live registry holds the actor routes, the note-create routes, the
+    /// chat routes and the poll-vote pre-check and nothing else: the `Update`
+    /// table is keyed by the five actor object types, `Delete` runs through
+    /// the object-type entry the chat handler claims and the fallback that
+    /// resolves an object id, and the `Create` table is keyed by the eight
+    /// `Note`-family object types the parser accepts plus the chat handler's
+    /// `ChatMessage`, with the poll ticket's guard running ahead of the
+    /// `Note` entry it shares with the note handler. The object-type tables
+    /// are also the entry points later tickets add their own keys to.
     #[test]
     fn the_live_registry_holds_the_actor_routes() {
         let handlers = Handlers::default();
@@ -1227,6 +1355,14 @@ mod tests {
             handlers.create_by_object_type.len(),
             crate::federation::note_parser::OBJECT_TYPES.len() + 1,
             "the note family plus the chat ticket's key: later tickets (polls) add their own"
+        );
+        assert!(
+            handlers.pre_checks_create("Note"),
+            "a Create of a `Note` is put to the poll ticket's guard first: an answer is a vote, not a post"
+        );
+        assert!(
+            !handlers.pre_checks_create("Question"),
+            "and the guard covers the note shape alone: a `Question` is a poll, folded by the note handler"
         );
     }
 
@@ -1887,6 +2023,71 @@ mod tests {
                 + seen("ok", "https://peer.example/activities/create-chat"),
             0,
             "neither the reference nor the unclaimed type reached a handler"
+        );
+    }
+
+    /// A `Create` pre-check runs ahead of its object type's entry: a document
+    /// the guard claims leaves through the guard's own handler, and one it
+    /// passes over folds through the table exactly as it did before the guard
+    /// existed. That is the shape of the poll vote — a `Note` that is not a
+    /// post — and the fall-through is what keeps ordinary notes alone.
+    #[tokio::test]
+    async fn a_create_pre_check_runs_ahead_of_its_object_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let mut handlers = Handlers::new();
+        handlers.register_create("Note", ok_handler);
+        handlers.register_create_prechecked("Note", claims_named, prechecked_handler);
+        let named = json!({
+            "id": "https://peer.example/activities/guarded-note",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/posts/guarded",
+                "type": "Note",
+                "name": "the claimed option",
+            },
+        });
+        let plain = json!({
+            "id": "https://peer.example/activities/unguarded-note",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/posts/unguarded",
+                "type": "Note",
+                "content": "an ordinary post",
+            },
+        });
+        let state = app_state(&pool);
+
+        let claimed = deliver(&state, &alice, &named, &handlers).await;
+        let passed = deliver(&state, &alice, &plain, &handlers).await;
+
+        assert_eq!(claimed, Ok(()), "the claimed document completes");
+        assert_eq!(passed, Ok(()), "and so does the passed-over one");
+        assert_eq!(
+            seen("prechecked", "https://peer.example/activities/guarded-note"),
+            1,
+            "the guard's handler folded the document it claimed"
+        );
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/guarded-note"),
+            0,
+            "and the type's own entry never saw it"
+        );
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/unguarded-note"),
+            1,
+            "the document the guard passed over reached the table"
+        );
+        assert_eq!(
+            seen(
+                "prechecked",
+                "https://peer.example/activities/unguarded-note"
+            ),
+            0,
+            "and not the guarded handler"
         );
     }
 

@@ -41,7 +41,13 @@
 //! transaction that inserts the voter's marks and moves every counter the
 //! entity reports — locking the poll row first, so two concurrent ballots
 //! from one account serialize and the second is refused rather than
-//! double-counted.
+//! double-counted. The inbound poll-vote ticket (WBE-174) reuses that same
+//! write for a federated `Create` of one answer, which is why
+//! [`cast_vote`]'s refusal is stated per mark: a poll that is
+//! [`multiple`](Poll::multiple) takes a voter's later options as they arrive
+//! (one `Create` each) while [`voters_count`](Poll::voters_count) moves for
+//! the first one only, and a poll that is not refuses the second ballot
+//! whole.
 //!
 //! The poll-end notification ticket (WBE-113) adds the sweep the
 //! [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY) job runs:
@@ -478,8 +484,9 @@ const HAS_VOTED_SQL: &str =
 /// poll, an account that never voted and a poll only others voted on all
 /// answer `false` — nobody else's ballot is this voter's fact.
 ///
-/// [`cast_vote`] runs the same probe again inside its transaction, so the
-/// endpoint's answer stays honest under concurrent requests.
+/// [`cast_vote`] reads the voter's marks again inside its transaction (the
+/// same `poll_id, user_id` walk), so the endpoint's
+/// answer stays honest under concurrent requests.
 ///
 /// # Errors
 ///
@@ -504,10 +511,13 @@ const LOCK_POLL_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_to
                               WHERE id = $1
                                 FOR UPDATE";
 
-/// [`cast_vote`]'s in-transaction rerun of [`HAS_VOTED_SQL`]: taken under
-/// the poll's row lock, it is what makes the endpoint's already-voted
-/// refusal hold even for two requests that raced past the cheap read.
-const VOTER_MARKED_SQL: &str = HAS_VOTED_SQL;
+/// [`cast_vote`]'s in-transaction read of the voter's own marks: which
+/// options of the poll that account has already ticked, taken under the
+/// poll's row lock. Its emptiness is what makes a ballot a voter's *first* —
+/// the only one that raises `voters_count` — and its contents are what no
+/// later ballot may tick twice.
+const VOTER_MARKS_SQL: &str =
+    "SELECT option_id FROM poll_votes WHERE poll_id = $1 AND user_id = $2";
 
 /// [`cast_vote`]'s marks: one `poll_votes` row per chosen option, all in
 /// one statement on the transaction — the same [`WITH ORDINALITY`]-style
@@ -521,38 +531,66 @@ const INSERT_MARKS_SQL: &str = "INSERT INTO poll_votes (poll_id, option_id, user
 
 /// [`cast_vote`]'s per-option bump: each chosen option gains exactly one
 /// vote. The `poll_id` guard keeps a mistargeted option id from moving a
-/// row of another poll; the endpoint only ever passes ids read from this
+/// row of another poll; both callers only ever pass ids read from this
 /// poll's own [`options`].
 const BUMP_OPTIONS_SQL: &str = "UPDATE poll_options SET votes_count = votes_count + 1
      WHERE poll_id = $1 AND id = ANY($2)";
 
 /// [`cast_vote`]'s roll-up bump: `votes_count` gains one per mark,
-/// `voters_count` gains the one new voter. Both moves are in-statement
-/// arithmetic on the stored column, so racing ballots on one poll sum
-/// instead of overwriting each other — on top of the row lock that makes
-/// every voter's marks land as one indivisible ballot.
+/// `voters_count` gains the one voter a first ballot brings — `$3`, which is
+/// `0` for every later mark the same account adds to a
+/// [`multiple`](Poll::multiple) poll, because that voter is already counted.
+/// Both moves are in-statement arithmetic on the stored column, so racing
+/// ballots on one poll sum instead of overwriting each other — on top of the
+/// row lock that makes every ballot's marks land as one indivisible write.
 const BUMP_POLL_SQL: &str = "UPDATE polls SET votes_count = votes_count + $2,
-        voters_count = voters_count + 1
+        voters_count = voters_count + $3
     WHERE id = $1";
+
+/// Whether [`cast_vote`] would record `option_ids` for `user_id`, and the
+/// marks it would actually write: `Some` of the options the voter has not
+/// ticked yet, `None` when the ballot marks nothing new. A poll that is not
+/// [`Poll::multiple`] takes one ballot per voter, so any earlier mark
+/// refuses a later one whole; a [`multiple`](Poll::multiple) poll lets a
+/// voter's later ballots add options, which is how a federated vote arrives
+/// — one `Create` per chosen option — and why the voter's marks, not the
+/// voter, are what a repeat cannot double.
+fn fresh_marks(multiple: bool, marked: &[Uuid], option_ids: &[Uuid]) -> Option<Vec<Uuid>> {
+    if !marked.is_empty() && !multiple {
+        return None;
+    }
+    let fresh: Vec<Uuid> = option_ids
+        .iter()
+        .copied()
+        .filter(|id| !marked.contains(id))
+        .collect();
+    (!fresh.is_empty()).then_some(fresh)
+}
 
 /// Records `user_id`'s ballot on poll `poll_id` as one transaction.
 ///
 /// The write is the marks themselves, each chosen option's
 /// [`votes_count`](PollOption::votes_count) stepped, and the poll's
 /// roll-up columns — [`votes_count`](Poll::votes_count) by the number of
-/// options marked, [`voters_count`](Poll::voters_count) by the one new
-/// voter.
+/// options marked, [`voters_count`](Poll::voters_count) by the one voter a
+/// first ballot brings. A voter's later marks on a [`multiple`](Poll::multiple)
+/// poll therefore move the counts of the options they name and the poll's
+/// vote total without counting the voter twice, which is what an inbound
+/// [`Create`](crate::federation::handlers::vote) of one answer needs and what
+/// [`crate::federation::handlers::vote`] lands through this one function
+/// beside the endpoint.
 ///
 /// `option_ids` must name options of `poll_id`, deduplicated by the caller
 /// (a voter cannot tick the same option twice, and the primary key would
 /// refuse the attempt anyway); the endpoint derives them from the parsed
 /// choices before it gets here. The answer is `true` when the ballot was
-/// recorded and `false` when the voter already had a mark on this poll —
-/// detected under the poll's row lock, which is what serializes racing
-/// requests into one ballot and one refusal. A poll that was deleted
-/// between the caller's read and this write is [`AppError::NotFound`];
-/// nothing was changed in either refused case, because the whole write
-/// rolls back.
+/// recorded and `false` when nothing new was: a voter with an earlier mark
+/// on a poll that is not [`multiple`](Poll::multiple), or a ballot naming
+/// only options that voter has ticked already. Both are detected under the
+/// poll's row lock, which is what serializes racing requests into one write
+/// per ballot and one refusal. A poll that was deleted between the caller's
+/// read and this write is [`AppError::NotFound`]; nothing was changed in
+/// either refused case, because the whole write rolls back.
 ///
 /// # Errors
 ///
@@ -572,41 +610,43 @@ pub async fn cast_vote(
         .bind(poll_id)
         .fetch_optional(&mut *tx)
         .await?;
-    if locked.is_none() {
+    let Some(stand) = locked else {
         tx.rollback().await?;
         return Err(AppError::NotFound);
-    }
-    let already_voted: bool = sqlx::query_scalar::<_, bool>(VOTER_MARKED_SQL)
+    };
+    let marked: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(VOTER_MARKS_SQL)
         .bind(poll_id)
         .bind(user_id)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-    if already_voted {
+    let Some(fresh) = fresh_marks(stand.multiple, &marked, option_ids) else {
         tx.rollback().await?;
         return Ok(false);
-    }
-    let marks = i32::try_from(option_ids.len()).map_err(|_overflow| {
+    };
+    let marks = i32::try_from(fresh.len()).map_err(|_overflow| {
         AppError::Internal(format!(
             "ballot of {} marks is longer than an i32",
             option_ids.len()
         ))
     })?;
+    let voter = i32::from(marked.is_empty());
     sqlx::query(INSERT_MARKS_SQL)
         .bind(poll_id)
         .bind(user_id)
-        .bind(option_ids)
+        .bind(&fresh)
         .execute(&mut *tx)
         .await
         .map(drop)?;
     sqlx::query(BUMP_OPTIONS_SQL)
         .bind(poll_id)
-        .bind(option_ids)
+        .bind(&fresh)
         .execute(&mut *tx)
         .await
         .map(drop)?;
     sqlx::query(BUMP_POLL_SQL)
         .bind(poll_id)
         .bind(marks)
+        .bind(voter)
         .execute(&mut *tx)
         .await
         .map(drop)?;
@@ -1660,6 +1700,135 @@ mod tests {
                 .expect("the marks read"),
             vec![0],
             "and wrote no second mark"
+        );
+    }
+
+    /// A [`params`] two-option poll that lets one voter mark both options —
+    /// the shape an inbound federated ballot arrives against, one `Create`
+    /// per chosen option.
+    fn many_params(titles: &[&str]) -> PollParams {
+        PollParams {
+            multiple: true,
+            ..params(titles)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multiple_poll_counts_a_voter_s_later_ballot_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(&pool, posted.id, &many_params(&["tea", "coffee"])).await;
+        let choices = options(&pool, stand.id).await.expect("options read");
+        let ids: Vec<Uuid> = choices.iter().map(|choice| choice.id).collect();
+
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[0]])
+                .await
+                .expect("the first option is recorded"),
+            "bob's first ballot lands"
+        );
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[1]])
+                .await
+                .expect("the later option is recorded"),
+            "a multiple poll takes the same voter's second option"
+        );
+        let after = get_by_id(&pool, stand.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert_eq!(after.votes_count, 2, "one vote per distinct option");
+        assert_eq!(
+            after.voters_count, 1,
+            "the voter is counted once, not twice"
+        );
+        assert_eq!(
+            option_counts(&pool, stand.id).await,
+            vec![(0, 1), (1, 1)],
+            "and each of the voter's two options gained one"
+        );
+        assert_eq!(
+            voted_option_positions(&pool, stand.id, bob.id)
+                .await
+                .expect("the marks read"),
+            vec![0, 1],
+            "both options stand marked under one ballot-set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_multiple_poll_refuses_an_option_the_voter_ticked_already() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(&pool, posted.id, &many_params(&["tea", "coffee", "water"])).await;
+        let choices = options(&pool, stand.id).await.expect("options read");
+        let ids: Vec<Uuid> = choices.iter().map(|choice| choice.id).collect();
+
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[0]])
+                .await
+                .expect("the first ballot lands"),
+            "the first option is recorded"
+        );
+
+        assert!(
+            !cast_vote(&pool, stand.id, bob.id, &[ids[0]])
+                .await
+                .expect("the repeat is answered"),
+            "re-marking a ticked option records nothing new"
+        );
+        let after = get_by_id(&pool, stand.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert_eq!(after.votes_count, 1, "the refusal doubled no count");
+        assert_eq!(after.voters_count, 1, "in either column");
+    }
+
+    #[tokio::test]
+    async fn a_multiple_ballot_writes_only_the_fresh_options() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let bob = create_user(&pool, "bob").await;
+        let posted = create_status(&pool, &alice).await;
+        let stand = create_for(&pool, posted.id, &many_params(&["tea", "coffee", "water"])).await;
+        let choices = options(&pool, stand.id).await.expect("options read");
+        let ids: Vec<Uuid> = choices.iter().map(|choice| choice.id).collect();
+
+        // One option already marked; the whole three-option ballot then adds
+        // only the two it has not ticked, never re-counting the first.
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &[ids[0]])
+                .await
+                .expect("the first option lands"),
+            "the first option is recorded"
+        );
+        assert!(
+            cast_vote(&pool, stand.id, bob.id, &ids)
+                .await
+                .expect("the full ballot is recorded"),
+            "the two fresh options land on the second ballot"
+        );
+        let after = get_by_id(&pool, stand.id)
+            .await
+            .expect("the poll reads")
+            .expect("the poll stands");
+        assert_eq!(
+            after.votes_count, 3,
+            "each of the three options, counted once"
+        );
+        assert_eq!(after.voters_count, 1, "still a single voter");
+        assert_eq!(
+            option_counts(&pool, stand.id).await,
+            vec![(0, 1), (1, 1), (2, 1)],
+            "the already-marked option was not bumped a second time"
         );
     }
 

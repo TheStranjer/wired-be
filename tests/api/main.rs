@@ -223,6 +223,12 @@ mod pins;
 /// stored once per replayed key and never by a preview.
 mod polls;
 
+/// Inbound poll votes over federation (WBE-174): the dispatcher folding a
+/// `Create` of a bodyless `Note` that names one option of this instance's
+/// own poll — counts, dedupe, refusals, the author's telling — and the
+/// fall-through that leaves an ordinary note reply to the create path.
+mod poll_votes;
+
 /// Web Push subscriptions (`/api/v1/push/subscription`) and the VAPID key
 /// the app and instance responses advertise.
 mod push;
