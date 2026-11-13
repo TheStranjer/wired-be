@@ -40,8 +40,11 @@ use url::Url;
 
 use crate::{
     error::AppError,
-    federation::json::{as_array, first_string, value_or_id},
-    models::user::{DEFAULT_ACTOR_TYPE, Flag, User},
+    federation::json::{as_array, first_string, http_host, value_or_id},
+    models::{
+        instance,
+        user::{DEFAULT_ACTOR_TYPE, Flag, User},
+    },
     util::{
         id::new_id,
         sanitize::{sanitize_html, strip_html},
@@ -303,10 +306,19 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
 /// nickname: a row other than this actor's own wins
 /// [`ActorError::NicknameConflict`] instead of being renamed or overwritten.
 ///
+/// After the row is stored, [`instance::touch`] records first sight of the
+/// host of [`ap_id`](NewRemoteUser::ap_id) (or notes that a known host was
+/// seen again): mirroring a remote user is what makes its instance exist in
+/// the ledger. An `ap_id` with no usable host — nothing [`http_host`] can
+/// read — names no instance to record, so the touch is skipped and the
+/// upsert still answers `Ok`: the user row is stored either way and no
+/// host is invented from the nickname.
+///
 /// # Errors
 ///
 /// [`ActorError::NicknameConflict`] when another `ap_id` already holds this
-/// nickname; [`ActorError::Failed`] for any database failure.
+/// nickname; [`ActorError::Failed`] for any database failure, including the
+/// instance record.
 pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<User, ActorError> {
     let holder: Option<String> = sqlx::query_scalar(NICKNAME_HOLDER_SQL)
         .bind(new.nickname.as_str())
@@ -341,6 +353,12 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.public_key.as_str())
         .fetch_one(pool)
         .await?;
+    // First sight of the mirrored user touches its instance; an `ap_id`
+    // [`http_host`] cannot read names no host, and the record is skipped
+    // (see the function docs).
+    if let Some(host) = http_host(&new.ap_id) {
+        instance::touch(pool, &host).await?;
+    }
     Ok(user)
 }
 
@@ -555,6 +573,8 @@ fn parse_published(json: &Value) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+
+    use chrono::TimeDelta;
 
     use super::*;
     use crate::models::user::{
@@ -1264,5 +1284,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.0, 2, "and nothing else was inserted");
+    }
+
+    /// The `instances` row of `host`: `inserted_at`, `updated_at` and its
+    /// mark.
+    async fn instance_row(
+        pool: &PgPool,
+        host: &str,
+    ) -> (DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>) {
+        sqlx::query_as::<_, (DateTime<Utc>, DateTime<Utc>, Option<DateTime<Utc>>)>(
+            "SELECT inserted_at, updated_at, unreachable_since FROM instances WHERE host = $1",
+        )
+        .bind(host)
+        .fetch_one(pool)
+        .await
+        .expect("the mirrored host has a row")
+    }
+
+    /// The first upsert of a remote actor first-sights its instance: the
+    /// row exists the moment the user does, and carries no mark — a host
+    /// this instance has merely mirrored is reachable; delivery failures
+    /// make the marks, not fetches.
+    #[tokio::test]
+    async fn a_first_upsert_creates_the_instance_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            user.domain.as_deref(),
+            Some("mastodon.example"),
+            "the mirror row stores"
+        );
+        let (inserted, updated, mark) = instance_row(&pool, "mastodon.example").await;
+        assert!(mark.is_none(), "a mirrored host is first-sighted unmarked");
+        assert_eq!(
+            inserted, updated,
+            "the row is stamped once, by its own insert"
+        );
+    }
+
+    /// The second upsert of the same actor is a re-sighting: it bumps the
+    /// instance row's `updated_at` and writes nothing else — first sight
+    /// stands and the row stays unmarked, on the same user row as before.
+    #[tokio::test]
+    async fn a_second_upsert_only_bumps_the_instance_updated_at() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let first = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+        // Age the row's stamps so the re-sighting's bump is an observable
+        // move rather than a race with the clock; the comparisons below
+        // read the aged values back, which is what the columns hold.
+        let _aged =
+            sqlx::query("UPDATE instances SET inserted_at = $2, updated_at = $2 WHERE host = $1")
+                .bind("mastodon.example")
+                .bind(Utc::now() - TimeDelta::days(1))
+                .execute(&pool)
+                .await
+                .expect("the stamps are settable");
+        let (inserted, aged, mark) = instance_row(&pool, "mastodon.example").await;
+        assert!(mark.is_none(), "nothing marked the aged row");
+
+        let second = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+
+        let (inserted_now, updated_now, mark_now) = instance_row(&pool, "mastodon.example").await;
+        assert_eq!(second.id, first.id, "the same mirror row, updated");
+        assert_eq!(inserted_now, inserted, "first sight is never rewritten");
+        assert!(updated_now > aged, "the re-sighting bumps updated_at");
+        assert!(mark_now.is_none(), "and the row stays unmarked");
+    }
+
+    /// An `ap_id` [`http_host`] cannot read names no instance: the stored
+    /// behavior is to skip the record and answer `Ok` — the user row goes
+    /// in like any other and no host is invented from the nickname.
+    #[tokio::test]
+    async fn an_upsert_with_a_hostless_ap_id_skips_the_instance_record() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut new = parse_actor(&fixture(MASTODON)).unwrap();
+        new.ap_id = "mailto:alice@mastodon.example".to_owned();
+
+        let user = upsert_remote_user(&pool, new).await.unwrap();
+
+        assert_eq!(
+            user.ap_id, "mailto:alice@mastodon.example",
+            "the user row is stored all the same"
+        );
+        let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM instances")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "and the instance record was skipped");
     }
 }
