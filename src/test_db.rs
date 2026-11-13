@@ -14,9 +14,10 @@
 //!   connecting role (every migration's version and checksum plus the username,
 //!   see `fingerprint`), so editing `migrations/` — or running the suite as
 //!   another role, whose databases it could not reset — yields a different
-//!   template, and this role's databases of the old fingerprint are dropped. The first caller in a process builds it under a
-//!   session advisory lock, so concurrent test binaries build — and wait for —
-//!   exactly one template.
+//!   template, and this role's idle databases of the old fingerprint are
+//!   dropped (ones another suite is still connected to are left for it). The
+//!   first caller in a process builds it under a session advisory lock, so
+//!   concurrent test binaries build — and wait for — exactly one template.
 //! - **Slot databases**, `wired_test_{fp}_{n}`, are copies of the template
 //!   made with `CREATE DATABASE … TEMPLATE …` on a slot's first use. That cost
 //!   is paid about once per concurrent test thread, not once per test.
@@ -326,8 +327,8 @@ async fn prepare_template(
 }
 
 /// The work done while holding the template lock: create and migrate the
-/// template if it is not there yet, then drop every database of a fingerprint
-/// other than `fp` — the leftovers of earlier migration sets.
+/// template if it is not there yet, then drop every idle database of a
+/// fingerprint other than `fp` — the leftovers of earlier migration sets.
 ///
 /// # Errors
 ///
@@ -381,27 +382,31 @@ async fn release_template_lock(conn: &mut PgConnection) -> Result<(), TestDbErro
     }
 }
 
-/// Drops every database of this fingerprint's own prefix whose fingerprint is
-/// not `fp`.
+/// Drops every database of a fingerprint other than `fp`: the leftovers of
+/// earlier migration sets.
 ///
-/// `WITH (FORCE)` ends the sessions still reading a stale slot — the test
-/// binaries of an older build, which cannot be holding a lease of this
-/// fingerprint's slots — so editing `migrations/` between two runs leaves no
-/// databases behind. Only databases the connecting role owns are candidates:
-/// another role's leftovers are not this role's to drop, and cost nothing but
-/// disk to leave. The maintenance database is never dropped, however it is
-/// named.
+/// A database that still has a session connected is skipped, and a drop that
+/// loses that race is logged and skipped rather than forced: on a shared
+/// server a foreign-fingerprint database can belong to another branch's test
+/// suite running right now, and force-dropping it would sever that suite's
+/// live leases. Leaving a stale database costs disk, nothing more, and the
+/// next sweep while it is idle takes it. Only databases the connecting role
+/// owns are candidates: another role's leftovers are not this role's to drop.
+/// The maintenance database is never dropped, however it is named.
 ///
 /// # Errors
 ///
-/// Returns [`TestDbError::Database`] if a lookup or drop fails.
+/// Returns [`TestDbError::Database`] if a lookup fails.
 async fn drop_stale_databases(conn: &mut PgConnection, fp: &str) -> Result<(), TestDbError> {
     let current = current_database(conn).await?;
     let owned: Vec<String> = sqlx::query_scalar(
-        "SELECT datname FROM pg_database \
-          WHERE starts_with(datname, $1) \
-            AND pg_get_userbyid(datdba) = current_user \
-          ORDER BY datname",
+        "SELECT d.datname FROM pg_database d \
+          WHERE starts_with(d.datname, $1) \
+            AND pg_get_userbyid(d.datdba) = current_user \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname \
+            ) \
+          ORDER BY d.datname",
     )
     .bind(DB_PREFIX)
     .fetch_all(&mut *conn)
@@ -409,10 +414,22 @@ async fn drop_stale_databases(conn: &mut PgConnection, fp: &str) -> Result<(), T
     for database in owned {
         let is_stale = owned_fingerprint(&database).is_some_and(|got| got != fp);
         if is_stale && database != current {
-            drop_database(conn, &database).await?;
+            drop_idle_database(conn, &database).await;
         }
     }
     Ok(())
+}
+
+/// `DROP DATABASE IF EXISTS <name>`, without `WITH (FORCE)`: the caller found
+/// no session on the database, and a session that attached since then should
+/// refuse the drop, not be killed by it. The refusal is logged at debug and
+/// skipped — cleanup is opportunistic, and a database that is being used is
+/// by definition not leftover garbage.
+async fn drop_idle_database(conn: &mut PgConnection, name: &str) {
+    let sql = format!("DROP DATABASE IF EXISTS {}", quoted(name));
+    if let Err(err) = execute_ddl(conn, sql).await {
+        tracing::debug!("left {name} in place, its drop was refused: {err}");
+    }
 }
 
 /// The name of the database `conn` is connected to.
@@ -1108,5 +1125,69 @@ mod tests {
     fn quoting_keeps_an_identifier_one_word() {
         assert_eq!(quoted("plain"), "\"plain\"");
         assert_eq!(quoted("two\"words"), "\"two\"\"words\"");
+    }
+
+    /// The stale sweep takes only idle databases: a foreign-fingerprint
+    /// database some session is connected to survives the sweep and an idle
+    /// one goes, while a database of this fingerprint's own survives either
+    /// way. A branch's running suite must never lose its live leases to
+    /// another branch's startup cleanup.
+    #[tokio::test]
+    async fn stale_cleanup_spares_databases_that_are_in_use() {
+        let fp = leased_fingerprint();
+        let alien = "deadbeefdeadbeef";
+        let busy = slot_name(alien, 40);
+        let idle = slot_name(alien, 41);
+        let own = slot_name(&fp, 42);
+        let mut conn = maintenance_conn().await;
+        let options = maintenance_options().expect("DATABASE_URL is set for the test suite");
+        for database in [&busy, &idle, &own] {
+            create_database(&mut conn, database, "template1")
+                .await
+                .expect("the test database is created");
+        }
+        // Sessions on the two databases that must survive the sweep: the
+        // busy alien one because cleanup skips anything in use, and the
+        // own-fingerprint one also against a concurrently starting foreign
+        // sweep, which may only ever take idle databases.
+        let busy_session = PgConnection::connect_with(&options.clone().database(&busy))
+            .await
+            .expect("a session attaches to the busy database");
+        let own_session = PgConnection::connect_with(&options.database(&own))
+            .await
+            .expect("a session attaches to the own-fingerprint database");
+
+        drop_stale_databases(&mut conn, &fp)
+            .await
+            .expect("the sweep runs");
+
+        assert!(
+            database_exists(&mut conn, &busy)
+                .await
+                .expect("the catalog answers"),
+            "a database another session is using is not someone's garbage"
+        );
+        assert!(
+            !database_exists(&mut conn, &idle)
+                .await
+                .expect("the catalog answers"),
+            "an idle foreign database is swept away"
+        );
+        assert!(
+            database_exists(&mut conn, &own)
+                .await
+                .expect("the catalog answers"),
+            "this fingerprint's own databases are never stale"
+        );
+
+        drop(busy_session);
+        drop(own_session);
+        // Forced teardown: a session the server has not finished reaping
+        // must not refuse the cleanup of this test's own databases.
+        for database in [&busy, &idle, &own] {
+            drop_database(&mut conn, database)
+                .await
+                .expect("the test database is dropped again");
+        }
     }
 }

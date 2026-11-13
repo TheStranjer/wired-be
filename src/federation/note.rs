@@ -407,7 +407,8 @@ fn poll_option_json(option: &PollOptionData) -> Value {
     })
 }
 
-/// The `@context` of every document this module builds: the
+/// The `@context` of every document this module and the
+/// [`activities`](super::activities) beside it build: the
 /// `ActivityStreams` vocabulary, this instance's [`litepub_context_json`]
 /// schema, and the `und` language map Pleroma's `make_json_ld_header`
 /// writes for a document that declares no language. The collection

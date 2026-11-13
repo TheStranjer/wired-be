@@ -10,6 +10,13 @@
 //! unknown `keyId`'s actor through [`get_or_fetch_by_ap_id`]), and verifies
 //! the signature through [`crate::federation::signature`].
 //!
+//! [`fetch_signer`] is that same authentication for the routes that need
+//! more than a yes: the private/direct object and activity read routes call
+//! it to learn whether the reader is one of the actors the document is
+//! addressed to, so it hands back the `User` row the `keyId` names instead of
+//! only its public key. Its `Ok(None)` — the flag off and nothing signed — is
+//! the anonymous reader those routes weigh against their audience.
+//!
 //! The instance actor document at `/internal/fetch` is deliberately not
 //! gated: a peer cannot sign with a key it has not fetched yet, so the
 //! signer's own document has to stay readable without one.
@@ -21,7 +28,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         fetch_actor::get_or_fetch_by_ap_id,
-        signature::verify::{ParsedSignature, SignedRequestParts, parse_signature_header, verify},
+        signature::verify::{SignedRequestParts, parse_signature_header, verify},
     },
     models::user::{User, get_by_ap_id},
     state::AppState,
@@ -30,6 +37,14 @@ use crate::{
 /// The refusal every unsatisfied check answers with: the requester is
 /// unknown or unproven, which is an authentication failure (401).
 const REFUSAL: &str = "This instance requires authenticated fetches";
+
+/// The header whose value carries a requester's proof.
+const SIGNATURE_HEADER: HeaderName = HeaderName::from_static("signature");
+
+/// The refusal of an unproven read, as the [`AppError`] routes answer with.
+fn refusal() -> AppError {
+    AppError::Unauthorized(REFUSAL.to_owned())
+}
 
 /// Whether this request may be answered.
 ///
@@ -51,13 +66,83 @@ pub async fn fetch_allowed(
     uri: &Uri,
     headers: &HeaderMap,
 ) -> AppResult<()> {
+    // The flag-off path stays a plain yes: no header is read, nothing is
+    // looked up and no document is dereferenced to answer it.
     if !state.config.fetch.authorized_fetch.get() {
         return Ok(());
     }
-    let Some(signature) = received_signature(headers) else {
-        return Err(AppError::Unauthorized(REFUSAL.to_owned()));
+    // With the gate on there is no anonymous reader: the request that offered
+    // no signature is refused, so the identity the pass returns is only what
+    // this entry point does not need.
+    authenticated_reader(state, method, uri, headers)
+        .await
+        .map(drop)
+}
+
+/// Who proved this request, for the routes that must know their reader.
+///
+/// The `AUTHORIZED_FETCH` flag decides what an unsigned read is worth, not
+/// how a signed one is judged:
+///
+/// * on — the answer is [`fetch_allowed`]'s gate in another shape: every
+///   unsatisfied check is the 401 refusal, a verified one is the `User` row
+///   the `keyId` names;
+/// * off — a request carrying no `Signature` header is the anonymous read
+///   every federation client is used to making, and answers `Ok(None)`
+///   without looking anything up; a request that does carry one is held to
+///   the same proof as above, so a header that is malformed, does not
+///   verify, or names an actor with no key is the 401 refusal rather than a
+///   silent `None` a caller could mistake for an anonymous reader.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] (401) as described above; database failures
+/// arrive as the usual [`AppError::Database`](crate::error::AppError).
+pub async fn fetch_signer(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> AppResult<Option<User>> {
+    authenticated_reader(state, method, uri, headers).await
+}
+
+/// The reader a request's `Signature` header proves, end to end: parse the
+/// header, resolve the key of the actor its `keyId` names (stored, or
+/// fetched once), and verify the signature over exactly this request. Both
+/// entry points are this one pass; `fetch_allowed` discards the row,
+/// [`fetch_signer`] hands it back.
+///
+/// `Ok(None)` is a request that offered no header at all while
+/// `AUTHORIZED_FETCH` is off; every other way of not proving the read is the
+/// 401 refusal, in both modes.
+async fn authenticated_reader(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> AppResult<Option<User>> {
+    let Some(header) = headers.get(SIGNATURE_HEADER) else {
+        // Nothing was offered: the refusal while the gate is on, the
+        // legitimate anonymous read while it is off.
+        return if state.config.fetch.authorized_fetch.get() {
+            Err(refusal())
+        } else {
+            Ok(None)
+        };
     };
-    let public_pem = signing_key_of(state, actor_of_key_id(&signature.key_id)).await?;
+    // Something was offered and it cannot be read: that is a failed proof,
+    // not the absence of one.
+    let Some(signature) = header
+        .to_str()
+        .ok()
+        .and_then(|value| parse_signature_header(value).ok())
+    else {
+        tracing::debug!("the Signature header could not be parsed");
+        return Err(refusal());
+    };
+    let signer = signing_actor(state, actor_of_key_id(&signature.key_id)).await?;
+    let public_pem = key_material(&signer)?;
     let target = request_target(uri);
     let request = SignedRequestParts {
         method: method.as_str(),
@@ -68,17 +153,9 @@ pub async fn fetch_allowed(
         // The requester proved nothing this instance accepts: log why
         // internally, answer the one refusal externally.
         tracing::debug!(%err, "the fetch signature did not verify");
-        AppError::Unauthorized(REFUSAL.to_owned())
-    })
-}
-
-/// The parsed `Signature` header of a received request, `None` when the
-/// header is absent, unreadable or malformed.
-fn received_signature(headers: &HeaderMap) -> Option<ParsedSignature> {
-    headers
-        .get(HeaderName::from_static("signature"))
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_signature_header(value).ok())
+        refusal()
+    })?;
+    Ok(Some(signer))
 }
 
 /// The actor a `keyId` names: the key URI up to its `#fragment`, e.g.
@@ -97,22 +174,22 @@ fn request_target(uri: &Uri) -> String {
     )
 }
 
-/// The public key that must verify the signature of an actor: the stored
-/// one when this instance knows the actor, and after one network
-/// dereference when it does not (the unknown-`keyId` rule).
-async fn signing_key_of(state: &AppState, actor_id: &str) -> AppResult<String> {
+/// The actor a `keyId` names, as its row: the stored one when this instance
+/// knows the actor, and after one network dereference when it does not (the
+/// unknown-`keyId` rule).
+///
+/// The row is what both entry points need — [`fetch_allowed`] only asks it
+/// for the key in [`key_material`], [`fetch_signer`] answers with it.
+async fn signing_actor(state: &AppState, actor_id: &str) -> AppResult<User> {
     if let Some(stored) = get_by_ap_id(&state.db, actor_id).await? {
-        return key_material(&stored);
+        return Ok(stored);
     }
-    let fetched = get_or_fetch_by_ap_id(state, actor_id)
-        .await
-        .map_err(|err| {
-            // The signer is only as trustworthy as its own document: an
-            // actor that cannot be dereferenced authenticates nobody.
-            tracing::debug!(%err, "could not dereference the signing actor");
-            AppError::Unauthorized(REFUSAL.to_owned())
-        })?;
-    key_material(&fetched)
+    get_or_fetch_by_ap_id(state, actor_id).await.map_err(|err| {
+        // The signer is only as trustworthy as its own document: an
+        // actor that cannot be dereferenced authenticates nobody.
+        tracing::debug!(%err, "could not dereference the signing actor");
+        refusal()
+    })
 }
 
 /// The PEM a user's signatures must verify against, or the refusal when
@@ -120,7 +197,7 @@ async fn signing_key_of(state: &AppState, actor_id: &str) -> AppResult<String> {
 fn key_material(user: &User) -> AppResult<String> {
     user.public_key.clone().ok_or_else(|| {
         tracing::debug!(ap_id = %user.ap_id, "the signing actor carries no public key");
-        AppError::Unauthorized(REFUSAL.to_owned())
+        refusal()
     })
 }
 
@@ -145,6 +222,7 @@ mod tests {
         config::{Config, TEST_BASE_URL},
         federation::signature::{SignedHeaders, SigningKey, sign_request},
         http_client::HttpClient,
+        models::user::{NewUser, insert},
         services::instance_actor::{ensure_instance_actor, instance_actor_ap_id},
         uploads::UploaderBackend,
         util::keys::{KeyPair, generate_keypair},
@@ -255,6 +333,46 @@ mod tests {
     /// Whether `outcome` is the 401 refusal.
     fn refused(outcome: &AppResult<()>) -> bool {
         matches!(outcome, Err(AppError::Unauthorized(_)))
+    }
+
+    /// Runs [`fetch_signer`] against `get`, asking for the path it signed.
+    async fn ask_signer(state: &AppState, get: &SignedGet) -> AppResult<Option<User>> {
+        ask_signer_target(state, get, TARGET_PATH).await
+    }
+
+    /// [`ask_signer`] with the requested URI path set to `path`, the mirror
+    /// of [`check_target`] for the entry point that names its reader.
+    async fn ask_signer_target(
+        state: &AppState,
+        get: &SignedGet,
+        path: &str,
+    ) -> AppResult<Option<User>> {
+        let uri = uri_of(path);
+        fetch_signer(state, &Method::GET, &uri, &get.headers).await
+    }
+
+    /// The `GET` whose `Signature` header is present but unparsable: it names
+    /// a key and signs nothing.
+    fn malformed_signature_get() -> SignedGet {
+        let mut headers = HeaderMap::new();
+        let previous = headers.insert(
+            HeaderName::from_static("signature"),
+            "keyId=\"https://test.example/users/alice#main-key\""
+                .parse()
+                .expect("test header value"),
+        );
+        drop(previous);
+        SignedGet { headers }
+    }
+
+    /// A state whose database is a pool that never connects: any lookup
+    /// would fail, so a refusal that arrives anyway was decided before the
+    /// instance looked at anything.
+    fn blind_state(config: Config) -> AppState {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        state_with(db, config)
     }
 
     /// Serves `app` on `listener` until the test aborts the task.
@@ -379,6 +497,170 @@ mod tests {
             .expect("the signing actor is now a stored mirror");
         assert_eq!(mirror.nickname, "signer@127.0.0.1", "mirrored as any actor");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_verified_fetch_names_its_signer_while_the_gate_is_on() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_with(db.pool().clone(), gate_on());
+        let actor = ensure_instance_actor(&state.db, &state.config)
+            .await
+            .unwrap();
+        let get = sign_as(
+            &format!("{}#main-key", actor.ap_id),
+            actor.private_key.as_deref().unwrap(),
+        );
+
+        let signer = ask_signer(&state, &get)
+            .await
+            .unwrap()
+            .expect("a verified signature names the actor that made it");
+
+        assert_eq!(signer.id, actor.id, "the row the keyId names");
+        assert_eq!(signer.ap_id, actor.ap_id, "and nothing else's");
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_fetch_is_refused_while_the_gate_is_on() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_with(db.pool().clone(), gate_on());
+
+        let outcome = ask_signer(&state, &unsigned_get()).await.unwrap_err();
+
+        assert!(
+            matches!(outcome, AppError::Unauthorized(_)),
+            "while the gate is on a reader that signed nothing has no identity"
+        );
+        assert_eq!(outcome.to_string(), REFUSAL, "the refusal is the message");
+    }
+
+    #[tokio::test]
+    async fn an_actor_with_no_key_material_names_no_signer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_with(db.pool().clone(), gate_on());
+        // A stored row with no public key: the resolution step finds the
+        // actor, and there is nothing left to verify a signature against.
+        let ap_id = format!("{TEST_BASE_URL}/users/keyless");
+        let keyless = insert(&state.db, &NewUser::local("keyless", &ap_id))
+            .await
+            .unwrap();
+        assert!(keyless.public_key.is_none(), "the row carries no key");
+        let get = sign_as(&format!("{ap_id}#main-key"), &remote_keys().private_pem);
+
+        let gate = check(&state, &get).await.unwrap_err();
+        let outcome = ask_signer(&state, &get).await.unwrap_err();
+
+        assert_eq!(gate.to_string(), REFUSAL, "the gate stays shut");
+        assert!(
+            matches!(outcome, AppError::Unauthorized(_)),
+            "and the reader it names is nobody"
+        );
+        assert_eq!(outcome.to_string(), REFUSAL, "the same refusal");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_id_names_the_mirrored_signer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = spawn(
+            listener,
+            Router::new()
+                .route(TARGET_PATH, get(remote_actor_document))
+                .with_state(base.clone()),
+        );
+        let state = state_with(db.pool().clone(), gate_on());
+        let key_id = format!("{base}{TARGET_PATH}#main-key");
+        let get = sign_as(&key_id, &remote_keys().private_pem);
+
+        let signer = ask_signer(&state, &get)
+            .await
+            .unwrap()
+            .expect("an actor fetched for its key is a signer like any other");
+
+        assert_eq!(
+            signer.ap_id,
+            format!("{base}{TARGET_PATH}"),
+            "the signer is the row the dereference stored"
+        );
+        assert_eq!(signer.nickname, "signer@127.0.0.1", "mirrored as any actor");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_fetch_off_the_gate_names_no_signer() {
+        // The blind pool proves the anonymous answer needs no lookup: not a
+        // stored key, not a dereference.
+        let state = blind_state(Config::for_tests());
+
+        let signer = ask_signer(&state, &unsigned_get())
+            .await
+            .expect("an unsigned read is legitimate while the flag is off");
+
+        assert!(signer.is_none(), "and it names no signer");
+    }
+
+    #[tokio::test]
+    async fn a_verified_fetch_off_the_gate_names_its_signer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_with(db.pool().clone(), Config::for_tests());
+        let actor = ensure_instance_actor(&state.db, &state.config)
+            .await
+            .unwrap();
+        let get = sign_as(
+            &format!("{}#main-key", actor.ap_id),
+            actor.private_key.as_deref().unwrap(),
+        );
+
+        let signer = ask_signer(&state, &get)
+            .await
+            .unwrap()
+            .expect("a signature that verifies names its signer even off the gate");
+
+        assert_eq!(
+            signer.id, actor.id,
+            "the same row the gate would have found"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signature_that_does_not_verify_off_the_gate_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_with(db.pool().clone(), Config::for_tests());
+        let actor = ensure_instance_actor(&state.db, &state.config)
+            .await
+            .unwrap();
+        let get = sign_as(
+            &format!("{}#main-key", actor.ap_id),
+            actor.private_key.as_deref().unwrap(),
+        );
+
+        let outcome = ask_signer_target(&state, &get, "/users/mallory")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(outcome, AppError::Unauthorized(_)),
+            "a broken proof is a refusal, never the anonymous answer"
+        );
+        assert_eq!(outcome.to_string(), REFUSAL, "the refusal is the message");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_signature_off_the_gate_is_refused_not_anonymous() {
+        // Blind again: a header that cannot be parsed is refused before this
+        // instance looks up the actor it names.
+        let state = blind_state(Config::for_tests());
+
+        let outcome = ask_signer(&state, &malformed_signature_get())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(outcome, AppError::Unauthorized(_)),
+            "an unparsable Signature header is a failed proof, not an anonymous read"
+        );
+        assert_eq!(outcome.to_string(), REFUSAL, "the refusal is the message");
     }
 
     #[tokio::test]

@@ -40,7 +40,12 @@
 //! the parts of a status. [`note`] is the way back out for statuses: the
 //! pure builder of the `Note`/`Question` objects a local post federates as
 //! and of the `Create`, `Announce` and `Tombstone` documents around it,
-//! plus the JSON-LD schema they reference. [`collections`] builds the
+//! plus the JSON-LD schema they reference. [`activities`] is the same
+//! pure build for the facts that are not statuses: the `Like`,
+//! `EmojiReact`, `Follow`, `Block`, `Undo`, `Accept` and `Reject`
+//! documents minted at `{BASE_URL}/activities/{uuid}`, served beside the
+//! status `Create`s and `Announce`s by the activity reads of
+//! [`crate::api::activitypub`]. [`collections`] builds the
 //! activity collections the actor document names — outbox, followers,
 //! following, featured and an object's replies — roots and keyset pages
 //! alike. [`publisher`] is the fan-out in front of delivery: it turns an
@@ -52,6 +57,7 @@
 //! [`dispatch`]; `GET /users/{nickname}/inbox`, the client read of a
 //! personal inbox, belongs to a later ticket.
 
+pub mod activities;
 pub mod actor;
 pub mod authorized_fetch;
 pub mod collections;
