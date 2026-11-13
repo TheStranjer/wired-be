@@ -33,7 +33,9 @@
 //! around it. [`translation`] the Mastodon `Translation` entity, built from a
 //! [`crate::services::translate`] provider answer. [`bookmark_folder`]
 //! Pleroma's `BookmarkFolder` entity, whose `emoji_url` the endpoint
-//! resolves from `custom_emojis` before the pure render. [`status_edit`] one
+//! resolves from `custom_emojis` before the pure render. [`backup`]
+//! Pleroma's `Backup` entity, whose download `url` the endpoint resolves
+//! from the uploader before the pure render. [`status_edit`] one
 //! element of the `GET /api/v1/statuses/{id}/history` answer: a status
 //! version, superseded or current. [`scheduled_status`] the Mastodon
 //! `ScheduledStatus` entity: one parked create-status request, its params
@@ -44,6 +46,7 @@
 pub mod account;
 pub mod announcement;
 pub mod application;
+pub mod backup;
 pub mod bookmark_folder;
 pub mod chat;
 pub mod conversation;

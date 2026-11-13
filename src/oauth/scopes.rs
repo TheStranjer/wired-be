@@ -161,6 +161,19 @@ pub const READ_SECURITY: &str = "read:security";
 /// backup-code and disable actions (Pleroma's `write:security`).
 pub const WRITE_SECURITY: &str = "write:security";
 
+/// The read side of account backups: `GET /api/v1/pleroma/backups`, the
+/// list of export archives an account has asked for.
+///
+/// Pleroma's `read:backups` on the `index` action of its
+/// `BackupController`,
+/// `lib/pleroma/web/pleroma_api/controllers/backup_controller.ex`.
+pub const READ_BACKUPS: &str = "read:backups";
+/// The write side of account backups: `POST /api/v1/pleroma/backups`, the
+/// request for a new export archive.
+///
+/// Pleroma's `write:backups` on that controller's `create` action.
+pub const WRITE_BACKUPS: &str = "write:backups";
+
 /// The roots of the scope trees [`Scopes::validate`] accepts.
 const VALID_ROOTS: [&str; 6] = [READ, WRITE, FOLLOW, PUSH, ADMIN_READ, ADMIN_WRITE];
 

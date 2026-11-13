@@ -57,6 +57,10 @@ mod auth;
 /// The `AUTHORIZED_FETCH` gate on the `ActivityPub` actor route.
 mod authorized_fetch;
 
+/// Account backups (`/api/v1/pleroma/backups`) over HTTP: the list, the
+/// request, its rate limit and its entity.
+mod backups;
+
 /// The blocks endpoints (`block`, `unblock` and the blocks list).
 mod blocks;
 
