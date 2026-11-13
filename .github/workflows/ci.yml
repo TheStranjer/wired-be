@@ -49,11 +49,19 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned, not `stable`: a new stable release changes rust-cache's key
+      # (a cold dependency build, ~10 min) and can bring new denied Clippy
+      # lints. Bump this deliberately, fixing any new lints in the same change.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.100.0
           components: clippy, rustfmt
 
+      # Save the dependency build even when a check fails; otherwise a red run
+      # leaves the next run as cold as this one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       # The test databases hold nothing but rows a test just wrote, and the
       # fixture empties every slot before reusing it, so durability is pure
