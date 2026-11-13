@@ -51,7 +51,7 @@ use crate::federation::{
         simple::{
             PUBLIC_ADDRESS, activity_host, activity_type, add_address, addresses_public,
             followers_collection, has_attachments, is_note_activity, limit_document,
-            note_object_mut, remove_public, rewrite_each_document,
+            note_object_mut, remove_public, remove_reference, rewrite_each_document,
         },
     },
 };
@@ -275,21 +275,6 @@ fn sandbox(activity: &mut Value) {
 /// tags match, as opposed to the media rules, which also act on `Update`s.
 fn is_create(activity: &Value) -> bool {
     activity_type(activity).is_some_and(|kind| kind == CREATE_TYPE) && is_note_activity(activity)
-}
-
-/// Drops one exact reference from `field`, normalizing a single-valued
-/// field into the one-element array it stands for, as
-/// [`remove_public`] does for the public address.
-fn remove_reference(document: &mut Map<String, Value>, field: &str, address: &str) {
-    let Some(value) = document.get_mut(field) else {
-        return;
-    };
-    if !value.is_array() {
-        *value = Value::Array(json::as_array(value).to_vec());
-    }
-    if let Value::Array(entries) = value {
-        entries.retain(|entry| json::value_or_id(entry).as_deref() != Some(address));
-    }
 }
 
 #[cfg(test)]

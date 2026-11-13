@@ -24,17 +24,23 @@
 //!
 //! The pipeline ships Pleroma's no-op policy
 //! ([`NoOpPolicy`], `lib/pleroma/web/activity_pub/mrf/noop_policy.ex`) and
-//! four real ones: the domain lists
+//! seven real ones: the domain lists
 //! (`lib/pleroma/web/activity_pub/mrf/simple_policy.ex`, in
 //! [`simple`]), the first-post link gate
 //! (`lib/pleroma/web/activity_pub/mrf/anti_link_spam_policy.ex`, in
 //! [`anti_link_spam`]), the markup normalizer
 //! (`lib/pleroma/web/activity_pub/mrf/normalize_markup_policy.ex`, in
-//! [`normalize_markup`]) and the user-tag switches
-//! (`lib/pleroma/web/activity_pub/mrf/tag_policy.ex`, in [`tag`]);
-//! further policy tickets add one `match` arm to [`build_chain`] each.
-//! Unknown names are warned about and skipped, so a configuration written
-//! ahead of a deploy never drops traffic.
+//! [`normalize_markup`]), the user-tag switches
+//! (`lib/pleroma/web/activity_pub/mrf/tag_policy.ex`, in [`tag`]), the
+//! keyword and regex filters
+//! (`lib/pleroma/web/activity_pub/mrf/keyword_policy.ex`, in [`keyword`]),
+//! the mention-count gate
+//! (`lib/pleroma/web/activity_pub/mrf/hellthread_policy.ex`, in
+//! [`hellthread`]) and the age gate
+//! (`lib/pleroma/web/activity_pub/mrf/object_age_policy.ex`, in
+//! [`object_age`]); further policy tickets add one `match` arm to
+//! [`build_chain`] each. Unknown names are warned about and skipped, so a
+//! configuration written ahead of a deploy never drops traffic.
 //!
 //! Two of those policies read facts about the actors an activity speaks
 //! about — follower and status counters, profile tags — that live in the
@@ -57,7 +63,10 @@
 //! transparency objects.
 
 pub mod anti_link_spam;
+pub mod hellthread;
+pub mod keyword;
 pub mod normalize_markup;
+pub mod object_age;
 pub mod simple;
 pub mod tag;
 
@@ -181,6 +190,10 @@ pub struct MrfConfig {
     /// Whether `simple` is one of the enabled policies: lists that are
     /// configured but switched off govern nothing, here or anywhere.
     simple_enabled: bool,
+    /// The keyword patterns of the `keyword` policy, compiled once here
+    /// for the same reason: a regex compiles at configuration reads, not
+    /// per activity, and an uncompilable one warns once per load.
+    keyword: Arc<keyword::KeywordConfig>,
 }
 
 impl MrfConfig {
@@ -202,17 +215,22 @@ impl MrfConfig {
     }
 
     /// One resolved chain: the names and the document as configured, with
-    /// the domain lists the `simple` key holds compiled beside them.
+    /// the domain lists the `simple` key holds and the patterns the
+    /// `keyword` key holds compiled beside them.
     fn assemble(policies: Vec<String>, params: Map<String, Value>) -> Self {
         let simple_enabled = policies.iter().any(|name| name == simple::PARAMS_KEY);
         let simple = Arc::new(simple::SimpleConfig::from_params(
             params.get(simple::PARAMS_KEY),
+        ));
+        let keyword = Arc::new(keyword::KeywordConfig::from_params(
+            params.get(keyword::PARAMS_KEY),
         ));
         Self {
             policies,
             params,
             simple,
             simple_enabled,
+            keyword,
         }
     }
 
@@ -387,6 +405,15 @@ pub fn build_chain(config: &MrfConfig) -> PolicyChain {
             ))),
             "tag" => Some(Box::new(tag::TagPolicy::new(
                 config.params_for(tag::PARAMS_KEY).cloned(),
+            ))),
+            "keyword" => Some(Box::new(keyword::KeywordPolicy::new(Arc::clone(
+                &config.keyword,
+            )))),
+            "hellthread" => Some(Box::new(hellthread::HellthreadPolicy::new(
+                config.params_for(hellthread::PARAMS_KEY).cloned(),
+            ))),
+            "object_age" => Some(Box::new(object_age::ObjectAgePolicy::new(
+                config.params_for(object_age::PARAMS_KEY).cloned(),
             ))),
             other => {
                 warn!(
@@ -880,14 +907,36 @@ mod tests {
     /// empty one does.
     #[test]
     fn build_chain_knows_its_policies_and_skips_unknown_names() {
-        let config = config_with(&["ghost", "noop", "simple"], &Value::Null);
+        let config = config_with(
+            &[
+                "ghost",
+                "noop",
+                "simple",
+                "anti_link_spam",
+                "normalize_markup",
+                "tag",
+                "keyword",
+                "hellthread",
+                "object_age",
+            ],
+            &Value::Null,
+        );
 
         let chain = build_chain(&config);
 
         assert_eq!(
             describe_policies(&chain),
-            vec!["NoOpPolicy".to_owned(), "SimplePolicy".to_owned()],
-            "`noop` and `simple` built their policies in order and the unknown name dropped out"
+            vec![
+                "NoOpPolicy".to_owned(),
+                "SimplePolicy".to_owned(),
+                "AntiLinkSpamPolicy".to_owned(),
+                "NormalizeMarkupPolicy".to_owned(),
+                "TagPolicy".to_owned(),
+                "KeywordPolicy".to_owned(),
+                "HellthreadPolicy".to_owned(),
+                "ObjectAgePolicy".to_owned(),
+            ],
+            "every known name built its policy in order and the unknown name dropped out"
         );
     }
 

@@ -78,7 +78,7 @@ const FLAG_TYPE: &str = "Flag";
 /// ([`PUBLIC_RECIPIENTS`] covers the two shorthands it may arrive as).
 pub(super) const PUBLIC_ADDRESS: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// The addressing properties the note rules rewrite.
-const ADDRESS_FIELDS: [&str; 2] = ["to", "cc"];
+pub(super) const ADDRESS_FIELDS: [&str; 2] = ["to", "cc"];
 /// The actor-document field each removal list strips, beside its list.
 const ACTOR_FIELDS: [(List, &str); 3] = [
     (List::AvatarRemoval, "icon"),
@@ -87,7 +87,7 @@ const ACTOR_FIELDS: [(List, &str); 3] = [
 ];
 /// The suffix of the followers-collection URL this policy falls back to
 /// (the convention Pleroma, Mastodon and [`super::super::actor`] all use).
-const FOLLOWERS_SUFFIX: &str = "/followers";
+pub(super) const FOLLOWERS_SUFFIX: &str = "/followers";
 /// The transparency block's key for the per-entry reasons: Pleroma's
 /// separate `mrf_simple_info`, folded into this policy's one block.
 const INFO_KEY: &str = "info";
@@ -789,7 +789,7 @@ where
 /// Moves the public address out of a document's `to` and into its `cc`: the
 /// note becomes unlisted. A document whose `to` names nothing public is
 /// left alone — there is no timeline to remove it from.
-fn unlist_document(document: &mut Map<String, Value>) {
+pub(super) fn unlist_document(document: &mut Map<String, Value>) {
     if !addresses_public(document, "to") {
         return;
     }
@@ -832,6 +832,21 @@ pub(super) fn remove_public(document: &mut Map<String, Value>, field: &str) {
     }
     if let Value::Array(entries) = value {
         entries.retain(|entry| !is_public_address(entry));
+    }
+}
+
+/// Drops one exact reference from `field`, normalizing a single-valued
+/// field into the one-element array it stands for, as
+/// [`remove_public`] does for the public address.
+pub(super) fn remove_reference(document: &mut Map<String, Value>, field: &str, address: &str) {
+    let Some(value) = document.get_mut(field) else {
+        return;
+    };
+    if !value.is_array() {
+        *value = Value::Array(json::as_array(value).to_vec());
+    }
+    if let Value::Array(entries) = value {
+        entries.retain(|entry| json::value_or_id(entry).as_deref() != Some(address));
     }
 }
 
