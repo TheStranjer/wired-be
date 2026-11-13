@@ -645,8 +645,7 @@ mod tests {
         headers
             .into_iter()
             .find(|(key, _value)| key == name)
-            .map(|(_key, value)| value)
-            .unwrap_or_default()
+            .map_or_default(|(_key, value)| value)
     }
 
     /// The mock's last request body.

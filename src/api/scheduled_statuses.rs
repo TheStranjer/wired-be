@@ -337,12 +337,11 @@ fn media_ids(row: &StoredRow) -> Vec<Uuid> {
     row.params
         .get("media_ids")
         .and_then(Value::as_array)
-        .map(|ids| {
+        .map_or_default(|ids| {
             ids.iter()
                 .filter_map(|id| id.as_str().and_then(parse_id))
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The attachment rows behind `ids`, keyed by id; asking about nothing reads
