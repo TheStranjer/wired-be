@@ -32,8 +32,8 @@
 //! archive and calls
 //! [`mark_processed`](crate::models::backup::mark_processed): until then
 //! the entity says so (`processed: false`, an empty `url`, `file_size: 0`).
-//! This slice starts no worker, so the kind it enqueues stands
-//! unregistered until the backup job slice lands.
+//! That kind is handled by [`handle_run`](crate::jobs::backups::handle_run),
+//! registered on the worker's [`JobRegistry`](crate::jobs::JobRegistry).
 //!
 //! The entity's `url` is the uploader's to know, so this module asks
 //! `state.uploader` for the stored key's public URL and the entity itself
@@ -68,12 +68,8 @@ use crate::{
 };
 
 /// The job kind a new backup request rides: the `backups.run` handler
-/// builds the account's archive and marks the row processed.
-///
-/// Declared here because this endpoint enqueues it; the handler itself
-/// belongs to the backup job slice, so until that ticket lands the kind
-/// stands unregistered and the worker discards its jobs — the row still
-/// records the request.
+/// ([`handle_run`](crate::jobs::backups::handle_run)) builds the
+/// account's archive and marks the row processed.
 pub const KIND_RUN: &str = "backups.run";
 
 /// The `/api/v1/pleroma/backups` router, nested into [`crate::api::v1`].

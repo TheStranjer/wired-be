@@ -28,6 +28,10 @@
 //! charset (a remote handle's `@`, above all) is replaced here, once, instead
 //! of being re-sanitized by whoever happens to ask for an export.
 //!
+//! [`get_by_id`] is the queue job's read: the `backups.run` handler is
+//! handed the request's id by the endpoint and knows nothing else of it
+//! before this fetch.
+//!
 //! Two reads drive the periodic purge a retention window needs: [`latest`]
 //! answers the account's newest request (the one to keep, and the one a
 //! rate-limit check looks at), and [`expired`] sweeps every row older than
@@ -61,6 +65,10 @@ const LIST_SQL: &str = "SELECT * FROM backups WHERE user_id = $1 ORDER BY id DES
 /// [`latest`]: the same walk cut to its first row, so the account's newest
 /// request is read without fetching the history behind it.
 const LATEST_SQL: &str = "SELECT * FROM backups WHERE user_id = $1 ORDER BY id DESC LIMIT 1";
+
+/// [`get_by_id`]: one row by its primary key alone — the id is the whole
+/// filter because the queue job names nothing else.
+const GET_BY_ID_SQL: &str = "SELECT * FROM backups WHERE id = $1";
 
 /// [`mark_processed`]: the job's write — the archive's size and the key it
 /// lives under, `processed` flipped, and the `updated_at` bump every rewrite
@@ -199,6 +207,26 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<Backup
 pub async fn latest(pool: &PgPool, user_id: Uuid) -> AppResult<Option<Backup>> {
     let row = sqlx::query_as::<_, Backup>(LATEST_SQL)
         .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// The backup `id` names, `None` when no row carries it.
+///
+/// This is the run job's read: the endpoint enqueues the row's id and the
+/// handler knows the request by nothing else, so the fetch doubles as its
+/// existence check — `None` is the account's own delete having won the
+/// race, not a failure. Like [`delete`], it carries no owner filter: the
+/// job was handed this id by the endpoint that recorded it.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<Backup>> {
+    let row = sqlx::query_as::<_, Backup>(GET_BY_ID_SQL)
+        .bind(id)
         .fetch_optional(pool)
         .await?;
     Ok(row)
@@ -477,6 +505,40 @@ mod tests {
                 .expect("alice has a row"),
             newer,
             "and it is stable"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_id_answers_the_row_by_its_id_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let row = seed(&pool, &alice).await;
+
+        assert_eq!(
+            get_by_id(&pool, row.id).await.expect("the job's read runs"),
+            Some(row.clone()),
+            "the id alone finds the request"
+        );
+
+        let marked = mark_processed(&pool, row.id, 256, "backups/alice.zip")
+            .await
+            .expect("the mark runs")
+            .expect("the row is there");
+        assert_eq!(
+            get_by_id(&pool, row.id)
+                .await
+                .expect("the second read runs"),
+            Some(marked),
+            "and it reads the marked row, not a stale copy"
+        );
+
+        assert!(
+            get_by_id(&pool, Uuid::now_v7())
+                .await
+                .expect("an unknown id is not a failure")
+                .is_none(),
+            "an id nothing carries answers None"
         );
     }
 

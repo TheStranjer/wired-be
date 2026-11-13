@@ -1,16 +1,36 @@
-//! The account export archive: the deflate zip a backup request describes,
-//! built straight from the database into a temp file.
+//! The account backups: the export archive a backup request describes,
+//! built straight from the database into a temp file, and the two queue
+//! jobs (decision 11) that turn a `backups` row into stored bytes.
 //!
 //! Reference: Pleroma's `Pleroma.Export.export/1`
 //! (`lib/pleroma/export/import.ex`), which writes an account's actor,
 //! outbox, likes and bookmarks as JSON files and zips them into
-//! `archive-<nickname>-<stamp>.zip` under a temp directory. Here [`build`]
-//! is that pure archive step only: it writes the zip, returns the name and
-//! the byte count of the result, and touches nothing else — no `backups`
-//! row, no uploader, no `jobs` registration. The follow-up ticket for the
-//! `backups.run` handler wires those around this call.
+//! `archive-<nickname>-<stamp>.zip` under a temp directory. [`build`] is
+//! that pure archive step: it writes the zip, returns the name and the
+//! byte count of the result, and touches nothing else — no `backups`
+//! row, no uploader. Around it stand this module's two job handlers:
 //!
-//! The archive holds exactly four entries, in this order:
+//! - [`backups.run`](crate::api::backups::KIND_RUN), handled by
+//!   [`handle_run`] on [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND), is
+//!   the job `POST /api/v1/pleroma/backups` enqueues with the arguments
+//!   `{"backup_id": "<uuid>"}`: it loads the row and its owner, builds
+//!   their archive, stores it under the key `backups/{user_id}/{name}`,
+//!   and marks the row processed. Unusable arguments, a vanished row or
+//!   a vanished owner discard the job — no retry can fix those; IO and
+//!   database failures retry it, the run being idempotent: re-putting
+//!   the same key and re-marking the same row converge, so another pass
+//!   costs nothing but the wait.
+//! - [`backups.purge`](KIND_PURGE), handled by [`handle_purge`] on the
+//!   same queue once a day from the
+//!   [`periodic_jobs`](super::scheduler::periodic_jobs) registry, sweeps
+//!   every request older than
+//!   [`backup_validity_days`](crate::config::Config::backup_validity_days)
+//!   out of storage and out of the table — processed rows losing their
+//!   file with their row, abandoned requests losing just the row. With
+//!   [`backup_purge`](crate::config::Config::backup_purge) off the pass
+//!   logs and deletes nothing.
+//!
+//! The archive itself holds exactly four entries, in this order:
 //!
 //! - `actor.json` — [`crate::federation::actor::actor_json`] for the
 //!   account, verbatim;
@@ -36,9 +56,12 @@
 
 use std::{fmt, fs::File, io::Write as _};
 
-use serde::Serialize;
+use bytes::Bytes;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tempfile::NamedTempFile;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -49,10 +72,11 @@ use crate::{
         actor::actor_json,
         note::{create_activity_json, load_note_context, note_json},
     },
+    jobs::{AttemptInfo, HandlerFuture, JobError},
     models::{
-        bookmark, favourite,
+        backup, bookmark, favourite,
         status::{self, Status},
-        user::User,
+        user::{self, User},
     },
     state::AppState,
 };
@@ -357,35 +381,247 @@ impl<'w> CollectionEntry<'w> {
     }
 }
 
+/// The job kind of the periodic backup purge, handled by [`handle_purge`]
+/// on [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND) from the
+/// [`periodic_jobs`](super::scheduler::periodic_jobs) registry.
+pub const KIND_PURGE: &str = "backups.purge";
+
+/// What a stored archive is put to the uploader as; the `content_type`
+/// column of [`crate::api::backups`] says the same about every backup.
+const ARCHIVE_CONTENT_TYPE: &str = "application/zip";
+
+/// The `{backup_id}` arguments of a [`crate::api::backups::KIND_RUN`] job,
+/// exactly as `enqueue_backup_job` in [`crate::api::backups`] writes them.
+#[derive(Debug, Deserialize)]
+struct RunArgs {
+    /// The `backups` row whose archive the job builds.
+    backup_id: Uuid,
+}
+
+/// Reads [`RunArgs`] out of a claimed job's payload; arguments this shape
+/// cannot deserialize are permanent — the job is discarded, never retried.
+fn parse_args(args: &Value) -> Result<Uuid, JobError> {
+    serde_json::from_value::<RunArgs>(args.clone())
+        .map(|parsed| parsed.backup_id)
+        .map_err(|err| JobError::Discard(format!("backup job arguments are unusable: {err}")))
+}
+
+/// Lifts a failure outside the queue's discard arms into a retry, naming
+/// the step that hit it; every remaining step of a run converges on a
+/// rerun, so another pass costs nothing but the wait.
+fn retry(step: &str, err: &dyn fmt::Display) -> JobError {
+    JobError::Retry(format!("backup {step} failed: {err}"))
+}
+
+/// The storage key of the archive `file_name` belonging to `user_id`:
+/// `backups/{user_id}/{file_name}` inside the uploads store. Both parts
+/// are key-charset clean by construction — the id is a hyphenated UUID,
+/// the name was minted by [`crate::models::backup::file_name`] — so
+/// [`crate::uploads::check_key`] accepts the result.
+fn storage_key(user_id: Uuid, file_name: &str) -> String {
+    format!("backups/{user_id}/{file_name}")
+}
+
+/// The [`JobRegistry`](super::JobRegistry) handler for
+/// [`KIND_RUN`](crate::api::backups::KIND_RUN): build the requested
+/// account's archive, store it, and mark the row processed.
+///
+/// The row the id names and its owner are read first — a vanished either
+/// one is permanent, the account's own delete having outrun the job — and
+/// a payload the shape cannot parse never runs at all; those discard.
+/// Everything after them is work a rerun converges on: [`build`] writes a
+/// fresh temp file from the database as it stands, the uploader overwrites
+/// the same key in place, and [`mark_processed`](backup::mark_processed)
+/// rewrites the same row with the same key, so any IO or database failure
+/// retries the job whole. The temp file is the archive's own to delete:
+/// dropping the [`BackupArchive`] removes it, at the latest when this
+/// handler returns.
+pub fn handle_run(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        let backup_id = parse_args(&args)?;
+        let row = load_backup(&state, backup_id).await?;
+        let owner = load_owner(&state, row.user_id).await?;
+        let archive = build(&state, &owner, &row.file_name)
+            .await
+            .map_err(|err| retry("archive build", &err))?;
+        let key = storage_key(owner.id, archive.file_name());
+        let bytes = tokio::fs::read(archive.temp.path())
+            .await
+            .map_err(|err| retry("archive read", &err))?;
+        state
+            .uploader
+            .put(&key, Bytes::from(bytes), ARCHIVE_CONTENT_TYPE)
+            .await
+            .map_err(|err| retry("archive upload", &err))?;
+        let size = i64::try_from(archive.size()).unwrap_or(i64::MAX);
+        let marked = backup::mark_processed(&state.db, row.id, size, &key)
+            .await
+            .map_err(|err| retry("row mark", &err))?;
+        if let Some(marked) = marked {
+            debug!(
+                backup = %marked.id,
+                user = %owner.nickname,
+                size,
+                %key,
+                "backup archive stored"
+            );
+        } else {
+            debug!(
+                backup = %row.id,
+                %key,
+                "the backup row vanished before its mark; the stored file is its own orphan"
+            );
+        }
+        Ok(())
+    })
+}
+
+/// The row the job builds. A vanished row is permanent (discard): the
+/// account's own delete took the request, and no retry brings it back.
+///
+/// # Errors
+///
+/// [`JobError::Discard`] when no row carries `id`, [`JobError::Retry`]
+/// on a database failure.
+async fn load_backup(state: &AppState, id: Uuid) -> Result<backup::Backup, JobError> {
+    match backup::get_by_id(&state.db, id).await {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(JobError::Discard(format!(
+            "the backup job's backup {id} no longer exists"
+        ))),
+        Err(err) => Err(retry("row read", &err)),
+    }
+}
+
+/// The account whose archive the row requests. A vanished owner is
+/// permanent (discard), exactly as in [`load_backup`]; the id comes from
+/// the row, so this is the race the delete won between the two reads.
+///
+/// # Errors
+///
+/// [`JobError::Discard`] when the user row is gone, [`JobError::Retry`]
+/// on a database failure.
+async fn load_owner(state: &AppState, user_id: Uuid) -> Result<User, JobError> {
+    match user::get_by_id(&state.db, user_id).await {
+        Ok(Some(owner)) => Ok(owner),
+        Ok(None) => Err(JobError::Discard(format!(
+            "the backup job's user {user_id} no longer exists"
+        ))),
+        Err(err) => Err(retry("owner read", &err)),
+    }
+}
+
+/// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_PURGE`]:
+/// one daily sweep of the backups past their validity window — the
+/// stored file goes first, then the row.
+///
+/// With [`backup_purge`](crate::config::Config::backup_purge) off the
+/// pass deletes nothing and reports so in the log; the window itself
+/// comes from
+/// [`backup_validity_days`](crate::config::Config::backup_validity_days),
+/// read at the sweep's `Utc::now()`. A row with no `storage_key` never
+/// had (or lost) its file, and an already-absent file answers the
+/// uploader's `NotFound` — both are tolerated, not failures: the row is
+/// all that is left to sweep. Any other refusal from the storage layer
+/// keeps the row for the next pass, so the queue never ends up with a
+/// database pointer to bytes it cannot name any more. A database failure
+/// retries the whole pass; every step is idempotent.
+///
+/// [`backup_purge`]: crate::config::Config::backup_purge
+pub fn handle_purge(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
+    Box::pin(async move {
+        if !state.config.backup_purge.get() {
+            info!(purged = 0, "backup purge disabled");
+            return Ok(());
+        }
+        let rows = backup::expired(&state.db, Utc::now(), state.config.backup_validity_days)
+            .await
+            .map_err(|err| retry("purge read", &err))?;
+        let mut purged = 0_usize;
+        for row in rows {
+            if let Some(key) = row.storage_key.as_deref()
+                && !sweep_archive_file(&state, &row, key).await
+            {
+                continue;
+            }
+            let _swept = backup::delete(&state.db, row.id)
+                .await
+                .map_err(|err| retry("row delete", &err))?;
+            purged += 1;
+        }
+        info!(purged, "expired account backups purged");
+        Ok(())
+    })
+}
+
+/// Removes the stored file of `key` for `row`, answering whether the row
+/// may follow it into deletion.
+///
+/// An already-absent file is tolerated: [`UploaderBackend::delete`] answers
+/// the queue's own [`AppError::NotFound`] for bytes that are gone, and then
+/// the row is all that is left to sweep. Any other refusal keeps the row
+/// for the next pass, so storage never ends up with a file whose database
+/// pointer was deleted around it — the rule of the orphaned-media sweep in
+/// [`super::maintenance`].
+///
+/// [`UploaderBackend::delete`]: crate::uploads::UploaderBackend::delete
+async fn sweep_archive_file(state: &AppState, row: &backup::Backup, key: &str) -> bool {
+    match state.uploader.delete(key).await {
+        Ok(()) => true,
+        Err(AppError::NotFound) => {
+            debug!(backup = %row.id, %key, "backup file already absent; sweeping the row");
+            true
+        }
+        Err(err) => {
+            warn!(
+                %err,
+                backup = %row.id,
+                %key,
+                "backup file delete failed; keeping the row for the next purge"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, io::Read as _, sync::Arc};
+    use std::{collections::HashSet, io::Read as _, sync::Arc, time::Duration};
 
-    use chrono::Utc;
-    use serde_json::Value;
-    use sqlx::PgPool;
+    use serde_json::json;
+    use sqlx::{PgPool, postgres::PgPoolOptions};
     use zip::ZipArchive;
 
     use super::*;
     use crate::{
-        config::TEST_BASE_URL,
+        config::{TEST_BASE_URL, Toggle},
         http_client::HttpClient,
+        jobs::{QUEUE_BACKGROUND, scheduler::periodic_jobs},
         models::{
             backup::file_name,
             status::{NewStatus, Visibility, insert, soft_delete},
             user::{NewUser, insert as insert_user, local_ap_id},
         },
-        uploads::UploaderBackend,
+        uploads::{self, UploaderBackend},
     };
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
     /// How many statuses the page-seam test seeds: just over one page.
     const OVER_PAGE: usize = PAGE_SIZE + 5;
+    /// The attempt info a test hands a handler: the first pass of a job
+    /// with an ordinary budget.
+    const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {
+        attempts: 1,
+        max_attempts: 5,
+    };
+    /// Days past the test config's 30-day validity window an aged purge
+    /// fixture is rewound to.
+    const AGED_DAYS: i64 = 31;
 
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
+    /// Test state over `pool` with `config`.
+    fn state_with_config(pool: &PgPool, config: Config) -> AppState {
+        let config = Arc::new(config);
         AppState {
             db: pool.clone(),
             hub: crate::streaming::hub::Hub::new(pool),
@@ -398,6 +634,34 @@ mod tests {
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: Arc::new(crate::mailer::MemoryTransport::new()),
         }
+    }
+
+    /// Test state over `pool` with the fixed test config.
+    fn app_state(pool: &PgPool) -> AppState {
+        state_with_config(pool, Config::for_tests())
+    }
+
+    /// Test state over `pool` whose uploads live in a fresh temporary
+    /// directory, together with that directory's guard: the handler stores
+    /// into and deletes from that same directory, so the guard must
+    /// outlive the run (the pattern of `src/jobs/maintenance.rs`'s
+    /// `uploads_state`).
+    fn uploads_state(pool: &PgPool) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().expect("a temp uploads dir");
+        let mut config = Config::for_tests();
+        config.uploads_dir = dir.path().to_path_buf();
+        let state = state_with_config(pool, config);
+        (dir, state)
+    }
+
+    /// Test state over a pool that cannot answer: closed before it ever
+    /// connected, which is how a handler sees a database that went away.
+    async fn broken_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .expect("a lazy pool needs no database");
+        pool.close().await;
+        app_state(&pool)
     }
 
     /// A local user named `nickname`.
@@ -440,6 +704,78 @@ mod tests {
         let _row: bookmark::Bookmark = bookmark::add(pool, who.id, status_id, None)
             .await
             .expect("the fixture bookmark stores");
+    }
+
+    /// Runs [`handle_run`] to completion on `state`, over the argument
+    /// document `POST /api/v1/pleroma/backups` writes.
+    async fn run(state: &AppState, backup_id: Uuid) -> Result<(), JobError> {
+        handle_run(
+            state.clone(),
+            FIRST_ATTEMPT,
+            json!({ "backup_id": backup_id.to_string() }),
+        )
+        .await
+    }
+
+    /// Runs [`handle_purge`] to completion; periodic jobs arrive with
+    /// empty args.
+    async fn purge(state: &AppState) -> Result<(), JobError> {
+        handle_purge(state.clone(), FIRST_ATTEMPT, json!({})).await
+    }
+
+    /// Moves the backup `id`'s `inserted_at` `days` into the past, so a
+    /// purge test is not a race with the clock. Asserts the row was there
+    /// to move.
+    async fn age(pool: &PgPool, id: Uuid, days: i64) {
+        let moved = sqlx::query("UPDATE backups SET inserted_at = $1 WHERE id = $2")
+            .bind(Utc::now() - chrono::TimeDelta::days(days))
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("the fixture row ages")
+            .rows_affected();
+        assert_eq!(moved, 1, "the row to rewind exists");
+    }
+
+    /// The entry names of the zip file standing at `path`, in archive
+    /// order — the read-back of a stored archive, opened by path because
+    /// the run's temp file is long gone.
+    fn stored_names(path: &std::path::Path) -> Vec<String> {
+        let file = File::open(path).expect("the stored archive is there");
+        let zip = ZipArchive::new(file).expect("the stored archive reads back");
+        zip.file_names()
+            .map(|name| name.expect("entry names read").into_owned())
+            .collect()
+    }
+
+    /// A finished, marked backup row for `owner` with a file of `bytes`
+    /// standing behind a hand-made key: a purge fixture the way
+    /// [`handle_run`] would leave one, but with the key independent of the
+    /// second-granular `file_name` so same-second fixtures cannot collide.
+    async fn processed_backup(
+        state: &AppState,
+        owner: &User,
+        name: &str,
+        bytes: &[u8],
+    ) -> (backup::Backup, String) {
+        let row = backup::create(&state.db, owner)
+            .await
+            .expect("the fixture backup creates");
+        let key = storage_key(owner.id, name);
+        state
+            .uploader
+            .put(&key, Bytes::from(bytes.to_vec()), ARCHIVE_CONTENT_TYPE)
+            .await
+            .expect("the fixture archive stores");
+        let size = bytes
+            .len()
+            .try_into()
+            .expect("a fixture's length is an i64 size");
+        let _marked = backup::mark_processed(&state.db, row.id, size, &key)
+            .await
+            .expect("the mark runs")
+            .expect("the requested row is there");
+        (row, key)
     }
 
     /// Builds `owner`'s archive under the name
@@ -713,5 +1049,290 @@ mod tests {
                 "{name} parses as an empty collection"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_run_handler_stores_the_archive_and_marks_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state) = uploads_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let _alices_post: Status = post(&pool, &alice, Visibility::Public, "alice posts").await;
+        let bobs_post: Status = post(&pool, &bob, Visibility::Public, "bob posts").await;
+        like(&pool, &alice, bobs_post.id).await;
+        mark(&pool, &alice, bobs_post.id).await;
+        let row = backup::create(&pool, &alice)
+            .await
+            .expect("the fixture backup creates");
+
+        // Through the registry's binding, so the pass also proves that the
+        // kind the endpoint enqueues stands behind this module's handler.
+        let handler = crate::job_registry()
+            .get(crate::api::backups::KIND_RUN)
+            .expect("the run kind is registered");
+        handler(
+            state.clone(),
+            FIRST_ATTEMPT,
+            json!({ "backup_id": row.id.to_string() }),
+        )
+        .await
+        .expect("the run job completes");
+
+        let key = storage_key(alice.id, &row.file_name);
+        uploads::check_key(&key).expect("the run's key is legal");
+        let marked = backup::get_by_id(&pool, row.id)
+            .await
+            .expect("the row reads")
+            .expect("the request stands");
+        assert!(marked.processed, "the run marks the row processed");
+        assert_eq!(
+            marked.storage_key.as_deref(),
+            Some(key.as_str()),
+            "and records the key it stored under"
+        );
+        assert!(marked.file_size > 0, "the archive's byte count stands too");
+        assert_eq!(
+            marked.file_name, row.file_name,
+            "the request's own name is kept"
+        );
+
+        let path = dir.path().join(&key);
+        assert!(
+            path.is_file(),
+            "the archive lives at the key in the uploads dir"
+        );
+        assert_eq!(
+            u64::try_from(marked.file_size).expect("a file size fits a u64"),
+            std::fs::metadata(&path)
+                .expect("the stored file is there")
+                .len(),
+            "file_size says what the stored file holds"
+        );
+        assert_eq!(
+            stored_names(&path),
+            [ACTOR_ENTRY, OUTBOX_ENTRY, LIKES_ENTRY, BOOKMARKS_ENTRY],
+            "the stored zip opens with the four entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_run_pass_converges_on_the_same_backup() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state) = uploads_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let _post: Status = post(&pool, &alice, Visibility::Public, "one post").await;
+        let row = backup::create(&pool, &alice)
+            .await
+            .expect("the fixture backup creates");
+
+        run(&state, row.id).await.expect("the first pass runs");
+        let first = backup::get_by_id(&pool, row.id)
+            .await
+            .expect("the row reads")
+            .expect("the request stands");
+        run(&state, row.id).await.expect("the rerun converges");
+        let second = backup::get_by_id(&pool, row.id)
+            .await
+            .expect("the row reads again")
+            .expect("it still stands");
+
+        assert!(second.processed, "still processed");
+        assert_eq!(
+            second.storage_key, first.storage_key,
+            "the same key, overwritten in place"
+        );
+        let path = dir.path().join(
+            second
+                .storage_key
+                .as_deref()
+                .expect("the rerun kept the key"),
+        );
+        assert!(path.is_file(), "one file stands at the key");
+        assert_eq!(
+            u64::try_from(second.file_size).expect("a file size fits a u64"),
+            std::fs::metadata(&path)
+                .expect("the stored file is there")
+                .len(),
+            "the recorded size still describes the stored file"
+        );
+        assert_eq!(
+            stored_names(&path).len(),
+            4,
+            "and the archive still opens with its four entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_args_a_missing_row_and_a_missing_user_discard() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+
+        let bad = handle_run(
+            state.clone(),
+            FIRST_ATTEMPT,
+            json!({ "id": "not-a-backup" }),
+        )
+        .await;
+        assert!(
+            matches!(&bad, Err(JobError::Discard(detail)) if detail.contains("unusable")),
+            "unusable arguments must discard, not {bad:?}"
+        );
+
+        let missing = run(&state, Uuid::now_v7()).await;
+        assert!(
+            matches!(&missing, Err(JobError::Discard(detail)) if detail.contains("no longer exists")),
+            "a vanished row must discard, not {missing:?}"
+        );
+
+        // A row cannot outlive its owner in the table — the foreign key's
+        // cascade takes it — so the owner arm is what races between the
+        // handler's two reads: it is proven on the read itself.
+        let orphan = load_owner(&state, Uuid::now_v7()).await;
+        assert!(
+            matches!(&orphan, Err(JobError::Discard(detail)) if detail.contains("user") && detail.contains("no longer exists")),
+            "a vanished owner must discard, not {orphan:?}"
+        );
+        assert!(
+            matches!(&orphan, Err(JobError::Discard(detail)) if detail.contains("no longer exists")),
+            "and it names the missing account: {orphan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_pool_retries_the_run_and_the_purge() {
+        let state = broken_state().await;
+
+        let run = run(&state, Uuid::now_v7()).await;
+        assert!(
+            matches!(&run, Err(JobError::Retry(detail)) if detail.starts_with("backup row read failed")),
+            "a closed pool retries the run, not {run:?}"
+        );
+
+        let swept = purge(&state).await;
+        assert!(
+            matches!(&swept, Err(JobError::Retry(detail)) if detail.starts_with("backup purge read failed")),
+            "a closed pool retries the purge, not {swept:?}"
+        );
+    }
+
+    #[test]
+    fn the_kinds_are_registered_and_the_purge_is_scheduled_daily() {
+        assert_eq!(
+            crate::api::backups::KIND_RUN,
+            "backups.run",
+            "the kind the endpoint enqueues"
+        );
+        assert_eq!(KIND_PURGE, "backups.purge", "the ticket's purge kind");
+
+        let registry = crate::job_registry();
+        assert!(
+            registry.get(crate::api::backups::KIND_RUN).is_some(),
+            "the worker knows the run kind"
+        );
+        assert!(
+            registry.get(KIND_PURGE).is_some(),
+            "the worker knows the purge kind"
+        );
+
+        let job = periodic_jobs()
+            .into_iter()
+            .find(|job| job.kind == KIND_PURGE)
+            .expect("the purge is on the periodic schedule");
+        assert_eq!(job.queue, QUEUE_BACKGROUND, "on the maintenance queue");
+        assert_eq!(job.every, Duration::from_hours(24), "once a day");
+    }
+
+    #[tokio::test]
+    async fn the_purge_sweeps_expired_rows_their_files_and_abandoned_requests() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state) = uploads_state(&pool);
+        let alice = user(&pool, "alice").await;
+
+        // An aged, finished archive with its file on disk...
+        let (stored, stored_key) =
+            processed_backup(&state, &alice, "stored.zip", b"a finished archive").await;
+        age(&pool, stored.id, AGED_DAYS).await;
+        // ...an aged finished row whose file is already gone (tolerated,
+        // the row is all that is left to sweep)...
+        let (lapsed, lapsed_key) = processed_backup(&state, &alice, "lapsed.zip", b"bytes").await;
+        state
+            .uploader
+            .delete(&lapsed_key)
+            .await
+            .expect("the fixture file goes first");
+        age(&pool, lapsed.id, AGED_DAYS).await;
+        // ...an aged request whose job never marked anything...
+        let abandoned = backup::create(&pool, &alice)
+            .await
+            .expect("the fixture backup creates");
+        age(&pool, abandoned.id, AGED_DAYS).await;
+        // ...and a young processed archive the sweep must leave untouched.
+        let (fresh, fresh_key) = processed_backup(&state, &alice, "fresh.zip", b"young").await;
+
+        // Through the registry's binding: this module's sweep stands
+        // behind the kind the scheduler enqueues.
+        let handler = crate::job_registry()
+            .get(KIND_PURGE)
+            .expect("the purge kind is registered");
+        handler(state.clone(), FIRST_ATTEMPT, json!({}))
+            .await
+            .expect("the purge pass completes");
+
+        for gone in [stored.id, lapsed.id, abandoned.id] {
+            assert!(
+                backup::get_by_id(&pool, gone)
+                    .await
+                    .expect("the swept row reads")
+                    .is_none(),
+                "row {gone} is past the window and gone"
+            );
+        }
+        assert!(
+            !dir.path().join(&stored_key).exists(),
+            "the aged archive's file went with its row"
+        );
+        let kept = backup::get_by_id(&pool, fresh.id)
+            .await
+            .expect("the young row reads")
+            .expect("it stands");
+        assert!(kept.processed, "a young row is nobody's purge");
+        assert!(
+            dir.path().join(&fresh_key).is_file(),
+            "and its file stays where it is"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_purge_stands_down_when_the_config_says() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let dir = tempfile::TempDir::new().expect("a temp uploads dir");
+        let mut config = Config::for_tests();
+        config.uploads_dir = dir.path().to_path_buf();
+        config.backup_purge = Toggle::new(false);
+        let state = state_with_config(&pool, config);
+        let alice = user(&pool, "alice").await;
+
+        let (row, key) = processed_backup(&state, &alice, "disabled.zip", b"bytes").await;
+        age(&pool, row.id, AGED_DAYS).await;
+
+        purge(&state)
+            .await
+            .expect("a disabled pass is a clean no-op");
+
+        assert!(
+            backup::get_by_id(&pool, row.id)
+                .await
+                .expect("the row reads")
+                .is_some(),
+            "the aged row stands: BACKUP_PURGE off deletes nothing"
+        );
+        assert!(
+            dir.path().join(&key).is_file(),
+            "and so does its stored file"
+        );
     }
 }

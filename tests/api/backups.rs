@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 use wired_be::{
     api::backups::KIND_RUN,
-    jobs::QUEUE_BACKGROUND,
+    jobs::{AttemptInfo, QUEUE_BACKGROUND, backups::handle_run},
     models::{backup, job::Job, user::User},
     util::time::parse_time,
 };
@@ -52,6 +52,12 @@ const EXPECTED_KEYS: [&str; 6] = [
     "processed",
     "url",
 ];
+/// The attempt info a test hands the run handler: the first pass of a job
+/// with an ordinary budget.
+const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {
+    attempts: 1,
+    max_attempts: 5,
+};
 
 /// A local user named `nickname` with a bearer token granting `scopes`.
 async fn fixture(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
@@ -442,5 +448,82 @@ async fn backups_are_per_account() {
     assert!(
         !ids(&for_alice).contains(&one_for_bob[0]["id"].as_str().unwrap_or_default()),
         "Bob's id never appears in Alice's list"
+    );
+}
+
+#[tokio::test]
+async fn the_run_job_behind_a_post_makes_the_archive_downloadable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let uploads = TempDir::new().expect("temp dir for uploads");
+    let app = common::test_app_with_uploads_dir(pool.clone(), uploads.path());
+    let (alice, token) = backup_owner(&pool, "alice").await;
+
+    // The whole path, in order: the endpoint records the request and
+    // queues the job with its arguments...
+    let body = requested(&app, &token).await;
+    assert_eq!(body.len(), 1, "one request recorded");
+    assert_eq!(
+        body[0]["processed"], false,
+        "the POST itself builds nothing"
+    );
+    let row = stored(&pool, &alice)
+        .await
+        .into_iter()
+        .next()
+        .expect("the POST recorded a row");
+    let jobs = queued_jobs(&pool).await;
+    assert_eq!(jobs.len(), 1, "one job queued");
+
+    // ...the worker runs it, over the very arguments the endpoint wrote...
+    let state = common::test_app_state(
+        pool.clone(),
+        common::test_config_with_uploads_dir(uploads.path()),
+    );
+    handle_run(state, FIRST_ATTEMPT, jobs[0].args.clone())
+        .await
+        .expect("the run job completes on the endpoint's own arguments");
+
+    // ...and the listing shows the processed entity with its download URL.
+    let done = listed(&app, &token).await;
+    let entry = &done[0];
+    assert_eq!(entry["id"], row.id.to_string(), "the same request");
+    assert_eq!(entry["processed"], true, "the job landed");
+    let size = entry["file_size"].as_i64().expect("file_size is a number");
+    assert!(size > 0, "the archive carries bytes, not {size}");
+    let key = format!("backups/{}/{}", alice.id, row.file_name);
+    let url = entry["url"].as_str().expect("url is a string");
+    assert_eq!(
+        url,
+        format!("{MEDIA_BASE_URL}/{key}"),
+        "the stored archive's /media URL"
+    );
+    assert!(
+        url.contains("/media/backups/"),
+        "the download stands under /media/backups/: {url}"
+    );
+
+    // The bytes live at that key in the uploads store, sized as the
+    // entity says, and the media route serves the URL the entity names.
+    let stored_file = uploads.path().join(&key);
+    assert!(stored_file.is_file(), "the archive is on disk: {key}");
+    assert_eq!(
+        std::fs::metadata(&stored_file)
+            .expect("the stored file is there")
+            .len(),
+        u64::try_from(size).expect("a file size fits a u64"),
+        "and file_size describes the stored file"
+    );
+    let fetched = common::TestRequest::get(&format!("/media/{key}"))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &fetched,
+        StatusCode::OK,
+        "the entity's URL serves the archive",
+    );
+    assert!(
+        fetched.body.starts_with(b"PK"),
+        "the served bytes open as a zip"
     );
 }
