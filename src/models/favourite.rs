@@ -32,7 +32,9 @@
 //! endpoint, and [`page_for_user`] pages the statuses behind one account's
 //! favourites for `GET /api/v1/favourites`. Both page reads key on the
 //! *favourite row id* — the `UUIDv7` the client's cursors and `Link`
-//! header walk, not the joined row's.
+//! header walk, not the joined row's. A fourth read, [`backup_page`],
+//! walks the same id the other way for the export job in
+//! [`crate::jobs::backups`].
 //!
 //! Deleting a user or a status takes its favourites through the foreign
 //! key's cascade. The [`Favourite::ap_id`] awaits the federation ticket
@@ -93,6 +95,17 @@ const USERS_PAGE_SQL: &str = "SELECT f.id AS favourite_id, u.* FROM favourites f
 /// [`status::get_many`] in a second read, so the keyset stays a plain walk
 /// of the `(user_id, id desc)` pair the table's migration indexes.
 const FAVOURITES_PAGE_SQL: &str = "SELECT f.* FROM favourites f
+     WHERE f.user_id = ";
+
+/// [`backup_page`]: one account's favourites walked in favourite id order,
+/// each row joined to its status so the archive item is the liked
+/// object's `uri` rather than an id the caller must look up again. Like
+/// [`FAVOURITES_PAGE_SQL`] the text stops where its one placeholder
+/// belongs, because that is where [`backup_page`] pushes the author's id
+/// bind; the function then appends the `after` cursor, the ascending
+/// ordering and the `LIMIT` on `f.id`.
+const BACKUP_PAGE_SQL: &str = "SELECT f.id, s.uri FROM favourites f
+    JOIN statuses s ON s.id = f.status_id
      WHERE f.user_id = ";
 
 /// One row of `favourites`: `user_id` favourited `status_id`.
@@ -316,6 +329,43 @@ pub async fn page_for_user(
             Some((favourite, status))
         })
         .collect())
+}
+
+/// One ascending page of `user_id`'s favourites for the backup archive
+/// ([`crate::jobs::backups`]).
+///
+/// Each entry is the favourite row's id — the keyset cursor the export
+/// walks, exactly as [`page_for_user`] keys its pages on the like id — and
+/// the liked status's `uri`, the item the archive lists. A favourite whose
+/// status row is gone entirely (hard-deleted, cascaded) contributes
+/// nothing; a soft-deleted one still rides along, its reserved `uri` part
+/// of the account's history. `after`, when given, admits only rows with a
+/// strictly greater favourite id, at `limit` at a time, so the whole walk
+/// costs pages of at most `limit` rows.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn backup_page(
+    pool: &PgPool,
+    user_id: Uuid,
+    after: Option<Uuid>,
+    limit: i64,
+) -> AppResult<Vec<(Uuid, String)>> {
+    let mut builder = QueryBuilder::<Postgres>::new(BACKUP_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(user_id);
+    if let Some(after) = after {
+        let _newer: &mut _ = builder.push(" AND f.id > ").push_bind(after);
+    }
+    let _paged: &mut _ = builder.push(" ORDER BY f.id ASC LIMIT ").push_bind(limit);
+    let rows = builder
+        .build_query_as::<(Uuid, String)>()
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// One keyset page of `sql` with `bound_id` as its leading placeholder:

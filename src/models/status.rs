@@ -498,6 +498,23 @@ const OUTBOX_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.user_id = ";
 /// public replies collection — and a tombstone is no post at all.
 const AP_VISIBLE: &str = " AND s.deleted_at IS NULL AND s.visibility IN ('public', 'unlisted')";
 
+/// [`backup_page`]: the head of the backup archive statement, up to (and
+/// including) the placeholder [`backup_page`] pushes the author's id into;
+/// the function then appends [`BACKUP_VISIBLE`], the `after` cursor, the
+/// ascending ordering and the `LIMIT` on `s.id`.
+const BACKUP_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.user_id = ";
+
+/// The row filter of [`backup_page`]: every live status an account
+/// authored that this instance federates. Unlike [`AP_VISIBLE`]'s two
+/// public arms the backup is the account's own export, so `private` and
+/// `direct` ride along too; only Pleroma's never-federated `local` stays
+/// out (it has no `Create` to carry — [`note_json`] refuses it) and no
+/// tombstone is anyone's post any more.
+///
+/// [`note_json`]: crate::federation::note::note_json
+const BACKUP_VISIBLE: &str = " AND s.deleted_at IS NULL \
+    AND s.visibility IN ('public', 'unlisted', 'private', 'direct')";
+
 /// [`public_replies_page`]: the head of the replies statement, up to (and
 /// including) the placeholder the object id is pushed into; the function
 /// then appends [`AP_VISIBLE`], the cursor, the ordering and the `LIMIT`.
@@ -917,6 +934,41 @@ pub async fn outbox_page(
     page.apply_keyset(&mut builder, "s.id");
     let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
     Ok(page.finish(rows))
+}
+
+/// One ascending page of `user_id`'s statuses for the backup archive
+/// ([`crate::jobs::backups`]).
+///
+/// Every live row the account authored that this instance federates — all
+/// four visibilities but `local`, which has no document to export (see
+/// `BACKUP_VISIBLE`) — oldest id first (decision 4), which is the order
+/// the archive's `orderedItems` must take. `after`, when given, is the
+/// keyset cursor: only rows with a strictly greater id come back, at
+/// `limit` at a time, so a caller walking a whole account never holds more
+/// than one page and never re-reads a row it has seen. This is the shape
+/// [`outbox_page`] has with [`PageParams`], narrowed to the one walk the
+/// export takes rather than a client-facing cursor set.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn backup_page(
+    pool: &PgPool,
+    user_id: Uuid,
+    after: Option<Uuid>,
+    limit: i64,
+) -> AppResult<Vec<Status>> {
+    let mut builder = QueryBuilder::<Postgres>::new(BACKUP_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(user_id).push(BACKUP_VISIBLE);
+    if let Some(after) = after {
+        let _newer: &mut _ = builder.push(" AND s.id > ").push_bind(after);
+    }
+    let _paged: &mut _ = builder.push(" ORDER BY s.id ASC LIMIT ").push_bind(limit);
+    let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
+    Ok(rows)
 }
 
 /// The publicly visible answers to `object_id`, counted rather than listed.
