@@ -188,6 +188,14 @@ pub const JOB_QUEUES_VAR: &str = "JOB_QUEUES";
 /// local statuses are hard-deleted by the daily maintenance purge; `0`
 /// disables the purge.
 pub const PURGE_DELETED_STATUSES_DAYS_VAR: &str = "PURGE_DELETED_STATUSES_DAYS";
+/// Environment variable holding the age in days a finished user backup
+/// archive stays downloadable.
+pub const BACKUP_VALIDITY_DAYS_VAR: &str = "BACKUP_VALIDITY_DAYS";
+/// Environment variable holding the minimum number of days between two
+/// backups of one user.
+pub const BACKUP_LIMIT_DAYS_VAR: &str = "BACKUP_LIMIT_DAYS";
+/// Environment variable holding whether the backup purge sweep runs at all.
+pub const BACKUP_PURGE_VAR: &str = "BACKUP_PURGE";
 /// Environment variable holding how many seconds the streaming WebSocket
 /// waits between two heartbeat pings of one socket.
 pub const STREAMING_PING_INTERVAL_SECS_VAR: &str = "STREAMING_PING_INTERVAL_SECS";
@@ -531,6 +539,15 @@ pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// unset: thirty days, the window the earlier maintenance sweeps give
 /// their rows before reclaiming them.
 pub const DEFAULT_PURGE_DELETED_STATUSES_DAYS: usize = 30;
+/// Backup archive validity used when `BACKUP_VALIDITY_DAYS` is unset: thirty
+/// days, the window a finished user backup archive stays downloadable.
+pub const DEFAULT_BACKUP_VALIDITY_DAYS: usize = 30;
+/// Backup interval floor used when `BACKUP_LIMIT_DAYS` is unset: seven days,
+/// the minimum spacing between two backups of one user.
+pub const DEFAULT_BACKUP_LIMIT_DAYS: usize = 7;
+/// Backup purge state used when `BACKUP_PURGE` is unset: the sweep runs;
+/// switching it off is the operator's explicit decision.
+pub const DEFAULT_BACKUP_PURGE: bool = true;
 /// Streaming heartbeat period used when `STREAMING_PING_INTERVAL_SECS` is
 /// unset: the 30 seconds Pleroma's `WebsocketHandler` pings a socket on
 /// (`lib/pleroma/web/mastodon_api/websocket_handler.ex`, `@tick`).
@@ -560,6 +577,19 @@ const TEST_MEDIA_PROXY: MediaProxyConfig = MediaProxyConfig {
     max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
     blacklist: Vec::new(),
 };
+/// The rate-limiter test defaults as a [`RateLimitConfig`], spelled once
+/// for [`Config::test_defaults`]'s literal like [`TEST_UPLOAD_LIMITS`] and
+/// [`TEST_MEDIA_PROXY`]; a function rather than a `const`, because
+/// [`default_limits`](crate::rate_limit::default_limits) builds its
+/// [`std::collections::BTreeMap`] at runtime.
+#[cfg(any(test, feature = "integration-tests"))]
+fn test_rate_limit() -> RateLimitConfig {
+    RateLimitConfig {
+        enabled: Toggle::new(false),
+        limits: rate_limit::default_limits(),
+        trust_proxy_headers: Toggle::new(DEFAULT_TRUST_PROXY_HEADERS),
+    }
+}
 /// Minimum length, in characters, of `MEDIA_PROXY_SECRET` when the media
 /// proxy is enabled: 32 bytes of key material for HMAC-SHA256.
 pub const MIN_MEDIA_PROXY_SECRET_CHARS: usize = 32;
@@ -1170,6 +1200,16 @@ pub struct Config {
     /// tombstones are never deleted — their rows keep a deleted remote
     /// post from being re-imported.
     pub purge_deleted_statuses_days: usize,
+    /// Age in days a finished user backup archive stays downloadable, from
+    /// `BACKUP_VALIDITY_DAYS`.
+    pub backup_validity_days: usize,
+    /// Minimum number of days between two backups of one user, from
+    /// `BACKUP_LIMIT_DAYS`.
+    pub backup_limit_days: usize,
+    /// Whether the backup purge sweep runs at all, from `BACKUP_PURGE`:
+    /// while off the sweep never deletes anything, whatever
+    /// [`backup_validity_days`](Self::backup_validity_days) says.
+    pub backup_purge: Toggle,
     /// Seconds between the heartbeat pings of one streaming socket, from
     /// `STREAMING_PING_INTERVAL_SECS`: [`PING_INTERVAL`] spells the same span
     /// (30, Pleroma's `@tick`), and a test keeps the two agreeing.
@@ -1271,10 +1311,7 @@ impl Config {
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, ConfigError> {
         let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
         let (profile, limits, text, auth, exposure, mail) = wording_and_mail(&lookup, &base_url)?;
-        let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
-        let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
-        let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
-        let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(&lookup)?;
+        let rest = rest_settings(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -1301,23 +1338,23 @@ impl Config {
             min_scheduled_secs: limits.min_scheduled_secs,
             max_scheduled_per_user: limits.max_scheduled_per_user,
             max_scheduled_per_user_per_day: limits.max_scheduled_per_user_per_day,
-            upload_limits,
-            avatar_limit_bytes,
-            banner_limit_bytes,
+            upload_limits: rest.upload_limits,
+            avatar_limit_bytes: rest.avatar_limit_bytes,
+            banner_limit_bytes: rest.banner_limit_bytes,
             inbox_max_bytes: limits.inbox_max_bytes,
             max_remote_mention_lookups: limits.max_remote_mention_lookups,
             uploads_dir: directory(&lookup, UPLOADS_DIR_VAR, DEFAULT_UPLOADS_DIR),
             emoji_dir: directory(&lookup, EMOJI_DIR_VAR, DEFAULT_EMOJI_DIR),
             media_base_url,
-            http_allow_private_hosts,
+            http_allow_private_hosts: rest.http_allow_private_hosts,
             accounts_email_optional: auth.accounts_email_optional,
             min_password_length: auth.min_password_length,
             oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
             password_reset_ttl_secs: auth.password_reset_ttl_secs,
             allow_account_deletion: auth.allow_account_deletion,
-            mongooseim_enabled,
-            captcha_enabled,
-            healthcheck_enabled,
+            mongooseim_enabled: rest.mongooseim_enabled,
+            captcha_enabled: rest.captcha_enabled,
+            healthcheck_enabled: rest.healthcheck_enabled,
             registrations_open: exposure.registrations_open,
             invites_enabled: exposure.invites_enabled,
             registrations_approval_required: exposure.registrations_approval_required,
@@ -1326,9 +1363,12 @@ impl Config {
             restrict_unauthenticated: exposure.restrict_unauthenticated,
             oauth_providers: auth.oauth_providers,
             available_frontends: exposure.available_frontends,
-            job_concurrency,
-            job_queues,
-            purge_deleted_statuses_days,
+            job_concurrency: rest.job_concurrency,
+            job_queues: rest.job_queues,
+            purge_deleted_statuses_days: rest.purge_deleted_statuses_days,
+            backup_validity_days: rest.backup_validity_days,
+            backup_limit_days: rest.backup_limit_days,
+            backup_purge: rest.backup_purge,
             streaming_ping_interval_secs: streaming_heartbeat(&lookup)?,
             smtp_host: mail.host,
             smtp_port: mail.port,
@@ -1342,8 +1382,8 @@ impl Config {
             rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup),
             translation: translation_settings(&lookup)?,
-            sign_fetches,
-            authorized_fetch,
+            sign_fetches: rest.sign_fetches,
+            authorized_fetch: rest.authorized_fetch,
             federation_enabled: federation_enabled(&lookup)?,
             accept_unsolicited_public: accept_unsolicited_public(&lookup)?,
             mrf_policies: mrf_policies(&lookup),
@@ -1481,6 +1521,9 @@ impl Config {
             job_concurrency: DEFAULT_JOB_CONCURRENCY,
             job_queues: comma_list(DEFAULT_JOB_QUEUES),
             purge_deleted_statuses_days: DEFAULT_PURGE_DELETED_STATUSES_DAYS,
+            backup_validity_days: DEFAULT_BACKUP_VALIDITY_DAYS,
+            backup_limit_days: DEFAULT_BACKUP_LIMIT_DAYS,
+            backup_purge: Toggle::new(DEFAULT_BACKUP_PURGE),
             streaming_ping_interval_secs: DEFAULT_STREAMING_PING_INTERVAL_SECS,
             smtp_host: None,
             smtp_port: DEFAULT_SMTP_PORT,
@@ -1499,11 +1542,7 @@ impl Config {
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
             accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
             mrf_policies: Vec::new(),
-            rate_limit: RateLimitConfig {
-                enabled: Toggle::new(false),
-                limits: rate_limit::default_limits(),
-                trust_proxy_headers: Toggle::new(DEFAULT_TRUST_PROXY_HEADERS),
-            },
+            rate_limit: test_rate_limit(),
         }
     }
 }
@@ -1636,6 +1675,115 @@ where
         DEFAULT_PURGE_DELETED_STATUSES_DAYS,
     )?;
     Ok((job_concurrency, job_queues, purge_deleted_statuses_days))
+}
+
+/// Reads the three settings that shape the user-backup feature: the age in
+/// days a finished backup archive stays downloadable
+/// ([`BACKUP_VALIDITY_DAYS_VAR`]), the minimum number of days between two
+/// backups of one user ([`BACKUP_LIMIT_DAYS_VAR`]) and whether the backup
+/// purge sweep runs at all ([`BACKUP_PURGE_VAR`]). Grouped because each is a
+/// plain default-or-parse and [`Config::from_lookup`] has a size budget
+/// (AGENTS.md); the tuple comes back in field order.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when one of the two day settings
+/// holds a value that is not a whole number, and
+/// [`ConfigError::InvalidBoolean`] when `BACKUP_PURGE` holds a value that is
+/// neither spelling.
+fn backup_settings<F>(lookup: &F) -> Result<(usize, usize, Toggle), ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let validity_days = number(
+        lookup,
+        BACKUP_VALIDITY_DAYS_VAR,
+        DEFAULT_BACKUP_VALIDITY_DAYS,
+    )?;
+    let limit_days = number(lookup, BACKUP_LIMIT_DAYS_VAR, DEFAULT_BACKUP_LIMIT_DAYS)?;
+    let purge = boolean(lookup, BACKUP_PURGE_VAR, DEFAULT_BACKUP_PURGE)?.into();
+    Ok((validity_days, limit_days, purge))
+}
+
+/// The five reader groups that share no theme — [`upload_settings`],
+/// [`fetch_settings`], [`misc_toggles`], [`job_worker`] and
+/// [`backup_settings`] — flattened into one named bundle so
+/// [`Config::from_lookup`] binds all fifteen of their fields with a single
+/// `let` and stays inside Clippy's line budget, the same move [`Groups`]
+/// spells for the wording and signup trios. The field names mirror the
+/// [`Config`] fields they hang on.
+#[derive(Debug)]
+struct RestSettings {
+    /// Per-request limits for multipart uploads (`UPLOAD_LIMIT_BYTES` and
+    /// `UPLOAD_MAX_FILES`).
+    upload_limits: UploadLimits,
+    /// Maximum avatar image size in bytes (`AVATAR_LIMIT_BYTES`).
+    avatar_limit_bytes: usize,
+    /// Maximum banner/background image size in bytes (`BANNER_LIMIT_BYTES`).
+    banner_limit_bytes: usize,
+    /// Whether the outbound SSRF guard is disabled
+    /// (`HTTP_ALLOW_PRIVATE_HOSTS`).
+    http_allow_private_hosts: bool,
+    /// Whether outgoing actor `GET`s are HTTP-signed (`SIGN_FETCHES`).
+    sign_fetches: Toggle,
+    /// Whether inbound `ActivityPub` `GET`s must carry a valid HTTP
+    /// signature (`AUTHORIZED_FETCH`).
+    authorized_fetch: Toggle,
+    /// Whether the `MongooseIM` auth endpoints are served
+    /// (`MONGOOSEIM_ENABLED`).
+    mongooseim_enabled: Toggle,
+    /// Whether a captcha provider is configured (`CAPTCHA_ENABLED`).
+    captcha_enabled: Toggle,
+    /// Whether the healthcheck endpoint reports pool data
+    /// (`HEALTHCHECK_ENABLED`).
+    healthcheck_enabled: Toggle,
+    /// The job worker's concurrent handler count (`JOB_CONCURRENCY`).
+    job_concurrency: usize,
+    /// The job queue names the worker drains (`JOB_QUEUES`).
+    job_queues: Vec<String>,
+    /// The deleted-status purge age (`PURGE_DELETED_STATUSES_DAYS`).
+    purge_deleted_statuses_days: usize,
+    /// The days a backup archive stays downloadable (`BACKUP_VALIDITY_DAYS`).
+    backup_validity_days: usize,
+    /// The minimum days between two backups of one user
+    /// (`BACKUP_LIMIT_DAYS`).
+    backup_limit_days: usize,
+    /// Whether the backup purge sweep runs at all (`BACKUP_PURGE`).
+    backup_purge: Toggle,
+}
+
+/// Reads the five groups [`RestSettings`] bundles.
+///
+/// # Errors
+///
+/// Those of [`upload_settings`], [`fetch_settings`], [`misc_toggles`],
+/// [`job_worker`] and [`backup_settings`].
+fn rest_settings<F>(lookup: &F) -> Result<RestSettings, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(lookup)?;
+    let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(lookup)?;
+    let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(lookup)?;
+    let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(lookup)?;
+    let (backup_validity_days, backup_limit_days, backup_purge) = backup_settings(lookup)?;
+    Ok(RestSettings {
+        upload_limits,
+        avatar_limit_bytes,
+        banner_limit_bytes,
+        http_allow_private_hosts,
+        sign_fetches,
+        authorized_fetch,
+        mongooseim_enabled,
+        captcha_enabled,
+        healthcheck_enabled,
+        job_concurrency,
+        job_queues,
+        purge_deleted_statuses_days,
+        backup_validity_days,
+        backup_limit_days,
+        backup_purge,
+    })
 }
 
 /// Reads the one setting that shapes the streaming WebSocket: how many
@@ -2643,99 +2791,12 @@ fn comma_list(value: &str) -> Vec<String> {
 /// Redacts `database_url`, which usually contains a password.
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Bound for the same reason: these three field names and their
-        // `self` paths together pass rustfmt's call width, and each would
-        // otherwise split over three lines and push the function past
-        // Clippy's line budget.
-        let activation = &self.account_activation_required;
-        let approval = &self.registrations_approval_required;
-        let anonymous_search = &self.search_statuses_unauthenticated;
-        // Bound for the same reason as above: each of these two names
-        // with its `self` path passes rustfmt's call width and would
-        // otherwise split over three lines, together pushing the function
-        // past Clippy's line budget.
-        let purge_days = &self.purge_deleted_statuses_days;
-        let ping_secs = &self.streaming_ping_interval_secs;
-        let max_remote_mention_lookups = &self.max_remote_mention_lookups;
-        let max_scheduled_per_day = &self.max_scheduled_per_user_per_day;
-        let fed = (self.federation_enabled, self.accept_unsolicited_public);
+        // The whole field list does not fit one function inside Clippy's
+        // line budget, so two segment helpers write it in declaration
+        // order and `fmt` only opens, hands over and closes the document.
         let mut debug = f.debug_struct("Config");
-        let debug = debug
-            .field("database_url", &"<redacted>")
-            .field("bind_addr", &self.bind_addr)
-            .field("base_url", &self.base_url)
-            .field("instance_name", &self.instance_name)
-            .field("instance_description", &self.instance_description)
-            .field("contact_email", &self.contact_email)
-            .field("instance_languages", &self.instance_languages)
-            .field("max_status_chars", &self.max_status_chars)
-            .field("max_media_attachments", &self.max_media_attachments)
-            .field("max_poll_options", &self.max_poll_options)
-            .field("max_poll_option_chars", &self.max_poll_option_chars)
-            .field("min_poll_expiration_secs", &self.min_poll_expiration_secs)
-            .field("max_poll_expiration_secs", &self.max_poll_expiration_secs)
-            .field("max_chat_message_chars", &self.max_chat_message_chars)
-            .field("max_media_description", &self.max_media_description)
-            .field("max_display_name_chars", &self.max_display_name_chars)
-            .field("max_bio_chars", &self.max_bio_chars)
-            .field("max_profile_fields", &self.max_profile_fields)
-            .field("max_report_comment", &self.max_report_comment)
-            .field("max_image_pixels", &self.max_image_pixels)
-            .field("max_pinned_statuses", &self.max_pinned_statuses)
-            .field("min_expiration_secs", &self.min_expiration_secs)
-            .field("min_scheduled_secs", &self.min_scheduled_secs)
-            .field("max_scheduled_per_user", &self.max_scheduled_per_user)
-            .field("max_scheduled_per_user_per_day", max_scheduled_per_day)
-            .field("upload_limits", &self.upload_limits)
-            .field("avatar_limit_bytes", &self.avatar_limit_bytes)
-            .field("banner_limit_bytes", &self.banner_limit_bytes)
-            .field("inbox_max_bytes", &self.inbox_max_bytes)
-            .field("max_remote_mention_lookups", max_remote_mention_lookups)
-            .field("http_allow_private_hosts", &self.http_allow_private_hosts)
-            .field("uploads_dir", &self.uploads_dir)
-            .field("emoji_dir", &self.emoji_dir)
-            .field("media_base_url", &self.media_base_url)
-            .field("accounts_email_optional", &self.accounts_email_optional)
-            .field("min_password_length", &self.min_password_length)
-            .field("oauth_token_ttl_secs", &self.oauth_token_ttl_secs)
-            .field("password_reset_ttl_secs", &self.password_reset_ttl_secs)
-            .field("account_activation_required", activation)
-            .field("allow_account_deletion", &self.allow_account_deletion)
-            .field("mongooseim_enabled", &self.mongooseim_enabled)
-            .field("captcha_enabled", &self.captcha_enabled)
-            .field("healthcheck_enabled", &self.healthcheck_enabled)
-            .field("registrations_open", &self.registrations_open)
-            .field("invites_enabled", &self.invites_enabled)
-            .field("registrations_approval_required", approval)
-            .field("search_statuses_unauthenticated", anonymous_search)
-            .field("restrict_unauthenticated", &self.restrict_unauthenticated)
-            .field("oauth_providers", &self.oauth_providers)
-            .field("available_frontends", &self.available_frontends)
-            .field("job_concurrency", &self.job_concurrency)
-            .field("job_queues", &self.job_queues)
-            .field("purge_deleted_statuses_days", purge_days)
-            .field("streaming_ping_interval_secs", ping_secs)
-            .field("smtp_host", &self.smtp_host)
-            .field("smtp_port", &self.smtp_port)
-            .field("smtp_username", &self.smtp_username)
-            .field("smtp_password", &"<redacted>")
-            .field("smtp_tls", &self.smtp_tls)
-            .field("mail_from", &self.mail_from)
-            .field("secret_key_base", &hide_secret(self))
-            .field("media_proxy", &self.media_proxy)
-            .field("rich_media_ignore_hosts", &self.rich_media_ignore_hosts)
-            .field("rich_media_remote", &self.rich_media_remote)
-            .field("vapid", &self.vapid)
-            .field("translation", &self.translation)
-            .field("sign_fetches", &self.sign_fetches)
-            .field("authorized_fetch", &self.authorized_fetch)
-            .field("rate_limit", &self.rate_limit);
-        // The federation trio — the enabled toggle, the unsolicited-public
-        // toggle and the policy-name list — closes the chain from a
-        // helper: the documented split that holds `fmt` inside Clippy's
-        // line budget. The fields stay named in `fmt`'s body, as the
-        // binding's and the call's arguments.
-        debug_federation(debug, fed, self.mrf_policies.as_slice())
+        let debug = debug_identity_and_exposure(&mut debug, self);
+        debug_delivery_and_federation(debug, self).finish()
     }
 }
 
@@ -2748,21 +2809,130 @@ fn hide_secret(config: &Config) -> Option<&'static str> {
     config.secret_key_base.as_ref().map(|_| "<redacted>")
 }
 
-/// Completes the [`Config`] `Debug` struct: the federation toggles — the
-/// enabled switch and the unsolicited-public gate — and the enabled MRF
-/// policy names, then the whole document. Factored out of the [`Debug`]
-/// impl above to hold that function's line count inside Clippy's budget.
-fn debug_federation(
-    debug: &mut fmt::DebugStruct<'_, '_>,
-    toggles: (Toggle, Toggle),
-    mrf_policies: &[String],
-) -> fmt::Result {
-    let (federation_enabled, accept_unsolicited_public) = toggles;
+/// Writes the first segment of the [`Config`] `Debug` document: the
+/// instance's identity, its content limits, storage locations, auth
+/// requirements and everything it exposes to clients — every field from
+/// `database_url` (redacted, it carries the password) to
+/// `available_frontends`. The builder arrives borrowed and leaves borrowed,
+/// so `fmt` can keep the chain going.
+fn debug_identity_and_exposure<'a, 'b, 'd>(
+    debug: &'d mut fmt::DebugStruct<'a, 'b>,
+    config: &Config,
+) -> &'d mut fmt::DebugStruct<'a, 'b> {
     debug
-        .field("federation_enabled", &federation_enabled)
-        .field("accept_unsolicited_public", &accept_unsolicited_public)
-        .field("mrf_policies", &mrf_policies)
-        .finish()
+        .field("database_url", &"<redacted>")
+        .field("bind_addr", &config.bind_addr)
+        .field("base_url", &config.base_url)
+        .field("instance_name", &config.instance_name)
+        .field("instance_description", &config.instance_description)
+        .field("contact_email", &config.contact_email)
+        .field("instance_languages", &config.instance_languages)
+        .field("max_status_chars", &config.max_status_chars)
+        .field("max_media_attachments", &config.max_media_attachments)
+        .field("max_poll_options", &config.max_poll_options)
+        .field("max_poll_option_chars", &config.max_poll_option_chars)
+        .field("min_poll_expiration_secs", &config.min_poll_expiration_secs)
+        .field("max_poll_expiration_secs", &config.max_poll_expiration_secs)
+        .field("max_chat_message_chars", &config.max_chat_message_chars)
+        .field("max_media_description", &config.max_media_description)
+        .field("max_display_name_chars", &config.max_display_name_chars)
+        .field("max_bio_chars", &config.max_bio_chars)
+        .field("max_profile_fields", &config.max_profile_fields)
+        .field("max_report_comment", &config.max_report_comment)
+        .field("max_image_pixels", &config.max_image_pixels)
+        .field("max_pinned_statuses", &config.max_pinned_statuses)
+        .field("min_expiration_secs", &config.min_expiration_secs)
+        .field("min_scheduled_secs", &config.min_scheduled_secs)
+        .field("max_scheduled_per_user", &config.max_scheduled_per_user)
+        .field(
+            "max_scheduled_per_user_per_day",
+            &config.max_scheduled_per_user_per_day,
+        )
+        .field("upload_limits", &config.upload_limits)
+        .field("avatar_limit_bytes", &config.avatar_limit_bytes)
+        .field("banner_limit_bytes", &config.banner_limit_bytes)
+        .field("inbox_max_bytes", &config.inbox_max_bytes)
+        .field(
+            "max_remote_mention_lookups",
+            &config.max_remote_mention_lookups,
+        )
+        .field("http_allow_private_hosts", &config.http_allow_private_hosts)
+        .field("uploads_dir", &config.uploads_dir)
+        .field("emoji_dir", &config.emoji_dir)
+        .field("media_base_url", &config.media_base_url)
+        .field("accounts_email_optional", &config.accounts_email_optional)
+        .field("min_password_length", &config.min_password_length)
+        .field("oauth_token_ttl_secs", &config.oauth_token_ttl_secs)
+        .field("password_reset_ttl_secs", &config.password_reset_ttl_secs)
+        .field(
+            "account_activation_required",
+            &config.account_activation_required,
+        )
+        .field("allow_account_deletion", &config.allow_account_deletion)
+        .field("mongooseim_enabled", &config.mongooseim_enabled)
+        .field("captcha_enabled", &config.captcha_enabled)
+        .field("healthcheck_enabled", &config.healthcheck_enabled)
+        .field("registrations_open", &config.registrations_open)
+        .field("invites_enabled", &config.invites_enabled)
+        .field(
+            "registrations_approval_required",
+            &config.registrations_approval_required,
+        )
+        .field(
+            "search_statuses_unauthenticated",
+            &config.search_statuses_unauthenticated,
+        )
+        .field("restrict_unauthenticated", &config.restrict_unauthenticated)
+        .field("oauth_providers", &config.oauth_providers)
+        .field("available_frontends", &config.available_frontends)
+}
+
+/// Writes the second segment of the [`Config`] `Debug` document: the job
+/// worker and its sweeps — the deleted-status purge age and the backup
+/// trio — the streaming heartbeat, the mailer (whose `smtp_password` and
+/// [`hide_secret`]'s `secret_key_base` are the impl's redactions beside
+/// `database_url`), the media and translation services, and the
+/// federation, MRF and rate-limiter settings. The builder arrives borrowed
+/// and leaves borrowed, so `fmt` can close the document it opened.
+fn debug_delivery_and_federation<'a, 'b, 'd>(
+    debug: &'d mut fmt::DebugStruct<'a, 'b>,
+    config: &Config,
+) -> &'d mut fmt::DebugStruct<'a, 'b> {
+    debug
+        .field("job_concurrency", &config.job_concurrency)
+        .field("job_queues", &config.job_queues)
+        .field(
+            "purge_deleted_statuses_days",
+            &config.purge_deleted_statuses_days,
+        )
+        .field("backup_validity_days", &config.backup_validity_days)
+        .field("backup_limit_days", &config.backup_limit_days)
+        .field("backup_purge", &config.backup_purge)
+        .field(
+            "streaming_ping_interval_secs",
+            &config.streaming_ping_interval_secs,
+        )
+        .field("smtp_host", &config.smtp_host)
+        .field("smtp_port", &config.smtp_port)
+        .field("smtp_username", &config.smtp_username)
+        .field("smtp_password", &"<redacted>")
+        .field("smtp_tls", &config.smtp_tls)
+        .field("mail_from", &config.mail_from)
+        .field("secret_key_base", &hide_secret(config))
+        .field("media_proxy", &config.media_proxy)
+        .field("rich_media_ignore_hosts", &config.rich_media_ignore_hosts)
+        .field("rich_media_remote", &config.rich_media_remote)
+        .field("vapid", &config.vapid)
+        .field("translation", &config.translation)
+        .field("sign_fetches", &config.sign_fetches)
+        .field("authorized_fetch", &config.authorized_fetch)
+        .field("federation_enabled", &config.federation_enabled)
+        .field(
+            "accept_unsolicited_public",
+            &config.accept_unsolicited_public,
+        )
+        .field("mrf_policies", &config.mrf_policies)
+        .field("rate_limit", &config.rate_limit)
 }
 
 /// A configuration value is missing or invalid.
@@ -3242,6 +3412,90 @@ mod tests {
         assert!(
             debug.contains("purge_deleted_statuses_days: 7"),
             "the purge age is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The backup trio: thirty valid days, a seven-day interval and the
+    /// purge sweep on by default, each environment variable overriding, a
+    /// blank falling back, junk in the two day settings refused, and
+    /// `Debug` showing all three.
+    #[test]
+    fn backup_settings_default_and_read_their_variables() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.backup_validity_days, 30,
+            "default BACKUP_VALIDITY_DAYS is thirty days"
+        );
+        assert_eq!(
+            defaults.backup_limit_days, 7,
+            "default BACKUP_LIMIT_DAYS is seven days"
+        );
+        assert!(
+            defaults.backup_purge.get(),
+            "the backup purge sweep runs by default"
+        );
+        let config = config_with(&[
+            (BACKUP_VALIDITY_DAYS_VAR, "10"),
+            (BACKUP_LIMIT_DAYS_VAR, "2"),
+            (BACKUP_PURGE_VAR, "false"),
+        ]);
+        assert_eq!(
+            config.backup_validity_days, 10,
+            "custom BACKUP_VALIDITY_DAYS"
+        );
+        assert_eq!(config.backup_limit_days, 2, "custom BACKUP_LIMIT_DAYS");
+        assert!(
+            !config.backup_purge.get(),
+            "`BACKUP_PURGE=false` stops the sweep"
+        );
+        let blank = config_with(&[
+            (BACKUP_VALIDITY_DAYS_VAR, ""),
+            (BACKUP_LIMIT_DAYS_VAR, ""),
+            (BACKUP_PURGE_VAR, ""),
+        ]);
+        assert_eq!(
+            (
+                blank.backup_validity_days,
+                blank.backup_limit_days,
+                blank.backup_purge.get(),
+            ),
+            (30, 7, true),
+            "an empty value applies the default"
+        );
+        for (var, value) in [
+            (BACKUP_VALIDITY_DAYS_VAR, "many"),
+            (BACKUP_LIMIT_DAYS_VAR, "weekly"),
+        ] {
+            let err = try_config_with(&[(var, value)]).unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::InvalidNumber(var),
+                "`{var}={value:?}` is not a whole number"
+            );
+            assert!(err.source().is_none(), "no source");
+            assert!(
+                err.to_string().starts_with(&format!("invalid {var}: ")),
+                "message names the variable"
+            );
+        }
+        let err = try_config_with(&[(BACKUP_PURGE_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(BACKUP_PURGE_VAR),
+            "a value that is neither boolean spelling is refused"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("backup_validity_days: 10"),
+            "the archive validity window is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("backup_limit_days: 2"),
+            "the per-user backup interval is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("backup_purge: Toggle(false)"),
+            "the purge switch is visible in Debug output: {debug}"
         );
     }
 

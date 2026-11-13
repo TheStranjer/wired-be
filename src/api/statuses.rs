@@ -1102,8 +1102,7 @@ async fn get_status_history(
     let worn = media_attachment::for_statuses(&state.db, &[row.id]).await?;
     let current: Vec<Uuid> = worn
         .get(&row.id)
-        .map(|rows| rows.iter().map(|attachment| attachment.id).collect())
-        .unwrap_or_default();
+        .map_or_default(|rows| rows.iter().map(|attachment| attachment.id).collect());
     let attachments = history_attachments(&state, &revisions, &current).await?;
     let mut history = Vec::with_capacity(revisions.len() + 1);
     for revision in &revisions {
