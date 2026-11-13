@@ -58,7 +58,7 @@ All configuration comes from environment variables. For local development, copy 
 | `AUTHORIZED_FETCH` | no | `false` | Require a valid HTTP Signature on `GET`s of the ActivityPub actor and collection routes; while off they answer anonymous requests (`true`/`false`, or `1`/`0`) |
 | `FEDERATION_ENABLED` | no | `true` | Whether the instance federates at all; while off every ActivityPub inbox `POST` is refused with 403 `{"error":"Federation is disabled"}` and outbound delivery queues nothing (`true`/`false`, or `1`/`0`) |
 | `ACCEPT_UNSOLICITED_PUBLIC` | no | `true` | Whether public and unlisted remote statuses are stored even from authors no local account follows; while off the ingest path drops such a post unless a local user is mentioned in it or it answers a local status (`private`, `direct` and followers-addressed posts are never gated) (`true`/`false`, or `1`/`0`) |
-| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`, `anti_link_spam`, `normalize_markup`, `tag`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
+| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`, `anti_link_spam`, `normalize_markup`, `tag`, `keyword`, `hellthread`, `object_age`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
 | `AVATAR_LIMIT_BYTES` | no | `2000000` | Maximum size of the `avatar` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
@@ -180,6 +180,71 @@ The last two switches are read off the tags of the **target** of a `Follow`
 |---|---|
 | `mrf_tag:disable-remote-subscription` | `Follow` requests for the tagged account from remote users are refused |
 | `mrf_tag:disable-any-subscription` | `Follow` requests for the tagged account are refused, whoever sends them |
+
+`keyword` is Pleroma's `KeywordPolicy`
+(`lib/pleroma/web/activity_pub/mrf/keyword_policy.ex`). Its three lists act
+on the text of the note a `Create` or `Update` carries — the note's
+`content`, `summary` and `name`, weighed before any replacement runs:
+
+```json
+{
+  "policies": ["keyword"],
+  "keyword": {
+    "reject": ["free money", "/^BUY\\s+NOW\\b/i"],
+    "federated_timeline_removal": ["politics"],
+    "replace": [["bad word", "b*tch"], ["/\\bfoo\\b/i", "bar"]]
+  }
+}
+```
+
+Each pattern entry is a plain string (matched as a case-insensitive
+substring) or a regex written between slashes, `"/pattern/"`, optionally
+followed by the flags `i`, `m`, `s` or `x`. A pattern that does not compile,
+or outgrows the compiled-size limit, is skipped with a warning; the rest of
+its list keeps working.
+
+| List | Effect |
+|---|---|
+| `reject` | The activity is refused |
+| `federated_timeline_removal` | The public address moves from `to` into `cc`: the note arrives unlisted |
+| `replace` | `[pattern, replacement]` pairs; every entry rewrites each of `content`, `summary` and `name` that holds a string, in configured order, replacing all matches. The replacement is written literally (no `$name` group expansion) |
+
+`hellthread` is Pleroma's `HellthreadPolicy`
+(`lib/pleroma/web/activity_pub/mrf/hellthread_policy.ex`). It counts the
+mention targets in the activity's `to` and `cc` — the public address and
+every `/followers` collection are not mentions — and weighs the count
+strictly against two thresholds:
+
+```json
+{ "policies": ["hellthread"], "hellthread": { "delist_threshold": 10, "reject_threshold": 20 } }
+```
+
+| Key | Default | Effect |
+|---|---|---|
+| `delist_threshold` | `10` | More mentions than this and the public address moves from `to` into `cc`; `0` switches the stage off |
+| `reject_threshold` | `20` | More mentions than this and the activity is refused; `0` switches the stage off |
+
+`object_age` is Pleroma's `ObjectAgePolicy`
+(`lib/pleroma/web/activity_pub/mrf/object_age_policy.ex`). It speaks about
+`Create` activities whose embedded object `published` lies further in the
+past than `threshold` seconds (default `604800`, one week; the comparison is
+strict, and an unreadable or future timestamp is never old), and takes every
+action named in `actions`:
+
+```json
+{ "policies": ["object_age"], "object_age": { "threshold": 604800, "actions": ["delist", "strip_followers"] } }
+```
+
+| Action | Effect |
+|---|---|
+| `delist` | The public address moves from `to` into `cc`: the note arrives unlisted |
+| `strip_followers` | The author's followers collection leaves `to` and `cc`, so the post reaches no home feed by audience address |
+| `reject` | The activity is refused, before anything rewrites |
+
+The three policies publish their configured subsets as the `mrf_keyword`,
+`mrf_hellthread` and `mrf_objectage` transparency objects beside their
+`KeywordPolicy`, `HellthreadPolicy` and `ObjectAgePolicy` names in
+`mrf_policies`.
 
 ## Development
 
