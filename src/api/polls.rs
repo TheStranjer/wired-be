@@ -311,9 +311,10 @@ async fn accepted_marks(
 /// Whether the poll's deadline has passed at `now`: the same strict
 /// comparison the [`Poll`] entity renders as `expired` — a poll at its
 /// deadline is still open, a poll with no deadline never closes — so the
-/// endpoint's `"Poll's finished"` and the entity's flag can never
-/// disagree about the same instant.
-fn poll_closed(poll: &PollRow, now: DateTime<Utc>) -> bool {
+/// endpoint's `"Poll's finished"`, the entity's flag and the federated
+/// ballot's gate ([`crate::federation::handlers::vote`]) can never disagree
+/// about the same instant.
+pub(crate) fn poll_closed(poll: &PollRow, now: DateTime<Utc>) -> bool {
     poll.expires_at.is_some_and(|deadline| deadline < now)
 }
 
@@ -416,10 +417,17 @@ fn choice_index(value: &Value) -> Option<i32> {
 ///
 /// `poll` is the row as the transaction left it, `voter` the account
 /// that cast the ballot, and `option_ids` the options it marked — the
-/// same ids [`poll::cast_vote`] wrote.
+/// same ids [`poll::cast_vote`] wrote. The federated ballot
+/// ([`crate::federation::handlers::vote`]) calls the same hook, so an
+/// author is told about a remote vote exactly as about a local one.
 ///
 /// [`notify::on_poll_vote`]: crate::services::notify::on_poll_vote
-async fn after_vote_cast(state: &AppState, poll: &PollRow, voter: &User, _option_ids: &[Uuid]) {
+pub(crate) async fn after_vote_cast(
+    state: &AppState,
+    poll: &PollRow,
+    voter: &User,
+    _option_ids: &[Uuid],
+) {
     notify::on_poll_vote(state, poll, voter).await;
 }
 
