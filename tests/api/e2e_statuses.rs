@@ -8,8 +8,10 @@
 //! the create then claims through `media_ids`), a content warning
 //! (`spoiler_text` + `sensitive`), a poll (the form's nested
 //! `poll[options][]` / `poll[expires_in]` keys), a hashtag post
-//! (`#E2ETag`) and a `local` post @-mentioning the follower — and every
-//! viewer role reads each one back through `GET /api/v1/statuses/{id}`.
+//! (`#E2ETag`), a `local` post @-mentioning the follower and a `public`
+//! quote of the `private` one through the create's `quote_id` arm — and
+//! every viewer role reads each one back through
+//! `GET /api/v1/statuses/{id}`.
 //! The answers are pinned against the visibility model in
 //! `wired_be::models::status_visibility`: the viewer a rule admits reads
 //! the exact entity — its `id`, its stored `visibility`, its rendered
@@ -34,8 +36,13 @@
 //! `GET /api/v1/accounts/{author}/statuses` with every real `StatusesParams`
 //! filter — `pinned`, `only_media`, `exclude_replies`, `exclude_reblogs`,
 //! `with_muted`, `tagged`, `exclude_visibilities[]` — across the six sweep
-//! viewers, asserting each page's membership by id set. Quote statuses are
-//! still not posted here; a tombstone and a reblog — the model's rules 1
+//! viewers, asserting each page's membership by id set. The quote kind
+//! rides every surface too: the create's gate refuses an original the
+//! poster cannot reach with the one shared 404 and writes nothing,
+//! `pleroma.quotes_count` counts exactly the one accepted quote, both
+//! `context` arms stand empty around a post that quotes, and the quote
+//! row rides the account and timeline sweeps as the `public` root it is.
+//! A tombstone and a reblog — the model's rules 1
 //! and 7 — are `e2e_interactions.rs`'s delete and boost scenarios (the
 //! sweep's one boost is the author's own, posted here to be filtered). The
 //! per-endpoint parameter refusals stay pinned by the area files
@@ -744,6 +751,256 @@ async fn a_hashtag_post_links_its_tag_for_the_open_audience() {
     }
 }
 
+/// Part 1's quote exhibit: the author's `private` original and the
+/// `public` post quoting it through the create's `quote_id` arm, both
+/// answered as the entities their creates wrote.
+async fn quote_pair(app: &Router, world: &World) -> (Value, Value) {
+    let original = posted(
+        app,
+        &world.author.token,
+        json!({"status": "the quoted word", "visibility": "private"}),
+    )
+    .await;
+    let quote = posted(
+        app,
+        &world.author.token,
+        json!({"status": "quoting in public", "quote_id": entity_id(&original)}),
+    )
+    .await;
+    (original, quote)
+}
+
+/// `POST /api/v1/statuses` as `token` answered raw — the probe create
+/// whose refusal a test pins, where [`posted`] would only ever assert the
+/// 200 and hand back the entity.
+async fn create_probe(app: &Router, token: &str, body: Value) -> common::TestResponse {
+    common::TestRequest::post(STATUSES)
+        .bearer(token)
+        .json(&body)
+        .send(app)
+        .await
+}
+
+/// The quote kind, posted through the create's `quote_id` arm: the
+/// create's own answer nests the quoted original for the poster — the
+/// render arm's nested `quote`, one level deep — and the original counts
+/// exactly this one quote on its `pleroma.quotes_count`.
+#[tokio::test]
+async fn a_quote_create_nests_its_original_and_counts_it_once() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let (original, quote) = quote_pair(&app, &world).await;
+
+    assert_eq!(
+        quote["visibility"],
+        json!("public"),
+        "a quote is an ordinary post about another one"
+    );
+    assert_eq!(
+        quote["quote"]["id"], original["id"],
+        "the create nests the quoted original for the poster"
+    );
+    assert_eq!(
+        quote["quote"]["content"],
+        json!("<p>the quoted word</p>"),
+        "the nested entity speaks as the original"
+    );
+    assert_eq!(
+        quote["quote"]["account"]["acct"],
+        json!("author"),
+        "the original's author rides the nest"
+    );
+    assert_eq!(
+        quote["quote"]["quote"],
+        Value::Null,
+        "one level deep: the original quotes nothing"
+    );
+    let shown = get(
+        &app,
+        Some(&world.author.token),
+        &format!("{STATUSES}/{}", entity_id(&original)),
+    )
+    .await;
+    common::assert_answer(&shown, StatusCode::OK, "the author reads the original");
+    assert_eq!(
+        shown.json_value()["pleroma"]["quotes_count"],
+        json!(1),
+        "the original counts its one quote"
+    );
+}
+
+/// The show sweep of the quote kind: every open viewer reads the
+/// `public` quote (rule 3 — only the blocked account loses even this),
+/// while the nested `quote` follows the *original's* audience: the author
+/// and the accepted follower read the `private` original back inside it
+/// (rule 5), every other admitted viewer reads `quote: null` — the very
+/// answer of a row that quotes nothing, no id or text leaking — and no
+/// viewer's `pleroma` block carries `quote_id`, `quote_url` or
+/// `quote_visible` at all (a recorded decision).
+#[tokio::test]
+async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let (original, quote) = quote_pair(&app, &world).await;
+
+    let shape = Shape {
+        id: entity_id(&quote),
+        visibility: "public",
+        content: json!("<p>quoting in public</p>"),
+        acct: "author",
+    };
+    let admitted = sweep(&app, &world, &shape, &OPEN).await;
+    assert_eq!(admitted.len(), 7, "the open audience reads the quote");
+    for (entity, who) in admitted.iter().zip(OPEN) {
+        if matches!(who, "author" | "follower") {
+            assert_eq!(
+                entity["quote"]["id"], original["id"],
+                "{who}: the reachable original nests"
+            );
+        } else {
+            assert_eq!(
+                entity["quote"],
+                Value::Null,
+                "{who}: the hidden original answers like no quote at all"
+            );
+        }
+        for key in ["quote_id", "quote_url", "quote_visible"] {
+            assert!(
+                entity["pleroma"].get(key).is_none(),
+                "{who}: no `{key}` key rides the pleroma block"
+            );
+        }
+    }
+}
+
+/// Quoting is not replying: the quote's own `context` answers two empty
+/// arms — for the author and for a stranger reading the same `public`
+/// quote — and the quoted original answers no descent into the post
+/// quoting it.
+#[tokio::test]
+async fn a_quote_hangs_from_no_thread_in_either_context() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let (original, quote) = quote_pair(&app, &world).await;
+
+    for (who, token) in [
+        ("the author", Some(world.author.token.as_str())),
+        ("the stranger", Some(world.stranger.token.as_str())),
+    ] {
+        let response = context(&app, token, &entity_id(&quote)).await;
+        common::assert_answer(&response, StatusCode::OK, &format!("{who} at the quote"));
+        let (ancestors, descendants) = context_arms(&response.json_value(), who);
+        assert!(ancestors.is_empty(), "{who}: a quote replies to nothing");
+        assert!(descendants.is_empty(), "{who}: nothing threaded the quote");
+    }
+
+    let below = context(&app, Some(&world.author.token), &entity_id(&original)).await;
+    common::assert_answer(&below, StatusCode::OK, "the author at the original");
+    let (_ancestors, descendants) = context_arms(&below.json_value(), "the author at the original");
+    assert!(
+        descendants.is_empty(),
+        "the original answers no descent into the post quoting it"
+    );
+}
+
+/// The create's `quote_id` gate is the show route's shared gate: quoting
+/// a `private` post the poster never reaches, quoting anything at all for
+/// the account the author blocked (rule 2 outranks the quote), and
+/// quoting a never-stored or a malformed id all answer the one shared
+/// 404 — byte-identical to the show route's refusal of an absent id, so
+/// a refused quote leaks no existence anywhere.
+#[tokio::test]
+async fn a_quote_of_an_invisible_original_is_the_shared_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let (original, quote) = quote_pair(&app, &world).await;
+
+    let bodies = [
+        json!({"status": "a stranger cannot", "quote_id": entity_id(&original)}),
+        json!({"status": "a block outranks", "quote_id": entity_id(&quote)}),
+        json!({"status": "nothing stored", "quote_id": UNKNOWN_ID}),
+        json!({"status": "not an id", "quote_id": "not-an-id"}),
+    ];
+    let tokens = [
+        world.stranger.token.as_str(),
+        world.blocker.token.as_str(),
+        world.stranger.token.as_str(),
+        world.stranger.token.as_str(),
+    ];
+    let mut refused = Vec::new();
+    for (token, body) in tokens.into_iter().zip(bodies) {
+        refused.push(create_probe(&app, token, body).await);
+    }
+    refused.push(
+        get(
+            &app,
+            Some(world.stranger.token.as_str()),
+            &format!("{STATUSES}/{UNKNOWN_ID}"),
+        )
+        .await,
+    );
+    common::assert_all_refused(
+        &refused,
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "every refused quote create and the show route's absent id",
+    );
+    let show = &refused[4];
+    for probe in &refused[..4] {
+        assert_eq!(
+            probe.body, show.body,
+            "a refused quote is indistinguishable from a missing status"
+        );
+    }
+}
+
+/// The refused creates wrote nothing: the quoted original still counts
+/// exactly its one accepted quote and the refused poster's own status
+/// page answers empty, so a probe of the gate costs no row and no count.
+#[tokio::test]
+async fn a_refused_quote_writes_no_row_and_moves_no_counter() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, world) = world(&pool).await;
+    let (original, _quote) = quote_pair(&app, &world).await;
+
+    for probe in [
+        json!({"status": "a stranger cannot", "quote_id": entity_id(&original)}),
+        json!({"status": "nothing stored", "quote_id": UNKNOWN_ID}),
+    ] {
+        let refused = create_probe(&app, &world.stranger.token, probe).await;
+        common::assert_answer(&refused, StatusCode::NOT_FOUND, "the refused quote create");
+    }
+
+    let shown = get(
+        &app,
+        Some(&world.author.token),
+        &format!("{STATUSES}/{}", entity_id(&original)),
+    )
+    .await;
+    assert_eq!(
+        shown.json_value()["pleroma"]["quotes_count"],
+        json!(1),
+        "the original still counts only the one accepted quote"
+    );
+
+    let stranger_page = get(
+        &app,
+        Some(&world.stranger.token),
+        &format!("{ACCOUNTS}/{}/statuses", world.stranger.user.id),
+    )
+    .await;
+    common::assert_answer(&stranger_page, StatusCode::OK, "the stranger's own page");
+    assert!(
+        page_ids(&stranger_page).is_empty(),
+        "the refused creates wrote no row"
+    );
+}
+
 /// Rule 2 in the matrix's own words: the account the author blocked reads
 /// the shared 404 of the author's public post *and* of a `direct` that
 /// @-addresses the blockee — the mention would have admitted them, the
@@ -835,12 +1092,16 @@ struct Thread {
 }
 
 /// The account sweep's exhibit: a [`Thread`] plus the kinds the filters key
-/// on — the attached warning post, the `#E2ETag` post, a plain post pinned
-/// to the profile, and the author's boost of `mentioned`'s own original.
+/// on — the `public` quote of the thread's root, the attached warning post,
+/// the `#E2ETag` post, a plain post pinned to the profile, and the author's
+/// boost of `mentioned`'s own original.
 #[derive(Debug)]
 struct Exhibit {
     /// The thread legs the `exclude_replies` and visibility filters ride.
     thread: Thread,
+    /// The `public` quote of [`Thread::root`] — an ordinary root row on
+    /// every page that answers the root.
+    quote: String,
     /// The one status carrying a media attachment (with a warning).
     media: String,
     /// The one status carrying `#E2ETag`.
@@ -950,12 +1211,21 @@ async fn post_thread(app: &Router, world: &World) -> Thread {
     }
 }
 
-/// Post the whole [`Exhibit`]: the [`Thread`] legs first, then the media
-/// post carrying a content warning, the hashtag post, the plain post
-/// pinned through the pin write, and the author's boost of `mentioned`'s
-/// public original — every one through the client API.
+/// Post the whole [`Exhibit`]: the [`Thread`] legs first, then the public
+/// quote of the root, the media post carrying a content warning, the
+/// hashtag post, the plain post pinned through the pin write, and the
+/// author's boost of `mentioned`'s public original — every one through
+/// the client API.
 async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
     let thread = post_thread(app, world).await;
+    let quote = entity_id(
+        &posted(
+            app,
+            &world.author.token,
+            json!({"status": "the root, quoted", "quote_id": &thread.root}),
+        )
+        .await,
+    );
     let attachment = uploaded(app, &world.author.token).await;
     let media = entity_id(
         &posted(
@@ -1003,6 +1273,7 @@ async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
     let boost = reblogged(app, &world.author.token, &original).await;
     Exhibit {
         thread,
+        quote,
         media,
         tagpost,
         extra,
@@ -1469,10 +1740,10 @@ async fn the_blocked_viewer_reads_no_context_of_the_thread() {
     );
 }
 
-/// The sweep's unfiltered page: the author reads all eight rows; the
+/// The sweep's unfiltered page: the author reads all nine rows; the
 /// accepted follower adds nothing over `public` but the `private` reply;
 /// the stranger, the muter and the anonymous caller reach exactly the
-/// five open rows; the blocked account reads the byte-identical empty
+/// six open rows; the blocked account reads the byte-identical empty
 /// page of a never-posting account (rules 3-6, again, by id set).
 #[tokio::test]
 async fn the_unfiltered_page_answers_every_viewer_exactly_what_visibility_allows() {
@@ -1487,6 +1758,7 @@ async fn the_unfiltered_page_answers_every_viewer_exactly_what_visibility_allows
         &thread.reply,
         &thread.deep,
         &thread.dm,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1495,6 +1767,7 @@ async fn the_unfiltered_page_answers_every_viewer_exactly_what_visibility_allows
     let follower = newest_first(&[
         &thread.root,
         &thread.reply,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1502,6 +1775,7 @@ async fn the_unfiltered_page_answers_every_viewer_exactly_what_visibility_allows
     ]);
     let open = newest_first(&[
         &thread.root,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1593,8 +1867,8 @@ async fn only_media_keeps_the_attached_post_alone() {
 /// `exclude_replies=true` drops the whole reply chain — the private reply
 /// and the direct reply-of-reply — while the conversation continuation
 /// stays: it threads by conversation id and answers no status, so it is no
-/// reply. The boost, the media post, the tag post, the pin and the root
-/// are all roots.
+/// reply. The boost, the media post, the tag post, the pin, the quote and
+/// the root are all roots.
 #[tokio::test]
 async fn exclude_replies_drops_the_chain_but_not_the_conversation_leg() {
     let db = common::test_db().await;
@@ -1606,6 +1880,7 @@ async fn exclude_replies_drops_the_chain_but_not_the_conversation_leg() {
     let author = newest_first(&[
         &thread.root,
         &thread.dm,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1613,6 +1888,7 @@ async fn exclude_replies_drops_the_chain_but_not_the_conversation_leg() {
     ]);
     let open = newest_first(&[
         &thread.root,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1649,6 +1925,7 @@ async fn exclude_reblogs_drops_the_boost() {
         &thread.reply,
         &thread.deep,
         &thread.dm,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1656,11 +1933,18 @@ async fn exclude_reblogs_drops_the_boost() {
     let follower = newest_first(&[
         &thread.root,
         &thread.reply,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
     ]);
-    let open = newest_first(&[&thread.root, &show.media, &show.tagpost, &show.extra]);
+    let open = newest_first(&[
+        &thread.root,
+        &show.quote,
+        &show.media,
+        &show.tagpost,
+        &show.extra,
+    ]);
     sweep_page(
         &app,
         &world,
@@ -1687,6 +1971,7 @@ async fn with_muted_returns_the_viewers_own_exclusions() {
         &thread.reply,
         &thread.deep,
         &thread.dm,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1695,6 +1980,7 @@ async fn with_muted_returns_the_viewers_own_exclusions() {
     let follower = newest_first(&[
         &thread.root,
         &thread.reply,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1702,6 +1988,7 @@ async fn with_muted_returns_the_viewers_own_exclusions() {
     ]);
     let open = newest_first(&[
         &thread.root,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1789,6 +2076,7 @@ async fn exclude_visibilities_drops_named_scopes() {
 
     let open = newest_first(&[
         &thread.root,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1799,6 +2087,7 @@ async fn exclude_visibilities_drops_named_scopes() {
         &thread.root,
         &thread.deep,
         &thread.dm,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1822,6 +2111,7 @@ async fn exclude_visibilities_drops_named_scopes() {
     let no_direct = newest_first(&[
         &thread.root,
         &thread.reply,
+        &show.quote,
         &show.media,
         &show.tagpost,
         &show.extra,
@@ -1872,8 +2162,8 @@ const NO_TOKEN: &str = "Invalid credentials";
 const NO_SCOPE: &str = "Insufficient permissions: read:statuses.";
 
 /// Every kind the timeline matrix posts, all authored by the author: the
-/// ten stand-alone kind posts of part 1's vocabulary plus part 2's
-/// [`Thread`], fourteen ids the five timeline routes are swept by. The
+/// eleven stand-alone kind posts of part 1's vocabulary plus part 2's
+/// [`Thread`], fifteen ids the five timeline routes are swept by. The
 /// [`Kinds::all`] set is what the author's home page and their own list's
 /// page must answer in full; every other viewer's page is a subset written
 /// out in the test that pins it.
@@ -1902,6 +2192,9 @@ struct Kinds {
     /// The `local` post @-mentioning `follower` — every local token's, no
     /// anonymous caller's.
     local: String,
+    /// The `public` quote of the plain `public` post — the create's
+    /// `quote_id` arm, riding every page that post rides.
+    quote: String,
     /// Part 2's reply chain: the public root, the private reply, the direct
     /// reply-of-reply and the direct conversation continuation.
     thread: Thread,
@@ -1923,6 +2216,7 @@ impl Kinds {
             &self.poll,
             &self.tagpost,
             &self.local,
+            &self.quote,
             &self.thread.root,
             &self.thread.reply,
             &self.thread.deep,
@@ -1951,8 +2245,9 @@ async fn posted_id(app: &Router, token: &str, body: Value) -> String {
 
 /// Post every timeline kind as the author through the client API: part 2's
 /// [`Thread`] first, then the six text kinds by stored visibility, the
-/// media, warning, poll and hashtag posts, and the `local` mention — the
-/// whole [`Kinds`] exhibit on one world.
+/// media, warning, poll and hashtag posts, the `local` mention, and the
+/// `public` quote of the plain `public` post through the create's
+/// `quote_id` arm — the whole [`Kinds`] exhibit on one world.
 async fn post_kinds(app: &Router, world: &World) -> Kinds {
     let thread = post_thread(app, world).await;
     let public = plain_kind(app, world, "public", "a public timeline word").await;
@@ -1994,6 +2289,12 @@ async fn post_kinds(app: &Router, world: &World) -> Kinds {
         json!({"status": "tagged #E2ETag for the timelines"}),
     )
     .await;
+    let quote = posted_id(
+        app,
+        &world.author.token,
+        json!({"status": "a timeline word, quoted", "quote_id": &public}),
+    )
+    .await;
     Kinds {
         public,
         unlisted,
@@ -2005,6 +2306,7 @@ async fn post_kinds(app: &Router, world: &World) -> Kinds {
         poll,
         tagpost,
         local,
+        quote,
         thread,
     }
 }
@@ -2121,6 +2423,7 @@ async fn the_home_timeline_answers_author_follower_and_the_blind_blocker() {
         &kinds.poll,
         &kinds.tagpost,
         &kinds.local,
+        &kinds.quote,
         &thread.root,
         &thread.reply,
     ]);
@@ -2180,6 +2483,7 @@ async fn the_home_timeline_goes_quiet_for_the_muter_and_returns_with_with_muted(
         &kinds.poll,
         &kinds.tagpost,
         &kinds.local,
+        &kinds.quote,
         &thread.root,
         &thread.reply,
     ]);
@@ -2212,6 +2516,7 @@ async fn the_public_timeline_narrows_the_kinds_to_public_rows_plus_local_for_tok
         &kinds.warning,
         &kinds.poll,
         &kinds.tagpost,
+        &kinds.quote,
         &kinds.thread.root,
     ]);
     page_shows(&app, None, PUBLIC, &open, "the anonymous caller").await;
@@ -2223,6 +2528,7 @@ async fn the_public_timeline_narrows_the_kinds_to_public_rows_plus_local_for_tok
         &kinds.poll,
         &kinds.tagpost,
         &kinds.local,
+        &kinds.quote,
         &kinds.thread.root,
     ]);
     page_shows(
@@ -2302,6 +2608,7 @@ async fn the_restriction_gate_closes_only_the_anonymous_public_reads() {
         &kinds.poll,
         &kinds.tagpost,
         &kinds.local,
+        &kinds.quote,
         &kinds.thread.root,
     ]);
     page_shows(

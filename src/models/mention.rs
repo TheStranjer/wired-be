@@ -270,8 +270,7 @@ mod tests {
     /// by id.
     fn mention_ids(map: &HashMap<Uuid, Vec<User>>, status_id: Uuid) -> Vec<Uuid> {
         map.get(&status_id)
-            .map(|users| users.iter().map(|user| user.id).collect())
-            .unwrap_or_default()
+            .map_or_default(|users| users.iter().map(|user| user.id).collect())
     }
 
     /// The table's rows as `(status_id, user_id, position)`, read straight
