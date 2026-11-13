@@ -267,6 +267,13 @@ pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
 /// follows are dropped at ingestion, unless a local user is mentioned or
 /// the status replies to a local one.
 pub const ACCEPT_UNSOLICITED_PUBLIC_VAR: &str = "ACCEPT_UNSOLICITED_PUBLIC";
+/// Environment variable holding how long a host whose delivery failed stays
+/// treated as reachable, in seconds, as `UNREACHABLE_GRACE_SECS`.
+///
+/// [`crate::models::instance::is_host_unreachable`] reads a host unreachable
+/// only when its `unreachable_since` mark is older than this span, so `0` —
+/// the default — makes any marked host unreachable at once.
+pub const UNREACHABLE_GRACE_SECS_VAR: &str = "UNREACHABLE_GRACE_SECS";
 /// Environment variable holding the comma-separated list of MRF policy
 /// names enabled without any `mrf` instance setting: the fallback of
 /// [`crate::federation::mrf`]'s configuration load.
@@ -595,6 +602,15 @@ pub const DEFAULT_FEDERATION_ENABLED: bool = true;
 /// anti-spam decision, Pleroma's
 /// `[:instance, :limit]`-style gate spelled as one switch.
 pub const DEFAULT_ACCEPT_UNSOLICITED_PUBLIC: bool = true;
+/// Unreachable-host grace period used when `UNREACHABLE_GRACE_SECS` is
+/// unset: `0`, so a host the delivery path has marked counts as unreachable
+/// with the mark itself.
+///
+/// Pleroma has no such window — its `Instances.filter_reachable/1` drops
+/// every host carrying `unreachable_since` — so `0` is the compatible
+/// reading; an operator raising it gives a host that refused one `POST` the
+/// grace of a retry cycle before the whole instance stops talking to it.
+pub const DEFAULT_UNREACHABLE_GRACE_SECS: usize = 0;
 /// Rate limiting used when `RATE_LIMITS_ENABLED` is unset: routes that
 /// mount a bucket throttle, like Pleroma's `RateLimiterPlug`.
 pub const DEFAULT_RATE_LIMITS_ENABLED: bool = true;
@@ -1243,6 +1259,17 @@ pub struct Config {
     /// (`private`, `direct` and the author's followers-addressed posts are
     /// never gated — they were aimed at somebody here).
     pub accept_unsolicited_public: Toggle,
+    /// How long after a host was marked unreachable it still counts as
+    /// reachable for outbound federation, in seconds, from
+    /// `UNREACHABLE_GRACE_SECS`; `0` (the default) makes any marked host
+    /// unreachable at once.
+    ///
+    /// [`crate::federation::publisher`] turns it into a span and passes it to
+    /// [`is_host_unreachable`](crate::models::instance::is_host_unreachable),
+    /// which keeps a host deliverable while its `unreachable_since` mark is
+    /// younger than this window — the back-off floor a single failed `POST`
+    /// should not be able to defederate a peer over.
+    pub unreachable_grace_secs: usize,
     /// The MRF policy names from `MRF_POLICIES` (comma list): the fallback
     /// chain configuration of [`crate::federation::mrf`], used whenever
     /// the `mrf` instance setting carries no `policies` array of its own.
@@ -1273,7 +1300,6 @@ impl Config {
         let (profile, limits, text, auth, exposure, mail) = wording_and_mail(&lookup, &base_url)?;
         let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(&lookup)?;
         let (http_allow_private_hosts, sign_fetches, authorized_fetch) = fetch_settings(&lookup)?;
-        let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(&lookup)?;
         let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(&lookup)?;
         Ok(Self {
             database_url,
@@ -1315,9 +1341,9 @@ impl Config {
             oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
             password_reset_ttl_secs: auth.password_reset_ttl_secs,
             allow_account_deletion: auth.allow_account_deletion,
-            mongooseim_enabled,
-            captcha_enabled,
-            healthcheck_enabled,
+            mongooseim_enabled: mongooseim_enabled(&lookup)?,
+            captcha_enabled: captcha_enabled(&lookup)?,
+            healthcheck_enabled: healthcheck_enabled(&lookup)?,
             registrations_open: exposure.registrations_open,
             invites_enabled: exposure.invites_enabled,
             registrations_approval_required: exposure.registrations_approval_required,
@@ -1346,6 +1372,7 @@ impl Config {
             authorized_fetch,
             federation_enabled: federation_enabled(&lookup)?,
             accept_unsolicited_public: accept_unsolicited_public(&lookup)?,
+            unreachable_grace_secs: unreachable_grace_secs(&lookup)?,
             mrf_policies: mrf_policies(&lookup),
             rate_limit: rate_limit_settings(&lookup)?,
         })
@@ -1498,6 +1525,7 @@ impl Config {
             authorized_fetch: Toggle::new(DEFAULT_AUTHORIZED_FETCH),
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
             accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
+            unreachable_grace_secs: DEFAULT_UNREACHABLE_GRACE_SECS,
             mrf_policies: Vec::new(),
             rate_limit: RateLimitConfig {
                 enabled: Toggle::new(false),
@@ -1888,25 +1916,48 @@ where
         .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"))
 }
 
-/// Reads the three feature toggles that gate the endpoints of
-/// [`crate::api::misc`]: the `MongooseIM` auth endpoints, the captcha
-/// provider and the healthcheck. Grouped because each is a plain
-/// default-or-parse and [`Config::from_lookup`] has a size budget
-/// (AGENTS.md); the tuple comes back in field order.
+/// Reads `MONGOOSEIM_ENABLED`, [`DEFAULT_MONGOOSEIM_ENABLED`] when unset:
+/// whether the `MongooseIM` auth endpoints are served. One-variable readers
+/// like this hang directly on [`Config::from_lookup`]'s literal, which is
+/// what keeps that function inside its size budget (AGENTS.md).
 ///
 /// # Errors
 ///
-/// Returns [`ConfigError::InvalidBoolean`] for whichever variable holds a
-/// value that is neither spelling.
-fn misc_toggles<F>(lookup: &F) -> Result<(Toggle, Toggle, Toggle), ConfigError>
+/// Returns [`ConfigError::InvalidBoolean`] when the variable holds a value
+/// that is neither spelling.
+fn mongooseim_enabled<F>(lookup: &F) -> Result<Toggle, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    Ok((
-        boolean(lookup, MONGOOSEIM_ENABLED_VAR, DEFAULT_MONGOOSEIM_ENABLED)?.into(),
-        boolean(lookup, CAPTCHA_ENABLED_VAR, DEFAULT_CAPTCHA_ENABLED)?.into(),
-        boolean(lookup, HEALTHCHECK_ENABLED_VAR, DEFAULT_HEALTHCHECK_ENABLED)?.into(),
-    ))
+    Ok(boolean(lookup, MONGOOSEIM_ENABLED_VAR, DEFAULT_MONGOOSEIM_ENABLED)?.into())
+}
+
+/// Reads `CAPTCHA_ENABLED`, [`DEFAULT_CAPTCHA_ENABLED`] when unset: whether a
+/// captcha provider is configured (see [`crate::api::misc`] for both).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when the variable holds a value
+/// that is neither spelling.
+fn captcha_enabled<F>(lookup: &F) -> Result<Toggle, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(boolean(lookup, CAPTCHA_ENABLED_VAR, DEFAULT_CAPTCHA_ENABLED)?.into())
+}
+
+/// Reads `HEALTHCHECK_ENABLED`, [`DEFAULT_HEALTHCHECK_ENABLED`] when unset:
+/// whether the healthcheck endpoint reports pool and liveness data.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when the variable holds a value
+/// that is neither spelling.
+fn healthcheck_enabled<F>(lookup: &F) -> Result<Toggle, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(boolean(lookup, HEALTHCHECK_ENABLED_VAR, DEFAULT_HEALTHCHECK_ENABLED)?.into())
 }
 
 /// What [`content_limits`] reads: the eleven plain numeric content limits,
@@ -2092,6 +2143,26 @@ where
         DEFAULT_ACCEPT_UNSOLICITED_PUBLIC,
     )?
     .into())
+}
+
+/// Reads `UNREACHABLE_GRACE_SECS`, [`DEFAULT_UNREACHABLE_GRACE_SECS`] when
+/// unset: how long a host marked unreachable stays deliverable, so
+/// [`crate::federation::publisher`] can hold a freshly marked peer in the
+/// target set for one more retry cycle.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when the variable holds a value
+/// that is not a whole number.
+fn unreachable_grace_secs<F>(lookup: &F) -> Result<usize, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    number(
+        lookup,
+        UNREACHABLE_GRACE_SECS_VAR,
+        DEFAULT_UNREACHABLE_GRACE_SECS,
+    )
 }
 
 /// Reads `MRF_POLICIES`: the comma-separated list of MRF policy names
@@ -2659,6 +2730,7 @@ impl fmt::Debug for Config {
         let max_remote_mention_lookups = &self.max_remote_mention_lookups;
         let max_scheduled_per_day = &self.max_scheduled_per_user_per_day;
         let fed = (self.federation_enabled, self.accept_unsolicited_public);
+        let tail = (self.mrf_policies.as_slice(), &self.rate_limit);
         let mut debug = f.debug_struct("Config");
         let debug = debug
             .field("database_url", &"<redacted>")
@@ -2728,14 +2800,13 @@ impl fmt::Debug for Config {
             .field("vapid", &self.vapid)
             .field("translation", &self.translation)
             .field("sign_fetches", &self.sign_fetches)
-            .field("authorized_fetch", &self.authorized_fetch)
-            .field("rate_limit", &self.rate_limit);
-        // The federation trio — the enabled toggle, the unsolicited-public
-        // toggle and the policy-name list — closes the chain from a
-        // helper: the documented split that holds `fmt` inside Clippy's
-        // line budget. The fields stay named in `fmt`'s body, as the
-        // binding's and the call's arguments.
-        debug_federation(debug, fed, self.mrf_policies.as_slice())
+            .field("authorized_fetch", &self.authorized_fetch);
+        // The tail of the document — the federation toggles, the
+        // unreachable-host grace period, the policy-name list and the rate
+        // limiter — closes from a helper: the documented split that holds
+        // `fmt` inside Clippy's line budget. `fed` and `tail` bind those same
+        // fields, which the helper then renders under their own names.
+        debug_federation(debug, fed, tail, self.unreachable_grace_secs)
     }
 }
 
@@ -2748,20 +2819,26 @@ fn hide_secret(config: &Config) -> Option<&'static str> {
     config.secret_key_base.as_ref().map(|_| "<redacted>")
 }
 
-/// Completes the [`Config`] `Debug` struct: the federation toggles — the
-/// enabled switch and the unsolicited-public gate — and the enabled MRF
-/// policy names, then the whole document. Factored out of the [`Debug`]
-/// impl above to hold that function's line count inside Clippy's budget.
+/// Completes the [`Config`] `Debug` document: the federation settings — the
+/// enabled switch, the unsolicited-public gate and the unreachable-host grace
+/// period — then the `MRF` policy names and the rate limiter settings, and the
+/// whole struct. Factored out of the [`Debug`] impl above to hold that
+/// function's line count inside Clippy's budget; the arguments carry the
+/// values in [`Config`] field order, so the document reads like the struct.
 fn debug_federation(
     debug: &mut fmt::DebugStruct<'_, '_>,
-    toggles: (Toggle, Toggle),
-    mrf_policies: &[String],
+    federation: (Toggle, Toggle),
+    tail: (&[String], &RateLimitConfig),
+    grace: usize,
 ) -> fmt::Result {
-    let (federation_enabled, accept_unsolicited_public) = toggles;
+    let (federation_enabled, accept_unsolicited_public) = federation;
+    let (mrf_policies, rate_limit) = tail;
     debug
         .field("federation_enabled", &federation_enabled)
         .field("accept_unsolicited_public", &accept_unsolicited_public)
+        .field("unreachable_grace_secs", &grace)
         .field("mrf_policies", &mrf_policies)
+        .field("rate_limit", rate_limit)
         .finish()
 }
 
@@ -4219,6 +4296,47 @@ mod tests {
         assert!(
             debug.contains("accept_unsolicited_public: Toggle(false)"),
             "the ingest gate toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The unreachable-host grace period: zero by default, so every marked
+    /// host counts, the environment overriding it, and `Debug` showing the
+    /// value.
+    #[test]
+    fn reads_custom_unreachable_grace_secs() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.unreachable_grace_secs, 0,
+            "default UNREACHABLE_GRACE_SECS"
+        );
+
+        let config = config_with(&[(UNREACHABLE_GRACE_SECS_VAR, "3600")]);
+        assert_eq!(
+            config.unreachable_grace_secs, 3600,
+            "custom UNREACHABLE_GRACE_SECS"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("unreachable_grace_secs: 3600"),
+            "the grace period is visible in Debug output: {debug}"
+        );
+    }
+
+    /// An empty `UNREACHABLE_GRACE_SECS` is the unset state, and anything
+    /// that is not a whole number refuses startup.
+    #[test]
+    fn invalid_unreachable_grace_secs_is_an_error() {
+        let blank = config_with(&[(UNREACHABLE_GRACE_SECS_VAR, "")]);
+        assert_eq!(
+            blank.unreachable_grace_secs, 0,
+            "an empty value is the default, not an error"
+        );
+
+        let err = try_config_with(&[(UNREACHABLE_GRACE_SECS_VAR, "an-hour")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNumber(UNREACHABLE_GRACE_SECS_VAR),
+            "error variant"
         );
     }
 

@@ -661,7 +661,7 @@ mod tests {
     fn an_unknown_policy_is_rejected_with_mastodon_wording() {
         for value in [json!(""), json!("everyone"), json!("List"), json!(" list")] {
             assert_eq!(
-                rejection(json!({"title": "x", "replies_policy": value.clone()})),
+                rejection(json!({"title": "x", "replies_policy": value})),
                 POLICY_INVALID,
                 "`{value}` is not a policy"
             );
@@ -672,7 +672,7 @@ mod tests {
     fn a_blank_or_absent_title_is_rejected_with_mastodon_wording() {
         for value in [json!(null), json!(""), json!("   ")] {
             assert_eq!(
-                rejection(json!({"title": value.clone()})),
+                rejection(json!({"title": value})),
                 TITLE_BLANK,
                 "`{value}` is a blank title"
             );

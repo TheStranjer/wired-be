@@ -1843,8 +1843,7 @@ async fn mention_links(pool: &PgPool, id: Uuid) -> Vec<Uuid> {
         .expect("the mention links read");
     links
         .get(&id)
-        .map(|users| users.iter().map(|account| account.id).collect())
-        .unwrap_or_default()
+        .map_or_default(|users| users.iter().map(|account| account.id).collect())
 }
 
 /// The names `status_hashtags` links to one status, as the hashtag model
@@ -1855,8 +1854,7 @@ async fn tag_links(pool: &PgPool, id: Uuid) -> Vec<String> {
         .expect("the tag links read");
     links
         .get(&id)
-        .map(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
-        .unwrap_or_default()
+        .map_or_default(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
 }
 
 /// A minimal post is created, answered as the [`Status`] entity and stored
