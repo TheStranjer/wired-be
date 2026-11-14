@@ -359,11 +359,15 @@ async fn cited_rule_ids(state: &AppState, values: Option<IdValues>) -> AppResult
 /// decision 11) — wire themselves in here, reading the filed report from
 /// `state`.
 ///
+/// The inbound federation `Flag` ([`crate::federation::handlers::misc`])
+/// runs the same hook on the report it files, so whatever a later ticket
+/// lands here fires for locally filed and forwarded reports alike.
+///
 /// Intentionally empty until then, like the blocks'
 /// [`after_block_changed`](crate::api::blocks::after_block_changed) hook:
 /// Pleroma's `CommonAPI.report` delivers its `Flag` inline through
 /// `ActivityPub.flag`, and this server's counterpart is a later ticket.
-const fn after_report_created(_state: &AppState, _report: &ReportRow) {}
+pub(crate) const fn after_report_created(_state: &AppState, _report: &ReportRow) {}
 
 #[cfg(test)]
 mod tests {

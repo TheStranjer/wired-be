@@ -84,6 +84,11 @@ ON CONFLICT (report_id, status_id) DO NOTHING";
 /// [`get`]: the one report behind a primary key.
 const GET_SQL: &str = "SELECT * FROM reports WHERE id = $1";
 
+/// [`set_ap_id`]: the mirror write of an inbound `Flag` — the filed report
+/// keeps its identity, only the activity id it stands for arrives. Unknown
+/// ids match no row and change nothing.
+const SET_AP_ID_SQL: &str = "UPDATE reports SET ap_id = $2 WHERE id = $1";
+
 /// [`statuses_for`]: the statuses one report cites, oldest status first —
 /// the `UUIDv7` text sorts in creation order (decision 4), which is the order
 /// Mastodon's `status_ids` array reads in. The join on `statuses` is what
@@ -372,6 +377,29 @@ pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Option<Report>> {
         .fetch_optional(pool)
         .await?;
     Ok(row)
+}
+
+/// Records `ap_id` as the `Flag` activity the stored report `id` stands
+/// for: the federation mirror's write (decision 6).
+///
+/// [`create`] leaves a remote reporter's row without an id because that id
+/// is the one the reporter's own instance minted, and this is where the
+/// inbound `Flag` activity's id lands on it. The unique `ap_id` index
+/// refuses a second report under one id, and an unknown `id` matches no
+/// row and changes nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding, an `ap_id` another row
+/// already carries) arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn set_ap_id(pool: &PgPool, id: Uuid, ap_id: &str) -> AppResult<()> {
+    sqlx::query(SET_AP_ID_SQL)
+        .bind(id)
+        .bind(ap_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
 }
 
 /// The ids of the live statuses `report_id` cites, oldest status first.
@@ -716,6 +744,46 @@ mod tests {
             stored(&pool, row.id).await.ap_id.is_none(),
             "and nothing was stored in its place"
         );
+    }
+
+    /// The federation mirror's write: [`set_ap_id`] lands the delivered
+    /// `Flag`'s id on the row [`create`] left bare, keeps the row itself,
+    /// and is refused by the unique index when the id already stands.
+    #[tokio::test]
+    async fn set_ap_id_lands_the_flag_id_on_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = remote_user(&pool, "carol").await;
+        let alice = local_user(&pool, "alice").await;
+        let bob = remote_user(&pool, "bob").await;
+        let row = seed(&pool, &carol, &alice).await;
+        let flag = "https://remote.example/activities/flag-42";
+
+        set_ap_id(&pool, row.id, flag).await.unwrap();
+        let mirrored = stored(&pool, row.id).await;
+        assert_eq!(mirrored.ap_id.as_deref(), Some(flag), "the id landed");
+        assert_eq!(mirrored.id, row.id, "the row itself did not move");
+        assert_eq!(
+            mirrored.reporter_id, row.reporter_id,
+            "and nothing else did"
+        );
+
+        set_ap_id(&pool, row.id, flag)
+            .await
+            .expect("restating the same id is no error");
+
+        let second = seed(&pool, &carol, &bob).await;
+        let taken = set_ap_id(&pool, second.id, flag)
+            .await
+            .expect_err("one Flag ids one report");
+        assert!(
+            matches!(taken, AppError::Database(_)),
+            "the unique index is the guard: {taken}"
+        );
+
+        set_ap_id(&pool, new_id(), "https://remote.example/activities/orphan")
+            .await
+            .expect("an unknown report id changes nothing and is no error");
     }
 
     /// Filing is not idempotent on the pair: a second report is a second row

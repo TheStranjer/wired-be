@@ -89,6 +89,9 @@ pub const TYPE_UPDATE: &str = "update";
 /// [`chat_message_id`](Notification::chat_message_id) row, which the entity
 /// renders under `chat_message` (Pleroma's `put_chat_message`).
 pub const TYPE_CHAT_MENTION: &str = "pleroma:chat_mention";
+/// The move type: an account the recipient follows moved to a new actor
+/// (Mastodon's `move`). Ungrouped.
+pub const TYPE_MOVE: &str = "move";
 
 /// The types the grouped API merges across notifications.
 ///
