@@ -925,12 +925,16 @@ async fn owned_chat(state: &AppState, user_id: Uuid, id: &str) -> AppResult<chat
 /// message (see the entity's module docs for what each part replaces in
 /// Pleroma's `ChatView.render("show.json")`).
 ///
+/// [`crate::api::streaming`] renders a hinted chat through this same
+/// builder, so a socket's `pleroma:chat_update` entity and the endpoint's
+/// are built the same way.
+///
 /// # Errors
 ///
 /// [`AppError::NotFound`] if the recipient row is gone (the foreign key makes
 /// that unreachable while the chat exists); database failures arrive through
 /// `?` as [`AppError::Database`].
-async fn chat_entity(state: &AppState, row: &chat::Chat) -> AppResult<Chat> {
+pub(crate) async fn chat_entity(state: &AppState, row: &chat::Chat) -> AppResult<Chat> {
     let recipient = chat_recipient(state, row).await?;
     let unread = chat::unread_count(&state.db, row.id).await?;
     let last_message = newest_message(state, row.id).await?;

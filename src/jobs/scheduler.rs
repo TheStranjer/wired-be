@@ -213,6 +213,12 @@ pub fn bucket(now: DateTime<Utc>, every: Duration) -> i64 {
 /// makes that at most one row per job per period, from any number of app
 /// instances. Enqueue failures are logged, never fatal: the next tick
 /// retries the same period because no row claimed the key.
+///
+/// The shutdown is consulted even while a tick is in flight: one slow
+/// database round trip of an enqueue must not deafen the scheduler to the
+/// stop signal, so a shutdown that resolves mid-tick ends the loop at
+/// once — a half-issued period is exactly what the next tick's retry (or
+/// the next app instance) is for.
 pub async fn run<F>(pool: PgPool, jobs: Vec<PeriodicJob>, shutdown: F)
 where
     F: Future<Output = ()>,
@@ -232,7 +238,13 @@ where
         tokio::select! {
             biased;
             () = &mut shutdown => ticking = false,
-            _ = ticker.tick() => tick(&pool, &jobs, clock_now(wall, started)).await,
+            _ = ticker.tick() => {
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => ticking = false,
+                    () = tick(&pool, &jobs, clock_now(wall, started)) => {}
+                }
+            }
         }
     }
     debug!("periodic job scheduler stopped");
@@ -314,6 +326,22 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// Steps the hand-cranked clock a second at a time until two reads of
+    /// `kind`'s row count agree: the settled count after a scheduler run
+    /// whose last shutdown may have abandoned an in-flight enqueue whose
+    /// statement the server still lands.
+    async fn settle_count(pool: &PgPool, kind: &str, mut last: i64) -> i64 {
+        for _settle in 0..8 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let next = count_jobs(pool, kind).await;
+            if next == last {
+                break;
+            }
+            last = next;
+        }
+        last
     }
 
     #[test]
@@ -518,14 +546,23 @@ mod tests {
         // later, so two periods turn over in ~500 steps. The budget is far
         // larger because one step is one round trip and a busy Postgres
         // needs more of them; the loop stops the run itself as soon as the
-        // second row has landed, so a third tick at 1000 steps is out of
-        // reach either way.
-        drive_clock(&pool, 2_500, |rows| rows >= 2).await;
+        // second row has landed, so a third tick is out of reach either
+        // way. And `run` hears the oneshot even with a tick handler in
+        // flight — its handler selects on the same shutdown — so the
+        // scheduler stops on the signal rather than on a race against the
+        // next tick boundary.
+        let rows = drive_clock(&pool, 2_500, |rows| rows >= 2).await;
         let _sent = stop_tx.send(());
-        drive_clock(&pool, 300, |_rows| scheduler.is_finished()).await;
+        let _rows = drive_clock(&pool, 300, |_rows| scheduler.is_finished()).await;
         scheduler
             .await
             .expect("the scheduler task ran to completion");
+
+        // A stopped handler's statement can already be at the server, so
+        // one straggler period may still land behind the shutdown; the
+        // assertions wait for the count to settle (two reads in a row
+        // that agree) rather than pinning it to an instant's snapshot.
+        let settled = settle_count(&pool, "heartbeat", rows).await;
 
         let keys = keys_for(&pool, "heartbeat").await;
         let buckets = keys
@@ -556,11 +593,13 @@ mod tests {
 
         // `run` returned when the shutdown resolved; 60 more seconds of
         // virtual time (six tick periods) prove nothing keeps ticking
-        // behind it.
+        // behind it: a live scheduler adds rows on every boundary and the
+        // re-settle outgrows the settled count, while the one straggler a
+        // stopped handler could still land is already absorbed by it.
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(
-            keys_for(&pool, "heartbeat").await,
-            keys,
+            settle_count(&pool, "heartbeat", settled).await,
+            settled,
             "the scheduler stopped with its shutdown"
         );
 
@@ -581,13 +620,15 @@ mod tests {
     /// Steps the paused clock 20 ms at a time until `ready` is satisfied by
     /// the `heartbeat` row count of that step, and fails the test past
     /// `budget` steps: the scheduler has to turn its schedule over (and has
-    /// to notice its shutdown) without the suite waiting on it.
+    /// to notice its shutdown) without the suite waiting on it. The count
+    /// that satisfied `ready` is the answer — the seed a later
+    /// [`settle_count`] waits out.
     ///
     /// The round trip is the point of a step, not the number it reads: a
     /// task parked on Postgres is what lets the runtime drive the
     /// scheduler's own inserts to completion while the virtual clock stands
     /// still between steps.
-    async fn drive_clock<R>(pool: &PgPool, budget: u32, ready: R)
+    async fn drive_clock<R>(pool: &PgPool, budget: u32, ready: R) -> i64
     where
         R: Fn(i64) -> bool,
     {
@@ -596,7 +637,7 @@ mod tests {
         loop {
             let rows = count_jobs(pool, "heartbeat").await;
             if ready(rows) {
-                return;
+                return rows;
             }
             assert!(
                 steps < budget,

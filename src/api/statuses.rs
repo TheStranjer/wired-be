@@ -60,10 +60,11 @@
 //! `draft.preview?`: every check and the full render run, and the entity a
 //! create would have answered is built in memory without a write or a
 //! hook). A post that passes answers **200** with the [`Status`] entity
-//! rendered for its author. Everything a fresh status still owes the
-//! streaming sockets, the notifications and the wider federation hangs off
-//! that service's single documented hook, so this file never grows a second
-//! write path. The body may also carry Pleroma's `expires_in` (top-level
+//! rendered for its author. What a fresh status still owes the wider
+//! federation — and every other post-write telling — hangs off that
+//! service's single documented hook, where the mention notifications and
+//! the streaming `update` push already run, so this file never grows a
+//! second write path. The body may also carry Pleroma's `expires_in` (top-level
 //! only, whole seconds): the service turns an accepted span into the row's
 //! `expires_at`, and a post wearing one schedules its own delete — a
 //! [`statuses.expire`](crate::jobs::statuses::KIND_EXPIRE) job due at that
@@ -404,8 +405,9 @@
 //! service's `after_status_deleted` hook
 //! ([`crate::services::delete_status`] — the same landing point the
 //! expiration jobs run through), where the notification ticket has wired
-//! the cleanup that takes the deleted status's notifications with it. The
-//! `status_deleted` stream push still waits for its ticket there.
+//! the cleanup that takes the deleted status's notifications with it and
+//! the streaming ticket pushes the `delete` to exactly the timelines that
+//! carried the post.
 //!
 //! # The edit, its history and its source
 //!
@@ -436,8 +438,8 @@
 //! author sees the edited post, `edited_at` set. The route's
 //! `after_status_edited` hook already lands
 //! [`crate::services::notify`]'s `update` telling of the post's local
-//! boosters and the `Update` activity that re-drafts the post for
-//! everyone else; the `status.update` stream push awaits the same point.
+//! boosters, the `Update` activity that re-drafts the post for everyone
+//! else, and the `status.update` stream push.
 //!
 //! `GET /api/v1/statuses/{id}/history` is Pleroma's `show_history`:
 //! optional auth (`read:statuses` on a presented user token), the same
@@ -523,7 +525,7 @@ use crate::{
         notify,
         render_status::{render_status, render_statuses},
         rich_media::stored_card_json,
-        schedule_status,
+        schedule_status, streaming,
         translate::Translator,
     },
     state::AppState,
@@ -2566,9 +2568,12 @@ pub(crate) async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, p
 /// account still boosting the edited post — Pleroma's `Update` arm of
 /// `get_potential_receiver_ap_ids`, the object's local `Announce` actors
 /// minus the author (`lib/pleroma/notification.ex`) — is landed here from
-/// [`notify::on_status_edited`], and the federated re-draft of the post
+/// [`notify::on_status_edited`], the federated re-draft of the post
 /// itself — the `Update` activity carrying the new note, addressed as the
-/// status is — from [`federation_out::after_status_edited`].
+/// status is — from [`federation_out::after_status_edited`], and the
+/// `status.update` stream push — Pleroma's `CommonAPI.update` tail
+/// through its `Streamer`, redrawing the post on every socket that
+/// carried it — from [`streaming::status_edited`].
 ///
 /// The federated edit handler runs it too
 /// ([`crate::federation::handlers::note`]): an inbound `Update` of a
@@ -2577,21 +2582,23 @@ pub(crate) async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, p
 /// local door's alone: a mirrored row belongs to its origin, and
 /// [`federation_out::after_status_edited`] says nothing for one.
 ///
-/// The one consumer still waiting wires itself in here: the streaming
-/// ticket that pushes the edited status to `status.update`; it ships the
-/// re-rendered entity, so it will grow this one call's signature when it
-/// lands.
-///
 /// `row` is the pre-edit stored row: the id every consumer names — the
 /// write keeps it — and the author whose boosters the telling reads off
 /// the live reblog rows. The federation arm needs no field of this
 /// snapshot but that id: it re-reads the row the write left behind, since
-/// the document it announces is the post as edited.
+/// the document it announces is the post as edited. The stream push needs
+/// only the fields an edit never moves — author, visibility, thread,
+/// locality, the reblog link a boost alone carries — and reads the post's
+/// live mentions, hashtags and attachments through the target
+/// computation, so the answer is the row the write stored however the
+/// body rewrote the text.
 ///
 /// [`notify::on_status_edited`]: crate::services::notify::on_status_edited
+/// [`streaming::status_edited`]: crate::services::streaming::status_edited
 pub(crate) async fn after_status_edited(state: &AppState, row: &StatusRow) {
     notify::on_status_edited(state, row).await;
     federation_out::after_status_edited(state, row).await;
+    streaming::status_edited(state, row).await;
 }
 
 #[cfg(test)]

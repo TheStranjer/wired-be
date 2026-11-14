@@ -59,6 +59,18 @@
 //! [`scheduled_statuses`](crate::jobs::scheduled_statuses) queue, so the
 //! endpoint's schedule arm never re-decides any of it.
 //!
+//! [`streaming`] is the status side of the streaming bus: for a stored
+//! status and its author it computes the hub stream names the event would
+//! ride (`public`, `user:<uuid>`, `list:<uuid>`, `hashtag:<tag>`, …), the
+//! [`Audience`](crate::streaming::hub::Audience) that gates its delivery
+//! and the local-only flag, so the publishing slice that hands the event to
+//! [`Hub::publish`](crate::streaming::hub::Hub::publish) never re-decides
+//! who may see what; and it is that publishing slice itself — the
+//! [`status_created`](crate::services::streaming::status_created),
+//! [`status_deleted`](crate::services::streaming::status_deleted) and
+//! [`status_edited`](crate::services::streaming::status_edited) emitters
+//! the three status hooks call.
+//!
 //! [`vapid`] is the instance's Web Push identity: the ES256 key pair kept in
 //! `instance_secrets`, generated on first use and overridable through the
 //! `VAPID_*` settings, of which the endpoints serve only the public half.
@@ -101,6 +113,7 @@ pub mod notify;
 pub mod render_status;
 pub mod rich_media;
 pub mod schedule_status;
+pub mod streaming;
 pub mod timeline;
 pub mod translate;
 pub mod vapid;

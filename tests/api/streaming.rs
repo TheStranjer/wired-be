@@ -19,7 +19,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use axum::{http::StatusCode, response::Response};
 use futures_util::{SinkExt as _, StreamExt as _};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::{
     net::TcpStream,
@@ -35,9 +35,14 @@ use wired_be::{
     api::streaming::MAX_SUBSCRIPTIONS,
     config::Config,
     models::{
-        block, conversation_mute, domain_block, list,
+        block, conversation_mute, domain_block, follow, list,
         mute::{self, MuteOptions},
+        status,
         user::{NewUser, User, insert},
+    },
+    services::{
+        create_status::{self, CreateStatusParams},
+        delete_status,
     },
     state::AppState,
     streaming::hub::{Audience, StreamEvent},
@@ -287,12 +292,23 @@ fn event_on(streams: &[&str], marker: &str, audience: Audience) -> StreamEvent {
         event: "update".to_owned(),
         payload: Some(format!(r#"{{"id":"{marker}"}}"#)),
         audience,
+        render: None,
+        local_only: false,
     }
 }
 
 /// A public `update` whose entity carries `marker` as its id.
 fn public_update(marker: &str) -> StreamEvent {
     event_on(&["public"], marker, Audience::Public)
+}
+
+/// An `Everyone` `update` on `streams` flagged `local_only`, whose entity
+/// carries `marker` as its id: for authenticated local viewers only.
+fn local_only_update(streams: &[&str], marker: &str) -> StreamEvent {
+    StreamEvent {
+        local_only: true,
+        ..event_on(streams, marker, Audience::Everyone)
+    }
 }
 
 /// A public `update` whose entity is authored by `author` (as `acct`, which
@@ -428,33 +444,39 @@ async fn an_invalid_token_rejects_the_upgrade() {
     );
 }
 
-/// A token in the query string authenticates the socket, and its `user` stream
-/// carries only the events addressed to that user.
+/// A token in the query string authenticates the socket, its bare
+/// `stream=user` subscription is held under the canonical `user:<reader uuid>`
+/// hub name, and it receives the event whose streams name `user:<its uuid>`
+/// while staying silent about one naming another user's `user:<uuid>`.
 #[tokio::test]
 async fn token_in_the_query_string_opens_the_user_stream() {
     let server = Server::start().await;
     let reader = account(server.pool(), "query-reader").await;
     let other = account(server.pool(), "query-other").await;
+    let own_stream = format!("user:{}", reader.id);
+    let other_stream = format!("user:{}", other.id);
     let secret = token(server.pool(), &reader, "read:statuses").await;
     let mut client = open(&server.url(&format!("stream=user&access_token={secret}"))).await;
 
     server.publish(event_on(
-        &["user"],
+        &[other_stream.as_str()],
         "for-other",
         Audience::Users(vec![other.id]),
     ));
     server.publish(event_on(
-        &["user"],
+        &[own_stream.as_str()],
         "for-me",
         Audience::Users(vec![reader.id]),
     ));
 
     let frames = read_until(&mut client, "for-me").await;
-    assert_absent(&frames, &["for-other"]);
+    assert_absent(&frames, &["for-other", &other_stream]);
     assert_eq!(
         frames.last().expect("the control frame"),
-        r#"{"stream":["user"],"event":"update","payload":"{\"id\":\"for-me\"}"}"#,
-        "the socket's own event arrives on its own stream"
+        &format!(
+            r#"{{"stream":["{own_stream}"],"event":"update","payload":"{{\"id\":\"for-me\"}}"}}"#
+        ),
+        "the socket's own event arrives on its uuid-named stream"
     );
 }
 
@@ -481,8 +503,9 @@ async fn token_in_the_subprotocol_is_echoed_back() {
         "the offered protocol comes back as the chosen one"
     );
 
+    let own_stream = format!("user:{}", reader.id);
     server.publish(event_on(
-        &["user"],
+        &[own_stream.as_str()],
         "via-subprotocol",
         Audience::Users(vec![reader.id]),
     ));
@@ -645,13 +668,15 @@ async fn an_anonymous_socket_authenticates_without_a_reconnect() {
     .await;
     send(&mut client, r#"{"type":"subscribe","stream":"user"}"#).await;
     settled(&mut client).await;
+    let own_stream = format!("user:{}", reader.id);
+    let other_stream = format!("user:{}", other.id);
     server.publish(event_on(
-        &["user"],
+        &[other_stream.as_str()],
         "for-other",
         Audience::Users(vec![other.id]),
     ));
     server.publish(event_on(
-        &["user"],
+        &[own_stream.as_str()],
         "after-auth",
         Audience::Users(vec![reader.id]),
     ));
@@ -774,6 +799,35 @@ async fn audience_decides_between_an_anonymous_and_an_authenticated_socket() {
     );
     let alone = read_until(&mut anonymous, "for-anyone").await;
     assert_absent(&alone, &["for-everyone"]);
+}
+
+/// A `local_only` event is for local viewers: an anonymous socket on the same
+/// stream skips it however its audience and streams match, and the control
+/// event published after it arrives as usual. An authenticated socket sees
+/// both.
+#[tokio::test]
+async fn a_local_only_event_never_reaches_an_anonymous_socket() {
+    let server = Server::start().await;
+    let reader = account(server.pool(), "local-gate-reader").await;
+    let secret = token(server.pool(), &reader, "read").await;
+    let mut anonymous = open(&server.url(PUBLIC)).await;
+    let mut authenticated = open(&server.url(&format!("{PUBLIC}&access_token={secret}"))).await;
+
+    server.publish(local_only_update(&["public"], "local-for-everyone"));
+    server.publish(public_update("local-control"));
+
+    let alone = read_until(&mut anonymous, "local-control").await;
+    assert_absent(&alone, &["local-for-everyone"]);
+    assert!(
+        alone.iter().any(|frame| frame.contains("local-control")),
+        "the anonymous socket receives the control event after it: {alone:?}"
+    );
+    let both = read_until(&mut authenticated, "local-control").await;
+    assert!(
+        both.iter()
+            .any(|frame| frame.contains("local-for-everyone")),
+        "an authenticated socket is a local viewer and does see the event: {both:?}"
+    );
 }
 
 /// Every heartbeat period the server pings the socket, and the client's
@@ -911,4 +965,185 @@ async fn read_raw_frame(stream: &mut TcpStream) -> Option<u8> {
         }
     }
     Some(opcode)
+}
+
+/// The whole lifecycle over a real socket: creating a public status through
+/// [`create_status`] publishes `update` with the rendered entity, and an
+/// anonymous socket on `public` and a follower's socket on `user` both
+/// receive it; deleting it publishes `delete` and both sockets see the
+/// withdrawal.
+#[tokio::test]
+async fn a_created_public_status_reaches_public_and_home_then_deletes() {
+    let server = Server::start().await;
+    let author = account(server.pool(), "lifecycle-author").await;
+    let follower = account(server.pool(), "lifecycle-follower").await;
+    let relationship = follow::follow(
+        server.pool(),
+        &server.state.config.base_url,
+        &follower,
+        &author,
+    )
+    .await
+    .expect("the follow fixture writes");
+    assert_eq!(
+        relationship.state,
+        follow::FollowState::Accepted,
+        "the unlocked local target grants the follow on the spot"
+    );
+    let secret = token(server.pool(), &follower, "read").await;
+
+    let mut anon = open(&server.url(PUBLIC)).await;
+    let mut home = open(&server.url(&format!("stream=user&access_token={secret}"))).await;
+    settled(&mut anon).await;
+    settled(&mut home).await;
+
+    let entity =
+        create_status::create_status(&server.state, &author, None, create_body(LIFECYCLE_TEXT))
+            .await
+            .expect("the create service runs");
+
+    let anon_frame = next_json(&mut anon).await;
+    assert_update_carries(&anon_frame, &entity.id);
+    assert!(
+        streams_of(&anon_frame).contains(&"public"),
+        "the anonymous socket's public stream carries it: {anon_frame}"
+    );
+
+    let home_stream = format!("user:{}", follower.id);
+    let home_frame = next_json(&mut home).await;
+    assert_update_carries(&home_frame, &entity.id);
+    assert!(
+        streams_of(&home_frame).contains(&home_stream.as_str()),
+        "the follower's home stream carries it: {home_frame}"
+    );
+
+    let id = Uuid::parse_str(&entity.id).expect("the entity id is a uuid");
+    let row = status::get_by_id(server.pool(), id)
+        .await
+        .expect("the row reads")
+        .expect("the create stored it");
+    assert!(
+        delete_status::delete_status(&server.state, &row)
+            .await
+            .expect("the delete service runs"),
+        "the row was live"
+    );
+
+    for (frame, who) in [
+        (next_json(&mut anon).await, "anonymous"),
+        (next_json(&mut home).await, "follower"),
+    ] {
+        assert_eq!(frame["event"], "delete", "the {who} socket sees the delete");
+        assert_eq!(
+            frame["payload"].as_str(),
+            Some(entity.id.as_str()),
+            "the {who} socket's delete payload is the status id"
+        );
+    }
+}
+
+/// The send-time render over a real socket: creating a public status
+/// publishes its `RenderSpec::Status` hint, and each connection renders
+/// the entity for its OWN viewer at send time. A plain subscriber on
+/// `public` receives the full entity JSON in the frame; a subscriber who
+/// blocked the author receives nothing of it — only the control event
+/// published after, which proves its socket is open and streaming.
+#[tokio::test]
+async fn a_created_status_renders_for_one_subscriber_and_skips_a_blocker() {
+    let server = Server::start().await;
+    let author = account(server.pool(), "render-author").await;
+    let subscriber = account(server.pool(), "render-subscriber").await;
+    let blocker = account(server.pool(), "render-blocker").await;
+    let _blocked = block::block(
+        server.pool(),
+        &server.state.config.base_url,
+        &blocker,
+        &author,
+    )
+    .await
+    .expect("the block fixture writes");
+    let seen_token = token(server.pool(), &subscriber, "read").await;
+    let blind_token = token(server.pool(), &blocker, "read").await;
+    let mut watcher = open(&server.url(&format!("stream=public&access_token={seen_token}"))).await;
+    let mut skipped = open(&server.url(&format!("stream=public&access_token={blind_token}"))).await;
+    settled(&mut watcher).await;
+    settled(&mut skipped).await;
+
+    let entity =
+        create_status::create_status(&server.state, &author, None, create_body(LIFECYCLE_TEXT))
+            .await
+            .expect("the create service runs");
+
+    let frame = next_json(&mut watcher).await;
+    assert_update_carries(&frame, &entity.id);
+    let payload: Value = serde_json::from_str(
+        frame["payload"]
+            .as_str()
+            .expect("the update carries a payload string"),
+    )
+    .expect("the payload is the entity JSON");
+    assert_eq!(
+        payload["account"]["id"],
+        json!(author.id.to_string()),
+        "the rendered entity carries the author's account"
+    );
+
+    server.publish(public_update("render-control"));
+    let frames = read_until(&mut skipped, "render-control").await;
+    assert_absent(&frames, &[&entity.id, LIFECYCLE_TEXT]);
+    assert!(
+        frames.iter().any(|line| line.contains("render-control")),
+        "the blocker's socket goes on streaming after the dropped hint: {frames:?}"
+    );
+}
+
+/// The next text frame, parsed as Mastodon's JSON envelope.
+async fn next_json(client: &mut Client) -> Value {
+    serde_json::from_str(&next_text(client).await).expect("every streaming frame is JSON")
+}
+
+/// The frame's `stream` array, as strings.
+fn streams_of(frame: &Value) -> Vec<&str> {
+    frame["stream"]
+        .as_array()
+        .expect("the envelope names its streams")
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<&str>>>()
+        .expect("every stream name is a string")
+}
+
+/// A create body for a public status of `text`, through the service's own
+/// parameters type.
+fn create_body(text: &str) -> CreateStatusParams {
+    serde_json::from_value(json!({ "status": text, "visibility": "public" }))
+        .expect("the test body is a create body")
+}
+
+/// The post the lifecycle test creates, asserted in the streamed entity.
+const LIFECYCLE_TEXT: &str = "a status that streams live";
+
+/// Asserts an `update` frame is Mastodon's arrival event for the status
+/// `id`, its payload the rendered public-view entity with the lifecycle
+/// text in its content.
+fn assert_update_carries(frame: &Value, id: &str) {
+    assert_eq!(frame["event"], "update", "the socket sees an update");
+    let payload = frame["payload"]
+        .as_str()
+        .expect("the update carries a payload string");
+    let entity: Value = serde_json::from_str(payload).expect("the payload is the entity JSON");
+    assert_eq!(
+        entity["id"], id,
+        "the payload is the created status's rendered entity"
+    );
+    assert_eq!(
+        entity["visibility"], "public",
+        "rendered as the socket's reader sees it"
+    );
+    assert!(
+        entity["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(LIFECYCLE_TEXT)),
+        "the content rides the entity: {entity}"
+    );
 }

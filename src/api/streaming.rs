@@ -12,11 +12,23 @@
 //! - **a reader of the hub**. Every connection takes a
 //!   [`Hub::subscribe`](crate::streaming::hub::Hub::subscribe) receiver and
 //!   forwards the events it may see as Mastodon's text frame,
-//!   `{"stream":["user"],"event":"update","payload":"<json string>"}`. An
-//!   event passes when [`stream_matches`] finds one of the connection's
-//!   subscriptions on it, its [`Audience`] covers the socket's reader (a
-//!   `Users` event reaches those users only) and the reader's own `Filters`
-//!   say nothing against it.
+//!   `{"stream":["user:<reader uuid>"],"event":"update","payload":"<json
+//!   string>"}`. An event passes when [`stream_matches`] finds one of the
+//!   connection's subscriptions on it, its [`Audience`] covers the socket's
+//!   reader (a `Users` event reaches those users only), a `local_only` event
+//!   has a reader at all — an anonymous socket never sees one — and the
+//!   reader's own `Filters` say nothing against it. An event that carries a
+//!   [`render`](crate::streaming::hub::StreamEvent::render) hint instead of
+//!   a payload has its entity rendered for this connection's OWN viewer at
+//!   send time — one hub event, each socket its own view, the way Pleroma's
+//!   `Streamer` renders in the socket process: a hinted status through
+//!   [`render_status`], a hinted notification through the notifications
+//!   endpoint's builder, a hinted chat through the chats endpoint's builder.
+//!   A hint the socket cannot answer for its reader — no row, not visible,
+//!   a deactivated actor, or text one of the reader's irreversible word
+//!   filters matches — drops the event rather than sending an
+//!   entity-less frame. The socket's viewer is its authenticated [`User`]
+//!   row, loaded once when the socket opens or authenticates.
 //! - **its own subscription set**, opened at the handshake by `stream` (plus
 //!   `tag` / `list` / `instance`) and changed afterwards by the `subscribe`
 //!   and `unsubscribe` frames, capped at [`MAX_SUBSCRIPTIONS`].
@@ -66,12 +78,18 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    api::{chats, notifications},
     auth,
     error::{AppError, AppResult},
-    models::{block, conversation_mute, domain_block, hashtag, list, mute},
+    models::{
+        block, chat, conversation_mute, domain_block, filter, hashtag, list, mute, notification,
+        status, status_visibility,
+        user::{self, User},
+    },
     oauth::scopes::{READ, READ_LISTS, READ_NOTIFICATIONS, READ_STATUSES, Scopes},
+    services::render_status::render_status,
     state::AppState,
-    streaming::hub::{Audience, StreamEvent, stream_matches},
+    streaming::hub::{Audience, RenderSpec, StreamEvent, stream_matches},
 };
 
 /// The heartbeat period of one streaming socket: Pleroma's `@tick`
@@ -134,13 +152,17 @@ const PUBLIC_REMOTE_MEDIA: &str = "public:remote:media";
 const HASHTAG: &str = "hashtag";
 /// One hashtag's local statuses (`tag` names it).
 const HASHTAG_LOCAL: &str = "hashtag:local";
-/// The reader's own timeline.
+/// The reader's own timeline; the socket holds it as the hub's
+/// `user:<reader uuid>`.
 const USER: &str = "user";
-/// The reader's notifications.
+/// The reader's notifications; the socket holds it as the hub's
+/// `user:notification:<reader uuid>`.
 const USER_NOTIFICATION: &str = "user:notification";
-/// The reader's chats (Pleroma's `user:pleroma_chat`).
+/// The reader's chats (Pleroma's `user:pleroma_chat`); the socket holds it
+/// as the hub's `user:pleroma_chat:<reader uuid>`.
 const USER_PLEROMA_CHAT: &str = "user:pleroma_chat";
-/// The reader's direct messages.
+/// The reader's direct messages; the socket holds it as the hub's
+/// `direct:<reader uuid>`.
 const DIRECT: &str = "direct";
 /// One of the reader's lists (`list` names it).
 const LIST: &str = "list";
@@ -289,9 +311,11 @@ struct Connection {
     /// The shared state: the hub to read, and the pool the reader's
     /// suppression sets are (re-)read from.
     state: AppState,
-    /// The id of the user the socket authenticated as; `None` while it
-    /// watches public streams only.
-    reader: Option<Uuid>,
+    /// The `users` row of the user the socket authenticated as, read ONCE
+    /// when the socket opens (or authenticates later) and held for its
+    /// life: every send-time render is this viewer's own view; `None`
+    /// while the socket watches public streams only.
+    reader: Option<Arc<User>>,
     /// The scopes that user's token granted — empty for an anonymous socket,
     /// which is what turns every private stream into a
     /// [`Refusal::Unauthorized`] subscription.
@@ -320,14 +344,9 @@ impl Connection {
     async fn new(state: AppState, credential: Option<auth::AuthContext>) -> AppResult<Self> {
         let (reader, scopes) = credential.map_or_else(
             || (None, Scopes::parse("")),
-            |found| {
-                (
-                    found.user.map(|reader| reader.id),
-                    Scopes::parse(&found.token.scopes),
-                )
-            },
+            |found| (found.user.map(Arc::new), Scopes::parse(&found.token.scopes)),
         );
-        let filters = Filters::load(&state.db, reader).await?;
+        let filters = Filters::load(&state.db, reader.as_ref().map(|user| user.id)).await?;
         let now = tokio::time::Instant::now();
         let ping = heartbeat_period(&state);
         Ok(Self {
@@ -432,7 +451,7 @@ impl Connection {
         match auth::credential(&self.state, raw).await {
             Ok(Some(found)) => match found.user {
                 Some(reader) => {
-                    self.adopt(reader.id, &found.token.scopes).await;
+                    self.adopt(reader, &found.token.scopes).await;
                     Vec::new()
                 }
                 None => refused,
@@ -445,14 +464,15 @@ impl Connection {
         }
     }
 
-    /// Takes an authenticated reader over from an anonymous socket: the user,
-    /// its scopes, and the suppression sets that go with them. A failed read
-    /// leaves the (empty) sets in place rather than dropping the connection;
-    /// the next refresh retries.
-    async fn adopt(&mut self, reader: Uuid, scopes: &str) {
+    /// Takes an authenticated reader over from an anonymous socket: the user
+    /// row, its token's scopes, and the suppression sets that go with them.
+    /// A failed read leaves the (empty) sets in place rather than dropping
+    /// the connection; the next refresh retries.
+    async fn adopt(&mut self, reader: User, scopes: &str) {
         self.scopes = Scopes::parse(scopes);
-        self.reader = Some(reader);
-        match Filters::load(&self.state.db, self.reader).await {
+        let reader_id = reader.id;
+        self.reader = Some(Arc::new(reader));
+        match Filters::load(&self.state.db, Some(reader_id)).await {
             Ok(filters) => self.filters = filters,
             Err(err) => warn!(%err, "streaming filters could not be loaded on authenticate"),
         }
@@ -460,13 +480,15 @@ impl Connection {
 
     /// The hub stream name the requested `name` expands to for this socket.
     ///
-    /// `user`, `user:notification`, `user:pleroma_chat` and `direct` keep
-    /// their own names: where Pleroma registers a socket on a `user:<id>`
-    /// topic, this hub carries the readers in the event's [`Audience`], so the
-    /// name is the same for every user and [`Connection::audience_allows`]
-    /// decides who sees it. A hashtag and a list are suffixed with what they
-    /// are about, exactly as Pleroma's topics are (`hashtag:<tag>`,
-    /// `list:<id>`).
+    /// The client keeps sending the bare `user`, `user:notification`,
+    /// `user:pleroma_chat` and `direct`; what the socket holds is the
+    /// canonical per-reader hub name with the reader's uuid suffixed onto
+    /// it (`user:<reader uuid>`, `direct:<reader uuid>`, …), the way
+    /// Pleroma registers a socket on a `user:<id>` topic. The event's
+    /// [`Audience`] stays the second gate: a matching stream name alone
+    /// does not deliver to a reader it does not cover. A hashtag and a
+    /// list are suffixed with what they are about, exactly as Pleroma's
+    /// topics are (`hashtag:<tag>`, `list:<id>`).
     async fn topic_for(&self, name: &str, args: &StreamArgs) -> Result<String, Refusal> {
         if is_user_stream(name) {
             return self.user_topic(name);
@@ -480,12 +502,17 @@ impl Connection {
     /// A private user stream: the socket needs a user whose token grants one
     /// of [`PRIVATE_SCOPES`] (Pleroma's `get_topic` `@user_streams` clause is
     /// the same user-bound-token match with one scope per stream; the ticket
-    /// lists the three accepted scopes together, and `read` covers them all).
+    /// lists the three accepted scopes together, and `read` covers them all),
+    /// and the topic it holds is the reader's own: the requested `name` with
+    /// the reader's uuid suffixed onto it.
     fn user_topic(&self, name: &str) -> Result<String, Refusal> {
-        if self.reader.is_some() && grants(&self.scopes, &PRIVATE_SCOPES) {
-            return Ok(name.to_owned());
-        }
-        Err(Refusal::Unauthorized)
+        let Some(reader) = self
+            .reader_id()
+            .filter(|_| grants(&self.scopes, &PRIVATE_SCOPES))
+        else {
+            return Err(Refusal::Unauthorized);
+        };
+        Ok(format!("{name}:{reader}"))
     }
 
     /// A list stream: one of [`PRIVATE_SCOPES`] or [`LIST_SCOPES`], and a list
@@ -493,7 +520,7 @@ impl Connection {
     /// `get_topic("list", …)` answers too.
     async fn list_topic(&self, args: &StreamArgs) -> Result<String, Refusal> {
         let refused = Err(Refusal::Unauthorized);
-        let Some(reader) = self.reader else {
+        let Some(reader) = self.reader_id() else {
             return refused;
         };
         if !(grants(&self.scopes, &PRIVATE_SCOPES) || grants(&self.scopes, &LIST_SCOPES)) {
@@ -512,25 +539,264 @@ impl Connection {
         }
     }
 
-    /// The frame to write for `event`, `None` when this connection may not see
-    /// it: no subscribed stream, an audience it is outside, or a reader whose
-    /// filters suppress the entity.
-    fn frame_for(&self, event: &StreamEvent) -> Option<String> {
+    /// The id of this socket's authenticated reader, `None` while it is
+    /// anonymous.
+    fn reader_id(&self) -> Option<Uuid> {
+        self.reader.as_ref().map(|reader| reader.id)
+    }
+
+    /// This socket's viewer row for the send-time renders: its own
+    /// authenticated reader, or nobody — the anonymous view — while the
+    /// socket has no reader. An authenticated socket never renders in
+    /// another reader's view: the viewer is the one loaded at the
+    /// handshake, not a row re-read per event.
+    fn viewer(&self) -> Option<&User> {
+        self.reader.as_ref().map(Arc::as_ref)
+    }
+
+    /// The frame to write for `event`, `None` when this connection may not
+    /// see it: no subscribed stream, an audience it is outside, a
+    /// `local_only` event with no reader to be local for, a reader whose
+    /// filters suppress the entity, or a [`RenderSpec`] hint this
+    /// socket cannot answer for its own viewer.
+    ///
+    /// An event that carries its entity as `payload` is written as it is.
+    /// An event that carries a [`RenderSpec`] hint instead — what
+    /// [`status_created`] and [`status_edited`] publish — has that entity
+    /// rendered for this connection's OWN viewer here, the way Pleroma's
+    /// `Streamer` renders in the socket process: one hub event, each
+    /// socket its own view. A rendered entity then replaces the frame's
+    /// `payload` (Mastodon's string-in-envelope rule), and the reader's
+    /// `Filters` judge it: relationship suppression weighs the rendered
+    /// payload as it weighs any other, and a rendered entity whose text
+    /// matches one of the reader's active irreversible word filters is
+    /// dropped rather than shown.
+    ///
+    /// [`status_created`]: crate::services::streaming::status_created
+    /// [`status_edited`]: crate::services::streaming::status_edited
+    async fn frame_for(&self, event: &StreamEvent) -> Option<String> {
         if !stream_matches(&self.subscriptions, event)
             || !self.audience_allows(event)
-            || self.filters.suppresses(event)
+            || !self.local_allows(event)
         {
+            return None;
+        }
+        let payload = self.payload_for(event).await?;
+        if self.filters.suppresses(payload.as_deref()) {
             return None;
         }
         let frame = Frame {
             stream: event.streams.as_slice(),
             event: event.event.as_str(),
-            payload: event.payload.as_deref(),
+            payload: payload.as_deref(),
         };
         match serde_json::to_string(&frame) {
             Ok(text) => Some(text),
             Err(err) => {
                 warn!(%err, "streaming frame could not be serialized");
+                None
+            }
+        }
+    }
+
+    /// The payload to write for `event`: the event's own body when it
+    /// carries one (the pre-serialized path, unchanged), the hinted entity
+    /// rendered for this socket's viewer when it carries a [`RenderSpec`]
+    /// hint without a body, and no body for an event that carries neither.
+    /// The outer `None` is the drop signal that [`frame_for`] reads: a
+    /// hint the socket cannot answer for its reader has no entity to show,
+    /// and Mastodon's `update` *is* its entity — silence beats an
+    /// entity-less frame.
+    async fn payload_for(&self, event: &StreamEvent) -> Option<Option<String>> {
+        if event.payload.is_some() {
+            return Some(event.payload.clone());
+        }
+        let Some(render) = event.render.as_ref() else {
+            return Some(None);
+        };
+        let payload = self.render_hint(render).await?;
+        if self.filters.suppresses_words(&payload) {
+            debug!("a streamed render hint matches the reader's irreversible word filters");
+            return None;
+        }
+        Some(Some(payload))
+    }
+
+    /// The entity JSON a [`RenderSpec`] hint answers to for this socket's
+    /// viewer: each kind built by its own endpoint's render path, so one
+    /// hub event becomes every reader's own view. `None` — the drop
+    /// signal — when this socket cannot be shown the entity at all.
+    async fn render_hint(&self, render: &RenderSpec) -> Option<String> {
+        match render {
+            RenderSpec::Status(id) => self.render_hinted_status(*id).await,
+            RenderSpec::Notification(id) => self.render_hinted_notification(*id).await,
+            RenderSpec::Chat(id) => self.render_hinted_chat(*id).await,
+        }
+    }
+
+    /// The Status entity JSON of the hinted status `id`, rendered for this
+    /// socket's viewer. `None` — the drop signal — when the row is gone or
+    /// unreadable (a status deleted before this socket caught up reads as
+    /// gone: [`status::get_by_id`] hides tombstones), when
+    /// [`status_visibility::can_view`] says no for this viewer or the
+    /// author's account is deactivated, or when the renderer has no view
+    /// of it at all.
+    ///
+    /// [`status::get_by_id`]: crate::models::status::get_by_id
+    async fn render_hinted_status(&self, id: Uuid) -> Option<String> {
+        let row = self.hinted_status_row(id).await?;
+        if !self.status_admits_reader(&row, id).await {
+            return None;
+        }
+        let viewer = self.viewer();
+        match render_status(&self.state, viewer, &row).await {
+            Ok(Some(entity)) => entity_json(&entity, id),
+            Ok(None) => {
+                debug!(%id, "a streaming render hint has no renderable view");
+                None
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming render hint could not be rendered");
+                None
+            }
+        }
+    }
+
+    /// The live row the status hint names, `None` when it is gone (the
+    /// delete beat this socket to it) or unreadable (a log line).
+    async fn hinted_status_row(&self, id: Uuid) -> Option<status::Status> {
+        match status::get_by_id(&self.state.db, id).await {
+            Ok(Some(row)) => Some(row),
+            Ok(None) => {
+                debug!(%id, "a streaming render hint names no live status");
+                None
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming render hint could not be read");
+                None
+            }
+        }
+    }
+
+    /// Whether this socket's viewer may see the hinted status row at all:
+    /// the shared visibility rules (the anonymous socket gets the
+    /// anonymous view, a private post reaches its author and the followers
+    /// `can_view` admits — and nobody else), and an author whose account
+    /// is deactivated answers nothing to anybody.
+    async fn status_admits_reader(&self, row: &status::Status, id: Uuid) -> bool {
+        let viewer = self.viewer();
+        match status_visibility::can_view(&self.state.db, row, viewer).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(%id, "a streaming render hint is not visible to its reader");
+                return false;
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming render hint could not be judged");
+                return false;
+            }
+        }
+        match user::get_by_id(&self.state.db, row.user_id).await {
+            Ok(Some(author)) => {
+                let active = author.is_active.get();
+                if !active {
+                    debug!(%id, "the author of a streaming render hint is deactivated");
+                }
+                active
+            }
+            Ok(None) => {
+                debug!(%id, "a streaming render hint names a status with no author");
+                false
+            }
+            Err(err) => {
+                warn!(%err, %id, "the author of a streaming render hint could not be read");
+                false
+            }
+        }
+    }
+
+    /// The Notification entity JSON of the hinted notification `id`, built
+    /// the way [`crate::api::notifications`] renders one and for this
+    /// socket's reader only: `None` — the drop signal — when the socket
+    /// has no viewer, the row is not a live notification addressed to
+    /// this reader (a foreign, unknown or dismissed row, or one whose
+    /// actor is deactivated, all of which
+    /// [`notification::get_visible`] answers `None` for), the actor left
+    /// no user row, or any read or render fails.
+    async fn render_hinted_notification(&self, id: Uuid) -> Option<String> {
+        let Some(viewer) = self.viewer() else {
+            debug!(%id, "a streaming notification hint reaches a readerless socket");
+            return None;
+        };
+        let row = match notification::get_visible(&self.state.db, viewer.id, id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                debug!(%id, "a streaming notification hint is no live notification of the reader's");
+                return None;
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming notification hint could not be read");
+                return None;
+            }
+        };
+        let rows = [row];
+        // Like the endpoint's single-notification read, a hinted row keeps
+        // its full render: `filters: &[]` is that pass's no-op spelling.
+        let entities =
+            match notifications::render_notifications(&self.state, viewer, &rows, &[]).await {
+                Ok(entities) => entities,
+                Err(err) => {
+                    warn!(%err, %id, "a streaming notification hint could not be rendered");
+                    return None;
+                }
+            };
+        let Some(entity) = entities.into_iter().next() else {
+            debug!(%id, "a streaming notification hint has no renderable actor");
+            return None;
+        };
+        entity_json(&entity, id)
+    }
+
+    /// The Chat entity JSON of the hinted chat `id` (the reader's own row
+    /// of it, the way the chats endpoints address a chat), built by
+    /// [`crate::api::chats`]' entity builder. `None` — the drop signal —
+    /// when the socket has no viewer, no chat of this reader's carries
+    /// that id, or the other participant is gone or deactivated.
+    async fn render_hinted_chat(&self, id: Uuid) -> Option<String> {
+        let Some(reader) = self.reader_id() else {
+            debug!(%id, "a streaming chat hint reaches a readerless socket");
+            return None;
+        };
+        let row = match chat::get_owned(&self.state.db, reader, id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                debug!(%id, "a streaming chat hint names no chat of the reader's");
+                return None;
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming chat hint could not be read");
+                return None;
+            }
+        };
+        match user::get_by_id(&self.state.db, row.recipient_id).await {
+            Ok(Some(recipient)) if recipient.is_active.get() => {}
+            Ok(Some(_)) => {
+                debug!(%id, "the other participant of a streaming chat hint is deactivated");
+                return None;
+            }
+            Ok(None) => {
+                debug!(%id, "a streaming chat hint names a chat with no recipient");
+                return None;
+            }
+            Err(err) => {
+                warn!(%err, %id, "the other participant of a streaming chat hint could not be read");
+                return None;
+            }
+        }
+        match chats::chat_entity(&self.state, &row).await {
+            Ok(entity) => entity_json(&entity, id),
+            Err(err) => {
+                warn!(%err, %id, "a streaming chat hint could not be rendered");
                 None
             }
         }
@@ -543,8 +809,16 @@ impl Connection {
         match &event.audience {
             Audience::Public => true,
             Audience::Everyone => self.reader.is_some(),
-            Audience::Users(ids) => self.reader.is_some_and(|reader| ids.contains(&reader)),
+            Audience::Users(ids) => self.reader_id().is_some_and(|reader| ids.contains(&reader)),
         }
+    }
+
+    /// Whether the event's `local_only` flag lets this connection see it at
+    /// all: the flag marks an event about this instance's local users and
+    /// entities, and a socket with no authenticated reader is not one of the
+    /// local viewers it may reach — whatever its audience or stream names say.
+    const fn local_allows(&self, event: &StreamEvent) -> bool {
+        !event.local_only || self.reader.is_some()
     }
 }
 
@@ -719,7 +993,8 @@ struct Frame<'event> {
 
 /// What a reader does not want to see, read once when the socket opens and
 /// refreshed every [`FILTER_TTL`]: the accounts it blocked and muted, the
-/// domains it blocked, and the threads it muted.
+/// domains it blocked, the threads it muted, and its active irreversible
+/// word filters in the streaming contexts.
 ///
 /// Pleroma recomputes the same sets per event in `Streamer.filtered_by_user?`
 /// (`lib/pleroma/web/streamer.ex`) against its cache; one set per connection
@@ -736,15 +1011,27 @@ struct Filters {
     domains: HashSet<String>,
     /// Threads the reader muted (`conversation_mutes`).
     threads: HashSet<Uuid>,
+    /// The reader's active, irreversible word filters in the streaming
+    /// contexts ([`STREAMING_CONTEXTS`]), verbatim [`filter::Filter`] rows
+    /// for [`filter::matches`] to run.
+    words: Vec<filter::Filter>,
 }
 
+/// The filter contexts streaming answers: `home` for the reader's own,
+/// direct and list timelines, `notifications` for the notification stream
+/// and `public` for the public, media, remote and hashtag timelines. A
+/// filter active in any one of them judges every entity a socket renders;
+/// the `thread` and `account` contexts belong to the HTTP reads that name
+/// them, not to a stream.
+const STREAMING_CONTEXTS: [&str; 3] = ["home", "notifications", "public"];
+
 impl Filters {
-    /// The suppression sets of `reader`, read in four queries. An anonymous
+    /// The suppression sets of `reader`, read in five queries. An anonymous
     /// reader suppresses nothing and asks the database nothing.
     ///
     /// # Errors
     ///
-    /// Whatever any of the four reads fails on.
+    /// Whatever any of the five reads fails on.
     async fn load(pool: &PgPool, reader: Option<Uuid>) -> AppResult<Self> {
         let Some(reader) = reader else {
             return Ok(Self::default());
@@ -753,16 +1040,19 @@ impl Filters {
         let muted = mute::muted_ids(pool, reader).await?;
         let domains = domain_block::blocked_domains(pool, reader).await?;
         let threads = conversation_mute::muted_ids(pool, reader).await?;
+        let words = word_filters(pool, reader).await?;
         Ok(Self {
             blocked: blocked.into_iter().collect(),
             muted: muted.into_iter().collect(),
             domains: domains.into_iter().collect(),
             threads: threads.into_iter().collect(),
+            words,
         })
     }
 
-    /// Whether a reader has nothing suppressed, so no payload needs reading at
-    /// all.
+    /// Whether the reader has no relationship suppression at all, so no
+    /// payload needs reading for [`Filters::suppresses`]. The word filters
+    /// are a separate gate with a guard of their own.
     fn is_empty(&self) -> bool {
         self.blocked.is_empty()
             && self.muted.is_empty()
@@ -770,16 +1060,18 @@ impl Filters {
             && self.threads.is_empty()
     }
 
-    /// Whether `event` is one this reader suppresses: its entity is authored
-    /// by a blocked or muted account, posted from a blocked domain, or part of
-    /// a muted thread. An event whose payload names none of those — a
-    /// `delete`, whose payload is only a status id, or a body-less event — is
-    /// never suppressed: there is nothing to object to.
-    fn suppresses(&self, event: &StreamEvent) -> bool {
+    /// Whether the payload one frame would carry is something this reader
+    /// suppresses: an entity authored by a blocked or muted account, posted
+    /// from a blocked domain, or part of a muted thread. A payload that
+    /// names none of those — a `delete`, whose payload is only a status id,
+    /// or a body-less event — is never suppressed: there is nothing to
+    /// object to. The payload judged is the one [`frame_for`] resolved, so
+    /// a render-hinted event is weighed by its rendered entity too.
+    fn suppresses(&self, payload: Option<&str>) -> bool {
         if self.is_empty() {
             return false;
         }
-        let facts = Facts::of(event);
+        let facts = Facts::of(payload);
         self.suppressed_author(&facts)
             || facts.hosts.iter().any(|host| self.domains.contains(host))
             || facts
@@ -796,6 +1088,89 @@ impl Filters {
             .authors
             .iter()
             .any(|author| self.blocked.contains(author) || self.muted.contains(author))
+    }
+
+    /// Whether the text a rendered entity carries matches one of the
+    /// reader's active irreversible word filters — the streaming drop for
+    /// a phrase the reader refuses to see even once. Only rendered
+    /// entities are weighed: a pre-serialized payload event stays with
+    /// [`Filters::suppresses`], the suppression it has always had.
+    fn suppresses_words(&self, payload: &str) -> bool {
+        if self.words.is_empty() {
+            return false;
+        }
+        let texts = entity_texts(payload);
+        texts
+            .iter()
+            .any(|text| self.words.iter().any(|word| filter::matches(word, text)))
+    }
+}
+
+/// The reader's active word filters that apply to streaming: the
+/// [`filter::list_active`] rows that are irreversible (a warn filter only
+/// tells the client to cover the post, it never drops it) and name at
+/// least one of the [`STREAMING_CONTEXTS`].
+async fn word_filters(pool: &PgPool, reader: Uuid) -> AppResult<Vec<filter::Filter>> {
+    let active = filter::list_active(pool, reader).await?;
+    Ok(active
+        .into_iter()
+        .filter(|row| {
+            row.irreversible
+                && row
+                    .context
+                    .iter()
+                    .any(|context| STREAMING_CONTEXTS.contains(&context.as_str()))
+        })
+        .collect())
+}
+
+/// The serialized entity JSON of a rendered hint, `None` with a log when
+/// it would not serialize.
+fn entity_json<T: Serialize>(entity: &T, id: Uuid) -> Option<String> {
+    match serde_json::to_string(entity) {
+        Ok(text) => Some(text),
+        Err(err) => {
+            warn!(%err, %id, "a streamed entity could not be serialized");
+            None
+        }
+    }
+}
+
+/// The filterable text a rendered entity payload states: every
+/// `content` and `spoiler_text` string it carries, nested entities
+/// included — a reblog's original, a notification's status, a chat's last
+/// message. A payload that is no JSON object, or holds neither key,
+/// states no text and matches nothing.
+fn entity_texts(payload: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(payload) else {
+        debug!("streaming render payload is no JSON");
+        return Vec::new();
+    };
+    let mut texts = Vec::new();
+    collect_texts(&value, &mut texts);
+    texts
+}
+
+/// Records the `content` / `spoiler_text` strings of `value`, walking
+/// every nested object and array so one pass reaches the whole entity.
+fn collect_texts(value: &Value, texts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for key in ["content", "spoiler_text"] {
+                if let Some(text) = map.get(key).and_then(Value::as_str) {
+                    texts.push(text.to_owned());
+                }
+            }
+            for nested in map.values() {
+                collect_texts(nested, texts);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_texts(item, texts);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -822,10 +1197,10 @@ struct Facts {
 }
 
 impl Facts {
-    /// The facts `event`'s payload states.
-    fn of(event: &StreamEvent) -> Self {
+    /// The facts one frame payload states.
+    fn of(payload: Option<&str>) -> Self {
         let mut facts = Self::default();
-        let Some(payload) = event.payload.as_deref() else {
+        let Some(payload) = payload else {
             return facts;
         };
         match serde_json::from_str::<Value>(payload) {
@@ -980,7 +1355,7 @@ async fn from_hub(
     received: Result<Arc<StreamEvent>, broadcast::error::RecvError>,
 ) -> Flow {
     match received {
-        Ok(event) => match connection.frame_for(&event) {
+        Ok(event) => match connection.frame_for(&event).await {
             None => Flow::Keep,
             Some(frame) => write(socket, Message::Text(frame.into())).await,
         },
@@ -1006,10 +1381,10 @@ async fn heartbeat(socket: &mut WebSocket, connection: &mut Connection) -> Flow 
 
 /// Reads the reader's suppression sets again.
 async fn refresh_filters(connection: &mut Connection) -> Flow {
-    if connection.reader.is_none() {
+    let Some(reader) = connection.reader_id() else {
         return Flow::Keep;
-    }
-    match Filters::load(&connection.state.db, connection.reader).await {
+    };
+    match Filters::load(&connection.state.db, Some(reader)).await {
         Ok(filters) => connection.filters = filters,
         Err(err) => warn!(%err, "streaming filters could not be refreshed; the old set stays"),
     }
@@ -1033,11 +1408,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, DEFAULT_STREAMING_PING_INTERVAL_SECS},
+        config::{Config, DEFAULT_STREAMING_PING_INTERVAL_SECS, TEST_BASE_URL},
         http_client::HttpClient,
         models::{
+            follow,
             list::NewList,
-            user::{NewUser, User, insert},
+            status::{NewStatus, Visibility},
+            user::{Flag, NewUser, User, insert},
         },
         streaming::hub::Hub,
         uploads::UploaderBackend,
@@ -1050,6 +1427,8 @@ mod tests {
             event: "update".to_owned(),
             payload: Some(payload.to_owned()),
             audience: Audience::Public,
+            render: None,
+            local_only: false,
         }
     }
 
@@ -1111,16 +1490,23 @@ mod tests {
 
     /// The id of a fresh local account named `nickname`.
     ///
+    /// A connection holds its viewer in an `Arc`, which `User` is not
+    /// (`User` is a wide row and is never cloned by the serving code), so
+    /// the fixtures hand out the shared handle too: `&Arc<User>` coerces
+    /// to `&User` wherever a model call wants the row.
+    ///
     /// # Panics
     ///
     /// If the insert fails, e.g. because the nickname is taken.
-    async fn account(state: &AppState, nickname: &str) -> User {
-        insert(
-            &state.db,
-            &NewUser::local(nickname, &format!("https://test.example/users/{nickname}")),
+    async fn account(state: &AppState, nickname: &str) -> Arc<User> {
+        Arc::new(
+            insert(
+                &state.db,
+                &NewUser::local(nickname, &format!("https://test.example/users/{nickname}")),
+            )
+            .await
+            .expect("user fixture inserts"),
         )
-        .await
-        .expect("user fixture inserts")
     }
 
     /// The one-element set `value` is, for building a [`Filters`] by hand.
@@ -1161,6 +1547,51 @@ mod tests {
             .expect("an anonymous connection loads no filters");
         connection.subscriptions = streams.iter().copied().map(String::from).collect();
         connection
+    }
+
+    /// The id of a fresh local account named `nickname` whose user is
+    /// deactivated.
+    ///
+    /// # Panics
+    ///
+    /// If the insert fails, e.g. because the nickname is taken.
+    async fn inactive_account(state: &AppState, nickname: &str) -> User {
+        insert(
+            &state.db,
+            &NewUser {
+                is_active: Flag::new(false),
+                ..NewUser::local(nickname, &format!("https://test.example/users/{nickname}"))
+            },
+        )
+        .await
+        .expect("the deactivated user fixture inserts")
+    }
+
+    /// A connection streaming for `reader` as its own viewer, with the
+    /// suppression sets read now and `streams` held.
+    async fn for_reader(state: &AppState, reader: &Arc<User>, streams: &[&str]) -> Connection {
+        let mut connection = watching(state, streams).await;
+        let reader_id = reader.id;
+        connection.reader = Some(Arc::clone(reader));
+        connection.filters = Filters::load(&state.db, Some(reader_id))
+            .await
+            .expect("the filters load");
+        connection
+    }
+
+    /// The entity JSON a frame's Mastodon payload string carries.
+    ///
+    /// # Panics
+    ///
+    /// If the frame is no JSON envelope or its payload is no entity JSON.
+    fn frame_payload(frame: &str) -> Value {
+        let envelope: Value = serde_json::from_str(frame).expect("the frame is JSON");
+        serde_json::from_str(
+            envelope["payload"]
+                .as_str()
+                .expect("the frame carries a payload string"),
+        )
+        .expect("the payload is the entity JSON")
     }
 
     #[test]
@@ -1431,6 +1862,7 @@ mod tests {
 
         let frame = connection
             .frame_for(&event(&["public"], r#"{"id":"7"}"#))
+            .await
             .expect("a matching public event is rendered");
 
         assert_eq!(
@@ -1452,6 +1884,7 @@ mod tests {
 
         let frame = connection
             .frame_for(&deleted)
+            .await
             .expect("a delete on a held stream is rendered");
 
         assert_eq!(
@@ -1467,12 +1900,16 @@ mod tests {
         let connection = watching(&state, &["hashtag:rust"]).await;
 
         assert!(
-            connection.frame_for(&event(&["public"], "{}")).is_none(),
+            connection
+                .frame_for(&event(&["public"], "{}"))
+                .await
+                .is_none(),
             "a public event does not reach a hashtag subscription"
         );
         assert!(
             connection
                 .frame_for(&event(&["hashtag", "hashtag:rust"], "{}"))
+                .await
                 .is_some(),
             "the hashtag's own event does, on any of its streams"
         );
@@ -1490,6 +1927,7 @@ mod tests {
 
         let frame = connection
             .frame_for(&filters_changed)
+            .await
             .expect("an event with no body is still delivered");
 
         assert_eq!(
@@ -1502,46 +1940,134 @@ mod tests {
     async fn audience_decides_who_sees_an_event() {
         let (_db, state) = state().await;
         let reader = account(&state, "stream-reader").await;
-        let mut mine = watching(&state, &[USER]).await;
-        mine.reader = Some(reader.id);
-        let on = event(&["user"], "{}");
+        let other = Uuid::now_v7();
+        let own_stream = format!("{USER}:{}", reader.id);
+        let other_stream = format!("{USER}:{other}");
+        let mut mine = watching(&state, &[own_stream.as_str()]).await;
+        mine.reader = Some(Arc::clone(&reader));
+        let on = event(&[own_stream.as_str()], "{}");
 
         let for_me = StreamEvent {
             audience: Audience::Users(vec![reader.id]),
             ..on.clone()
         };
         let for_other = StreamEvent {
-            audience: Audience::Users(vec![Uuid::now_v7()]),
+            audience: Audience::Users(vec![other]),
             ..on.clone()
         };
         let everyone = StreamEvent {
             audience: Audience::Everyone,
             ..on.clone()
         };
+        let on_other_stream = event(&[other_stream.as_str()], "{}");
 
-        assert!(mine.frame_for(&for_me).is_some(), "its own user sees it");
         assert!(
-            mine.frame_for(&for_other).is_none(),
-            "and nobody else's user does"
+            mine.frame_for(&for_me).await.is_some(),
+            "its own user sees it"
         );
         assert!(
-            mine.frame_for(&everyone).is_some(),
+            mine.frame_for(&for_other).await.is_none(),
+            "the audience stays the second gate even on a held stream name"
+        );
+        assert!(
+            mine.frame_for(&everyone).await.is_some(),
             "an Everyone event reaches an authenticated socket"
         );
-
-        let mut anonymous = watching(&state, &[USER]).await;
-        anonymous.subscriptions = vec![USER.to_owned()];
         assert!(
-            anonymous.frame_for(&for_me).is_none(),
+            mine.frame_for(&on_other_stream).await.is_none(),
+            "another reader's uuid-named stream never matches"
+        );
+
+        let anonymous = watching(&state, &[own_stream.as_str()]).await;
+        assert!(
+            anonymous.frame_for(&for_me).await.is_none(),
             "an anonymous socket never receives a Users event"
         );
         assert!(
-            anonymous.frame_for(&everyone).is_none(),
+            anonymous.frame_for(&everyone).await.is_none(),
             "nor an Everyone one"
         );
         assert!(
-            anonymous.frame_for(&on).is_some(),
+            anonymous.frame_for(&on).await.is_some(),
             "but a Public event is public"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_only_event_never_reaches_an_anonymous_socket() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "local-gate-reader").await;
+        let anonymous = watching(&state, &[PUBLIC]).await;
+        let mut member = watching(&state, &[PUBLIC]).await;
+        member.reader = Some(Arc::clone(&reader));
+        let local_public = StreamEvent {
+            local_only: true,
+            ..event(&[PUBLIC], "{}")
+        };
+
+        assert!(
+            anonymous.frame_for(&local_public).await.is_none(),
+            "a local_only event is dropped for a readerless socket, whatever its audience"
+        );
+        let local_everyone = StreamEvent {
+            audience: Audience::Everyone,
+            ..local_public.clone()
+        };
+        assert!(
+            anonymous.frame_for(&local_everyone).await.is_none(),
+            "Everyone plus local_only means authenticated local viewers only"
+        );
+        assert!(
+            member.frame_for(&local_everyone).await.is_some(),
+            "and an authenticated socket is exactly such a viewer"
+        );
+        let not_local = StreamEvent {
+            local_only: false,
+            ..local_public
+        };
+        assert!(
+            anonymous.frame_for(&not_local).await.is_some(),
+            "without the flag the same event streams on as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_stream_is_held_under_the_readers_uuid() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "uuid-naming-reader").await;
+        let mut connection = Connection::new(state, None).await.unwrap();
+        connection.reader = Some(Arc::clone(&reader));
+        connection.scopes = Scopes::parse(READ);
+
+        for name in [USER, USER_NOTIFICATION, USER_PLEROMA_CHAT, DIRECT] {
+            let topic = connection
+                .topic_for(name, &StreamArgs::default())
+                .await
+                .expect("a reader with read watches its own streams");
+            assert_eq!(
+                topic,
+                format!("{name}:{}", reader.id),
+                "the client's bare `{name}` is held as the canonical hub name"
+            );
+        }
+
+        let subscribed = connection
+            .on_client_text(r#"{"type":"subscribe","stream":"user"}"#)
+            .await;
+        assert_eq!(
+            connection.subscriptions,
+            vec![format!("{USER}:{}", reader.id)],
+            "the bare subscribe is answered nothing and holds the suffixed name"
+        );
+        assert!(subscribed.is_empty(), "and the frame itself is accepted");
+
+        let unsubscribed = connection
+            .on_client_text(r#"{"type":"unsubscribe","stream":"user"}"#)
+            .await;
+        assert!(unsubscribed.is_empty(), "and the bare name lets go of it");
+        assert!(
+            connection.subscriptions.is_empty(),
+            "the suffixed name left with it"
         );
     }
 
@@ -1556,14 +2082,17 @@ mod tests {
         let mut connection = Connection::new(state.clone(), None)
             .await
             .expect("the connection loads");
-        connection.reader = Some(reader.id);
+        connection.reader = Some(Arc::clone(&reader));
         connection.filters = Filters::load(&state.db, Some(reader.id))
             .await
             .expect("the filters load");
         connection.subscriptions = vec![PUBLIC.to_owned()];
 
         assert!(
-            connection.frame_for(&event(&["public"], &body)).is_none(),
+            connection
+                .frame_for(&event(&["public"], &body))
+                .await
+                .is_none(),
             "a muted author is suppressed, on a public stream too"
         );
         assert!(
@@ -1572,13 +2101,14 @@ mod tests {
                     &["public"],
                     &status_payload(Uuid::now_v7(), "loud", thread)
                 ))
+                .await
                 .is_some(),
             "and somebody else's status still arrives"
         );
     }
 
     #[tokio::test]
-    async fn the_suppression_sets_are_read_from_the_four_tables() {
+    async fn the_suppression_sets_are_read_from_the_five_tables() {
         let (_db, state) = state().await;
         let reader = account(&state, "filter-reader").await;
         let blocked = account(&state, "filter-blocked").await;
@@ -1595,7 +2125,7 @@ mod tests {
 
         let filters = Filters::load(&state.db, Some(reader.id))
             .await
-            .expect("the four reads run");
+            .expect("the five reads run");
 
         assert_eq!(
             filters.blocked,
@@ -1612,13 +2142,87 @@ mod tests {
 
         let body = status_payload(muted.id, "muted@spam.example", thread);
         assert!(
-            filters.suppresses(&event(&["public"], &body)),
+            filters.suppresses(Some(body.as_str())),
             "one entity can be suppressed on three counts at once"
         );
         assert!(
             Filters::load(&state.db, None).await.unwrap().is_empty(),
             "and an anonymous reader suppresses nothing"
         );
+    }
+
+    /// The fifth read keeps only what streaming hides outright: an
+    /// irreversible filter of a streaming context. A warn filter stays out
+    /// (it covers a post, it never drops one) and so does an irreversible
+    /// filter of a non-streaming context.
+    #[tokio::test]
+    async fn the_word_filter_read_keeps_irreversible_streaming_rows() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "wordfilter-loader").await;
+        seed_word_filter(&state, &reader, "spoilers", "home", true).await;
+        seed_word_filter(&state, &reader, "maybe", "public", false).await;
+        seed_word_filter(&state, &reader, "profile-only", "account", true).await;
+        let _expired = filter::create(
+            &state.db,
+            reader.id,
+            &filter::NewFilter {
+                phrase: "past-due".to_owned(),
+                context: vec!["home".to_owned()],
+                irreversible: true,
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::days(1)),
+                ..filter::NewFilter::default()
+            },
+        )
+        .await
+        .expect("the expired filter fixture creates");
+
+        let filters = Filters::load(&state.db, Some(reader.id))
+            .await
+            .expect("the five reads run");
+
+        assert_eq!(
+            filters
+                .words
+                .iter()
+                .map(|row| row.phrase.as_str())
+                .collect::<Vec<&str>>(),
+            ["spoilers"],
+            "the irreversible streaming row, newest-first as [`filter::list_active`] reads it"
+        );
+        let anonymous = Filters::load(&state.db, None)
+            .await
+            .expect("the anonymous load runs no read");
+        assert!(
+            anonymous.words.is_empty(),
+            "word filters are a reader's own, and the anonymous reader has none"
+        );
+    }
+
+    /// A stored word filter of `reader`'s: `phrase` in the single
+    /// `context`, hidden outright per `irreversible`.
+    ///
+    /// # Panics
+    ///
+    /// If the insert fails.
+    async fn seed_word_filter(
+        state: &AppState,
+        reader: &User,
+        phrase: &str,
+        context: &str,
+        irreversible: bool,
+    ) {
+        let _created = filter::create(
+            &state.db,
+            reader.id,
+            &filter::NewFilter {
+                phrase: phrase.to_owned(),
+                context: vec![context.to_owned()],
+                irreversible,
+                ..filter::NewFilter::default()
+            },
+        )
+        .await
+        .expect("the word filter fixture creates");
     }
 
     #[test]
@@ -1629,8 +2233,7 @@ mod tests {
         let body = format!(
             r#"{{"account":{{"id":"{booster}","acct":"booster"}},"reblog":{{"account":{{"id":"{original}","acct":"original"}},"conversation_id":"{thread}"}}}}"#
         );
-        let status = event(&["public"], &body);
-        let facts = Facts::of(&status);
+        let facts = Facts::of(Some(body.as_str()));
 
         assert_eq!(
             facts.authors,
@@ -1642,27 +2245,27 @@ mod tests {
             ..Filters::default()
         };
         assert!(
-            blocking_the_original.suppresses(&status),
+            blocking_the_original.suppresses(Some(body.as_str())),
             "and blocking either one suppresses the reblog"
         );
     }
 
     #[test]
     fn a_delete_event_names_nobody_and_is_never_suppressed() {
-        let deleted = event(&["public"], &format!("\"{}\"", Uuid::now_v7()));
+        let body = format!("\"{}\"", Uuid::now_v7());
         let filters = Filters {
             muted: one(Uuid::now_v7()),
             ..Filters::default()
         };
 
-        let facts = Facts::of(&deleted);
+        let facts = Facts::of(Some(body.as_str()));
 
         assert!(
             facts.authors.is_empty() && facts.hosts.is_empty() && facts.threads.is_empty(),
             "a payload that is no entity object states no facts"
         );
         assert!(
-            !filters.suppresses(&deleted),
+            !filters.suppresses(Some(body.as_str())),
             "so there is nothing to object to and the delete goes out"
         );
     }
@@ -1800,7 +2403,7 @@ mod tests {
         .await
         .expect("the list fixture writes");
         let mut connection = Connection::new(state.clone(), None).await.unwrap();
-        connection.reader = Some(reader.id);
+        connection.reader = Some(Arc::clone(&reader));
         let args = StreamArgs {
             list: Some(mine.id.to_string()),
             ..StreamArgs::default()
@@ -1889,7 +2492,7 @@ mod tests {
             "and a socket that has a user already is not authenticated twice"
         );
         assert_eq!(
-            connection.reader,
+            connection.reader_id(),
             Some(reader.id),
             "the socket now streams as its reader"
         );
@@ -1901,19 +2504,667 @@ mod tests {
             subscribed.is_empty(),
             "its own stream opens without a reconnect"
         );
-        connection.filters = Filters::load(&state.db, connection.reader)
+        assert_eq!(
+            connection.subscriptions,
+            vec![format!("{USER}:{}", reader.id)],
+            "and is held under the reader's uuid"
+        );
+        connection.filters = Filters::load(&state.db, connection.reader_id())
             .await
             .expect("the filters load");
         let body = status_payload(muted.id, "late-suppressed", Uuid::now_v7());
+        let own_stream = format!("{USER}:{}", reader.id);
         assert!(
             connection
                 .frame_for(&StreamEvent {
                     audience: Audience::Users(vec![reader.id]),
-                    ..event(&[USER], &body)
+                    ..event(&[own_stream.as_str()], &body)
                 })
+                .await
                 .is_none(),
             "and the filters the new reader brought apply to what it sees"
         );
+    }
+
+    /// The render hint of a live status arrives at the socket as an
+    /// `update` carrying the rendered entity: the hint is the hub's
+    /// envelope, the entity the socket's own view of it.
+    #[tokio::test]
+    async fn a_status_render_hint_arrives_as_the_rendered_entity() {
+        let (_db, state) = state().await;
+        let alice = account(&state, "hint-render-alice").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&alice, "rendered at the socket"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let connection = watching(&state, &[PUBLIC]).await;
+
+        let frame = connection
+            .frame_for(&hinted_update(row.id))
+            .await
+            .expect("a hinted update is rendered for the socket");
+
+        let envelope: Value = serde_json::from_str(&frame).expect("the frame is JSON");
+        assert_eq!(
+            envelope["event"], "update",
+            "the event name rides the frame as published: {frame}"
+        );
+        let payload: Value = serde_json::from_str(
+            envelope["payload"]
+                .as_str()
+                .expect("the rendered update carries a payload string"),
+        )
+        .expect("the payload is the entity JSON");
+        assert_eq!(
+            payload["id"],
+            Value::from(row.id.to_string()),
+            "the payload is the hinted status's entity"
+        );
+        assert_eq!(
+            payload["content"],
+            Value::from("<p>rendered at the socket</p>"),
+            "rendered from the live row"
+        );
+    }
+
+    /// A render hint that no longer names a renderable status — the row
+    /// tombstone between the publish and this socket's read — drops the
+    /// frame: Mastodon's `update` is its entity, and an entity-less one is
+    /// noise a client cannot use.
+    #[tokio::test]
+    async fn a_render_hint_whose_status_is_gone_drops_the_frame() {
+        let (_db, state) = state().await;
+        let alice = account(&state, "hint-gone-alice").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&alice, "doomed before delivery"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let _tombstone = status::soft_delete(&state.db, row.id)
+            .await
+            .expect("the delete fixture runs");
+        let connection = watching(&state, &[PUBLIC]).await;
+
+        assert!(
+            connection.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the tombstoned hint delivers nothing"
+        );
+        assert!(
+            connection
+                .frame_for(&hinted_update(Uuid::now_v7()))
+                .await
+                .is_none(),
+            "and so does a hint that never named a row"
+        );
+    }
+
+    /// A notification hint that names no live notification of the
+    /// socket's reader — here, a readerless socket, which can never be
+    /// the addressee — drops the event: the hint asked for an entity this
+    /// viewer cannot be shown, and a body-less `notification` would be
+    /// the client parsing `null`.
+    #[tokio::test]
+    async fn a_render_hint_that_cannot_be_answered_drops_the_event() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &[USER_NOTIFICATION]).await;
+        let hinted = StreamEvent {
+            streams: vec![USER_NOTIFICATION.to_owned()],
+            event: "notification".to_owned(),
+            payload: None,
+            audience: Audience::Public,
+            render: Some(RenderSpec::Notification(Uuid::now_v7())),
+            local_only: false,
+        };
+
+        assert!(
+            connection.frame_for(&hinted).await.is_none(),
+            "a hint no viewer can be answered for is dropped, not pushed body-less"
+        );
+        let hinted_chat = StreamEvent {
+            render: Some(RenderSpec::Chat(Uuid::now_v7())),
+            ..hinted
+        };
+        assert!(
+            connection.frame_for(&hinted_chat).await.is_none(),
+            "and the same for a chat hint on a readerless socket"
+        );
+    }
+
+    /// The reader's filters judge the rendered payload: an update hinted
+    /// from a muted account never reaches the muter's socket.
+    #[tokio::test]
+    async fn a_rendered_update_is_judged_by_the_readers_filters() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "hint-filter-reader").await;
+        let author = account(&state, "hint-filter-author").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "from a muted account"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        mute_author(&state, &reader, &author).await;
+        let mut connection = watching(&state, &[PUBLIC]).await;
+        connection.reader = Some(Arc::clone(&reader));
+        connection.filters = Filters::load(&state.db, Some(reader.id))
+            .await
+            .expect("the filters load");
+
+        assert!(
+            connection.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the rendered payload carries the authorship the filters read"
+        );
+    }
+
+    /// The ticket's core promise, per viewer: a hinted PRIVATE status
+    /// renders for a follower of the author, and the same hint dropped on
+    /// a stranger's socket — stream name and audience matched for them,
+    /// but the send-time [`status_visibility::can_view`] re-judgment says
+    /// no. The pre-serialized path could never tell these viewers apart.
+    #[tokio::test]
+    async fn a_private_status_hint_renders_for_a_follower_and_not_for_a_stranger() {
+        let (_db, state) = state().await;
+        let author = account(&state, "private-hint-author").await;
+        let follower = account(&state, "private-hint-follower").await;
+        let stranger = account(&state, "private-hint-stranger").await;
+        let _relation = follow::follow(&state.db, TEST_BASE_URL, &follower, &author)
+            .await
+            .expect("the follow fixture writes");
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus {
+                visibility: Visibility::Private,
+                ..NewStatus::local(&author, "followers only")
+            },
+        )
+        .await
+        .expect("the status fixture inserts");
+
+        let own_stream = format!("{USER}:{}", follower.id);
+        let follower_connection = for_reader(&state, &follower, &[&own_stream]).await;
+        let frame = follower_connection
+            .frame_for(&StreamEvent {
+                streams: vec![own_stream.clone()],
+                audience: Audience::Users(vec![follower.id]),
+                ..hinted_update(row.id)
+            })
+            .await
+            .expect("the hinted private status renders for a follower");
+        let entity = frame_payload(&frame);
+        assert_eq!(
+            entity["id"],
+            Value::from(row.id.to_string()),
+            "the payload is the hinted status's entity"
+        );
+        assert_eq!(
+            entity["content"],
+            Value::from("<p>followers only</p>"),
+            "rendered for the socket's own viewer"
+        );
+
+        let other_stream = format!("{USER}:{}", stranger.id);
+        let stranger_connection = for_reader(&state, &stranger, &[&other_stream]).await;
+        assert!(
+            stranger_connection
+                .frame_for(&StreamEvent {
+                    streams: vec![other_stream],
+                    audience: Audience::Users(vec![stranger.id]),
+                    ..hinted_update(row.id)
+                })
+                .await
+                .is_none(),
+            "the same hint on a non-follower's stream drops at the visibility gate"
+        );
+    }
+
+    /// An active irreversible word filter of a streaming context drops the
+    /// rendered event; the same phrase as a warn filter (not irreversible)
+    /// or outside the streaming contexts leaves it on the wire.
+    #[tokio::test]
+    async fn an_irreversible_word_filter_drops_a_rendered_status() {
+        let (_db, state) = state().await;
+        let author = account(&state, "wordfilter-author").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "a plain post about spoilers"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let warner = phrase_filter(&state, "wordfilter-warner", "spoilers", false, "home").await;
+        let hider = phrase_filter(&state, "wordfilter-hider", "spoilers", true, "home").await;
+        let outsider =
+            phrase_filter(&state, "wordfilter-outsider", "spoilers", true, "account").await;
+
+        let aloud = for_reader(&state, &warner, &[PUBLIC]).await;
+        assert!(
+            aloud.frame_for(&hinted_update(row.id)).await.is_some(),
+            "a warn filter never drops the event; the client covers it"
+        );
+        let silent = for_reader(&state, &hider, &[PUBLIC]).await;
+        assert!(
+            silent.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the irreversible streaming filter matches the rendered content and drops"
+        );
+        let standing = for_reader(&state, &outsider, &[PUBLIC]).await;
+        assert!(
+            standing.frame_for(&hinted_update(row.id)).await.is_some(),
+            "a filter outside the streaming contexts judges no stream"
+        );
+    }
+
+    /// The word filter judges every rendered kind the same way: the text
+    /// of the notification's own status falls, and its recipient can never
+    /// be the socket's anonymous nobody.
+    #[tokio::test]
+    async fn an_irreversible_word_filter_drops_a_rendered_notification() {
+        let (_db, state) = state().await;
+        let actor = account(&state, "wordfilter-note-actor").await;
+        let recipient = phrase_filter(
+            &state,
+            "wordfilter-note-recipient",
+            "spoilers",
+            true,
+            "home",
+        )
+        .await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&actor, "a post full of spoilers"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let note = notification::create(
+            &state.db,
+            &notification::NewNotification {
+                user_id: recipient.id,
+                from_account_id: actor.id,
+                notification_type: "favourite",
+                status_id: Some(row.id),
+                emoji: None,
+                report_id: None,
+                chat_message_id: None,
+            },
+        )
+        .await
+        .expect("the notification fixture writes");
+        let own_stream = format!("{USER_NOTIFICATION}:{}", recipient.id);
+        let connection = for_reader(&state, &recipient, &[&own_stream]).await;
+
+        assert!(
+            connection
+                .frame_for(&notification_hint(&own_stream, recipient.id, note.id))
+                .await
+                .is_none(),
+            "the notification's embedded status text matches the reader's hidden phrase"
+        );
+    }
+
+    /// The viewer is the row the socket took at authenticate: the reader's
+    /// profile changes afterwards ride past the live socket, which keeps
+    /// rendering in the view it loaded. (Suppression sets are a separate
+    /// question: they refresh every [`FILTER_TTL`].)
+    #[tokio::test]
+    async fn the_socket_holds_its_viewer_from_the_handshake() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "frozen-viewer").await;
+        let author = account(&state, "frozen-viewer-author").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "a public post"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let mut connection = watching(&state, &[PUBLIC]).await;
+        connection.reader = Some(Arc::clone(&reader));
+
+        let _renamed = sqlx::query("UPDATE users SET name = 'Renamed Later' WHERE id = $1")
+            .bind(reader.id)
+            .execute(&state.db)
+            .await
+            .expect("the rename fixture runs");
+
+        let frame = connection
+            .frame_for(&hinted_update(row.id))
+            .await
+            .expect("the public hint still renders for the viewer");
+        let entity = frame_payload(&frame);
+        assert_eq!(
+            entity["content"], "<p>a public post</p>",
+            "the hint rendered through the socket's held viewer"
+        );
+        let held = connection
+            .viewer()
+            .expect("the socket holds its viewer from the handshake");
+        assert!(
+            held.name.is_empty(),
+            "the rename never reached the connection: it renders from the row it loaded, \
+             not a live re-read per event"
+        );
+    }
+
+    /// A hint whose status author has been deactivated since the publish
+    /// answers nothing to anybody.
+    #[tokio::test]
+    async fn a_status_hint_of_a_deactivated_author_drops() {
+        let (_db, state) = state().await;
+        let ghost = inactive_account(&state, "deactivated-hint-author").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&ghost, "heard from the grave"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let connection = watching(&state, &[PUBLIC]).await;
+
+        assert!(
+            connection.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the send-time render drops the deactivated author's status"
+        );
+    }
+
+    /// A notification hint arrives at its recipient's socket as the full
+    /// notification entity — actor expanded, the named status rendered,
+    /// the mute flag the endpoint's own relationship read answers — the
+    /// same shape `GET /api/v1/notifications` gives.
+    #[tokio::test]
+    async fn a_notification_hint_renders_the_entity_for_its_recipient() {
+        let (_db, state) = state().await;
+        let actor = account(&state, "notification-hint-actor").await;
+        let recipient = account(&state, "notification-hint-recipient").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&actor, "the liked post"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let note = notification::create(
+            &state.db,
+            &notification::NewNotification {
+                user_id: recipient.id,
+                from_account_id: actor.id,
+                notification_type: "favourite",
+                status_id: Some(row.id),
+                emoji: None,
+                report_id: None,
+                chat_message_id: None,
+            },
+        )
+        .await
+        .expect("the notification fixture writes");
+        let own_stream = format!("{USER_NOTIFICATION}:{}", recipient.id);
+        let connection = for_reader(&state, &recipient, &[&own_stream]).await;
+
+        let frame = connection
+            .frame_for(&notification_hint(&own_stream, recipient.id, note.id))
+            .await
+            .expect("the recipient's socket renders the notification");
+
+        let entity = frame_payload(&frame);
+        assert_eq!(entity["id"], note.id.to_string(), "the notification's id");
+        assert_eq!(entity["type"], "favourite", "and its stored type");
+        assert_eq!(
+            entity["account"]["id"],
+            actor.id.to_string(),
+            "the actor expanded into an account"
+        );
+        assert_eq!(
+            entity["status"]["id"],
+            row.id.to_string(),
+            "the named status rendered into the entity"
+        );
+        assert_eq!(
+            entity["pleroma"]["is_muted"], false,
+            "the recipient does not mute the actor"
+        );
+    }
+
+    /// A notification hint is the recipient's alone: another reader's
+    /// socket and the recipient's own socket after a dismissal both lose
+    /// the event at the `get_visible` gate.
+    #[tokio::test]
+    async fn a_notification_hint_is_dropped_for_everybody_but_its_recipient() {
+        let (_db, state) = state().await;
+        let actor = account(&state, "notification-drop-actor").await;
+        let recipient = account(&state, "notification-drop-recipient").await;
+        let stranger = account(&state, "notification-drop-stranger").await;
+        let note = notification::create(
+            &state.db,
+            &notification::NewNotification {
+                user_id: recipient.id,
+                from_account_id: actor.id,
+                notification_type: "follow",
+                status_id: None,
+                emoji: None,
+                report_id: None,
+                chat_message_id: None,
+            },
+        )
+        .await
+        .expect("the notification fixture writes");
+
+        let theirs = format!("{USER_NOTIFICATION}:{}", stranger.id);
+        let stranger_connection = for_reader(&state, &stranger, &[&theirs]).await;
+        assert!(
+            stranger_connection
+                .frame_for(&notification_hint(&theirs, stranger.id, note.id))
+                .await
+                .is_none(),
+            "a notification addressed to somebody else renders on no other socket"
+        );
+
+        let own_stream = format!("{USER_NOTIFICATION}:{}", recipient.id);
+        let _dismissed = notification::dismiss(&state.db, recipient.id, note.id)
+            .await
+            .expect("the dismissal fixture runs");
+        let recipient_connection = for_reader(&state, &recipient, &[&own_stream]).await;
+        assert!(
+            recipient_connection
+                .frame_for(&notification_hint(&own_stream, recipient.id, note.id))
+                .await
+                .is_none(),
+            "and the recipient loses the row once it is dismissed"
+        );
+    }
+
+    /// A chat hint renders the reader's own chat through the chats
+    /// endpoint's builder: the peer as account, the live unread count and
+    /// the newest message.
+    #[tokio::test]
+    async fn a_chat_hint_renders_the_chat_for_its_participant() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "chat-hint-reader").await;
+        let sender = account(&state, "chat-hint-sender").await;
+        let chat_row = chat::get_or_create(&state.db, &reader, &sender)
+            .await
+            .expect("the chat fixture opens");
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .expect("the message fixture takes a transaction");
+        let _sent = chat::add_message(
+            &mut tx,
+            &sender,
+            &reader,
+            &chat::NewChatMessage::text("hello in here"),
+        )
+        .await
+        .expect("the message fixture sends");
+        tx.commit().await.expect("the message fixture commits");
+        let own_stream = format!("{USER_PLEROMA_CHAT}:{}", reader.id);
+        let connection = for_reader(&state, &reader, &[&own_stream]).await;
+
+        let frame = connection
+            .frame_for(&chat_hint(&own_stream, reader.id, chat_row.id))
+            .await
+            .expect("the participant's socket renders their chat");
+
+        let entity = frame_payload(&frame);
+        assert_eq!(
+            entity["id"],
+            chat_row.id.to_string(),
+            "the reader's own chat row"
+        );
+        assert_eq!(
+            entity["account"]["id"],
+            sender.id.to_string(),
+            "the peer as the chat's account"
+        );
+        assert_eq!(entity["unread"], 1, "the unread count read at send time");
+        assert_eq!(
+            entity["last_message"]["content"], "<p>hello in here</p>",
+            "the newest message rendered into the entity"
+        );
+    }
+
+    /// A chat hint answers only for its participant, and only while the
+    /// peer is a live account: the other side's chat id, no id at all and
+    /// a deactivated peer all drop the event.
+    #[tokio::test]
+    async fn a_chat_hint_is_dropped_for_strangers_and_a_deactivated_peer() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "chat-drop-reader").await;
+        let stranger = account(&state, "chat-drop-stranger").await;
+        let peer = account(&state, "chat-drop-peer").await;
+        let chat_row = chat::get_or_create(&state.db, &reader, &peer)
+            .await
+            .expect("the chat fixture opens");
+
+        let theirs = format!("{USER_PLEROMA_CHAT}:{}", stranger.id);
+        let stranger_connection = for_reader(&state, &stranger, &[&theirs]).await;
+        assert!(
+            stranger_connection
+                .frame_for(&chat_hint(&theirs, stranger.id, chat_row.id))
+                .await
+                .is_none(),
+            "one participant's chat id means nothing to another"
+        );
+        assert!(
+            stranger_connection
+                .frame_for(&chat_hint(&theirs, stranger.id, Uuid::now_v7()))
+                .await
+                .is_none(),
+            "and so does a hint that names no chat at all"
+        );
+
+        let _deactivated = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(peer.id)
+            .execute(&state.db)
+            .await
+            .expect("the deactivation fixture runs");
+        let own_stream = format!("{USER_PLEROMA_CHAT}:{}", reader.id);
+        let reader_connection = for_reader(&state, &reader, &[&own_stream]).await;
+        assert!(
+            reader_connection
+                .frame_for(&chat_hint(&own_stream, reader.id, chat_row.id))
+                .await
+                .is_none(),
+            "a deactivated peer answers nothing to the participant's socket"
+        );
+    }
+
+    /// A `notification` event that carries only the notification render
+    /// hint, for `reader`'s stream — the shape a notification producer
+    /// will publish.
+    fn notification_hint(stream: &str, reader: Uuid, id: Uuid) -> StreamEvent {
+        StreamEvent {
+            streams: vec![stream.to_owned()],
+            event: "notification".to_owned(),
+            payload: None,
+            audience: Audience::Users(vec![reader]),
+            render: Some(RenderSpec::Notification(id)),
+            local_only: false,
+        }
+    }
+
+    /// A `pleroma:chat_update` event that carries only the chat render
+    /// hint, for `reader`'s chat stream.
+    fn chat_hint(stream: &str, reader: Uuid, id: Uuid) -> StreamEvent {
+        StreamEvent {
+            streams: vec![stream.to_owned()],
+            event: "pleroma:chat_update".to_owned(),
+            payload: None,
+            audience: Audience::Users(vec![reader]),
+            render: Some(RenderSpec::Chat(id)),
+            local_only: false,
+        }
+    }
+
+    /// `nickname`'s user with one active word filter for `phrase`:
+    /// irreversible per `irreversible`, in the single context `context`.
+    ///
+    /// # Panics
+    ///
+    /// If either fixture write fails.
+    async fn phrase_filter(
+        state: &AppState,
+        nickname: &str,
+        phrase: &str,
+        irreversible: bool,
+        context: &str,
+    ) -> Arc<User> {
+        let reader = account(state, nickname).await;
+        seed_word_filter(state, &reader, phrase, context, irreversible).await;
+        reader
+    }
+
+    /// The word filter reads the whole rendered entity, not just its top
+    /// level: the status's own content and spoiler, a reblog's original,
+    /// a notification's status and a chat's last message all state text.
+    #[test]
+    fn the_filterable_text_reaches_every_nested_entity() {
+        let payload = r#"{"id":"1","content":"outer","spoiler_text":"subject",
+             "reblog":{"content":"inner"},
+             "pleroma":{"content":{"text/plain":"raw"},"conversation_id":"c"},
+             "status":{"spoiler_text":"nested subject"},
+             "last_message":{"content":"chat text"},
+             "media_attachments":[{"description":"not filterable"}]}"#;
+
+        let mut texts = entity_texts(payload);
+        texts.sort();
+
+        assert_eq!(
+            texts,
+            ["chat text", "inner", "nested subject", "outer", "subject"],
+            "content and spoiler_text at every depth, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_payload_with_no_entity_states_no_text() {
+        assert!(
+            entity_texts("\"just-a-status-id\"").is_empty(),
+            "a delete's id payload matches no phrase"
+        );
+        assert!(
+            entity_texts("not json at all").is_empty(),
+            "and neither does a body that is no JSON"
+        );
+    }
+
+    /// An `update` event that carries only a status render hint: the shape
+    /// [`crate::services::streaming::status_created`] publishes.
+    fn hinted_update(id: Uuid) -> StreamEvent {
+        StreamEvent {
+            streams: vec![PUBLIC.to_owned()],
+            event: "update".to_owned(),
+            payload: None,
+            audience: Audience::Public,
+            render: Some(RenderSpec::Status(id)),
+            local_only: false,
+        }
     }
 
     /// A bearer token string minted for `reader` granting `scopes`.

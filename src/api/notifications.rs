@@ -634,11 +634,15 @@ async fn read_up_to(state: &AppState, viewer: &User, max_text: &str) -> AppResul
 /// it leaves the listing with it. A row whose actor left no row (deleted
 /// mid-request) drops out of the answer.
 ///
+/// [`crate::api::streaming`] renders a hinted notification through this
+/// same path, so the socket's entity and the endpoint's are built the
+/// same way (the ticket's "as api/notifications.rs does").
+///
 /// # Errors
 ///
 /// [`Database`](crate::error::AppError::Database) from the account,
 /// relationship, status, chat-message and visibility reads.
-async fn render_notifications(
+pub(crate) async fn render_notifications(
     state: &AppState,
     viewer: &User,
     rows: &[NotificationRow],

@@ -79,6 +79,18 @@ const LISTS_CONTAINING_SQL: &str = "SELECT lists.* FROM lists
      WHERE lists.user_id = $1 AND list_members.user_id = $2
      ORDER BY lists.id";
 
+/// [`lists_following_member`]: every list that holds `member_id` as a
+/// member *and* whose owner's follow of them is an accepted fact — the
+/// same join [`lists_containing`] states per owner, stated for all owners
+/// at once (decision 3's batched-read shape), so the streaming audience
+/// names each of the member's lists without one query per owner.
+const LISTS_FOLLOWING_MEMBER_SQL: &str = "SELECT lists.* FROM lists
+     JOIN list_members ON list_members.list_id = lists.id
+     JOIN follows ON follows.follower_id = lists.user_id
+          AND follows.followee_id = list_members.user_id
+     WHERE list_members.user_id = $1 AND follows.state = 'accepted'
+     ORDER BY lists.id";
+
 /// [`add_members`]: every requested member in one statement, each row taking
 /// the next `position` from the sequence (so the array's order is the order the
 /// members were added in). A pair that is already a member conflicts on the
@@ -350,6 +362,31 @@ pub async fn lists_containing(
     Ok(rows)
 }
 
+/// Every list that holds `member_id` as a member while an **accepted**
+/// follow of theirs by the list's owner is on the books.
+///
+/// The streaming audience's list side: the whole-owner-set statement of
+/// the same fact [`lists_containing`] answers for one owner (the API's
+/// membership rule is "the owner follows the member"; the join keeps a
+/// follow that was since withdrawn from carrying memberships).
+///
+/// A member of nobody's list, or of only lists whose owners no longer
+/// follow them, yields the empty vector; whether `member_id` names a live
+/// user is the caller's question, not this query's. Oldest list first,
+/// like every read here.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn lists_following_member(pool: &PgPool, member_id: Uuid) -> AppResult<Vec<List>> {
+    let rows = sqlx::query_as::<_, List>(LISTS_FOLLOWING_MEMBER_SQL)
+        .bind(member_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
 /// Adds `member_ids` to the list `list_id`, returning how many memberships
 /// were new.
 ///
@@ -450,7 +487,10 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         error::AppError,
-        models::user::{NewUser, User, insert, local_ap_id},
+        models::{
+            follow,
+            user::{NewUser, User, insert, local_ap_id},
+        },
         pagination::MAX_LIMIT,
     };
 
@@ -816,6 +856,52 @@ mod tests {
         assert!(
             nolists.is_empty(),
             "a member of no list yields the empty vector"
+        );
+    }
+
+    /// [`lists_following_member`] walks every owner at once, and carries a
+    /// list only while its owner's follow of the member is an accepted
+    /// fact: a membership whose follow has gone delivers nothing.
+    #[tokio::test]
+    async fn lists_following_member_walks_every_following_owner() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+
+        let _grant = follow::follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("alice follows bob");
+        let first = seed(&pool, &alice, "first").await;
+        let _without = seed(&pool, &alice, "without").await;
+        let last = seed(&pool, &alice, "last").await;
+        add_member(&pool, &first, &bob).await;
+        add_member(&pool, &last, &bob).await;
+
+        let stale = seed(&pool, &carol, "unfollowed").await;
+        add_member(&pool, &stale, &bob).await;
+
+        let found = lists_following_member(&pool, bob.id)
+            .await
+            .expect("the batched list read runs");
+        assert_eq!(
+            titles(&found),
+            ["first", "last"],
+            "both of alice's lists holding bob across the whole owner set, and not \
+             carol's unfollowed membership or alice's membership-less list"
+        );
+
+        let _removed = follow::remove_follower(&pool, bob.id, alice.id)
+            .await
+            .expect("the follower removal runs")
+            .expect("bob had alice as a follower");
+        let after = lists_following_member(&pool, bob.id)
+            .await
+            .expect("the batched list read runs");
+        assert!(
+            after.is_empty(),
+            "the memberships outlive the withdrawn follow, but no longer stream"
         );
     }
 

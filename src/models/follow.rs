@@ -263,6 +263,21 @@ const SUBSCRIBERS_SQL: &str = "SELECT u.* FROM follows f
         AND f.notify = true AND u.local = true AND u.is_active = true
    ORDER BY f.id";
 
+/// [`accepted_local_follower_ids`]: the accepted relationships of
+/// `followee_id` held by accounts this instance owns that are still active,
+/// oldest relationship first. `reblogs_only` ($2) drops the followers who
+/// turned [`show_reblogs`] off — a bound `false` parameter lets the whole
+/// predicate pass, so one statement serves both the plain and the
+/// boosts-hiding audience.
+///
+/// [`show_reblogs`]: Follow::show_reblogs
+const ACCEPTED_LOCAL_FOLLOWER_IDS_SQL: &str = "SELECT f.follower_id FROM follows f
+     JOIN users u ON u.id = f.follower_id
+      WHERE f.followee_id = $1 AND f.state = 'accepted'
+        AND u.local = true AND u.is_active = true
+        AND ($2 = false OR f.show_reblogs = true)
+   ORDER BY f.id";
+
 /// [`familiar_followers`]: the accounts that follow `target` (`own`, the
 /// target's own follower edges) and are themselves followed by the viewer
 /// (`theirs`, the viewer's outgoing edges), accepted on both ends. Active
@@ -1140,6 +1155,36 @@ pub async fn subscribers(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// The ids of the **local, active, accepted** followers of `followee_id`,
+/// oldest relationship first.
+///
+/// The follower side of a streaming audience (see
+/// [`crate::services::streaming`]): a remote mirror holds no socket on this
+/// instance to push to, a deactivated account must not be handed new events,
+/// and a not-yet-accepted relationship has granted nothing — so the query
+/// keeps only accepted relationships whose follower is local and active.
+/// `reblogs_only` additionally drops the followers who turned
+/// [`show_reblogs`](Follow::show_reblogs) off for the followee, which is the
+/// home rule a boost follows: the caller sets it when the post whose
+/// audience is being computed is a reblog row.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn accepted_local_follower_ids(
+    pool: &PgPool,
+    followee_id: Uuid,
+    reblogs_only: bool,
+) -> AppResult<Vec<Uuid>> {
+    let rows = sqlx::query_as::<_, (Uuid,)>(ACCEPTED_LOCAL_FOLLOWER_IDS_SQL)
+        .bind(followee_id)
+        .bind(reblogs_only)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// The accounts `viewer_id` follows that also follow `target_id` — the
@@ -3004,6 +3049,105 @@ mod tests {
         assert!(
             move_followers_of(&pool, new_id()).await.unwrap().is_empty(),
             "an account nobody follows has an empty move set"
+        );
+    }
+
+    /// `accepted_local_follower_ids` keeps exactly the streaming audience's
+    /// follower side: local, active, accepted follows of the account — and,
+    /// with `reblogs_only`, only the ones still showing its boosts.
+    #[tokio::test]
+    async fn accepted_local_follower_ids_selects_local_active_accepted_followers() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let author = local_user(&pool, "author").await;
+        let fan = local_user(&pool, "fan").await;
+        let quiet = local_user(&pool, "quiet").await;
+        let ghost = insert(
+            &pool,
+            &NewUser {
+                is_active: Flag::new(false),
+                ..local_new("ghost")
+            },
+        )
+        .await
+        .expect("the deactivated fixture inserts");
+        let rejected = local_user(&pool, "rejected").await;
+        let remote = remote_user(&pool, "remote_fan").await;
+
+        let _fan = follow(&pool, TEST_BASE_URL, &fan, &author)
+            .await
+            .expect("the fan's follow is accepted");
+        let _quiet = follow(&pool, TEST_BASE_URL, &quiet, &author)
+            .await
+            .expect("the quiet follower's follow is accepted");
+        let toggled = set_toggles(
+            &pool,
+            quiet.id,
+            author.id,
+            FollowToggles {
+                show_reblogs: Some(false),
+                notify: None,
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the accepted row takes the toggle");
+        assert!(!toggled.show_reblogs, "the stored row hides boosts");
+        let _ghost = follow(&pool, TEST_BASE_URL, &ghost, &author)
+            .await
+            .expect("the deactivated follow is accepted");
+        let _stale = rejected_relation(&pool, &rejected, &author).await;
+        let _remote = follow(&pool, TEST_BASE_URL, &remote, &author)
+            .await
+            .expect("the remote follow is accepted");
+
+        let mut expected = vec![fan.id, quiet.id];
+        expected.sort_unstable();
+        let mut with_hidden = accepted_local_follower_ids(&pool, author.id, false)
+            .await
+            .unwrap();
+        with_hidden.sort_unstable();
+        assert_eq!(
+            with_hidden, expected,
+            "the two local active accepted followers, boosts-hidden one included"
+        );
+        assert_eq!(
+            accepted_local_follower_ids(&pool, author.id, true)
+                .await
+                .unwrap(),
+            vec![fan.id],
+            "reblogs_only drops the follower who turned boosts off, and with them \
+             the remote mirror, the deactivated account and the rejected row"
+        );
+    }
+
+    /// A pending request has granted nothing, so a locked account's
+    /// follower queue is empty to the streaming audience either way.
+    #[tokio::test]
+    async fn accepted_local_follower_ids_skips_pending_relationships() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let idol = locked_user(&pool, "idol").await;
+        let requester = local_user(&pool, "requester").await;
+        let _pending = follow(&pool, TEST_BASE_URL, &requester, &idol)
+            .await
+            .expect("the locked account's follow waits");
+        assert_eq!(
+            get(&pool, requester.id, idol.id)
+                .await
+                .unwrap()
+                .expect("the request exists")
+                .state,
+            FollowState::Pending,
+            "the fixture waits, unanswered"
+        );
+
+        assert!(
+            accepted_local_follower_ids(&pool, idol.id, false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a waiting request is nobody's audience"
         );
     }
 
