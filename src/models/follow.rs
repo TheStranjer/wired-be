@@ -794,6 +794,20 @@ pub async fn get(pool: &PgPool, follower_id: Uuid, target_id: Uuid) -> AppResult
 /// here, so an `Undo` can only withdraw its own maker's follow.
 const GET_BY_AP_ID_SQL: &str = "SELECT * FROM follows WHERE follower_id = $1 AND ap_id = $2";
 
+/// [`find_by_ap_id`]: the one relationship carrying `ap_id` whatever pair
+/// it joins. The inbound `Accept`, `Reject` and `Undo` that name the follow
+/// they answer by its activity id alone read through here: the answering
+/// account is the *followee*, whom the follower-scoped [`get_by_ap_id`]
+/// could not key on. The column is `UNIQUE` (decision 6), so at most one
+/// row can carry the id.
+const FIND_BY_AP_ID_SQL: &str = "SELECT * FROM follows WHERE ap_id = $1";
+
+/// [`set_ap_id`]: the `Follow` activity id onto the row — the mirror write
+/// of a remote follower's delivered activity, and the newest id when a peer
+/// re-sends the follow under one — refreshing `updated_at` the way every
+/// update here does.
+const SET_AP_ID_SQL: &str = "UPDATE follows SET ap_id = $2, updated_at = now() WHERE id = $1";
+
 /// The relationship of `follower_id` whose `Follow` activity carries
 /// `ap_id`, `None` when the account has no such follow.
 ///
@@ -812,6 +826,51 @@ pub async fn get_by_ap_id(
         .fetch_optional(pool)
         .await?;
     Ok(follow)
+}
+
+/// The relationship whose `Follow` activity carries `ap_id`, `None` when no
+/// stored row does.
+///
+/// The unscoped sibling of [`get_by_ap_id`], for the inbound federation
+/// handlers: an `Accept` or `Reject` from the followed account names the
+/// follow it answers by its activity id alone, and the answering account is
+/// the followee, not the follower. [`follow`] stores a remote follower's
+/// delivered id here and the pair's newest id on every re-send (decision 6),
+/// which is what makes an id the key the peers' answers find.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn find_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<Follow>> {
+    let follow = sqlx::query_as::<_, Follow>(FIND_BY_AP_ID_SQL)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(follow)
+}
+
+/// Records `ap_id` as the `Follow` activity the relationship `id` stands
+/// for: the mirror write of the inbound federation handler (decision 6).
+///
+/// [`follow`] leaves a remote follower's row without an id, because that id
+/// is the one the follower's own instance minted, and this is where the
+/// delivered activity's id lands on the row — including over an older one
+/// when the peer re-sends the same follow under a fresh id. An unknown `id`
+/// matches no row and changes nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding, an `ap_id` another row
+/// already carries) arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn set_ap_id(pool: &PgPool, id: Uuid, ap_id: &str) -> AppResult<()> {
+    sqlx::query(SET_AP_ID_SQL)
+        .bind(id)
+        .bind(ap_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
 }
 
 /// The ids of the users `follower_id` follows, accepted relationships only,
@@ -3703,6 +3762,70 @@ mod tests {
             .expect("the read runs")
             .is_none(),
             "and an id no row carries answers nothing"
+        );
+    }
+
+    /// [`set_ap_id`] and [`find_by_ap_id`]: the mirror write lands the
+    /// delivered activity id on a remote follower's id-less row, the
+    /// unscoped read keys on it, a re-send replaces the older id, and an
+    /// unknown row or id changes and answers nothing.
+    #[tokio::test]
+    async fn the_mirror_id_write_lands_and_the_unscoped_read_finds_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mallory = remote_user(&pool, "mallory").await;
+        let bob = local_user(&pool, "bob").await;
+
+        let created = follow(&pool, TEST_BASE_URL, &mallory, &bob)
+            .await
+            .expect("the remote follow stores");
+        assert!(
+            created.ap_id.is_none(),
+            "a remote follower's row starts without an id"
+        );
+
+        let first = "https://remote.example/activities/follow-1";
+        set_ap_id(&pool, created.id, first)
+            .await
+            .expect("the mirror write runs");
+        assert_eq!(
+            find_by_ap_id(&pool, first)
+                .await
+                .expect("the read runs")
+                .map(|row| row.id),
+            Some(created.id),
+            "the delivered id keys the row"
+        );
+
+        let second = "https://remote.example/activities/follow-2";
+        set_ap_id(&pool, created.id, second)
+            .await
+            .expect("the re-send's write runs");
+        assert!(
+            find_by_ap_id(&pool, first)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "the older id keys nothing once the newest took its place"
+        );
+        assert_eq!(
+            find_by_ap_id(&pool, second)
+                .await
+                .expect("the read runs")
+                .map(|row| row.ap_id),
+            Some(Some(second.to_owned())),
+            "and the newest id is the stored one"
+        );
+
+        set_ap_id(&pool, new_id(), "https://remote.example/activities/nowhere")
+            .await
+            .expect("a write onto an unknown row is a no-op, not a failure");
+        assert!(
+            find_by_ap_id(&pool, "https://remote.example/activities/nowhere")
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "and it stored nothing"
         );
     }
 }
