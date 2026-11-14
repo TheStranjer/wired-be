@@ -36,6 +36,11 @@
 //! pages live at the top-level paths Pleroma routes them on,
 //! `/frontend_switcher`, `/embed/{id}`, `/notice/{id}/embed_player` and
 //! `/mailer/unsubscribe/{token}`.
+//! [`remote_interaction::router`] joins it at the root as well: the
+//! ostatus subscribe pages, `GET /authorize_interaction` and the
+//! `/main/ostatus` pair live at the top-level paths Pleroma routes them
+//! on, while [`remote_interaction::pleroma_router`] rides on [`v1`] for
+//! `POST /api/v1/pleroma/remote_interaction`.
 //! [`password_reset::auth_router`] joins it at `POST /auth/password`, the
 //! address Pleroma routes the reset request on outside `/api` (its two
 //! `/api/v1/pleroma/password_reset` pages ride on [`v1`]).
@@ -82,6 +87,7 @@ pub mod pleroma_import;
 pub mod pleroma_settings;
 pub mod polls;
 pub mod push;
+pub mod remote_interaction;
 pub mod reports;
 pub mod scheduled_statuses;
 pub mod scrobbles;

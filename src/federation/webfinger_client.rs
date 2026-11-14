@@ -29,6 +29,13 @@
 //!    content type, falling back to the document's first character when the
 //!    type is absent or unknown.
 //!
+//! Two reads ride on that lookup: [`resolve_acct`] extracts the actor URL,
+//! and `finger_with_base` answers the whole document as a JRD
+//! `serde_json::Value` (an XRD answer is normalized into the same shape).
+//! The latter is how the remote-interaction endpoints find the
+//! `http://ostatus.org/schema/1.0/subscribe` template (see
+//! [`crate::api::remote_interaction`]).
+//!
 //! Every resolved document is also checked for domain containment (see
 //! [`resolve_acct`]): a host must not be able to point this instance at an
 //! actor on someone else's host.
@@ -38,6 +45,7 @@ use std::{error::Error, fmt};
 use quick_xml::{XmlVersion, escape::unescape, events::BytesStart, events::Event, reader::Reader};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap};
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use tracing::debug;
 use url::Url;
 
@@ -47,10 +55,13 @@ use crate::http_client::{HttpClient, HttpError, HttpResponse};
 /// documents are small, and a hostile host must not be able to stream an
 /// endless one into this process.
 const MAX_BODY_BYTES: usize = 256 * 1024;
-/// Media type asked for on every `WebFinger` GET (RFC 7033's JRD).
-const JRD_JSON: &str = "application/jrd+json";
+/// Media type asked for on every `WebFinger` GET (RFC 7033's JRD). Crate
+/// visibility because the remote-interaction tests label their mock
+/// answers with it (see [`crate::api::remote_interaction`]).
+pub(crate) const JRD_JSON: &str = "application/jrd+json";
 /// Media type sent as `Accept` on the host-meta GET (RFC 7033's XRD).
-const XRD_XML: &str = "application/xrd+xml";
+/// Crate-visible for the same reason.
+pub(crate) const XRD_XML: &str = "application/xrd+xml";
 /// The `rel` naming the actor document.
 const SELF_REL: &str = "self";
 /// The `rel` of the LRDD template link inside host-meta.
@@ -61,10 +72,13 @@ const ACTIVITY_JSON: &str = "application/activity+json";
 /// never compared — the ticket fixes "ignore parameters" — so any
 /// `application/ld+json` (with or without parameters) names the actor.
 const LD_JSON: &str = "application/ld+json";
-/// The resource macro of an LRDD template (RFC 7033 Section 5).
-const URI_MACRO: &str = "{uri}";
+/// The resource macro of an LRDD template (RFC 7033 Section 5). Crate
+/// visibility because the remote-interaction endpoints expand the same
+/// macro in a subscribe template (see
+/// [`crate::api::remote_interaction`]).
+pub(crate) const URI_MACRO: &str = "{uri}";
 /// The percent-encoded spelling of [`URI_MACRO`], as Mastodon emits it.
-const URI_MACRO_ENCODED: &str = "%7Buri%7D";
+pub(crate) const URI_MACRO_ENCODED: &str = "%7Buri%7D";
 /// The `acct:` URI scheme prefix `WebFinger` resources carry.
 const ACCT_PREFIX: &str = "acct:";
 /// XRD is an XML 1.0 vocabulary; attribute values are normalized and
@@ -176,19 +190,66 @@ pub(crate) async fn resolve_acct_with_base(
     acct: &str,
     scheme_and_authority_override: Option<&str>,
 ) -> Result<String, WebfingerError> {
+    let (response, domain) = fetch_answer(http, acct, scheme_and_authority_override).await?;
+    let document = parse_finger_response(&response)?;
+    let actor = document.actor_href().ok_or(WebfingerError::NoActorLink)?;
+    verify_round_trip(document.subject.as_deref(), actor, &domain)?;
+    Ok(actor.to_owned())
+}
+
+/// Resolves a remote handle through `WebFinger` and answers the whole
+/// document as a JRD JSON object.
+///
+/// The lookup is [`resolve_acct`]'s — same URLs, same host-meta fallback,
+/// same format sniffing — but instead of extracting the actor URL it
+/// returns the document itself: a JSON answer verbatim (unknown members
+/// like `aliases` and `properties` included), an XRD answer normalized
+/// into `{subject?, links[]}` with every `<Link>` element's `rel`, `type`,
+/// `href` and `template` attributes. Callers that read anything beyond the
+/// actor link — the subscribe-template lookup of
+/// [`crate::api::remote_interaction`], for instance — go through here.
+/// No domain-containment check is applied: the document is returned as
+/// answered, and a later ticket that consumes an actor URL from it reuses
+/// [`resolve_acct`], which does check.
+///
+/// [`resolve_acct`]: resolve_acct
+///
+/// # Errors
+///
+/// The same failures as [`resolve_acct`]'s lookup steps:
+/// [`WebfingerError::InvalidAcct`] for an unusable handle (no request is
+/// made), [`WebfingerError::Http`] for transport, status and body-size
+/// failures, [`WebfingerError::Malformed`] for a body that is neither
+/// valid JRD (a JSON object) nor valid XRD.
+pub(crate) async fn finger_with_base(
+    http: &HttpClient,
+    acct: &str,
+    scheme_and_authority_override: Option<&str>,
+) -> Result<Value, WebfingerError> {
+    let (response, _domain) = fetch_answer(http, acct, scheme_and_authority_override).await?;
+    full_jrd(&response)
+}
+
+/// The shared half of both reads: the `WebFinger` answer for `acct`, plus
+/// the (lowercased) domain it was looked up on. Every failure — an
+/// unusable handle, a transport or status failure of the direct attempt or
+/// of the host-meta fallback — stops the lookup before any parsing.
+async fn fetch_answer(
+    http: &HttpClient,
+    acct: &str,
+    scheme_and_authority_override: Option<&str>,
+) -> Result<(HttpResponse, String), WebfingerError> {
     let (nickname, domain) = split_acct(acct).ok_or(WebfingerError::InvalidAcct)?;
     let base = scheme_and_authority_override.map_or_else(|| default_base(&domain), str::to_owned);
     let resource = format!("acct:{nickname}@{domain}");
-    let document = match fetch(http, &finger_url(&base, &resource), JRD_JSON).await {
-        Ok(response) => parse_finger_response(&response)?,
+    let response = match fetch(http, &finger_url(&base, &resource), JRD_JSON).await {
+        Ok(response) => response,
         Err(first_error) if should_fall_back(&first_error) => {
             fall_back_to_lrdd(http, first_error, &base, &resource).await?
         }
         Err(first_error) => return Err(first_error),
     };
-    let actor = document.actor_href().ok_or(WebfingerError::NoActorLink)?;
-    verify_round_trip(document.subject.as_deref(), actor, &domain)?;
-    Ok(actor.to_owned())
+    Ok((response, domain))
 }
 
 /// The base the spec fixes for a domain: `https://{domain}` — never a port,
@@ -205,12 +266,11 @@ async fn fall_back_to_lrdd(
     first_error: WebfingerError,
     base: &str,
     resource: &str,
-) -> Result<FingerDocument, WebfingerError> {
+) -> Result<HttpResponse, WebfingerError> {
     let Some(template_url) = lrdd_url_from_host_meta(http, base, resource).await else {
         return Err(first_error);
     };
-    let response = fetch(http, &template_url, JRD_JSON).await?;
-    parse_finger_response(&response)
+    fetch(http, &template_url, JRD_JSON).await
 }
 
 /// The first-attempt failures that justify consulting host-meta (the ticket
@@ -443,6 +503,25 @@ impl FingerLink {
             .map(str::trim)
             .filter(|href| is_http_url(href))
     }
+
+    /// This link as the JRD object an XRD `<Link>` element states: exactly
+    /// the members its attributes carry, under their JSON names (`type` for
+    /// [`link_type`](Self::link_type)).
+    fn jrd_object(&self) -> Value {
+        let mut object = Map::new();
+        for (name, value) in [
+            ("rel", &self.rel),
+            ("type", &self.link_type),
+            ("href", &self.href),
+            ("template", &self.template),
+        ] {
+            if let Some(text) = value {
+                let _set: Option<Value> =
+                    object.insert(name.to_owned(), Value::String(text.clone()));
+            }
+        }
+        Value::Object(object)
+    }
 }
 
 /// Whether a link's declared `type` names an `ActivityPub` JSON document,
@@ -474,6 +553,44 @@ fn parse_finger_response(response: &HttpResponse) -> Result<FingerDocument, Webf
     } else {
         parse_xrd(&body)
     }
+}
+
+/// The whole `WebFinger` answer as a JRD JSON object, chosen by the same
+/// format rules as [`parse_finger_response`]: a JSON body is returned
+/// verbatim (every member it carries survives, and anything that is not a
+/// JSON object is [`WebfingerError::Malformed`]); an XRD body is
+/// normalized through [`jrd_of_xrd`].
+fn full_jrd(response: &HttpResponse) -> Result<Value, WebfingerError> {
+    if answered_json(&response.headers, &response.body) {
+        let document: Value = serde_json::from_slice(&response.body).map_err(note_malformed)?;
+        if document.is_object() {
+            Ok(document)
+        } else {
+            Err(note_malformed(
+                "a webfinger JRD answer is not a JSON object",
+            ))
+        }
+    } else {
+        let body = String::from_utf8(response.body.to_vec()).map_err(note_malformed)?;
+        let document = parse_xrd(&body)?;
+        Ok(jrd_of_xrd(&document))
+    }
+}
+
+/// An XRD answer as the JRD document it states: `{subject?, links[]}`,
+/// every `<Link>` element one object carrying exactly the attributes it
+/// had. The vocabulary XRD has and JRD does not (namespaces, element
+/// ordering, XML syntax) is dropped, as any reader of the JRD shape never
+/// sees it anyway.
+fn jrd_of_xrd(document: &FingerDocument) -> Value {
+    let links: Vec<Value> = document.links.iter().map(FingerLink::jrd_object).collect();
+    let mut object = Map::new();
+    if let Some(subject) = &document.subject {
+        let _set: Option<Value> =
+            object.insert("subject".to_owned(), Value::String(subject.clone()));
+    }
+    let _set: Option<Value> = object.insert("links".to_owned(), Value::Array(links));
+    Value::Object(object)
 }
 
 /// Whether the answer is to be read as JRD JSON: Pleroma's `do_finger`
@@ -790,6 +907,15 @@ mod tests {
         result
     }
 
+    /// Reads the full JRD for `acct` against `app` served on loopback,
+    /// through the scheme-and-authority override.
+    async fn finger_against(app: Router, acct: &str) -> Result<Value, WebfingerError> {
+        let (server, base) = serve(app).await;
+        let result = finger_with_base(&client(), acct, Some(&base)).await;
+        server.abort();
+        result
+    }
+
     /// A router counting the requests it answers and then failing, to prove
     /// a code path never reached it.
     fn counting_failure_route(path: &'static str, hits: &Arc<AtomicUsize>) -> Router {
@@ -876,6 +1002,92 @@ mod tests {
     async fn resolves_an_xrd_answer() {
         let app = static_route("/.well-known/webfinger", Some(XRD_XML), XRD_ALICE);
         assert_actor(resolve_against(app, ACCT).await, ACTOR);
+    }
+
+    #[tokio::test]
+    async fn finger_answers_the_full_jrd_document() {
+        let app = static_route("/.well-known/webfinger", Some(JRD_JSON), JRD_ALICE);
+        let (server, base) = serve(app).await;
+        let document = finger_with_base(&client(), ACCT, Some(&base))
+            .await
+            .expect("the mock answers a JRD document");
+        server.abort();
+        assert_eq!(
+            document["subject"],
+            json!("acct:alice@remote.example"),
+            "the subject survives"
+        );
+        assert_eq!(
+            document["aliases"],
+            json!(["https://remote.example/users/alice"]),
+            "members the actor reader ignores stay in the document"
+        );
+        let links = document["links"].as_array().expect("the links array");
+        assert_eq!(links.len(), 3, "every advertised link, in order");
+        assert_eq!(
+            links[2]["template"],
+            json!("https://remote.example/ostatus_subscribe?acct={uri}"),
+            "the subscribe template is there to read"
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_normalizes_an_xrd_answer_to_jrd() {
+        let app = static_route("/.well-known/webfinger", Some(XRD_XML), XRD_ALICE);
+        let (server, base) = serve(app).await;
+        let document = finger_with_base(&client(), ACCT, Some(&base))
+            .await
+            .expect("an XRD answer normalizes");
+        server.abort();
+        assert_eq!(
+            document,
+            json!({
+                "subject": "acct:alice@remote.example",
+                "links": [
+                    {"rel": "http://webfinger.net/rel/profile-page",
+                     "type": "text/html",
+                     "href": "https://remote.example/@alice"},
+                    {"rel": "self",
+                     "type": "application/activity+json",
+                     "href": "https://remote.example/users/alice"},
+                ],
+            }),
+            "each <Link> becomes exactly the object its attributes state"
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_rejects_a_json_answer_that_is_no_object() {
+        let app = static_route("/.well-known/webfinger", Some(JRD_JSON), "[]");
+        let error = finger_against(app, ACCT).await.unwrap_err();
+        assert!(
+            matches!(error, WebfingerError::Malformed),
+            "a JRD document is a JSON object: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_fails_an_unusable_handle_before_any_request() {
+        let error = finger_with_base(&client(), "alice", None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, WebfingerError::InvalidAcct),
+            "no handle, no request: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finger_falls_back_to_the_host_meta_template_too() {
+        let app = status_route("/.well-known/webfinger", StatusCode::NOT_FOUND)
+            .merge(host_meta_route(false))
+            .merge(static_route("/lrdd", Some(JRD_JSON), JRD_ALICE));
+        let (server, base) = serve(app).await;
+        let document = finger_with_base(&client(), ACCT, Some(&base))
+            .await
+            .expect("the template answer is a full document");
+        server.abort();
+        assert_eq!(document["subject"], json!("acct:alice@remote.example"));
     }
 
     #[tokio::test]

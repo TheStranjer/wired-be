@@ -300,8 +300,10 @@ async fn wait_for_ctrl_c() {
 /// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
 /// [`api::html_pages`] (`/frontend_switcher`, `/embed/{id}`,
-/// `/notice/{id}/embed_player` and `/mailer/unsubscribe/{token}`). Paths
-/// no route matches get the standard JSON error response (decision 8).
+/// `/notice/{id}/embed_player` and `/mailer/unsubscribe/{token}`) and the
+/// remote-interaction pages of [`api::remote_interaction`]
+/// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`).
+/// Paths no route matches get the standard JSON error response (decision 8).
 ///
 /// `state` is handed to [`api::router`] and [`api::oauth::router`] before
 /// it is consumed: the registration routes those build mount the rate
@@ -326,6 +328,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::emoji_packs::files_router())
             .merge(api::misc::router())
             .merge(api::html_pages::router())
+            .merge(api::remote_interaction::router())
             .fallback(not_found)
             .with_state(state),
     )
