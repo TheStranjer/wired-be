@@ -506,14 +506,16 @@ async fn local_emoji(pool: &PgPool, shortcode: &str) -> AppResult<Option<CustomE
 /// author of a new reaction — and its withdrawal, when the reaction is
 /// taken back — runs through here, landed from
 /// [`notify::on_reaction_changed`] (Pleroma's `EmojiReact` notification
-/// arm, whose potential receiver is the object's actor alone).
-///
-/// The federation ticket that sends an `EmojiReact` activity (and its
-/// `Undo`, when a reaction is withdrawn) wires the delivery in here too —
-/// the activity to send is [`ReactionRow::ap_id`], the triple it names is
-/// [`ReactionRow::user_id`], [`ReactionRow::status_id`] and
-/// [`ReactionRow::emoji`], and the queueing happens through `state`
-/// (decision 11). The same hook is where Pleroma's
+/// arm, whose potential receiver is the object's actor alone). The inbound
+/// `EmojiReact` handler runs it too
+/// ([`crate::federation::handlers::interactions`]): a mirrored remote
+/// reaction tells the local author exactly as a local one does, and the
+/// reaction's `Undo` takes that telling back. The federation ticket that
+/// sends an `EmojiReact` activity (and its `Undo`, when a reaction is
+/// withdrawn) wires the delivery in here too — the activity to send is
+/// [`ReactionRow::ap_id`], the triple it names is [`ReactionRow::user_id`],
+/// [`ReactionRow::status_id`] and [`ReactionRow::emoji`], and the queueing
+/// happens through `state` (decision 11). The same hook is where Pleroma's
 /// `pleroma:emoji_reaction` socket broadcast will land.
 ///
 /// `reacting` states which way the write moved the fact: `true` for the reaction
@@ -523,7 +525,11 @@ async fn local_emoji(pool: &PgPool, shortcode: &str) -> AppResult<Option<CustomE
 /// withdrawal that found no row to remove never reaches this hook.
 ///
 /// [`notify::on_reaction_changed`]: crate::services::notify::on_reaction_changed
-async fn after_reaction_changed(state: &AppState, reaction: &ReactionRow, reacting: bool) {
+pub(crate) async fn after_reaction_changed(
+    state: &AppState,
+    reaction: &ReactionRow,
+    reacting: bool,
+) {
     notify::on_reaction_changed(state, reaction, reacting).await;
 }
 

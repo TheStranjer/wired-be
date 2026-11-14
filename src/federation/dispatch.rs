@@ -449,9 +449,30 @@ impl Handlers {
         None
     }
 
-    /// Whether the `Create` sub-registry claims `object_type` — the read
-    /// the handler modules' own tests use to check what they registered
-    /// without reaching into the table.
+    /// Whether the by-name table claims `kind` — the
+    /// [`handles_create`] question asked of the plain routes, by the
+    /// handler modules that register them.
+    ///
+    /// [`handles_create`]: Self::handles_create
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn handles(&self, kind: &str) -> bool {
+        self.by_type.contains_key(kind)
+    }
+
+    /// Whether the `Undo` table claims the inner activity type `kind` — the
+    /// [`handles`] question one level deeper, for the withdrawal routes.
+    ///
+    /// [`handles`]: Self::handles
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn handles_undo(&self, kind: &str) -> bool {
+        self.undo_by_type.contains_key(kind)
+    }
+
+    /// Whether the `Create` sub-registry claims `object_type` — the
+    /// [`handles_create`](Self::handles_create) question for the create
+    /// routes, asked by the handler modules that register them.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn handles_create(&self, object_type: &str) -> bool {
@@ -1335,91 +1356,68 @@ mod tests {
         );
     }
 
-    /// The live registry holds the actor and misc routes, the note-create
-    /// routes, the chat routes and the poll-vote pre-check and nothing else:
-    /// `Block`/`Flag`/`Add`/`Remove`/`Move` route by their own names and the
-    /// `Undo` table holds the withdrawal of a `Block`, the `Update` table is
-    /// keyed by the five actor object types plus the note family's editable
-    /// four, `Delete` runs through the object-type entries the chat and note
-    /// handlers claim and the fallback that resolves an object id, and the
-    /// `Create` table is keyed by the eight `Note`-family object types the
-    /// parser accepts plus the chat handler's `ChatMessage`, with the poll
-    /// ticket's guard running ahead of the `Note` entry it shares with the
-    /// note handler. The tables are also the entry points later tickets add
-    /// their own keys to.
+    /// The live registry: `Block`/`Flag`/`Add`/`Remove`/`Move` and
+    /// `Like`/`EmojiReact`/`Announce` route by their own names, the `Undo`
+    /// table holds the withdrawals of a `Block` and of the three
+    /// interactions, the `Update` table is keyed by the five actor object
+    /// types plus the note family's editable four, `Delete` runs through
+    /// the object-type entries the chat and note handlers claim and the
+    /// fallback that resolves an object id, and the `Create` table is keyed
+    /// by the eight `Note`-family object types the parser accepts plus the
+    /// chat handler's `ChatMessage`, with the poll ticket's guard running
+    /// ahead of the `Note` entry it shares with the note handler. The
+    /// tables are also the entry points later tickets add their own keys to.
+    /// A registry table's keys in order, for the set-equality read of
+    /// [`assert_table`].
+    fn table_keys<V>(map: &HashMap<&'static str, V>) -> Vec<&'static str> {
+        let mut keys = map.keys().copied().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// A registry table holds exactly the space-separated names `want`:
+    /// every entry point claimed by one handler and none more — the set
+    /// itself is the contract the registered tickets promise.
+    fn assert_table<V>(map: &HashMap<&'static str, V>, want: &str, why: &str) {
+        let mut want = want.split(' ').collect::<Vec<_>>();
+        want.sort_unstable();
+        assert_eq!(table_keys(map), want, "{why}");
+    }
+
     #[test]
     fn the_live_registry_holds_the_registered_routes() {
         let handlers = Handlers::default();
-        for kind in ["Block", "Flag", "Add", "Remove", "Move"] {
-            assert!(
-                handlers.by_type.contains_key(kind),
-                "{kind} routes to the misc handler by its own name"
-            );
-        }
-        assert_eq!(
-            handlers.by_type.len(),
-            5,
-            "the misc types only: the create and follow tickets add `Create`, `Follow` and the rest"
+        assert_table(
+            &handlers.by_type,
+            "Add Announce Block EmojiReact Flag Like Move Remove",
+            "the misc five plus the interaction trio, and nothing further: \
+             `Create`, `Follow` and the rest ride the other tables",
         );
-        assert!(
-            handlers.undo_by_type.contains_key("Block"),
-            "an Undo of a Block routes to the misc handler"
+        assert_table(
+            &handlers.undo_by_type,
+            "Announce Block EmojiReact Like",
+            "the misc withdrawal plus the interaction trio's own",
         );
-        assert_eq!(
-            handlers.undo_by_type.len(),
-            1,
-            "and no withdrawal routes further yet"
+        assert_table(
+            &handlers.update_by_object_type,
+            "Application Article Group Note Organization Page Person Question Service",
+            "the actor objects plus the note family's editable four",
         );
-        for object_type in ["Person", "Service", "Group", "Organization", "Application"] {
-            assert!(
-                handlers.update_by_object_type.contains_key(object_type),
-                "an Update of a {object_type} folds through the actor handler"
-            );
-        }
-        for object_type in ["Note", "Question", "Article", "Page"] {
-            assert!(
-                handlers.update_by_object_type.contains_key(object_type),
-                "an Update of a {object_type} folds through the note-edit handler"
-            );
-        }
-        assert_eq!(
-            handlers.update_by_object_type.len(),
-            9,
-            "the actor objects plus the note family's editable four"
-        );
-        assert!(
-            handlers.delete_by_object_type.contains_key("ChatMessage"),
-            "a Delete of an embedded `ChatMessage` withdraws through the chat handler"
-        );
-        for object_type in ["Note", "Question", "Article", "Page", "Tombstone"] {
-            assert!(
-                handlers.delete_by_object_type.contains_key(object_type),
-                "a Delete of an embedded `{object_type}` withdraws through the note handler"
-            );
-        }
-        assert_eq!(
-            handlers.delete_by_object_type.len(),
-            6,
-            "the chat entry plus the note family's deletable five"
+        assert_table(
+            &handlers.delete_by_object_type,
+            "Article ChatMessage Note Page Question Tombstone",
+            "the chat entry plus the note family's deletable five",
         );
         assert!(
             handlers.delete_fallback.is_some(),
             "the Delete fallback is registered: it is what tells a peer deleting itself from one deleting a post"
         );
-        for object_type in crate::federation::note_parser::OBJECT_TYPES {
-            assert!(
-                handlers.create_by_object_type.contains_key(object_type),
-                "a Create of a {object_type} folds through the note-ingest handler"
-            );
-        }
-        assert!(
-            handlers.create_by_object_type.contains_key("ChatMessage"),
-            "and a Create of a `ChatMessage` folds through the chat handler"
-        );
-        assert_eq!(
-            handlers.create_by_object_type.len(),
-            crate::federation::note_parser::OBJECT_TYPES.len() + 1,
-            "the note family plus the chat ticket's key: later tickets (polls) add their own"
+        let mut create = crate::federation::note_parser::OBJECT_TYPES.to_vec();
+        create.push("ChatMessage");
+        assert_table(
+            &handlers.create_by_object_type,
+            &create.join(" "),
+            "the note family plus the chat ticket's key: later tickets (polls) add their own",
         );
         assert!(
             handlers.pre_checks_create("Note"),
