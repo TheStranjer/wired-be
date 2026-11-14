@@ -111,16 +111,19 @@ const DELETE_TYPE: &str = "Delete";
 const CREATE_TYPE: &str = "Create";
 
 /// Activity types whose `object` is by design a reference to content that
-/// lives somewhere else — someone else's note, actor, or custom emoji —
-/// so the containment rule of the embedded object's host does not apply
-/// to them. Pleroma's `Transmogrifier` and `ObjectValidators` treat
-/// exactly these as the activities that legitimately speak about foreign
-/// objects.
-const FOREIGN_OBJECT_TYPES: [&str; 10] = [
+/// lives somewhere else — someone else's note, actor, or custom emoji, or,
+/// for the follow handshake's `Accept` and `Reject`, our *own* activity
+/// handed back by the remote peer — so the containment rule of the embedded
+/// object's host does not apply to them. Pleroma's `Transmogrifier` and
+/// `ObjectValidators` treat exactly these as the activities that
+/// legitimately speak about foreign objects.
+const FOREIGN_OBJECT_TYPES: [&str; 12] = [
     "Announce",
     "Like",
     "EmojiReact",
     "Follow",
+    "Accept",
+    "Reject",
     "Block",
     "Flag",
     "Undo",
@@ -1357,9 +1360,10 @@ mod tests {
     }
 
     /// The live registry: `Block`/`Flag`/`Add`/`Remove`/`Move` and
-    /// `Like`/`EmojiReact`/`Announce` route by their own names, the `Undo`
-    /// table holds the withdrawals of a `Block` and of the three
-    /// interactions, the `Update` table is keyed by the five actor object
+    /// `Like`/`EmojiReact`/`Announce` route by their own names, the follow
+    /// handshake's `Follow`/`Accept`/`Reject` join them and the `Undo` table
+    /// holds the withdrawals of a `Block`, of the three interactions and of a
+    /// `Follow`, the `Update` table is keyed by the five actor object
     /// types plus the note family's editable four, `Delete` runs through
     /// the object-type entries the chat and note handlers claim and the
     /// fallback that resolves an object id, and the `Create` table is keyed
@@ -1389,14 +1393,14 @@ mod tests {
         let handlers = Handlers::default();
         assert_table(
             &handlers.by_type,
-            "Add Announce Block EmojiReact Flag Like Move Remove",
-            "the misc five plus the interaction trio, and nothing further: \
-             `Create`, `Follow` and the rest ride the other tables",
+            "Accept Add Announce Block EmojiReact Flag Follow Like Move Reject Remove",
+            "the misc five, the interaction trio, the follow handshake's three, \
+             and nothing further: `Create` and the rest ride the other tables",
         );
         assert_table(
             &handlers.undo_by_type,
-            "Announce Block EmojiReact Like",
-            "the misc withdrawal plus the interaction trio's own",
+            "Announce Block EmojiReact Follow Like",
+            "the misc withdrawal, the interaction trio's own, and the follow handshake's",
         );
         assert_table(
             &handlers.update_by_object_type,
@@ -2556,9 +2560,10 @@ mod tests {
     }
 
     /// The registered job handler drives the same pipeline
-    /// [`handle_incoming`] does: over the live registry a real `Follow` — a
-    /// type no handler module has claimed — runs containment, claims its
-    /// ledger row, and completes as an unknown-type ignore.
+    /// [`handle_incoming`] does: over the live registry a real `Follow` of
+    /// an account this instance does not store — a delivery the follow
+    /// handler claims and then ignores — runs containment, claims its
+    /// ledger row, and completes.
     #[tokio::test]
     async fn the_job_handler_drives_the_pipeline() {
         let db = crate::test_db::test_db().await.expect("test database slot");

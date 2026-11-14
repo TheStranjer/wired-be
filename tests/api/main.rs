@@ -120,6 +120,14 @@ mod follow_actions;
 /// (`POST /api/v1/follows`).
 mod follow_by_uri;
 
+/// Inbound follow handshake over federation (WBE-168): the dispatcher
+/// folding a peer's `Follow`, `Accept`, `Reject` and `Undo`(of a `Follow`)
+/// — grants with an `Accept` delivery, blocked pairs answered with a
+/// `Reject`, our own pending follows answered by the followee, withdrawals
+/// and duplicates — onto this instance's rows, counters, tellings and
+/// delivery queue (`src/federation/handlers/follow.rs`).
+mod follow_federation;
+
 /// The follower and following lists of an account.
 mod follow_lists;
 

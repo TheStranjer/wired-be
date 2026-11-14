@@ -10,7 +10,9 @@
 //! remote account, [`misc`] for the `Block` (+`Undo`), `Flag`, `Add`,
 //! `Remove` and `Move` that ride beside them, [`interactions`] for the
 //! `Like`, `EmojiReact` and `Announce` (and their `Undo`s) that land on a
-//! status, with the create and note tickets adding their files in turn.
+//! status, [`follow`] for the `Follow`, `Accept`, `Reject` and `Undo` of a
+//! `Follow` that carry the follow handshake across the wire, with the
+//! create and note tickets adding their files in turn.
 //!
 //! A handler is a plain
 //! [`HandlerFn`](crate::federation::dispatch::HandlerFn): it gets the shared
@@ -29,6 +31,7 @@
 pub mod actor;
 pub mod chat;
 pub mod create;
+pub mod follow;
 pub mod interactions;
 pub mod misc;
 pub mod note;
@@ -50,6 +53,7 @@ pub fn registry() -> Handlers {
     actor::register(&mut handlers);
     misc::register(&mut handlers);
     interactions::register(&mut handlers);
+    follow::register(&mut handlers);
     create::register(&mut handlers);
     chat::register(&mut handlers);
     vote::register(&mut handlers);
