@@ -26,6 +26,7 @@
 pub mod account_note;
 pub mod activity;
 pub mod announcement;
+pub mod backup;
 pub mod block;
 pub mod bookmark;
 pub mod bookmark_folder;

@@ -85,7 +85,11 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// [`imports::KIND_MUTES`](jobs::imports::KIND_MUTES)), the account
 /// deletion jobs ([`deletion::KIND_DELETE`](jobs::deletion::KIND_DELETE)
 /// and the remote mirror's
-/// [`KIND_DELETE_REMOTE`](jobs::deletion::KIND_DELETE_REMOTE)),
+/// [`KIND_DELETE_REMOTE`](jobs::deletion::KIND_DELETE_REMOTE)), the
+/// account backup jobs — the archive run of a request
+/// ([`backups.run`](api::backups::KIND_RUN), [`jobs::backups::handle_run`])
+/// and its daily expiry sweep
+/// ([`backups.purge`](jobs::backups::KIND_PURGE)) —,
 /// the Web Push delivery job
 /// ([`web_push::KIND_DELIVER`](jobs::web_push::KIND_DELIVER)), the poll-end
 /// notification sweep ([`KIND_END_NOTIFY`](jobs::polls::KIND_END_NOTIFY))
@@ -245,6 +249,8 @@ fn job_registry() -> JobRegistry {
         jobs::deletion::KIND_DELETE_REMOTE,
         jobs::deletion::handle_delete_remote,
     );
+    registry.register(api::backups::KIND_RUN, jobs::backups::handle_run);
+    registry.register(jobs::backups::KIND_PURGE, jobs::backups::handle_purge);
     registry.register(jobs::statuses::KIND_EXPIRE, jobs::statuses::handle_expire);
     registry.register(jobs::statuses::KIND_SWEEP, jobs::statuses::handle_sweep);
     registry.register(

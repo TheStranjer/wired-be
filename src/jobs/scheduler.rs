@@ -9,7 +9,8 @@
 //! dismissed-notification sweep, the hourly
 //! OAuth/MFA/password-reset token sweep, the daily jobs-table prune, the
 //! daily deleted-local-status purge, the six-hourly orphaned-local-media
-//! sweep and the daily received-activity-ledger prune; later tickets
+//! sweep, the daily received-activity-ledger prune and the daily
+//! backup-expiry purge; later tickets
 //! append one line per entry), and [`run`] ticks every
 //! ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
@@ -114,7 +115,12 @@ pub struct PeriodicJob {
 /// ([`federation.cleanup_received`](crate::federation::dispatch::KIND_CLEANUP_RECEIVED))
 /// shares it too: past two weeks an id is beyond any inbox retry chain
 /// still running, so the period only decides how long the bookkeeping row
-/// outlives the redeliveries it guards against.
+/// outlives the redeliveries it guards against. The daily purge of the
+/// account backups past their validity window
+/// ([`backups.purge`](super::backups::KIND_PURGE)) shares it too: past
+/// the configured window an archive is its owner's no longer, so the
+/// period only decides how long the stored file and its row outlive that
+/// window.
 #[must_use]
 pub fn periodic_jobs() -> Vec<PeriodicJob> {
     vec![
@@ -163,6 +169,11 @@ pub fn periodic_jobs() -> Vec<PeriodicJob> {
         },
         PeriodicJob {
             kind: crate::federation::dispatch::KIND_CLEANUP_RECEIVED,
+            queue: super::QUEUE_BACKGROUND,
+            every: Duration::from_hours(24),
+        },
+        PeriodicJob {
+            kind: super::backups::KIND_PURGE,
             queue: super::QUEUE_BACKGROUND,
             every: Duration::from_hours(24),
         },

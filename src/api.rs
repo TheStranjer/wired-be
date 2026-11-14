@@ -50,6 +50,7 @@ pub mod accounts;
 pub mod activitypub;
 pub mod announcements;
 pub mod apps;
+pub mod backups;
 pub mod blocks;
 pub mod chats;
 pub mod conversations;

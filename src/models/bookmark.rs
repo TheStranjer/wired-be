@@ -31,7 +31,9 @@
 //! [`page_for_user`] pages the statuses behind one account's bookmarks for
 //! `GET /api/v1/bookmarks`.
 //! Both key on the *bookmark row id* — the `UUIDv7` the client's cursors
-//! and `Link` header walk, not the joined row's.
+//! and `Link` header walk, not the joined row's. A third read,
+//! [`backup_page`], walks the same id the other way for the export job in
+//! [`crate::jobs::backups`].
 //!
 //! [`Bookmark::folder_id`] is filed by the folders ticket: the write takes
 //! the folder it names (a repeat **restates** it, so a re-bookmark with a
@@ -92,6 +94,17 @@ const FLAGGED_IDS_SQL: &str = "SELECT status_id, folder_id FROM bookmarks
 /// the folder clause and the keyset it then append run on `b.folder_id`
 /// and the bookmark id `b.id`.
 const BOOKMARKS_PAGE_SQL: &str = "SELECT b.* FROM bookmarks b
+     WHERE b.user_id = ";
+
+/// [`backup_page`]: one account's bookmarks walked in bookmark id order,
+/// each row joined to its status so the archive item is the bookmarked
+/// object's `uri` rather than an id the caller must look up again. Like
+/// [`BOOKMARKS_PAGE_SQL`] the text stops where its one placeholder
+/// belongs, because that is where [`backup_page`] pushes the author's id
+/// bind; the function then appends the `after` cursor, the ascending
+/// ordering and the `LIMIT` on `b.id`.
+const BACKUP_PAGE_SQL: &str = "SELECT b.id, s.uri FROM bookmarks b
+    JOIN statuses s ON s.id = b.status_id
      WHERE b.user_id = ";
 
 /// One row of `bookmarks`: `user_id` bookmarked `status_id`.
@@ -268,6 +281,43 @@ pub async fn page_for_user(
             Some((bookmark, status))
         })
         .collect())
+}
+
+/// One ascending page of `user_id`'s bookmarks for the backup archive
+/// ([`crate::jobs::backups`]).
+///
+/// Each entry is the bookmark row's id — the keyset cursor the export
+/// walks, exactly as [`page_for_user`] keys its pages on the bookmark
+/// id — and the bookmarked status's `uri`, the item the archive lists. A
+/// bookmark whose status row is gone entirely (hard-deleted, cascaded)
+/// contributes nothing; a soft-deleted one still rides along, its reserved
+/// `uri` part of the account's history. `after`, when given, admits only
+/// rows with a strictly greater bookmark id, at `limit` at a time, so the
+/// whole walk costs pages of at most `limit` rows.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn backup_page(
+    pool: &PgPool,
+    user_id: Uuid,
+    after: Option<Uuid>,
+    limit: i64,
+) -> AppResult<Vec<(Uuid, String)>> {
+    let mut builder = QueryBuilder::<Postgres>::new(BACKUP_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(user_id);
+    if let Some(after) = after {
+        let _newer: &mut _ = builder.push(" AND b.id > ").push_bind(after);
+    }
+    let _paged: &mut _ = builder.push(" ORDER BY b.id ASC LIMIT ").push_bind(limit);
+    let rows = builder
+        .build_query_as::<(Uuid, String)>()
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// One keyset page of `user_id`'s bookmarks, optionally narrowed to

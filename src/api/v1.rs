@@ -6,10 +6,10 @@ use axum::Router;
 
 use crate::{
     api::{
-        account_lists, accounts, announcements, apps, blocks, chats, conversations, custom_emojis,
-        domain_blocks, emoji_packs, emoji_reactions, endorsements, filters, follow_requests,
-        instance, lists, markers, media, misc, mutes, notifications, oauth_tokens, password_reset,
-        pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push,
+        account_lists, accounts, announcements, apps, backups, blocks, chats, conversations,
+        custom_emojis, domain_blocks, emoji_packs, emoji_reactions, endorsements, filters,
+        follow_requests, instance, lists, markers, media, misc, mutes, notifications, oauth_tokens,
+        password_reset, pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push,
         remote_interaction, reports, scheduled_statuses, scrobbles, search, statuses, streaming,
         tags, timelines,
     },
@@ -71,6 +71,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(timelines::router())
         .nest("/pleroma", misc::util_router())
         .nest("/pleroma/apps", oauth_tokens::apps_router())
+        .nest("/pleroma/backups", backups::router())
         .nest(
             "/pleroma/bookmark_folders",
             pleroma_bookmark_folders::router(),
