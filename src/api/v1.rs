@@ -9,8 +9,9 @@ use crate::{
         account_lists, accounts, announcements, apps, blocks, chats, conversations, custom_emojis,
         domain_blocks, emoji_packs, emoji_reactions, endorsements, filters, follow_requests,
         instance, lists, markers, media, misc, mutes, notifications, oauth_tokens, password_reset,
-        pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push, reports,
-        scheduled_statuses, scrobbles, search, statuses, streaming, tags, timelines,
+        pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push,
+        remote_interaction, reports, scheduled_statuses, scrobbles, search, statuses, streaming,
+        tags, timelines,
     },
     state::AppState,
 };
@@ -59,6 +60,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(pleroma_settings::router(&state.config))
         .merge(polls::router(state))
         .merge(push::router())
+        .merge(remote_interaction::pleroma_router())
         .merge(reports::router(state))
         .merge(scheduled_statuses::router())
         .merge(scrobbles::router())
