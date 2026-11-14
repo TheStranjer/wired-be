@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(rejection(json!({})), NAME_BLANK, "absent is blank");
         for value in [json!(""), json!("   ")] {
             assert_eq!(
-                rejection(json!({"name": value.clone()})),
+                rejection(json!({"name": value})),
                 NAME_BLANK,
                 "`{value}` is blank"
             );

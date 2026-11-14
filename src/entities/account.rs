@@ -734,23 +734,20 @@ pub(crate) fn full_nickname(user: &User, config: &Config) -> String {
 /// are skipped, and stored jsonb of any other shape renders as the empty
 /// list, so malformed storage never fails a response.
 fn fields_from_json(stored: &Value) -> Vec<Field> {
-    stored
-        .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| {
-                    let name = entry.get("name").and_then(Value::as_str)?;
-                    let value = entry.get("value").and_then(Value::as_str)?;
-                    Some(Field {
-                        name: name.to_owned(),
-                        value: value.to_owned(),
-                        verified_at: None,
-                    })
+    stored.as_array().map_or_default(|entries| {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.get("name").and_then(Value::as_str)?;
+                let value = entry.get("value").and_then(Value::as_str)?;
+                Some(Field {
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                    verified_at: None,
                 })
-                .collect()
-        })
-        .unwrap_or_default()
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]

@@ -366,7 +366,7 @@ mod tests {
     fn an_unknown_visibility_is_rejected() {
         for value in [json!(""), json!("local"), json!("Public"), json!(" public")] {
             assert_eq!(
-                rejection(json!({"title": "x", "visibility": value.clone()})),
+                rejection(json!({"title": "x", "visibility": value})),
                 VISIBILITY_INVALID,
                 "`{value}` is not a scrobble visibility"
             );
@@ -377,7 +377,7 @@ mod tests {
     fn a_blank_or_absent_title_is_rejected() {
         for value in [json!(null), json!(""), json!("   ")] {
             assert_eq!(
-                rejection(json!({"title": value.clone()})),
+                rejection(json!({"title": value})),
                 TITLE_BLANK,
                 "`{value}` is a blank title"
             );
@@ -481,7 +481,7 @@ mod tests {
         ] {
             let err = crate::extract::into_params::<ScrobbleParams>(json!({
                 "title": "x",
-                "length": value.clone(),
+                "length": value,
             }))
             .expect_err(&format!("`{value}` is no millisecond count"));
             assert!(

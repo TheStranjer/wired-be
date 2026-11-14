@@ -1789,8 +1789,7 @@ mod tests {
             .await
             .expect("the batch read works");
         map.get(&status_id)
-            .map(|users| users.iter().map(|user| user.id).collect())
-            .unwrap_or_default()
+            .map_or_default(|users| users.iter().map(|user| user.id).collect())
     }
 
     #[tokio::test]
@@ -1882,8 +1881,7 @@ mod tests {
             .await
             .expect("the batch read works");
         map.get(&status_id)
-            .map(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
-            .unwrap_or_default()
+            .map_or_default(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
     }
 
     #[tokio::test]

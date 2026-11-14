@@ -91,9 +91,10 @@ pub enum Audience {
 /// entity, and its `Streamer` renders in the socket process per user; the
 /// status emitters of [`crate::services::streaming`] publish
 /// [`RenderSpec::Status`] with an empty payload and
-/// [`crate::api::streaming`] renders the hinted status for each socket's
-/// reader. The other variants stay hints until their producers' slices
-/// land.
+/// [`crate::api::streaming`] renders each hinted entity — status,
+/// notification or chat — for its own socket's reader at send time. The
+/// notification and chat producers' slices still have to land; the framing
+/// answers their hints in the meantime.
 ///
 /// The variants serialize to `{"status": "<uuid>"}`,
 /// `{"notification": "<uuid>"}` and `{"chat": "<uuid>"}`: `snake_case`
@@ -106,7 +107,8 @@ pub enum RenderSpec {
     Status(Uuid),
     /// The event points at the notification with this id.
     Notification(Uuid),
-    /// The event points at the chat message with this id.
+    /// The event points at the chat with this id — each reader's own row
+    /// of the conversation, which is what the socket renders.
     Chat(Uuid),
 }
 

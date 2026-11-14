@@ -778,7 +778,7 @@ mod tests {
             json!({"scope": 7}),
         ] {
             let bad = OauthLoginState {
-                params: broken.clone(),
+                params: broken,
                 ..pending.clone()
             };
             let err = StoredParams::of_state(&bad)

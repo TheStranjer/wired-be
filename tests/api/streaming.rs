@@ -1042,6 +1042,61 @@ async fn a_created_public_status_reaches_public_and_home_then_deletes() {
     }
 }
 
+/// The send-time render over a real socket: creating a public status
+/// publishes its `RenderSpec::Status` hint, and each connection renders
+/// the entity for its OWN viewer at send time. A plain subscriber on
+/// `public` receives the full entity JSON in the frame; a subscriber who
+/// blocked the author receives nothing of it — only the control event
+/// published after, which proves its socket is open and streaming.
+#[tokio::test]
+async fn a_created_status_renders_for_one_subscriber_and_skips_a_blocker() {
+    let server = Server::start().await;
+    let author = account(server.pool(), "render-author").await;
+    let subscriber = account(server.pool(), "render-subscriber").await;
+    let blocker = account(server.pool(), "render-blocker").await;
+    let _blocked = block::block(
+        server.pool(),
+        &server.state.config.base_url,
+        &blocker,
+        &author,
+    )
+    .await
+    .expect("the block fixture writes");
+    let seen_token = token(server.pool(), &subscriber, "read").await;
+    let blind_token = token(server.pool(), &blocker, "read").await;
+    let mut watcher = open(&server.url(&format!("stream=public&access_token={seen_token}"))).await;
+    let mut skipped = open(&server.url(&format!("stream=public&access_token={blind_token}"))).await;
+    settled(&mut watcher).await;
+    settled(&mut skipped).await;
+
+    let entity =
+        create_status::create_status(&server.state, &author, None, create_body(LIFECYCLE_TEXT))
+            .await
+            .expect("the create service runs");
+
+    let frame = next_json(&mut watcher).await;
+    assert_update_carries(&frame, &entity.id);
+    let payload: Value = serde_json::from_str(
+        frame["payload"]
+            .as_str()
+            .expect("the update carries a payload string"),
+    )
+    .expect("the payload is the entity JSON");
+    assert_eq!(
+        payload["account"]["id"],
+        json!(author.id.to_string()),
+        "the rendered entity carries the author's account"
+    );
+
+    server.publish(public_update("render-control"));
+    let frames = read_until(&mut skipped, "render-control").await;
+    assert_absent(&frames, &[&entity.id, LIFECYCLE_TEXT]);
+    assert!(
+        frames.iter().any(|line| line.contains("render-control")),
+        "the blocker's socket goes on streaming after the dropped hint: {frames:?}"
+    );
+}
+
 /// The next text frame, parsed as Mastodon's JSON envelope.
 async fn next_json(client: &mut Client) -> Value {
     serde_json::from_str(&next_text(client).await).expect("every streaming frame is JSON")
