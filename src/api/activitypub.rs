@@ -165,7 +165,10 @@ use crate::{
         multipart::{MultipartForm, upload_body_limit},
     },
     federation::{
-        activities::{EmojiReactContext, block_json, emoji_react_json, follow_json, like_json},
+        activities::{
+            AS_PUBLIC, EmojiReactContext, ObjectActivityContext, activity_id, block_json,
+            emoji_react_json, follow_json, like_json,
+        },
         actor::actor_json,
         authorized_fetch::{fetch_allowed, fetch_signer},
         collections::{self, FollowSide},
@@ -827,16 +830,37 @@ fn relation_json(state: &AppState, resolved: &LocalActivity) -> AppResult<Value>
     let object = resolved.object_ap_id.as_str();
     let published = &resolved.inserted_at;
     match resolved.kind {
-        LocalActivityKind::Like => Ok(like_json(config, id, actor, object, published)),
+        // The served relation document keeps this module's public-address
+        // convention: what the outbound hooks delivered is their own
+        // addressing, computed from the acted-on status.
+        LocalActivityKind::Like => {
+            let to = [AS_PUBLIC];
+            let cc: [&str; 0] = [];
+            let document = activity_id(config, id);
+            Ok(like_json(&ObjectActivityContext {
+                config,
+                id: &document,
+                actor_ap_id: actor,
+                object_uri: object,
+                to: &to,
+                cc: &cc,
+                published,
+            }))
+        }
         LocalActivityKind::EmojiReact => {
             let Some(emoji) = resolved.emoji.as_deref() else {
                 return Err(AppError::RouteNotFound);
             };
+            let to = [AS_PUBLIC];
+            let cc: [&str; 0] = [];
+            let document = activity_id(config, id);
             let context = EmojiReactContext {
                 config,
-                id,
+                id: &document,
                 actor_ap_id: actor,
                 object_uri: object,
+                to: &to,
+                cc: &cc,
                 emoji,
                 emoji_url: resolved.emoji_url.as_deref(),
                 published,
