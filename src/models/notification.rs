@@ -82,6 +82,9 @@ pub const TYPE_POLL: &str = "poll";
 pub const TYPE_STATUS: &str = "status";
 /// The update type: a post the recipient boosted was edited. Ungrouped.
 pub const TYPE_UPDATE: &str = "update";
+/// The move type: an account the recipient follows moved to a new actor
+/// (Mastodon's `move`). Ungrouped.
+pub const TYPE_MOVE: &str = "move";
 
 /// The types the grouped API merges across notifications.
 ///

@@ -6,7 +6,7 @@
 //! ends in one telling of the affected local account, with the same rules
 //! Pleroma's `skip?` list applies. This module is the single place those
 //! tellings are decided, and the action hooks in [`crate::api`] and
-//! [`crate::services`] are thin landings that call exactly one of its ten
+//! [`crate::services`] are thin landings that call exactly one of its eleven
 //! functions:
 //!
 //! - [`on_follow`] — the follow endpoint's telling: `follow` when the
@@ -48,6 +48,10 @@
 //!   author is told `pleroma:emoji_reaction` naming the emoji, and the
 //!   withdrawal takes exactly that telling back (one emoji's row, not the
 //!   other emoji's on the same status).
+//! - [`on_move`] — the inbound `Move` handler's telling: every local
+//!   follower whose relationship a departing remote account's move was
+//!   applied to is told `move`, the *old* account as actor (Mastodon's
+//!   `move` notification: the account they followed is now elsewhere).
 //!
 //! Every creation runs through [`notification::maybe_notify`], so the
 //! recipient's `block_from_strangers` setting withholds what it withholds
@@ -87,8 +91,8 @@ use crate::{
         mention,
         notification::{
             self, NewNotification, TYPE_EMOJI_REACTION, TYPE_FAVOURITE, TYPE_FOLLOW,
-            TYPE_FOLLOW_REQUEST, TYPE_MENTION, TYPE_POLL, TYPE_REBLOG, TYPE_STATUS, TYPE_UPDATE,
-            Telling,
+            TYPE_FOLLOW_REQUEST, TYPE_MENTION, TYPE_MOVE, TYPE_POLL, TYPE_REBLOG, TYPE_STATUS,
+            TYPE_UPDATE, Telling,
         },
         poll::{self, Poll as PollRow},
         status::{self, Status as StatusRow, Visibility},
@@ -717,6 +721,29 @@ async fn reaction_telling(
         },
     )
     .await
+}
+
+/// The inbound `Move` handler's telling, run by
+/// [`crate::federation::handlers::misc`] for every local follower whose
+/// relationship the migration was applied to.
+///
+/// The follower is told `move` with the **old** account as actor (Mastodon's
+/// `move` notification: the account they followed declared a new one, and
+/// this instance moved them). The migration's new follow tells no `follow`:
+/// the endpoint's [`on_follow`] audience is the client API's follows, and a
+/// migrated relationship is the move itself, which this one row reports.
+/// Deduplicated on [`notification::already_notified`] through this module's
+/// `tell_once`: a `Move` redelivered after the ledger's fortnight expires
+/// tells an already-told follower nothing new.
+pub async fn on_move(state: &AppState, follower: &User, moved: &User) {
+    if let Err(err) = tell_once(state, follower, moved.id, TYPE_MOVE).await {
+        warn!(
+            follower = %follower.id,
+            moved = %moved.id,
+            %err,
+            "could not tell a follower about an account's move"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -761,7 +761,7 @@ mod tests {
                 (
                     row.shortcode.as_str(),
                     row.image_url.as_str(),
-                    row.tags.first().map(String::as_str).unwrap_or_default(),
+                    row.tags.first().map_or_default(String::as_str),
                     row.category.as_deref(),
                 )
             })

@@ -29,6 +29,12 @@
 //! whatever pair it is given and is content with none. Deleting either account
 //! takes its blocks through the foreign key's cascade.
 //!
+//! The federation mirror of an inbound `Block` activity adds the two writes
+//! that fact needs: [`set_ap_id`] records the remote activity id on the row
+//! [`block`] left without one (a remote blocker's id is the one its own
+//! instance minted), and [`get_by_ap_id`] reads the block back by that id —
+//! what an `Undo` that names only the activity resolves through.
+//!
 //! The three reads are the ones the endpoints and the guards need:
 //! [`is_blocking`] the one directional fact, [`blocked_between`] the same
 //! question in either direction (what [`follow`] refuses on), and
@@ -77,6 +83,15 @@ const UNBLOCK_SQL: &str = "DELETE FROM blocks WHERE blocker_id = $1 AND blocked_
 
 /// [`get`]: the one block of an ordered pair.
 const GET_SQL: &str = "SELECT * FROM blocks WHERE blocker_id = $1 AND blocked_id = $2";
+
+/// [`get_by_ap_id`]: the one block behind a `Block` activity id — the
+/// `ap_id` unique index answers the lookup directly.
+const GET_BY_AP_ID_SQL: &str = "SELECT * FROM blocks WHERE ap_id = $1";
+
+/// [`set_ap_id`]: the mirror write of an inbound `Block` — the row keeps its
+/// identity, only the activity id it stands for arrives. Unknown ids match
+/// no row and change nothing.
+const SET_AP_ID_SQL: &str = "UPDATE blocks SET ap_id = $2 WHERE id = $1";
 
 /// [`is_blocking`]: the one directional fact, asked as an existence check so a
 /// blocker never costs more than a `true`.
@@ -254,6 +269,45 @@ pub async fn unblock(pool: &PgPool, blocker: &User, target: &User) -> AppResult<
         .fetch_optional(pool)
         .await?;
     Ok(removed)
+}
+
+/// Records `ap_id` as the `Block` activity the stored block `id` stands
+/// for: the federation mirror's write (decision 6).
+///
+/// [`block`] leaves a remote blocker's row without an id because that id
+/// is the one the blocker's own instance minted, and this is where the
+/// inbound `Block` activity's id lands on it. The unique `ap_id` index
+/// refuses a second block under one id, and an unknown `id` matches no row
+/// and changes nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding, an `ap_id` another row
+/// already carries) arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn set_ap_id(pool: &PgPool, id: Uuid, ap_id: &str) -> AppResult<()> {
+    sqlx::query(SET_AP_ID_SQL)
+        .bind(id)
+        .bind(ap_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
+/// The block whose `Block` activity carries `ap_id`, `None` when no stored
+/// block does: how the federation `Undo` that names only the activity id
+/// finds the pair to lift.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<Block>> {
+    let block = sqlx::query_as::<_, Block>(GET_BY_AP_ID_SQL)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(block)
 }
 
 /// Whether `blocker` has blocked `target`.
@@ -1107,5 +1161,90 @@ mod tests {
             .await
             .expect("a blocker with nothing blocked pages");
         assert!(other.is_empty(), "and holds nothing of alice's blocks");
+    }
+
+    /// The federation mirror's pair of writes: [`set_ap_id`] lands the remote
+    /// activity id on the row [`block`] left without one, and [`get_by_ap_id`]
+    /// reads that row back by the id — the path an `Undo` of a bare activity
+    /// id resolves through.
+    #[tokio::test]
+    async fn an_activity_id_lands_on_the_row_and_reads_it_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = remote_user(&pool, "carol").await;
+        let alice = local_user(&pool, "alice").await;
+        let row = block(&pool, TEST_BASE_URL, &carol, &alice)
+            .await
+            .expect("the fixture block stores");
+        assert!(row.ap_id.is_none(), "the remote blocker's row starts bare");
+
+        let activity = "https://remote.example/activities/block-77";
+        set_ap_id(&pool, row.id, activity).await.unwrap();
+        let mirrored = stored_block(&pool, &carol, &alice).await;
+        assert_eq!(
+            mirrored.ap_id.as_deref(),
+            Some(activity),
+            "the delivered activity id is the row's now"
+        );
+        assert_eq!(mirrored.id, row.id, "and the row itself did not move");
+        let found = get_by_ap_id(&pool, activity).await.unwrap();
+        assert_eq!(
+            found
+                .as_ref()
+                .map(|found| (found.id, found.ap_id.as_deref())),
+            Some((row.id, Some(activity))),
+            "the id reads the block back, now carrying that id"
+        );
+
+        set_ap_id(&pool, row.id, activity)
+            .await
+            .expect("restating the same id is no error");
+        assert_eq!(
+            stored_block(&pool, &carol, &alice).await.ap_id.as_deref(),
+            Some(activity),
+            "and writes the same value"
+        );
+        assert!(
+            get_by_ap_id(&pool, "https://remote.example/activities/never")
+                .await
+                .unwrap()
+                .is_none(),
+            "an id no block carries resolves to nothing"
+        );
+        set_ap_id(&pool, new_id(), "https://remote.example/activities/orphan")
+            .await
+            .expect("an unknown block id changes nothing and is no error");
+    }
+
+    /// One `Block` activity ids one block: the unique `ap_id` refuses a
+    /// second row under the same id.
+    #[tokio::test]
+    async fn one_activity_ids_one_block() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = remote_user(&pool, "carol").await;
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let row = block(&pool, TEST_BASE_URL, &carol, &alice)
+            .await
+            .expect("the fixture block stores");
+        let activity = "https://remote.example/activities/block-78";
+        set_ap_id(&pool, row.id, activity).await.unwrap();
+
+        let second = block(&pool, TEST_BASE_URL, &carol, &bob)
+            .await
+            .expect("the second pair blocks");
+        let taken = set_ap_id(&pool, second.id, activity)
+            .await
+            .expect_err("the id is spent on one row");
+        assert!(
+            matches!(taken, AppError::Database(_)),
+            "the unique index is the guard: {taken}"
+        );
+        assert_eq!(
+            stored_block(&pool, &carol, &bob).await.ap_id,
+            None,
+            "and the refused write stored nothing"
+        );
     }
 }

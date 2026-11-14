@@ -1097,16 +1097,34 @@ mod tests {
         );
     }
 
-    /// The live registry holds the actor routes and nothing else: the
-    /// `Update` table is keyed by the five actor object types, `Delete` runs
-    /// through the fallback that resolves an object id, and both tables are
-    /// the entry points the note and status tickets add their own keys to.
+    /// The live registry holds the actor and misc routes: the `Update` table
+    /// is keyed by the five actor object types, `Delete` runs through the
+    /// fallback that resolves an object id, `Block`/`Flag`/`Add`/`Remove`/
+    /// `Move` route by their own names, and the `Undo` table holds the
+    /// withdrawal of a `Block`; all of those tables are the entry points the
+    /// note and status tickets add their own keys to.
     #[test]
-    fn the_live_registry_holds_the_actor_routes() {
+    fn the_live_registry_holds_the_registered_routes() {
         let handlers = Handlers::default();
+        for kind in ["Block", "Flag", "Add", "Remove", "Move"] {
+            assert!(
+                handlers.by_type.contains_key(kind),
+                "{kind} routes to the misc handler by its own name"
+            );
+        }
+        assert_eq!(
+            handlers.by_type.len(),
+            5,
+            "the misc types only: the create and follow tickets add `Create`, `Follow` and the rest"
+        );
         assert!(
-            handlers.by_type.is_empty() && handlers.undo_by_type.is_empty(),
-            "no activity type is routed by its own name yet, and no Undo either"
+            handlers.undo_by_type.contains_key("Block"),
+            "an Undo of a Block routes to the misc handler"
+        );
+        assert_eq!(
+            handlers.undo_by_type.len(),
+            1,
+            "and no withdrawal routes further yet"
         );
         for object_type in ["Person", "Service", "Group", "Organization", "Application"] {
             assert!(

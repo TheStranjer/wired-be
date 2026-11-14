@@ -7,8 +7,9 @@
 //! by type: one file per family of activities that speak about the same kind
 //! of thing, each registering its routes into the dispatcher's
 //! [`Handlers::default`] — [`actor`] for the `Update` and `Delete` of a
-//! remote account, with the create, note and edit tickets adding their files
-//! beside it.
+//! remote account, [`misc`] for the `Block` (+`Undo`), `Flag`, `Add`,
+//! `Remove` and `Move` that ride beside them, with the create and note
+//! tickets adding their files in turn.
 //!
 //! A handler is a plain
 //! [`HandlerFn`](crate::federation::dispatch::HandlerFn): it gets the shared
@@ -25,6 +26,7 @@
 //! for a retry, anything else discarding it.
 
 pub mod actor;
+pub mod misc;
 
 use crate::federation::dispatch::Handlers;
 
@@ -40,5 +42,6 @@ use crate::federation::dispatch::Handlers;
 pub fn registry() -> Handlers {
     let mut handlers = Handlers::new();
     actor::register(&mut handlers);
+    misc::register(&mut handlers);
     handlers
 }
