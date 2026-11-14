@@ -1450,7 +1450,7 @@ async fn post_block(state: &AppState, auth: &AuthUser, activity: &Value) -> AppR
     let reference = activity_reference(activity)?;
     let target = stored_actor(state, &reference).await?;
     let created = block::block(&state.db, &state.config.base_url, &auth.0, &target).await?;
-    after_block_changed(state, &created, true);
+    after_block_changed(state, &created, true).await;
     Ok(row_activity_id(&state.config, created.ap_id.as_deref()))
 }
 
@@ -1544,7 +1544,7 @@ async fn undo_named_follow(state: &AppState, auth: &AuthUser, found: &Follow) ->
 async fn undo_named_block(state: &AppState, auth: &AuthUser, found: &Block) -> AppResult<String> {
     let target = user_by_id(state, found.blocked_id).await?;
     if let Some(removed) = block::unblock(&state.db, &auth.0, &target).await? {
-        after_block_changed(state, &removed, false);
+        after_block_changed(state, &removed, false).await;
     }
     Ok(new_activity_id(&state.config))
 }
@@ -1592,7 +1592,7 @@ async fn undo_announce_of(state: &AppState, auth: &AuthUser, reference: &str) ->
 async fn undo_block_of(state: &AppState, auth: &AuthUser, reference: &str) -> AppResult<()> {
     let target = stored_actor(state, reference).await?;
     if let Some(removed) = block::unblock(&state.db, &auth.0, &target).await? {
-        after_block_changed(state, &removed, false);
+        after_block_changed(state, &removed, false).await;
     }
     Ok(())
 }

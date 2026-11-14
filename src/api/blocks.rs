@@ -125,7 +125,7 @@ async fn block_account(
         target = %target.id,
         "account blocked"
     );
-    after_block_changed(&state, &block, true);
+    after_block_changed(&state, &block, true).await;
     one_relationship(&state, auth.0.id, target.id).await
 }
 
@@ -161,7 +161,7 @@ async fn unblock_account(
             target = %target.id,
             "block withdrawn"
         );
-        after_block_changed(&state, block, false);
+        after_block_changed(&state, block, false).await;
     }
     one_relationship(&state, auth.0.id, target.id).await
 }
@@ -280,9 +280,10 @@ fn page_link(base_url: &str, path: &str, entries: &[(Block, User)]) -> Option<St
     link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
-/// Post-write hook of both block routes: the federation ticket that sends a
-/// `Block` activity (and its `Undo`, when a block is lifted) wires the
-/// delivery in here — the activity to send is [`Block::ap_id`], the pair is
+/// Post-write hook of both block routes: hands the write to
+/// [`crate::services::federation_out`], which sends the `Block` activity
+/// (and its `Undo`, when a block is lifted) to the blocked account's
+/// instance — the activity to send is [`Block::ap_id`], the pair is
 /// [`Block::blocker_id`] and [`Block::blocked_id`], and the queueing happens
 /// through `state` (decision 11).
 ///
@@ -290,15 +291,15 @@ fn page_link(base_url: &str, path: &str, entries: &[(Block, User)]) -> Option<St
 /// `Block` a `…/block` left behind, `false` for the `Undo` of the `Block` a
 /// `…/unblock` removed. The write is what this hook reports, so an unblock
 /// that found no row to remove never reaches it; `…/block` is idempotent on
-/// the pair, so a repeat restates the same fact and the federation ticket
-/// decides what that means for the queue.
+/// the pair, so a repeat restates the same fact and the federation service
+/// deduplicates the delivery per activity and inbox.
 ///
-/// Intentionally empty until then, like the follow model's
-/// [`blocked_between`](crate::models::follow) hook: Pleroma's
-/// `CommonAPI.block` / `CommonAPI.unblock` deliver their activities inline,
-/// and this server's delivery queue is a later ticket.
+/// The hook never fails the request: federation is the write's echo, and an
+/// echo that cannot be queued is logged, not answered.
 ///
 /// [`Block::ap_id`]: crate::models::block::Block::ap_id
 /// [`Block::blocker_id`]: crate::models::block::Block::blocker_id
 /// [`Block::blocked_id`]: crate::models::block::Block::blocked_id
-pub(crate) const fn after_block_changed(_state: &AppState, _block: &Block, _blocking: bool) {}
+pub(crate) async fn after_block_changed(state: &AppState, block: &Block, blocking: bool) {
+    crate::services::federation_out::after_block_changed(state, block, !blocking).await;
+}

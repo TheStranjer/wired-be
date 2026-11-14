@@ -89,6 +89,7 @@
 pub mod create_status;
 pub mod delete_status;
 pub mod emoji_packs;
+pub mod federation_out;
 pub mod filter;
 pub mod ingest;
 pub mod instance_actor;

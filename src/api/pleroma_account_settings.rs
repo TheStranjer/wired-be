@@ -100,9 +100,12 @@
 //!
 //! Federation of the `Move` activity and the move notifications are not
 //! part of this ticket; they attach to the `after_account_moved` hook
-//! later. The federated `Delete` of a deleted account's actor attaches to
-//! the `after_account_deleted` hook with the ticket that owns the outbox
-//! pipeline.
+//! later. The federated `Delete` of a deleted account's actor is the
+//! `users.delete` sweep's own: it runs in
+//! [`crate::services::federation_out::after_account_deleted`] while the
+//! sweep still holds the relationship rows the fan-out reads. A disabled
+//! account publishes nothing, the decision
+//! [`crate::services::federation_out::after_account_disabled`] documents.
 //!
 //! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
 //! [`get_or_fetch_by_ap_id`]: crate::federation::fetch_actor::get_or_fetch_by_ap_id
@@ -553,14 +556,6 @@ async fn transfer_followers(state: &AppState, origin: &User, target: &User) -> A
 /// outbox pipeline. Later tickets replace the body, not the call sites.
 const fn after_account_moved(_state: &AppState, _old: &User, _new: &User) {}
 
-/// The hook the deletion runs once the account is marked deleted, its
-/// tokens revoked and its [`users.delete`](deletion::KIND_DELETE) sweep
-/// queued. It is deliberately empty: federating the actor's `Delete`
-/// (Pleroma's `ActivityPub.delete`) attaches here with the federation
-/// ticket that owns the outbox pipeline. Later tickets replace the body,
-/// not the call site.
-const fn after_account_deleted(_state: &AppState, _account: &User) {}
-
 /// `POST /api/pleroma/change_password` — set a new password. The gates
 /// run in order — the current password, then the confirmation, then the
 /// length; every refusal is a 200 error body, as Pleroma renders them —
@@ -701,7 +696,12 @@ fn confirmation_token(account: &User, email: &str) -> String {
 /// start: the account is deactivated with `deleted_at` stamped and all
 /// its tokens — the presenting one included — revoked in one transaction,
 /// the [`users.delete`](deletion::KIND_DELETE) sweep is queued on
-/// [`QUEUE_BACKGROUND`], and [`after_account_deleted`] runs.
+/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
+/// sweep's own first act (see
+/// [`federation_out::after_account_deleted`](crate::services::federation_out::after_account_deleted)),
+/// not the endpoint's: the announcement reads the relationship rows the
+/// sweep is about to clear, and a client that gets this 200 must not wait
+/// on either.
 ///
 /// # Errors
 ///
@@ -740,7 +740,6 @@ async fn delete_account(
         queued = queued.is_some(),
         "account deletion started"
     );
-    after_account_deleted(&state, &auth.0);
     Ok(success_body())
 }
 
@@ -761,6 +760,13 @@ async fn mark_and_revoke_all(state: &AppState, account: &User) -> AppResult<u64>
 /// without the sweep, and its tokens are revoked whole because a
 /// disabled account must not still be acting.
 ///
+/// The account publishes nothing: a deactivation leaves the actor document
+/// resolvable so the posts and follows peers already hold keep rendering,
+/// and that decision lands in
+/// [`federation_out::after_account_disabled`](crate::services::federation_out::after_account_disabled)
+/// — the hook runs after a successful write and sends nothing, in this and
+/// every configuration, until a ticket says otherwise.
+///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
@@ -776,6 +782,7 @@ async fn disable_account(
         return Ok(error_body(INVALID_PASSWORD));
     }
     let revoked = deactivate_and_revoke_all(&state, &auth.0).await?;
+    crate::services::federation_out::after_account_disabled(&state, &auth.0);
     debug!(account = %auth.0.nickname, revoked, "account disabled");
     Ok(success_body())
 }

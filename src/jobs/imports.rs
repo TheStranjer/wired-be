@@ -315,7 +315,7 @@ async fn apply_block(state: &AppState, importer: &User, target: &User) -> Result
         Ok(created) => created,
         Err(err) => return skip_or_retry(err, Action::Block, target),
     };
-    after_block_changed(state, &created, true);
+    after_block_changed(state, &created, true).await;
     Ok(())
 }
 

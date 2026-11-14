@@ -42,9 +42,11 @@
 //! [`JobError::Retry`] and only unusable arguments or a vanished user row
 //! are a discard.
 //!
-//! Federation of the actor's `Delete` (the `after_account_deleted` hook in
-//! [`crate::api::pleroma_account_settings`]) attaches to the endpoint with
-//! the federation ticket that owns the outbox pipeline.
+//! Federation of the actor's `Delete` is the sweep's own first act:
+//! [`crate::services::federation_out::after_account_deleted`] runs between
+//! loading the account and clearing its rows, because the fan-out to the
+//! remote followers and followees reads the relationships the clear step
+//! deletes.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -117,6 +119,7 @@ pub fn handle_delete(state: AppState, _attempt: AttemptInfo, args: Value) -> Han
     Box::pin(async move {
         let user_id = parse_args(&args)?;
         let account = load_account(&state, user_id).await?;
+        crate::services::federation_out::after_account_deleted(&state, &account).await;
         clear_data(&state, &account).await?;
         user::purge_personal_data(&state.db, account.id)
             .await
@@ -618,6 +621,73 @@ mod tests {
             count_where(&pool, "list_members", "user_id", bob.id).await,
             0,
             "bob's membership of alice's list went down with her list"
+        );
+    }
+
+    /// The sweep announces the account while the graph still exists: a
+    /// local account with a remote follower leaves exactly one
+    /// `federator.publish` job — the deterministic `Delete`, its snapshot
+    /// naming the follower's shared inbox — even though the same pass
+    /// deletes every follow row and purges the row's personal data. The
+    /// keypair stays behind on purpose: the queued deliveries sign with it
+    /// after this returns.
+    #[tokio::test]
+    async fn the_handler_publishes_the_delete_before_clearing_the_graph() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(
+            &pool,
+            &NewUser {
+                private_key: Some("PEM-PRIV".to_owned()),
+                public_key: Some("PEM-PUB".to_owned()),
+                ..NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice"))
+            },
+        )
+        .await
+        .expect("the keyed local fixture inserts");
+        let fan = insert(
+            &pool,
+            &NewUser {
+                nickname: "fan@peer.example".to_owned(),
+                ap_id: "https://peer.example/users/fan".to_owned(),
+                local: Flag::new(false),
+                domain: Some("peer.example".to_owned()),
+                inbox: Some("https://peer.example/users/fan/inbox".to_owned()),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+        accepted_follow(&pool, &fan, &alice).await;
+
+        run(&app_state(&pool), alice.id)
+            .await
+            .expect("the delete job runs");
+
+        let rows =
+            sqlx::query_as::<_, (Value,)>("SELECT args FROM jobs WHERE kind = 'federator.publish'")
+                .fetch_all(&pool)
+                .await
+                .expect("the publish job reads");
+        assert_eq!(rows.len(), 1, "the sweep announces the account once");
+        let args = &rows[0].0;
+        assert_eq!(args["actor_id"], alice.id.to_string());
+        assert_eq!(args["activity"]["type"], "Delete");
+        assert_eq!(
+            args["activity"]["id"],
+            format!("{TEST_BASE_URL}/activities/delete-user-{}", alice.id),
+            "the id is the deterministic one the ticket pins"
+        );
+        assert_eq!(
+            args["extra_inboxes"],
+            json!(["https://peer.example/inbox"]),
+            "the follower's shared inbox was snapshotted before the clear"
+        );
+        assert_eq!(
+            count_where(&pool, "follows", "followee_id", alice.id).await,
+            0,
+            "and the relationship rows are gone all the same"
         );
     }
 

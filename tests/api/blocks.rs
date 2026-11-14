@@ -9,9 +9,11 @@
 //! keyset-paginated over the *block row* id with Pleroma's `Link` header and
 //! Mastodon's 80-row cap, each entry embedding the viewer's relationship; a
 //! blocked pair cannot follow over the model in either direction, with the
-//! two exact messages. Every route half of the auth and scope pipelines is
-//! pinned: the listing with `read:blocks`, the two writes with
-//! `write:blocks | follow`.
+//! two exact messages; a block of a REMOTE account publishes its `Block`
+//! (and the unblock its `Undo`) through the queued federation, a block of a
+//! local account publishes nothing; and every route half of the auth and
+//! scope pipelines is pinned: the listing with `read:blocks`, the two writes
+//! with `write:blocks | follow`.
 
 #![cfg(test)]
 
@@ -764,5 +766,103 @@ async fn the_writes_take_write_blocks_or_follow() {
     assert!(
         stored_blocks(&pool, &alice).await.is_empty(),
         "the granted round trips left nothing behind"
+    );
+}
+
+/// The arguments of the `federator.publish` jobs queued so far, in the
+/// order they landed — what the block endpoints' federation hook writes.
+async fn publish_jobs(pool: &PgPool) -> Vec<Value> {
+    sqlx::query_as::<_, (Value,)>(
+        "SELECT args FROM jobs WHERE kind = 'federator.publish' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the publish jobs read")
+    .into_iter()
+    .map(|(args,)| args)
+    .collect()
+}
+
+/// The stored `ap_id` of the pair's block row: the activity id the
+/// federation must reuse, read straight off the table.
+async fn stored_ap_id(pool: &PgPool, blocker: &User, target: &User) -> String {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT ap_id FROM blocks WHERE blocker_id = $1 AND blocked_id = $2",
+    )
+    .bind(blocker.id)
+    .bind(target.id)
+    .fetch_one(pool)
+    .await
+    .expect("the block row reads")
+    .expect("a local blocker's row carries its activity id")
+}
+
+/// A block of a REMOTE account federates: the write queues one
+/// `federator.publish` job carrying the `Block` under the id the row
+/// stores, addressed to the blocked actor alone, and the unblock queues
+/// the `Undo` of that same document. A block of a LOCAL account is
+/// settled in the database and publishes nothing.
+#[tokio::test]
+async fn blocking_a_remote_account_publishes_the_block_and_its_undo() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = fixture(&pool, "alice", "write").await;
+    let bob = common::create_remote_user(&pool, "bob", "peer.example").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let app = common::test_app(pool.clone());
+
+    let blocked = authorized(&action_path(&bob.id, "block"), &token)
+        .send(&app)
+        .await;
+    assert_eq!(blocked.status, StatusCode::OK, "the block is written");
+    let jobs = publish_jobs(&pool).await;
+    assert_eq!(jobs.len(), 1, "and published once");
+    let activity = &jobs[0]["activity"];
+    assert_eq!(activity["type"], "Block");
+    assert_eq!(
+        activity["id"],
+        stored_ap_id(&pool, &alice, &bob).await,
+        "the activity carries the id the row stored, not a freshly minted one"
+    );
+    assert_eq!(activity["actor"], alice.ap_id);
+    assert_eq!(
+        activity["to"][0], bob.ap_id,
+        "the blocked actor is the only recipient"
+    );
+    let block_id = activity["id"].as_str().expect("a string id").to_owned();
+
+    let local_block = authorized(&action_path(&carol.id, "block"), &token)
+        .send(&app)
+        .await;
+    assert_eq!(local_block.status, StatusCode::OK, "local blocks work too");
+    assert_eq!(
+        publish_jobs(&pool).await.len(),
+        1,
+        "and a local pair publishes nothing"
+    );
+
+    let lifted = authorized(&action_path(&bob.id, "unblock"), &token)
+        .send(&app)
+        .await;
+    assert_eq!(lifted.status, StatusCode::OK, "the unblock is written");
+    let later = publish_jobs(&pool).await;
+    assert_eq!(later.len(), 2, "the withdrawal is published");
+    let undo = &later[1]["activity"];
+    assert_eq!(undo["type"], "Undo");
+    assert_eq!(undo["actor"], alice.ap_id);
+    assert_eq!(undo["to"][0], bob.ap_id);
+    assert_eq!(
+        undo["object"]["id"], block_id,
+        "the undo withdraws the very block the row stands for"
+    );
+
+    let local_lift = authorized(&action_path(&carol.id, "unblock"), &token)
+        .send(&app)
+        .await;
+    assert_eq!(local_lift.status, StatusCode::OK);
+    assert_eq!(
+        publish_jobs(&pool).await.len(),
+        2,
+        "and lifting a local block publishes nothing either"
     );
 }
