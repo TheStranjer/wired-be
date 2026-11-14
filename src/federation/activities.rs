@@ -4,7 +4,9 @@
 //! Served at `{BASE_URL}/activities/{uuid}`, these are the `Like`,
 //! `EmojiReact`, `Announce`, `Follow`, `Block`, `Undo`, `Accept` and
 //! `Reject` behind the tables of `docs/ARCHITECTURE.md` decision 6 —
-//! favourites, reactions, boosts, follows and blocks — other than notes.
+//! favourites, reactions, boosts, follows and blocks — other than notes,
+//! plus the `Move`, `Flag` and `Add`/`Remove` behind the account
+//! lifecycle and moderation writes.
 //!
 //! These are the counterparts of Pleroma's
 //! `lib/pleroma/web/activity_pub/views/*_view.ex` renderers, and pure
@@ -46,7 +48,12 @@
 //! [`reject_json`] render the addressing their [`AnsweredActivity`]
 //! carries: the two follow answers name the follower, and the withdrawal
 //! of an interaction repeats the addressing of the activity it embeds —
-//! exactly who heard the fact hears its taking-back.
+//! exactly who heard the fact hears its taking-back. The `target`-bearing
+//! builders [`move_json`], [`add_json`] and [`remove_json`] and the
+//! moderation builder [`flag_json`] likewise render the lines their caller
+//! computed: the move names the origin's followers collection in `to`, the
+//! pin the public address in `to` and the followers collection in `cc`,
+//! and the forwarded flag the reported account alone.
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -74,6 +81,14 @@ const TYPE_UNDO: &str = "Undo";
 const TYPE_ACCEPT: &str = "Accept";
 /// The activity type of a refused follow request.
 const TYPE_REJECT: &str = "Reject";
+/// The activity type of an account move.
+const TYPE_MOVE: &str = "Move";
+/// The activity type of a forwarded report.
+const TYPE_FLAG: &str = "Flag";
+/// The activity type of a pin added to the featured collection.
+const TYPE_ADD: &str = "Add";
+/// The activity type of a pin withdrawn from the featured collection.
+const TYPE_REMOVE: &str = "Remove";
 /// The tag type of a custom emoji, as the note builder's `emoji_tag`
 /// writes it.
 const TYPE_EMOJI: &str = "Emoji";
@@ -180,6 +195,66 @@ pub struct AnsweredActivity<'a> {
     /// The activity being answered or withdrawn, embedded as the object.
     pub answered: &'a Value,
     /// The answer row's creation moment, written as `published`.
+    pub published: &'a DateTime<Utc>,
+}
+
+/// The inputs [`move_json`], [`add_json`] and [`remove_json`] share.
+///
+/// One activity that moves `object` in or out of `target`: the `Move`
+/// carries the origin's own actor id (as `object`) onto the account it
+/// moved to (as `target`), and the pin pair features the pinned status'
+/// object uri (as `object`) in the actor's featured collection (as
+/// `target`) or withdraws it. The three documents are one skeleton under a
+/// different `type`, the way the object-addressed builders are.
+#[derive(Debug)]
+pub struct TargetedActivityContext<'a> {
+    /// The instance whose origin and JSON-LD schema mint the document.
+    pub config: &'a Config,
+    /// The `UUIDv7` naming this activity, which also names it (decision 6).
+    pub id: Uuid,
+    /// The acting account's actor id.
+    pub actor_ap_id: &'a str,
+    /// The object: the moved account's actor id for a `Move`, the pinned
+    /// status' uri for an `Add` or `Remove`.
+    pub object: &'a str,
+    /// The target: the destination actor id for a `Move`, the actor's
+    /// featured collection url for an `Add` or `Remove`.
+    pub target: &'a str,
+    /// The primary addressing line, in order.
+    pub to: &'a [&'a str],
+    /// The copy line, in order.
+    pub cc: &'a [&'a str],
+    /// The moment of the write behind the activity, written as
+    /// `published`.
+    pub published: &'a DateTime<Utc>,
+}
+
+/// Everything [`flag_json`] renders one forwarded report's document from.
+///
+/// The instance speaking for its reporter: the object array names the
+/// reported account first and the cited statuses' object uris after it,
+/// exactly as Pleroma's `build_flag_object` lays them out, and `content`
+/// carries the reporter's comment.
+#[derive(Debug)]
+pub struct FlagContext<'a> {
+    /// The instance whose origin and JSON-LD schema frame the document.
+    pub config: &'a Config,
+    /// The document's `id`: the report row's stored `ap_id` (decision 6),
+    /// the id [`crate::models::report::create`] minted for it.
+    pub id: &'a str,
+    /// The instance actor's id: a forwarded report travels as the
+    /// instance's own statement, not the reporter's.
+    pub actor_ap_id: &'a str,
+    /// The `object` array, in order: the reported account's actor id
+    /// first, then the cited statuses' object uris.
+    pub object_ids: &'a [String],
+    /// The reporter's comment, verbatim.
+    pub content: &'a str,
+    /// The primary addressing line, in order.
+    pub to: &'a [&'a str],
+    /// The copy line, in order.
+    pub cc: &'a [&'a str],
+    /// The report's `inserted_at`, written as the activity's `published`.
     pub published: &'a DateTime<Utc>,
 }
 
@@ -425,6 +500,72 @@ pub fn reject_json(answer: &AnsweredActivity<'_>) -> Value {
     answered_json(TYPE_REJECT, answer)
 }
 
+/// The shared shape of the activities that carry a `target`: `type_name`
+/// moving `ctx`'s object in or out of it under the caller's addressing.
+fn targeted_json(type_name: &'static str, ctx: &TargetedActivityContext<'_>) -> Value {
+    document_json(ActivityDocument {
+        config: ctx.config,
+        id: activity_id(ctx.config, ctx.id),
+        type_name,
+        actor_ap_id: ctx.actor_ap_id,
+        object: json!(ctx.object),
+        to: address_values(ctx.to),
+        cc: address_values(ctx.cc),
+        published: ctx.published,
+        extra: vec![("target", json!(ctx.target))],
+    })
+}
+
+/// The `Move` in `ctx`: `actor_ap_id` has moved — its own old actor id,
+/// the object, onto the new actor id, the target — and tells the
+/// addresses `ctx` names.
+///
+/// Pleroma's `ActivityPub.move`: `to` is the origin's followers
+/// collection, whose remote entries the publisher expands when the fan-out
+/// runs; local followers were already transferred by the move endpoint,
+/// and remote ones are their own instances' to rewrite — this activity is
+/// what those instances act on.
+#[must_use]
+pub fn move_json(ctx: &TargetedActivityContext<'_>) -> Value {
+    targeted_json(TYPE_MOVE, ctx)
+}
+
+/// The `Add` in `ctx`: `actor_ap_id` featured the status at `object` in
+/// the collection at `target`.
+#[must_use]
+pub fn add_json(ctx: &TargetedActivityContext<'_>) -> Value {
+    targeted_json(TYPE_ADD, ctx)
+}
+
+/// The `Remove` in `ctx`: `actor_ap_id` withdrew the pin of the status at
+/// `object` from the collection at `target`.
+#[must_use]
+pub fn remove_json(ctx: &TargetedActivityContext<'_>) -> Value {
+    targeted_json(TYPE_REMOVE, ctx)
+}
+
+/// The `Flag` in `ctx`: the instance reports the account and statuses
+/// `ctx.object_ids` names, with the reporter's comment as `content`.
+///
+/// Pleroma's `make_flag_data` reduced to the fields the ticket pins: the
+/// `actor` is the instance actor (Mastodon's forwarded-report convention —
+/// the instance vouches on the wire), and the recipient is the reported
+/// account's inbox alone, which `ctx.to` names.
+#[must_use]
+pub fn flag_json(ctx: &FlagContext<'_>) -> Value {
+    document_json(ActivityDocument {
+        config: ctx.config,
+        id: ctx.id.to_owned(),
+        type_name: TYPE_FLAG,
+        actor_ap_id: ctx.actor_ap_id,
+        object: Value::Array(ctx.object_ids.iter().map(|id| json!(id)).collect()),
+        to: address_values(ctx.to),
+        cc: address_values(ctx.cc),
+        published: ctx.published,
+        extra: vec![("content", json!(ctx.content))],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +591,11 @@ mod tests {
     const STATUS_URI: &str = "https://test.example/objects/01934568-1111-7000-8000-abcdef012345";
     /// The custom emoji's image URL, as the reaction row stores it.
     const EMOJI_URL: &str = "https://test.example/emoji/railroad_track.png";
+    /// The acting account's featured (pinned) collection, the `target` an
+    /// `Add` or `Remove` names.
+    const FEATURED: &str = "https://test.example/users/alice/featured";
+    /// The instance actor's id, the `actor` a forwarded `Flag` carries.
+    const INSTANCE_AP: &str = "https://test.example/internal/fetch";
     /// Every fixture's creation moment, in the wire format.
     const PUBLISHED: &str = "2024-01-31T12:34:56.789Z";
 
@@ -533,6 +679,70 @@ mod tests {
     /// a reblog row's `uri` hold (decision 6).
     fn stored_id() -> String {
         activity_id(&config(), activity_uuid())
+    }
+
+    /// The `Move`, `Flag`, `Add` and `Remove` fixtures, for the shared
+    /// convention sweep every document in this module must pass.
+    fn lifecycle_documents<'a>(
+        config: &'a Config,
+        id: &'a str,
+        published: &'a DateTime<Utc>,
+    ) -> Vec<(&'static str, Value)> {
+        let to = [BOB_AP];
+        vec![
+            (
+                "Move",
+                move_json(&TargetedActivityContext {
+                    config,
+                    id: activity_uuid(),
+                    actor_ap_id: ALICE_AP,
+                    object: ALICE_AP,
+                    target: BOB_AP,
+                    to: &to,
+                    cc: &NO_CC,
+                    published,
+                }),
+            ),
+            (
+                "Flag",
+                flag_json(&FlagContext {
+                    config,
+                    id,
+                    actor_ap_id: INSTANCE_AP,
+                    object_ids: &[BOB_AP.to_owned()],
+                    content: "spam",
+                    to: &to,
+                    cc: &NO_CC,
+                    published,
+                }),
+            ),
+            (
+                "Add",
+                add_json(&TargetedActivityContext {
+                    config,
+                    id: activity_uuid(),
+                    actor_ap_id: ALICE_AP,
+                    object: STATUS_URI,
+                    target: FEATURED,
+                    to: &PUBLIC_TO,
+                    cc: &FOLLOWERS_CC,
+                    published,
+                }),
+            ),
+            (
+                "Remove",
+                remove_json(&TargetedActivityContext {
+                    config,
+                    id: activity_uuid(),
+                    actor_ap_id: ALICE_AP,
+                    object: STATUS_URI,
+                    target: FEATURED,
+                    to: &PUBLIC_TO,
+                    cc: &FOLLOWERS_CC,
+                    published,
+                }),
+            ),
+        ]
     }
 
     #[test]
@@ -830,6 +1040,129 @@ mod tests {
     }
 
     #[test]
+    fn a_move_carries_the_origin_to_its_target() {
+        let config = config();
+        let published = published();
+        let to = [FOLLOWERS];
+        let document = move_json(&TargetedActivityContext {
+            config: &config,
+            id: activity_uuid(),
+            actor_ap_id: ALICE_AP,
+            object: ALICE_AP,
+            target: BOB_AP,
+            to: &to,
+            cc: &NO_CC,
+            published: &published,
+        });
+        assert_eq!(
+            document,
+            json!({
+                "@context": expected_context(),
+                "id": format!("{BASE}/activities/{ACTIVITY_ID}"),
+                "type": "Move",
+                "actor": ALICE_AP,
+                "object": ALICE_AP,
+                "target": BOB_AP,
+                "published": PUBLISHED,
+                "to": [FOLLOWERS],
+                "cc": [],
+            }),
+            "the whole Move: object is the origin's own id, target the destination"
+        );
+        let mut keys = ACTIVITY_KEYS.to_vec();
+        keys.push("target");
+        keys.sort_unstable();
+        assert_eq!(json_keys(&document), keys, "and nothing else");
+    }
+
+    #[test]
+    fn a_flag_lists_the_reported_account_then_the_cited_statuses() {
+        let config = config();
+        let published = published();
+        let id = stored_id();
+        let objects = vec![
+            BOB_AP.to_owned(),
+            STATUS_URI.to_owned(),
+            format!("{BASE}/objects/second-cited"),
+        ];
+        let to = [BOB_AP];
+        let document = flag_json(&FlagContext {
+            config: &config,
+            id: &id,
+            actor_ap_id: INSTANCE_AP,
+            object_ids: &objects,
+            content: "spam, again",
+            to: &to,
+            cc: &NO_CC,
+            published: &published,
+        });
+        assert_eq!(
+            document,
+            json!({
+                "@context": expected_context(),
+                "id": id,
+                "type": "Flag",
+                "actor": INSTANCE_AP,
+                "object": [BOB_AP, STATUS_URI, format!("{BASE}/objects/second-cited")],
+                "content": "spam, again",
+                "published": PUBLISHED,
+                "to": [BOB_AP],
+                "cc": [],
+            }),
+            "the whole Flag: the instance speaks, the account leads the \
+             object list, and only it is addressed"
+        );
+        let mut keys = ACTIVITY_KEYS.to_vec();
+        keys.push("content");
+        keys.sort_unstable();
+        assert_eq!(json_keys(&document), keys, "content, and nothing else");
+    }
+
+    #[test]
+    fn a_pin_add_and_remove_share_the_feature_s_skeleton() {
+        let config = config();
+        let published = published();
+        let to = [AS_PUBLIC];
+        let cc = [FOLLOWERS];
+        let ctx = TargetedActivityContext {
+            config: &config,
+            id: activity_uuid(),
+            actor_ap_id: ALICE_AP,
+            object: STATUS_URI,
+            target: FEATURED,
+            to: &to,
+            cc: &cc,
+            published: &published,
+        };
+        let document = add_json(&ctx);
+        assert_eq!(
+            document,
+            json!({
+                "@context": expected_context(),
+                "id": format!("{BASE}/activities/{ACTIVITY_ID}"),
+                "type": "Add",
+                "actor": ALICE_AP,
+                "object": STATUS_URI,
+                "target": FEATURED,
+                "published": PUBLISHED,
+                "to": [AS_PUBLIC],
+                "cc": [FOLLOWERS],
+            }),
+            "the whole Add: the status into the featured collection"
+        );
+        let mut keys = ACTIVITY_KEYS.to_vec();
+        keys.push("target");
+        keys.sort_unstable();
+        assert_eq!(json_keys(&document), keys, "and nothing else");
+
+        let removal = remove_json(&ctx);
+        assert_eq!(removal["type"], "Remove", "the withdrawal shares the shape");
+        assert_eq!(removal["object"], json!(STATUS_URI));
+        assert_eq!(removal["target"], json!(FEATURED));
+        assert_eq!(json_keys(&removal), keys, "key for key");
+    }
+
+    #[test]
     fn every_document_starts_with_the_shared_note_context() {
         let config = config();
         let published = published();
@@ -880,6 +1213,8 @@ mod tests {
             ("Accept", accept_json(&answer)),
             ("Reject", reject_json(&answer)),
         ];
+        let mut documents: Vec<(&str, Value)> = documents.into_iter().collect();
+        documents.extend(lifecycle_documents(&config, &id, &published));
         for (name, document) in documents {
             assert_eq!(
                 document["@context"],

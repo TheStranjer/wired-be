@@ -19,6 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
+    federation::publisher,
     models::{
         instance_rule,
         report::{self, Category, ReportState},
@@ -26,6 +27,7 @@ use wired_be::{
         user::{Flag, NewUser, User},
     },
     pagination::{MAX_LIMIT, PageParams},
+    services::instance_actor::instance_actor_ap_id,
 };
 
 use crate::common;
@@ -1012,5 +1014,98 @@ async fn the_route_spends_its_rate_limit_bucket() {
         filings(&pool).await.len(),
         2,
         "the third request never reached the handler"
+    );
+}
+
+/// The args of every queued `federator.publish` job, in insertion order.
+async fn publish_jobs(pool: &PgPool) -> Vec<Value> {
+    sqlx::query_as::<_, (Value,)>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
+        .bind(publisher::KIND_PUBLISH)
+        .fetch_all(pool)
+        .await
+        .expect("the publish jobs read")
+        .into_iter()
+        .map(|(args,)| args)
+        .collect()
+}
+
+/// The forwarding half: a `forward = true` filing about a REMOTE account
+/// queues the instance's `Flag` — from the instance actor, the target
+/// first in `object` and the only address, the comment as content — and
+/// nothing else rides along.
+#[tokio::test]
+async fn a_forwarded_filing_about_a_remote_account_queues_the_flag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = reporter(&pool, "alice").await;
+    let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
+    let cited = common::create_status(&pool, &bob, "flag me", Visibility::Public).await;
+
+    let value = filed(
+        &app,
+        &token,
+        json!({
+            "account_id": bob.id.to_string(),
+            "status_ids": [cited.id.to_string()],
+            "comment": "they will not stop",
+            "forward": true,
+        }),
+    )
+    .await;
+    let row = stored(&pool, &value).await;
+
+    let jobs = publish_jobs(&pool).await;
+    assert_eq!(jobs.len(), 1, "the forward is announced once");
+    let activity = &jobs[0]["activity"];
+    assert_eq!(activity["type"], "Flag");
+    assert_eq!(
+        activity["id"],
+        row.ap_id.expect("a local filing mints its Flag id"),
+        "the document is the report row's own activity"
+    );
+    assert_eq!(
+        activity["actor"],
+        instance_actor_ap_id(TEST_BASE_URL),
+        "the instance speaks for its reporter"
+    );
+    assert_eq!(
+        activity["object"],
+        json!([bob.ap_id, cited.uri]),
+        "the reported account leads the cited statuses"
+    );
+    assert_eq!(activity["content"], "they will not stop", "the comment");
+    assert_eq!(
+        activity["to"],
+        json!([bob.ap_id]),
+        "the target is the only address"
+    );
+    assert_eq!(activity["cc"], json!([]), "and nobody is copied");
+}
+
+/// The arms that federate nothing: a forwarded filing whose target is a
+/// LOCAL account, and an unforwarded filing about a remote one, queue no
+/// `Flag` — the report stays with our own moderators.
+#[tokio::test]
+async fn filings_that_must_not_forward_queue_no_flag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = reporter(&pool, "alice").await;
+    let neighbour = common::create_local_user(&pool, "neighbour").await;
+    let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
+
+    let _local = filed(
+        &app,
+        &token,
+        json!({"account_id": neighbour.id.to_string(), "forward": true}),
+    )
+    .await;
+    let _quiet = filed(&app, &token, about(&bob)).await;
+
+    assert_eq!(filings(&pool).await.len(), 2, "both reports are stored");
+    assert!(
+        publish_jobs(&pool).await.is_empty(),
+        "neither filing leaves the instance"
     );
 }

@@ -17,10 +17,13 @@
 //! even at the limit, because Pleroma's own write skips its check for it,
 //! and withdrawing a pin that is not there is the same unchanged entity.
 //!
-//! Nothing federates yet: the `Featured` collection's `Add`/`Remove` attach
-//! at the module's `after_pin_changed` hook, so these routes ride no
-//! throttle bucket either — Pleroma's rate-limited status actions are the
-//! like writes and the delete, not the pins.
+//! The pin writes federate the fact they store: the `Featured`
+//! collection's `Add` and `Remove` queue through the module's
+//! `after_pin_changed` hook and
+//! [`wired_be::services::federation_out::after_pin_changed`], delivered to
+//! the pinner's remote followers when the fan-out job runs. These routes
+//! ride no throttle bucket either — Pleroma's rate-limited status actions
+//! are the like writes and the delete, not the pins.
 //!
 //! [`Status`]: wired_be::entities::status::Status
 
@@ -32,10 +35,11 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
+    federation::publisher,
     models::{
         pinned_status,
         status::{self, NewStatus, Status as StatusRow, Visibility},
-        user::User,
+        user::{self, User},
     },
     util::time::mastodon_time,
 };
@@ -605,6 +609,70 @@ async fn deleting_a_pinned_status_removes_the_pin() {
             .collect::<Vec<Uuid>>(),
         vec![kept.id],
         "and the profile lists the survivor only"
+    );
+}
+
+/// The activity of every queued `federator.publish` job, insertion order.
+async fn publish_activities(pool: &PgPool) -> Vec<Value> {
+    sqlx::query_as::<_, (Value,)>(
+        "SELECT args->'activity' FROM jobs WHERE kind = $1 ORDER BY inserted_at, id",
+    )
+    .bind(publisher::KIND_PUBLISH)
+    .fetch_all(pool)
+    .await
+    .expect("the publish jobs read")
+    .into_iter()
+    .map(|(activity,)| activity)
+    .collect()
+}
+
+/// The federation half of the pair: the pin queues the `Add` that features
+/// the status in the author's own collection, and the unpin the `Remove`
+/// that takes it back down — one announcement per write that changed
+/// something, restatements silent.
+#[tokio::test]
+async fn the_pin_writes_queue_the_feature_and_its_withdrawal() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = pinner(&pool, "alice").await;
+    let featured_post = post(&pool, &alice).await;
+
+    pin_ok(&app, &token, &featured_post.id.to_string()).await;
+
+    let after_pin = publish_activities(&pool).await;
+    assert_eq!(after_pin.len(), 1, "the pin announces once");
+    assert_eq!(after_pin[0]["type"], "Add");
+    assert_eq!(after_pin[0]["actor"], alice.ap_id);
+    assert_eq!(after_pin[0]["object"], featured_post.uri);
+    assert_eq!(
+        after_pin[0]["target"],
+        user::featured(&alice.ap_id),
+        "the bare fixture carries no featured_url, so the built collection address rides along"
+    );
+    assert_eq!(
+        after_pin[0]["to"][0],
+        "https://www.w3.org/ns/activitystreams#Public"
+    );
+
+    let response = unpin_route(&app, &token, &featured_post.id.to_string()).await;
+    common::assert_answer(&response, StatusCode::OK, "the withdrawal answers");
+
+    let after_unpin = publish_activities(&pool).await;
+    assert_eq!(
+        after_unpin.len(),
+        2,
+        "and the withdrawal announces once more"
+    );
+    assert_eq!(after_unpin[1]["type"], "Remove");
+    assert_eq!(after_unpin[1]["object"], featured_post.uri);
+
+    let restated = unpin_route(&app, &token, &featured_post.id.to_string()).await;
+    common::assert_answer(&restated, StatusCode::OK, "a second withdrawal answers");
+    assert_eq!(
+        publish_activities(&pool).await.len(),
+        2,
+        "a withdrawal that found no pin announces nothing"
     );
 }
 

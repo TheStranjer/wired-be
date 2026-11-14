@@ -9,13 +9,14 @@
 //! target resolution, `alsoKnownAs` precondition, 30-day cooldown), the
 //! follower transfer (local accepted followers move, opted-out and
 //! remote ones stay), the counters that move with it, the entity's
-//! nested non-recursive `moved` render, and every route's `AuthUser` +
-//! scope pipeline. The credential tests pin the 200-with-error shape of
-//! every password/validation refusal, which tokens survive which action,
-//! the email-confirmation branch and its queued letter, and the delete
-//! endpoint's config gate, `deleted_at` mark and enqueued
-//! `users.delete` sweep (the sweep itself is exercised handler-direct in
-//! `src/jobs/deletion.rs`).
+//! nested non-recursive `moved` render, the `Move` activity the completed
+//! move queues for the federation fan-out (a refusal queues nothing), and
+//! every route's `AuthUser` + scope pipeline. The credential tests pin the
+//! 200-with-error shape of every password/validation refusal, which tokens
+//! survive which action, the email-confirmation branch and its queued
+//! letter, and the delete endpoint's config gate, `deleted_at` mark and
+//! enqueued `users.delete` sweep (the sweep itself is exercised
+//! handler-direct in `src/jobs/deletion.rs`).
 
 #![cfg(test)]
 
@@ -25,6 +26,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
+    federation::publisher,
     mailer::KIND_SEND,
     models::{
         follow::{self, FollowState},
@@ -417,6 +419,63 @@ async fn move_transfers_local_followers_and_marks_the_account() {
         show["moved"]["moved"],
         Value::Null,
         "the nesting is non-recursive: the target's own move renders null"
+    );
+
+    // The federation half: the move is announced as a `Move`.
+    assert_move_queued(&pool, &alice, &bob).await;
+}
+
+/// The federation half of a completed move: exactly one `federator.publish`
+/// job — the bare fixture's origin has no followers collection column, so
+/// the profile `Update` arm stays quiet — carrying the `Move` that names
+/// the origin as both actor and object and the destination as target.
+async fn assert_move_queued(pool: &PgPool, origin: &User, destination: &User) {
+    let announcements = queued_jobs(pool, publisher::KIND_PUBLISH).await;
+    assert_eq!(announcements.len(), 1, "the move is announced once");
+    let (queue, args) = &announcements[0];
+    assert_eq!(
+        queue,
+        wired_be::jobs::QUEUE_FEDERATOR_OUTGOING,
+        "the fan-out rides the outgoing federation queue"
+    );
+    assert_eq!(
+        args["actor_id"],
+        origin.id.to_string(),
+        "published as the origin"
+    );
+    let activity = &args["activity"];
+    assert_eq!(activity["type"], "Move");
+    assert_eq!(activity["actor"], origin.ap_id);
+    assert_eq!(activity["object"], origin.ap_id);
+    assert_eq!(activity["target"], destination.ap_id);
+    assert_eq!(
+        activity["to"],
+        json!([format!("{}/followers", origin.ap_id)]),
+        "the followers collection is the only address"
+    );
+    assert_eq!(activity["cc"], json!([]));
+}
+
+/// A refused move federates nothing: no gate that answers before the
+/// write is reached queues a publish job.
+#[tokio::test]
+async fn a_refused_move_announces_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
+    let _bob = aliased_target(&pool, "bob", &alice).await;
+    let app = common::test_app(pool.clone());
+
+    let wrong = move_account(&app, &token, "not-my-password", "bob").await;
+    assert_eq!(wrong.status, StatusCode::OK, "the refusal body");
+    assert_eq!(
+        wrong.json_value(),
+        json!({"error": "Invalid password."}),
+        "the password refusal"
+    );
+    assert!(
+        queued_jobs(&pool, publisher::KIND_PUBLISH).await.is_empty(),
+        "a refused move announces nothing"
     );
 }
 

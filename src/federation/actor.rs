@@ -47,9 +47,10 @@ const IMAGE_TYPE: &str = "Image";
 /// actor fields this instance federates: `@context`, `id`, `type`,
 /// `preferredUsername`, `name`, `summary`, `url`, the four collections,
 /// `featured`, `endpoints`, `publicKey`, `manuallyApprovesFollowers`,
-/// `discoverable`, `attachment`, `published`, `tag`, `alsoKnownAs` and
-/// `capabilities`, plus `icon` and `image` only when the row carries an
-/// avatar or a banner.
+/// `discoverable`, `attachment`, `published`, `tag`, `alsoKnownAs` (the
+/// row's stored aliases) and `capabilities`, plus `icon` and `image` only
+/// when the row carries an avatar or a banner and `movedTo` only when the
+/// row records a move.
 #[must_use]
 pub fn actor_json(user: &User, config: &Config) -> Value {
     Value::Object(
@@ -62,7 +63,8 @@ pub fn actor_json(user: &User, config: &Config) -> Value {
 
 /// Every field of [`actor_json`]'s object as a `(name, value)` pair, in the
 /// order Pleroma's renderer assembles them; the media fields come in only
-/// when the row has the media.
+/// when the row has the media, and `movedTo` only when the row records a
+/// move.
 fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
     let ap_id = user.ap_id.as_str();
     let mut fields = vec![
@@ -93,9 +95,12 @@ fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
         ("attachment", attachments(user)),
         ("published", json!(mastodon_time(&user.inserted_at))),
         ("tag", json!([])),
-        ("alsoKnownAs", json!([])),
-        ("capabilities", capabilities()),
+        ("alsoKnownAs", json!(user.also_known_as)),
     ]);
+    if let Some(moved_to) = user.moved_to_ap_id.as_deref() {
+        fields.push(("movedTo", json!(moved_to)));
+    }
+    fields.push(("capabilities", capabilities()));
     fields
 }
 
@@ -387,6 +392,10 @@ mod tests {
         assert_eq!(document["attachment"], json!([]), "no profile fields");
         assert_eq!(document["tag"], json!([]), "no emojis yet");
         assert_eq!(document["alsoKnownAs"], json!([]), "no aliases yet");
+        assert!(
+            document.get("movedTo").is_none(),
+            "an account that never moved emits no movedTo"
+        );
         assert_eq!(
             document["capabilities"],
             json!({"acceptsChatMessages": true}),
@@ -588,5 +597,43 @@ mod tests {
             json!([]),
             "malformed storage renders as the empty list"
         );
+    }
+
+    #[test]
+    fn stored_aliases_render_under_also_known_as_in_order() {
+        let mut alice = local_alice();
+        alice.also_known_as = vec![
+            "https://test.example/users/alicia".to_owned(),
+            "https://other.example/users/alice".to_owned(),
+        ];
+        let document = render(&alice);
+        assert_eq!(
+            document["alsoKnownAs"],
+            json!([
+                "https://test.example/users/alicia",
+                "https://other.example/users/alice",
+            ]),
+            "the stored actor ids, verbatim and in order"
+        );
+        assert_eq!(
+            json_keys(&document),
+            BASE_KEYS,
+            "aliases are a value, not a new key"
+        );
+    }
+
+    #[test]
+    fn a_moved_account_emits_moved_to() {
+        let mut alice = local_alice();
+        alice.moved_to_ap_id = Some("https://other.example/users/alice".to_owned());
+        let document = render(&alice);
+        assert_eq!(
+            document["movedTo"], "https://other.example/users/alice",
+            "the move target rides the actor document"
+        );
+        let mut expected: Vec<&str> = BASE_KEYS.to_vec();
+        expected.push("movedTo");
+        expected.sort_unstable();
+        assert_eq!(json_keys(&document), expected, "one more key");
     }
 }
