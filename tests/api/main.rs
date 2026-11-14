@@ -306,6 +306,10 @@ mod search;
 /// `…/history` and `…/source` twins).
 mod status_edits;
 
+/// The outbound federation of the status lifecycle over HTTP: the `Create`,
+/// `Update` and `Delete` the post, edit and delete routes queue.
+mod status_federation;
+
 /// The status endpoints: the reads (`GET /api/v1/statuses/{id}` and its
 /// batch form) and the write (`POST /api/v1/statuses`).
 mod statuses;

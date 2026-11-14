@@ -397,14 +397,15 @@
 //! rows of the deleted statuses stay in the table, referenced by nothing
 //! live, until the cleanup job removes them.
 //!
-//! What leaves this instance is the boost's withdrawal: a deleted REBLOG
-//! row federates the `Undo` of the `Announce` it was, attached at the
-//! deletion service's `after_status_deleted` hook
+//! What leaves this instance is the withdrawal: a deleted REBLOG row
+//! federates the `Undo` of the `Announce` it was and a deleted plain status
+//! its `Delete` — the reserved object id as a `Tombstone`, under the
+//! addressing the post travelled with — both attached at the deletion
+//! service's `after_status_deleted` hook
 //! ([`crate::services::delete_status`] — the same landing point the
-//! expiration jobs run through), where the
-//! notification ticket has wired the cleanup that takes the deleted
-//! status's notifications with it. The `Delete` of a plain status and the
-//! `status_deleted` stream push still wait for their tickets there.
+//! expiration jobs run through), where the notification ticket has wired
+//! the cleanup that takes the deleted status's notifications with it. The
+//! `status_deleted` stream push still waits for its ticket there.
 //!
 //! # The edit, its history and its source
 //!
@@ -435,8 +436,8 @@
 //! author sees the edited post, `edited_at` set. The route's
 //! `after_status_edited` hook already lands
 //! [`crate::services::notify`]'s `update` telling of the post's local
-//! boosters; the `Update` activity and the `status.update` stream push
-//! await the same point.
+//! boosters and the `Update` activity that re-drafts the post for
+//! everyone else; the `status.update` stream push awaits the same point.
 //!
 //! `GET /api/v1/statuses/{id}/history` is Pleroma's `show_history`:
 //! optional auth (`read:statuses` on a presented user token), the same
@@ -2565,12 +2566,16 @@ pub(crate) async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, p
 /// account still boosting the edited post — Pleroma's `Update` arm of
 /// `get_potential_receiver_ap_ids`, the object's local `Announce` actors
 /// minus the author (`lib/pleroma/notification.ex`) — is landed here from
-/// [`notify::on_status_edited`].
+/// [`notify::on_status_edited`], and the federated re-draft of the post
+/// itself — the `Update` activity carrying the new note, addressed as the
+/// status is — from [`federation_out::after_status_edited`].
 ///
 /// The federated edit handler runs it too
 /// ([`crate::federation::handlers::note`]): an inbound `Update` of a
 /// mirrored status is an edit like any other, and the boosters of the post
-/// are told from either door alike.
+/// are told from either door alike. The announcement of the edit is the
+/// local door's alone: a mirrored row belongs to its origin, and
+/// [`federation_out::after_status_edited`] says nothing for one.
 ///
 /// The one consumer still waiting wires itself in here: the streaming
 /// ticket that pushes the edited status to `status.update`; it ships the
@@ -2579,11 +2584,14 @@ pub(crate) async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, p
 ///
 /// `row` is the pre-edit stored row: the id every consumer names — the
 /// write keeps it — and the author whose boosters the telling reads off
-/// the live reblog rows.
+/// the live reblog rows. The federation arm needs no field of this
+/// snapshot but that id: it re-reads the row the write left behind, since
+/// the document it announces is the post as edited.
 ///
 /// [`notify::on_status_edited`]: crate::services::notify::on_status_edited
 pub(crate) async fn after_status_edited(state: &AppState, row: &StatusRow) {
     notify::on_status_edited(state, row).await;
+    federation_out::after_status_edited(state, row).await;
 }
 
 #[cfg(test)]

@@ -30,8 +30,9 @@
 //!
 //! The `update` telling of the post's local boosters already lands at the
 //! module's `after_status_edited` hook (WBE-113, tested in
-//! `notification_generation.rs`). Nothing federates yet: the `Update`
-//! activity and the `status.update` stream push attach at the same point.
+//! `notification_generation.rs`), and so does the federated `Update` of the
+//! re-drafted note (WBE-176, tested in `status_federation.rs`). The
+//! `status.update` stream push attaches at the same point.
 //!
 //! [`Status`]: wired_be::entities::status::Status
 

@@ -5,9 +5,10 @@
 //! `CommonAPI.delete` (`lib/pleroma/web/common_api.ex`); this module is the
 //! write it wraps — the tombstone of the row and of every live reblog of it,
 //! the counter steps, and the `after_status_deleted` hook the
-//! notification cleanup (and, for a deleted reblog row, the withdrawal of
-//! its `Announce`; once the note ticket lands, the `Delete` activity and
-//! the `status_deleted` stream push) hangs off. The endpoint
+//! notification cleanup hangs off — beside it the withdrawal the network is
+//! owed (the `Undo` of a deleted boost's `Announce`, the `Delete` of a
+//! deleted post's note) and, still to come, the `status_deleted` stream
+//! push. The endpoint
 //! keeps its own gates — authentication, the visibility 404, the ownership
 //! rule, the pre-delete render — and calls [`delete_status`] for the write
 //! itself.
@@ -67,21 +68,23 @@ pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<
 /// deleted status onto its thread's newest remaining direct status — or
 /// withdraws the participation when the thread has none (see
 /// [`conversation::repoint_after_delete`]). The federation of the
-/// withdrawal is wired in here too: for a REBLOG row
-/// [`federation_out::after_status_deleted`] sends the `Undo` of the
-/// `Announce` the row was — a deleted boost withdraws itself, it is never
-/// a `Delete`. The `Delete` of a plain status (and with it the withdrawal
-/// of every reblog this delete took down) and the streaming ticket that
+/// withdrawal is wired in here too: [`federation_out::after_status_deleted`]
+/// sends the `Undo` of the `Announce` for a REBLOG row — a deleted boost
+/// withdraws itself, it is never a `Delete` — and the `Delete` of the note
+/// for a plain status, both queued through `state` (decision 11) so the
+/// fan-out never runs on the request's own time. The streaming ticket that
 /// pushes `status_deleted` to the timelines that carried the post still
-/// land here, and the queueing will happen through `state` (decision 11).
+/// lands here.
 ///
 /// `status` is the row **as it was before the delete** — the delete clears the
 /// stored text, so this is the only copy of what the post said: its
 /// [`id`](status::Status::id) and [`uri`](status::Status::uri) name the object
 /// to withdraw, [`user_id`](status::Status::user_id) is the actor that owns
-/// it, and [`reblog_of_id`](status::Status::reblog_of_id) says whether the
-/// object was a boost whose original must stop counting it. Pleroma runs all
-/// three off the same `CommonAPI.delete` pipeline.
+/// it, [`visibility`](status::Status::visibility) and its mention links are
+/// the audience that has to be told, and
+/// [`reblog_of_id`](status::Status::reblog_of_id) says which of the two
+/// withdrawals the row owes. Pleroma runs all three off the same
+/// `CommonAPI.delete` pipeline.
 ///
 /// The cleanup is best-effort: the delete itself is already committed and
 /// must not answer a failure the client would retry against a gone
