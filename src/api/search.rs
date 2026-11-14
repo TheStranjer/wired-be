@@ -47,29 +47,62 @@
 //! (case-insensitive) fill exactly that one and leave the other two empty;
 //! any other spelling fills nothing, as before this ticket. One exception
 //! rides on the untyped search: a query beginning with `#` is a hashtag
-//! term, not text, and fills only the hashtag list. `resolve` still rides
-//! along to the model, which ignores it until the federation ticket gives
-//! it `WebFinger`. The two versions answer the same document until v1's
-//! hashtag arm differs: v1 spells hashtag entries as plain name strings
-//! and v2 as [`Tag`] entities whose (uncomputed) `history` renders as the
-//! empty list.
+//! term, not text, and fills only the hashtag list. The two versions answer
+//! the same document until v1's hashtag arm differs: v1 spells hashtag
+//! entries as plain name strings and v2 as [`Tag`] entities whose
+//! (uncomputed) `history` renders as the empty list.
+//!
+//! `resolve=true` is the federation arm of the same three routes, and it
+//! runs only for an authenticated viewer: reaching past the stored rows is
+//! a lookup on somebody's behalf, so an anonymous request gets exactly what
+//! the ordinary search answers. The query's shape picks the lookup. A
+//! `nick@domain` handle the stored search matched no row for exactly goes
+//! through [`get_or_fetch_by_acct`] and its account rides first in
+//! `accounts`. An `http(s)` URL is read as an actor id first —
+//! [`get_or_fetch_by_ap_id`] answers a stored or local actor from the
+//! database and refuses an unknown local id without touching the network —
+//! and, when that reading finds no actor, as a status through
+//! [`resolve_status`]. A resolved status rides first in `statuses`, one the
+//! viewer may not see is left out altogether, and its author is never
+//! added to `accounts` as a second copy of itself. [`resolve_status`] also
+//! matches this instance's own `/objects/{uuid}` and `/notice/{uuid}` rows
+//! from the database, and the one local form it does not name,
+//! `/users/{nickname}/statuses/{id}`, is read by id through
+//! [`status::get_by_id`]: a URL on this instance's own origin is never
+//! dereferenced over HTTP. Every lookup runs under the five-second
+//! `RESOLVE_BUDGET`, the
+//! request spends at most one of them (an attempt that fails falls through
+//! to the next reading, only a success counts), every failure is silent,
+//! and `type` narrows the readings to the resource it names: `type=accounts`
+//! fetches no post, `type=statuses` fetches no account.
 //!
 //! All three routes run in the limiter's `search` bucket (Pleroma
-//! throttles the three search actions there; see [`crate::rate_limit`]).
+//! throttles the three search actions there; see [`crate::rate_limit`]),
+//! which is the bucket a resolving request spends too — the lookup rides
+//! inside the same routed handler, so no `resolve=true` query escapes it.
+
+use std::{future::Future, pin::Pin, time::Duration};
 
 use axum::{Json, Router, extract::State, http::Uri, routing::get};
 use serde::Serialize;
 use tracing::debug;
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
     auth::MaybeAuthUser,
+    config::Config,
     entities::{account::Account, status::Status as StatusEntity, tag::Tag},
     error::{AppError, AppResult},
+    federation::{
+        fetch_actor::{FetchError, get_or_fetch_by_acct, get_or_fetch_by_ap_id, is_local_ap_id},
+        fetch_object::resolve_status,
+        webfinger_client::{resolve_acct_with_base, split_acct, strip_finger_prefixes},
+    },
     models::{
         hashtag::{self, Hashtag},
-        status_search,
+        status::{self, Status as StatusRow},
+        status_search, status_visibility,
         user::User,
         user_search::{self, SearchOpts},
     },
@@ -115,6 +148,21 @@ const STATUSES_TYPE: &str = "statuses";
 
 /// `type` spelling that searches hashtags.
 const HASHTAGS_TYPE: &str = "hashtags";
+
+/// The whole budget of one resolving search's remote lookup: five seconds
+/// for the round the lookup runs — `WebFinger` and the actor dereference, or
+/// the object dereference and its author's — past which the arm answers as
+/// if nothing had resolved. The same five seconds a remote mention lookup
+/// gives itself (see [`crate::services::mentions::REMOTE_LOOKUP_BUDGET`]).
+const RESOLVE_BUDGET: Duration = Duration::from_secs(5);
+
+/// The path segment a local actor URL opens with, and the one a local
+/// perma-link opens with too (see [`local_permalink_id`]).
+const USERS_SEGMENT: &str = "users";
+
+/// The segment only a local perma-link adds after the nickname:
+/// `{BASE_URL}/users/{nickname}/statuses/{id}`.
+const STATUSES_SEGMENT: &str = "statuses";
 
 /// Which combined-search route answered: the two versions render the
 /// hashtag list differently.
@@ -211,7 +259,8 @@ struct SearchParams {
     text_page: PageParams,
     /// `following`: restrict the account search to the viewer's follows.
     following: bool,
-    /// `resolve`: handed to the model, which ignores it (yet).
+    /// `resolve`: the federation arm's switch, read by [`resolve_query`] —
+    /// and still handed to the model, which ignores it.
     resolve: bool,
     /// `type`: which resource lists the combined search fills.
     resource: Resource,
@@ -357,7 +406,9 @@ struct SearchResults {
 
 /// `GET /api/v1/accounts/search` — the account search on its own, answered
 /// as a flat array of [`Account`] entities (Mastodon's account-search
-/// spelling, which Pleroma renders through its `AccountView`).
+/// spelling, which Pleroma renders through its `AccountView`). A resolving
+/// request reads the same array, with the account it fetched first; it runs
+/// no status lookup, because this route has no status list to put one in.
 ///
 /// # Errors
 ///
@@ -375,7 +426,16 @@ async fn account_search(
 ) -> AppResult<Json<Vec<Account>>> {
     auth.require_user_scope(READ_ACCOUNTS)?;
     let params = SearchParams::parse(uri.query())?;
-    Ok(Json(search_accounts(&state, &auth, &params).await?))
+    let viewer: Option<&User> = auth.0.as_ref();
+    let rows = account_rows(&state, viewer, &params).await?;
+    let request = Resolver::new(&params, Arms::AccountsOnly, viewer, &rows);
+    let resolved = resolve_query(&state, &request).await;
+    Ok(Json(account_entities(
+        &state,
+        viewer,
+        &rows,
+        resolved.account(),
+    )))
 }
 
 /// `GET /api/v1/search` — the combined search document in the v1
@@ -409,7 +469,9 @@ async fn search_v2(
 /// The combined search both versions answer: scope-gated, parameters
 /// parsed, and every arm [`SearchParams::searches`] selects filled with
 /// its own search — statuses only for a permitted request, as
-/// [`statuses_are_searchable`] reads the ticket's gate.
+/// [`statuses_are_searchable`] reads the ticket's gate — with the account
+/// or the post the request resolved (see [`resolve_query`]) riding first in
+/// its own list.
 ///
 /// # Errors
 ///
@@ -423,14 +485,17 @@ async fn search_document(
     auth.require_user_scope(READ_ACCOUNTS)?;
     let params = SearchParams::parse(uri.query())?;
     let viewer: Option<&User> = auth.0.as_ref();
-    let accounts = if params.searches(Resource::Accounts) {
-        search_accounts(&state, &auth, &params).await?
+    let rows = if params.searches(Resource::Accounts) {
+        account_rows(&state, viewer, &params).await?
     } else {
         Vec::new()
     };
+    let request = Resolver::new(&params, Arms::Combined, viewer, &rows);
+    let resolved = resolve_query(&state, &request).await;
+    let accounts = account_entities(&state, viewer, &rows, resolved.account());
     let statuses = if params.searches(Resource::Statuses) && statuses_are_searchable(&state, viewer)
     {
-        find_statuses(&state, viewer, &params).await?
+        find_statuses(&state, viewer, &params, resolved.status()).await?
     } else {
         Vec::new()
     };
@@ -455,9 +520,10 @@ fn statuses_are_searchable(state: &AppState, viewer: Option<&User>) -> bool {
 }
 
 /// The status entities the `statuses` arm answers with: the model's
-/// visible, text-matched page, rendered through the shared batch renderer
-/// for the request's viewer (an anonymous render is Pleroma's stranger
-/// view, exactly as on the timelines).
+/// visible, text-matched page — with the post the request resolved, when
+/// the viewer may see it, riding first — rendered through the shared batch
+/// renderer for the request's viewer (an anonymous render is Pleroma's
+/// stranger view, exactly as on the timelines).
 ///
 /// # Errors
 ///
@@ -467,8 +533,9 @@ async fn find_statuses(
     state: &AppState,
     viewer: Option<&User>,
     params: &SearchParams,
+    resolved: Option<&StatusRow>,
 ) -> AppResult<Vec<StatusEntity>> {
-    let rows = status_search::search_statuses(
+    let mut rows = status_search::search_statuses(
         &state.db,
         viewer,
         &params.q,
@@ -476,13 +543,48 @@ async fn find_statuses(
         &params.text_page,
     )
     .await?;
-    let rendered = render_statuses(state, viewer, &rows).await?;
+    let mut page: Vec<StatusRow> = Vec::with_capacity(rows.len() + usize::from(resolved.is_some()));
+    if let Some(top) = visible_resolution(state, viewer, resolved).await? {
+        let id = top.id;
+        rows.retain(|row| row.id != id);
+        page.push(top);
+    }
+    page.append(&mut rows);
+    let rendered = render_statuses(state, viewer, &page).await?;
     debug!(
         count = rendered.len(),
         author_filtered = params.account_id.is_some(),
+        resolved = page.len() > rows.len(),
         "statuses searched"
     );
     Ok(rendered)
+}
+
+/// The resolved status this request may answer with: [`can_view`] is the
+/// shared gate, so a `private` or `direct` post the viewer has no business
+/// reading is left out of the list exactly as the text search would never
+/// have found it.
+///
+/// [`can_view`]: crate::models::status_visibility::can_view
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+async fn visible_resolution(
+    state: &AppState,
+    viewer: Option<&User>,
+    resolved: Option<&StatusRow>,
+) -> AppResult<Option<StatusRow>> {
+    let Some(row) = resolved else {
+        return Ok(None);
+    };
+    if status_visibility::can_view(&state.db, row, viewer).await? {
+        Ok(Some(row.clone()))
+    } else {
+        debug!("a resolved status the viewer may not see is left out of the answer");
+        Ok(None)
+    }
 }
 
 /// The hashtag arm: names stored with the query as their prefix, in the
@@ -506,22 +608,18 @@ async fn find_hashtags(
     Ok(HashtagList::render(found, version, &state.config.base_url))
 }
 
-/// The account entities both search answers run through: the model's
-/// ranked, viewer-filtered rows rendered as [`Account`] for the request's
-/// viewer (an anonymous request renders Pleroma's stranger view; the
-/// listings here are not relationship endpoints, so `pleroma.relationship`
-/// stays the empty object).
+/// The account rows of one search answer, before any resolution and before
+/// rendering: the model's ranked, viewer-filtered page for the query.
 ///
 /// # Errors
 ///
 /// Any database failure arrives through `?` as
 /// [`AppError::Database`](crate::error::AppError).
-async fn search_accounts(
+async fn account_rows(
     state: &AppState,
-    auth: &MaybeAuthUser,
+    viewer: Option<&User>,
     params: &SearchParams,
-) -> AppResult<Vec<Account>> {
-    let viewer: Option<&User> = auth.0.as_ref();
+) -> AppResult<Vec<User>> {
     let rows = user_search::search_accounts(&state.db, viewer, &params.q, &params.opts()).await?;
     debug!(
         count = rows.len(),
@@ -529,18 +627,381 @@ async fn search_accounts(
         resolve = params.resolve,
         "accounts searched"
     );
-    Ok(rows
+    Ok(rows)
+}
+
+/// The account entities both search answers run through: `rows` rendered as
+/// [`Account`] for the request's viewer (an anonymous request renders
+/// Pleroma's stranger view; the listings here are not relationship
+/// endpoints, so `pleroma.relationship` stays the empty object), with the
+/// account the request resolved riding first — and left out of `rows` when
+/// the fetch answered a row that is in the page after all, so one account is
+/// never listed twice.
+fn account_entities(
+    state: &AppState,
+    viewer: Option<&User>,
+    rows: &[User],
+    resolved: Option<&User>,
+) -> Vec<Account> {
+    let mut accounts: Vec<Account> = rows
         .iter()
+        .filter(|row| resolved.is_none_or(|found| row.id != found.id))
         .map(|found| Account::from_user_for(viewer, found, &state.config, None))
-        .collect())
+        .collect();
+    if let Some(found) = resolved {
+        accounts.insert(
+            0,
+            Account::from_user_for(viewer, found, &state.config, None),
+        );
+    }
+    accounts
+}
+
+/// Which lists the answering route renders, and so which arm the request's
+/// single resolution is allowed to spend itself on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arms {
+    /// The combined document: both the `accounts` and the `statuses` lists
+    /// answer, so either reading is worth running.
+    Combined,
+    /// The flat account array: only `accounts` answers, so a status reading
+    /// would fetch a post this route has nowhere to put.
+    AccountsOnly,
+}
+
+impl Arms {
+    /// Whether this route renders `asked`'s list.
+    fn renders(self, asked: Resource) -> bool {
+        asked != Resource::Statuses || matches!(self, Self::Combined)
+    }
+
+    /// Whether a request on `params` may spend its one lookup on `asked`:
+    /// the route renders that list, and the request's `type` selects it —
+    /// `type=accounts` asks for no post, `type=statuses` for no account, and
+    /// a `#`-prefixed untyped query asks for neither.
+    fn attempts(self, params: &SearchParams, asked: Resource) -> bool {
+        self.renders(asked) && params.searches(asked)
+    }
+}
+
+/// Everything the one resolution of a request decides from: the parsed
+/// request, the arms its route renders, the viewer whose credentials make
+/// resolution possible at all, and the account rows the stored search has
+/// already answered.
+#[derive(Debug)]
+struct Resolver<'a> {
+    /// The parsed request parameters.
+    params: &'a SearchParams,
+    /// Which lists the answering route renders.
+    arms: Arms,
+    /// The requesting viewer: `None` anonymously, which resolves nothing.
+    viewer: Option<&'a User>,
+    /// The rows [`account_rows`] answered for this request, in its ranking:
+    /// the exact-match test reads them to keep a handle this instance
+    /// already stores off the network.
+    rows: &'a [User],
+    /// The origin a mock `WebFinger` peer answers on, and `None` everywhere
+    /// else: `WebFinger` is HTTPS-only by RFC 7033, so only the in-crate
+    /// tests can point it at loopback (see
+    /// [`crate::services::mentions::resolve_mentions_with_base`], the same
+    /// seam).
+    webfinger_base: Option<&'a str>,
+}
+
+impl<'a> Resolver<'a> {
+    /// The resolver a handler runs, against the real `WebFinger`.
+    const fn new(
+        params: &'a SearchParams,
+        arms: Arms,
+        viewer: Option<&'a User>,
+        rows: &'a [User],
+    ) -> Self {
+        Self {
+            params,
+            arms,
+            viewer,
+            rows,
+            webfinger_base: None,
+        }
+    }
+
+    /// Whether this request asks for resolution at all: `resolve=true`, from
+    /// an authenticated viewer. Resolution is a federation action on
+    /// somebody's behalf, so an anonymous caller keeps the ordinary stored
+    /// search's answer (Pleroma's `maybe_resolve` resolves for a user, too).
+    const fn resolves(&self) -> bool {
+        self.params.resolve && self.viewer.is_some()
+    }
+
+    /// Whether this request may spend its one lookup on `asked`'s arm.
+    fn attempts(&self, asked: Resource) -> bool {
+        self.arms.attempts(self.params, asked)
+    }
+}
+
+/// What the one lookup of a resolving search produced. The payloads are
+/// boxed: a [`User`] or a [`StatusRow`] outgrows the nothing-resolved arm by
+/// an order of magnitude.
+#[derive(Debug)]
+enum Resolution {
+    /// Nothing resolved: no lookup ran, or every attempt failed quietly.
+    Nothing,
+    /// The account to answer first in `accounts`.
+    Account(Box<User>),
+    /// The status row to answer first in `statuses`.
+    Status(Box<StatusRow>),
+}
+
+impl Resolution {
+    /// The resolved account, when that is what the lookup found.
+    fn account(&self) -> Option<&User> {
+        match self {
+            Self::Account(found) => Some(found.as_ref()),
+            Self::Nothing | Self::Status(_) => None,
+        }
+    }
+
+    /// The resolved status row, when that is what the lookup found.
+    fn status(&self) -> Option<&StatusRow> {
+        match self {
+            Self::Status(found) => Some(found.as_ref()),
+            Self::Nothing | Self::Account(_) => None,
+        }
+    }
+}
+
+/// The request's one remote lookup, silent on every failure. The query's
+/// shape decides: an `http(s)` URL goes to [`resolve_url`], and any other
+/// query that spells a `nick@domain` handle goes to [`resolve_handle`].
+/// Anything else — a word, a `#tag`, a query in no scheme federation speaks
+/// — resolves nothing, and the answer is the stored search's alone.
+async fn resolve_query(state: &AppState, request: &Resolver<'_>) -> Resolution {
+    if !request.resolves() {
+        return Resolution::Nothing;
+    }
+    let query = request.params.q.trim();
+    match web_url(query) {
+        Some(url) => resolve_url(state, request, &url).await,
+        None => resolve_handle(state, request, query).await,
+    }
+}
+
+/// The URL arm: the actor reading first, the status reading second, and the
+/// request stops at the first thing it finds. A status URL run through the
+/// actor reading fails there — a `Note` document is no actor — which is what
+/// lets one query name either kind of remote object (the ticket's "try, and
+/// fall through on failure"), while `type` still keeps either reading from
+/// being attempted at all.
+async fn resolve_url(state: &AppState, request: &Resolver<'_>, url: &Url) -> Resolution {
+    if request.attempts(Resource::Accounts)
+        && let Some(found) = fetch_actor_url(state, url).await
+    {
+        return Resolution::Account(Box::new(found));
+    }
+    if request.attempts(Resource::Statuses)
+        && let Some(found) = fetch_status_url(state, url).await
+    {
+        return Resolution::Status(Box::new(found));
+    }
+    Resolution::Nothing
+}
+
+/// The handle arm: a `nick@domain` query (the leading `@` optional) that the
+/// stored search matched no row for exactly, looked up through
+/// [`get_or_fetch_by_acct`]. A handle this client would refuse to finger is
+/// no handle at all for the search either — [`split_acct`] is what says so —
+/// and a query the search already matched nickname for nickname needs no
+/// lookup, because the row the fetch would return is already in the page.
+async fn resolve_handle(state: &AppState, request: &Resolver<'_>, query: &str) -> Resolution {
+    if !request.attempts(Resource::Accounts)
+        || split_acct(query).is_none()
+        || matched_exact(request.rows, query)
+    {
+        return Resolution::Nothing;
+    }
+    fetch_handle(state, request.webfinger_base, query)
+        .await
+        .map_or(Resolution::Nothing, |found| {
+            Resolution::Account(Box::new(found))
+        })
+}
+
+/// One resolution's remote lookup, pinned to a pointer: [`within_budget`]
+/// waits on it, and a boxed future keeps the waiting search's own state
+/// machine small however much state the federation dereference inside it
+/// carries (the shape [`crate::jobs`] hands its job handlers, for the same
+/// reason).
+type Lookup<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The handle lookup of a resolving search: [`get_or_fetch_by_acct`] —
+/// `WebFinger`, then the actor dereference, then the vouch check — under
+/// [`RESOLVE_BUDGET`], every failure (and every clock that runs out) answering
+/// `None` with a `debug` line, because the ticket's unresolved arm is an
+/// empty list, not an error.
+async fn fetch_handle(state: &AppState, webfinger_base: Option<&str>, acct: &str) -> Option<User> {
+    within_budget(Box::pin(async move {
+        match lookup_handle(state, webfinger_base, acct).await {
+            Ok(found) => Some(found),
+            Err(err) => {
+                debug!(%err, %acct, "a search could not resolve the handle");
+                None
+            }
+        }
+    }))
+    .await
+}
+
+/// The one handle lookup behind [`fetch_handle`]. The production arm is
+/// [`get_or_fetch_by_acct`] entire; the `Some(base)` arm runs the same
+/// `WebFinger`-then-actor round trip against a mock peer at `base` and
+/// skips only the vouch check `get_or_fetch_by_acct` closes it with — a mock
+/// answering on loopback can never name the dotted domain of a handle
+/// `WebFinger` accepts, so the check would reject every mock success. The
+/// same seam [`crate::services::mentions::resolve_mentions_with_base`]
+/// keeps, for the same reason.
+async fn lookup_handle(
+    state: &AppState,
+    webfinger_base: Option<&str>,
+    acct: &str,
+) -> Result<User, FetchError> {
+    match webfinger_base {
+        None => get_or_fetch_by_acct(state, acct).await,
+        Some(base) => {
+            let ap_id = resolve_acct_with_base(&state.http_client, acct, Some(base)).await?;
+            get_or_fetch_by_ap_id(state, &ap_id).await
+        }
+    }
+}
+
+/// The actor reading of a URL query: [`get_or_fetch_by_ap_id`] under
+/// [`RESOLVE_BUDGET`]. It answers a stored actor or a local one from the
+/// database — an unknown id on this instance's own origin is refused without
+/// any network at all — and mirrors a remote one it has never seen.
+async fn fetch_actor_url(state: &AppState, url: &Url) -> Option<User> {
+    within_budget(Box::pin(async move {
+        match get_or_fetch_by_ap_id(state, url.as_str()).await {
+            Ok(found) => Some(found),
+            Err(err) => {
+                debug!(%err, "a search read a URL as an actor id and found no account");
+                None
+            }
+        }
+    }))
+    .await
+}
+
+/// The status reading of a URL query: this instance's own perma-link is a
+/// database read, and [`resolve_status`] does the rest — it answers a stored
+/// row (its `/objects/{uuid}` shape and its `/notice/{uuid}` alias alike)
+/// and nothing at all for an unknown local id, so the only local form left
+/// out is the perma-link the resolver stores no uri under.
+async fn fetch_status_url(state: &AppState, url: &Url) -> Option<StatusRow> {
+    if let Some(id) = local_permalink_id(&state.config, url) {
+        let found = status::get_by_id(&state.db, id).await.ok().flatten();
+        debug!(
+            %id,
+            stored = found.is_some(),
+            "a local status perma-link resolved from the database"
+        );
+        return found;
+    }
+    within_budget(Box::pin(async move {
+        match resolve_status(state, url.as_str()).await {
+            Ok(found) => found,
+            Err(err) => {
+                debug!(%err, "a search read a URL as a status and found no post");
+                None
+            }
+        }
+    }))
+    .await
+}
+
+/// The query as a URL federation can act on: `http` or `https` only —
+/// anything else (a word, a handle, an `ftp:` or `mailto:` address) names no
+/// remote document, and is [`None`].
+fn web_url(query: &str) -> Option<Url> {
+    let parsed = Url::parse(query).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then_some(parsed)
+}
+
+/// Whether the stored search already answered with the account `query`
+/// names: a row whose nickname *is* the query, case folded and its leading
+/// `@` (or `acct:`) folded away. Such a query needs no lookup — the account
+/// the fetch would return is already in the page.
+fn matched_exact(rows: &[User], query: &str) -> bool {
+    let handle = strip_finger_prefixes(query.trim());
+    rows.iter()
+        .any(|row| row.nickname.eq_ignore_ascii_case(handle))
+}
+
+/// The id a local status perma-link names: `{BASE_URL}/users/{nickname}/
+/// statuses/{id}` on this instance's own origin, with `id` a stored-shaped
+/// id ([`parse_id`]). The nickname segment is the client's slug and decides
+/// nothing — the id is the row. Every other URL is [`None`], including a
+/// local URL of another shape, which the resolver's own local arms settle.
+fn local_permalink_id(config: &Config, url: &Url) -> Option<Uuid> {
+    if !is_local_ap_id(config, url.as_str()) {
+        return None;
+    }
+    let mut segments = url.path().trim_start_matches('/').split('/');
+    if segments.next() != Some(USERS_SEGMENT) {
+        return None;
+    }
+    if segments.next().is_none_or(str::is_empty) {
+        return None;
+    }
+    if segments.next() != Some(STATUSES_SEGMENT) {
+        return None;
+    }
+    let id = segments.next().filter(|id| !id.is_empty())?;
+    if segments.next().is_some() {
+        return None;
+    }
+    parse_id(id)
+}
+
+/// Runs one resolution `future` under [`RESOLVE_BUDGET`], answering whatever
+/// it answers or [`None`] when the budget runs out first. A lookup cut off
+/// mid-flight is simply dropped: the ticket's silent failure, and the same
+/// posture a remote mention lookup takes (see [`crate::services::ingest`]).
+///
+/// The future arrives boxed for the same reason [`crate::jobs`] boxes its
+/// handler futures: a federation dereference is kilobytes of state machine,
+/// and the search's own future holds a pointer to it instead.
+async fn within_budget<T>(future: Lookup<'_, Option<T>>) -> Option<T> {
+    tokio::time::timeout(RESOLVE_BUDGET, future)
+        .await
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use axum::{
+        extract::{Path, Query},
+        http::header::CONTENT_TYPE,
+        response::{IntoResponse as _, Response},
+    };
     use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
-    use crate::config::TEST_BASE_URL;
+    use crate::{
+        config::TEST_BASE_URL,
+        http_client::HttpClient,
+        models::user::{NewUser, get_by_ap_id, insert, local_ap_id},
+        uploads::UploaderBackend,
+    };
 
     /// The parsed parameters of `query`.
     ///
@@ -827,5 +1288,442 @@ mod tests {
                 .expect("the empty list serializes");
             assert_eq!(empty, json!([]), "an unsearched arm is still an array");
         }
+    }
+
+    /// `User-Agent` for the mock-reachable client.
+    const TEST_UA: &str = "Wired (https://test.example)";
+
+    /// Test state over `pool`: the fixed test config with a client whose SSRF
+    /// guard is off, so the handle lookup may reach the loopback mock.
+    fn test_state(pool: &PgPool) -> AppState {
+        let config = Arc::new(Config::for_tests());
+        AppState {
+            db: pool.clone(),
+            hub: crate::streaming::hub::Hub::new(pool),
+            config: Arc::clone(&config),
+            http_client: HttpClient::new_for_tests(TEST_UA),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
+            translation_languages_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        }
+    }
+
+    /// A local user named `nickname`, inserted straight.
+    async fn local_user(pool: &PgPool, nickname: &str) -> User {
+        insert(
+            pool,
+            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
+        )
+        .await
+        .expect("the fixture local user inserts")
+    }
+
+    /// A stored remote mirror of `nickname` on `host`, the shape decision 7
+    /// keeps: the nickname carries the whole handle.
+    async fn mirror_user(pool: &PgPool, nickname: &str, host: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("{nickname}@{host}"),
+                ap_id: format!("https://{host}/users/{nickname}"),
+                domain: Some(host.to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the fixture mirror inserts")
+    }
+
+    /// The mock remote peer: its `http://` origin beside the per-endpoint
+    /// request counts the tests assert on.
+    #[derive(Clone, Debug)]
+    struct Mock {
+        /// The peer's origin.
+        base: String,
+        /// `WebFinger` requests it received.
+        webfinger_hits: Arc<AtomicUsize>,
+        /// Actor dereferences it received.
+        actor_hits: Arc<AtomicUsize>,
+    }
+
+    /// Serves `WebFinger` and one actor document per nickname on a loopback
+    /// port; the returned task is aborted by the test once its assertions are
+    /// in.
+    async fn mock_peer() -> (Mock, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the mock peer binds a port");
+        let mock = Mock {
+            base: format!("http://{}", listener.local_addr().expect("a bound address")),
+            webfinger_hits: Arc::new(AtomicUsize::new(0)),
+            actor_hits: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/.well-known/webfinger", get(mock_webfinger))
+            .route("/users/{nick}", get(mock_actor))
+            .with_state(mock.clone());
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                tracing::debug!("mock peer stopped: {err}");
+            }
+        });
+        (mock, server)
+    }
+
+    /// [`mock_peer`]'s `WebFinger` arm: a `JRD` whose self link points at this
+    /// peer's own `/users/{nick}`, under a subject that vouches for the
+    /// `{nick}@mock.example` handle the resolver was asked about.
+    async fn mock_webfinger(
+        State(mock): State<Mock>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Response {
+        let _hits = mock.webfinger_hits.fetch_add(1, Ordering::SeqCst);
+        let nickname = params
+            .get("resource")
+            .and_then(|resource| resource.strip_prefix("acct:"))
+            .and_then(|handle| handle.split_once('@').map(|(nick, _)| nick))
+            .unwrap_or_else(|| panic!("the mock was fingered for no acct: {params:?}"));
+        let jrd = json!({
+            "subject": format!("acct:{nickname}@mock.example"),
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("{}/users/{nickname}", mock.base),
+            }],
+        });
+        ([(CONTENT_TYPE, "application/jrd+json")], jrd.to_string()).into_response()
+    }
+
+    /// [`mock_peer`]'s actor arm: the self-identifying `Person` document
+    /// [`parse_actor`] requires.
+    ///
+    /// [`parse_actor`]: crate::federation::remote_actor::parse_actor
+    async fn mock_actor(State(mock): State<Mock>, Path(nick): Path<String>) -> Response {
+        let _hits = mock.actor_hits.fetch_add(1, Ordering::SeqCst);
+        let id = format!("{}/users/{nick}", mock.base);
+        let document = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "type": "Person",
+            "id": id,
+            "preferredUsername": nick,
+            "name": "Mock",
+            "inbox": format!("{id}/inbox"),
+            "publicKey": {
+                "id": format!("{id}#main-key"),
+                "owner": id,
+                "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n",
+            },
+        });
+        (
+            [(CONTENT_TYPE, "application/activity+json")],
+            document.to_string(),
+        )
+            .into_response()
+    }
+
+    /// The origin of a port nothing listens on any more: every request to it
+    /// fails to connect, which is how an unreachable peer reads here without
+    /// waiting on any network or timer.
+    async fn dead_base() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port is free to bind");
+        let base = format!("http://{}", listener.local_addr().expect("a bound address"));
+        drop(listener);
+        base
+    }
+
+    /// The hits one mock counter has recorded.
+    fn hits(counter: &AtomicUsize) -> usize {
+        counter.load(Ordering::SeqCst)
+    }
+
+    /// The one lookup a resolving combined search runs for `query`: `viewer`
+    /// asking, `rows` already answered by the stored search, and `base` the
+    /// mock `WebFinger` origin to point the handle arm at (`None` asks the
+    /// real one, which no loopback mock answers).
+    async fn resolution(
+        state: &AppState,
+        viewer: Option<&User>,
+        query: &str,
+        rows: &[User],
+        base: Option<&str>,
+    ) -> Resolution {
+        let params = parse(query);
+        let request = Resolver {
+            webfinger_base: base,
+            ..Resolver::new(&params, Arms::Combined, viewer, rows)
+        };
+        resolve_query(state, &request).await
+    }
+
+    /// A handle the stored search answered nothing for is fetched through
+    /// `WebFinger`, mirrored into `users`, and rides the account list first;
+    /// the next search for the same handle is served by that mirror, so the
+    /// actor document is never dereferenced twice.
+    #[tokio::test]
+    async fn a_resolved_handle_rides_first_and_is_stored_for_later() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let (mock, server) = mock_peer().await;
+        let viewer = local_user(&pool, "viewer").await;
+        let follower = local_user(&pool, "alfred").await;
+
+        let found = resolution(
+            &state,
+            Some(&viewer),
+            "q=alice@mock.example&resolve=true",
+            &[],
+            Some(&mock.base),
+        )
+        .await;
+        assert!(
+            found.account().is_some() && found.status().is_none(),
+            "the account arm is what answered"
+        );
+        let Resolution::Account(account) = found else {
+            panic!("the handle resolved to an account: {found:?}");
+        };
+        assert_eq!(
+            account.ap_id,
+            format!("{}/users/alice", mock.base),
+            "the actor the mock's WebFinger named"
+        );
+        assert!(!account.local.get(), "and a remote mirror, not a local row");
+        let stored = get_by_ap_id(&pool, &account.ap_id)
+            .await
+            .expect("the mirror read")
+            .expect("the fetched actor is stored for later");
+        assert_eq!(stored.id, account.id, "the answer is the stored row");
+
+        let follower_id = follower.id.to_string();
+        let listed = account_entities(&state, Some(&viewer), &[follower], Some(&account));
+        let ids: Vec<String> = listed.iter().map(|entry| entry.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![account.id.to_string(), follower_id],
+            "the resolved account comes first, the stored match follows"
+        );
+
+        let again = resolution(
+            &state,
+            Some(&viewer),
+            "q=alice@mock.example&resolve=true",
+            &[],
+            Some(&mock.base),
+        )
+        .await;
+        assert!(
+            matches!(again, Resolution::Account(_)),
+            "the mirror answers the next search too"
+        );
+        assert_eq!(
+            (hits(&mock.webfinger_hits), hits(&mock.actor_hits)),
+            (2, 1),
+            "one actor dereference for the two searches: the second read the mirror"
+        );
+        server.abort();
+    }
+
+    /// A handle the stored search matched nickname for nickname runs no
+    /// lookup at all: the account the fetch would return is already in the
+    /// page, and the peer never hears about the request.
+    #[tokio::test]
+    async fn an_exact_handle_match_resolves_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let (mock, server) = mock_peer().await;
+        let viewer = local_user(&pool, "viewer").await;
+        let eve = mirror_user(&pool, "eve", "remote.example").await;
+        assert!(
+            matched_exact(std::slice::from_ref(&eve), "@Eve@remote.example"),
+            "the stored nickname is an exact match for the typed handle"
+        );
+
+        let found = resolution(
+            &state,
+            Some(&viewer),
+            "q=%40eve%40remote.example&resolve=true",
+            &[eve],
+            Some(&mock.base),
+        )
+        .await;
+        assert!(
+            matches!(found, Resolution::Nothing),
+            "the exact match is the answer already: {found:?}"
+        );
+        assert_eq!(
+            (hits(&mock.webfinger_hits), hits(&mock.actor_hits)),
+            (0, 0),
+            "and no lookup ran"
+        );
+        server.abort();
+    }
+
+    /// The peer behind a handle cannot be reached: the arm answers nothing,
+    /// quietly — no error, no partial row, and the account list stays as the
+    /// stored search left it.
+    #[tokio::test]
+    async fn an_unreachable_handle_resolves_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let viewer = local_user(&pool, "viewer").await;
+        let base = dead_base().await;
+
+        let found = resolution(
+            &state,
+            Some(&viewer),
+            "q=alice@mock.example&resolve=true",
+            &[],
+            Some(&base),
+        )
+        .await;
+        assert!(
+            matches!(found, Resolution::Nothing),
+            "an unreachable peer is the empty arm: {found:?}"
+        );
+    }
+
+    /// Resolution needs both the flag and a viewer: `resolve=false` and an
+    /// anonymous `resolve=true` are the ordinary stored search, and the mock
+    /// peer sees neither request.
+    #[tokio::test]
+    async fn resolution_needs_the_flag_and_a_viewer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let (mock, server) = mock_peer().await;
+        let viewer = local_user(&pool, "viewer").await;
+
+        for (who, query) in [
+            ("no flag", "q=alice@mock.example"),
+            ("an anonymous caller", "q=alice@mock.example&resolve=true"),
+            ("junk that is not a handle", "q=alice&resolve=true"),
+            ("a tag query", "q=%23alice&resolve=true"),
+        ] {
+            let asked = match who {
+                "an anonymous caller" => None,
+                _ => Some(&viewer),
+            };
+            let found = resolution(&state, asked, query, &[], Some(&mock.base)).await;
+            assert!(
+                matches!(found, Resolution::Nothing),
+                "{who} resolves nothing: {found:?}"
+            );
+        }
+        assert_eq!(
+            (hits(&mock.webfinger_hits), hits(&mock.actor_hits)),
+            (0, 0),
+            "and none of them reached the network"
+        );
+        server.abort();
+    }
+
+    /// `type` narrows the readings to the resource it names: a handle is
+    /// never fetched for `type=statuses`, and the flat account search never
+    /// spends its one lookup on a post it has no list for.
+    #[tokio::test]
+    async fn the_requested_type_narrows_what_resolves() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let (mock, server) = mock_peer().await;
+        let viewer = local_user(&pool, "viewer").await;
+
+        let found = resolution(
+            &state,
+            Some(&viewer),
+            "q=alice@mock.example&resolve=true&type=statuses",
+            &[],
+            Some(&mock.base),
+        )
+        .await;
+        assert!(
+            matches!(found, Resolution::Nothing),
+            "`type=statuses` asks for no account: {found:?}"
+        );
+        assert_eq!(hits(&mock.webfinger_hits), 0, "and no lookup ran");
+
+        let untyped = parse("q=bob");
+        assert!(
+            Arms::Combined.attempts(&untyped, Resource::Statuses),
+            "the combined document can answer a resolved post"
+        );
+        assert!(
+            !Arms::AccountsOnly.attempts(&untyped, Resource::Statuses),
+            "the flat account array cannot, so it never fetches one"
+        );
+        for asked in [Resource::Accounts, Resource::Hashtags] {
+            assert!(
+                Arms::AccountsOnly.attempts(&untyped, asked),
+                "the accounts arm is still there for {asked:?}"
+            );
+        }
+        let only_tags = parse("q=%23bob");
+        for asked in [Resource::Accounts, Resource::Statuses] {
+            assert!(
+                !Arms::Combined.attempts(&only_tags, asked),
+                "a `#`-query resolves no {asked:?} either"
+            );
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn only_an_http_url_is_read_as_an_address() {
+        for query in [
+            "https://remote.example/users/zoe",
+            "http://127.0.0.1:8080/a",
+        ] {
+            let url = web_url(query).expect("the address parses as a web URL");
+            assert!(matches!(url.scheme(), "http" | "https"), "{query} is web");
+        }
+        for query in [
+            "alice@remote.example",
+            "@alice",
+            "ftp://remote.example/pub",
+            "mailto:alice@remote.example",
+            "//remote.example/users/zoe",
+            "",
+        ] {
+            assert!(web_url(query).is_none(), "`{query}` names no document");
+        }
+    }
+
+    #[test]
+    fn a_local_permalink_is_read_by_id_and_nothing_else() {
+        let config = Config::for_tests();
+        let id = Uuid::now_v7();
+        for (path, want) in [
+            (format!("/users/bob/statuses/{id}"), Some(id)),
+            (format!("/users/bob/statuses/{}", id.simple()), Some(id)),
+            (format!("/users/bob/statuses/{id}/replies"), None),
+            ("/users/bob/statuses/nope".to_owned(), None),
+            (format!("/users//statuses/{id}"), None),
+            ("/users/bob/statuses".to_owned(), None),
+            ("/users/bob".to_owned(), None),
+            (format!("/notice/{id}"), None),
+            (format!("/objects/{id}"), None),
+        ] {
+            let url = Url::parse(&format!("{TEST_BASE_URL}{path}")).expect("the fixture URL");
+            assert_eq!(
+                local_permalink_id(&config, &url),
+                want,
+                "`{path}` is no perma-link of ours"
+            );
+        }
+        let elsewhere = Url::parse(&format!("http://127.0.0.1:9999/users/bob/statuses/{id}"))
+            .expect("the foreign URL");
+        assert_eq!(
+            local_permalink_id(&config, &elsewhere),
+            None,
+            "another origin's perma-link is not ours to read from the database"
+        );
     }
 }

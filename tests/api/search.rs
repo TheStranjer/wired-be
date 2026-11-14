@@ -11,21 +11,43 @@
 //! treat a `#`-leading query as a hashtag-only term, render hashtags as
 //! v1 name strings and v2 tag entities, and count into the limiter's
 //! `search` bucket.
+//!
+//! `resolve=true` is the federation arm of the same routes (WBE-192), and it
+//! runs only for an authenticated viewer: an actor URL the instance has
+//! never seen is fetched from a mock `ActivityPub` peer on loopback and rides
+//! first in `accounts`, a status URL is fetched and rendered into `statuses`
+//! with its author left out of `accounts`, a URL on this instance's own
+//! origin is read from the database alone, and a peer that cannot be reached
+//! answers the same empty lists an unresolving search would. `type` keeps the
+//! readings to the resource it names, and a resolving request spends the
+//! `search` bucket like any other.
 
 #![cfg(test)]
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-use axum::Router;
-use axum::http::StatusCode;
+use axum::{
+    Router,
+    extract::{Path, State},
+    http::{StatusCode, header::CONTENT_TYPE},
+    response::{IntoResponse as _, Response},
+    routing::get as route_get,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::{net::TcpListener, task::JoinHandle};
 use wired_be::config::Toggle;
 use wired_be::models::{
     block, follow, hashtag,
     mute::{self, MuteOptions},
     status::{self, NewStatus, Visibility},
-    user::User,
+    user::{self, User},
 };
 
 use crate::common;
@@ -1161,4 +1183,554 @@ async fn an_empty_query_fills_no_list_anywhere() {
             );
         }
     }
+}
+
+/// The public addressing a fetched note needs to ingest as the world's.
+const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
+
+/// A mock `ActivityPub` peer on loopback: `zoe`'s actor document and one
+/// public note per name, with the request counter the "was this attempted at
+/// all" assertions read.
+struct MockPeer {
+    /// The peer's `http://{addr}` origin.
+    base: String,
+    /// Requests it has answered.
+    hits: Arc<AtomicUsize>,
+    /// The task serving it, aborted when the test is done.
+    server: JoinHandle<()>,
+}
+
+/// The mock's shared state: the origin its documents must name themselves
+/// with, beside the hit counter.
+#[derive(Clone)]
+struct Peer {
+    /// The `http://{addr}` origin.
+    base: String,
+    /// Requests answered.
+    hits: Arc<AtomicUsize>,
+}
+
+/// A body labelled the way an `ActivityPub` peer labels one.
+fn ap_json(document: &Value) -> Response {
+    (
+        [(CONTENT_TYPE, "application/activity+json")],
+        document.to_string(),
+    )
+        .into_response()
+}
+
+/// Counts the hit and answers `zoe`'s self-identifying actor document.
+async fn serve_actor(State(peer): State<Peer>) -> Response {
+    let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
+    let id = format!("{}/users/zoe", peer.base);
+    ap_json(&json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Person",
+        "id": id,
+        "preferredUsername": "zoe",
+        "name": "Zoe",
+        "inbox": format!("{id}/inbox"),
+        "publicKey": {
+            "id": format!("{id}#main-key"),
+            "owner": id,
+            "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n",
+        },
+    }))
+}
+
+/// Counts the hit and answers the self-identifying public note named by the
+/// path, authored by this peer's `zoe`.
+async fn serve_object(State(peer): State<Peer>, Path(name): Path<String>) -> Response {
+    let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
+    ap_json(&json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Note",
+        "id": format!("{}/objects/{name}", peer.base),
+        "attributedTo": format!("{}/users/zoe", peer.base),
+        "to": [PUBLIC],
+        "content": format!("<p>remote post {name}</p>"),
+        "published": "2024-03-01T10:00:00.000Z",
+    }))
+}
+
+impl MockPeer {
+    /// Binds a port and serves `zoe` at `{base}/users/zoe` and any note at
+    /// `{base}/objects/{name}`.
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the mock peer binds a port");
+        let address = listener.local_addr().expect("a bound address");
+        let peer = Peer {
+            base: format!("http://{address}"),
+            hits: Arc::new(AtomicUsize::new(0)),
+        };
+        Self {
+            base: peer.base.clone(),
+            hits: Arc::clone(&peer.hits),
+            server: tokio::spawn(async move {
+                let app = Router::new()
+                    .route("/users/{nick}", route_get(serve_actor))
+                    .route("/objects/{name}", route_get(serve_object))
+                    .with_state(peer);
+                if let Err(err) = axum::serve(listener, app).await {
+                    tracing::debug!("mock peer stopped: {err}");
+                }
+            }),
+        }
+    }
+
+    /// The actor URL this peer serves.
+    fn actor_url(&self) -> String {
+        format!("{}/users/zoe", self.base)
+    }
+
+    /// The object URL of fixture note `name`.
+    fn object_url(&self, name: &str) -> String {
+        format!("{}/objects/{name}", self.base)
+    }
+
+    /// The requests answered so far.
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MockPeer {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// The origin of a port nothing listens on any more: every request to it
+/// fails to connect, which is how an unreachable peer reads here without
+/// waiting on any network or timer.
+async fn dead_origin() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port is free to bind");
+    let base = format!("http://{}", listener.local_addr().expect("a bound address"));
+    drop(listener);
+    base
+}
+
+/// A resolving search on an actor URL the instance has never seen runs the
+/// federation round trip: the mock peer's actor is fetched, mirrored into
+/// `users`, and rides first in `accounts` — on the combined document of both
+/// versions and on the flat account search alike.
+#[tokio::test]
+async fn resolve_fetches_an_unknown_actor_by_url() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let peer = MockPeer::start().await;
+    let url = peer.actor_url();
+    let app = common::test_app(pool.clone());
+
+    for path in [V1_SEARCH, V2_SEARCH] {
+        let found = get(&app, Some(&token), &format!("{path}?q={url}&resolve=true")).await;
+        common::assert_answer(&found, StatusCode::OK, "the resolving search");
+        let body = found.json_value();
+        assert_document(&body);
+        assert_eq!(
+            accounts_of(&body),
+            vec![zoe_id(&pool, &url).await],
+            "{path} answers the fetched account first"
+        );
+        assert_list_empty(&body, "statuses", "an actor URL is no post");
+    }
+
+    let flat = get(
+        &app,
+        Some(&token),
+        &format!("{ACCOUNTS_SEARCH}?q={url}&resolve=true"),
+    )
+    .await;
+    common::assert_answer(&flat, StatusCode::OK, "the flat account search");
+    assert_eq!(
+        listed_ids(&flat.json_value()),
+        vec![zoe_id(&pool, &url).await],
+        "and it answers the same account, as a flat array"
+    );
+    assert_eq!(
+        flat.json_value()[0]["acct"],
+        "zoe@127.0.0.1",
+        "the handle decision 7 stores the mirror under"
+    );
+}
+
+/// The stored mirror id of the mock peer's `zoe`.
+async fn zoe_id(pool: &PgPool, ap_id: &str) -> String {
+    user::get_by_ap_id(pool, ap_id)
+        .await
+        .unwrap()
+        .expect("the resolved actor is mirrored")
+        .id
+        .to_string()
+}
+
+/// A resolving search on a status URL fetches the remote note, stores it, and
+/// answers it rendered for the viewer in `statuses` — with its author left
+/// out of `accounts`: the account arm ran on the rows stored before the
+/// resolve, and the resolution adds nothing to it.
+#[tokio::test]
+async fn resolve_fetches_a_remote_status_by_url() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let peer = MockPeer::start().await;
+    let url = peer.object_url("first");
+    let app = common::test_app(pool.clone());
+
+    let found = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q={url}&resolve=true"),
+    )
+    .await;
+    common::assert_answer(&found, StatusCode::OK, "the resolving status search");
+    let body = found.json_value();
+    assert_document(&body);
+    let resolved = status_rows_by_uri(&pool, &url).await;
+    assert_eq!(
+        statuses_of(&body),
+        resolved,
+        "the fetched note is the statuses list"
+    );
+    assert_list_empty(&body, "accounts", "its author is not duplicated there");
+    let entity = &body["statuses"][0];
+    assert_eq!(entity["uri"], url, "the entity carries the object id");
+    assert_eq!(
+        entity["content"], "<p>remote post first</p>",
+        "and its content"
+    );
+    assert_eq!(
+        entity["account"]["acct"], "zoe@127.0.0.1",
+        "rendered with its author"
+    );
+
+    let repeat = get(
+        &app,
+        Some(&token),
+        &format!("{V2_SEARCH}?q={url}&resolve=true"),
+    )
+    .await;
+    assert_eq!(
+        statuses_of(&repeat.json_value()),
+        resolved,
+        "the stored row answers the next search too"
+    );
+}
+
+/// The ids of the live statuses stored under `uri`, as a list.
+async fn status_rows_by_uri(pool: &PgPool, uri: &str) -> Vec<String> {
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT id::text FROM statuses WHERE uri = $1")
+        .bind(uri)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    rows.into_iter().map(|(id,)| id).collect()
+}
+
+/// Every local URL form the ticket names resolves through the database, with
+/// no peer to ask: the account behind `/users/{nick}`, and the post behind
+/// `/objects/{id}`, `/notice/{id}` and `/users/{nick}/statuses/{id}`.
+#[tokio::test]
+async fn resolve_reads_local_urls_from_the_database() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let posted = common::create_local_user(&pool, "poster").await;
+    let row =
+        common::create_status(&pool, &posted, "a local post to find", Visibility::Public).await;
+    let app = common::test_app(pool.clone());
+
+    let cases = vec![
+        (
+            posted.ap_id.clone(),
+            vec![posted.id.to_string()],
+            Vec::new(),
+        ),
+        (
+            format!("{BASE}/users/poster"),
+            vec![posted.id.to_string()],
+            Vec::new(),
+        ),
+        (row.uri.clone(), Vec::new(), vec![row.id.to_string()]),
+        (
+            row.url
+                .clone()
+                .expect("a local status carries its notice url"),
+            Vec::new(),
+            vec![row.id.to_string()],
+        ),
+        (
+            format!("{BASE}/users/poster/statuses/{}", row.id),
+            Vec::new(),
+            vec![row.id.to_string()],
+        ),
+    ];
+    for (url, want_accounts, want_statuses) in cases {
+        let found = get(
+            &app,
+            Some(&token),
+            &format!("{V1_SEARCH}?q={url}&resolve=true"),
+        )
+        .await;
+        common::assert_answer(&found, StatusCode::OK, "the local resolve");
+        let body = found.json_value();
+        assert_eq!(accounts_of(&body), want_accounts, "`{url}` accounts");
+        assert_eq!(statuses_of(&body), want_statuses, "`{url}` statuses");
+    }
+
+    let gone = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q={BASE}/users/nobody&resolve=true"),
+    )
+    .await;
+    common::assert_answer(&gone, StatusCode::OK, "an unknown local actor");
+    assert_all_lists_empty(&gone.json_value(), "a local URL with no row behind it");
+}
+
+/// A resolved status the viewer may not see is left out of the answer: the
+/// same `/notice/{id}` is the author's own and nobody else's.
+#[tokio::test]
+async fn resolve_omits_a_status_the_viewer_may_not_see() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (author, author_token) = fixture(&pool, "author", "read").await;
+    let (_other, other_token) = fixture(&pool, "other", "read").await;
+    let secret = common::create_status(&pool, &author, "author only", Visibility::Private).await;
+    let url = secret.url.clone().expect("a local notice url");
+    let app = common::test_app(pool.clone());
+
+    let hidden = get(
+        &app,
+        Some(&other_token),
+        &format!("{V1_SEARCH}?q={url}&resolve=true"),
+    )
+    .await;
+    common::assert_answer(&hidden, StatusCode::OK, "the refusing answer is an answer");
+    assert_all_lists_empty(&hidden.json_value(), "a viewer the private post excludes");
+
+    let shown = get(
+        &app,
+        Some(&author_token),
+        &format!("{V1_SEARCH}?q={url}&resolve=true"),
+    )
+    .await;
+    assert_eq!(
+        statuses_of(&shown.json_value()),
+        vec![secret.id.to_string()],
+        "the author reads their own post"
+    );
+}
+
+/// A peer that cannot be reached is the empty answer, not an error: both
+/// readings fail quietly, and the stored search's own lists still answer
+/// beside them.
+#[tokio::test]
+async fn resolve_is_silent_for_an_unreachable_host() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let known = common::create_local_user(&pool, "resolvable").await;
+    let dead = dead_origin().await;
+    let app = common::test_app(pool.clone());
+
+    for path in ["/users/ghost", "/objects/ghost"] {
+        let query = format!("{dead}{path}");
+        let found = get(
+            &app,
+            Some(&token),
+            &format!("{V1_SEARCH}?q={query}&resolve=true"),
+        )
+        .await;
+        common::assert_answer(&found, StatusCode::OK, "an unreachable peer is no error");
+        let body = found.json_value();
+        assert_document(&body);
+        assert_list_empty(&body, "statuses", &format!("`{query}` resolves nothing"));
+        assert_list_empty(&body, "accounts", &format!("`{query}` resolves nothing"));
+    }
+
+    let flagged = get(
+        &app,
+        Some(&token),
+        &format!("{ACCOUNTS_SEARCH}?q=resolv&resolve=true"),
+    )
+    .await;
+    let plain = get(&app, Some(&token), &format!("{ACCOUNTS_SEARCH}?q=resolv")).await;
+    let ids = listed_ids(&flagged.json_value());
+    assert!(
+        ids.contains(&known.id.to_string()),
+        "the stored search still answers beside the flag: {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        listed_ids(&plain.json_value()),
+        "and a resolve that failed changes nothing about the answer"
+    );
+}
+
+/// Resolution is a viewer's action: the anonymous `resolve=true` request is
+/// the ordinary search, even with a live peer behind the URL, while the same
+/// request with a token fetches.
+#[tokio::test]
+async fn resolve_needs_an_authenticated_viewer() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let peer = MockPeer::start().await;
+    let url = peer.actor_url();
+    let app = common::test_app(pool.clone());
+
+    let anonymous = get(&app, None, &format!("{V1_SEARCH}?q={url}&resolve=true")).await;
+    common::assert_answer(
+        &anonymous,
+        StatusCode::OK,
+        "the anonymous search is answered",
+    );
+    assert_all_lists_empty(
+        &anonymous.json_value(),
+        "an anonymous resolve=true asks nothing of the network",
+    );
+    assert_eq!(peer.hits(), 0, "and the peer never heard about it");
+
+    let signed = get(
+        &app,
+        Some(&token),
+        &format!("{V1_SEARCH}?q={url}&resolve=true"),
+    )
+    .await;
+    assert_eq!(
+        accounts_of(&signed.json_value()).len(),
+        1,
+        "the same request with a viewer fetches"
+    );
+    assert!(peer.hits() > 0, "and the peer answered it");
+}
+
+/// `type` keeps a resolving search to the resource it names: no account is
+/// fetched for `type=statuses` (the peer is never asked), and no post for
+/// `type=accounts` (the status reading never runs).
+#[tokio::test]
+async fn resolve_attempts_only_the_requested_type() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let peer = MockPeer::start().await;
+    let app = common::test_app(pool.clone());
+
+    let statuses_only = get(
+        &app,
+        Some(&token),
+        &format!(
+            "{V1_SEARCH}?q={}&resolve=true&type=statuses",
+            peer.actor_url()
+        ),
+    )
+    .await;
+    common::assert_answer(&statuses_only, StatusCode::OK, "the typed search");
+    assert_list_empty(
+        &statuses_only.json_value(),
+        "accounts",
+        "type=statuses resolves no account",
+    );
+    assert!(
+        user::get_by_ap_id(&pool, &peer.actor_url())
+            .await
+            .unwrap()
+            .is_none(),
+        "the actor reading never ran: no account was mirrored"
+    );
+
+    let accounts_only = get(
+        &app,
+        Some(&token),
+        &format!(
+            "{V1_SEARCH}?q={}&resolve=true&type=accounts",
+            peer.object_url("second")
+        ),
+    )
+    .await;
+    let body = accounts_only.json_value();
+    assert_list_empty(&body, "statuses", "type=accounts resolves no post");
+    assert_list_empty(&body, "accounts", "and a note is no actor");
+    assert_eq!(
+        stored_notes(&pool, "second").await,
+        0,
+        "the status reading never ran: nothing was stored"
+    );
+}
+
+/// The number of stored statuses whose uri ends in fixture note `name`.
+async fn stored_notes(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri LIKE $1")
+        .bind(format!("%/objects/{name}"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A handle the instance already stores for exact is answered by that row:
+/// `resolve=true` changes nothing about the result (and, with no peer behind
+/// its domain, could not have fetched anything else).
+#[tokio::test]
+async fn resolve_leaves_an_exact_handle_match_as_it_is() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let eve = common::create_remote_user(&pool, "eve", "unlisted.example").await;
+    let app = common::test_app(pool.clone());
+
+    for flag in ["", "&resolve=true"] {
+        let found = get(
+            &app,
+            Some(&token),
+            &format!("{ACCOUNTS_SEARCH}?q=%40eve%40unlisted.example{flag}"),
+        )
+        .await;
+        common::assert_answer(&found, StatusCode::OK, "the stored handle");
+        assert_eq!(
+            listed_ids(&found.json_value()),
+            vec![eve.id.to_string()],
+            "`resolve=true` is the same answer as without it"
+        );
+    }
+}
+
+/// A resolving request spends the `search` bucket like any other: the same
+/// token's two requests inside a budget of two, the third refused before its
+/// lookup ever runs.
+#[tokio::test]
+async fn a_resolving_request_spends_the_search_bucket() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_viewer, token) = fixture(&pool, "resolver", "read").await;
+    let dead = dead_origin().await;
+    let config = common::test_config_with_rate_limits("search=2:600");
+    let app = common::test_app_with_config(pool, config);
+
+    for remaining in ["1", "0"] {
+        let answer =
+            common::TestRequest::get(&format!("{V1_SEARCH}?q={dead}/users/ghost&resolve=true"))
+                .bearer(&token)
+                .send(&app)
+                .await;
+        common::assert_answer(&answer, StatusCode::OK, "inside the budget");
+        assert_eq!(
+            answer.header("x-ratelimit-remaining"),
+            Some(remaining),
+            "the resolving request counted down the bucket"
+        );
+    }
+
+    let refused =
+        common::TestRequest::get(&format!("{V1_SEARCH}?q={dead}/users/ghost&resolve=true"))
+            .bearer(&token)
+            .send(&app)
+            .await;
+    common::assert_answer(&refused, StatusCode::TOO_MANY_REQUESTS, "the spent window");
+    common::assert_error(&refused, THROTTLED, "decision 8's body");
 }
