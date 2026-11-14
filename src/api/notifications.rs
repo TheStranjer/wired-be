@@ -73,6 +73,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -87,6 +88,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
     models::{
+        filter,
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
@@ -140,7 +142,9 @@ fn empty_body() -> Json<Value> {
 /// deactivated-actor rows out) [`notification::page_for_user`] carries;
 /// `with_muted` decides what else hides there. The page's actors and
 /// statuses are batched once into the render (see
-/// [`render_notifications`]).
+/// [`render_notifications`]), and the recipient's active `notifications`
+/// phrase filters drop their matching rows from the page on the way
+/// (Pleroma's `exclude_filtered`, see `drop_phrase_filtered` there).
 ///
 /// # Errors
 ///
@@ -176,6 +180,7 @@ async fn list(
         },
     )
     .await?;
+    let rows = drop_phrase_filtered(&state.db, &auth.0, rows).await?;
     debug!(
         count = rows.len(),
         user = %auth.0.id,
@@ -188,6 +193,51 @@ async fn list(
         page_link(&state.config.base_url, uri.path(), &rows).as_deref(),
     )?;
     Ok((headers, Json(entities)))
+}
+
+/// The `notifications` v1 phrase filters' server-side application:
+/// Pleroma's `Notification` `exclude_filtered` arm, run on the fetched
+/// page — rows whose status content matches one of the recipient's active,
+/// non-expired filters carrying the `notifications` context leave the
+/// listing (see [`filter::hiding_in`]), a row whose status the recipient
+/// posted themselves is exempt (Pleroma's actor arm), and a row without a
+/// status stands (its content-null arm). Filters naming other contexts or
+/// past their expiry hide nothing here — matching context is what a
+/// filter's context list means.
+///
+/// [`filter::hiding_in`]: crate::models::filter::hiding_in
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+async fn drop_phrase_filtered(
+    pool: &PgPool,
+    recipient: &User,
+    rows: Vec<NotificationRow>,
+) -> AppResult<Vec<NotificationRow>> {
+    let active = filter::hiding_in(pool, recipient.id, "notifications").await?;
+    if active.is_empty() {
+        return Ok(rows);
+    }
+    let status_ids: Vec<Uuid> = rows.iter().filter_map(|row| row.status_id).collect();
+    let statuses: HashMap<Uuid, StatusRow> = status::get_many(pool, &status_ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, row))
+        .collect();
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            let Some(status) = row.status_id.and_then(|id| statuses.get(&id)) else {
+                return true;
+            };
+            status.user_id == recipient.id
+                || !active
+                    .iter()
+                    .any(|candidate| filter::matches(candidate, &status.content))
+        })
+        .collect())
 }
 
 /// `GET /api/v1/notifications/{id}` — the caller's live notification `id`
@@ -847,5 +897,134 @@ mod tests {
                 "which is a 422, not {err}"
             );
         }
+    }
+
+    /// A local user named `nickname`.
+    async fn person(pool: &PgPool, nickname: &str) -> User {
+        user::insert(
+            pool,
+            &user::NewUser::local(
+                nickname,
+                &user::local_ap_id(crate::config::TEST_BASE_URL, nickname),
+            ),
+        )
+        .await
+        .expect("the fixture user inserts")
+    }
+
+    /// `author`'s public status of `text`.
+    async fn shout(pool: &PgPool, author: &User, text: &str) -> StatusRow {
+        status::insert(
+            pool,
+            crate::config::TEST_BASE_URL,
+            &status::NewStatus {
+                visibility: status::Visibility::Public,
+                ..status::NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("the fixture status inserts")
+    }
+
+    /// A mention notification of `recipient` by `causer` about `row`.
+    async fn note_about(
+        pool: &PgPool,
+        recipient: &User,
+        causer: &User,
+        row: &StatusRow,
+    ) -> NotificationRow {
+        notification::create(
+            pool,
+            &notification::NewNotification {
+                user_id: recipient.id,
+                from_account_id: causer.id,
+                notification_type: notification::TYPE_MENTION,
+                status_id: Some(row.id),
+                emoji: None,
+                report_id: None,
+            },
+        )
+        .await
+        .expect("the fixture notification inserts")
+    }
+
+    /// A filter of `phrase` for `owner`, in `contexts`, expiring at
+    /// `expires_at`.
+    async fn filter_by(
+        pool: &PgPool,
+        owner: &User,
+        phrase: &str,
+        contexts: &[&str],
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let _row = filter::create(
+            pool,
+            owner.id,
+            &filter::NewFilter {
+                phrase: phrase.to_owned(),
+                context: contexts.iter().map(|name| (*name).to_owned()).collect(),
+                expires_at,
+                ..filter::NewFilter::default()
+            },
+        )
+        .await
+        .expect("the fixture filter creates");
+    }
+
+    /// The `notifications` filters' hiding, on the fetched page: a
+    /// notifications-context filter drops the mention notifications whose
+    /// status text matches, keeps the misses, the recipient's own post and
+    /// the statusless follow row, and does nothing while it names another
+    /// context or sits past its expiry.
+    #[tokio::test]
+    async fn the_notifications_page_drops_filtered_mentions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let recipient = person(pool, "recipient").await;
+        let causer = person(pool, "causer").await;
+        let noisy = shout(pool, &causer, "read this spam today").await;
+        let clean = shout(pool, &causer, "a quiet mention").await;
+        let own = shout(pool, &recipient, "my own spam note").await;
+        let rows = vec![
+            note_about(pool, &recipient, &causer, &noisy).await,
+            note_about(pool, &recipient, &causer, &clean).await,
+            note_about(pool, &recipient, &causer, &own).await,
+        ];
+
+        // Without filters the page is untouched.
+        let untouched = drop_phrase_filtered(pool, &recipient, rows.clone())
+            .await
+            .expect("the pass reads");
+        assert_eq!(untouched.len(), 3, "no filters, nothing hidden");
+
+        // A home-context filter is none of this listing's business.
+        filter_by(pool, &recipient, "spam", &["home"], None).await;
+        let home_pass = drop_phrase_filtered(pool, &recipient, rows.clone())
+            .await
+            .expect("the home pass reads");
+        assert_eq!(home_pass.len(), 3, "a home filter hides no notifications");
+
+        // The notifications filter hides the match only — and an expired
+        // one hides nothing again.
+        filter_by(pool, &recipient, "spam", &["notifications"], None).await;
+        let hidden = drop_phrase_filtered(pool, &recipient, rows.clone())
+            .await
+            .expect("the filtered pass reads");
+        assert_eq!(
+            hidden.iter().map(|row| row.status_id).collect::<Vec<_>>(),
+            vec![Some(clean.id), Some(own.id)],
+            "the matching mention leaves; the clean one and the exempt \
+             own post stand"
+        );
+
+        let expired = sqlx::query("UPDATE filters SET expires_at = now() - interval '1 hour'")
+            .execute(pool)
+            .await
+            .expect("the expiry backdate runs");
+        assert_eq!(expired.rows_affected(), 2, "both fixture filters expired");
+        let expired_pass = drop_phrase_filtered(pool, &recipient, rows)
+            .await
+            .expect("the expired pass reads");
+        assert_eq!(expired_pass.len(), 3, "expired filters hide nothing");
     }
 }

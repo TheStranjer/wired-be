@@ -47,12 +47,16 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::{AppError, AppResult},
-    federation::signature::{SignedHeaders, SigningKey, sign_request},
+    federation::{
+        note::{create_activity_json, load_note_context, note_json},
+        signature::{SignedHeaders, SigningKey, sign_request},
+    },
     http_client::HttpError,
     jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_FEDERATOR_OUTGOING},
     models::{
         instance_policy_domain,
         job::{NewJob, enqueue},
+        status::Status,
         user::{self, User},
     },
     state::AppState,
@@ -191,6 +195,58 @@ pub async fn enqueue_delivery(
         debug!(%unique_key, "delivery already queued for this activity and inbox");
     }
     Ok(())
+}
+
+/// The create hook's federation half: queue this local status's `Create`
+/// to every remote account it @-mentions.
+///
+/// The reference is Pleroma's publishing pipeline (`Pleroma.Web.Federator
+/// .publish(activity)` feeding `Publisher.publish_one`): a fresh activity
+/// reaches its addressees' inboxes as a signed job per `(activity, inbox)`
+/// pair. The addressee set here is the status's remote mentions — the
+/// follower side of the fanout lands with the follow-distribution ticket —
+/// so a mention of an account on another instance federates the post the
+/// moment it is stored, whatever its visibility (a `private` or `direct`
+/// status exists to reach its mentionees, and only they). Local mentions
+/// are handed nothing: they read the database directly. A `local`-visibility
+/// status renders no object at all ([`note_json`]'s refusal) and queues
+/// nothing, and with [`Config::federation_enabled`] off the whole build is
+/// skipped.
+///
+/// Best-effort beside the client's stored post, like the rest of the create
+/// hook: every failure — the context read, one inbox's enqueue — is logged
+/// and carried on, because the status stands whatever federation does.
+/// Two remote accounts on one host share their instance inbox and
+/// [`enqueue_delivery`]'s unique key folds the pair into one job.
+///
+/// [`note_json`]: crate::federation::note::note_json
+pub async fn fanout_create(state: &AppState, status: &Status) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    let Ok(ctx) = load_note_context(&state.db, &state.config, status.id).await else {
+        warn!(status = %status.id, "could not load the note context for a status create");
+        return;
+    };
+    let Some(note) = note_json(&ctx) else {
+        return;
+    };
+    let activity = create_activity_json(&note, &ctx.status, &state.config);
+    for mention in ctx.mentions.iter().filter(|person| !person.local.get()) {
+        let Some(inbox) = best_inbox(mention) else {
+            continue;
+        };
+        if let Err(err) =
+            enqueue_delivery(&state.db, &state.config, &inbox, &ctx.author, &activity).await
+        {
+            warn!(
+                %err,
+                status = %status.id,
+                inbox,
+                "could not queue a status create delivery"
+            );
+        }
+    }
 }
 
 /// The [`KIND_DELIVER`] handler, registered by [`crate::serve`]: runs one
@@ -1432,5 +1488,206 @@ mod tests {
             "a producer bug is a 422, got {err}"
         );
         assert_eq!(job_count(&pool).await, 0, "and nothing was queued");
+    }
+
+    /// `zoe@peer.example`, a remote mirror with a shared and a personal inbox.
+    async fn remote(pool: &PgPool) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: "zoe@peer.example".to_owned(),
+                ap_id: "https://peer.example/users/zoe".to_owned(),
+                domain: Some("peer.example".to_owned()),
+                inbox: Some("https://peer.example/users/zoe/inbox".to_owned()),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// `text` as alice's local status mentioning everyone in `mentioned`.
+    async fn posted(
+        pool: &PgPool,
+        alice: &User,
+        text: &str,
+        mentioned: &[&User],
+        visibility: crate::models::status::Visibility,
+    ) -> Status {
+        crate::models::status::insert(
+            pool,
+            TEST_BASE_URL,
+            &crate::models::status::NewStatus {
+                visibility,
+                mentioned_user_ids: mentioned.iter().map(|person| person.id).collect(),
+                ..crate::models::status::NewStatus::local(alice, text)
+            },
+        )
+        .await
+        .expect("the fixture status inserts")
+    }
+
+    /// The queued `federator.deliver` jobs as `(inbox, actor_id, body)` triples.
+    async fn deliveries(pool: &PgPool) -> Vec<(String, String, Value)> {
+        sqlx::query_as::<_, (String, String, Value)>(
+            "SELECT args->>'inbox', args->>'actor_id', args->'body' FROM jobs \
+             WHERE kind = 'federator.deliver' ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("the deliveries read")
+    }
+
+    #[tokio::test]
+    async fn fanout_create_delivers_to_the_remote_mentions_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = actor(&pool).await;
+        let zoe = remote(&pool).await;
+        let bob = local(&pool, "bob").await;
+        let row = posted(
+            &pool,
+            &alice,
+            "hi @zoe@peer.example and @bob",
+            &[&zoe, &bob],
+            crate::models::status::Visibility::Public,
+        )
+        .await;
+
+        fanout_create(&state, &row).await;
+
+        let queued = deliveries(&pool).await;
+        assert_eq!(queued.len(), 1, "one job, for the one remote mention");
+        let (inbox, actor_id, body) = &queued[0];
+        assert_eq!(
+            inbox, "https://peer.example/inbox",
+            "the remote's shared inbox"
+        );
+        assert_eq!(actor_id, &alice.id.to_string(), "signed as the author");
+        assert_eq!(body["type"], "Create", "the Create activity");
+        assert_eq!(
+            body["id"],
+            format!("{TEST_BASE_URL}/activities/{}", row.id),
+            "decision 6's activity id"
+        );
+        assert_eq!(body["object"]["id"], row.uri, "the Note's own id");
+        assert_eq!(
+            body["object"]["content"], row.content,
+            "the rendered content rides in the Note"
+        );
+        assert_eq!(
+            body["to"],
+            json!(["https://www.w3.org/ns/activitystreams#Public"]),
+            "a public post addresses the public collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_create_is_quiet_without_remote_addressees() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = actor(&pool).await;
+        let bob = local(&pool, "bob").await;
+
+        // A local-only mention reaches nobody over HTTP.
+        let local_mention = posted(
+            &pool,
+            &alice,
+            "hi @bob",
+            &[&bob],
+            crate::models::status::Visibility::Public,
+        )
+        .await;
+        fanout_create(&state, &local_mention).await;
+        assert!(
+            deliveries(&pool).await.is_empty(),
+            "local mentions are handed nothing"
+        );
+
+        // A `local`-visibility post renders no object and queues nothing.
+        let stays_home = posted(
+            &pool,
+            &alice,
+            "quiet",
+            &[],
+            crate::models::status::Visibility::Local,
+        )
+        .await;
+        fanout_create(&state, &stays_home).await;
+        assert!(
+            deliveries(&pool).await.is_empty(),
+            "a local-visibility status never federates"
+        );
+
+        // With federation disabled even a remote mention queues nothing.
+        let zoe = remote(&pool).await;
+        let off = posted(
+            &pool,
+            &alice,
+            "hi @zoe@peer.example",
+            &[&zoe],
+            crate::models::status::Visibility::Public,
+        )
+        .await;
+        let mut off_state = test_state(&pool);
+        Arc::make_mut(&mut off_state.config).federation_enabled = Toggle::new(false);
+        fanout_create(&off_state, &off).await;
+        assert!(
+            deliveries(&pool).await.is_empty(),
+            "a disabled instance sends nothing"
+        );
+    }
+
+    /// Inserts a local user named `nickname` (no keys: the enqueue never
+    /// signs, only the handler does).
+    async fn local(pool: &PgPool, nickname: &str) -> User {
+        insert(
+            pool,
+            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
+        )
+        .await
+        .expect("the local fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn fanout_create_folds_one_inboxes_shared_inbox_into_one_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = actor(&pool).await;
+        let zoe = remote(&pool).await;
+        let am = insert(
+            &pool,
+            &NewUser {
+                nickname: "am@peer.example".to_owned(),
+                ap_id: "https://peer.example/users/am".to_owned(),
+                domain: Some("peer.example".to_owned()),
+                inbox: Some("https://peer.example/users/am/inbox".to_owned()),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .unwrap();
+        let row = posted(
+            &pool,
+            &alice,
+            "hi @zoe@peer.example @am@peer.example",
+            &[&zoe, &am],
+            crate::models::status::Visibility::Public,
+        )
+        .await;
+
+        fanout_create(&state, &row).await;
+
+        let queued = deliveries(&pool).await;
+        assert_eq!(
+            queued.len(),
+            1,
+            "two accounts, one shared instance inbox, one job"
+        );
     }
 }

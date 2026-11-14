@@ -27,9 +27,11 @@ use crate::util::sanitize::escape_html;
 /// `[`, `{`, then `@` and a nickname of `[A-Za-z0-9_.-]` whose last character
 /// is alphanumeric or `_`, then an optional `@domain` of `[A-Za-z0-9.-]` with
 /// at least one dot and an alphanumeric last character — so sentence-final
-/// `.` and `-` fall out of the match. The lead is a capture group (re-emitted
-/// by [`linkify_entities`]) because the `regex` crate has no look-behind.
-const MENTION_PATTERN: &str = r"(?<lead>^|[\s(\[{])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9]))?";
+/// `.` and `-` fall out of the match — optionally suffixed with `:port`
+/// digits, which belong to the host the federation lookups key on. The lead
+/// is a capture group (re-emitted by [`linkify_entities`]) because the
+/// `regex` crate has no look-behind.
+const MENTION_PATTERN: &str = r"(?<lead>^|[\s(\[{])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9](?::[0-9]{1,5})?))?";
 
 /// The hashtag pattern: a leading start-of-text or any character that is not
 /// a letter or a number (so `a#b` and `1#b` do not match, while
@@ -67,7 +69,7 @@ static MENTION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(MENTION
 /// a `>` at a match's start is always a tag's close, granting it keeps the
 /// renderer's matches the extractor's: a leading mention is linked exactly
 /// when it is stored.
-const MENTION_LINK_PATTERN: &str = r"(?<lead>^|[\s(\[{>])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9]))?";
+const MENTION_LINK_PATTERN: &str = r"(?<lead>^|[\s(\[{>])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9](?::[0-9]{1,5})?))?";
 
 /// The compiled [`MENTION_LINK_PATTERN`], with the same `None` fallback as
 /// [`MENTION_RE`].
@@ -486,6 +488,28 @@ mod tests {
             extract_mentions("trailing @bob- and @a."),
             vec![mention("bob", None), mention("a", None)],
             "a forbidden tail character drops out of the nickname"
+        );
+    }
+
+    #[test]
+    fn a_domain_may_carry_an_explicit_port() {
+        assert_eq!(
+            extract_mentions("hi @remote@127.0.0.1:34567!"),
+            vec![mention("remote", Some("127.0.0.1:34567"))],
+            "the port belongs to the domain; the trailing ! does not"
+        );
+        assert_eq!(
+            extract_mentions("@u@example.com:8080 and @v@host.example:x"),
+            vec![
+                mention("u", Some("example.com:8080")),
+                mention("v", Some("host.example")),
+            ],
+            "digits make a port, a letter does not — `:x` stays outside"
+        );
+        assert_eq!(
+            extract_mentions("@u@example.com:"),
+            vec![mention("u", Some("example.com"))],
+            "a bare trailing colon is no port"
         );
     }
 

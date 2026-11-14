@@ -1043,7 +1043,10 @@ pub struct Config {
     pub media_base_url: String,
     /// Whether outbound HTTP may connect to private, loopback and other
     /// reserved addresses, i.e. the SSRF guard is disabled, from
-    /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
+    /// `HTTP_ALLOW_PRIVATE_HOSTS` — and, in the same breath, whether a
+    /// `WebFinger` lookup of a `nick@host:port` handle asks `http://` that
+    /// authority instead of the spec's `https://`. Development and tests
+    /// only.
     pub http_allow_private_hosts: bool,
     /// Whether registration may omit the email address, from
     /// `ACCOUNTS_EMAIL_OPTIONAL`. See

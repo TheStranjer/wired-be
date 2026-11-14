@@ -77,6 +77,13 @@ mod custom_emojis;
 /// Domain blocks (`/api/v1/domain_blocks`).
 mod domain_blocks;
 
+/// The end-to-end discovery and federation scenarios (WBE-223): the
+/// search trio over the visibility matrix, the v1 phrase filters applied
+/// to the timelines, the Atom/RSS feeds and the link card through the job
+/// queue, and a remote mention resolved and delivered against a loopback
+/// mock peer.
+mod e2e_discovery;
+
 /// The end-to-end interaction scenarios (WBE-223): favourite, reblog,
 /// bookmark + folder, pin, thread mute, reaction, poll vote, edit, expiry
 /// through the job queue, and delete, each asserted across the direct

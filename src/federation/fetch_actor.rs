@@ -325,7 +325,11 @@ pub async fn get_or_fetch_by_acct(state: &AppState, acct: &str) -> Result<User, 
 /// HTTPS-only by RFC 7033 and resolves against the handle's domain, so
 /// only [`resolve_acct_with_base`]'s test override can point it at a
 /// loopback mock; production passes [`None`] and this override keeps the
-/// account tests able to drive the same full round trip.
+/// account tests able to drive the same full round trip. The one exception
+/// the production path itself makes is [`dev_webfinger_base`]'s: a handle
+/// whose domain names an explicit port is fingered over plain `http://`
+/// while the instance runs in the development mode
+/// [`Config::http_allow_private_hosts`] selects.
 async fn get_or_fetch_by_acct_with_base(
     state: &AppState,
     acct: &str,
@@ -337,12 +341,31 @@ async fn get_or_fetch_by_acct_with_base(
     {
         return Ok(stored);
     }
-    let ap_id = resolve_acct_with_base(&state.http_client, acct, webfinger_base).await?;
+    let dev_base = dev_webfinger_base(&state.config, acct);
+    let base = webfinger_base.or(dev_base.as_deref());
+    let ap_id = resolve_acct_with_base(&state.http_client, acct, base).await?;
     let user = get_or_fetch_by_ap_id(state, &ap_id).await?;
     if !acct_matches(&user.nickname, acct) {
         return Err(FetchError::AcctMismatch);
     }
     Ok(user)
+}
+
+/// The development-mode `WebFinger` origin for `acct`: while
+/// [`Config::http_allow_private_hosts`] is on — the mode
+/// `HTTP_ALLOW_PRIVATE_HOSTS` selects, documented as development and tests
+/// only, and the same switch that disables the SSRF guard — a handle whose
+/// domain carries an explicit `:port` is fingered at `http://` that
+/// authority, so a federation peer running on loopback (or any host on a
+/// non-standard port) is resolvable end to end. Every other handle keeps
+/// the spec's `https://{domain}` base; production, with the flag off,
+/// never returns one.
+fn dev_webfinger_base(config: &Config, acct: &str) -> Option<String> {
+    if !config.http_allow_private_hosts {
+        return None;
+    }
+    let domain = strip_finger_prefixes(acct).rsplit_once('@')?.1;
+    domain.contains(':').then(|| format!("http://{domain}"))
 }
 
 /// Refetches `user`'s actor document and updates the mirror right away,
@@ -593,6 +616,14 @@ mod tests {
     /// The `http://{addr}` origin a listener answers on.
     fn origin(listener: &TcpListener) -> String {
         format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// The `host:port` authority of an `http://{addr}` origin — what the
+    /// mirror's `user@host` nickname and `domain` column now carry, port
+    /// included (decision 7, and the handle a `WebFinger` round trip on a
+    /// loopback peer resolves to).
+    fn authority_of(base: &str) -> &str {
+        base.split_once("://").map_or(base, |(_scheme, rest)| rest)
     }
 
     /// Serves `app` on `listener` until the test aborts the task.
@@ -1270,11 +1301,16 @@ mod tests {
 
         let first = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();
         assert_eq!(
-            first.nickname, "alice@127.0.0.1",
-            "preferredUsername@host of the id (decision 7)"
+            first.nickname,
+            format!("alice@{}", authority_of(&base)),
+            "preferredUsername@host of the id, port included (decision 7)"
         );
         assert_eq!(first.ap_id, ap_id, "the id is stored as fetched");
-        assert_eq!(first.domain.as_deref(), Some("127.0.0.1"), "the id's host");
+        assert_eq!(
+            first.domain.as_deref(),
+            Some(authority_of(&base)),
+            "the id's host and port"
+        );
         assert!(!first.local.get(), "the row is a remote mirror");
         assert_eq!(first.name, "First", "the document landed");
         assert_eq!(
@@ -1523,14 +1559,14 @@ mod tests {
 
         assert!(
             matches!(error, FetchError::AcctMismatch),
-            "the actor's own handle is alice@127.0.0.1, not the asked one: {error:?}"
+            "the actor's own handle is alice@127.0.0.1:port, not the asked one: {error:?}"
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
             "the actor URL came out of the webfinger answer and was fetched once"
         );
-        let mirror = get_by_nickname(&state.db, "alice@127.0.0.1")
+        let mirror = get_by_nickname(&state.db, &format!("alice@{}", authority_of(&base)))
             .await
             .unwrap()
             .expect("the fetched actor is mirrored under its own handle");
@@ -1559,6 +1595,84 @@ mod tests {
             matches!(error, FetchError::Webfinger(WebfingerError::InvalidAcct)),
             "a handle the resolver refuses fails before any request: {error:?}"
         );
+    }
+
+    #[test]
+    fn the_dev_base_serves_a_ported_handle_over_http_only_in_dev_mode() {
+        let mut dev = Config::for_tests();
+        assert!(
+            dev.http_allow_private_hosts,
+            "the test config is the development mode"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice@127.0.0.1:4000").as_deref(),
+            Some("http://127.0.0.1:4000"),
+            "a handle naming an explicit port is fingered at that authority"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "@alice@Remote.Example:8080").as_deref(),
+            Some("http://Remote.Example:8080"),
+            "prefixes fold; the domain part is taken verbatim"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice@remote.example"),
+            None,
+            "a portless handle keeps the spec's https base even in dev mode"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice"),
+            None,
+            "a bare nickname has no domain to build a base from"
+        );
+        dev.http_allow_private_hosts = false;
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice@127.0.0.1:4000"),
+            None,
+            "with the guard on (production) no http base is ever offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ported_handle_resolves_through_the_dev_base_without_an_override() {
+        // The production `get_or_fetch_by_acct` arm: no `webfinger_base`
+        // override at all. The dev-mode config fingers the loopback mock at
+        // its own `http://{host:port}` origin, the actor mirrors under the
+        // handle it vouches for, and the vouch passes because the mirror
+        // nickname carries the port like the requested acct does.
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let acct = format!("alice@{}", authority_of(&base));
+        let jrd = json!({
+            "subject": format!("acct:{acct}"),
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("{base}/users/alice"),
+            }],
+        });
+        let peer = peer_at(&base);
+        let app = Router::new()
+            .route(
+                "/.well-known/webfinger",
+                get(webfinger).with_state(jrd.to_string()),
+            )
+            .merge(
+                Router::new()
+                    .route("/users/alice", get(self_actor))
+                    .with_state(peer),
+            );
+        let server = spawn(listener, app);
+        let state = test_state(pool);
+
+        let found = get_or_fetch_by_acct(&state, &acct)
+            .await
+            .expect("the ported handle resolves in dev mode");
+
+        server.abort();
+        assert_eq!(found.nickname, acct, "mirrored under the asked handle");
+        assert_eq!(found.ap_id, format!("{base}/users/alice"), "by its id");
     }
 
     #[tokio::test]

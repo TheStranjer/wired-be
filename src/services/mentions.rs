@@ -623,8 +623,9 @@ mod tests {
             "the written domain kept"
         );
         assert_eq!(
-            user.nickname, "alice@127.0.0.1",
-            "mirrored under the actor's own handle (decision 7)"
+            user.nickname,
+            format!("alice@{}", mock.base.trim_start_matches("http://")),
+            "mirrored under the actor's own handle, port included (decision 7)"
         );
         assert_eq!(
             user.ap_id,

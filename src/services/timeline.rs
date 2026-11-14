@@ -19,7 +19,11 @@
 //! - what the viewer may see at all: [`push_visibility_clause`], always
 //!   applied, on top of the unconditional `deleted_at IS NULL` (a scheduled
 //!   `expires_at` is not a filter: an expired row stays readable until the
-//!   sweep takes it, as everywhere else in this schema).
+//!   sweep takes it, as everywhere else in this schema);
+//! - what the viewer asked to never read again: `drop_phrase_filtered`,
+//!   the v1 [`crate::models::filter`] phrase filters whose `context` names
+//!   the listing, applied to the fetched page after the query — Pleroma's
+//!   `restrict_filtered` arm of `fetch_activities`.
 //!
 //! Finally [`PageParams::apply_keyset`] runs on `statuses.id` (decision 4:
 //! `UUIDv7` text sorts by creation, so the cursors are plain id
@@ -51,6 +55,7 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::{
+        filter,
         status::{Status, Visibility},
         status_visibility::push_visibility_clause,
         user::{Flag, User},
@@ -355,6 +360,7 @@ impl TimelineQuery {
         push_visibility_clause(&mut builder, viewer, "s");
         self.page.apply_keyset(&mut builder, "s.id");
         let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
+        let rows = drop_phrase_filtered(pool, viewer, self.source.phrase_context(), rows).await?;
         Ok(self.page.finish(rows))
     }
 
@@ -368,6 +374,70 @@ impl TimelineQuery {
                 TimelineSource::Home | TimelineSource::Direct | TimelineSource::List { .. }
             )
     }
+}
+
+/// The v1 filter context name a source is listed under (the five spelled
+/// by [`crate::api::filters`]'s validation): the viewer's own pages
+/// ([`TimelineSource::Home`], [`TimelineSource::Direct`],
+/// [`TimelineSource::List`]) are the `home` context, the instance-wide
+/// pages ([`TimelineSource::Public`] and every [`TimelineSource::Hashtag`])
+/// the `public` one, and an account's posting history
+/// ([`TimelineSource::Account`]) the `account` one — the assignments
+/// Mastodon's v1 filter contexts draw for the listings Pleroma runs
+/// `restrict_filtered` over.
+impl TimelineSource {
+    /// The v1 phrase-filter context this listing is filtered under.
+    const fn phrase_context(&self) -> &'static str {
+        match self {
+            Self::Home | Self::Direct | Self::List { .. } => "home",
+            Self::Public | Self::Hashtag { .. } => "public",
+            Self::Account { .. } => "account",
+        }
+    }
+}
+
+/// The v1 phrase filters' server-side application: Pleroma's
+/// `ActivityPub.fetch_activities` `restrict_filtered` arm, run on the
+/// fetched page instead of in SQL because [`filter::matches`] is this
+/// repository's phrase test. The rows a page loses are the ones
+/// [`filter::hiding_in`] names — active, non-expired filters whose
+/// `context` list carries the listing's context (`restrict_filtered`
+/// composes one regex over the same active set; the ticket's context
+/// matching refines which listing each filter speaks for) — and
+/// `hiding_in`'s doc states why warn and irreversible drop alike here.
+/// The viewer's own posts are exempt (Pleroma's `activity.actor ==
+/// user.ap_id` arm), and an anonymous request has no filters to apply.
+///
+/// A reblog row carries no text of its own, so nothing matches one and the
+/// boost stands with its (also unfiltered) original — Pleroma's `content`
+/// test over the boosted object has no relational twin until the render
+/// batch grows one.
+///
+/// [`filter::matches`]: crate::models::filter::matches
+async fn drop_phrase_filtered(
+    pool: &PgPool,
+    viewer: Option<&User>,
+    context: &'static str,
+    rows: Vec<Status>,
+) -> AppResult<Vec<Status>> {
+    let Some(viewer) = viewer else {
+        return Ok(rows);
+    };
+    let matching = filter::hiding_in(pool, viewer.id, context).await?;
+    if matching.is_empty() {
+        return Ok(rows);
+    }
+    Ok(rows
+        .into_iter()
+        .filter(|row| row.user_id == viewer.id || !matches_any(&matching, &row.content))
+        .collect())
+}
+
+/// Whether any of `filters` finds its phrase in `content`.
+fn matches_any(filters: &[filter::Filter], content: &str) -> bool {
+    filters
+        .iter()
+        .any(|candidate| filter::matches(candidate, content))
 }
 
 /// Appends the [`TimelineSource`] predicate — the ` AND ` group that decides
@@ -709,7 +779,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            block, conversation_mute, domain_block, follow,
+            block, conversation_mute, domain_block, filter, follow,
             list::{self, List, ListChanges, NewList},
             mute::{self, MuteOptions},
             pinned_status,
@@ -2299,6 +2369,213 @@ mod tests {
         assert!(
             nothing_newer.is_empty(),
             "nothing is newer than the newest row"
+        );
+    }
+
+    /// Inserts `phrase` as `owner`'s irreversible filter naming `contexts`.
+    async fn hide(pool: &PgPool, owner: &User, phrase: &str, contexts: &[&str]) {
+        let _row = filter::create(
+            pool,
+            owner.id,
+            &filter::NewFilter {
+                phrase: phrase.to_owned(),
+                context: contexts.iter().map(|name| (*name).to_owned()).collect(),
+                irreversible: true,
+                ..filter::NewFilter::default()
+            },
+        )
+        .await
+        .expect("the fixture filter creates");
+    }
+
+    /// The server-side phrase filters: an active irreversible filter drops
+    /// the rows matching its phrase from the listings its `context` names
+    /// (Pleroma's `restrict_filtered`), leaves every other listing alone,
+    /// exempts the viewer's own posts, stops at its expiry, and ignores a
+    /// phrase that only occurs glued inside a longer word (`whole_word`).
+    #[tokio::test]
+    async fn irreversible_context_filters_drop_matching_rows_from_their_pages() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let _followed = follow::follow(&pool, BASE, &bob, &alice)
+            .await
+            .expect("bob follows alice");
+        let matched = post(&pool, &alice, Visibility::Public, "a spam alert").await;
+        let glued = post(&pool, &alice, Visibility::Public, "spammer at work").await;
+        let clean = post(&pool, &alice, Visibility::Public, "clean today").await;
+        let own = post(&pool, &bob, Visibility::Public, "my own spam").await;
+        let bob_viewer = || as_viewer(&pool, &bob);
+
+        // Home context: alice's matched post leaves bob's home page, the
+        // glued word stands (whole word), the clean post stands, and bob's
+        // own spam is exempt.
+        let home_before = page_ids(
+            &pool,
+            &timeline(Some(bob_viewer().await), TimelineSource::Home),
+        )
+        .await;
+        assert!(
+            home_before.contains(&matched.id),
+            "the follow's post is on home before the filter"
+        );
+        hide(&pool, &bob, "spam", &["home"]).await;
+        let home = page_ids(
+            &pool,
+            &timeline(Some(bob_viewer().await), TimelineSource::Home),
+        )
+        .await;
+        assert_eq!(
+            home,
+            minus(&[&matched, &glued, &clean, &own], &[&matched]),
+            "home drops only the whole-word match; the glued word and the \
+             exempt own post stand"
+        );
+
+        // The public listing is a different context: the home filter hides
+        // nothing there until a `public` filter joins it.
+        let public_before = page_ids(
+            &pool,
+            &timeline(Some(bob_viewer().await), TimelineSource::Public),
+        )
+        .await;
+        assert!(
+            public_before.contains(&matched.id),
+            "a home filter does not reach the public page"
+        );
+        hide(&pool, &bob, "spam", &["public"]).await;
+        let public = page_ids(
+            &pool,
+            &timeline(Some(bob_viewer().await), TimelineSource::Public),
+        )
+        .await;
+        assert!(
+            !public.contains(&matched.id) && public.contains(&clean.id),
+            "the public filter drops the match from the public page too"
+        );
+
+        // An anonymous page has no filters to apply.
+        let anonymous = page_ids(&pool, &timeline(None, TimelineSource::Public)).await;
+        assert!(
+            anonymous.contains(&matched.id),
+            "the anonymous public page hides nothing"
+        );
+
+        // An expired filter stops hiding: backdate it and the row returns.
+        let expired = sqlx::query("UPDATE filters SET expires_at = now() - interval '1 hour'")
+            .execute(&pool)
+            .await
+            .expect("the expiry backdate runs");
+        assert_eq!(expired.rows_affected(), 2, "both bob filters expired");
+        let home_after = page_ids(
+            &pool,
+            &timeline(Some(bob_viewer().await), TimelineSource::Home),
+        )
+        .await;
+        assert!(
+            home_after.contains(&matched.id),
+            "the expired filter hides nothing any more"
+        );
+    }
+
+    /// The `Account` listing is the `account` context: a filter naming it
+    /// hides the matching rows from the profile page, one naming `home`
+    /// does not.
+    #[tokio::test]
+    async fn the_account_page_filters_under_the_account_context() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let matched = post(&pool, &alice, Visibility::Public, "ad spam post").await;
+        let kept = post(&pool, &alice, Visibility::Public, "quiet").await;
+
+        hide(&pool, &bob, "spam", &["home"]).await;
+        let page = page_ids(
+            &pool,
+            &timeline(
+                Some(as_viewer(&pool, &bob).await),
+                TimelineSource::Account { user_id: alice.id },
+            ),
+        )
+        .await;
+        assert!(
+            page.contains(&matched.id),
+            "a home filter does not hide from a profile page"
+        );
+
+        hide(&pool, &bob, "spam", &["account"]).await;
+        let filtered = page_ids(
+            &pool,
+            &timeline(
+                Some(as_viewer(&pool, &bob).await),
+                TimelineSource::Account { user_id: alice.id },
+            ),
+        )
+        .await;
+        assert_eq!(
+            filtered,
+            minus(&[&matched, &kept], &[&matched]),
+            "the account-context filter drops the match and keeps the rest"
+        );
+    }
+
+    /// The tag timeline shares the `public` context; the warn
+    /// (non-irreversible) filter of the same phrase hides its matches
+    /// there too — on a plain listing both drop the row.
+    #[tokio::test]
+    async fn warn_filters_hide_and_the_tag_page_shares_the_public_context() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let tagged = status::insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                visibility: Visibility::Public,
+                hashtags: vec!["alerts".to_owned()],
+                ..NewStatus::local(&alice, "tagged spam")
+            },
+        )
+        .await
+        .expect("the tagged fixture post inserts");
+
+        let tag_page = || async {
+            page_ids(
+                &pool,
+                &timeline(
+                    Some(as_viewer(&pool, &bob).await),
+                    TimelineSource::Hashtag {
+                        any: vec!["alerts".to_owned()],
+                        all: Vec::new(),
+                        none: Vec::new(),
+                    },
+                ),
+            )
+            .await
+        };
+        assert!(
+            tag_page().await.contains(&tagged.id),
+            "the tag page carries the post before any filter"
+        );
+
+        let _warn = filter::create(
+            &pool,
+            bob.id,
+            &filter::NewFilter {
+                phrase: "spam".to_owned(),
+                context: vec!["public".to_owned()],
+                ..filter::NewFilter::default()
+            },
+        )
+        .await
+        .expect("the warn filter creates");
+        assert!(
+            !tag_page().await.contains(&tagged.id),
+            "the warn filter hides its match from the tag page, which \
+             shares the public context"
         );
     }
 }

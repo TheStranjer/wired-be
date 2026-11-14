@@ -1711,6 +1711,7 @@ async fn after_status_created(state: &AppState, status: &status::Status) {
     notify::on_mention(state, status).await;
     crate::jobs::rich_media::schedule_fetch(state, status).await;
     participate_in_conversation(state, status).await;
+    crate::federation::delivery::fanout_create(state, status).await;
 }
 
 /// The conversation arm of [`after_status_created`]: a `direct` status is
@@ -2556,7 +2557,8 @@ mod tests {
         .pop()
         .expect("the remote mention resolved");
         server.abort();
-        assert_eq!(fetched.1.nickname, "alice@127.0.0.1", "mirror handle");
+        let mirror_acct = format!("alice@{}", base.trim_start_matches("http://"));
+        assert_eq!(fetched.1.nickname, mirror_acct, "mirror handle");
 
         let entity = created(
             &app_state,
@@ -2590,7 +2592,7 @@ mod tests {
         assert_eq!(
             value["mentions"],
             json!([{ "id": fetched.1.id.to_string(), "username": "alice",
-                     "url": fetched.1.ap_id, "acct": "alice@127.0.0.1" }]),
+                     "url": fetched.1.ap_id, "acct": mirror_acct }]),
             "and answered in the entity"
         );
     }
