@@ -1269,7 +1269,7 @@ async fn update_credentials(
         .await?
         .ok_or_else(|| AppError::Internal("profile update matched no row".to_owned()))?;
     delete_replaced_files(&state, applied.replaced).await;
-    after_profile_updated(&state, &updated);
+    after_profile_updated(&state, &updated).await;
     owner_view(&state, &updated).await
 }
 
@@ -2007,15 +2007,17 @@ fn names_own_domain(config: &Config, mention: &MentionRef) -> bool {
 }
 
 /// Post-update hook of [`update_credentials`], run once per accepted
-/// profile write with the updated row: the federation ticket that answers
-/// a profile change with an `Update` of the actor wires the delivery in
-/// here — the actor is [`User::ap_id`], and the queueing happens through
-/// `state` (decision 11).
+/// profile write with the updated row: hands the change to
+/// [`crate::services::federation_out`], which answers it with an `Update`
+/// of the actor document — the actor is [`User::ap_id`], and the queueing
+/// happens through `state` (decision 11).
 ///
-/// Intentionally empty until then, like [`after_follower_removed`]:
-/// Pleroma's `update_credentials` federates through the pipeline inline,
-/// and this server's delivery queue is a later ticket.
-const fn after_profile_updated(_state: &AppState, _user: &User) {}
+/// The service debounces a burst of edits into one queued activity, so this
+/// hook is cheap to fire from every accepted write; it never fails the
+/// request.
+pub(crate) async fn after_profile_updated(state: &AppState, user: &User) {
+    crate::services::federation_out::after_profile_updated(state, user).await;
+}
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or
 /// remote. An id that is not `UUID` text is a 404, not a 400, like every

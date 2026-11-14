@@ -241,6 +241,15 @@ const REMOTE_FOLLOWERS_SQL: &str = "SELECT u.* FROM follows f
         AND u.local = false AND u.is_active = true
    ORDER BY f.id";
 
+/// [`remote_followees`]: accepted relationships held *toward* remote, active
+/// mirrors of the bound account — the followee-side mirror of
+/// [`REMOTE_FOLLOWERS_SQL`], with the same accepted-and-active gate.
+const REMOTE_FOLLOWEES_SQL: &str = "SELECT u.* FROM follows f
+     JOIN users u ON u.id = f.followee_id
+      WHERE f.follower_id = $1 AND f.state = 'accepted'
+        AND u.local = false AND u.is_active = true
+   ORDER BY f.id";
+
 /// [`subscribers`]: the *local*, active followers whose accepted follow of
 /// the bound account has its `notify` toggle on — Pleroma's
 /// `User.subscriber_users` (`lib/pleroma/user.ex`), the list its
@@ -1024,6 +1033,26 @@ pub async fn move_followers_of(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<Us
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn remote_followers(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
     let rows = sqlx::query_as::<_, User>(REMOTE_FOLLOWERS_SQL)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// [`remote_followees`]: the *remote*, active mirrors `user_id` follows.
+///
+/// Accepted relationships held toward those mirrors — the followee-side
+/// mirror of `REMOTE_FOLLOWERS_SQL`, with the same accepted-and-active
+/// gate. The account `Delete` fan-out reads it: the accounts this one
+/// followed learned something from it too, and both sides of every
+/// relationship must learn it is gone.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remote_followees(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<User>> {
+    let rows = sqlx::query_as::<_, User>(REMOTE_FOLLOWEES_SQL)
         .bind(user_id)
         .fetch_all(pool)
         .await?;

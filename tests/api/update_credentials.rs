@@ -28,7 +28,10 @@
 //! `source` block and its `pleroma` block reflecting the new values (the
 //! `verify_credentials` render), the route behind `AuthUser` and
 //! `write:accounts` (401 unauthenticated, 403 for the wrong credential),
-//! and the `POST` alias serving the old clients.
+//! the `POST` alias serving the old clients, and the profile-federation
+//! hook: one accepted write queues the actor document as an `Update` under
+//! the per-account debounce key — a burst of writes pays for one queued
+//! activity — and a row without a followers collection queues nothing.
 
 #![cfg(test)]
 
@@ -2661,5 +2664,94 @@ async fn the_response_reflects_every_new_value() {
         shown_body["pleroma"].get("settings_store"),
         None,
         "but the client settings are not"
+    );
+}
+
+/// The queued `federator.publish` jobs: `(args, unique_key)` pairs, in the
+/// order they landed — what the profile hook's debounce is visible in.
+async fn publish_jobs(pool: &PgPool) -> Vec<(Value, Option<String>)> {
+    sqlx::query_as::<_, (Value, Option<String>)>(
+        "SELECT args, unique_key FROM jobs WHERE kind = 'federator.publish' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the publish jobs read")
+}
+
+/// An accepted profile write publishes the actor document once per burst:
+/// the first `PATCH` queues the `Update` — object the actor document, `cc`
+/// the followers collection the fan-out expands at delivery time — under
+/// the per-account debounce key, and the follow-up writes that arrive
+/// while it is still live are swallowed by the queue's dedup.
+#[tokio::test]
+async fn profile_writes_publish_one_debounced_update() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+        new.followers_url = Some(format!("{BASE}/users/alice/followers"));
+        new.inbox = Some(format!("{BASE}/users/alice/inbox"));
+        new.private_key = Some("PEM-PRIV".to_owned());
+        new.public_key = Some("PEM-PUB".to_owned());
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    let app = common::test_app(pool.clone());
+
+    let first = ok_body(&patch_json(&app, &token, &json!({"display_name": "One"})).await);
+    assert_eq!(first["display_name"], "One", "the first write lands");
+
+    let jobs = publish_jobs(&pool).await;
+    assert_eq!(jobs.len(), 1, "and publishes once");
+    let (args, unique_key) = &jobs[0];
+    let expected_key = format!("profile-update:{}", alice.id);
+    assert_eq!(
+        unique_key.as_deref(),
+        Some(expected_key.as_str()),
+        "the job is keyed for the debounce"
+    );
+    let activity = &args["activity"];
+    assert_eq!(activity["type"], "Update");
+    assert_eq!(activity["actor"], alice.ap_id);
+    assert_eq!(
+        activity["object"]["id"], alice.ap_id,
+        "the object is the actor document itself"
+    );
+    assert_eq!(
+        activity["object"]["name"], "One",
+        "carrying the new profile"
+    );
+    assert_eq!(
+        activity["cc"][0],
+        format!("{BASE}/users/alice/followers"),
+        "addressed to the followers collection"
+    );
+
+    for name in ["Two", "Three"] {
+        let again = ok_body(&patch_json(&app, &token, &json!({"display_name": name})).await);
+        assert_eq!(again["display_name"], name, "the write lands");
+    }
+    let after_burst = publish_jobs(&pool).await;
+    assert_eq!(
+        after_burst.len(),
+        1,
+        "and the burst stayed one queued activity"
+    );
+}
+
+/// The guard the hook runs before publishing: a row whose `followers_url`
+/// is absent has no collection address for the fan-out to expand, so a
+/// profile write for it lands without a queued activity.
+#[tokio::test]
+async fn a_row_without_a_followers_collection_publishes_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, token, _alice) = authed_app(&pool, "quiet").await;
+
+    let body = ok_body(&patch_json(&app, &token, &json!({"display_name": "Quiet"})).await);
+    assert_eq!(body["display_name"], "Quiet", "the write lands");
+    assert!(
+        publish_jobs(&pool).await.is_empty(),
+        "a fixture row without a followers collection has no audience to announce to"
     );
 }

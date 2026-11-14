@@ -121,7 +121,7 @@ pub struct PublishOpts {
     pub only_to: Option<Vec<String>>,
 }
 
-/// The [`KIND_PUBLISH`] job arguments: the two fields
+/// The [`KIND_PUBLISH`] job arguments: the fields
 /// [`publish_in_background`] writes and [`handle`] reads.
 #[derive(Debug, Deserialize)]
 struct PublishArgs {
@@ -129,6 +129,11 @@ struct PublishArgs {
     actor_id: Uuid,
     /// The activity document to fan out.
     activity: Value,
+    /// Recipients the activity's own addressing does not name, carried
+    /// through to [`publish`] as [`PublishOpts::extra_inboxes`]; absent
+    /// means none.
+    #[serde(default)]
+    extra_inboxes: Vec<String>,
 }
 
 /// The kind of the reject-stage seam of [`publish`]: a `fn` pointer so a
@@ -213,12 +218,19 @@ async fn publish_filtered(
 /// Queues one [`KIND_PUBLISH`] job on [`QUEUE_FEDERATOR_OUTGOING`] so an
 /// API request returns without waiting for the fan-out's DB lookups.
 ///
-/// The job carries `activity` and the id of the local actor to publish it
-/// as, and runs as soon as a worker claims it: [`handle`] loads the actor
-/// and calls [`publish`]. Large follower sets are the reason this exists.
-/// Each publish call enqueues its own job; the per-`(activity, inbox)`
-/// deduplication [`enqueue_delivery`] applies is what keeps a repeated
-/// publish from sending twice.
+/// The job carries `activity`, the id of the local actor to publish it as,
+/// and `extra_inboxes` — recipients the activity's own addressing does not
+/// name, which [`handle`] hands to [`publish`] through
+/// [`PublishOpts::extra_inboxes`] — and runs as soon as a worker claims
+/// it. Large follower sets are the reason this exists. Each publish call
+/// enqueues its own job; the per-`(activity, inbox)` deduplication
+/// [`enqueue_delivery`] applies is what keeps a repeated publish from
+/// sending twice.
+///
+/// `unique_key` becomes the job row's deduplication key (see
+/// [`enqueue`]): while a job with the same key is live the new job is
+/// dropped, which is what lets a debounced publisher (a profile's
+/// `Update`, say) collapse a burst of edits into the one queued fan-out.
 ///
 /// # Errors
 ///
@@ -228,16 +240,22 @@ pub async fn publish_in_background(
     state: &AppState,
     actor_id: Uuid,
     activity: &Value,
+    extra_inboxes: &[String],
+    unique_key: Option<&str>,
 ) -> AppResult<()> {
     let _job = enqueue(
         &state.db,
         NewJob {
             queue: QUEUE_FEDERATOR_OUTGOING,
             kind: KIND_PUBLISH,
-            args: json!({ "actor_id": actor_id, "activity": activity }),
+            args: json!({
+                "actor_id": actor_id,
+                "activity": activity,
+                "extra_inboxes": extra_inboxes,
+            }),
             run_at: None,
             max_attempts: None,
-            unique_key: None,
+            unique_key,
         },
     )
     .await?;
@@ -263,7 +281,11 @@ async fn run_publish(state: AppState, args: Value) -> Result<(), JobError> {
         ));
     }
     let actor = publishing_actor(&state, args.actor_id).await?;
-    let count = publish(&state, &actor, &args.activity, PublishOpts::default())
+    let opts = PublishOpts {
+        extra_inboxes: args.extra_inboxes,
+        only_to: None,
+    };
+    let count = publish(&state, &actor, &args.activity, opts)
         .await
         .map_err(|err| {
             JobError::Retry(format!(
@@ -1281,7 +1303,7 @@ mod tests {
         let state = test_state(&pool);
         let activity = public_activity(&alice);
 
-        publish_in_background(&state, alice.id, &activity)
+        publish_in_background(&state, alice.id, &activity, &[], None)
             .await
             .unwrap();
         let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE kind = $1 LIMIT 1")
@@ -1302,6 +1324,50 @@ mod tests {
             delivered_inboxes(&pool).await,
             vec!["https://other.example/users/erin/inbox"],
             "the handler's fan-out queued the follower's delivery"
+        );
+    }
+
+    /// The background job also carries the recipients the activity's own
+    /// addressing does not name: the `extra_inboxes` argument reaches
+    /// [`publish`] through [`handle`], and a second enqueue under the same
+    /// `unique_key` is swallowed by the queue's dedup — the debounced
+    /// publisher's contract.
+    #[tokio::test]
+    async fn the_background_job_carries_extra_recipients_and_debounces() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = alice(&pool).await;
+        let state = test_state(&pool);
+        let activity = json!({
+            "id": ACTIVITY_ID,
+            "type": "Update",
+            "actor": alice.ap_id,
+            "object": alice.ap_id,
+            "to": [PUBLIC],
+        });
+        let extra = vec!["https://extra.example/inbox".to_owned()];
+
+        publish_in_background(&state, alice.id, &activity, &extra, Some("debounce/1"))
+            .await
+            .unwrap();
+        publish_in_background(&state, alice.id, &activity, &extra, Some("debounce/1"))
+            .await
+            .unwrap();
+
+        let jobs = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE kind = $1")
+            .bind(KIND_PUBLISH)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 1, "the repeat hits the live job's key");
+        assert_eq!(jobs[0].args["extra_inboxes"], json!(extra));
+
+        let outcome = handle(state.clone(), first_attempt(), jobs[0].args.clone()).await;
+        assert_eq!(outcome, Ok(()), "the handler completes");
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://extra.example/inbox"],
+            "and delivered what the caller named beside the addressing"
         );
     }
 
