@@ -161,11 +161,36 @@ pub async fn favourite(
     user_id: Uuid,
     status_id: Uuid,
 ) -> AppResult<Option<Favourite>> {
+    favourite_like(pool, user_id, status_id, &local_activity_id(base_url)).await
+}
+
+/// Records `user_id`'s like of `status_id` standing for one `Like` activity
+/// with the explicit `ap_id`.
+///
+/// Idempotent on `(user_id, status_id)` exactly like [`favourite`]: a pair
+/// that already liked keeps its row — id, `ap_id` and all — steps nothing
+/// and answers `None`. This is the federation mirror's write (decision 6 —
+/// a remote activity's `ap_id` is whatever the remote sent, so the
+/// activity's own `Undo` names it back and [`get_by_ap_id`] finds the row
+/// by it); [`favourite`] is this same statement under a freshly minted
+/// local id.
+///
+/// [`get_by_ap_id`]: get_by_ap_id
+///
+/// # Errors
+///
+/// Those of [`favourite`].
+pub async fn favourite_like(
+    pool: &PgPool,
+    user_id: Uuid,
+    status_id: Uuid,
+    ap_id: &str,
+) -> AppResult<Option<Favourite>> {
     let created = sqlx::query_as::<_, Favourite>(FAVOURITE_SQL)
         .bind(new_id())
         .bind(user_id)
         .bind(status_id)
-        .bind(local_activity_id(base_url))
+        .bind(ap_id)
         .fetch_optional(pool)
         .await?;
     if created.is_some() {
@@ -876,6 +901,57 @@ mod tests {
             matches!(err, AppError::Database(_)),
             "the foreign key refuses, not a silent no-op: {err}"
         );
+    }
+
+    /// The mirror's write: [`favourite_like`] stores the delivered activity
+    /// id as the row's own and steps the counter, and a pair that already
+    /// liked — under any id — keeps its first row, its first id and the
+    /// first count.
+    #[tokio::test]
+    async fn favourite_like_stands_under_the_delivered_activity_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let status_id = post_by(&pool, "bob").await;
+
+        let created = favourite_like(
+            &pool,
+            alice.id,
+            status_id,
+            "https://peer.example/activities/like-1",
+        )
+        .await
+        .expect("the mirror write stores")
+        .expect("the pair had nothing to keep");
+        assert_eq!(
+            created.ap_id.as_deref(),
+            Some("https://peer.example/activities/like-1"),
+            "the row carries the delivered id, not a minted one"
+        );
+        assert_eq!(count(&pool, status_id).await, 1, "and the counter stepped");
+
+        let restated = favourite_like(
+            &pool,
+            alice.id,
+            status_id,
+            "https://peer.example/activities/like-2",
+        )
+        .await
+        .expect("restating a like is not an error");
+        assert!(restated.is_none(), "the pair keeps its one row");
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT ap_id FROM favourites WHERE user_id = $1 AND status_id = $2",
+            )
+            .bind(alice.id)
+            .bind(status_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the id reads"),
+            Some("https://peer.example/activities/like-1".to_owned()),
+            "the first delivery's id stands"
+        );
+        assert_eq!(count(&pool, status_id).await, 1, "and the count stayed one");
     }
 
     /// The two new reads beside the write: [`get`] finds the pair's row

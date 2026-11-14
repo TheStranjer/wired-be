@@ -144,6 +144,14 @@ mod instance;
 /// The instance actor document and its exclusion from public listings.
 mod instance_actor;
 
+/// Inbound `Like`, `EmojiReact`, `Announce` and their `Undo`s over federation
+/// (WBE-177): the dispatcher folding a peer's interaction onto a local (or
+/// freshly fetched) status — rows, counters, tellings, the entity's
+/// `favourites_count`/`reblogs_count`/`pleroma.emoji_reactions` — and the
+/// visibility and wrong-actor gates that refuse it (`src/federation/
+/// handlers/interactions.rs`).
+mod interactions;
+
 /// List members (`/api/v1/lists/{id}/accounts`).
 mod list_accounts;
 

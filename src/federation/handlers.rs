@@ -8,8 +8,9 @@
 //! of thing, each registering its routes into the dispatcher's
 //! [`Handlers::default`] — [`actor`] for the `Update` and `Delete` of a
 //! remote account, [`misc`] for the `Block` (+`Undo`), `Flag`, `Add`,
-//! `Remove` and `Move` that ride beside them, with the create and note
-//! tickets adding their files in turn.
+//! `Remove` and `Move` that ride beside them, [`interactions`] for the
+//! `Like`, `EmojiReact` and `Announce` (and their `Undo`s) that land on a
+//! status, with the create and note tickets adding their files in turn.
 //!
 //! A handler is a plain
 //! [`HandlerFn`](crate::federation::dispatch::HandlerFn): it gets the shared
@@ -28,6 +29,7 @@
 pub mod actor;
 pub mod chat;
 pub mod create;
+pub mod interactions;
 pub mod misc;
 pub mod note;
 pub mod vote;
@@ -47,6 +49,7 @@ pub fn registry() -> Handlers {
     let mut handlers = Handlers::new();
     actor::register(&mut handlers);
     misc::register(&mut handlers);
+    interactions::register(&mut handlers);
     create::register(&mut handlers);
     chat::register(&mut handlers);
     vote::register(&mut handlers);

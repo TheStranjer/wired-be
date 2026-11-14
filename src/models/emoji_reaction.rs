@@ -270,16 +270,63 @@ pub async fn react(
     base_url: &str,
     reaction: &NewReaction<'_>,
 ) -> AppResult<EmojiReaction> {
+    react_with_ap_id(pool, reaction, &local_activity_id(base_url)).await
+}
+
+/// [`react`]'s write under an explicit `ap_id`: the federation mirror's
+/// door, where the row stands for the delivered `EmojiReact` activity.
+///
+/// Decision 6: a remote activity's id is whatever the remote sent, so its
+/// own `Undo` names it back and [`get_by_ap_id`] finds the row by it.
+///
+/// [`get_by_ap_id`]: get_by_ap_id
+///
+/// # Errors
+///
+/// Those of [`react`].
+pub async fn react_with_ap_id(
+    pool: &PgPool,
+    reaction: &NewReaction<'_>,
+    ap_id: &str,
+) -> AppResult<EmojiReaction> {
     let row = sqlx::query_as::<_, EmojiReaction>(REACT_SQL)
         .bind(new_id())
         .bind(reaction.user_id)
         .bind(reaction.status_id)
         .bind(reaction.emoji)
         .bind(reaction.url)
-        .bind(local_activity_id(base_url))
+        .bind(ap_id)
         .fetch_one(pool)
         .await?;
     Ok(row)
+}
+
+/// The `SELECT` behind [`get_by_ap_id`]: the reaction of one account whose
+/// `EmojiReact` activity carries one id. Scoping the lookup to the reactor
+/// is the point, exactly as in [`crate::models::favourite::get_by_ap_id`]:
+/// somebody else quoting the id finds nothing, so a `Undo` can only take
+/// back its own maker's reaction.
+const REACTION_BY_AP_ID_SQL: &str =
+    "SELECT * FROM emoji_reactions WHERE user_id = $1 AND ap_id = $2";
+
+/// The [`EmojiReaction`] of `user_id` whose `EmojiReact` activity carries
+/// `ap_id`, `None` when the account has no such reaction.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_ap_id(
+    pool: &PgPool,
+    user_id: Uuid,
+    ap_id: &str,
+) -> AppResult<Option<EmojiReaction>> {
+    let reaction = sqlx::query_as::<_, EmojiReaction>(REACTION_BY_AP_ID_SQL)
+        .bind(user_id)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(reaction)
 }
 
 /// Removes `user_id`'s reaction `emoji` from `status_id`, reporting the row
@@ -679,6 +726,74 @@ mod tests {
         assert_eq!(
             both[1].url, None,
             "and the unicode one stays without an image"
+        );
+    }
+
+    /// The mirror's writes: [`react_with_ap_id`] stores the delivered
+    /// activity id as the row's own, a repeat of the triple under a new id
+    /// keeps the first row's id (and only refreshes the image), and
+    /// [`get_by_ap_id`] reads the row by that id — for its maker only.
+    #[tokio::test]
+    async fn a_mirrored_reaction_keeps_the_delivered_activity_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "mirror-alice").await;
+        let carol = user(&pool, "mirror-carol").await;
+        let status_id = post_by(&pool, "mirror-bob").await;
+
+        let stored = react_with_ap_id(
+            &pool,
+            &NewReaction {
+                user_id: alice.id,
+                status_id,
+                emoji: CAT,
+                url: Some(CAT_URL),
+            },
+            "https://peer.example/activities/react-1",
+        )
+        .await
+        .expect("the mirror write stores");
+        assert_eq!(
+            stored.ap_id.as_deref(),
+            Some("https://peer.example/activities/react-1"),
+            "the row carries the delivered id, not a minted one"
+        );
+
+        let restated = react_with_ap_id(
+            &pool,
+            &NewReaction {
+                user_id: alice.id,
+                status_id,
+                emoji: CAT,
+                url: Some("https://test.example/emoji/cats/new.png"),
+            },
+            "https://peer.example/activities/react-2",
+        )
+        .await
+        .expect("restating a reaction is not an error");
+        assert_eq!(restated.id, stored.id, "the triple keeps its one row");
+        assert_eq!(
+            restated.ap_id.as_deref(),
+            Some("https://peer.example/activities/react-1"),
+            "and the first delivery's id"
+        );
+        assert_eq!(
+            restated.url.as_deref(),
+            Some("https://test.example/emoji/cats/new.png"),
+            "while the image the repeat brought is picked up"
+        );
+
+        let found = get_by_ap_id(&pool, alice.id, "https://peer.example/activities/react-1")
+            .await
+            .expect("the activity-id read runs")
+            .expect("the id names the row");
+        assert_eq!(found.id, stored.id, "the maker finds its own reaction");
+        assert!(
+            get_by_ap_id(&pool, carol.id, "https://peer.example/activities/react-1")
+                .await
+                .expect("the activity-id read runs")
+                .is_none(),
+            "and another account quoting it names none of its own"
         );
     }
 

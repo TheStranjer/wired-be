@@ -2473,11 +2473,15 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 /// Post-write hook of both favourite routes: the favourite telling of the
 /// status's author — and its withdrawal, when a favourite is undone — runs
 /// through here, landed from [`notify::on_favourite`] (Pleroma's
-/// `CommonAPI.favorite` pipeline runs the same pair). The federation ticket
-/// that sends the `Like` activity (and its `Undo`) wires its delivery into
-/// the same body: the activity to send is [`FavouriteRow::ap_id`], the pair
-/// it names is [`FavouriteRow::user_id`] and [`FavouriteRow::status_id`],
-/// and the queueing happens through `state` (decision 11).
+/// `CommonAPI.favorite` pipeline runs the same pair). The inbound
+/// `Like` handler runs it too
+/// ([`crate::federation::handlers::interactions`]): a mirrored remote like
+/// tells the local author exactly as a local one does, and the like's
+/// `Undo` takes that telling back. The federation ticket that *sends* the
+/// `Like` activity (and its `Undo`) wires its delivery into the same body:
+/// the activity to send is [`FavouriteRow::ap_id`], the pair it names is
+/// [`FavouriteRow::user_id`] and [`FavouriteRow::status_id`], and the
+/// queueing happens through `state` (decision 11).
 ///
 /// `favouriting` states which way the write moved the fact: `true` for the
 /// favourite a `POST …/favourite` left behind — a repeat favourite never
@@ -2487,7 +2491,11 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 /// never reaches it either.
 ///
 /// [`notify::on_favourite`]: crate::services::notify::on_favourite
-async fn after_favourite_changed(state: &AppState, favourite: &FavouriteRow, favouriting: bool) {
+pub(crate) async fn after_favourite_changed(
+    state: &AppState,
+    favourite: &FavouriteRow,
+    favouriting: bool,
+) {
     notify::on_favourite(state, favourite, favouriting).await;
 }
 
@@ -2501,7 +2509,10 @@ async fn after_favourite_changed(state: &AppState, favourite: &FavouriteRow, fav
 /// through `state` (decision 11).
 /// The telling of the original's author — Pleroma's `Announce`
 /// notification rides the same `CommonAPI.repeat` pipeline — lands in the
-/// same body, from [`notify::on_reblog`].
+/// same body, from [`notify::on_reblog`]. The inbound `Announce` handler
+/// runs it too ([`crate::federation::handlers::interactions`]): a remote
+/// boost tells the local author of the boosted post exactly as a local one
+/// does, and the boost's `Undo` takes that telling back.
 ///
 /// `reblog` is the row the write just created or tombstoned: on the
 /// withdrawal it is the tombstone, whose `uri` the `Undo` must name.
@@ -2513,7 +2524,7 @@ async fn after_favourite_changed(state: &AppState, favourite: &FavouriteRow, fav
 /// withdrawal that found no row to remove never reaches it either.
 ///
 /// [`notify::on_reblog`]: crate::services::notify::on_reblog
-async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, reblogging: bool) {
+pub(crate) async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, reblogging: bool) {
     notify::on_reblog(state, reblog, reblogging).await;
 }
 
