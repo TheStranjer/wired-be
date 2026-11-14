@@ -27,10 +27,10 @@
 //! mirrors, then trigram similarity descending; `id DESC` breaks the final
 //! tie so `offset` pages cannot straddle an unstable order (decision 4).
 //!
-//! [`SearchOpts::resolve`] is accepted and ignored here: reaching beyond
-//! the stored mirrors to look up handles the instance has never seen is
-//! the later federation ticket's work, just as Pleroma's `maybe_resolve`
-//! is a separate feature gate on the search.
+//! [`SearchOpts::resolve`] is accepted and ignored here: the endpoint reads
+//! that flag itself and prepends whatever it fetches to the ranked page this
+//! query answers (see [`crate::api::search`]), which is where Pleroma folds
+//! its resolved id into `top_user_ids` before the same page runs.
 
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
@@ -53,9 +53,10 @@ pub struct SearchOpts {
     /// (that list is the viewer's own, so hiding parts of it from them
     /// answers nothing they did not choose to follow).
     pub following_only: bool,
-    /// `resolve=true`: accepted and ignored by this module — fetching a
-    /// handle from the wider network is the later federation ticket, which
-    /// will read this flag where Pleroma's `maybe_resolve` sits.
+    /// `resolve=true`: accepted and ignored by this module. The endpoint
+    /// reads the flag and prepends the account it fetches to this query's
+    /// ranked page (see [`crate::api::search`]), where Pleroma's
+    /// `maybe_resolve` sits.
     pub resolve: bool,
 }
 
