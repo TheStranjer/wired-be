@@ -31,8 +31,9 @@
 //! - `GET /api/v1/pleroma/mascot` (scope `read:accounts`) — the account's
 //!   mascot attachment (`settings_store["mascot"]`, the keys `id`, `url`,
 //!   `type` and `pleroma.mime_type`) or the instance default:
-//!   `{"id":"default-mascot","url":"{BASE_URL}/images/pleroma-fox-tan-smol.png",…}`,
-//!   Pleroma's `[:assets, :default_mascot]` fox.
+//!   `{"id":"default-mascot","url":"{BASE_URL}/images/mascot.png",…}`
+//!   (Pleroma's `[:assets, :default_mascot]`, renamed to Wired's own
+//!   mascot path).
 //! - `PUT /api/v1/pleroma/mascot` (scope `write:accounts`) — a multipart
 //!   `file` part whose bytes [`infer`] names an `image/*` type; anything
 //!   else is 415 `{"error":"mascots can only be images"}` (no bytes read
@@ -101,9 +102,10 @@ const FILE_FIELD: &str = "file";
 const MASCOT_KEY: &str = "mascot";
 /// `id` of the instance default mascot (Pleroma's `User.get_mascot`).
 const DEFAULT_MASCOT_ID: &str = "default-mascot";
-/// Path appended to `BASE_URL` for the default mascot's URL (Pleroma's
-/// `[:assets, :mascots, :pleroma_fox_tan]` url).
-const DEFAULT_MASCOT_PATH: &str = "/images/pleroma-fox-tan-smol.png";
+/// Path appended to `BASE_URL` for the default mascot's URL: Wired's own
+/// mascot (the shape Pleroma serves from `[:assets, :mascots]`, under its
+/// `[:assets, :default_mascot]` key).
+const DEFAULT_MASCOT_PATH: &str = "/images/mascot.png";
 /// `pleroma.mime_type` of the default mascot.
 const DEFAULT_MASCOT_MIME: &str = "image/png";
 /// 422 body for a `frontend_name` the operator did not make pickable, the
@@ -482,8 +484,9 @@ fn mascot_attachment(id: &str, url: &str, mime_type: &str) -> Value {
     })
 }
 
-/// The instance default mascot: Pleroma's `[:assets, :default_mascot]`
-/// tan fox, served from this instance's static path.
+/// The instance default mascot: Wired's own mascot, served from this
+/// instance's static path (the answer Pleroma's `[:assets,
+/// :default_mascot]` gives for an account that stored none).
 fn default_mascot(base_url: &str) -> Value {
     mascot_attachment(
         DEFAULT_MASCOT_ID,
@@ -718,16 +721,16 @@ mod tests {
     }
 
     #[test]
-    fn the_default_mascot_is_the_pleroma_fox() {
+    fn the_default_mascot_is_the_instance_mascot() {
         assert_eq!(
             default_mascot("https://test.example"),
             json!({
                 "id": "default-mascot",
-                "url": "https://test.example/images/pleroma-fox-tan-smol.png",
+                "url": "https://test.example/images/mascot.png",
                 "type": "image",
                 "pleroma": { "mime_type": "image/png" },
             }),
-            "the ticket's default, hung off the instance origin"
+            "Wired's default mascot, hung off the instance origin"
         );
     }
 

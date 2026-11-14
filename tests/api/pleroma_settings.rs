@@ -95,11 +95,11 @@ async fn get_settings(app: &Router, token: &str, app_name: &str) -> common::Test
         .await
 }
 
-/// The default mascot, as the ticket fixes it for the test origin.
+/// Wired's default mascot, as the endpoint fixes it for the test origin.
 fn default_mascot() -> Value {
     json!({
         "id": "default-mascot",
-        "url": "https://test.example/images/pleroma-fox-tan-smol.png",
+        "url": "https://test.example/images/mascot.png",
         "type": "image",
         "pleroma": { "mime_type": "image/png" },
     })
@@ -339,10 +339,10 @@ async fn a_non_object_patch_body_is_unprocessable() {
     );
 }
 
-/// Without a stored mascot the answer is the instance default: Pleroma's
-/// tan fox, under `BASE_URL`.
+/// Without a stored mascot the answer is the instance default: Wired's
+/// own mascot, under `BASE_URL`.
 #[tokio::test]
-async fn the_mascot_default_is_the_fox() {
+async fn the_mascot_default_is_the_instance_mascot() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
@@ -353,7 +353,11 @@ async fn the_mascot_default_is_the_fox() {
         .send(&app)
         .await;
     assert_eq!(response.status, StatusCode::OK, "the default answers 200");
-    assert_eq!(response.json_value(), default_mascot(), "the ticket's fox");
+    assert_eq!(
+        response.json_value(),
+        default_mascot(),
+        "the instance's default mascot"
+    );
 }
 
 /// A PNG upload is stored through the uploader, announced as the

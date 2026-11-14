@@ -11,9 +11,10 @@
 //! both versions are the same document here.
 //!
 //! The document reports what this instance is: software identity (name
-//! `"pleroma"`, because Pleroma-compatible clients sniff it, with the real
-//! crate version in the compatibility comment), federation protocols,
-//! registration state, live usage counters read from the database, and the
+//! `"wired"` — this server is Wired — with Pleroma named in the version's
+//! compatibility comment as the interface it replicates), federation
+//! protocols, registration state, live usage counters read from the
+//! database, and the
 //! Pleroma-compatible `metadata` block. Where the ticket's shape and
 //! Pleroma 2.10.2's defaults meet, the ticket wins; values Pleroma reads
 //! from its runtime config take this instance's [`Config`] where it has an
@@ -49,9 +50,10 @@ use crate::{
 const REL_20: &str = "http://nodeinfo.diaspora.software/ns/schema/2.0";
 /// The `rel` announcing the `NodeInfo` 2.1 schema.
 const REL_21: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
-/// `software.name` (Pleroma's `Pleroma.Application.name()` downcased):
-/// clients key their Pleroma-extension behaviour off exactly this string.
-const SOFTWARE_NAME: &str = "pleroma";
+/// `software.name`: this server identifies itself as Wired. Clients that
+/// speak Pleroma's dialect detect it through the `features` list (see
+/// [`crate::services::instance_meta`]), not by sniffing this name.
+const SOFTWARE_NAME: &str = "wired";
 /// The Pleroma release whose HTTP interface this server replicates
 /// (decision 1), kept in the software version's compatibility comment.
 const PLEROMA_COMPATIBILITY_VERSION: &str = "2.10.2";
@@ -293,10 +295,10 @@ impl NodeInfo {
 /// The `software` block.
 #[derive(Debug, Serialize)]
 struct Software {
-    /// Always `"pleroma"`: the name Pleroma-compatible clients sniff.
+    /// Always `"wired"`: the name this server identifies itself with.
     name: &'static str,
-    /// The Pleroma version this server's HTTP interface replicates,
-    /// commented with the wired-be crate version.
+    /// The wired-be crate version, commented with the Pleroma release
+    /// this server's HTTP interface is compatible with.
     version: String,
     /// Source repository — only the 2.1 schema has this key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -315,7 +317,7 @@ impl Software {
         Self {
             name: SOFTWARE_NAME,
             version: format!(
-                "{PLEROMA_COMPATIBILITY_VERSION} (compatible; wired-be {})",
+                "{} (compatible; Pleroma {PLEROMA_COMPATIBILITY_VERSION})",
                 env!("CARGO_PKG_VERSION")
             ),
             repository: with_links.then_some(REPOSITORY_URL),
@@ -846,17 +848,14 @@ mod tests {
     }
 
     #[test]
-    fn the_document_holds_the_pleroma_compatibility_identity() {
+    fn the_document_identifies_the_server_as_wired() {
         let v20 = document(SchemaVersion::V20);
         assert_eq!(v20["version"], "2.0", "the version field");
-        assert_eq!(v20["software"]["name"], "pleroma", "clients sniff it");
+        assert_eq!(v20["software"]["name"], "wired", "the server is Wired");
         assert_eq!(
             v20["software"]["version"],
-            format!(
-                "2.10.2 (compatible; wired-be {})",
-                env!("CARGO_PKG_VERSION")
-            ),
-            "the compatibility comment carries the crate version"
+            format!("{} (compatible; Pleroma 2.10.2)", env!("CARGO_PKG_VERSION")),
+            "Wired's own version first, Pleroma named as the compatibility target"
         );
         assert_eq!(v20["protocols"], json!(["activitypub"]), "one protocol");
         assert_eq!(
@@ -872,7 +871,7 @@ mod tests {
         let metadata = &v21["metadata"];
         assert_eq!(metadata["nodeName"], "Wired", "from the test config");
         assert_eq!(
-            metadata["nodeDescription"], "A Pleroma-compatible instance",
+            metadata["nodeDescription"], "A Wired instance, compatible with Pleroma clients",
             "from the test config"
         );
         assert_eq!(metadata["private"], false, "a public instance");

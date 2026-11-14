@@ -100,10 +100,11 @@ const TOP_KEYS: [&str; 25] = [
 ];
 
 /// The `version` string the endpoint claims: the Mastodon API level,
-/// commented with the replicated Pleroma release and this crate.
+/// commented with the Pleroma release Wired is compatible with and
+/// Wired's own crate version.
 fn instance_version() -> String {
     format!(
-        "2.7.2 (compatible; Pleroma 2.10.2 wired-be {})",
+        "2.7.2 (compatible; Pleroma 2.10.2; Wired {})",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -189,8 +190,8 @@ fn expected_document(vapid_key: &str) -> Value {
     json!({
         "uri": "test.example",
         "title": "Wired",
-        "short_description": "A Pleroma-compatible instance",
-        "description": "A Pleroma-compatible instance",
+        "short_description": "A Wired instance, compatible with Pleroma clients",
+        "description": "A Wired instance, compatible with Pleroma clients",
         "email": "",
         "version": instance_version(),
         "urls": { "streaming_api": "wss://test.example" },
@@ -703,7 +704,7 @@ fn expected_v2_document(vapid_key: &str) -> Value {
         "title": "Wired",
         "version": instance_version(),
         "source_url": "https://github.com/TheStranjer/wired-be",
-        "description": "A Pleroma-compatible instance",
+        "description": "A Wired instance, compatible with Pleroma clients",
         "usage": { "users": { "active_month": 0 } },
         "thumbnail": { "url": format!("{BASE}/images/thumbnail.jpg") },
         "languages": ["en"],
@@ -1169,7 +1170,7 @@ async fn the_extended_description_wraps_the_instance_description() {
         "the ticket's two keys"
     );
     assert_eq!(
-        document["content"], "<p>A Pleroma-compatible instance</p>",
+        document["content"], "<p>A Wired instance, compatible with Pleroma clients</p>",
         "the INSTANCE_DESCRIPTION paragraph"
     );
     let stamp = document["updated_at"]
@@ -1384,7 +1385,7 @@ async fn federation_publishes_nothing_when_transparency_is_off() {
         );
         assert_eq!(
             document["description"],
-            json!("A Pleroma-compatible instance"),
+            json!("A Wired instance, compatible with Pleroma clients"),
             "{path}: and the rest of the document is unaffected"
         );
     }

@@ -3,7 +3,7 @@ name = "wired-be"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "API-only fediverse backend in Rust/Axum, aiming for Pleroma BE compatibility."
+description = "Wired's API-only fediverse backend in Rust/Axum, compatible with Pleroma's API."
 publish = false
 
 [features]

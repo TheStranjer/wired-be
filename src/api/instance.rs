@@ -473,13 +473,13 @@ async fn show_extended_description(State(state): State<AppState>) -> Json<Extend
 }
 
 /// The `version` string: Mastodon's API level, commented with the Pleroma
-/// release replicated and this crate's own version — the same comment
-/// style the [`NodeInfo`] software version uses.
+/// release this server is compatible with and Wired's own crate version —
+/// the same comment style the [`NodeInfo`] software version uses.
 ///
 /// [`NodeInfo`]: crate::api::nodeinfo
 fn version_string() -> String {
     format!(
-        "{MASTODON_API_LEVEL} (compatible; Pleroma {PLEROMA_COMPATIBILITY_VERSION} wired-be {})",
+        "{MASTODON_API_LEVEL} (compatible; Pleroma {PLEROMA_COMPATIBILITY_VERSION}; Wired {})",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -1494,14 +1494,14 @@ mod tests {
     }
 
     #[test]
-    fn the_version_names_the_api_level_pleroma_and_the_crate() {
+    fn the_version_names_the_api_level_pleroma_and_wired() {
         assert_eq!(
             version_string(),
             format!(
-                "2.7.2 (compatible; Pleroma 2.10.2 wired-be {})",
+                "2.7.2 (compatible; Pleroma 2.10.2; Wired {})",
                 env!("CARGO_PKG_VERSION")
             ),
-            "the ticket's compatibility comment with the real crate version"
+            "the API level, the compatibility target, and Wired's own version"
         );
     }
 
@@ -2019,7 +2019,7 @@ mod tests {
         assert_eq!(document["domain"], "test.example", "the config domain");
         assert_eq!(document["title"], "Wired", "the config name");
         assert_eq!(
-            document["description"], "A Pleroma-compatible instance",
+            document["description"], "A Wired instance, compatible with Pleroma clients",
             "the config description"
         );
         assert_eq!(
@@ -2299,7 +2299,7 @@ mod tests {
             rendered,
             json!({
                 "updated_at": "2026-10-11T12:00:00.000Z",
-                "content": "<p>A Pleroma-compatible instance</p>",
+                "content": "<p>A Wired instance, compatible with Pleroma clients</p>",
             }),
             "the paragraph-wrapped INSTANCE_DESCRIPTION stamped in Mastodon time"
         );
