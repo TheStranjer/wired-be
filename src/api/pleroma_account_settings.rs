@@ -98,8 +98,12 @@
 //! with those two calls. Remote followers' relationships are their own
 //! instances' to rewrite, and stay.
 //!
-//! Federation of the `Move` activity and the move notifications are not
-//! part of this ticket; they attach to the `after_account_moved` hook
+//! Federation of the `Move` activity and the move notifications: the
+//! federating half has landed —
+//! [`crate::services::federation_out::after_account_moved`] publishes the
+//! `Move` to the origin's remote followers and an `Update` of the re-read
+//! actor (which now carries its `movedTo`) through the hook
+//! `move_account` runs. The move notifications attach to the same hook
 //! later. The federated `Delete` of a deleted account's actor is the
 //! `users.delete` sweep's own: it runs in
 //! [`crate::services::federation_out::after_account_deleted`] while the
@@ -138,6 +142,7 @@ use crate::{
         user::{self, User, get_by_ap_id, get_by_email},
     },
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
+    services::federation_out,
     state::AppState,
     util::password::{hash_password, verify_password},
 };
@@ -450,7 +455,7 @@ async fn move_account(
     }
     user::mark_moved(&state.db, auth.0.id, &target.ap_id).await?;
     transfer_followers(&state, &auth.0, &target).await?;
-    after_account_moved(&state, &auth.0, &target);
+    after_account_moved(&state, &auth.0, &target).await;
     Ok(success_body())
 }
 
@@ -549,12 +554,16 @@ async fn transfer_followers(state: &AppState, origin: &User, target: &User) -> A
 }
 
 /// The hook the move runs once the account is marked moved and its
-/// followers have transferred. It is deliberately empty: federating the
-/// `Move` activity (Pleroma's `ActivityPub.move` inserts it into the
-/// origin's outbox and delivers to the follower collection) and the move
-/// notifications attach here with the federation ticket that owns the
-/// outbox pipeline. Later tickets replace the body, not the call sites.
-const fn after_account_moved(_state: &AppState, _old: &User, _new: &User) {}
+/// followers have transferred: announces the move through
+/// [`federation_out::after_account_moved`] — Pleroma's `ActivityPub.move`
+/// fan-out to the origin's remote followers, plus the profile `Update`
+/// that carries the new `movedTo`. The move notifications attach here
+/// with their own ticket; the hook never fails the request (decision 11
+/// queues the delivery, and the federation hook swallows its own enqueue
+/// errors).
+async fn after_account_moved(state: &AppState, old: &User, new: &User) {
+    federation_out::after_account_moved(state, old, new).await;
+}
 
 /// `POST /api/pleroma/change_password` — set a new password. The gates
 /// run in order — the current password, then the confirmation, then the
@@ -782,7 +791,7 @@ async fn disable_account(
         return Ok(error_body(INVALID_PASSWORD));
     }
     let revoked = deactivate_and_revoke_all(&state, &auth.0).await?;
-    crate::services::federation_out::after_account_disabled(&state, &auth.0);
+    federation_out::after_account_disabled(&state, &auth.0);
     debug!(account = %auth.0.nickname, revoked, "account disabled");
     Ok(success_body())
 }

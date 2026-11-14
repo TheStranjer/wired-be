@@ -310,7 +310,7 @@ async fn apply_flag(
     report::set_ap_id(&state.db, row.id, &view.id)
         .await
         .map_err(|err| transient("report activity id", &err))?;
-    after_report_created(&state, &row);
+    after_report_created(&state, &row).await;
     debug!(
         report = %row.id,
         target = %target.nickname,

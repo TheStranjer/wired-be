@@ -55,9 +55,13 @@
 //! which is what [`report::set_state`] and [`report::assign`] are there for.
 //!
 //! Filing is also the moment the later tickets act on: the admin
-//! notification, the email to the admins and the federation of the `Flag`
-//! activity all hang off this write, and the route calls this module's
-//! `after_report_created` hook as their documented empty landing point.
+//! notification and the email to the admins hang off this write, and the
+//! route calls this module's `after_report_created` hook as their landing
+//! point. The hook's federating half has landed:
+//! [`crate::services::federation_out::after_report_created`] forwards the
+//! report's `Flag` to a REMOTE target's instance when the reporter asked
+//! for it (`forward = true`), and stays silent for a local target or an
+//! unforwarded filing.
 //!
 //! [`report::create`]: crate::models::report::create
 //! [`report::set_state`]: crate::models::report::set_state
@@ -82,6 +86,7 @@ use crate::{
         user::User,
     },
     oauth::scopes::WRITE_REPORTS,
+    services::federation_out,
     state::AppState,
     util::id::parse_id,
 };
@@ -157,7 +162,7 @@ async fn create_report(
         target = %target.id,
         "report filed"
     );
-    after_report_created(&state, &row);
+    after_report_created(&state, &row).await;
     filed_response(&state, &auth.0, &target, &row).await
 }
 
@@ -351,23 +356,23 @@ async fn cited_rule_ids(state: &AppState, values: Option<IdValues>) -> AppResult
     }
 }
 
-/// Post-write hook of `POST /api/v1/reports`: the tickets that notify the
-/// admins of a new report — the `admin:reports` notification, the email to
-/// the instance's admins, and the federation of the `Flag` activity this
-/// report becomes (whose activity id is already stored as
-/// [`ReportRow::ap_id`], and whose delivery queues through the job table,
-/// decision 11) — wire themselves in here, reading the filed report from
-/// `state`.
+/// Post-write hook of `POST /api/v1/reports`: forwards the report's `Flag`
+/// to a REMOTE target's instance when the reporter asked for it, through
+/// [`federation_out::after_report_created`] (whose delivery queues through
+/// the job table, decision 11), and nothing else yet.
+///
+/// The ticket that notifies the admins of a new report — the
+/// `admin:reports` notification and the email to the instance's admins —
+/// still wires itself in here, reading the filed report from `state`.
 ///
 /// The inbound federation `Flag` ([`crate::federation::handlers::misc`])
-/// runs the same hook on the report it files, so whatever a later ticket
-/// lands here fires for locally filed and forwarded reports alike.
-///
-/// Intentionally empty until then, like the blocks'
-/// [`after_block_changed`](crate::api::blocks::after_block_changed) hook:
-/// Pleroma's `CommonAPI.report` delivers its `Flag` inline through
-/// `ActivityPub.flag`, and this server's counterpart is a later ticket.
-pub(crate) const fn after_report_created(_state: &AppState, _report: &ReportRow) {}
+/// runs the same hook on the report it files, so whatever stands here
+/// fires for locally filed and forwarded reports alike; the federating
+/// half answers silence for the inbound one, whose target is by
+/// construction a local account.
+pub(crate) async fn after_report_created(state: &AppState, report: &ReportRow) {
+    federation_out::after_report_created(state, report).await;
+}
 
 #[cfg(test)]
 mod tests {

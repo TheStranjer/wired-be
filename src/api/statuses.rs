@@ -312,10 +312,11 @@
 //! harmless: [`pinned_status::unpin`] deletes nothing and the answer is the
 //! unchanged entity with 200.
 //!
-//! Neither pin write federates anything yet either: the federation ticket
-//! that announces the `Featured` collection's `Add` and `Remove` lands in
-//! this module's `after_pin_changed` hook, the documented empty landing
-//! point it still is.
+//! Neither pin write announces itself to the network except through the
+//! `Featured` collection's `Add` and `Remove`, which
+//! [`crate::services::federation_out::after_pin_changed`] sends to the
+//! pinning account's remote followers — the pair lands in this module's
+//! `after_pin_changed` hook.
 //!
 //! # The thread-mute writes
 //!
@@ -2166,7 +2167,7 @@ async fn pin_status(
             user = %auth.0.id,
             "status pinned"
         );
-        after_pin_changed(&state, &pinned, true);
+        after_pin_changed(&state, &pinned, true).await;
     }
     current_entity(&state, &auth.0, row.id).await
 }
@@ -2207,7 +2208,7 @@ async fn unpin_status(
             user = %auth.0.id,
             "pin withdrawn"
         );
-        after_pin_changed(&state, &removed, false);
+        after_pin_changed(&state, &removed, false).await;
     }
     current_entity(&state, &auth.0, row.id).await
 }
@@ -2537,11 +2538,10 @@ pub(crate) async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, r
     federation_out::after_reblog_changed(state, reblog, reblogging).await;
 }
 
-/// Post-write hook of both pin routes: the federation ticket that adds the
-/// pin to its author's `Featured` collection — Pleroma's `Add`/`Remove`
-/// activities (`Builder.pin` and `Builder.unpin`, delivered with the object
-/// and withdrawn by its `Undo`) — wires the delivery in here, and the
-/// queueing happens through `state` (decision 11).
+/// Post-write hook of both pin routes: announces the featured collection's
+/// `Add` or `Remove` through [`federation_out::after_pin_changed`] —
+/// Pleroma's `Builder.pin` and `Builder.unpin`, delivered to the pinning
+/// account's remote followers (decision 11 queues the fan-out).
 ///
 /// `pinned` is the row the write just stored or removed: its
 /// [`user_id`](PinnedStatus::user_id) names the actor whose collection moves
@@ -2554,10 +2554,12 @@ pub(crate) async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, r
 /// `POST …/unpin` withdrew. A withdrawal that found no pin to remove never
 /// reaches it either.
 ///
-/// Intentionally empty until then, like the blocks'
-/// [`after_block_changed`](crate::api::blocks::after_block_changed) (the
-/// reactions' `after_reaction_changed` has since landed its telling).
-const fn after_pin_changed(_state: &AppState, _pinned: &PinnedStatus, _pinning: bool) {}
+/// Intentionally the federation half alone: unlike the favourite and boost
+/// hooks this one has no notification to send, and the routes ride no
+/// throttle bucket.
+pub(crate) async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, pinning: bool) {
+    federation_out::after_pin_changed(state, pinned, pinning).await;
+}
 
 /// Post-write hook of the edit route: the `update` telling of every local
 /// account still boosting the edited post — Pleroma's `Update` arm of
