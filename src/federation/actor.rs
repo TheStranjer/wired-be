@@ -174,16 +174,12 @@ fn public_key(user: &User) -> Value {
 /// objects. Entries that are not `{name, value}` objects are skipped, so
 /// malformed storage never fails a response.
 fn attachments(user: &User) -> Value {
-    let properties = user
-        .fields
-        .as_array()
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(property_value)
-                .collect::<Vec<Value>>()
-        })
-        .unwrap_or_default();
+    let properties = user.fields.as_array().map_or_else(Vec::new, |entries| {
+        entries
+            .iter()
+            .filter_map(property_value)
+            .collect::<Vec<Value>>()
+    });
     Value::Array(properties)
 }
 

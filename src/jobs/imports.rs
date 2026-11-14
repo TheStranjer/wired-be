@@ -588,10 +588,7 @@ mod tests {
             "and it starts exactly where this run stopped"
         );
         assert_eq!(
-            next.args["options"]
-                .as_array()
-                .map(Vec::len)
-                .unwrap_or_default(),
+            next.args["options"].as_array().map_or(0, Vec::len),
             10,
             "the options travel with the accts"
         );

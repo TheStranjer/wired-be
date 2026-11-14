@@ -308,7 +308,7 @@ pub fn app(state: AppState) -> Router {
         Router::new()
             .route("/health", get(health))
             .merge(api::router(&state))
-            .merge(api::activitypub::router())
+            .merge(api::activitypub::router(&state.config))
             .merge(api::feeds::router())
             .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())

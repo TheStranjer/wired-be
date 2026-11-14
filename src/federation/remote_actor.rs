@@ -497,8 +497,7 @@ fn parse_media_url(json: &Value, field: &str) -> Option<String> {
 fn parse_fields(json: &Value) -> Value {
     let properties = json
         .get("attachment")
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or(&[][..], as_array)
         .iter()
         .filter_map(property_value)
         .collect();
@@ -521,8 +520,7 @@ fn property_value(entry: &Value) -> Option<Value> {
 /// `normalize_also_known_as`); non-string entries are skipped.
 fn parse_also_known_as(json: &Value) -> Vec<String> {
     json.get("alsoKnownAs")
-        .map(as_array)
-        .unwrap_or_default()
+        .map_or(&[][..], as_array)
         .iter()
         .filter_map(Value::as_str)
         .map(str::to_owned)

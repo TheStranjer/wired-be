@@ -1281,14 +1281,12 @@ mod tests {
         map: &HashMap<Uuid, Vec<PollOption>>,
         status_id: Uuid,
     ) -> Vec<(i32, String)> {
-        map.get(&status_id)
-            .map(|options| {
-                options
-                    .iter()
-                    .map(|option| (option.position, option.title.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        map.get(&status_id).map_or_else(Vec::new, |options| {
+            options
+                .iter()
+                .map(|option| (option.position, option.title.clone()))
+                .collect()
+        })
     }
 
     #[tokio::test]

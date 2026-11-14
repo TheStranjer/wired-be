@@ -1841,10 +1841,9 @@ async fn mention_links(pool: &PgPool, id: Uuid) -> Vec<Uuid> {
     let links = mention::for_statuses(pool, std::slice::from_ref(&id))
         .await
         .expect("the mention links read");
-    links
-        .get(&id)
-        .map(|users| users.iter().map(|account| account.id).collect())
-        .unwrap_or_default()
+    links.get(&id).map_or_else(Vec::new, |users| {
+        users.iter().map(|account| account.id).collect()
+    })
 }
 
 /// The names `status_hashtags` links to one status, as the hashtag model
@@ -1853,10 +1852,9 @@ async fn tag_links(pool: &PgPool, id: Uuid) -> Vec<String> {
     let links = hashtag::for_statuses(pool, std::slice::from_ref(&id))
         .await
         .expect("the tag links read");
-    links
-        .get(&id)
-        .map(|tags| tags.iter().map(|tag| tag.name.clone()).collect())
-        .unwrap_or_default()
+    links.get(&id).map_or_else(Vec::new, |tags| {
+        tags.iter().map(|tag| tag.name.clone()).collect()
+    })
 }
 
 /// A minimal post is created, answered as the [`Status`] entity and stored

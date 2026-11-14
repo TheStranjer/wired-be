@@ -21,10 +21,26 @@
 //! from the same controller's `outbox/2`, `followers/2`, `following/2`,
 //! `pinned/2` and `object_replies/2` actions — and the three inbox
 //! `POST`s of the actors those documents name (`inbox/2` feeding
-//! `Federator.incoming_ap_doc`). `GET /users/{nickname}/inbox`, the
-//! client reads of a personal inbox, belongs to the C2S ticket.
+//! `Federator.incoming_ap_doc`).
 //!
-//! Every `GET` of this router negotiates content: an `Accept` header
+//! Beside the federation face sits the client-to-server one, Pleroma's
+//! `ActivityPubController` actions `read_inbox`, `update_outbox`,
+//! `whoami` and `upload_media`: `GET /users/{nickname}/inbox`, the
+//! owner's `OrderedCollection` of the `Create` activities addressed to
+//! them, `POST /users/{nickname}/outbox`, which folds an activity posted
+//! by the owner into the same writes the Mastodon client API runs and
+//! answers `201` with the new activity's id in `Location`,
+//! `GET /api/ap/whoami`, the authenticated user's own actor document,
+//! and `POST /api/ap/upload_media`, the media upload answered as an
+//! `ActivityStreams` `Document`. These four are OAuth routes, not
+//! federation: they authenticate with the bearer token (decision 9),
+//! demand the token's user *be* the `{nickname}` of the path — every
+//! other pairing is 403 `{"error":"Forbidden"}`, Pleroma's catch-all
+//! arm — and they answer regardless of what `Accept` says, since no
+//! `ActivityPub` peer ever calls them.
+//!
+//! Every federation `GET` of this router (never a C2S one) negotiates
+//! content: an `Accept` header
 //! naming one of the two `ActivityPub` media types gets the document; an
 //! `Accept` naming `text/html` (and no `ActivityPub` type) is a browser
 //! and gets Pleroma's redirect to the frontend page of the same address —
@@ -78,26 +94,47 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
+    api::{
+        blocks::after_block_changed,
+        media::{UploadParams, store_upload},
+        statuses::{CANNOT_REBLOG, action_target_id},
+    },
+    auth::AuthUser,
     config::Config,
     error::{AppError, AppResult},
+    extract::{
+        ApiBody,
+        multipart::{MultipartForm, upload_body_limit},
+    },
     federation::{
         actor::actor_json,
         authorized_fetch::fetch_allowed,
         collections::{self, FollowSide},
         dispatch::KIND_INCOMING,
         inbox_auth::{InboxAuthError, SignedActivity},
-        note::{LITEPUB_SCHEMA_PATH, litepub_context_json},
+        json as ap_json,
+        note::{self, LITEPUB_SCHEMA_PATH, litepub_context_json},
+        note_parser,
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
+        block::{self, Block},
+        favourite,
+        follow::{self, Follow},
         job::{NewJob, enqueue},
-        status::{self, Status},
+        media_attachment, mention, oauth_app,
+        status::{self, Status, Visibility},
         status_visibility,
-        user::{User, get_by_nickname},
+        user::{self, User, get_by_nickname},
     },
-    services::instance_actor,
+    oauth::scopes::{READ, READ_STATUSES, WRITE_MEDIA, WRITE_STATUSES},
+    services::{
+        create_status::{self, CreateStatusParams},
+        delete_status::delete_status,
+        instance_actor, notify,
+    },
     state::AppState,
-    util::id::parse_id,
+    util::id::{new_id, parse_id},
 };
 
 /// `Content-Type` of an actor document: `ActivityPub` is JSON-LD with its
@@ -132,19 +169,46 @@ const INCOMING_MAX_ATTEMPTS: i32 = 5;
 /// ticket that adds one registers the inbox routes (and their bucket name)
 /// with it.
 pub const RATE_LIMIT_BUCKET: &str = "ap_routes";
+/// 403 body of the two C2S actor routes when the bearer's user is not the
+/// `{nickname}` of the path (the ticket's wording of Pleroma's
+/// catch-all `can't read inbox of … as …` arm).
+const FORBIDDEN: &str = "Forbidden";
+/// 400 body of the C2S outbox for an activity whose type it does not
+/// fold — and for a `Create` whose object is not a `Note`.
+const UNSUPPORTED_ACTIVITY_TYPE: &str = "Unsupported activity type";
+/// The `type` a posted `Create`'s object must wear to be folded: the
+/// outbox takes the plain post and nothing else (a poll's `Question`, a
+/// `Tombstone`, an actor — all unsupported).
+const OBJECT_TYPE_NOTE: &str = "Note";
+/// The collection `type` of the C2S inbox root.
+const ORDERED_COLLECTION: &str = "OrderedCollection";
+/// How many activities one C2S inbox page holds — the outbox page's size,
+/// the ticket's twenty.
+const INBOX_PAGE_SIZE: i64 = 20;
 
 /// The top-level `ActivityPub` router, merged by [`crate::app`].
 ///
 /// It serves the actor documents peers fetch, the activity collections
 /// beside them (the account's outbox, followers, following and featured
-/// list, an object's replies), and the three inbox routes that accept
-/// their deliveries (`POST /inbox`, `POST /users/{nickname}/inbox`
-/// and `POST /internal/fetch/inbox`). `GET /users/{nickname}/inbox` is
-/// the C2S ticket's, not this router's.
-pub fn router() -> Router<AppState> {
+/// list, an object's replies), the three inbox routes that accept their
+/// deliveries (`POST /inbox`, `POST /users/{nickname}/inbox` and
+/// `POST /internal/fetch/inbox`), and the four OAuth-authenticated
+/// client-to-server routes: `GET /users/{nickname}/inbox`,
+/// `POST /users/{nickname}/outbox`, `GET /api/ap/whoami` and
+/// `POST /api/ap/upload_media`.
+///
+/// `config` is what the C2S upload route sizes its body limit from: the
+/// multipart extractor refuses bodies over 2 MiB unless the route raises
+/// that first (see [`upload_body_limit`], and the same on the Mastodon
+/// upload routes in [`crate::api::media`]).
+pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/users/{nickname}", get(get_actor))
-        .route("/users/{nickname}/outbox", get(get_outbox))
+        .route("/users/{nickname}/inbox", get(read_inbox).post(user_inbox))
+        .route(
+            "/users/{nickname}/outbox",
+            get(get_outbox).post(update_outbox),
+        )
         .route("/users/{nickname}/followers", get(get_followers))
         .route("/users/{nickname}/following", get(get_following))
         .route("/users/{nickname}/collections/featured", get(get_featured))
@@ -152,8 +216,12 @@ pub fn router() -> Router<AppState> {
         .route("/internal/fetch", get(get_instance_actor))
         .route(LITEPUB_SCHEMA_PATH, get(litepub_schema))
         .route("/inbox", post(inbox))
-        .route("/users/{nickname}/inbox", post(user_inbox))
         .route("/internal/fetch/inbox", post(inbox))
+        .route("/api/ap/whoami", get(whoami))
+        .route(
+            "/api/ap/upload_media",
+            post(ap_upload_media).layer(upload_body_limit(config)),
+        )
 }
 
 /// What the negotiation and the account lookup settled on for a
@@ -517,6 +585,708 @@ async fn enqueue_incoming(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Client-to-server: the owner's reads and writes at the same addresses
+// (Pleroma's `read_inbox`, `update_outbox`, `whoami` and `upload_media`).
+// ---------------------------------------------------------------------------
+
+/// `GET /users/{nickname}/inbox` — the owner's personal inbox, Pleroma's
+/// `read_inbox`: the collection root, or with `?page=true` a newest-first
+/// page (20 per page, cursor `max_id`) of the `Create` activities of the
+/// statuses addressed to the account — the ones that @-mention it
+/// (`status_mentions`: the replies, the direct messages and the mentioned
+/// posts all link the addressee there), rendered exactly as the outbox
+/// renders its own. The gates are the ticket's: a bearer token granting
+/// `read` or `read:statuses` (without one the extractor's 401 answers,
+/// Pleroma's `EnsureAuthenticatedPlug` word for word), and the token's
+/// user must *be* the `{nickname}` of the path — every other pairing is
+/// the 403. No `Accept` negotiation and no HTTP Signature: this is the
+/// client API on an actor address, not the document a peer fetches.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the scope check; [`AppError::Forbidden`] with [`FORBIDDEN`] for
+/// somebody else's inbox; [`AppError::BadRequest`] from the page cursors;
+/// any database failure arrives through `?` as [`AppError::Database`].
+async fn read_inbox(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(nickname): Path<String>,
+    uri: Uri,
+) -> AppResult<Response> {
+    auth.require_any(&[READ, READ_STATUSES])?;
+    ensure_own_actor(&auth.0, &nickname)?;
+    let collection = user::inbox(&auth.0.ap_id);
+    let document = if collections::page_requested(uri.query()) {
+        inbox_page(&state, auth.0.id, &collection, uri.query()).await?
+    } else {
+        collections::collection_root(&collection, ORDERED_COLLECTION, None, &state.config)
+    };
+    Ok(document_response(&document))
+}
+
+/// One `?page=true` of the personal inbox: the ids of the statuses
+/// mentioning the owner, newest first off the keyset (decision 4), as
+/// their `Create` activities inside the same page envelope the outbox
+/// writes.
+async fn inbox_page(
+    state: &AppState,
+    owner_id: Uuid,
+    collection: &str,
+    query: Option<&str>,
+) -> AppResult<Value> {
+    let page = collections::keyset_page(query, INBOX_PAGE_SIZE)?;
+    let ids = mention::mentioned_status_ids(&state.db, owner_id, page).await?;
+    let items = inbox_creates(state, &ids).await?;
+    let links = collections::descending_page_links(
+        collection,
+        query,
+        ids.first().copied(),
+        ids.last().copied(),
+        i64::try_from(ids.len()).unwrap_or(i64::MAX) == INBOX_PAGE_SIZE,
+    );
+    Ok(collections::ordered_collection_page(
+        &links,
+        items,
+        &state.config,
+    ))
+}
+
+/// The page's status ids as `Create` activities, page order kept: the
+/// live rows come back through one batch read and each renders through
+/// the outbox's own loader. A row that vanished between the id page and
+/// its render — or that federates as nothing (`local` visibility) — drops
+/// out rather than failing the page.
+async fn inbox_creates(state: &AppState, ids: &[Uuid]) -> AppResult<Vec<Value>> {
+    let rows = status::get_many(&state.db, ids).await?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in ids
+        .iter()
+        .filter_map(|id| rows.iter().find(|row| row.id == *id))
+    {
+        items.extend(create_activity_of(state, row.id).await?);
+    }
+    Ok(items)
+}
+
+/// One live status row as its `Create` activity, `None` when its object
+/// is gone or wears no document.
+async fn create_activity_of(state: &AppState, status_id: Uuid) -> AppResult<Option<Value>> {
+    match note::load_note_context(&state.db, &state.config, status_id).await {
+        Ok(ctx) => Ok(note::note_json(&ctx)
+            .map(|object| note::create_activity_json(&object, &ctx.status, &state.config))),
+        // The row fell between the id page and its render.
+        Err(AppError::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// `POST /users/{nickname}/outbox` — the C2S write, Pleroma's
+/// `update_outbox`: one `ActivityStreams` activity by the owner, folded
+/// into the same writes the Mastodon client API runs. `Create` of a
+/// `Note` posts through [`create_status::create_status`]; `Delete`
+/// tombstones the caller's own status; `Follow` and `Block` write the
+/// relationship through the models; `Like` and `Announce` are the
+/// favourite and the reblog; `Undo` withdraws a `Follow`, `Like`,
+/// `Announce` or `Block`, named either by the embedded activity or by the
+/// id its creation answered in `Location`. Any other type is the 400
+/// [`UNSUPPORTED_ACTIVITY_TYPE`]. A folded activity is not stored as
+/// such — decision 6 keeps the facts relationally and renders their
+/// activities from them — so the answer is the ticket's: `201` with the
+/// new object/activity id in `Location` and an empty body.
+///
+/// The gates are [`read_inbox`]'s, on `write:statuses` (Pleroma runs the
+/// whole outbox under one scope, not per activity type).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the scope check; [`AppError::Forbidden`] with [`FORBIDDEN`] for
+/// somebody else's outbox (and for a `Delete` of a post the caller does
+/// not own); [`AppError::BadRequest`] with [`UNSUPPORTED_ACTIVITY_TYPE`];
+/// the inner write's own refusals — the create's 422s and reply 404, the
+/// self-follow and block refusals, the boost 422 — and
+/// [`AppError::NotFound`] for an object the activity names that no stored
+/// row carries.
+async fn update_outbox(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(nickname): Path<String>,
+    ApiBody(activity): ApiBody<Value>,
+) -> AppResult<Response> {
+    auth.require(WRITE_STATUSES)?;
+    ensure_own_actor(&auth.0, &nickname)?;
+    let location = post_activity(&state, &auth, &activity).await?;
+    debug!(
+        actor = %auth.0.id,
+        %location,
+        "c2s activity accepted"
+    );
+    let value = HeaderValue::from_str(&location)
+        .map_err(|err| AppError::Internal(format!("the activity id is not header-safe: {err}")))?;
+    Ok((StatusCode::CREATED, [(header::LOCATION, value)]).into_response())
+}
+
+/// The outbox's type dispatch: the seven activity types the ticket folds,
+/// each answered by the `Location` id of the activity the write
+/// corresponds to, and everything else — including a body that names no
+/// string type at all — by the 400.
+async fn post_activity(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    match activity
+        .get("type")
+        .and_then(ap_json::first_type)
+        .as_deref()
+    {
+        Some("Create") => post_create(state, auth, activity).await,
+        Some("Delete") => post_delete(state, auth, activity).await,
+        Some("Follow") => post_follow(state, auth, activity).await,
+        Some("Like") => post_like(state, auth, activity).await,
+        Some("Announce") => post_announce(state, auth, activity).await,
+        Some("Block") => post_block(state, auth, activity).await,
+        Some("Undo") => post_undo(state, auth, activity).await,
+        Some(_) | None => Err(AppError::BadRequest(UNSUPPORTED_ACTIVITY_TYPE.to_owned())),
+    }
+}
+
+/// The C2S owner gate of the two actor-keyed routes: the bearer's user
+/// must *be* the account the path names — Pleroma matches the token's
+/// nickname against the route's in the controller head, and its
+/// catch-all arm answers every other pairing the 403. No lookup stands
+/// between the two: the extractor already handed a live local account,
+/// so a matching nickname can only name that one.
+fn ensure_own_actor(user: &User, nickname: &str) -> AppResult<()> {
+    if user.nickname == nickname {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(FORBIDDEN.to_owned()))
+    }
+}
+
+/// `Create` of a `Note` — the post, through the client API's own write
+/// service. The note's `content` is the status text, its `summary` the
+/// content warning and its `sensitive` flag the fold; the audience is
+/// read off `to`/`cc` exactly as the federation parser reads them
+/// ([`note_parser::parse_visibility`]: the public addressee in `to` is
+/// `public`, in `cc` alone `unlisted`, the followers collection
+/// `private`, anything else `direct`); `inReplyTo` names the answered
+/// status by object id or id text; and every `attachment` reference
+/// carries an upload id from `POST /api/ap/upload_media` — the `media_ids`
+/// the create claims, whose "the caller's own, not yet posted" rules are
+/// the media model's. `Location` names the `Create` the post federates
+/// as, `{BASE_URL}/activities/{status id}` (decision 6, and the id
+/// [`note::create_activity_json`] writes).
+async fn post_create(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    let object = note_object(activity)?;
+    let params = CreateStatusParams {
+        status: text_field(object, "content"),
+        spoiler_text: text_field(object, "summary"),
+        sensitive: object.get("sensitive").and_then(Value::as_bool),
+        visibility: Some(
+            note_parser::parse_visibility(&create_addressing(object, activity), &auth.0)
+                .as_str()
+                .to_owned(),
+        ),
+        in_reply_to_id: replied_to(state, object).await?,
+        media_ids: Some(attachment_ids(object)),
+        ..CreateStatusParams::default()
+    };
+    let app = oauth_app::get_by_id(&state.db, auth.1.app_id).await?;
+    let entity = create_status::create_status(state, &auth.0, app.as_ref(), params).await?;
+    Ok(format!(
+        "{}/activities/{}",
+        state.config.base_url, entity.id
+    ))
+}
+
+/// The `Create`'s object, when it is a `Note` document: a bare reference,
+/// a missing object, or any other object type is the 400
+/// [`UNSUPPORTED_ACTIVITY_TYPE`] — the outbox posts a plain note and
+/// nothing else.
+fn note_object(activity: &Value) -> AppResult<&Value> {
+    let unsupported = || AppError::BadRequest(UNSUPPORTED_ACTIVITY_TYPE.to_owned());
+    activity
+        .get("object")
+        .filter(|object| {
+            object.is_object()
+                && object.get("type").and_then(ap_json::first_type).as_deref()
+                    == Some(OBJECT_TYPE_NOTE)
+        })
+        .ok_or_else(unsupported)
+}
+
+/// The string `object` carries under `key`: `None` for an absent, `null`
+/// or non-text value, which for `content` leaves the create's own empty
+/// refusal and for `summary` no content warning.
+fn text_field(object: &Value, key: &str) -> Option<String> {
+    object.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// The `to`/`cc` the create's audience is read from: the note's own when
+/// it addresses anyone, the enclosing `Create`'s otherwise — C2S clients
+/// write the audience on either half, and the two places Pleroma's
+/// pipeline checks. The result is the shape [`note_parser::parse_visibility`]
+/// reads: one object with `to` and `cc`.
+fn create_addressing(object: &Value, activity: &Value) -> Value {
+    let audience = |key: &str| {
+        object
+            .get(key)
+            .filter(|value| !is_empty_audience(value))
+            .or_else(|| activity.get(key))
+            .cloned()
+            .unwrap_or_else(|| json!([]))
+    };
+    json!({ "to": audience("to"), "cc": audience("cc") })
+}
+
+/// Whether an addressing value names nobody: no non-empty reference
+/// anywhere in it — `null`, the empty array, the empty string, or a
+/// value that carries no reference at all all mean "this half holds no
+/// audience", and the create falls back to the other half.
+fn is_empty_audience(value: &Value) -> bool {
+    !ap_json::references(value)
+        .iter()
+        .any(|recipient| !recipient.is_empty())
+}
+
+/// The note's `inReplyTo` as the create's id text: the answered status
+/// must be a row this instance stores (an object id or the bare id text,
+/// through the same read a `Like` uses), or the shared 404. An absent or
+/// `null` reference is a root post.
+async fn replied_to(state: &AppState, object: &Value) -> AppResult<Option<String>> {
+    let Some(reference) = object.get("inReplyTo").and_then(ap_json::value_or_id) else {
+        return Ok(None);
+    };
+    let row = status_by_reference(state, &reference)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Some(row.id.to_string()))
+}
+
+/// The `attachment` array's upload ids, submission order kept: every
+/// reference's last path segment — the media id `POST /api/ap/upload_media`
+/// answers as the `Document`'s `id`, bare or under an id URL. The create
+/// itself decides what each id may mean: the media model claims only the
+/// poster's own, not-yet-posted uploads and refuses any other with its
+/// 422.
+fn attachment_ids(object: &Value) -> Vec<String> {
+    object
+        .get("attachment")
+        .map_or(&[][..], ap_json::as_array)
+        .iter()
+        .filter_map(ap_json::value_or_id)
+        .map(|reference| match reference.rsplit_once('/') {
+            Some((_origin_and_path, last_segment)) => last_segment.to_owned(),
+            None => reference,
+        })
+        .collect()
+}
+
+/// `Delete` of the caller's own status, named by object id or id text:
+/// the same write `DELETE /api/v1/statuses/{id}` runs — the tombstone of
+/// the row and its reblogs, the counter steps and the post-delete hooks
+/// ([`delete_status`]). Somebody else's post is the 403, Pleroma's
+/// permission arm of `fix_user_message`; an unknown or already deleted
+/// one is the shared 404. `Location` names the `Delete` itself: a fresh
+/// `{BASE_URL}/activities/{uuid}` id, since a withdrawal creates no row
+/// to key one on (decision 6).
+async fn post_delete(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    let reference = activity_reference(activity)?;
+    let row = status_by_reference(state, &reference)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if row.user_id != auth.0.id {
+        return Err(AppError::Forbidden(FORBIDDEN.to_owned()));
+    }
+    // The write is idempotent: the `false` is the concurrent delete that
+    // turned the row into a tombstone between the read and this write —
+    // the fact already withdrawn, and the same accepted answer.
+    let _restated = delete_status(state, &row).await?;
+    Ok(new_activity_id(&state.config))
+}
+
+/// `Follow` of an actor: the object names the followed account by actor
+/// id, resolved among the stored rows (remote mirrors included — this
+/// endpoint reads what is stored and does not fetch an unseen actor over
+/// the network), and the write is the model's own [`follow::follow`], the
+/// very one `POST /api/v1/accounts/{id}/follow` runs: a locked target
+/// leaves a `pending` request, a repeat restates the relationship, and
+/// the block refusals are the model's. `Location` carries the follow's
+/// activity id — the `ap_id` the row keeps (decision 6), which is what
+/// an `Undo` of it names.
+async fn post_follow(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    let reference = activity_reference(activity)?;
+    let target = stored_actor(state, &reference).await?;
+    let created = follow::follow(&state.db, &state.config.base_url, &auth.0, &target).await?;
+    notify::on_follow(state, &auth.0, &target, Some(&created), true).await;
+    Ok(row_activity_id(&state.config, created.ap_id.as_deref()))
+}
+
+/// `Like` of a status: the favourite, on the same gate and with the same
+/// boost-folding as `POST /api/v1/statuses/{id}/favourite` — what the
+/// caller may not see is the 404, and a reblog's id likes its original.
+/// A repeat is the existing row's activity id with the same `201` (one
+/// like, told once: the notification fires only on the write that made
+/// the row).
+async fn post_like(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    let row = interactable_status(state, auth, activity).await?;
+    let liked_id = action_target_id(&row);
+    let created =
+        favourite::favourite(&state.db, &state.config.base_url, auth.0.id, liked_id).await?;
+    let stored = match created {
+        Some(created) => {
+            notify::on_favourite(state, &created, true).await;
+            Some(created)
+        }
+        None => favourite::get(&state.db, auth.0.id, liked_id).await?,
+    };
+    Ok(row_activity_id(
+        &state.config,
+        stored.as_ref().and_then(|found| found.ap_id.as_deref()),
+    ))
+}
+
+/// `Announce` of a status: the reblog at `public` visibility, under the
+/// shared gate, the boost-folding ("nobody boosts a boost") and the
+/// `private`/`direct` refusal of `POST /api/v1/statuses/{id}/reblog`. A
+/// reblog row *is* its `Announce` (decision 6), so `Location` is that
+/// row's own `uri` — which is what an `Undo` of the boost names.
+async fn post_announce(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    let row = interactable_status(state, auth, activity).await?;
+    let original = reblog_target(state, &row).await?;
+    if matches!(
+        original.visibility,
+        Visibility::Private | Visibility::Direct
+    ) {
+        return Err(AppError::Unprocessable(CANNOT_REBLOG.to_owned()));
+    }
+    let (reblog, created) = status::create_reblog(
+        &state.db,
+        &state.config.base_url,
+        &auth.0,
+        &original,
+        Visibility::Public,
+    )
+    .await?;
+    if created {
+        notify::on_reblog(state, &reblog, true).await;
+    }
+    Ok(reblog.uri)
+}
+
+/// `Block` of an actor: [`block::block`], the same write
+/// `POST /api/v1/accounts/{id}/block` runs — idempotent on the pair, and
+/// the self-block refusal is the model's. `Location` carries the block's
+/// activity id, the `ap_id` the row keeps.
+async fn post_block(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    let reference = activity_reference(activity)?;
+    let target = stored_actor(state, &reference).await?;
+    let created = block::block(&state.db, &state.config.base_url, &auth.0, &target).await?;
+    after_block_changed(state, &created, true);
+    Ok(row_activity_id(&state.config, created.ap_id.as_deref()))
+}
+
+/// `Undo` of one of those: the withdrawn activity named by id alone (the
+/// `Location` the creation answered — the four relationship tables and
+/// the reblog rows all key on it, decision 6) or as an embedded activity
+/// whose inner type and object name the fact. The withdrawals are the
+/// Mastodon routes' own writes, idempotent for the same peace: an `Undo`
+/// of something already withdrawn is still accepted. `Location` names the
+/// `Undo` itself, a fresh activity id.
+async fn post_undo(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
+    match activity.get("object") {
+        Some(inner) if inner.is_object() => undo_embedded(state, auth, inner).await,
+        Some(object) => {
+            let reference = ap_json::value_or_id(object).ok_or(AppError::NotFound)?;
+            undo_by_activity_id(state, auth, &reference).await
+        }
+        None => Err(AppError::NotFound),
+    }
+}
+
+/// The `Undo` of an embedded activity: the inner `type` says what is
+/// withdrawn and the inner `object` names the target — the four types the
+/// outbox itself creates, and any other inner type is the 400.
+async fn undo_embedded(state: &AppState, auth: &AuthUser, inner: &Value) -> AppResult<String> {
+    let reference = inner
+        .get("object")
+        .and_then(ap_json::value_or_id)
+        .ok_or(AppError::NotFound)?;
+    match inner.get("type").and_then(ap_json::first_type).as_deref() {
+        Some("Follow") => undo_follow_of(state, auth, &reference).await?,
+        Some("Like") => undo_like_of(state, auth, &reference).await?,
+        Some("Announce") => undo_announce_of(state, auth, &reference).await?,
+        Some("Block") => undo_block_of(state, auth, &reference).await?,
+        Some(_) | None => {
+            return Err(AppError::BadRequest(UNSUPPORTED_ACTIVITY_TYPE.to_owned()));
+        }
+    }
+    Ok(new_activity_id(&state.config))
+}
+
+/// An `Undo` naming the withdrawn activity by its id alone: whichever of
+/// the caller's own rows carries the id (a `follows`, `favourite` or
+/// `block` `ap_id`, or the `uri` of the caller's reblog row — an id
+/// somebody else's activity bears names none of theirs, and a plain
+/// status `uri` is no activity) is withdrawn, with the same hooks the
+/// embedded form runs. Nothing carrying it is the shared 404.
+async fn undo_by_activity_id(
+    state: &AppState,
+    auth: &AuthUser,
+    reference: &str,
+) -> AppResult<String> {
+    if let Some(found) = follow::get_by_ap_id(&state.db, auth.0.id, reference).await? {
+        return undo_named_follow(state, auth, &found).await;
+    }
+    if let Some(found) = favourite::get_by_ap_id(&state.db, auth.0.id, reference).await? {
+        if let Some(removed) = favourite::unfavourite(&state.db, auth.0.id, found.status_id).await?
+        {
+            notify::on_favourite(state, &removed, false).await;
+        }
+        return Ok(new_activity_id(&state.config));
+    }
+    if let Some(found) = block::get_by_ap_id(&state.db, auth.0.id, reference).await? {
+        return undo_named_block(state, auth, &found).await;
+    }
+    if let Some(row) = status::get_by_uri(&state.db, reference).await?
+        && let Some(original_id) = row.reblog_of_id.filter(|_| row.user_id == auth.0.id)
+    {
+        if let Some(tombstone) = status::remove_reblog(&state.db, auth.0.id, original_id).await? {
+            notify::on_reblog(state, &tombstone, false).await;
+        }
+        return Ok(new_activity_id(&state.config));
+    }
+    Err(AppError::NotFound)
+}
+
+/// The withdrawal of a follow found by its activity id: the followed
+/// account is read off the row, and [`follow::unfollow`] takes it back —
+/// the Mastodon route's unfollow ending, where a withdrawal reaches no
+/// telling back, so the result needs only binding.
+async fn undo_named_follow(state: &AppState, auth: &AuthUser, found: &Follow) -> AppResult<String> {
+    let target = user_by_id(state, found.followee_id).await?;
+    let _withdrawn = follow::unfollow(&state.db, &auth.0, &target).await?;
+    Ok(new_activity_id(&state.config))
+}
+
+/// The withdrawal of a block found by its activity id: the blocked
+/// account is read off the row, [`block::unblock`] takes the pair back,
+/// and the hook fires for the row that went — the Mastodon route's own
+/// ending.
+async fn undo_named_block(state: &AppState, auth: &AuthUser, found: &Block) -> AppResult<String> {
+    let target = user_by_id(state, found.blocked_id).await?;
+    if let Some(removed) = block::unblock(&state.db, &auth.0, &target).await? {
+        after_block_changed(state, &removed, false);
+    }
+    Ok(new_activity_id(&state.config))
+}
+
+/// The `Undo` of an embedded `Follow` naming its target actor.
+async fn undo_follow_of(state: &AppState, auth: &AuthUser, reference: &str) -> AppResult<()> {
+    let target = stored_actor(state, reference).await?;
+    let previous = follow::get(&state.db, auth.0.id, target.id).await?;
+    if follow::unfollow(&state.db, &auth.0, &target).await? {
+        notify::on_follow(state, &auth.0, &target, previous.as_ref(), false).await;
+    }
+    Ok(())
+}
+
+/// The `Undo` of an embedded `Like` naming its status (or of a
+/// withdrawn-by-id `Like`, whose row already names the status).
+async fn undo_like_of(state: &AppState, auth: &AuthUser, reference: &str) -> AppResult<()> {
+    let row = status_by_reference(state, reference)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(removed) =
+        favourite::unfavourite(&state.db, auth.0.id, action_target_id(&row)).await?
+    {
+        notify::on_favourite(state, &removed, false).await;
+    }
+    Ok(())
+}
+
+/// The `Undo` of an embedded `Announce` naming the boosted status: the
+/// reblog-row-withdrawal of `POST …/unreblog`, tolerant of a pair with
+/// nothing to take back.
+async fn undo_announce_of(state: &AppState, auth: &AuthUser, reference: &str) -> AppResult<()> {
+    let row = status_by_reference(state, reference)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if let Some(tombstone) =
+        status::remove_reblog(&state.db, auth.0.id, action_target_id(&row)).await?
+    {
+        notify::on_reblog(state, &tombstone, false).await;
+    }
+    Ok(())
+}
+
+/// The `Undo` of an embedded `Block` naming its target actor.
+async fn undo_block_of(state: &AppState, auth: &AuthUser, reference: &str) -> AppResult<()> {
+    let target = stored_actor(state, reference).await?;
+    if let Some(removed) = block::unblock(&state.db, &auth.0, &target).await? {
+        after_block_changed(state, &removed, false);
+    }
+    Ok(())
+}
+
+/// `GET /api/ap/whoami` — the authenticated user's own actor document:
+/// Pleroma's `whoami` rendering `user.json` for the token's user, the
+/// very bytes [`get_actor`] serves a federation fetch. The gate is a
+/// bearer token granting `read`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `read` check.
+async fn whoami(State(state): State<AppState>, auth: AuthUser) -> AppResult<Response> {
+    auth.require(READ)?;
+    Ok(document_response(&actor_json(&auth.0, &state.config)))
+}
+
+/// `POST /api/ap/upload_media` — the C2S media upload, Pleroma's
+/// `upload_media`: the very processing `POST /api/v1/media` runs
+/// ([`store_upload`]), answered — as Pleroma does, and the ticket fixes
+/// it — `200` with the stored row as an `ActivityStreams` `Document`. The
+/// `id` it carries is the media id, which is what a posted `Create` names
+/// in its `attachment` to claim the upload.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:media` check; whatever [`store_upload`] refuses — the
+/// 413 over the upload limit, the 422 for a missing, blank or
+/// undetectable file — and its storage and database failures.
+async fn ap_upload_media(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    form: MultipartForm<UploadParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_MEDIA)?;
+    let row = store_upload(&state, auth.0.id, form).await?;
+    Ok(Json(document_json(&row)))
+}
+
+/// The stored media row as its `ActivityStreams` `Document`: Pleroma's
+/// object shape — `url` a one-entry `Link` array carrying the file's type
+/// and address, `name` the alt text (empty when it carries none), the
+/// `mediaType` beside it and the `blurhash` when the analysis computed
+/// one — with the `id` a client quotes from a create's attachment: the
+/// media id itself, decision 4's hyphenated text.
+fn document_json(row: &media_attachment::MediaAttachment) -> Value {
+    let mut fields = vec![
+        ("type", json!("Document")),
+        (
+            "url",
+            json!([
+                { "type": "Link", "mediaType": &row.content_type, "href": &row.url },
+            ]),
+        ),
+        ("name", json!(row.description.clone().unwrap_or_default())),
+        ("mediaType", json!(&row.content_type)),
+    ];
+    if let Some(blurhash) = &row.blurhash {
+        fields.push(("blurhash", json!(blurhash)));
+    }
+    fields.push(("id", json!(row.id)));
+    Value::Object(
+        fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    )
+}
+
+/// The single reference an interaction activity's `object` carries — a
+/// bare id string or an embedded document's own — or the shared 404 for
+/// an activity that names nothing: there is no object to act on.
+fn activity_reference(activity: &Value) -> AppResult<String> {
+    activity
+        .get("object")
+        .and_then(ap_json::value_or_id)
+        .ok_or(AppError::NotFound)
+}
+
+/// The live status a reference names: text that parses as an id reads by
+/// primary key, anything else as the object's `uri` — the two forms an
+/// `ActivityPub` client may know a status by (`{BASE_URL}/objects/{uuid}`
+/// included, which is what a `Like`'s `object` and a note's `inReplyTo`
+/// carry). Tombstones and unknown references answer `None`, and the
+/// caller turns that into the 404.
+async fn status_by_reference(state: &AppState, reference: &str) -> AppResult<Option<Status>> {
+    match parse_id(reference) {
+        Some(id) => status::get_by_id(&state.db, id).await,
+        None => status::get_by_uri(&state.db, reference).await,
+    }
+}
+
+/// The stored, live account an actor reference names — the object of a
+/// `Follow` or a `Block` (remote mirrors included; an unseen remote actor
+/// is this endpoint's 404, and a deactivated one hides behind it, like
+/// [`crate::api::accounts`]'s follow target gate).
+async fn stored_actor(state: &AppState, reference: &str) -> AppResult<User> {
+    user::get_by_ap_id(&state.db, reference)
+        .await?
+        .filter(|found| found.is_active.get())
+        .ok_or(AppError::NotFound)
+}
+
+/// The row of a followed or blocked account a relationship names: the
+/// pair gate read it live before the write, so its absence means the
+/// account row itself is gone underneath the relationship — the 404.
+async fn user_by_id(state: &AppState, id: Uuid) -> AppResult<User> {
+    user::get_by_id(&state.db, id)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+/// The status an interaction activity points at, as its actor may see it:
+/// the same gate [`crate::api::helpers::status_for_viewer_or_404`] is for
+/// the Mastodon routes — a live row named by id or object `uri`, visible
+/// to the caller, or the one 404 that never reveals a private post.
+async fn interactable_status(
+    state: &AppState,
+    auth: &AuthUser,
+    activity: &Value,
+) -> AppResult<Status> {
+    let reference = activity_reference(activity)?;
+    let row = status_by_reference(state, &reference)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if status_visibility::can_view(&state.db, &row, Some(&auth.0)).await? {
+        Ok(row)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+/// The status a boost lands on: `row` itself, or its original when the
+/// client named a reblog row — nobody boosts a boost, the same fold
+/// [`crate::api::statuses`]'s reblog route applies.
+async fn reblog_target(state: &AppState, row: &Status) -> AppResult<Status> {
+    match row.reblog_of_id {
+        None => Ok(row.clone()),
+        Some(original_id) => status::get_by_id(&state.db, original_id)
+            .await?
+            .ok_or(AppError::NotFound),
+    }
+}
+
+/// The activity id a relationship row answers in `Location`: its own
+/// `ap_id`, which [`follow::follow`], [`favourite::favourite`] and
+/// [`block::block`] mint for every local maker (decision 6) — and a
+/// freshly minted one for the row that somehow lacks it, so no arm has a
+/// `None` to explain away.
+fn row_activity_id(config: &Config, ap_id: Option<&str>) -> String {
+    ap_id.map_or_else(|| new_activity_id(config), str::to_owned)
+}
+
+/// A freshly minted local activity id, `{BASE_URL}/activities/{uuid}`
+/// (decision 6): the answer's `Location` for the writes that retire a
+/// fact instead of leaving a row behind — the `Delete` and the `Undo`s.
+fn new_activity_id(config: &Config) -> String {
+    format!("{}/activities/{}", config.base_url, new_id())
+}
+
 /// Whether `headers` name an `ActivityPub` media type in `Accept`. An
 /// absent header is not one: a client that states nothing gets the
 /// non-`ActivityPub` answer. The comparison is case-insensitive, as the
@@ -812,6 +1582,220 @@ mod tests {
             RATE_LIMIT_BUCKET, "ap_routes",
             "Pleroma's bucket name, off by default there and waiting for \
              this server's first rate limiter"
+        );
+    }
+
+    /// The audience rule of the C2S create: only values the visibility
+    /// parser can read a recipient out of count as an audience.
+    #[test]
+    fn an_audience_names_nobody_when_it_carries_no_reference() {
+        for empty in [Value::Null, json!([]), json!("")] {
+            assert!(is_empty_audience(&empty), "`{empty}` addresses nobody");
+        }
+        for filled in [
+            json!("https://test.example/users/bob"),
+            json!(["https://test.example/users/bob"]),
+            json!([{"id": "https://test.example/users/bob"}]),
+        ] {
+            assert!(
+                !is_empty_audience(&filled),
+                "`{filled}` names at least one recipient"
+            );
+        }
+    }
+
+    /// The create's audience is the note's own when it carries one and the
+    /// enclosing activity's otherwise — the two places C2S clients write
+    /// `to`/`cc`.
+    #[test]
+    fn the_addressing_falls_back_from_the_object_to_the_activity() {
+        let activity = json!({
+            "type": "Create",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "cc": ["https://test.example/users/alice/followers"],
+        });
+        let own = json!({ "type": "Note", "to": ["https://test.example/users/bob"] });
+        let merged = create_addressing(&own, &activity);
+        assert_eq!(
+            merged["to"],
+            json!(["https://test.example/users/bob"]),
+            "the object's own audience wins"
+        );
+        assert_eq!(
+            merged["cc"],
+            json!(["https://test.example/users/alice/followers"]),
+            "and each half falls back on its own"
+        );
+
+        let empty = json!({ "type": "Note", "to": [], "cc": Value::Null });
+        let echoed = create_addressing(&empty, &activity);
+        assert_eq!(
+            echoed["to"], activity["to"],
+            "an empty array is no audience: the activity's applies"
+        );
+        assert_eq!(echoed["cc"], activity["cc"], "and so is a null one");
+
+        let naked = json!({ "type": "Note" });
+        let bare = create_addressing(&naked, &json!({"type": "Create"}));
+        assert_eq!(
+            bare,
+            json!({ "to": [], "cc": [] }),
+            "an activity that addresses nobody reads as addressing nobody"
+        );
+    }
+
+    /// The attachment references a posted create may carry — the bare
+    /// upload id or a URL ending in it — all read as the ids the create's
+    /// `media_ids` wants, in submission order.
+    #[test]
+    fn attachment_references_read_as_upload_ids_in_order() {
+        let object = json!({
+            "type": "Note",
+            "attachment": [
+                {"type": "Document", "id": "01934567-89ab-7cde-f012-3456789abcde"},
+                {"id": "https://test.example/api/v1/media/01934567-89ab-7cde-f012-4456789abcde"},
+                "01934567-89ab-7cde-f012-5456789abcde",
+                {"type": "Document"},
+                {"name": "no reference at all"},
+            ],
+        });
+        assert_eq!(
+            attachment_ids(&object),
+            [
+                "01934567-89ab-7cde-f012-3456789abcde",
+                "01934567-89ab-7cde-f012-4456789abcde",
+                "01934567-89ab-7cde-f012-5456789abcde",
+            ],
+            "ids bare and as the last path segment; reference-less entries drop out"
+        );
+        assert!(
+            attachment_ids(&json!({"type": "Note"})).is_empty(),
+            "a note with no attachments claims no uploads"
+        );
+    }
+
+    /// A posted `Create` folds only a `Note` object: every other shape is
+    /// the 400 `Unsupported activity type`.
+    #[test]
+    fn only_a_note_document_is_a_creatable_object() {
+        for object in [
+            json!({"type": "Note", "content": "hi"}),
+            json!({"type": ["Note", "Article"], "content": "hi"}),
+        ] {
+            let activity = json!({"type": "Create", "object": object});
+            let note = note_object(&activity).expect("`Note` is the supported object type");
+            assert_eq!(
+                note["content"], "hi",
+                "and it is the object that comes back"
+            );
+        }
+        for activity in [
+            json!({"type": "Create"}),
+            json!({"type": "Create", "object": "https://test.example/objects/1"}),
+            json!({"type": "Create", "object": {"type": "Question"}}),
+            json!({"type": "Create", "object": {"content": "no type"}}),
+            json!({"type": "Create", "object": Value::Null}),
+        ] {
+            let err = note_object(&activity)
+                .expect_err("anything but an embedded Note is not a creatable object");
+            assert_eq!(
+                err.to_string(),
+                UNSUPPORTED_ACTIVITY_TYPE,
+                "and it is refused as the unsupported shape it is"
+            );
+        }
+    }
+
+    /// A media row, `document_json` renders twice over: `url` a one-entry
+    /// `Link` array, `name` the alt text, `mediaType` beside it,
+    /// `blurhash` only when there is one, and the media `id` for the
+    /// create to quote.
+    #[test]
+    fn the_upload_document_is_the_c2s_attachment_shape() {
+        let row = media_row(Some("a gradient"), Some("UBLF5j00Rj"));
+        let document = document_json(&row);
+        assert_eq!(document["type"], "Document", "the object type");
+        assert_eq!(
+            document["id"], "01934567-89ab-7cde-f012-3456789abcde",
+            "the media id the create names in its attachment"
+        );
+        assert_eq!(
+            document["url"],
+            json!([{
+                "type": "Link",
+                "mediaType": "image/png",
+                "href": "https://test.example/media/01934567/cat.png",
+            }]),
+            "the Link Pleroma's upload object carries"
+        );
+        assert_eq!(document["name"], "a gradient", "the alt text");
+        assert_eq!(document["mediaType"], "image/png", "the file type");
+        assert_eq!(document["blurhash"], "UBLF5j00Rj", "the computed hash");
+
+        let bare = media_row(None, None);
+        let undecorated = document_json(&bare);
+        assert_eq!(undecorated["name"], "", "no alt text is the empty name");
+        assert!(
+            undecorated.get("blurhash").is_none(),
+            "and an unhashed upload carries no blurhash key at all"
+        );
+    }
+
+    /// The media row `document_json` renders, with only the fields the
+    /// `Document` reads set.
+    fn media_row(
+        description: Option<&str>,
+        blurhash: Option<&str>,
+    ) -> media_attachment::MediaAttachment {
+        media_attachment::MediaAttachment {
+            id: Uuid::parse_str("01934567-89ab-7cde-f012-3456789abcde").unwrap(),
+            user_id: None,
+            status_id: None,
+            position: 0,
+            storage_key: None,
+            remote_url: None,
+            url: "https://test.example/media/01934567/cat.png".to_owned(),
+            preview_url: None,
+            content_type: "image/png".to_owned(),
+            description: description.map(str::to_owned),
+            blurhash: blurhash.map(str::to_owned),
+            width: None,
+            height: None,
+            preview_width: None,
+            preview_height: None,
+            duration: None,
+            focus_x: None,
+            focus_y: None,
+            file_size: None,
+            sensitive_hint: false,
+            inserted_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The fresh activity id the withdrawals answer in `Location`:
+    /// decision 6's local activity address, and `row_activity_id` keeps a
+    /// row's own id when it has one.
+    #[test]
+    fn withdrawal_locations_are_fresh_activity_ids() {
+        let config = Config::for_tests();
+        let id = new_activity_id(&config);
+        let tail = id
+            .strip_prefix("https://test.example/activities/")
+            .expect("a local activity id under the instance base URL");
+        assert!(
+            parse_id(tail).is_some(),
+            "and the tail is the minted id itself: {id}"
+        );
+        assert_eq!(
+            row_activity_id(&config, Some("https://peer.example/activities/7")),
+            "https://peer.example/activities/7",
+            "a row that carries an activity id is answered with it"
+        );
+        let minted = row_activity_id(&config, None);
+        assert!(
+            minted.starts_with("https://test.example/activities/"),
+            "and one that does not falls back to a fresh id: {minted}"
         );
     }
 }

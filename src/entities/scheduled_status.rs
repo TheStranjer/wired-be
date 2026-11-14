@@ -168,8 +168,7 @@ fn stored_media_ids(stored: &Value) -> Vec<String> {
     stored
         .get("media_ids")
         .and_then(Value::as_array)
-        .map(|ids| ids.iter().map(media_id_text).collect())
-        .unwrap_or_default()
+        .map_or_else(Vec::new, |ids| ids.iter().map(media_id_text).collect())
 }
 
 /// One stored `media_ids` element as text: a string passes through
