@@ -364,10 +364,12 @@ async fn assert_fired_and_visible(
 /// posted, backdate the one fire, drain the queues through the harness,
 /// and read the published status back through HTTP.
 ///
-/// The drain counts two: the backdated [`KIND_PUBLISH`] fire and the
+/// The drain counts three: the backdated [`KIND_PUBLISH`] fire, the
 /// `rich_media.fetch` job the fired create queues for its own status (the
-/// post carries no page link, so that job completes as a no-op). Both
-/// reach a terminal state, leaving the queue settled.
+/// post carries no page link, so that job completes as a no-op), and the
+/// `federator.publish` job the create's note-federation hook queues —
+/// which fans out to nothing here, bob being local. All three reach a
+/// terminal state, leaving the queue settled.
 #[tokio::test]
 async fn a_scheduled_post_publishes_when_the_queue_drains() {
     let db = common::test_db().await;
@@ -390,13 +392,13 @@ async fn a_scheduled_post_publishes_when_the_queue_drains() {
     backdate_publish_jobs(&pool).await;
     assert_eq!(
         common::run_all_jobs(&state).await,
-        2,
-        "the drain ran the fire and the fired create's card fetch"
+        3,
+        "the drain ran the fire, the fired create's card fetch and its note announcement"
     );
     assert_eq!(
         unsettled_jobs(&pool).await,
         0,
-        "the queue is settled: both jobs reached a terminal state"
+        "the queue is settled: all three jobs reached a terminal state"
     );
     assert_eq!(status_count(&pool).await, 1, "the fire wrote one status");
 

@@ -71,7 +71,22 @@
 //!   object}`, because Mastodon matches the answer by what it carries rather
 //!   than by an id it would have to fetch, and both answers go to the
 //!   follower's inbox alone — `only_to` is the follower, so the fan-out never
-//!   touches the followee's other followers.
+//!   touches the followee's other followers;
+//! - [`after_follow_changed`]: the outbound side of the follow write itself
+//!   — a local follower's `Follow` of a REMOTE account, under the row's own
+//!   stored `ap_id` (Pleroma's `ActivityPub.follow`), and, when the
+//!   relationship is withdrawn, the `Undo` embedding that same document
+//!   under a fresh id (`ActivityPub.unfollow`). A re-follow of an open pair
+//!   restates the same activity id, so the per-inbox delivery dedup keeps
+//!   the handshake a single sending; a LOCAL followee is settled in the
+//!   database and hears nothing;
+//! - [`after_follow_request_resolved`]: the follow-request endpoint's
+//!   landing point for the answers above — [`accept_follow`] for an
+//!   authorization, [`reject_follow`] for a refusal, run only for a REMOTE
+//!   requester over the delivered activity's stored id;
+//! - [`after_follower_removed`]: the `Reject` of a forced removal —
+//!   `remove_from_followers` telling the dropped REMOTE follower that their
+//!   `Follow` no longer stands, Pleroma's `User.remove_follower` answer.
 //!
 //! The interaction documents come from the [`activities`] builders under
 //! the addressing the acted-on status earns: the author stands in `to`,
@@ -88,10 +103,14 @@
 //! jobs when the worker runs it), and returns. Failures to enqueue are
 //! logged, never propagated: the user-visible write has already committed,
 //! and a client that got its 200 must not see an `ActivityPub` problem. The
-//! follow answers are the deliberate exception: they run inside a queue job
-//! already (the inbound dispatcher's), so they call
-//! [`publish`](crate::federation::publisher::publish) directly and hand
-//! their failure back to the dispatcher's retry rather than swallow it.
+//! follow activities are the deliberate exception: the local side of a
+//! follow pair announces itself with
+//! [`publish`](crate::federation::publisher::publish) directly, `only_to`
+//! naming the one remote actor — there is no follower expansion to defer,
+//! so the request pays for an address lookup and a job insert, and the
+//! network stays the delivery worker's work either way. The inbound
+//! dispatcher's answers hand their failure back to its retry; the endpoint
+//! hooks run the same calls fire-and-forget and log theirs.
 //!
 //! [`activities`]: crate::federation::activities
 
@@ -105,7 +124,8 @@ use crate::{
         activities::{
             AnsweredActivity, EmojiReactContext, FlagContext, ObjectActivityContext,
             TargetedActivityContext, accept_json, activity_id, add_json, announce_json, block_json,
-            emoji_react_json, flag_json, like_json, move_json, reject_json, remove_json, undo_json,
+            emoji_react_json, flag_json, follow_json, like_json, move_json, reject_json,
+            remove_json, undo_json,
         },
         actor::actor_json,
         note,
@@ -115,7 +135,7 @@ use crate::{
         block::Block,
         emoji_reaction::EmojiReaction,
         favourite::Favourite,
-        follow,
+        follow::{self, Follow},
         pinned_status::PinnedStatus,
         report::{self, Report as ReportRow},
         status::{self, Status, Visibility},
@@ -298,6 +318,40 @@ async fn queue_activity(state: &AppState, actor: &User, document: &Value, what: 
     match publisher::publish_in_background(state, actor.id, document, &[], None).await {
         Ok(()) => debug!(actor = %actor.ap_id, "queued {what} federation"),
         Err(err) => warn!(%err, actor = %actor.ap_id, "could not queue {what} federation"),
+    }
+}
+
+/// Hand one built activity to the publisher with the recipient set fixed to
+/// `recipient_ap_id` alone: [`publish`] resolves that one address to the
+/// peer's personal inbox and queues the delivery, so nothing fans out
+/// beyond the actor the activity is about. As every hook here a failed
+/// fan-out is logged, never returned: the client's write already stands.
+///
+/// [`publish`]: crate::federation::publisher::publish
+async fn publish_only_to(
+    state: &AppState,
+    actor: &User,
+    recipient_ap_id: &str,
+    document: &Value,
+    what: &str,
+) {
+    let opts = PublishOpts {
+        extra_inboxes: Vec::new(),
+        only_to: Some(vec![recipient_ap_id.to_owned()]),
+    };
+    match publisher::publish(state, actor, document, opts).await {
+        Ok(count) => debug!(
+            actor = %actor.ap_id,
+            recipient = recipient_ap_id,
+            count,
+            "queued {what} federation"
+        ),
+        Err(err) => warn!(
+            %err,
+            actor = %actor.ap_id,
+            recipient = recipient_ap_id,
+            "could not queue {what} federation"
+        ),
     }
 }
 
@@ -1163,6 +1217,197 @@ async fn answer_follow(
     publisher::publish(state, local_followee, &document, opts).await
 }
 
+/// Announce the follow or unfollow the caller just performed.
+///
+/// Only a REMOTE followee is worth announcing (a local one is settled in
+/// our own database) and only a local follower's activity may be signed.
+/// `following` selects the direction: the row's own `Follow` —
+/// [`follow_json`] under the stored `ap_id`, the follower as `actor`, the
+/// followee as `object` and as the only `to` address — or, for the
+/// withdrawal, the `Undo` wrapping that very document under a fresh
+/// `{BASE_URL}/activities/{uuid}` id (decision 6), Pleroma's
+/// `ActivityPub.follow`/`unfollow` pair. [`publish`] is then run with
+/// `only_to` naming the followee, so the activity lands in their personal
+/// inbox alone and the fan-out never touches the follower's own remote
+/// followers.
+///
+/// A restated follow — the endpoint's idempotent repeat of an open pair, an
+/// import re-run — re-sends the same activity id, and the per-activity,
+/// per-inbox deduplication of the delivery queue keeps the restatement a
+/// single sending. A pair with no row (a withdrawal that found nothing to
+/// take back) and a row with no `ap_id` announce nothing.
+///
+/// [`publish`]: crate::federation::publisher::publish
+pub async fn after_follow_changed(
+    state: &AppState,
+    follower: &User,
+    target: &User,
+    follow: Option<&Follow>,
+    following: bool,
+) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    if target.local.get() || !follower.local.get() {
+        return; // a local pair is settled in the database; only our actors sign
+    }
+    let Some(document) = follow_announcement(state, follower, target, follow, following) else {
+        return; // no row, or an id-less one: there is nothing to announce
+    };
+    publish_only_to(state, follower, &target.ap_id, &document, "follow").await;
+}
+
+/// The document [`after_follow_changed`] announces: the row's own `Follow`
+/// when the write opened (or restated) the relationship, and the `Undo`
+/// wrapping that document — a fresh id, the withdrawal's own moment — when
+/// it took the follow back. `None` when the write left no row, or the row
+/// carries no id to stand behind the document.
+fn follow_announcement(
+    state: &AppState,
+    follower: &User,
+    target: &User,
+    follow: Option<&Follow>,
+    following: bool,
+) -> Option<Value> {
+    let row = follow?;
+    let document = follow_document(state, row, follower, target)?;
+    if following {
+        return Some(document);
+    }
+    let now = chrono::Utc::now();
+    let to = [target.ap_id.as_str()];
+    Some(undo_json(&AnsweredActivity {
+        config: &state.config,
+        id: new_id(),
+        actor_ap_id: &follower.ap_id,
+        to: &to,
+        cc: &[],
+        answered: &document,
+        published: &now,
+    }))
+}
+
+/// The `Follow` behind the relationship row `row`: [`follow_json`] with its
+/// `id` replaced by the stored string — the builder mints ids from a fresh
+/// uuid and the row's `ap_id` is its own (decision 6), so only the stored
+/// text names the activity the peer was sent and must hear withdrawn.
+/// `None` when the row carries no id at all (a mirrored follow, which this
+/// instance does not own).
+fn follow_document(
+    state: &AppState,
+    row: &Follow,
+    follower: &User,
+    target: &User,
+) -> Option<Value> {
+    let stored_id = row.ap_id.as_deref()?;
+    let mut document = follow_json(
+        &state.config,
+        row.id,
+        &follower.ap_id,
+        &target.ap_id,
+        &row.inserted_at,
+    );
+    if let Some(fields) = document.as_object_mut() {
+        let _previous = fields.insert("id".to_owned(), json!(stored_id));
+    }
+    Some(document)
+}
+
+/// Answer the follow request `resolver` just resolved when the requester
+/// lives on another instance.
+///
+/// An authorization is an [`accept_follow`], a refusal a [`reject_follow`],
+/// both answering the delivered `Follow` by the id the request row stores
+/// and travelling to the follower's inbox alone. A local requester's answer
+/// is the row itself (their timeline is the delivery), and a request that
+/// carries no delivered activity id has nothing to answer by. As every
+/// endpoint hook here the answer is fire-and-forget: a failed fan-out
+/// arrives in the log, never in the client's response — the resolution
+/// itself already stands.
+pub async fn after_follow_request_resolved(
+    state: &AppState,
+    resolver: &User,
+    request: &Follow,
+    granted: bool,
+) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    if !resolver.local.get() {
+        return; // only our own actors answer their follow requests
+    }
+    let Some(follower) = load_user(state, request.follower_id).await else {
+        return; // a requester whose row is gone is nobody to answer
+    };
+    answer_follow_request(state, resolver, &follower, request, granted).await;
+}
+
+/// Refuse a REMOTE follower whose accepted follow of the local `target` was
+/// just forced out of the table by [`remove_follower`].
+///
+/// The document is the `Reject` [`reject_follow`] publishes for the pair,
+/// answering the delivered `Follow` by its stored id. A local follower, a
+/// gone row and an id-less request answer with silence, as in
+/// [`after_follow_request_resolved`].
+///
+/// [`remove_follower`]: crate::models::follow::remove_follower
+pub async fn after_follower_removed(state: &AppState, target: &User, removed: &Follow) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    if !target.local.get() {
+        return; // only our own actors answer their followers
+    }
+    let Some(follower) = load_user(state, removed.follower_id).await else {
+        return; // a follower whose row is gone is nobody to refuse
+    };
+    answer_follow_request(state, target, &follower, removed, false).await;
+}
+
+/// The shared body of [`after_follow_request_resolved`] and
+/// [`after_follower_removed`]: the REMOTE gate on the requester, the
+/// delivered activity's stored id, and the answer [`accept_follow`] /
+/// [`reject_follow`] publish to the follower's inbox alone — logged at both
+/// outcomes, since the endpoint's write never waits on the wire.
+async fn answer_follow_request(
+    state: &AppState,
+    target: &User,
+    follower: &User,
+    request: &Follow,
+    granted: bool,
+) {
+    if follower.local.get() {
+        return; // a local pair is settled in the database
+    }
+    let Some(follow_id) = request.ap_id.as_deref() else {
+        return; // no delivered activity to answer by its id
+    };
+    let answer = FollowAnswer {
+        follow_id,
+        follower_ap_id: &follower.ap_id,
+    };
+    let outcome = if granted {
+        accept_follow(state, target, &answer).await
+    } else {
+        reject_follow(state, target, &answer).await
+    };
+    match outcome {
+        Ok(count) => debug!(
+            actor = %target.ap_id,
+            follower = %follower.ap_id,
+            granted,
+            count,
+            "queued follow-request answer"
+        ),
+        Err(err) => warn!(
+            %err,
+            actor = %target.ap_id,
+            follower = %follower.ap_id,
+            "could not queue follow-request answer"
+        ),
+    }
+}
+
 /// Reads one user row for the hooks, answering `None` for a gone row or a
 /// database that will not answer (a federation miss, never a failure).
 async fn load_user(state: &AppState, id: Uuid) -> Option<User> {
@@ -1437,10 +1682,23 @@ mod tests {
         after_account_moved(&state, &alice, &bob).await;
         after_pin_changed(&state, &pin, true).await;
         after_report_created(&state, &report_row).await;
+        let stranger = remote(&pool, "stranger").await;
+        let following = follow::follow(&pool, TEST_BASE_URL, &alice, &stranger)
+            .await
+            .expect("the follow fixture writes");
+        after_follow_changed(&state, &alice, &stranger, Some(&following), true).await;
+        after_follow_changed(&state, &alice, &stranger, Some(&following), false).await;
+        after_follow_request_resolved(&state, &alice, &following, true).await;
+        after_follower_removed(&state, &alice, &following).await;
 
         assert!(
             publish_jobs(&pool).await.is_empty(),
             "an instance that does not federate queues nothing"
+        );
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "not even a follow-side delivery job"
         );
     }
 
@@ -3417,5 +3675,399 @@ mod tests {
             0,
             "neither a mirror's note nor a boost row is announced as a note"
         );
+    }
+
+    // ───────────────  the follow-write hooks  ───────────────
+
+    /// The args of every queued `federator.deliver` job, in insertion order.
+    async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
+        sqlx::query_as::<_, (Value,)>(
+            "SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id",
+        )
+        .bind(crate::federation::delivery::KIND_DELIVER)
+        .fetch_all(pool)
+        .await
+        .expect("the delivery jobs read")
+        .into_iter()
+        .map(|(args,)| args)
+        .collect()
+    }
+
+    /// `follower`'s follow of `target` recorded through the model, asserted
+    /// to carry what a local follower's row always does: a freshly minted
+    /// `ap_id` (decision 6) — the id the announcement must reuse.
+    async fn recorded_follow(pool: &PgPool, follower: &User, target: &User) -> Follow {
+        let row = follow::follow(pool, TEST_BASE_URL, follower, target)
+            .await
+            .expect("the follow fixture writes");
+        assert!(
+            row.ap_id.is_some(),
+            "a local follower's row carries a minted activity id"
+        );
+        row
+    }
+
+    /// Records the REMOTE requester `follower`'s follow of the local
+    /// `target` and lands the delivered activity's id on it — the shape the
+    /// inbound fold stores for a peer's `Follow`, which the answers name.
+    async fn remote_request(pool: &PgPool, follower: &User, target: &User, n: &str) -> Follow {
+        let mut row = follow::follow(pool, TEST_BASE_URL, follower, target)
+            .await
+            .expect("the request fixture writes");
+        let delivered = format!("https://remote.example/activities/{n}");
+        follow::set_ap_id(pool, row.id, &delivered)
+            .await
+            .expect("the delivered id lands");
+        row.ap_id = Some(delivered);
+        row
+    }
+
+    /// The `{BASE_URL}/activities/{uuid}` shape an answer or a withdrawal
+    /// must carry as its own id.
+    fn assert_fresh_activity_id(id: &str) {
+        assert!(
+            id.starts_with(&format!("{TEST_BASE_URL}/activities/")),
+            "the activity carries this instance's own id shape: {id}"
+        );
+        let _uuid = Uuid::parse_str(id.rsplit('/').next().unwrap_or_default())
+            .expect("the id ends in a uuid");
+    }
+
+    /// Following a REMOTE account queues the row's `Follow` straight to the
+    /// followee's personal inbox: the stored `ap_id` as the activity id,
+    /// the follower as actor, the followee as `object` and as the only
+    /// address — nobody else, not even the follower's own followers.
+    #[tokio::test]
+    async fn following_a_remote_account_delivers_the_stored_follow() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let fan = remote(&pool, "fan").await;
+        let row = recorded_follow(&pool, &alice, &fan).await;
+        let state = app_state(&pool);
+
+        after_follow_changed(&state, &alice, &fan, Some(&row), true).await;
+
+        let jobs = delivery_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "the request is announced once");
+        assert!(
+            publish_jobs(&pool).await.is_empty(),
+            "a one-recipient follow ships without a fan-out job"
+        );
+        assert_eq!(
+            jobs[0]["inbox"], "https://remote.example/users/fan/inbox",
+            "the followee's personal inbox is the sole target"
+        );
+        assert_eq!(
+            jobs[0]["actor_id"],
+            alice.id.to_string(),
+            "signed as the follower"
+        );
+        let body = &jobs[0]["body"];
+        assert_eq!(body["type"], "Follow");
+        assert_eq!(
+            body["id"],
+            row.ap_id.expect("a local follower's row carries its id"),
+            "the activity id is the stored follows.ap_id"
+        );
+        assert_eq!(body["actor"], alice.ap_id);
+        assert_eq!(body["object"], fan.ap_id);
+        assert_eq!(body["to"], json!([fan.ap_id]));
+        assert_eq!(body["cc"], json!([]));
+        assert_eq!(body["published"], mastodon_time(&row.inserted_at));
+    }
+
+    /// Unfollowing delivers the `Undo` that wraps the very `Follow` the row
+    /// stands for: the wrapper's own fresh id outside, the stored id inside,
+    /// and the same single addressee.
+    #[tokio::test]
+    async fn unfollowing_a_remote_account_delivers_the_undo() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let fan = remote(&pool, "fan").await;
+        let row = recorded_follow(&pool, &alice, &fan).await;
+        let stored_id = row
+            .ap_id
+            .clone()
+            .expect("a local follower's row carries its id");
+        let _withdrawn = follow::unfollow(&pool, &alice, &fan)
+            .await
+            .expect("the withdrawal runs");
+        let state = app_state(&pool);
+
+        after_follow_changed(&state, &alice, &fan, Some(&row), false).await;
+
+        let jobs = delivery_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "the withdrawal is announced once");
+        assert_eq!(
+            jobs[0]["inbox"], "https://remote.example/users/fan/inbox",
+            "the withdrawn follow's addressee hears the taking-back"
+        );
+        let body = &jobs[0]["body"];
+        assert_eq!(body["type"], "Undo");
+        assert_eq!(body["actor"], alice.ap_id);
+        assert_eq!(body["to"], json!([fan.ap_id]));
+        assert_eq!(body["cc"], json!([]));
+        let id = body["id"].as_str().expect("the undo has an id");
+        assert_fresh_activity_id(id);
+        assert_ne!(
+            id,
+            stored_id.as_str(),
+            "the wrapper stands under a fresh id"
+        );
+        assert_eq!(body["object"]["type"], "Follow");
+        assert_eq!(
+            body["object"]["id"], stored_id,
+            "the embedded follow keeps the row's stored id"
+        );
+        assert_eq!(body["object"]["actor"], alice.ap_id);
+        assert_eq!(body["object"]["object"], fan.ap_id);
+    }
+
+    /// A local followee, a mirrored follower and a write that left no row
+    /// behind are the documented silences: no delivery, no fan-out, nothing.
+    #[tokio::test]
+    async fn follow_writes_that_are_not_ours_to_announce_publish_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let neighbour = local(&pool, "neighbour").await;
+        let fan = remote(&pool, "fan").await;
+        let other = remote(&pool, "other").await;
+        let open_pair = recorded_follow(&pool, &alice, &neighbour).await;
+        let mirrored = follow::follow(&pool, TEST_BASE_URL, &fan, &other)
+            .await
+            .expect("the mirror's follow writes");
+        let state = app_state(&pool);
+
+        after_follow_changed(&state, &alice, &neighbour, Some(&open_pair), true).await;
+        after_follow_changed(&state, &alice, &neighbour, Some(&open_pair), false).await;
+        after_follow_changed(&state, &fan, &other, Some(&mirrored), true).await;
+        after_follow_changed(&state, &alice, &fan, None, false).await;
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "a local pair, a mirror's follow and an empty withdrawal queue nothing"
+        );
+    }
+
+    /// A follow row with no `ap_id` has no document to stand behind — both
+    /// arms fall silent, exactly as the block hook's twin rule does.
+    #[tokio::test]
+    async fn a_follow_without_a_stored_id_publishes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let fan = remote(&pool, "fan").await;
+        let mut row = recorded_follow(&pool, &alice, &fan).await;
+        row.ap_id = None;
+        let state = app_state(&pool);
+
+        after_follow_changed(&state, &alice, &fan, Some(&row), true).await;
+        after_follow_changed(&state, &alice, &fan, Some(&row), false).await;
+
+        assert_eq!(job_count(&pool).await, 0, "an id-less row has no document");
+    }
+
+    /// The endpoint's idempotent repeat — a second follow of the open pair —
+    /// restates the same activity, and the per-inbox delivery dedup is what
+    /// keeps the restated request a single sending.
+    #[tokio::test]
+    async fn a_repeated_follow_restates_one_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let fan = remote(&pool, "fan").await;
+        let row = recorded_follow(&pool, &alice, &fan).await;
+        let state = app_state(&pool);
+
+        after_follow_changed(&state, &alice, &fan, Some(&row), true).await;
+        after_follow_changed(&state, &alice, &fan, Some(&row), true).await;
+
+        let jobs = delivery_jobs(&pool).await;
+        assert_eq!(
+            jobs.len(),
+            1,
+            "the re-send collapses into the live delivery"
+        );
+        assert_eq!(
+            jobs[0]["body"]["id"],
+            row.ap_id.expect("a local follower's row carries its id"),
+            "and it is the row's own activity, not a re-mint"
+        );
+    }
+
+    /// Authorizing a REMOTE requester's follow delivers the `Accept` to
+    /// their personal inbox alone: the followee acts, the delivered
+    /// `Follow` rides inside by its id — the same answer the inbound
+    /// handler sends on the spot for an unlocked account.
+    #[tokio::test]
+    async fn authorizing_a_remote_request_delivers_the_accept() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let bob = remote(&pool, "bob").await;
+        let row = remote_request(&pool, &bob, &carol, "fo-ask-1").await;
+        let state = app_state(&pool);
+
+        after_follow_request_resolved(&state, &carol, &row, true).await;
+
+        let jobs = delivery_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "the grant answers once");
+        assert_eq!(
+            jobs[0]["inbox"], "https://remote.example/users/bob/inbox",
+            "the follower's personal inbox is the sole target"
+        );
+        assert_eq!(
+            jobs[0]["actor_id"],
+            carol.id.to_string(),
+            "signed as the followee"
+        );
+        let body = &jobs[0]["body"];
+        assert_eq!(body["type"], "Accept");
+        assert_eq!(body["actor"], carol.ap_id);
+        assert_eq!(body["to"], json!([bob.ap_id]));
+        assert_fresh_activity_id(body["id"].as_str().expect("the answer has an id"));
+        assert_eq!(
+            body["object"],
+            json!({
+                "id": row.ap_id.expect("the delivered id stands"),
+                "type": "Follow",
+                "actor": bob.ap_id,
+                "object": carol.ap_id,
+            }),
+            "the answer embeds the delivered Follow, the shape peers match on"
+        );
+    }
+
+    /// Refusing a REMOTE requester is the same document under `Reject`.
+    #[tokio::test]
+    async fn rejecting_a_remote_request_delivers_the_reject() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let bob = remote(&pool, "bob").await;
+        let row = remote_request(&pool, &bob, &carol, "fo-refuse-1").await;
+        let state = app_state(&pool);
+
+        after_follow_request_resolved(&state, &carol, &row, false).await;
+
+        let jobs = delivery_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "the refusal answers once");
+        assert_eq!(jobs[0]["inbox"], "https://remote.example/users/bob/inbox");
+        let body = &jobs[0]["body"];
+        assert_eq!(body["type"], "Reject");
+        assert_eq!(body["actor"], carol.ap_id);
+        assert_eq!(body["to"], json!([bob.ap_id]));
+        assert_eq!(body["object"]["type"], "Follow");
+        assert_eq!(
+            body["object"]["id"],
+            row.ap_id.expect("the delivered id stands"),
+            "the refusal answers the same delivered activity"
+        );
+    }
+
+    /// A LOCAL requester's answer — granted or refused — moves the row and
+    /// never a wire: the timeline is the delivery. An id-less request (no
+    /// delivered activity to answer) and a resolver who is not one of our
+    /// own actors are silent too.
+    #[tokio::test]
+    async fn follow_request_answers_that_stay_local_deliver_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let local_request = follow::follow(&pool, TEST_BASE_URL, &alice, &carol)
+            .await
+            .expect("the local request writes");
+        let idless = follow::follow(&pool, TEST_BASE_URL, &bob, &carol)
+            .await
+            .expect("the remote request writes");
+        assert!(
+            idless.ap_id.is_none(),
+            "a remote follower's row starts without an id"
+        );
+        let state = app_state(&pool);
+
+        after_follow_request_resolved(&state, &carol, &local_request, true).await;
+        after_follow_request_resolved(&state, &carol, &local_request, false).await;
+        after_follow_request_resolved(&state, &carol, &idless, true).await;
+        after_follow_request_resolved(&state, &bob, &local_request, true).await;
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "no answer of these four has a remote side to reach"
+        );
+    }
+
+    /// Dropping a REMOTE follower answers their `Follow` with a `Reject`
+    /// at their personal inbox — Pleroma's `User.remove_follower` outcome,
+    /// the removed row's stored id embedded.
+    #[tokio::test]
+    async fn removing_a_remote_follower_delivers_the_reject() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let _request = remote_request(&pool, &bob, &alice, "fo-drop-1").await;
+        let removed = follow::remove_follower(&pool, alice.id, bob.id)
+            .await
+            .expect("the removal runs")
+            .expect("the follower was there");
+        let state = app_state(&pool);
+
+        after_follower_removed(&state, &alice, &removed).await;
+
+        let jobs = delivery_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "the dropped follower is answered once");
+        assert_eq!(
+            jobs[0]["inbox"], "https://remote.example/users/bob/inbox",
+            "the follower's personal inbox is the sole target"
+        );
+        assert_eq!(
+            jobs[0]["actor_id"],
+            alice.id.to_string(),
+            "signed as the followee"
+        );
+        let body = &jobs[0]["body"];
+        assert_eq!(body["type"], "Reject");
+        assert_eq!(body["actor"], alice.ap_id);
+        assert_eq!(body["to"], json!([bob.ap_id]));
+        assert_fresh_activity_id(body["id"].as_str().expect("the answer has an id"));
+        assert_eq!(
+            body["object"]["id"],
+            removed.ap_id.expect("the delivered id stands"),
+            "the Reject answers the very Follow the row stood for"
+        );
+    }
+
+    /// A LOCAL follower removed from the list is settled in the database:
+    /// the answer never reaches a wire.
+    #[tokio::test]
+    async fn removing_a_local_follower_delivers_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let row = follow::follow(&pool, TEST_BASE_URL, &bob, &alice)
+            .await
+            .expect("the local follow writes");
+        let removed = follow::remove_follower(&pool, alice.id, bob.id)
+            .await
+            .expect("the removal runs")
+            .expect("the follower was there");
+        assert_eq!(
+            row.state, removed.state,
+            "the fixture removed the accepted row"
+        );
+        let state = app_state(&pool);
+
+        after_follower_removed(&state, &alice, &removed).await;
+
+        assert_eq!(job_count(&pool).await, 0, "a local follower hears nothing");
     }
 }

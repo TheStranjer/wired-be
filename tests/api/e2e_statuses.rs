@@ -835,9 +835,11 @@ async fn a_quote_create_nests_its_original_and_counts_it_once() {
 /// while the nested `quote` follows the *original's* audience: the author
 /// and the accepted follower read the `private` original back inside it
 /// (rule 5), every other admitted viewer reads `quote: null` — the very
-/// answer of a row that quotes nothing, no id or text leaking — and no
-/// viewer's `pleroma` block carries `quote_id`, `quote_url` or
-/// `quote_visible` at all (a recorded decision).
+/// answer of a row that quotes nothing, no id or text leaking — while the
+/// entity keeps the quoting contract: top-level `quote_id` names the
+/// original to every viewer, `pleroma.quote` mirrors the nested render and
+/// `pleroma.quote_visible` is false exactly when it is null, and `pleroma`
+/// carries no `quote_id` or `quote_url` key at all (a recorded decision).
 #[tokio::test]
 async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
     let db = common::test_db().await;
@@ -854,7 +856,8 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
     let admitted = sweep(&app, &world, &shape, &OPEN).await;
     assert_eq!(admitted.len(), 7, "the open audience reads the quote");
     for (entity, who) in admitted.iter().zip(OPEN) {
-        if matches!(who, "author" | "follower") {
+        let sees = matches!(who, "author" | "follower");
+        if sees {
             assert_eq!(
                 entity["quote"]["id"], original["id"],
                 "{who}: the reachable original nests"
@@ -866,7 +869,20 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
                 "{who}: the hidden original answers like no quote at all"
             );
         }
-        for key in ["quote_id", "quote_url", "quote_visible"] {
+        assert_eq!(
+            entity["quote_id"], original["id"],
+            "{who}: quote_id names the original whatever its visibility"
+        );
+        assert_eq!(
+            entity["pleroma"]["quote_visible"],
+            json!(sees),
+            "{who}: quote_visible is false exactly when the quote is null"
+        );
+        assert_eq!(
+            entity["pleroma"]["quote"], entity["quote"],
+            "{who}: the pleroma block mirrors the nested render"
+        );
+        for key in ["quote_id", "quote_url"] {
             assert!(
                 entity["pleroma"].get(key).is_none(),
                 "{who}: no `{key}` key rides the pleroma block"

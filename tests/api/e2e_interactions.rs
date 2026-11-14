@@ -1135,8 +1135,9 @@ async fn an_expiring_status_leaves_every_surface_when_its_fire_drains() {
     backdate_expire_jobs(&pool).await;
     assert_eq!(
         common::run_all_jobs(&state).await,
-        3,
-        "the drain ran both creates' card fetches and the backdated fire"
+        6,
+        "the drain ran both creates' card fetches and note announcements, \
+         the backdated fire, and the expired post's Delete announcement"
     );
     assert_eq!(
         expire_job_states(&pool).await,
