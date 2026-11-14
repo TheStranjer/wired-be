@@ -557,7 +557,10 @@ fn field_reference(json: &Value, keys: &[&str]) -> Option<String> {
 /// The visibility from `to` and `cc`: the public recipient in `to` is
 /// public, in `cc` alone unlisted, the author's followers collection (and
 /// nobody public) private, anything else direct.
-fn parse_visibility(json: &Value, author: &User) -> Visibility {
+///
+/// `pub(crate)` because the C2S outbox in [`crate::api::activitypub`]
+/// derives a posted `Create`'s audience with exactly this rule.
+pub(crate) fn parse_visibility(json: &Value, author: &User) -> Visibility {
     let to = recipients(json, "to");
     let cc = recipients(json, "cc");
     if has_public(&to) {

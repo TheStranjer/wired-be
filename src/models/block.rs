@@ -88,6 +88,14 @@ const GET_SQL: &str = "SELECT * FROM blocks WHERE blocker_id = $1 AND blocked_id
 /// `ap_id` unique index answers the lookup directly.
 const GET_BY_AP_ID_SQL: &str = "SELECT * FROM blocks WHERE ap_id = $1";
 
+/// [`get_by_blocker_and_ap_id`]: the block of one blocker whose `Block`
+/// activity carries one id (decision 6: a local block's `ap_id` is
+/// `{BASE_URL}/activities/{uuid}`). Scoping the lookup to the blocker keeps
+/// somebody else's activity id unfindable here, so an `Undo` can only lift
+/// its own maker's block.
+const GET_BY_BLOCKER_AND_AP_ID_SQL: &str =
+    "SELECT * FROM blocks WHERE blocker_id = $1 AND ap_id = $2";
+
 /// [`set_ap_id`]: the mirror write of an inbound `Block` — the row keeps its
 /// identity, only the activity id it stands for arrives. Unknown ids match
 /// no row and change nothing.
@@ -304,6 +312,30 @@ pub async fn set_ap_id(pool: &PgPool, id: Uuid, ap_id: &str) -> AppResult<()> {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<Block>> {
     let block = sqlx::query_as::<_, Block>(GET_BY_AP_ID_SQL)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(block)
+}
+
+/// The [`Block`] of `blocker_id` whose `Block` activity carries `ap_id`,
+/// `None` when the account has no such block.
+///
+/// Scoping the lookup to the blocker is the point: somebody else quoting
+/// the id finds nothing, so a C2S `Undo` can only lift the maker's own
+/// block.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_blocker_and_ap_id(
+    pool: &PgPool,
+    blocker_id: Uuid,
+    ap_id: &str,
+) -> AppResult<Option<Block>> {
+    let block = sqlx::query_as::<_, Block>(GET_BY_BLOCKER_AND_AP_ID_SQL)
+        .bind(blocker_id)
         .bind(ap_id)
         .fetch_optional(pool)
         .await?;
@@ -1245,6 +1277,34 @@ mod tests {
             stored_block(&pool, &carol, &bob).await.ap_id,
             None,
             "and the refused write stored nothing"
+        );
+    }
+
+    /// [`get_by_blocker_and_ap_id`]: the C2S `Undo` read — the blocker's own
+    /// row answers its minted activity id, and the same id quoted by another
+    /// account (or a stranger id) finds nothing.
+    #[tokio::test]
+    async fn a_block_answers_its_maker_by_activity_id_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let carol = local_user(&pool, "carol").await;
+        let bob = local_user(&pool, "bob").await;
+        seed_block(&pool, &alice, &bob).await;
+
+        let row = stored_block(&pool, &alice, &bob).await;
+        let ap_id = row.ap_id.expect("a local block carries an activity id");
+        let found = get_by_blocker_and_ap_id(&pool, alice.id, &ap_id)
+            .await
+            .expect("the read runs")
+            .expect("the maker finds its own block");
+        assert_eq!(found.id, row.id, "and reads the row behind the id");
+        assert!(
+            get_by_blocker_and_ap_id(&pool, carol.id, &ap_id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "somebody else quoting the id names none of their own blocks"
         );
     }
 }

@@ -202,6 +202,54 @@ pub async fn unfavourite(
     Ok(removed)
 }
 
+/// The `SELECT` behind [`get`]: one account's like of one status. The C2S
+/// outbox reads a repeat `Like`'s row through it to name the existing
+/// activity in its `Location`.
+const FAVOURITE_GET_SQL: &str = "SELECT * FROM favourites WHERE user_id = $1 AND status_id = $2";
+
+/// The `SELECT` behind [`get_by_ap_id`]: the like of one account whose
+/// `Like` activity carries one id (decision 6: a local like's `ap_id` is
+/// `{BASE_URL}/activities/{uuid}`). Scoping the lookup to the favouriting
+/// account keeps somebody else's activity id unfindable here, so an
+/// `Undo` can only withdraw its own maker's like.
+const FAVOURITE_BY_AP_ID_SQL: &str = "SELECT * FROM favourites WHERE user_id = $1 AND ap_id = $2";
+
+/// The [`Favourite`] of (`user_id`, `status_id`), `None` when the pair has
+/// no like row.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get(pool: &PgPool, user_id: Uuid, status_id: Uuid) -> AppResult<Option<Favourite>> {
+    let favourite = sqlx::query_as::<_, Favourite>(FAVOURITE_GET_SQL)
+        .bind(user_id)
+        .bind(status_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(favourite)
+}
+
+/// The [`Favourite`] of `user_id` whose `Like` activity carries `ap_id`,
+/// `None` when the account has no such like.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_ap_id(
+    pool: &PgPool,
+    user_id: Uuid,
+    ap_id: &str,
+) -> AppResult<Option<Favourite>> {
+    let favourite = sqlx::query_as::<_, Favourite>(FAVOURITE_BY_AP_ID_SQL)
+        .bind(user_id)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(favourite)
+}
+
 /// The `DELETE` behind [`delete_all_for_user`]: the account's own likes.
 const DELETE_ALL_FOR_USER_SQL: &str = "DELETE FROM favourites WHERE user_id = $1";
 
@@ -827,6 +875,53 @@ mod tests {
         assert!(
             matches!(err, AppError::Database(_)),
             "the foreign key refuses, not a silent no-op: {err}"
+        );
+    }
+
+    /// The two new reads beside the write: [`get`] finds the pair's row
+    /// only once it exists, and [`get_by_ap_id`] finds it by the
+    /// `{BASE_URL}/activities/{uuid}` id [`favourite`] minted — and finds
+    /// nothing for another account quoting the same id, which is what
+    /// keeps a C2S `Undo` inside its maker's facts.
+    #[tokio::test]
+    async fn get_reads_the_pair_and_get_by_ap_id_the_activity_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let carol = user(&pool, "carol").await;
+        let status_id = post_by(&pool, "bob").await;
+
+        assert!(
+            get(&pool, alice.id, status_id)
+                .await
+                .expect("the pair read runs")
+                .is_none(),
+            "no like yet, no row"
+        );
+
+        let created = favourite(&pool, BASE, alice.id, status_id)
+            .await
+            .expect("the favourite stores")
+            .expect("the pair had not favourited yet");
+        let found = get(&pool, alice.id, status_id)
+            .await
+            .expect("the pair read runs")
+            .expect("the write left a row");
+        assert_eq!(found.id, created.id, "the pair read finds the row");
+
+        let ap_id = created.ap_id.expect("a local like carries an activity id");
+        assert!(ap_id.starts_with(&format!("{BASE}/activities/")));
+        let by_id = get_by_ap_id(&pool, alice.id, &ap_id)
+            .await
+            .expect("the activity-id read runs")
+            .expect("the id names the row");
+        assert_eq!(by_id.id, created.id, "the id read finds the same row");
+        assert!(
+            get_by_ap_id(&pool, carol.id, &ap_id)
+                .await
+                .expect("the activity-id read runs")
+                .is_none(),
+            "and another account quoting it names none of its own"
         );
     }
 }

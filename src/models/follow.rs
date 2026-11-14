@@ -777,6 +777,34 @@ pub async fn get(pool: &PgPool, follower_id: Uuid, target_id: Uuid) -> AppResult
     Ok(follow)
 }
 
+/// [`get_by_ap_id`]: the one relationship of `follower_id` whose `Follow`
+/// activity carries `ap_id` — the read the C2S outbox runs when an `Undo`
+/// names the follow activity by its id alone (decision 6: a local
+/// follower's `ap_id` is `{BASE_URL}/activities/{uuid}`). Scoping the
+/// lookup to the follower keeps somebody else's activity id unfindable
+/// here, so an `Undo` can only withdraw its own maker's follow.
+const GET_BY_AP_ID_SQL: &str = "SELECT * FROM follows WHERE follower_id = $1 AND ap_id = $2";
+
+/// The relationship of `follower_id` whose `Follow` activity carries
+/// `ap_id`, `None` when the account has no such follow.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_ap_id(
+    pool: &PgPool,
+    follower_id: Uuid,
+    ap_id: &str,
+) -> AppResult<Option<Follow>> {
+    let follow = sqlx::query_as::<_, Follow>(GET_BY_AP_ID_SQL)
+        .bind(follower_id)
+        .bind(ap_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(follow)
+}
+
 /// The ids of the users `follower_id` follows, accepted relationships only,
 /// oldest follow first (decision 4).
 ///
@@ -3604,6 +3632,48 @@ mod tests {
             fresh_user(&pool, alice.id).await.followers_count,
             0,
             "and no counter moved"
+        );
+    }
+
+    /// [`get_by_ap_id`]: the C2S `Undo` read — the follower's own
+    /// relationship answers its minted activity id, another account
+    /// quoting the same id finds nothing, and an unknown id is `None`.
+    #[tokio::test]
+    async fn a_follow_answers_its_maker_by_activity_id_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let carol = local_user(&pool, "carol").await;
+        let bob = local_user(&pool, "bob").await;
+
+        let created = follow(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("the follow stores");
+        let ap_id = created
+            .ap_id
+            .expect("a local follow carries an activity id");
+        let found = get_by_ap_id(&pool, alice.id, &ap_id)
+            .await
+            .expect("the read runs")
+            .expect("the maker finds its own follow");
+        assert_eq!(found.id, created.id, "and reads the row behind the id");
+        assert!(
+            get_by_ap_id(&pool, carol.id, &ap_id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "somebody else quoting the id names none of their own follows"
+        );
+        assert!(
+            get_by_ap_id(
+                &pool,
+                alice.id,
+                &format!("{TEST_BASE_URL}/activities/never")
+            )
+            .await
+            .expect("the read runs")
+            .is_none(),
+            "and an id no row carries answers nothing"
         );
     }
 }

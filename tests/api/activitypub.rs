@@ -1,6 +1,9 @@
 //! Tests for the `ActivityPub` routes: `GET /users/{nickname}`, the actor
 //! document, the JSON-LD schema document at
-//! `GET /schemas/litepub-0.1.jsonld`, and the three inbox `POST`s.
+//! `GET /schemas/litepub-0.1.jsonld`, the three inbox `POST`s, and the
+//! client-to-server four — `GET /users/{nickname}/inbox`,
+//! `POST /users/{nickname}/outbox`, `GET /api/ap/whoami` and
+//! `POST /api/ap/upload_media`.
 //!
 //! An `ActivityPub` client (an `Accept` naming `application/activity+json`
 //! or `application/ld+json`) gets Pleroma's `user.json` document as
@@ -28,10 +31,13 @@
 
 #![cfg(test)]
 
-use axum::{Router, http::StatusCode};
+use axum::{Router, body::Bytes, http::StatusCode};
 use chrono::Utc;
+use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use std::io::Cursor;
+use tempfile::TempDir;
 use uuid::Uuid;
 use wired_be::{
     config::Toggle,
@@ -43,7 +49,8 @@ use wired_be::{
     models::{
         instance_setting,
         job::Job,
-        user::{Flag, NewUser, User},
+        status::{self, NewStatus, Status as StoredStatus, Visibility},
+        user::{Flag, NewUser, User, followers},
     },
     services::instance_actor::ensure_instance_actor,
     util::time::mastodon_time,
@@ -978,4 +985,1366 @@ async fn set_mrf(pool: &PgPool, setting: &Value) {
     instance_setting::set(pool, "mrf", setting)
         .await
         .expect("the mrf setting writes");
+}
+
+// ---------------------------------------------------------------------------
+// Client-to-server: the owner's inbox read, outbox writes, whoami and the
+// C2S media upload (Pleroma's `read_inbox`, `update_outbox`, `whoami` and
+// `upload_media`).
+// ---------------------------------------------------------------------------
+
+/// Boundary the C2S upload bodies are framed with.
+const C2S_BOUNDARY: &str = "wired-c2s-test-boundary";
+/// The `ActivityStreams` public collection.
+const AS_PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
+
+/// A local account named `nickname` with a bearer token granting `scopes`.
+async fn c2s_account(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
+    let user = common::create_local_user(pool, nickname).await;
+    let token = common::create_app_and_token(pool, &user, scopes).await;
+    (user, token)
+}
+
+/// A status by `author` that @-mentions `mentioned` — the fact the C2S
+/// inbox pages on — inserted straight through the model.
+async fn mention_status(
+    pool: &PgPool,
+    author: &User,
+    mentioned: &User,
+    text: &str,
+    visibility: Visibility,
+) -> StoredStatus {
+    let new = NewStatus {
+        visibility,
+        mentioned_user_ids: vec![mentioned.id],
+        ..NewStatus::local(author, text)
+    };
+    status::insert(pool, BASE, &new)
+        .await
+        .expect("the mention fixture inserts")
+}
+
+/// `GET /users/{nickname}/inbox` as `token`.
+async fn read_inbox(
+    app: &Router,
+    nickname: &str,
+    token: Option<&str>,
+    query: &str,
+) -> common::TestResponse {
+    let path = if query.is_empty() {
+        format!("/users/{nickname}/inbox")
+    } else {
+        format!("/users/{nickname}/inbox?{query}")
+    };
+    let request = common::TestRequest::get(&path);
+    let request = match token {
+        Some(token) => request.bearer(token),
+        None => request,
+    };
+    request.send(app).await
+}
+
+/// Posts `activity` to `/users/{nickname}/outbox` as `token` (none: the
+/// anonymous ask).
+async fn post_outbox(
+    app: &Router,
+    nickname: &str,
+    token: Option<&str>,
+    activity: Value,
+) -> common::TestResponse {
+    let request = common::TestRequest::post(&format!("/users/{nickname}/outbox"));
+    let request = match token {
+        Some(token) => request.bearer(token).json(&activity),
+        None => request.json(&activity),
+    };
+    request.send(app).await
+}
+
+/// The `Create` of a plain note, addressed as `to` says.
+fn create_note(to: &Value, cc: &Value, content: &str) -> Value {
+    json!({
+        "type": "Create",
+        "to": to,
+        "cc": cc,
+        "object": { "type": "Note", "content": content },
+    })
+}
+
+/// The status id an outbox answer's `Location` names: the tail of the
+/// `{BASE}/activities/{uuid}` address.
+fn location_status_id(response: &common::TestResponse) -> Uuid {
+    let location = response
+        .header("location")
+        .expect("a 201 carries a Location");
+    let tail = location
+        .strip_prefix(&format!("{BASE}/activities/"))
+        .unwrap_or(location);
+    Uuid::parse_str(tail).expect("the Location tail is the minted id")
+}
+
+/// `GET /api/v1/statuses/{id}` as `token`.
+async fn show_status(app: &Router, token: &str, id: Uuid) -> common::TestResponse {
+    common::TestRequest::get(&format!("/api/v1/statuses/{id}"))
+        .bearer(token)
+        .send(app)
+        .await
+}
+
+/// `GET /api/v1/accounts/relationships?id={target}` as `token`, answered
+/// for the one account it names.
+async fn relationship(app: &Router, token: &str, target: &User) -> Value {
+    let response =
+        common::TestRequest::get(&format!("/api/v1/accounts/relationships?id={}", target.id))
+            .bearer(token)
+            .send(app)
+            .await;
+    assert_eq!(response.status, StatusCode::OK, "the relationship reads");
+    let list = response.json_value();
+    list.as_array()
+        .expect("relationships answer a list")
+        .first()
+        .expect("one relationship was asked for")
+        .clone()
+}
+
+/// A decodable 8x8 `PNG` of `seed`-shifted colors, as bytes.
+fn png_fixture(seed: u32) -> Vec<u8> {
+    let channel = |value: u32| u8::try_from(value % 256).expect("a modulo of 256 fits a u8");
+    let image: RgbaImage = ImageBuffer::from_fn(8, 8, |x, y| {
+        Rgba([channel(x + seed), channel(y * 7), 128, 255])
+    });
+    let mut out = Vec::new();
+    DynamicImage::ImageRgba8(image)
+        .write_to(Cursor::new(&mut out), ImageFormat::Png)
+        .expect("the fixture encodes");
+    out
+}
+
+/// A `POST /api/ap/upload_media` with one `file` part and a description.
+async fn upload_to_ap(
+    app: &Router,
+    token: Option<&str>,
+    bytes: Vec<u8>,
+    description: Option<&'static str>,
+) -> common::TestResponse {
+    let mut parts = vec![common::MultipartPart::file(
+        "file",
+        "cat.png",
+        "image/png",
+        Bytes::from(bytes),
+    )];
+    if let Some(description) = description {
+        parts.push(common::MultipartPart::text("description", description));
+    }
+    let request = common::TestRequest::post("/api/ap/upload_media");
+    let request = match token {
+        Some(token) => request.bearer(token),
+        None => request,
+    };
+    request.multipart(C2S_BOUNDARY, &parts).send(app).await
+}
+
+/// The C2S inbox's gates: without a token the read answers Pleroma's
+/// `EnsureAuthenticatedPlug` 401, a stranger's token and a scope-less one
+/// the 403s — the wrong user the ticket's `{"error":"Forbidden"}`, the
+/// missing scope Pleroma's `OAuthScopesPlug` wording — while `read` and
+/// the `read:statuses` sub-scope both pass.
+#[tokio::test]
+async fn the_c2s_inbox_only_answers_its_owner() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, alice_read) = c2s_account(&pool, "c2s-inbox-alice", "read").await;
+    let (_bob, bob_token) = c2s_account(&pool, "c2s-inbox-bob", "read").await;
+    let (_, alice_write) = c2s_account(&pool, "c2s-inbox-carol", "write").await;
+
+    let anonymous = read_inbox(&app, "c2s-inbox-alice", None, "").await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "inbox, no token");
+    common::assert_error(&anonymous, "Invalid credentials", "inbox, no token");
+
+    let stranger = read_inbox(&app, "c2s-inbox-alice", Some(&bob_token), "").await;
+    common::assert_answer(&stranger, StatusCode::FORBIDDEN, "inbox of another");
+    common::assert_error(&stranger, "Forbidden", "inbox of another");
+
+    let unscoped = read_inbox(&app, "c2s-inbox-alice", Some(&alice_write), "").await;
+    common::assert_answer(&unscoped, StatusCode::FORBIDDEN, "inbox, no read scope");
+    common::assert_error(
+        &unscoped,
+        "Insufficient permissions: read | read:statuses.",
+        "inbox, no read scope",
+    );
+
+    let owner = read_inbox(&app, "c2s-inbox-alice", Some(&alice_read), "").await;
+    assert_eq!(
+        owner.status,
+        StatusCode::OK,
+        "the owner reads: {}",
+        owner.text()
+    );
+    assert_eq!(
+        owner.header("content-type"),
+        Some("application/activity+json; charset=utf-8"),
+        "the inbox is an ActivityPub document"
+    );
+
+    let (dave, dave_sub) = c2s_account(&pool, "c2s-inbox-dave", "read:statuses").await;
+    let sub = read_inbox(&app, &dave.nickname, Some(&dave_sub), "").await;
+    assert_eq!(
+        sub.status,
+        StatusCode::OK,
+        "read:statuses suffices as well: {}",
+        sub.text()
+    );
+}
+
+/// `GET /users/{nickname}/inbox` without `?page=true` answers the
+/// collection root: the inbox's own address, the `first` page link, and
+/// no items or totals of its own (Pleroma's `activity_collection.json`).
+#[tokio::test]
+async fn the_c2s_inbox_root_is_an_ordered_collection() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = c2s_account(&pool, "c2s-inbox-root", "read").await;
+
+    let response = read_inbox(&app, "c2s-inbox-root", Some(&token), "").await;
+    assert_eq!(response.status, StatusCode::OK, "the owner reads");
+    let root = response.json_value();
+    let keys: Vec<&str> = {
+        let mut keys: Vec<&str> = root
+            .as_object()
+            .expect("a collection is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    };
+    assert_eq!(
+        keys,
+        ["@context", "first", "id", "type"],
+        "the root carries the address, the type and the first link"
+    );
+    assert_eq!(root["id"], format!("{}/inbox", alice.ap_id), "its own id");
+    assert_eq!(root["type"], "OrderedCollection", "the collection type");
+    assert_eq!(
+        root["first"],
+        format!("{}/inbox?page=true", alice.ap_id),
+        "the first page hangs off the same address"
+    );
+}
+
+/// Seeds `nickname`'s inbox world: twenty-three public mentions by the
+/// pager, then a direct mention and one final public mention (the newest
+/// facts), and the two posts that must stay out of the listing — a public
+/// post mentioning nobody and one by the owner herself. Answers the
+/// mentioned status ids, newest first.
+async fn seed_inbox_mentions(pool: &PgPool, owner: &User, pager: &User) -> Vec<Uuid> {
+    let mut expected: Vec<Uuid> = Vec::new();
+    for i in 1..=23 {
+        let row = mention_status(
+            pool,
+            pager,
+            owner,
+            &format!("mention {i}"),
+            Visibility::Public,
+        )
+        .await;
+        expected.push(row.id);
+    }
+    let dm = mention_status(pool, pager, owner, "a quiet word", Visibility::Direct).await;
+    let late = mention_status(pool, pager, owner, "mention 24", Visibility::Public).await;
+    expected.push(dm.id);
+    expected.push(late.id);
+    let _unmentioned =
+        common::create_status(pool, pager, "to nobody in particular", Visibility::Public).await;
+    let _own = common::create_status(pool, owner, "my own post", Visibility::Public).await;
+    expected.sort_unstable();
+    expected.reverse();
+    expected
+}
+
+/// The paged C2S inbox lists the statuses that mention the owner as their
+/// `Create` activities, newest first, twenty to a page: the direct
+/// messages and mentions in, the unmentioned posts and the owner's own
+/// posts out, and the `next`/`prev` cursors of the keyset walk (decision 4
+/// keys it on the status id).
+#[tokio::test]
+async fn the_c2s_inbox_pages_mentions_as_create_activities() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = c2s_account(&pool, "c2s-inbox-page", "read").await;
+    let bob = common::create_local_user(&pool, "c2s-inbox-pager").await;
+    let expected = seed_inbox_mentions(&pool, &alice, &bob).await;
+
+    let first = read_inbox(&app, "c2s-inbox-page", Some(&token), "page=true").await;
+    assert_eq!(first.status, StatusCode::OK, "the first page");
+    let page = first.json_value();
+    assert_eq!(page["type"], "OrderedCollectionPage", "the page type");
+    assert_eq!(
+        page["partOf"],
+        format!("{}/inbox", alice.ap_id),
+        "the page names its root"
+    );
+    assert_eq!(
+        page["id"],
+        format!("{}/inbox?page=true", alice.ap_id),
+        "and echoes the address it was requested at"
+    );
+    let items = page["orderedItems"].as_array().expect("ordered items");
+    assert_eq!(items.len(), 20, "the page size is the ticket's twenty");
+    for item in items {
+        assert_eq!(item["type"], "Create", "every entry is a Create");
+        assert_eq!(item["actor"], bob.ap_id.as_str(), "by its author");
+    }
+    let page_ids: Vec<Uuid> = items.iter().map(status_of_item).collect();
+    assert_eq!(
+        page_ids,
+        expected[..20],
+        "newest first, and the unmentioned posts are absent"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["to"] == json!([alice.ap_id.as_str()])),
+        "the direct message reaches the inbox as a Create addressed to the owner alone"
+    );
+    let oldest = *page_ids.last().expect("a full page has a last entry");
+    assert_eq!(
+        page["next"],
+        json!(format!("{}/inbox?page=true&max_id={oldest}", alice.ap_id)),
+        "the next page walks to the oldest id"
+    );
+    assert_eq!(
+        page["prev"],
+        json!(format!(
+            "{}/inbox?page=true&min_id={}",
+            alice.ap_id, expected[0]
+        )),
+        "and a page back toward the newest end is keyed on its newest"
+    );
+
+    let second = read_inbox(
+        &app,
+        "c2s-inbox-page",
+        Some(&token),
+        &format!("page=true&max_id={oldest}"),
+    )
+    .await;
+    assert_eq!(
+        second.status,
+        StatusCode::OK,
+        "the second page: {}",
+        second.text()
+    );
+    let page2 = second.json_value();
+    let items2 = page2["orderedItems"].as_array().expect("ordered items");
+    assert_eq!(items2.len(), 5, "the tail of the walk holds five");
+    assert!(page2.get("next").is_none(), "a short page ends the walk");
+    let ids2: Vec<Uuid> = items2.iter().map(status_of_item).collect();
+    assert_eq!(ids2, expected[20..], "and continues newest-first");
+    assert_eq!(ids2[4], expected[24], "the walk ends at the oldest mention");
+}
+
+/// The status id a listed `Create` names, read off its object's
+/// `{BASE}/objects/{uuid}` id.
+fn status_of_item(item: &Value) -> Uuid {
+    let uri = item["object"]["id"].as_str().expect("the object's id");
+    Uuid::parse_str(uri.rsplit('/').next().expect("a final path segment"))
+        .expect("the tail is the status id")
+}
+
+/// A malformed `max_id` cursor is the shared 400 every keyset walk gives.
+#[tokio::test]
+async fn the_c2s_inbox_refuses_a_malformed_cursor() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = c2s_account(&pool, "c2s-inbox-cursor", "read").await;
+
+    let response = read_inbox(
+        &app,
+        "c2s-inbox-cursor",
+        Some(&token),
+        "page=true&max_id=nope",
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::BAD_REQUEST, "a bogus cursor");
+    common::assert_error(&response, "Invalid id", "a bogus cursor");
+}
+
+/// The C2S outbox gates: no token 401, another account's token the 403
+/// `{"error":"Forbidden"}`, and a token without `write:statuses` the scope
+/// refusal — before a single byte of the activity is looked at.
+#[tokio::test]
+async fn the_c2s_outbox_only_answers_its_owner() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, read_only) = c2s_account(&pool, "c2s-out-gate-a", "read").await;
+    let (_bob, bob_token) = c2s_account(&pool, "c2s-out-gate-b", "read write").await;
+
+    let anonymous = post_outbox(
+        &app,
+        "c2s-out-gate-a",
+        None,
+        create_note(&json!([AS_PUBLIC]), &json!([]), "hi"),
+    )
+    .await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "outbox, no token");
+
+    let stranger = post_outbox(
+        &app,
+        "c2s-out-gate-a",
+        Some(&bob_token),
+        create_note(&json!([AS_PUBLIC]), &json!([]), "hi"),
+    )
+    .await;
+    common::assert_answer(&stranger, StatusCode::FORBIDDEN, "outbox of another");
+    common::assert_error(&stranger, "Forbidden", "outbox of another");
+
+    let unscoped = post_outbox(
+        &app,
+        "c2s-out-gate-a",
+        Some(&read_only),
+        create_note(&json!([AS_PUBLIC]), &json!([]), "hi"),
+    )
+    .await;
+    common::assert_answer(&unscoped, StatusCode::FORBIDDEN, "outbox, no write scope");
+    common::assert_error(
+        &unscoped,
+        "Insufficient permissions: write:statuses.",
+        "outbox, no write scope",
+    );
+}
+
+/// `Create` of a `Note` through the outbox posts end to end: 201 with the
+/// `Create` activity's id in `Location` and an empty body, and the status
+/// readable at `/api/v1/statuses/{id}` with the note's text, warning and
+/// fold, and the upload the note attached.
+#[tokio::test]
+async fn the_c2s_outbox_create_posts_end_to_end() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let uploads = TempDir::new().expect("temp dir for uploads");
+    let app = common::test_app_with_uploads_dir(pool.clone(), uploads.path());
+    let (_alice, token) = c2s_account(&pool, "c2s-out-create", "read write").await;
+
+    let upload = upload_to_ap(&app, Some(&token), png_fixture(4), Some("a gradient")).await;
+    assert_eq!(upload.status, StatusCode::OK, "the upload lands");
+    let media_id = upload.json_value()["id"]
+        .as_str()
+        .expect("the media id")
+        .to_owned();
+
+    let activity = json!({
+        "type": "Create",
+        "to": [AS_PUBLIC],
+        "object": {
+            "type": "Note",
+            "content": "hello from c2s",
+            "summary": "a warning",
+            "sensitive": true,
+            "attachment": [{"type": "Document", "id": media_id}],
+        },
+    });
+    let created = post_outbox(&app, "c2s-out-create", Some(&token), activity).await;
+    assert_eq!(created.status, StatusCode::CREATED, "the create fires");
+    assert!(created.body.is_empty(), "and answers no body");
+    let location = created.header("location").expect("a Location").to_owned();
+
+    let shown = show_status(&app, &token, location_status_id(&created)).await;
+    assert_eq!(
+        shown.status,
+        StatusCode::OK,
+        "the post is visible to its author"
+    );
+    let entity = shown.json_value();
+    assert_eq!(
+        entity["uri"],
+        format!("{BASE}/objects/{}", entity["id"].as_str().expect("the id")),
+        "the stored object id under the test instance"
+    );
+    assert_eq!(
+        entity["content"], "<p>hello from c2s</p>",
+        "the text rode through"
+    );
+    assert_eq!(
+        entity["spoiler_text"], "a warning",
+        "and the summary became the warning"
+    );
+    assert_eq!(entity["sensitive"], true, "and the fold its flag");
+    assert_eq!(
+        entity["visibility"], "public",
+        "to the public, as `to` said"
+    );
+    assert_eq!(
+        entity["media_attachments"][0]["id"], media_id,
+        "the attachment id claimed the upload"
+    );
+    assert_eq!(
+        location,
+        format!(
+            "{BASE}/activities/{}",
+            entity["id"].as_str().expect("the id")
+        ),
+        "the Location is the Create activity the post federates as"
+    );
+}
+
+/// The create's visibility follows the note's and activity's `to`/`cc`
+/// exactly as the federation parser reads them: `Public` in `to` is
+/// public, in `cc` alone unlisted, the followers collection private,
+/// anything else direct.
+#[tokio::test]
+async fn the_c2s_outbox_create_reads_visibility_from_the_audience() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user_with(&pool, "c2s-out-visibility", |new| NewUser {
+        followers_url: Some(followers(&new.ap_id)),
+        ..new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "read write").await;
+    let followers = followers(&alice.ap_id);
+
+    let cases = [
+        (json!([AS_PUBLIC]), json!([]), "public"),
+        (json!([]), json!([AS_PUBLIC]), "unlisted"),
+        (json!([followers.clone()]), json!([]), "private"),
+        (json!([]), json!([]), "direct"),
+    ];
+    for (index, (to, cc, want)) in cases.iter().enumerate() {
+        let activity = create_note(to, cc, &format!("audience case {index}"));
+        let created = post_outbox(&app, "c2s-out-visibility", Some(&token), activity).await;
+        assert_eq!(created.status, StatusCode::CREATED, "case {index} posts");
+        let shown = show_status(&app, &token, location_status_id(&created)).await;
+        assert_eq!(
+            shown.json_value()["visibility"],
+            json!(*want),
+            "case {index} stores the audience its addressing spells"
+        );
+    }
+}
+
+/// The create's reply and object arms: an `inReplyTo` naming a stored
+/// status lands the answer on it, one naming nothing is the 404, and
+/// every shape the outbox does not fold — a non-`Note` object, a bare
+/// reference, an unknown type, an empty body — is the 400
+/// `{"error":"Unsupported activity type"}`.
+#[tokio::test]
+async fn the_c2s_outbox_create_replies_and_refuses_other_shapes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = c2s_account(&pool, "c2s-out-shape", "read write").await;
+    let parent = common::create_status(&pool, &alice, "a parent", Visibility::Public).await;
+
+    let reply = json!({
+        "type": "Create",
+        "to": [AS_PUBLIC],
+        "object": {
+            "type": "Note",
+            "content": "an answer",
+            "inReplyTo": parent.uri,
+        },
+    });
+    let created = post_outbox(&app, "c2s-out-shape", Some(&token), reply).await;
+    assert_eq!(created.status, StatusCode::CREATED, "the answer posts");
+    let shown = show_status(&app, &token, location_status_id(&created)).await;
+    assert_eq!(
+        shown.json_value()["in_reply_to_id"],
+        parent.id.to_string(),
+        "and lands on the parent it named"
+    );
+
+    let stranger = json!({
+        "type": "Create",
+        "to": [AS_PUBLIC],
+        "object": { "type": "Note", "content": "x", "inReplyTo": "https://nowhere.example/objects/1" },
+    });
+    let refused = post_outbox(&app, "c2s-out-shape", Some(&token), stranger).await;
+    common::assert_answer(
+        &refused,
+        StatusCode::NOT_FOUND,
+        "a parent that is no stored status",
+    );
+
+    for unsupported in [
+        json!({"type": "Create", "object": {"type": "Question", "content": "poll?"}}),
+        json!({"type": "Create", "object": format!("{BASE}/objects/whatever")}),
+        json!({"type": "Flag", "object": "x"}),
+        json!({"type": "Listen"}),
+        json!({}),
+    ] {
+        let denied = post_outbox(&app, "c2s-out-shape", Some(&token), unsupported.clone()).await;
+        common::assert_answer(
+            &denied,
+            StatusCode::BAD_REQUEST,
+            &format!("unsupported shape: {unsupported}"),
+        );
+        common::assert_error(
+            &denied,
+            "Unsupported activity type",
+            "an unfoldable activity",
+        );
+    }
+}
+
+/// `Delete` of the caller's own status by object id: the post goes out of
+/// `GET /api/v1/statuses/{id}` with a 201 naming the `Delete`; somebody
+/// else's post is the 403 and an unknown reference the 404.
+#[tokio::test]
+async fn the_c2s_outbox_delete_takes_only_its_own_posts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, alice_token) = c2s_account(&pool, "c2s-out-delete-a", "read write").await;
+    let (bob, bob_token) = c2s_account(&pool, "c2s-out-delete-b", "read write").await;
+
+    let activity = create_note(&json!([AS_PUBLIC]), &json!([]), "doomed");
+    let created = post_outbox(&app, "c2s-out-delete-a", Some(&alice_token), activity).await;
+    assert_eq!(created.status, StatusCode::CREATED, "the post fires");
+    let id = location_status_id(&created);
+    let uri = format!("{BASE}/objects/{id}");
+
+    let deleted = post_outbox(
+        &app,
+        "c2s-out-delete-a",
+        Some(&alice_token),
+        json!({"type": "Delete", "object": uri}),
+    )
+    .await;
+    assert_eq!(
+        deleted.status,
+        StatusCode::CREATED,
+        "the delete is accepted"
+    );
+    assert!(deleted.body.is_empty(), "and answers no body");
+    assert!(
+        deleted
+            .header("location")
+            .expect("a Location")
+            .starts_with(&format!("{BASE}/activities/")),
+        "the Location names the Delete activity"
+    );
+    let shown = show_status(&app, &alice_token, id).await;
+    common::assert_answer(&shown, StatusCode::NOT_FOUND, "the post after its delete");
+
+    let foreign = common::create_status(&pool, &bob, "bobs own", Visibility::Public).await;
+    let refused = post_outbox(
+        &app,
+        "c2s-out-delete-a",
+        Some(&alice_token),
+        json!({"type": "Delete", "object": foreign.uri}),
+    )
+    .await;
+    common::assert_answer(
+        &refused,
+        StatusCode::FORBIDDEN,
+        "a delete of another's post",
+    );
+    common::assert_error(&refused, "Forbidden", "a delete of another's post");
+
+    let unknown = post_outbox(
+        &app,
+        "c2s-out-delete-a",
+        Some(&alice_token),
+        json!({"type": "Delete", "object": format!("{BASE}/objects/{}", Uuid::now_v7())}),
+    )
+    .await;
+    common::assert_answer(&unknown, StatusCode::NOT_FOUND, "a delete of nothing");
+
+    // Bob may of course delete his own — by id text as well as by uri.
+    let by_id = post_outbox(
+        &app,
+        "c2s-out-delete-b",
+        Some(&bob_token),
+        json!({"type": "Delete", "object": foreign.id.to_string()}),
+    )
+    .await;
+    assert_eq!(
+        by_id.status,
+        StatusCode::CREATED,
+        "the id text names it too"
+    );
+}
+
+/// `Follow` of an actor id through the outbox: the relationship writes
+/// and reads back through the client API, a repeat restates the same
+/// fact and the same `Location`, and the `Undo` by the activity id the
+/// `Follow` answered takes the follow back. A second `Undo` of the same
+/// id names nothing any more and is the 404.
+#[tokio::test]
+async fn the_c2s_outbox_follows_and_undoes_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = c2s_account(&pool, "c2s-out-follow-a", "read write").await.1;
+    let (bob, _) = c2s_account(&pool, "c2s-out-follow-b", "read").await;
+
+    let follow = post_outbox(
+        &app,
+        "c2s-out-follow-a",
+        Some(&token),
+        json!({"type": "Follow", "object": bob.ap_id}),
+    )
+    .await;
+    assert_eq!(
+        follow.status,
+        StatusCode::CREATED,
+        "the follow lands: {}",
+        follow.text()
+    );
+    let follow_id = follow.header("location").expect("a Location").to_owned();
+    let rel = relationship(&app, &token, &bob).await;
+    assert_eq!(
+        rel["following"],
+        json!(true),
+        "and the relationship says so"
+    );
+
+    let repeat = post_outbox(
+        &app,
+        "c2s-out-follow-a",
+        Some(&token),
+        json!({"type": "Follow", "object": bob.ap_id}),
+    )
+    .await;
+    assert_eq!(repeat.status, StatusCode::CREATED, "a repeat is restated");
+    assert_eq!(
+        repeat.header("location"),
+        Some(follow_id.as_str()),
+        "naming the one Follow the pair holds"
+    );
+
+    let undone = post_outbox(
+        &app,
+        "c2s-out-follow-a",
+        Some(&token),
+        json!({"type": "Undo", "object": follow_id}),
+    )
+    .await;
+    assert_eq!(undone.status, StatusCode::CREATED, "the undo is accepted");
+    assert_ne!(
+        undone.header("location"),
+        Some(follow_id.as_str()),
+        "naming the fresh Undo activity instead"
+    );
+    let gone = relationship(&app, &token, &bob).await;
+    assert_eq!(gone["following"], json!(false), "and the follow is gone");
+
+    let again = post_outbox(
+        &app,
+        "c2s-out-follow-a",
+        Some(&token),
+        json!({"type": "Undo", "object": follow_id}),
+    )
+    .await;
+    common::assert_answer(&again, StatusCode::NOT_FOUND, "a second undo of one follow");
+}
+
+/// The other `Undo` arms: an embedded `Follow` withdraws by the target
+/// actor the inner activity names, a follow of an actor this instance has
+/// never stored is the 404 (the C2S door reads stored rows, it fetches
+/// nobody), and an embedded activity of no withdrawable type is the 400.
+#[tokio::test]
+async fn the_c2s_outbox_undoes_an_embedded_follow_and_refuses_the_rest() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = c2s_account(&pool, "c2s-out-follow-c", "read write").await.1;
+    let (bob, _) = c2s_account(&pool, "c2s-out-follow-d", "read").await;
+
+    let followed = post_outbox(
+        &app,
+        "c2s-out-follow-c",
+        Some(&token),
+        json!({"type": "Follow", "object": bob.ap_id}),
+    )
+    .await;
+    assert_eq!(followed.status, StatusCode::CREATED, "followed");
+    let embedded_undo = post_outbox(
+        &app,
+        "c2s-out-follow-c",
+        Some(&token),
+        json!({"type": "Undo", "object": {"type": "Follow", "object": bob.ap_id}}),
+    )
+    .await;
+    assert_eq!(
+        embedded_undo.status,
+        StatusCode::CREATED,
+        "the embedded undo lands"
+    );
+    let withdrawn = relationship(&app, &token, &bob).await;
+    assert_eq!(
+        withdrawn["following"],
+        json!(false),
+        "and withdrew the follow"
+    );
+
+    let unknown = post_outbox(
+        &app,
+        "c2s-out-follow-c",
+        Some(&token),
+        json!({"type": "Follow", "object": "https://nowhere.example/users/eve"}),
+    )
+    .await;
+    common::assert_answer(
+        &unknown,
+        StatusCode::NOT_FOUND,
+        "a follow of an unseen actor",
+    );
+
+    let dormant = common::create_deactivated_user_with_password(
+        &pool,
+        "c2s-out-follow-sleeps",
+        "correct horse battery staple",
+    )
+    .await;
+    let gone = post_outbox(
+        &app,
+        "c2s-out-follow-c",
+        Some(&token),
+        json!({"type": "Follow", "object": dormant.ap_id}),
+    )
+    .await;
+    common::assert_answer(
+        &gone,
+        StatusCode::NOT_FOUND,
+        "a follow of a deactivated account",
+    );
+
+    let odd = post_outbox(
+        &app,
+        "c2s-out-follow-c",
+        Some(&token),
+        json!({"type": "Undo", "object": {"type": "Flag", "object": bob.ap_id}}),
+    )
+    .await;
+    common::assert_answer(&odd, StatusCode::BAD_REQUEST, "an undo of an odd type");
+    common::assert_error(&odd, "Unsupported activity type", "an undo of an odd type");
+}
+
+/// `Like` of a status through the outbox: the favourite writes, the
+/// entity reads it back, a repeat answers the same activity id, and the
+/// `Undo` by that id withdraws it.
+#[tokio::test]
+async fn the_c2s_outbox_likes_and_undoes_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = c2s_account(&pool, "c2s-out-like-a", "read write").await;
+    let (bob, _) = c2s_account(&pool, "c2s-out-like-b", "read").await;
+    let post = common::create_status(&pool, &bob, "likeable", Visibility::Public).await;
+
+    let liked = post_outbox(
+        &app,
+        "c2s-out-like-a",
+        Some(&token),
+        json!({"type": "Like", "object": post.uri}),
+    )
+    .await;
+    assert_eq!(
+        liked.status,
+        StatusCode::CREATED,
+        "the like lands: {}",
+        liked.text()
+    );
+    let like_id = liked.header("location").expect("a Location").to_owned();
+    let shown = show_status(&app, &token, post.id).await;
+    let entity = shown.json_value();
+    assert_eq!(entity["favourites_count"], 1, "counted");
+    assert_eq!(entity["favourited"], true, "and flagged for its viewer");
+
+    let repeat = post_outbox(
+        &app,
+        "c2s-out-like-a",
+        Some(&token),
+        json!({"type": "Like", "object": post.uri}),
+    )
+    .await;
+    assert_eq!(repeat.status, StatusCode::CREATED, "a repeat is restated");
+    assert_eq!(
+        repeat.header("location"),
+        Some(like_id.as_str()),
+        "naming the one Like the pair holds"
+    );
+
+    let undone = post_outbox(
+        &app,
+        "c2s-out-like-a",
+        Some(&token),
+        json!({"type": "Undo", "object": like_id}),
+    )
+    .await;
+    assert_eq!(undone.status, StatusCode::CREATED, "the undo is accepted");
+    let after_undo = show_status(&app, &token, post.id).await.json_value();
+    assert_eq!(after_undo["favourites_count"], 0, "the like came off");
+}
+
+/// The like's other arms: an embedded `Undo` withdraws by the status the
+/// inner activity names, and what the caller may not see is the 404.
+#[tokio::test]
+async fn the_c2s_outbox_undoes_an_embedded_like_and_refuses_the_invisible() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = c2s_account(&pool, "c2s-out-like-c", "read write").await;
+    let (bob, bob_token) = c2s_account(&pool, "c2s-out-like-d", "read").await;
+    let post = common::create_status(&pool, &bob, "likeable too", Visibility::Public).await;
+    let hidden = common::create_status(&pool, &bob, "hidden away", Visibility::Private).await;
+
+    let liked = post_outbox(
+        &app,
+        "c2s-out-like-c",
+        Some(&token),
+        json!({"type": "Like", "object": post.uri}),
+    )
+    .await;
+    assert_eq!(liked.status, StatusCode::CREATED, "the like lands");
+    let embedded_undo = post_outbox(
+        &app,
+        "c2s-out-like-c",
+        Some(&token),
+        json!({"type": "Undo", "object": {"type": "Like", "object": post.uri}}),
+    )
+    .await;
+    assert_eq!(
+        embedded_undo.status,
+        StatusCode::CREATED,
+        "the embedded undo lands"
+    );
+    let as_author = show_status(&app, &bob_token, post.id).await.json_value();
+    assert_eq!(as_author["favourites_count"], 0, "and withdrew the like");
+
+    let invisible = post_outbox(
+        &app,
+        "c2s-out-like-c",
+        Some(&token),
+        json!({"type": "Like", "object": hidden.uri}),
+    )
+    .await;
+    common::assert_answer(
+        &invisible,
+        StatusCode::NOT_FOUND,
+        "a like of an unseen post",
+    );
+}
+
+/// `Announce` of a status through the outbox: the reblog row *is* the
+/// `Announce` (decision 6), so the `Location` names it and the boost
+/// renders over the original, and the `Undo` of that id takes the boost
+/// back.
+#[tokio::test]
+async fn the_c2s_outbox_announces_and_undoes_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = c2s_account(&pool, "c2s-out-boost-a", "read write").await;
+    let (bob, _) = c2s_account(&pool, "c2s-out-boost-b", "read").await;
+    let post = common::create_status(&pool, &bob, "boost me", Visibility::Public).await;
+
+    let announced = post_outbox(
+        &app,
+        "c2s-out-boost-a",
+        Some(&token),
+        json!({"type": "Announce", "object": post.uri}),
+    )
+    .await;
+    assert_eq!(
+        announced.status,
+        StatusCode::CREATED,
+        "the boost lands: {}",
+        announced.text()
+    );
+    let announce_id = announced.header("location").expect("a Location").to_owned();
+    assert_eq!(
+        announce_id,
+        format!("{BASE}/activities/{}", location_status_id(&announced)),
+        "the reblog's own activity address"
+    );
+    let reblog = show_status(&app, &token, location_status_id(&announced)).await;
+    let entity = reblog.json_value();
+    assert_eq!(
+        entity["uri"], announce_id,
+        "the row's uri is the Announce id"
+    );
+    assert_eq!(
+        entity["reblog"]["uri"], post.uri,
+        "and it carries the original it boosts"
+    );
+    let original = show_status(&app, &token, post.id).await.json_value();
+    assert_eq!(original["reblogs_count"], 1, "the original counts it");
+    assert_eq!(original["reblogged"], true, "and flags it for the booster");
+
+    let undone = post_outbox(
+        &app,
+        "c2s-out-boost-a",
+        Some(&token),
+        json!({"type": "Undo", "object": announce_id}),
+    )
+    .await;
+    assert_eq!(undone.status, StatusCode::CREATED, "the undo is accepted");
+    let after_undo = show_status(&app, &token, post.id).await.json_value();
+    assert_eq!(after_undo["reblogs_count"], 0, "the boost came off");
+    assert_eq!(
+        after_undo["reblogged"], false,
+        "and no longer flags it for the booster"
+    );
+}
+
+/// `Block` of an actor through the outbox and its `Undo` by the activity
+/// id the block answered: the relationship flips through the client API's
+/// own reads, and an unseen actor is the 404.
+#[tokio::test]
+async fn the_c2s_outbox_blocks_and_undoes_it() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = c2s_account(&pool, "c2s-out-block-a", "read write").await;
+    let (bob, _) = c2s_account(&pool, "c2s-out-block-b", "read").await;
+
+    let blocked = post_outbox(
+        &app,
+        "c2s-out-block-a",
+        Some(&token),
+        json!({"type": "Block", "object": bob.ap_id}),
+    )
+    .await;
+    assert_eq!(blocked.status, StatusCode::CREATED, "the block lands");
+    let block_id = blocked.header("location").expect("a Location").to_owned();
+    let rel = relationship(&app, &token, &bob).await;
+    assert_eq!(
+        rel["blocking"],
+        json!(true),
+        "the relationship says blocked"
+    );
+
+    let undone = post_outbox(
+        &app,
+        "c2s-out-block-a",
+        Some(&token),
+        json!({"type": "Undo", "object": block_id}),
+    )
+    .await;
+    assert_eq!(undone.status, StatusCode::CREATED, "the undo is accepted");
+    let lifted = relationship(&app, &token, &bob).await;
+    assert_eq!(lifted["blocking"], json!(false), "and the block is lifted");
+
+    let unknown = post_outbox(
+        &app,
+        "c2s-out-block-a",
+        Some(&token),
+        json!({"type": "Block", "object": "https://nowhere.example/users/eve"}),
+    )
+    .await;
+    common::assert_answer(
+        &unknown,
+        StatusCode::NOT_FOUND,
+        "a block of an unseen actor",
+    );
+}
+
+/// The embedded block withdrawal: the inner `Block`'s object names the
+/// target actor, and the undo lifts the pair's block.
+#[tokio::test]
+async fn the_c2s_outbox_undoes_an_embedded_block() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = c2s_account(&pool, "c2s-out-block-c", "read write").await;
+    let (bob, _) = c2s_account(&pool, "c2s-out-block-d", "read").await;
+
+    let reblocked = post_outbox(
+        &app,
+        "c2s-out-block-c",
+        Some(&token),
+        json!({"type": "Block", "object": bob.ap_id}),
+    )
+    .await;
+    assert_eq!(reblocked.status, StatusCode::CREATED, "blocked");
+    let undone = post_outbox(
+        &app,
+        "c2s-out-block-c",
+        Some(&token),
+        json!({"type": "Undo", "object": {"type": "Block", "object": bob.ap_id}}),
+    )
+    .await;
+    assert_eq!(
+        undone.status,
+        StatusCode::CREATED,
+        "the embedded undo lands"
+    );
+    let lifted_again = relationship(&app, &token, &bob).await;
+    assert_eq!(
+        lifted_again["blocking"],
+        json!(false),
+        "and the embedded undo lifted the block"
+    );
+}
+
+/// The `Announce` refusals: what the caller may not see is the shared
+/// 404, and the caller's own `private` post — visible to them and still
+/// not boostable — is the client API's own 422, in its own words.
+#[tokio::test]
+async fn the_c2s_outbox_refuses_an_unboostable_target() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = c2s_account(&pool, "c2s-out-boost-c", "read write").await;
+    let (bob, _) = c2s_account(&pool, "c2s-out-boost-d", "read").await;
+    let hidden = common::create_status(&pool, &bob, "keep it quiet", Visibility::Private).await;
+
+    let refused = post_outbox(
+        &app,
+        "c2s-out-boost-c",
+        Some(&token),
+        json!({"type": "Announce", "object": hidden.uri}),
+    )
+    .await;
+    common::assert_answer(
+        &refused,
+        StatusCode::NOT_FOUND,
+        "an Announce of an unseen post",
+    );
+
+    let mine = common::create_status(&pool, &alice, "my private word", Visibility::Private).await;
+    let unboostable = post_outbox(
+        &app,
+        "c2s-out-boost-c",
+        Some(&token),
+        json!({"type": "Announce", "object": mine.uri}),
+    )
+    .await;
+    common::assert_answer(
+        &unboostable,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an Announce of a private post",
+    );
+    common::assert_error(
+        &unboostable,
+        "Could not reblog private status",
+        "an Announce of a private post",
+    );
+}
+
+/// `GET /api/ap/whoami` answers the authenticated user's own actor
+/// document under the `ActivityPub` media type, and demands a `read`
+/// token.
+#[tokio::test]
+async fn whoami_answers_the_callers_own_actor_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = c2s_account(&pool, "c2s-whoami", "read").await;
+    let (_, write_only) = c2s_account(&pool, "c2s-whoami-writer", "write").await;
+
+    let response = common::TestRequest::get("/api/ap/whoami")
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the caller reads itself");
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/activity+json; charset=utf-8"),
+        "as an ActivityPub document"
+    );
+    let actor = response.json_value();
+    assert_eq!(actor["id"], alice.ap_id, "the actor id of the token's user");
+    assert_eq!(actor["type"], "Person", "a person");
+    assert_eq!(actor["preferredUsername"], "c2s-whoami", "by its nickname");
+
+    let anonymous = common::TestRequest::get("/api/ap/whoami").send(&app).await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "whoami, no token");
+
+    let unscoped = common::TestRequest::get("/api/ap/whoami")
+        .bearer(&write_only)
+        .send(&app)
+        .await;
+    common::assert_answer(&unscoped, StatusCode::FORBIDDEN, "whoami, no read scope");
+    common::assert_error(&unscoped, "Insufficient permissions: read.", "whoami scope");
+}
+
+/// `POST /api/ap/upload_media` runs the `POST /api/v1/media` processing
+/// and answers the stored row as an `ActivityStreams` `Document`: the
+/// media id for a create to quote, the `Link` url, the alt text, the
+/// file's type and the computed `Blurhash`.
+#[tokio::test]
+async fn the_c2s_upload_answers_a_document() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let uploads = TempDir::new().expect("temp dir for uploads");
+    let app = common::test_app_with_uploads_dir(pool.clone(), uploads.path());
+    let (_, token) = c2s_account(&pool, "c2s-upload", "read write").await;
+
+    let response = upload_to_ap(&app, Some(&token), png_fixture(9), Some("a gradient")).await;
+    assert_eq!(response.status, StatusCode::OK, "the upload answers 200");
+    let document = response.json_value();
+    let keys: Vec<&str> = {
+        let mut keys: Vec<&str> = document
+            .as_object()
+            .expect("a document is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    };
+    assert_eq!(
+        keys,
+        ["blurhash", "id", "mediaType", "name", "type", "url"],
+        "the documented key set"
+    );
+    assert_eq!(document["type"], "Document", "the object type");
+    assert_eq!(document["name"], "a gradient", "the submitted alt text");
+    assert_eq!(document["mediaType"], "image/png", "read from the bytes");
+    let media_id = Uuid::parse_str(document["id"].as_str().expect("an id text"))
+        .expect("the id is the media id itself");
+    let url = &document["url"][0];
+    assert_eq!(url["type"], "Link", "a Link entry");
+    assert_eq!(url["mediaType"], "image/png", "carrying the file type");
+    let href = url["href"].as_str().expect("an href");
+    assert!(
+        href.starts_with(&format!("{BASE}/media/")),
+        "the file is served under the media route: {href}"
+    );
+
+    // The row exists as the caller's own unattached upload, readable
+    // through the Mastodon media route — one row, two doors.
+    let shown = common::TestRequest::get(&format!("/api/v1/media/{media_id}"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(shown.status, StatusCode::OK, "the upload is readable");
+    let entity = shown.json_value();
+    assert_eq!(entity["id"], media_id.to_string(), "under one id");
+    assert_eq!(entity["url"], href, "served at one address");
+
+    // A bare upload carries no name text and still reports its hash.
+    let bare = upload_to_ap(&app, Some(&token), png_fixture(3), None).await;
+    assert_eq!(
+        bare.status,
+        StatusCode::OK,
+        "the file-less-description upload lands"
+    );
+    assert_eq!(bare.json_value()["name"], "", "an absent alt text is empty");
+}
+
+/// The upload's gates and refusals: no token 401, a token without
+/// `write:media` 403, and no `file` part the shared 422 — the same
+/// answers `POST /api/v1/media` gives, on the C2S address.
+#[tokio::test]
+async fn the_c2s_upload_demands_media_write_and_a_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let uploads = TempDir::new().expect("temp dir for uploads");
+    let app = common::test_app_with_uploads_dir(pool.clone(), uploads.path());
+    let (_, read_only) = c2s_account(&pool, "c2s-upload-reader", "read").await;
+    let (_, media_token) = c2s_account(&pool, "c2s-upload-writer", "write:media").await;
+
+    let anonymous = upload_to_ap(&app, None, png_fixture(1), None).await;
+    common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "upload, no token");
+
+    let unscoped = upload_to_ap(&app, Some(&read_only), png_fixture(2), None).await;
+    common::assert_answer(&unscoped, StatusCode::FORBIDDEN, "upload, no media scope");
+    common::assert_error(
+        &unscoped,
+        "Insufficient permissions: write:media.",
+        "upload scope",
+    );
+
+    let no_file = common::TestRequest::post("/api/ap/upload_media")
+        .bearer(&media_token)
+        .multipart(
+            C2S_BOUNDARY,
+            &[common::MultipartPart::text("description", "none")],
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &no_file,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an upload with no file part",
+    );
+    common::assert_error(
+        &no_file,
+        "Missing parameter: file",
+        "an upload with no file part",
+    );
+}
+
+/// The upload the create claims: the `Document`'s `id` is exactly what a
+/// posted `Create` names in its `attachment` — and the whole round trip
+/// from upload to attached post runs through the C2S door.
+#[tokio::test]
+async fn the_c2s_upload_feeds_the_c2s_create() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let uploads = TempDir::new().expect("temp dir for uploads");
+    let app = common::test_app_with_uploads_dir(pool.clone(), uploads.path());
+    let (_alice, token) = c2s_account(&pool, "c2s-upload-claim", "read write").await;
+
+    let upload = upload_to_ap(&app, Some(&token), png_fixture(7), None).await;
+    let document = upload.json_value();
+    let media_id = document["id"].as_str().expect("the media id").to_owned();
+
+    let activity = json!({
+        "type": "Create",
+        "to": [AS_PUBLIC],
+        "object": {
+            "type": "Note",
+            "content": "look at this",
+            "attachment": [{"type": "Document", "id": format!("{BASE}/api/v1/media/{media_id}")}],
+        },
+    });
+    let created = post_outbox(&app, "c2s-upload-claim", Some(&token), activity).await;
+    assert_eq!(
+        created.status,
+        StatusCode::CREATED,
+        "the create claims the upload"
+    );
+    let entity = show_status(&app, &token, location_status_id(&created))
+        .await
+        .json_value();
+    assert_eq!(
+        entity["media_attachments"][0]["id"], media_id,
+        "the upload id read whether bare or as the media route's URL"
+    );
+}
+
+/// Somebody else's upload is not the caller's to attach: the create that
+/// names a stranger's media id earns the media model's own 422.
+#[tokio::test]
+async fn the_c2s_create_cannot_claim_another_users_upload() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let uploads = TempDir::new().expect("temp dir for uploads");
+    let app = common::test_app_with_uploads_dir(pool.clone(), uploads.path());
+    let (_, carol_token) = c2s_account(&pool, "c2s-upload-stranger", "read write").await;
+    let (_, token) = c2s_account(&pool, "c2s-upload-thief", "read write").await;
+
+    let upload = upload_to_ap(&app, Some(&carol_token), png_fixture(5), None).await;
+    let media_id = upload.json_value()["id"]
+        .as_str()
+        .expect("the media id")
+        .to_owned();
+    let activity = json!({
+        "type": "Create",
+        "to": [AS_PUBLIC],
+        "object": {
+            "type": "Note",
+            "content": "stolen goods",
+            "attachment": [{"id": media_id}],
+        },
+    });
+    let refused = post_outbox(&app, "c2s-upload-thief", Some(&token), activity).await;
+    common::assert_answer(
+        &refused,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a foreign upload",
+    );
+    common::assert_error(&refused, "Media not found", "a foreign upload");
 }

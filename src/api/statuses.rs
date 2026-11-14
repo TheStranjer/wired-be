@@ -602,7 +602,11 @@ const INVALID_VISIBILITY: &str = "Invalid visibility";
 /// ticket's wording of Pleroma's refusal to `Announce` anything but a
 /// publicly-addressed object — a boost is for the followers and the world,
 /// never for a followers-only or addressed post, the caller's own included.
-const CANNOT_REBLOG: &str = "Could not reblog private status";
+///
+/// Shared with the C2S outbox's `Announce` arm in
+/// [`crate::api::activitypub`], which refuses the same targets in the same
+/// words.
+pub(crate) const CANNOT_REBLOG: &str = "Could not reblog private status";
 
 /// Page size cap of `favourited_by`: the ticket pins 80, above
 /// [`crate::pagination::MAX_LIMIT`], with Pleroma's global 20 as the
@@ -2446,7 +2450,10 @@ fn page_link(base_url: &str, path: &str, entry_ids: &[Uuid]) -> Option<String> {
 /// (nobody boosts a boost), and in the renderer's flag lookups, where the
 /// same rule keys `favourited` and `reblogged`. The endpoints still answer
 /// the row the client named.
-const fn action_target_id(row: &status::Status) -> Uuid {
+///
+/// `pub(crate)` because the C2S outbox in [`crate::api::activitypub`] folds
+/// its posted `Like`s and `Announce`s with the very same rule.
+pub(crate) const fn action_target_id(row: &status::Status) -> Uuid {
     match row.reblog_of_id {
         Some(original) => original,
         None => row.id,

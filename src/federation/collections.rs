@@ -265,7 +265,10 @@ pub fn page_requested(query: Option<&str>) -> bool {
 /// the query string (a malformed one is the shared 400 `Invalid id`),
 /// with the collection's own page size — the size is the endpoint's, not
 /// the client's.
-fn keyset_page(query: Option<&str>, size: i64) -> AppResult<PageParams> {
+///
+/// `pub(crate)` so the C2S inbox route in [`crate::api::activitypub`]
+/// pages its 20-row collection with the same rules.
+pub(crate) fn keyset_page(query: Option<&str>, size: i64) -> AppResult<PageParams> {
     let parsed = PageParams::from_query(query, MAX_LIMIT)?;
     Ok(PageParams {
         limit: size,
@@ -297,7 +300,11 @@ fn full_page(counted: usize, size: i64) -> bool {
 /// page's oldest id while the page came back full, `prev` walks back
 /// toward the newest end from the page's newest id, and the page's `id`
 /// echoes the request.
-fn descending_page_links(
+///
+/// `pub(crate)` for the same reason as [`keyset_page`]: the C2S inbox
+/// page in [`crate::api::activitypub`] links itself exactly like an
+/// outbox page.
+pub(crate) fn descending_page_links(
     collection: &str,
     query: Option<&str>,
     newest: Option<Uuid>,
