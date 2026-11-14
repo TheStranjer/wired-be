@@ -170,6 +170,13 @@ mod follow_by_uri;
 /// delivery queue (`src/federation/handlers/follow.rs`).
 mod follow_federation;
 
+/// The outbound federation of the follow endpoints over HTTP (WBE-171): the
+/// `Follow` and its `Undo` the follow and unfollow writes deliver, the
+/// `Accept` / `Reject` the follow-request answers and a forced follower
+/// removal deliver, and the local pairs that deliver nothing
+/// (`src/services/federation_out.rs`).
+mod follow_federation_out;
+
 /// The follower and following lists of an account.
 mod follow_lists;
 

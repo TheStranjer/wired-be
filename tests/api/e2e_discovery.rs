@@ -424,11 +424,10 @@ async fn the_home_filter_hides_matches_from_home_alone() {
 }
 
 /// Scenario 2, the `public` filters: an irreversible public filter drops
-/// its match from the public page only, a warn (non-irreversible) filter
-/// of the same context hides its match from the page too — with no
-/// per-status `filtered` marker on a v1 listing, drop and hide are the
-/// same act — and deleting a filter or running past its expiry brings the
-/// rows back.
+/// its match from the public page, a warn (non-irreversible) filter of the
+/// same context only annotates its match — which therefore keeps riding
+/// the v1 page, its `filtered` array the telling — and deleting a filter
+/// or running past its expiry takes the drops away with it.
 #[tokio::test]
 async fn the_public_filters_drop_and_their_removal_restores() {
     let db = common::test_db().await;
@@ -453,11 +452,27 @@ async fn the_public_filters_drop_and_their_removal_restores() {
         json!({"phrase": "digest", "context": ["public"], "irreversible": true}),
     )
     .await;
-    let hidden = page_ids(&read(&app, &bob_token, PUBLIC).await);
+    let hidden_page = read(&app, &bob_token, PUBLIC).await;
     assert_eq!(
-        hidden,
-        vec![id_of(&kept)],
-        "both matching rows leave the public page, warn and irreversible alike"
+        page_ids(&hidden_page),
+        vec![id_of(&kept), id_of(&thread)],
+        "the irreversible filter drops its match; the warn filter's match \
+         stays on the page, annotated"
+    );
+    let warned_entry = hidden_page
+        .json_value()
+        .as_array()
+        .expect("a status listing is an array")
+        .iter()
+        .find(|status| status["id"] == json!(id_of(&thread)))
+        .expect("the warned row rides the page")
+        .clone();
+    assert!(
+        !warned_entry["filtered"]
+            .as_array()
+            .expect("filtered is an array")
+            .is_empty(),
+        "the warned row carries its `filtered` warning"
     );
     assert_eq!(
         listed_phrases(&read(&app, &bob_token, FILTERS).await),
@@ -475,7 +490,7 @@ async fn the_public_filters_drop_and_their_removal_restores() {
     assert_eq!(
         after_removal,
         vec![id_of(&kept), id_of(&thread)],
-        "the thread post came back with its filter gone"
+        "deleting the warn filter changes the page nothing: its match never left"
     );
 
     let expired = sqlx::query(

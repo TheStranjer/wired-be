@@ -31,9 +31,10 @@
 //! Answering is also the moment the resolver's own inbox is updated — an
 //! `authorize` replaces the request's `follow_request` notification with a
 //! `follow` one through this module's `after_follow_request_resolved` hook
-//! (see [`crate::services::notify`]) — and the moment federation will owe
-//! the requester an `Accept` or `Reject` activity; that is the federation
-//! ticket's job, and it lands in the same hook.
+//! (see [`crate::services::notify`]) — and the moment the requester is
+//! answered: the same hook hands the `Accept` (or `Reject`) to
+//! [`crate::services::federation_out`], which queues its delivery to a
+//! REMOTE follower's inbox and says nothing to a local one.
 //!
 //! [`follow::accept`]: crate::models::follow::accept
 //! [`follow::reject`]: crate::models::follow::reject
@@ -60,7 +61,7 @@ use crate::{
     },
     oauth::scopes::{FOLLOW, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
-    services::notify,
+    services::{federation_out, notify},
     state::AppState,
     util::id::parse_id,
 };
@@ -236,11 +237,13 @@ fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) ->
 /// Post-resolution hook of both answer routes: the notification telling the
 /// [`notify`] module owns runs through here — an
 /// accepted request replaces its `follow_request` telling with a `follow`
-/// one, a rejection says nothing new — and the federation ticket that sends
-/// `Accept` / `Reject` activities for answered follows wires its delivery
-/// into the same body: the `Follow` activity to answer is
-/// [`Follow::ap_id`], its sender [`Follow::follower_id`], and the queueing
-/// happens through `state` (decision 11).
+/// one, a rejection says nothing new — and so does the federation of the
+/// answer itself: [`crate::services::federation_out`] sends the `Accept` of
+/// an authorization and the `Reject` of a refusal through the delivery
+/// queue (decision 11). The `Follow` activity answered is
+/// [`Follow::ap_id`], its sender [`Follow::follower_id`]'s account, and a
+/// LOCAL requester's answer stays in the database: only a REMOTE follower
+/// is ever delivered to. The hook never fails the request.
 async fn after_follow_request_resolved(
     state: &AppState,
     resolver: &User,
@@ -248,4 +251,5 @@ async fn after_follow_request_resolved(
     granted: bool,
 ) {
     notify::on_follow_request_resolved(state, resolver, request, granted).await;
+    federation_out::after_follow_request_resolved(state, resolver, request, granted).await;
 }

@@ -227,9 +227,9 @@
 //! unknown or deactivated id is the usual 404, resolved ahead of the guard
 //! that answers the caller's *own* id with 422 `{"error":"Can not remove
 //! yourself from followers"}`. A follower actually removed is the moment
-//! federation will owe that account a `Reject` for its `Follow`; the later
-//! federation ticket wires the delivery into this module's
-//! `after_follower_removed` hook.
+//! federation answers that account a `Reject` for its `Follow`: this
+//! module's `after_follower_removed` hook sends it, through the delivery
+//! queue, to a REMOTE follower only.
 //!
 //! `POST /api/v1/accounts/{id}/follow` and `…/unfollow` are Pleroma's
 //! `AccountController.follow` and `.unfollow` over `MastodonAPI.follow` /
@@ -254,9 +254,9 @@
 //! idempotent) — the unchanged [`Relationship`] answers it with 200. Creating
 //! or withdrawing a follow is also the moment the followee is told — this
 //! module's `after_follow_changed` hook lands the
-//! [`notify`] module's follow telling — and the
-//! moment federation will owe the pair a `Follow` or its `Undo`; the later
-//! ticket wires that into the same hook.
+//! [`notify`] module's follow telling — and the moment a REMOTE followee is
+//! told too: the same hook hands the pair's `Follow` (or the `Undo` of it)
+//! to [`crate::services::federation_out`], which queues the delivery.
 //!
 //! `POST /api/v1/follows` is Pleroma's `AccountController.follow_by_uri`
 //! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`): the
@@ -396,7 +396,7 @@ use crate::{
     },
     pagination::{PageParams, link_header, set_link_header},
     services::{
-        notify,
+        federation_out, notify,
         render_status::render_statuses,
         timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     },
@@ -2016,7 +2016,7 @@ fn names_own_domain(config: &Config, mention: &MentionRef) -> bool {
 /// hook is cheap to fire from every accepted write; it never fails the
 /// request.
 pub(crate) async fn after_profile_updated(state: &AppState, user: &User) {
-    crate::services::federation_out::after_profile_updated(state, user).await;
+    federation_out::after_profile_updated(state, user).await;
 }
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or
@@ -2225,7 +2225,7 @@ async fn remove_from_followers(
             user = %auth.0.id,
             "follower removed"
         );
-        after_follower_removed(&state, &auth.0, row);
+        after_follower_removed(&state, &auth.0, row).await;
     }
     one_relationship(&state, auth.0.id, follower.id).await
 }
@@ -2254,15 +2254,16 @@ async fn one_relationship(
 }
 
 /// Post-removal hook of [`remove_from_followers`], run once per actually
-/// removed follower: the federation ticket that answers a dropped follower
-/// with a `Reject` for its `Follow` wires the delivery in here — the
-/// activity to reject is [`Follow::ap_id`], its sender [`Follow::follower_id`],
-/// and the queueing happens through `state` (decision 11).
-///
-/// Intentionally empty until then: Pleroma's `User.remove_follower`
-/// delivers the `Reject` inline, and this server's delivery queue is a
-/// later ticket.
-const fn after_follower_removed(_state: &AppState, _followee: &User, _removed: &Follow) {}
+/// removed follower: the write's remote half lands in
+/// [`crate::services::federation_out`], which answers a dropped REMOTE
+/// follower with the `Reject` of its `Follow` — the activity rejected is
+/// [`Follow::ap_id`], its sender [`Follow::follower_id`]'s account, and the
+/// queueing happens through `state` (decision 11). A local follower is
+/// settled in the database and hears nothing; the hook never fails the
+/// request.
+async fn after_follower_removed(state: &AppState, followee: &User, removed: &Follow) {
+    federation_out::after_follower_removed(state, followee, removed).await;
+}
 
 /// The request parameters of `POST /api/v1/accounts/{id}/follow`: Mastodon's
 /// two per-follow toggles, read from the query string, a form body or a JSON
@@ -2529,11 +2530,11 @@ async fn unfollow_account(
 
 /// Post-write hook of [`follow_account`] and [`unfollow_account`]: the
 /// notification telling the [`notify`] module owns
-/// runs through here, and the landing point of the `Follow` / `Undo`
-/// federation waits in the same body — the ticket that delivers them wires
-/// the queueing in here (decision 11): the activity to federate is
-/// `follow`'s [`Follow::ap_id`], its sender [`User::ap_id`] and its target
-/// [`Follow::followee_id`].
+/// runs through here, and so does the federation of the `Follow` / `Undo`:
+/// the write's remote half lands in [`crate::services::federation_out`],
+/// which builds the activity from `follow`'s [`Follow::ap_id`] with its
+/// maker's [`User::ap_id`] as actor and [`Follow::followee_id`]'s account as
+/// object and sole recipient, and queues the delivery (decision 11).
 ///
 /// `follow` is the relationship the write left behind (a `…/follow` always has
 /// one; a `…/unfollow` names the row it deleted and is `None` for a pair with
@@ -2541,6 +2542,9 @@ async fn unfollow_account(
 /// states which way the write moved the fact: `true` for the `Follow` a
 /// `…/follow` created or reopened, `false` for the `Undo` of the `Follow` a
 /// `…/unfollow` withdrew.
+///
+/// The hook never fails the request: both halves are fire-and-forget, and a
+/// pair whose followed account is local federates nothing at all.
 pub(crate) async fn after_follow_changed(
     state: &AppState,
     follower: &User,
@@ -2549,6 +2553,7 @@ pub(crate) async fn after_follow_changed(
     following: bool,
 ) {
     notify::on_follow(state, follower, target, follow, following).await;
+    federation_out::after_follow_changed(state, follower, target, follow, following).await;
 }
 
 /// `GET /api/v1/accounts/{id}/followers` — the accounts that follow `id`

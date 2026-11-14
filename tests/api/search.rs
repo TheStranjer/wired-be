@@ -1285,6 +1285,16 @@ impl MockPeer {
         format!("{}/users/zoe", self.base)
     }
 
+    /// The `host:port` authority of [`MockPeer::base`]: what the mirror
+    /// write puts into `user@domain` after the loopback `http://` scheme
+    /// (decision 7, port included — the fetch names the domain exactly).
+    fn authority(&self) -> String {
+        self.base
+            .strip_prefix("http://")
+            .expect("the mock origin is http loopback")
+            .to_owned()
+    }
+
     /// The object URL of fixture note `name`.
     fn object_url(&self, name: &str) -> String {
         format!("{}/objects/{name}", self.base)
@@ -1354,8 +1364,8 @@ async fn resolve_fetches_an_unknown_actor_by_url() {
     );
     assert_eq!(
         flat.json_value()[0]["acct"],
-        "zoe@127.0.0.1",
-        "the handle decision 7 stores the mirror under"
+        format!("zoe@{}", peer.authority()),
+        "the handle decision 7 stores the mirror under, loopback port included"
     );
 }
 
@@ -1405,8 +1415,9 @@ async fn resolve_fetches_a_remote_status_by_url() {
         "and its content"
     );
     assert_eq!(
-        entity["account"]["acct"], "zoe@127.0.0.1",
-        "rendered with its author"
+        entity["account"]["acct"],
+        format!("zoe@{}", peer.authority()),
+        "rendered with its author, port-carrying handle and all"
     );
 
     let repeat = get(
