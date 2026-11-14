@@ -499,7 +499,9 @@ mod tests {
         let default = serde_json::to_string(&Manifest::new(&Config::for_tests())).unwrap();
         assert!(
             default.contains(r#""name":"Wired""#)
-                && default.contains(r#""description":"A Pleroma-compatible instance""#),
+                && default.contains(
+                    r#""description":"A Wired instance, compatible with Pleroma clients""#
+                ),
             "the document reads name and description from config: {default}"
         );
     }

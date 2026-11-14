@@ -37,13 +37,10 @@ const SCHEMA_21: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
 /// The repository the 2.1 document advertises.
 const REPOSITORY: &str = "https://github.com/TheStranjer/wired-be";
 
-/// The software version Pleroma-compatible clients should see: the Pleroma
-/// release this interface replicates, commented with this crate's version.
+/// The software version a client should see: this crate's own version,
+/// naming the Pleroma release this interface is compatible with.
 fn software_version() -> String {
-    format!(
-        "2.10.2 (compatible; wired-be {})",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("{} (compatible; Pleroma 2.10.2)", env!("CARGO_PKG_VERSION"))
 }
 
 /// The top-level keys every `NodeInfo` document carries, as a parsed
@@ -127,7 +124,7 @@ fn keys_of(value: &Value) -> Vec<&str> {
 fn expected_document(version: &str) -> Value {
     let mut document = json!({
         "version": "2.0",
-        "software": { "name": "pleroma", "version": software_version() },
+        "software": { "name": "wired", "version": software_version() },
         "protocols": ["activitypub"],
         "services": { "inbound": [], "outbound": [] },
         "openRegistrations": true,
@@ -137,7 +134,7 @@ fn expected_document(version: &str) -> Value {
         },
         "metadata": {
             "nodeName": "Wired",
-            "nodeDescription": "A Pleroma-compatible instance",
+            "nodeDescription": "A Wired instance, compatible with Pleroma clients",
             "private": false,
             "suggestions": { "enabled": false },
             "staffAccounts": [],

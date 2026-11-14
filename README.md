@@ -1,6 +1,8 @@
 # wired-be
 
-An API-only backend built on [Axum](https://github.com/tokio-rs/axum), the Rust web framework. Its goal is to first replicate, and later expand upon, [Pleroma](https://pleroma.social/)'s backend.
+Wired's API-only backend, built on [Axum](https://github.com/tokio-rs/axum), the Rust web
+framework. Wired is explicitly compatible with [Pleroma](https://pleroma.social/)'s API:
+its goal is to first replicate, and later expand upon, Pleroma's backend.
 
 ## Requirements
 
@@ -18,7 +20,7 @@ All configuration comes from environment variables. For local development, copy 
 | `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` (no trailing slash) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
-| `INSTANCE_DESCRIPTION` | no | `A Pleroma-compatible instance` | Short instance description |
+| `INSTANCE_DESCRIPTION` | no | `A Wired instance, compatible with Pleroma clients` | Short instance description |
 | `CONTACT_EMAIL` | no | | Admin contact email |
 | `INSTANCE_LANGUAGES` | no | `en` | Comma-separated content language codes |
 | `MAX_STATUS_CHARS` | no | `5000` | Maximum characters per status; `POST /api/v1/statuses` counts them the way clients do (each bare URL is worth 23) and refuses a longer post with 422 `{"error":"The status is over the character limit"}` |

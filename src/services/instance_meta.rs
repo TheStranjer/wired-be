@@ -85,6 +85,45 @@ mod tests {
 
     use super::*;
 
+    /// The complete feature list, spelled out entry by entry in order.
+    /// The Pleroma compatibility surface is deliberate: a later cleanup
+    /// must change this test on purpose for a flag to leave the list.
+    #[test]
+    fn the_full_feature_list_is_pinned() {
+        assert_eq!(
+            features(),
+            &[
+                "pleroma_api",
+                "mastodon_api",
+                "mastodon_api_grouped_notifications",
+                "mastodon_api_streaming",
+                "polls",
+                "v2_suggestions",
+                "pleroma_explicit_addressing",
+                "shareable_emoji_packs",
+                "multifetch",
+                "pleroma:api/v1/notifications:include_types_filter",
+                "editing",
+                "quote_posting",
+                "blockers_visible",
+                "chat",
+                "shout",
+                "relay",
+                "pleroma_emoji_reactions",
+                "pleroma_custom_emoji_reactions",
+                "pleroma_chat_messages",
+                "pleroma:pin_chats",
+                "exposable_reactions",
+                "profile_directory",
+                "pleroma:get:main/ostatus",
+                "pleroma:group_actors",
+                "pleroma:bookmark_folders",
+                "pleroma:block_expiration",
+            ][..],
+            "every Pleroma-dialect flag stays advertised, in Pleroma's order"
+        );
+    }
+
     #[test]
     fn features_are_unique_and_hold_the_core_dialects() {
         let listed = features();

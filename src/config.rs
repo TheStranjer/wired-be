@@ -306,8 +306,9 @@ pub const TRUST_PROXY_HEADERS_VAR: &str = "TRUST_PROXY_HEADERS";
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4000";
 /// Instance name used when `INSTANCE_NAME` is unset.
 pub const DEFAULT_INSTANCE_NAME: &str = "Wired";
-/// Description used when `INSTANCE_DESCRIPTION` is unset.
-pub const DEFAULT_INSTANCE_DESCRIPTION: &str = "A Pleroma-compatible instance";
+/// Description used when `INSTANCE_DESCRIPTION` is unset. Wired is the
+/// subject; Pleroma is named only as what the server is compatible with.
+pub const DEFAULT_INSTANCE_DESCRIPTION: &str = "A Wired instance, compatible with Pleroma clients";
 /// Language list used when `INSTANCE_LANGUAGES` is unset.
 pub const DEFAULT_INSTANCE_LANGUAGES: &str = "en";
 /// Status length used when `MAX_STATUS_CHARS` is unset.
@@ -3185,7 +3186,7 @@ mod tests {
         assert_eq!(config.base_url, ORIGIN, "base_url");
         assert_eq!(config.instance_name, "Wired", "default instance_name");
         assert_eq!(
-            config.instance_description, "A Pleroma-compatible instance",
+            config.instance_description, "A Wired instance, compatible with Pleroma clients",
             "default instance_description"
         );
         assert_eq!(config.contact_email, None, "default contact_email");

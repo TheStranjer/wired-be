@@ -394,7 +394,7 @@ async fn manifest_is_the_ticket_document() {
     );
     assert_eq!(
         response.text(),
-        r##"{"name":"Wired","short_name":"Wired","description":"A Pleroma-compatible instance","display":"standalone","scope":"/","start_url":"/","icons":[{"src":"/static/logo.svg","sizes":"any","type":"image/svg+xml"}],"theme_color":"#282c37","background_color":"#191b22"}"##,
+        r##"{"name":"Wired","short_name":"Wired","description":"A Wired instance, compatible with Pleroma clients","display":"standalone","scope":"/","start_url":"/","icons":[{"src":"/static/logo.svg","sizes":"any","type":"image/svg+xml"}],"theme_color":"#282c37","background_color":"#191b22"}"##,
         "the exact manifest body"
     );
 }
