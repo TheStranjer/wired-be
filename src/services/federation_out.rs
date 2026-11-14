@@ -19,10 +19,18 @@
 //!   boost's own visibility, and its `Undo` when the boost is withdrawn;
 //!   reblogs of `local`-visibility statuses, like `local`-visibility
 //!   statuses themselves, never federate;
-//! - [`after_status_deleted`]: the withdrawal a status delete owes the
-//!   network — for a reblog row that is the `Undo` of its `Announce`, not a
-//!   `Delete`; the `Delete` of a plain status lands with the note-federation
-//!   ticket and steps in here beside this arm;
+//! - [`after_status_created`] / [`after_status_edited`] /
+//!   [`after_status_deleted`]: the note lifecycle of a status row — the
+//!   `Create` that carries it out when its author posts, the `Update` that
+//!   re-drafts it when its author edits it, and, on a delete, the
+//!   withdrawal the network is owed: the `Delete` of a tombstoned plain
+//!   status, or the `Undo` of the `Announce` a tombstoned reblog row was
+//!   (never both: a boost is withdrawn, not deleted). All three are built
+//!   from the documents [`crate::federation::note`] renders — the same
+//!   `Note` the object route serves and the same addressing rule — so what
+//!   leaves this instance is what a peer can read back from it, and a
+//!   `local`-visibility post or a post by a switched-off account never
+//!   leaves it at all;
 //! - [`after_profile_updated`]: an `Update` of the actor document after
 //!   `PATCH /api/v1/accounts/update_credentials`, delivered to the account's
 //!   remote followers' inboxes — Pleroma's
@@ -100,6 +108,7 @@ use crate::{
             emoji_react_json, flag_json, like_json, move_json, reject_json, remove_json, undo_json,
         },
         actor::actor_json,
+        note,
         publisher::{self, PublishOpts},
     },
     models::{
@@ -233,6 +242,13 @@ struct StatusAction {
 /// actor that is gone or not ours to publish as, a status that is gone or
 /// `local`-visibility (which never federates, whatever the action), or an
 /// author that is gone.
+///
+/// The author's `is_active` flag is not a gate here, as it is not one in
+/// [`note_withdrawal`]: every arm this feeds announces a fact about a
+/// status that already reached the network (or takes one back), and a peer
+/// that holds the copy has to hear about the change whichever flag the
+/// acting account now wears. A NEW post is the case the flag does gate —
+/// see [`note_publisher`].
 async fn status_action(state: &AppState, actor_id: Uuid, status_id: Uuid) -> Option<StatusAction> {
     let actor = load_user(state, actor_id).await?;
     if !actor.local.get() {
@@ -442,29 +458,234 @@ pub async fn after_reblog_changed(state: &AppState, reblog: &Status, reblogging:
     queue_activity(state, &action.actor, &document, "reblog").await;
 }
 
-/// Take the boost down when its row is deleted.
+/// Announce the status the caller just posted: the `Create` activity
+/// carrying the note as this instance federates it.
 ///
-/// The document is the `Undo` of the `Announce`, not a `Delete` — the
-/// original the boost named stands, and withdrawing the boost is the whole
-/// truth of the row. A deleted plain status answers nothing here yet: the
-/// `Delete` of a note (and the withdrawal of the reblogs that delete took
-/// down with it) is the note-federation ticket's activity, landing beside
-/// this arm.
+/// The document is [`note::note_json`] wrapped in
+/// [`note::create_activity_json`] — the very pair the `/objects/{uuid}` and
+/// `/activities/{id}` routes serve, so what a follower's instance receives
+/// and what it later fetches are one document — published as the status'
+/// author, whose followers collection and mentionees the note's own `to` and
+/// `cc` name and whom the publisher therefore expands. Nothing is added to
+/// the fan-out beside that: a reply to a REMOTE parent needs no special
+/// arm, because the parent's author rides in the mention list the note's
+/// addressing is built from, and a `direct` status addresses its mentionees
+/// alone, so the followers never hear it.
+///
+/// Silence is the answer of a mirrored row (a remote post belongs to its
+/// origin's `Create`), of a reblog row (decision 6 gives it the `Announce`
+/// of [`after_reblog_changed`]), of a `local`-visibility post, and of a post
+/// whose author is not one of our own active actors.
+pub async fn after_status_created(state: &AppState, status: &Status) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    let Some(author) = note_publisher(state, status).await else {
+        return;
+    };
+    let Some(document) = note_document(state, status.id, NoteActivity::Create).await else {
+        return;
+    };
+    queue_activity(state, &author, &document, "note").await;
+}
+
+/// Announce the edit the caller just wrote: the `Update` activity carrying
+/// the status' NEW note.
+///
+/// The document is the re-rendered [`note::note_json`] — content, warning,
+/// attachments and the `updated` stamp the row now carries — wrapped in
+/// [`note::update_activity_json`] under a freshly minted
+/// `{BASE_URL}/activities/{uuid}` id, and it travels under the addressing
+/// the note itself states: the same audience the `Create` reached, so an
+/// edit corrects the copy at exactly the instances that hold one. The hook
+/// is handed the *pre-edit* row, which is why the document is re-read by id
+/// rather than built from the argument.
+///
+/// A `local`-visibility, mirrored or reblog row and a gone or
+/// non-publishing author answer with silence, as in
+/// [`after_status_created`].
+pub async fn after_status_edited(state: &AppState, status: &Status) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    let Some(author) = note_publisher(state, status).await else {
+        return;
+    };
+    let Some(document) = note_document(state, status.id, NoteActivity::Update).await else {
+        return;
+    };
+    queue_activity(state, &author, &document, "note edit").await;
+}
+
+/// The two shapes [`note_document`] wraps a status' live note into: the
+/// `Create` that first announces it and the `Update` that re-drafts it,
+/// which differ only in the wrapper they put on the same document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoteActivity {
+    /// The status' `Create`: the note wrapped by
+    /// [`note::create_activity_json`] under the deterministic
+    /// `{BASE_URL}/activities/{status id}` id.
+    Create,
+    /// The edited status' `Update`: the note wrapped by
+    /// [`note::update_activity_json`] under a freshly minted activity id.
+    Update,
+}
+
+/// The status' live note, wrapped in the lifecycle activity `kind` names,
+/// and `None` (logged) when there is nothing to announce: the row or its
+/// author died between the write and this read, or the row wears a
+/// visibility [`note::note_json`] refuses to render.
+async fn note_document(state: &AppState, status_id: Uuid, kind: NoteActivity) -> Option<Value> {
+    let ctx = match note::load_note_context(&state.db, &state.config, status_id).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            warn!(
+                %err,
+                status = %status_id,
+                "note federation could not read the status document"
+            );
+            return None;
+        }
+    };
+    let note = note::note_json(&ctx)?;
+    let document = match kind {
+        NoteActivity::Create => note::create_activity_json(&note, &ctx.status, &state.config),
+        NoteActivity::Update => note::update_activity_json(&note, new_id(), &state.config),
+    };
+    Some(document)
+}
+
+/// The author of a status this instance may announce as a note, `None` when
+/// the row is not its business: a mirrored row (its origin sent the
+/// `Create`), a reblog row (decision 6: its activity is the `Announce`
+/// [`after_reblog_changed`] sends), a `local`-visibility post (which never
+/// left the database), a gone author, an author that is not one of our own,
+/// or an author switched off — a deactivated account's new post stays inside
+/// this instance, the way the ingest fold refuses to store a live post for
+/// one.
+async fn note_publisher(state: &AppState, status: &Status) -> Option<User> {
+    if !federates_as_note(status) {
+        return None;
+    }
+    let author = load_user(state, status.user_id).await?;
+    (author.local.get() && author.is_active.get()).then_some(author)
+}
+
+/// Whether a status row is the kind this instance sends note activities
+/// for: one it owns, a plain post rather than a boost, and a visibility
+/// that reaches past this instance.
+const fn federates_as_note(status: &Status) -> bool {
+    status.local && status.reblog_of_id.is_none() && !matches!(status.visibility, Visibility::Local)
+}
+
+/// Take the boost down when its row is deleted, or the post itself.
+///
+/// The two arms answer the two kinds of row: a deleted REBLOG withdraws
+/// itself with the `Undo` of the `Announce` it was (never a `Delete` — the
+/// original it named stands), and a deleted plain status is taken off the
+/// network with the `Delete` of its note, whose object is the `Tombstone` the
+/// object route serves at that uri from here on.
+///
+/// One call announces the one row the delete service hands over: the reblogs
+/// that `status::soft_delete_with_reblogs` tombstones along with a deleted
+/// original go down unannounced — a boost is withdrawn by the delete of the
+/// boost, and a delete of the post it boosted is not that withdrawal.
 pub async fn after_status_deleted(state: &AppState, deleted: &Status) {
     if !state.config.federation_enabled.get() {
         return;
     }
-    let Some(original_id) = deleted.reblog_of_id else {
-        return; // the plain status' `Delete` is the note ticket's to send
-    };
+    match deleted.reblog_of_id {
+        Some(original_id) => boost_withdrawal(state, deleted, original_id).await,
+        None => note_withdrawal(state, deleted).await,
+    }
+}
+
+/// The `Undo` of the `Announce` a deleted reblog row was.
+///
+/// A `local`-visibility boost never went out, so nothing is withdrawn, and
+/// the rest of the refusals are [`status_action`]'s: an actor that is gone
+/// or not ours, an original that has died in the meantime.
+async fn boost_withdrawal(state: &AppState, deleted: &Status, original_id: Uuid) {
     if deleted.visibility == Visibility::Local {
-        return; // a local-only boost never went out, so nothing is withdrawn
+        return; // a local-only boost stays local
     }
     let Some(action) = status_action(state, deleted.user_id, original_id).await else {
         return;
     };
     let document = reblog_activity(state, deleted, &action, true);
     queue_activity(state, &action.actor, &document, "boost withdrawal").await;
+}
+
+/// The `Delete` of a deleted plain status: the reserved object id as a
+/// `Tombstone`, under the deterministic
+/// `{BASE_URL}/activities/delete-{status id}` id and the addressing the
+/// status itself travelled with.
+///
+/// The audience is the part that cannot be re-read: the live row is a
+/// tombstone by the time this runs ([`note::load_note_context`] answers one
+/// with a miss), so the two lines come from [`note::address_lines`] run over
+/// the pre-delete row the delete service holds and the mention links still
+/// attached to it — the very rule that wrote the note's own `to` and `cc`,
+/// which is what makes the withdrawal reach exactly the inboxes that hold
+/// the post and no others. A `direct` post's `Delete` therefore goes to its
+/// mentionees alone; a public one's to the author's remote followers.
+///
+/// The author's `is_active` flag is deliberately not a gate here, unlike
+/// [`note_publisher`]'s: a withdrawal is not a post going out but a copy
+/// coming down, and a peer that still holds the note of a since-deactivated
+/// account has to learn it is gone.
+async fn note_withdrawal(state: &AppState, deleted: &Status) {
+    if !federates_as_note(deleted) {
+        return;
+    }
+    let Some(author) = load_user(state, deleted.user_id).await else {
+        return;
+    };
+    if !author.local.get() {
+        return; // a mirror's row belongs to its own instance's history
+    }
+    let mentions = match note::load_mentions(&state.db, deleted).await {
+        Ok(mentions) => mentions,
+        Err(err) => {
+            warn!(
+                %err,
+                status = %deleted.id,
+                "note withdrawal could not read the status' audience"
+            );
+            return;
+        }
+    };
+    let (to, cc) = note::address_lines(deleted.visibility, &author, &mentions);
+    let row = withdrawn_row(state, deleted).await;
+    let document = note::delete_activity_json(&note::NoteDeletion {
+        config: &state.config,
+        status: &row,
+        actor_ap_id: &author.ap_id,
+        to: &to,
+        cc: &cc,
+    });
+    queue_activity(state, &author, &document, "note withdrawal").await;
+}
+
+/// The row as the delete left it, for the `Tombstone` to report: the
+/// database's own, whose `deleted_at` is the instant the withdrawal names
+/// and whose document is the one `/objects/{uuid}` answers with beside its
+/// `410`. The snapshot the caller holds stands in for it when the row cannot
+/// be re-read at all — a purge between the delete and this hook — leaving
+/// [`note::tombstone_json`] to report that row's last write instead.
+async fn withdrawn_row(state: &AppState, deleted: &Status) -> Status {
+    match status::get_by_id_including_deleted(&state.db, deleted.id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => deleted.clone(),
+        Err(err) => {
+            warn!(
+                %err,
+                status = %deleted.id,
+                "note withdrawal could not re-read the tombstoned row"
+            );
+            deleted.clone()
+        }
+    }
 }
 
 /// The `Announce` behind the reblog row `reblog`, in the undo arm wrapped
@@ -533,7 +754,7 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
 /// addressed to the public and to the account's followers collection.
 fn update_document(state: &AppState, account: &User, followers_collection: &str) -> Value {
     json!({
-        "@context": crate::federation::note::json_ld_context(&state.config),
+        "@context": note::json_ld_context(&state.config),
         "id": activity_id(&state.config, new_id()),
         "type": "Update",
         "actor": account.ap_id,
@@ -718,7 +939,7 @@ fn delete_document(state: &AppState, account: &User) -> Value {
         .clone()
         .unwrap_or_else(|| format!("{}/followers", account.ap_id));
     json!({
-        "@context": crate::federation::note::json_ld_context(&state.config),
+        "@context": note::json_ld_context(&state.config),
         "id": id,
         "type": "Delete",
         "actor": account.ap_id,
@@ -1203,6 +1424,9 @@ mod tests {
         let report_row = filed(&pool, &alice, &bob, &filing("unheard", true, Vec::new())).await;
         let state = state_with(&pool, unfederated());
 
+        after_status_created(&state, &own).await;
+        after_status_edited(&state, &own).await;
+        after_status_deleted(&state, &own).await;
         after_block_changed(&state, &row, false).await;
         after_profile_updated(&state, &alice).await;
         after_account_deleted(&state, &alice).await;
@@ -2061,8 +2285,8 @@ mod tests {
     }
 
     /// Deleting a local reblog row sends the `Undo` of its `Announce` —
-    /// never a `Delete` — and a deleted plain status federates nothing
-    /// here yet: the note's `Delete` is the other ticket's activity.
+    /// never a `Delete` — and a deleted plain status answers the other way
+    /// round: the `Delete` of its note, and no `Undo` beside it.
     #[tokio::test]
     async fn deleting_a_reblog_row_sends_the_undo_instead_of_a_delete() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -2081,15 +2305,24 @@ mod tests {
         after_status_deleted(&state, &reblog).await;
         after_status_deleted(&state, &doomed).await;
 
-        let activity = the_single_activity(&pool).await;
-        assert_eq!(activity["type"], "Undo", "the boost withdrawal is an Undo");
-        assert_eq!(activity["object"]["type"], "Announce");
-        assert_eq!(activity["object"]["id"], reblog.uri);
+        let jobs = publish_jobs(&pool).await;
         assert_eq!(
-            publish_jobs(&pool).await.len(),
-            1,
-            "and the plain status sent nothing: its Delete waits for its ticket"
+            jobs.len(),
+            2,
+            "the boost withdraws itself and the plain status is deleted"
         );
+        let undo = queued_activity(&jobs, "Undo");
+        assert_eq!(undo["object"]["type"], "Announce");
+        assert_eq!(
+            undo["object"]["id"], reblog.uri,
+            "a boost is never a Delete"
+        );
+        let delete = queued_activity(&jobs, "Delete");
+        assert_eq!(
+            delete["object"]["type"], "Tombstone",
+            "and a plain status is never an Undo"
+        );
+        assert_eq!(delete["object"]["id"], doomed.uri);
     }
 
     /// A boost of a `local`-visibility original never federates, and
@@ -2716,5 +2949,473 @@ mod tests {
         after_pin_changed(&state, &mirrored_pin, false).await;
 
         assert_eq!(job_count(&pool).await, 0, "neither row is ours to tell");
+    }
+
+    // ───────────────  the note lifecycle  ───────────────
+
+    /// A remote mirror `nickname@peer.example`, shared inbox included: the
+    /// second host the fan-out tests need beside [`remote`]'s one, so a
+    /// delivery set proves the followers' expansion crosses instances.
+    async fn peer(pool: &PgPool, nickname: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("{nickname}@peer.example"),
+                ap_id: format!("https://peer.example/users/{nickname}"),
+                local: Flag::new(false),
+                domain: Some("peer.example".to_owned()),
+                inbox: Some(format!("https://peer.example/users/{nickname}/inbox")),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                public_key: Some("PUB".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the peer fixture inserts")
+    }
+
+    /// A local post by `author` of `text`, seen as `visibility`.
+    async fn local_post(
+        pool: &PgPool,
+        author: &User,
+        text: &str,
+        visibility: Visibility,
+    ) -> Status {
+        status::insert(
+            pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                visibility,
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("the local post fixture inserts")
+    }
+
+    /// The edit the route just wrote, applied straight to `posted`: the new
+    /// text in both its spellings and the `edited_at` stamp
+    /// [`crate::models::status_edit`] marks with. The test's stand-in for
+    /// the edit transaction, so the hook runs on a row in the state a real
+    /// edit leaves behind.
+    async fn apply_edit(pool: &PgPool, posted: &Status, html: &str, text: &str) {
+        let updated = sqlx::query(
+            "UPDATE statuses SET content = $2, raw_text = $3, edited_at = now(), \
+                updated_at = now() WHERE id = $1",
+        )
+        .bind(posted.id)
+        .bind(html)
+        .bind(text)
+        .execute(pool)
+        .await
+        .expect("the edit fixture writes");
+        assert_eq!(updated.rows_affected(), 1, "the post is there to edit");
+    }
+
+    /// Switches an account off the way a deactivation or suspension does.
+    async fn deactivate(pool: &PgPool, account: &User) {
+        let updated = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(account.id)
+            .execute(pool)
+            .await
+            .expect("the deactivation fixture writes");
+        assert_eq!(
+            updated.rows_affected(),
+            1,
+            "the account is there to switch off"
+        );
+    }
+
+    /// Creating a public post for an account with followers on two remote
+    /// hosts queues the exact `Create` the object route serves — the
+    /// document and the status-derived id decision 6 pins — and the fan-out
+    /// POSTs it to each host's shared inbox once.
+    #[tokio::test]
+    async fn a_public_post_publishes_the_create_to_the_remote_followers() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        let dave = peer(&pool, "dave").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        accepted_follow(&pool, &dave, &alice).await;
+        let posted = local_post(&pool, &alice, "hello world", Visibility::Public).await;
+        let state = app_state(&pool);
+
+        after_status_created(&state, &posted).await;
+
+        let config = Config::for_tests();
+        let ctx = note::load_note_context(&pool, &config, posted.id)
+            .await
+            .expect("the note context reads");
+        let note = note::note_json(&ctx).expect("a public note renders");
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(
+            activity,
+            note::create_activity_json(&note, &posted, &config),
+            "the queued document is exactly the `Create` of the served note"
+        );
+        assert_eq!(activity["type"], "Create");
+        assert_eq!(
+            activity["id"],
+            format!("{TEST_BASE_URL}/activities/{}", posted.id),
+            "the activity id is the status' own — the address the C2S create promises"
+        );
+        assert_eq!(activity["actor"], alice.ap_id, "the author publishes");
+        assert_eq!(activity["to"], json!([PUBLIC]));
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id)]),
+            "the followers collection rides cc, and the publisher expands it"
+        );
+        assert_eq!(activity["object"]["id"], posted.uri);
+        assert_eq!(activity["published"], mastodon_time(&posted.inserted_at));
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://peer.example/inbox", "https://remote.example/inbox"],
+            "each host is posted to once, at its shared inbox"
+        );
+    }
+
+    /// A reply to a REMOTE parent needs no special arm: the parent's author
+    /// rides the note's `cc` (the mention list the document is built from
+    /// carries them), and the fan-out reaches their personal inbox beside
+    /// the followers' shared one.
+    #[tokio::test]
+    async fn a_reply_addresses_the_remote_parent_author() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let parent = remote_status(&pool, &bob, "parent-to-answer", Visibility::Public).await;
+        let reply = status::insert(
+            &pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                in_reply_to_id: Some(parent.id),
+                in_reply_to_account_id: Some(bob.id),
+                ..NewStatus::local(&alice, "answering you")
+            },
+        )
+        .await
+        .expect("the reply fixture inserts");
+        let state = app_state(&pool);
+
+        after_status_created(&state, &reply).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Create");
+        assert_eq!(activity["to"], json!([PUBLIC]));
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id), bob.ap_id]),
+            "the parent's author stands in the reply's cc line"
+        );
+        assert_eq!(
+            activity["object"]["inReplyTo"], parent.uri,
+            "and the object names the parent it answers"
+        );
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![
+                "https://remote.example/inbox",
+                "https://remote.example/users/bob/inbox",
+            ],
+            "the follower's shared inbox and the parent author's personal one"
+        );
+    }
+
+    /// A `direct` post is addressed to its mentionees alone: the note's `to`
+    /// names the remote account, `cc` is empty, and the author's followers —
+    /// remote included — hear nothing at all.
+    #[tokio::test]
+    async fn a_direct_post_goes_only_to_the_mentioned() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let dm = status::insert(
+            &pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                visibility: Visibility::Direct,
+                mentioned_user_ids: vec![bob.id],
+                ..NewStatus::local(&alice, "a private word")
+            },
+        )
+        .await
+        .expect("the direct fixture inserts");
+        let state = app_state(&pool);
+
+        after_status_created(&state, &dm).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Create");
+        assert_eq!(
+            activity["to"],
+            json!([bob.ap_id]),
+            "the recipient is the whole audience"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([]),
+            "no followers collection rides along"
+        );
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://remote.example/users/bob/inbox"],
+            "the mentioned account's personal inbox, and the follower is not told"
+        );
+    }
+
+    /// An edit queues the `Update` carrying the re-drafted note: a freshly
+    /// minted activity id (never the `Create`'s), the same reserved object
+    /// uri inside, the new text with its `updated` stamp, and the status'
+    /// own addressing so the copy every host holds is the one corrected.
+    #[tokio::test]
+    async fn an_edit_publishes_the_update_of_the_new_note() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let posted = local_post(&pool, &alice, "first draft", Visibility::Public).await;
+        let before = posted.clone();
+        apply_edit(&pool, &posted, "<p>second draft</p>", "second draft").await;
+        let state = app_state(&pool);
+
+        after_status_edited(&state, &before).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Update");
+        assert_eq!(activity["actor"], alice.ap_id);
+        let id = activity["id"].as_str().expect("the update carries an id");
+        assert!(
+            id.starts_with(&format!("{TEST_BASE_URL}/activities/")),
+            "a fresh own-instance activity id: {id}"
+        );
+        assert_ne!(
+            id,
+            format!("{TEST_BASE_URL}/activities/{}", posted.id),
+            "an edit is its own activity, not a restatement of the create"
+        );
+        assert_eq!(
+            activity["object"]["id"], posted.uri,
+            "the object is the same reserved uri the create carried"
+        );
+        assert_eq!(
+            activity["object"]["content"], "<p>second draft</p>",
+            "and it is the NEW note, read back after the write"
+        );
+        assert!(
+            activity["object"]["updated"].is_string(),
+            "the re-drafted note carries its edit stamp"
+        );
+        assert_eq!(
+            activity["to"],
+            json!([PUBLIC]),
+            "the addressing is the status' own"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id)]),
+            "both lines"
+        );
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://remote.example/inbox"],
+            "the host holding a copy is the host that hears about the edit"
+        );
+    }
+
+    /// Deleting a post through the shared deletion service queues the
+    /// `Delete` whose object is the status' `Tombstone`, under the
+    /// deterministic id the ticket pins and the addressing the post
+    /// travelled with — the withdrawal reaches exactly the hosts that hold
+    /// a copy, and a retried delete names the same activity.
+    #[tokio::test]
+    async fn a_delete_publishes_the_delete_with_its_tombstone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let doomed = local_post(&pool, &alice, "here today", Visibility::Public).await;
+        let state = app_state(&pool);
+
+        let withdrawn = crate::services::delete_status::delete_status(&state, &doomed)
+            .await
+            .expect("the deletion service runs");
+        assert!(withdrawn, "the row was live and went");
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Delete");
+        assert_eq!(
+            activity["id"],
+            format!("{TEST_BASE_URL}/activities/delete-{}", doomed.id),
+            "the deterministic withdrawal id"
+        );
+        assert_eq!(
+            activity["actor"], alice.ap_id,
+            "the author takes the post down"
+        );
+        assert_eq!(
+            activity["to"],
+            json!([PUBLIC]),
+            "the addressing the post carried"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id)]),
+            "both of its lines"
+        );
+        assert_eq!(
+            activity["object"]["id"], doomed.uri,
+            "the reserved object id"
+        );
+        assert_eq!(activity["object"]["type"], "Tombstone");
+        assert_eq!(activity["object"]["formerType"], "Note");
+        let gone = status::get_by_id_including_deleted(&pool, doomed.id)
+            .await
+            .expect("the tombstone reads")
+            .expect("the row is still stored, tombstoned");
+        assert_eq!(
+            activity["object"]["deleted"],
+            mastodon_time(&gone.deleted_at.expect("the delete stamped its instant")),
+            "the withdrawal reports the delete's own moment — the same one the \
+             `/objects/{{uuid}}` route answers beside its 410"
+        );
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://remote.example/inbox"],
+            "the withdrawal goes exactly where the post went"
+        );
+    }
+
+    /// `local` visibility is the outright refusal, in every direction: none
+    /// of the three lifecycle hooks queues a job for such a post, and none
+    /// of them expands the followers collection either.
+    #[tokio::test]
+    async fn a_local_visibility_note_federates_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let hidden = local_post(&pool, &alice, "instance only", Visibility::Local).await;
+        let state = app_state(&pool);
+
+        after_status_created(&state, &hidden).await;
+        after_status_edited(&state, &hidden).await;
+        after_status_deleted(&state, &hidden).await;
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "a local-visibility post moves no queue at all"
+        );
+    }
+
+    /// A post whose whole audience is local is still announced — the
+    /// publisher just finds no inbox to announce it to: a local follower's
+    /// timeline is the delivery, and no HTTP job is ever queued.
+    #[tokio::test]
+    async fn local_followers_receive_no_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let neighbour = local(&pool, "neighbour").await;
+        accepted_follow(&pool, &neighbour, &alice).await;
+        let posted = local_post(&pool, &alice, "for our own eyes", Visibility::Public).await;
+        let state = app_state(&pool);
+
+        after_status_created(&state, &posted).await;
+        assert_eq!(
+            publish_jobs(&pool).await.len(),
+            1,
+            "the note itself is announced"
+        );
+
+        run_publishes(&state, &pool).await;
+        assert!(
+            delivered_inboxes(&pool).await.is_empty(),
+            "and the fan-out names no inbox"
+        );
+    }
+
+    /// An account that is switched off posts nothing and corrects nothing:
+    /// both arms of the announce side refuse it. The withdrawal of a post it
+    /// made while it was live still goes out — the peers that hold a copy
+    /// have to learn it is gone, which is the whole point of the `Delete`.
+    #[tokio::test]
+    async fn a_switched_off_author_announces_no_new_post() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let posted = local_post(&pool, &alice, "before the freeze", Visibility::Public).await;
+        deactivate(&pool, &alice).await;
+        let state = app_state(&pool);
+
+        after_status_created(&state, &posted).await;
+        after_status_edited(&state, &posted).await;
+        assert!(
+            publish_jobs(&pool).await.is_empty(),
+            "a deactivated account's post neither goes out nor is re-drafted"
+        );
+
+        after_status_deleted(&state, &posted).await;
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(
+            activity["type"], "Delete",
+            "the withdrawal is not held back by the flag"
+        );
+    }
+
+    /// The note hooks speak for local plain posts only: a mirrored row —
+    /// which the ingest path runs through this very hook — and a reblog row,
+    /// whose activity is the `Announce` of [`after_reblog_changed`], are both
+    /// silence.
+    #[tokio::test]
+    async fn a_mirror_and_a_boost_publish_no_note_activities() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let mirrored = remote_status(&pool, &bob, "mirror-note", Visibility::Public).await;
+        let original = local_post(&pool, &alice, "boost me", Visibility::Public).await;
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &original, Visibility::Public)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_status_created(&state, &mirrored).await;
+        after_status_edited(&state, &mirrored).await;
+        after_status_deleted(&state, &mirrored).await;
+        after_status_created(&state, &reblog).await;
+        after_status_edited(&state, &reblog).await;
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "neither a mirror's note nor a boost row is announced as a note"
+        );
     }
 }

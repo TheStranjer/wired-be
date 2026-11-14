@@ -38,7 +38,9 @@
 //!   overwrite the mirrored ones through [`poll::record_remote_totals`] (and
 //!   a `Question` that arrived without a poll grows one through the create
 //!   path's poll writer), and the edit route's `after_status_edited`
-//!   hook — the boosters' telling — runs from here exactly as it runs from
+//!   hook — the boosters' telling, and the `Update` a local post would
+//!   federate (a mirrored row is its origin's to announce, so that half of
+//!   the hook stays silent here) — runs from here exactly as it runs from
 //!   there.
 //! * [`delete_note`], the `delete_by_object_type` entry for those four types
 //!   plus `Tombstone` and the registry's `Delete` fallback, resolves the

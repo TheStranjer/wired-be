@@ -12,10 +12,13 @@
 //! separate async reader that fills that context from the database.
 //!
 //! [`create_activity_json`] wraps an object in its `Create`,
-//! [`announce_activity_json`] renders a reblog row as the `Announce` it
-//! federates as (decision 6: the reblog *is* the activity, and its stored
-//! `uri` is the activity id), and [`tombstone_json`] is what a deleted
-//! status becomes. [`litepub_context_json`] is the JSON-LD schema document
+//! [`update_activity_json`] the same object re-drafted as an `Update` after
+//! an edit, [`delete_activity_json`] the row's [`tombstone_json`] as the
+//! `Delete` that withdraws it, [`announce_activity_json`] renders a reblog
+//! row as the `Announce` it federates as (decision 6: the reblog *is* the
+//! activity, and its stored `uri` is the activity id), and
+//! [`tombstone_json`] is what a deleted status becomes.
+//! [`litepub_context_json`] is the JSON-LD schema document
 //! every one of these references from its `@context`, served at
 //! [`LITEPUB_SCHEMA_PATH`] by [`crate::api::activitypub`].
 //!
@@ -61,6 +64,10 @@ const TYPE_NOTE: &str = "Note";
 const TYPE_QUESTION: &str = "Question";
 /// The type of a `Create` activity.
 const TYPE_CREATE: &str = "Create";
+/// The type of an edit's activity.
+const TYPE_UPDATE: &str = "Update";
+/// The type of a status withdrawal's activity.
+const TYPE_DELETE: &str = "Delete";
 /// The type of a reblog's activity.
 const TYPE_ANNOUNCE: &str = "Announce";
 /// The type of a deleted status's replacement document.
@@ -251,16 +258,33 @@ fn status_url(status: &Status) -> &str {
     status.url.as_deref().unwrap_or(status.uri.as_str())
 }
 
-/// The `to` and `cc` arrays `ctx`'s visibility addresses: `public` talks
-/// to the world and shows the post in the author's followers' timelines,
+/// The `to` and `cc` arrays `ctx`'s visibility addresses, as
+/// [`address_lines`] spells them from the three facts a note's audience
+/// rests on.
+fn addressing(ctx: &NoteContext) -> (Vec<Value>, Vec<Value>) {
+    address_lines(ctx.status.visibility, &ctx.author, &ctx.mentions)
+}
+
+/// The `to` and `cc` lines one visibility addresses: `public` talks to the
+/// world and shows the post in the author's followers' timelines,
 /// `unlisted` inverts the pair, `private` reaches only followers and
 /// mentionees, `direct` only mentionees — and `local` addresses nothing,
 /// which [`note_json`] has already refused to render. Mentioned accounts
 /// dedupe by actor id, keeping first-mention order.
-fn addressing(ctx: &NoteContext) -> (Vec<Value>, Vec<Value>) {
-    let followers_addr = json!(followers(&ctx.author.ap_id));
-    let mentioned = mention_addresses(&ctx.mentions);
-    match ctx.status.visibility {
+///
+/// The rule is [`addressing`]'s own, offered apart from the note render for
+/// the documents that must travel exactly where the note travelled but are
+/// not built from a live row: the `Delete` of a status recomputes these two
+/// lines from the row it held before the delete took it down, so the
+/// withdrawal reaches the very inboxes the post reached and no other.
+pub(crate) fn address_lines(
+    visibility: Visibility,
+    author: &User,
+    mentions: &[User],
+) -> (Vec<Value>, Vec<Value>) {
+    let followers_addr = json!(followers(&author.ap_id));
+    let mentioned = mention_addresses(mentions);
+    match visibility {
         Visibility::Public => (vec![json!(AS_PUBLIC)], prepend(followers_addr, mentioned)),
         Visibility::Unlisted => (vec![followers_addr], prepend(json!(AS_PUBLIC), mentioned)),
         Visibility::Private => (prepend(followers_addr, mentioned), Vec::new()),
@@ -470,6 +494,92 @@ pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> V
     })
 }
 
+/// The `Update` activity re-drafting an edited status: the new note as its
+/// object, under the addressing the note itself carries.
+///
+/// Like [`create_activity_json`] this is a copy of the object's own `actor`,
+/// `to` and `cc` (Pleroma's `Builder.update` follows the object's recipients
+/// for a status), so a re-draft travels to exactly the audience the post has
+/// and the two documents can never disagree about who they reached.
+///
+/// The activity id is a FRESH one, not the `Create`'s: an edit is its own
+/// activity, keyed on its own id (decision 6, [`activity_id`]'s shape),
+/// while what it revises is named from inside — the object's reserved
+/// `{BASE_URL}/objects/{uuid}` uri is the address a peer replaces. And the
+/// activity carries no `published` of its own for the same reason the
+/// withdrawal below carries none: the moment of the edit is the object's
+/// `updated` fact, which is what a reader of the re-draft reads.
+///
+/// [`activity_id`]: crate::federation::activities::activity_id
+#[must_use]
+pub fn update_activity_json(note: &Value, id: Uuid, config: &Config) -> Value {
+    json!({
+        "@context": json_ld_context(config),
+        "id": format!("{}/activities/{id}", config.base_url),
+        "type": TYPE_UPDATE,
+        "actor": note.get("actor").cloned().unwrap_or(Value::Null),
+        "to": note.get("to").cloned().unwrap_or_else(|| json!([])),
+        "cc": note.get("cc").cloned().unwrap_or_else(|| json!([])),
+        "object": note,
+    })
+}
+
+/// Everything [`delete_activity_json`] renders one status withdrawal from:
+/// the row as the delete left it, the author announcing it, and the two
+/// addressing lines the status travelled under.
+///
+/// The addressing rides in as the caller's already-rendered lines because it
+/// is not this document's to compute: the row behind it is a tombstone by the
+/// time a withdrawal is built, so the lines come out of the note builder's
+/// own addressing rule run over the status as it stood *before* the delete —
+/// which is what makes the withdrawal reach exactly the inboxes that hold the
+/// post.
+#[derive(Debug)]
+pub struct NoteDeletion<'a> {
+    /// The instance whose origin mints the activity id.
+    pub config: &'a Config,
+    /// The deleted status: the reserved `uri` the `Tombstone` names, and
+    /// the id the deterministic activity id is built from.
+    pub status: &'a Status,
+    /// The author's actor id — the `Delete`'s actor, the account whose key
+    /// the delivery signs with.
+    pub actor_ap_id: &'a str,
+    /// The primary addressing line, as the note builder's rule rendered it.
+    pub to: &'a [Value],
+    /// The copy line, as the note builder's rule rendered it.
+    pub cc: &'a [Value],
+}
+
+/// The `Delete` activity withdrawing a status: the row's `Tombstone` as its
+/// object, under the deterministic `{BASE_URL}/activities/delete-{status id}`
+/// id.
+///
+/// Mastodon accepts the bare uri too, and Pleroma's `Builder.delete` writes
+/// that plain reference, but the `Tombstone` is what this instance serves at
+/// that uri from the delete onwards, so a peer's copy and its fetch agree.
+///
+/// The id is derived rather than minted because the row's id is unique and
+/// never reused: every (re)run of one delete announces the same activity,
+/// and the delivery queue's per-activity, per-inbox dedup swallows a retry.
+/// The activity carries no `published` of its own — the moment the post went
+/// is the object's `deleted` fact, which is what a reader of the tombstone
+/// is after.
+#[must_use]
+pub fn delete_activity_json(deletion: &NoteDeletion<'_>) -> Value {
+    json!({
+        "@context": json_ld_context(deletion.config),
+        "id": format!(
+            "{}/activities/delete-{}",
+            deletion.config.base_url, deletion.status.id
+        ),
+        "type": TYPE_DELETE,
+        "actor": deletion.actor_ap_id,
+        "object": tombstone_json(deletion.status),
+        "to": deletion.to,
+        "cc": deletion.cc,
+    })
+}
+
 /// The `Announce` a reblog row federates as.
 ///
 /// Its own stored `uri` is already the `{BASE_URL}/activities/{id}` address
@@ -592,7 +702,12 @@ async fn parent_uri(pool: &PgPool, status: &Status) -> AppResult<Option<String>>
 /// appended when the post answers them without naming them — Pleroma
 /// addresses a reply's parent author the same way, and the addressing
 /// rules of [`note_json`] read it off this list.
-async fn load_mentions(pool: &PgPool, status: &Status) -> AppResult<Vec<User>> {
+///
+/// The reader is `pub(crate)` for the one document that repeats a status'
+/// audience without rendering the status: the `Delete` a withdrawal sends
+/// over the mention links of a row the database no longer answers for
+/// ([`crate::services::federation_out::after_status_deleted`]).
+pub(crate) async fn load_mentions(pool: &PgPool, status: &Status) -> AppResult<Vec<User>> {
     let mut mentions = mention::for_statuses(pool, &[status.id])
         .await?
         .remove(&status.id)

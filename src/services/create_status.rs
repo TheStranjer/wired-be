@@ -150,7 +150,7 @@ use crate::{
         status_edit, status_visibility,
         user::User,
     },
-    services::{mentions::resolve_mentions, notify, render_status::render_status},
+    services::{federation_out, mentions::resolve_mentions, notify, render_status::render_status},
     state::AppState,
     util::{
         entities::{MentionRef, extract_hashtags, linkify_entities},
@@ -1686,18 +1686,20 @@ const fn visibility_width(visibility: Visibility) -> u8 {
 /// public and hashtag timelines, the [`rich_media.fetch`](crate::jobs::rich_media)
 /// card job the post's first link schedules for itself (see
 /// [`schedule_fetch`](crate::jobs::rich_media::schedule_fetch)), and the
-/// federation of the `Create` activity through the job queue (see
-/// [`crate::models::job`], decision 11) — wire themselves in here, and only
-/// here.
+/// federation of the `Create` activity through the job queue (landed from
+/// [`federation_out::after_status_created`], decision 11's queued fan-out)
+/// — wire themselves in here, and only here.
 ///
 /// `status` is the stored row: the id the tellings name, the author they
 /// do not tell, the `visibility` that keeps a `direct` post out of the
 /// subscriber arm, and the `reblog_of_id` that keeps a boost row out of
-/// both. The two consumers still waiting (streaming and
-/// federation) need the rendered entity too and will grow this one call's
-/// signature when they land.
+/// both. The one consumer still waiting (streaming) needs the rendered
+/// entity too and will grow this one call's signature when it lands; the
+/// federation arm renders its own document from the row, through
+/// [`crate::federation::note`].
 ///
 /// [`notify::on_mention`]: crate::services::notify::on_mention
+/// [`federation_out::after_status_created`]: crate::services::federation_out::after_status_created
 ///
 /// `pub(crate)`, not private: the federation ingest path
 /// ([`crate::services::ingest`] step 9) runs a freshly mirrored remote
@@ -1710,6 +1712,7 @@ pub(crate) async fn after_status_created(state: &AppState, status: &status::Stat
     notify::on_subscribed_status(state, status).await;
     crate::jobs::rich_media::schedule_fetch(state, status).await;
     participate_in_conversation(state, status).await;
+    federation_out::after_status_created(state, status).await;
 }
 
 /// The conversation arm of [`after_status_created`]: a `direct` status is
