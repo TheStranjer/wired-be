@@ -61,7 +61,9 @@ All configuration comes from environment variables. For local development, copy 
 | `MAX_FETCHES_PER_ACTIVITY` | no | `20` | How many remote object dereferences one incoming activity may trigger at most; a fetch past the cap fails instead of fanning out further |
 | `FEDERATION_ENABLED` | no | `true` | Whether the instance federates at all; while off every ActivityPub inbox `POST` is refused with 403 `{"error":"Federation is disabled"}` and outbound delivery queues nothing (`true`/`false`, or `1`/`0`) |
 | `ACCEPT_UNSOLICITED_PUBLIC` | no | `true` | Whether public and unlisted remote statuses are stored even from authors no local account follows; while off the ingest path drops such a post unless a local user is mentioned in it or it answers a local status (`private`, `direct` and followers-addressed posts are never gated) (`true`/`false`, or `1`/`0`) |
-| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`, `anti_link_spam`, `normalize_markup`, `tag`, `keyword`, `hellthread`, `object_age`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
+| `MRF_POLICIES` | no | *(empty)* | Comma-separated MRF policy names (`noop`, `simple`, `anti_link_spam`, `normalize_markup`, `tag`, `keyword`, `hellthread`, `object_age`) run over every incoming and outgoing activity when the `mrf` instance setting carries no `policies` array of its own; while `MRF_TRANSPARENCY` is on the active names are advertised in the instance documents' `mrf_policies` (see "Moderation filters (MRF)") |
+| `MRF_TRANSPARENCY` | no | `true` | Whether the enabled policies publish their moderation lists at all: the `mrf_policies` names beside the `mrf_simple`, `mrf_simple_info` and `mrf_<policy>` objects in the federation block of `GET /api/v1/instance`, `GET /api/v2/instance` and `NodeInfo`, and the domain list `GET /api/v1/instance/domain_blocks` renders. While off those publish nothing (`{"enabled": true, "mrf_policies": [], "exclusions": false}` and an empty domain-block array) and the filters keep running (`true`/`false`, or `1`/`0`) |
+| `MRF_TRANSPARENCY_EXCLUSIONS` | no | *(empty)* | Comma-separated host patterns kept out of those published lists, matched with the same rules the lists themselves use, so `*.example.com` hides that entry and every entry below it. The hidden hosts stay blocked; using the feature is itself disclosed there as `"exclusions": true` |
 | `UPLOAD_LIMIT_BYTES` | no | `16000000` | Maximum size of one uploaded file in a multipart request, in bytes |
 | `UPLOAD_MAX_FILES` | no | `16` | Maximum number of files in one multipart request |
 | `AVATAR_LIMIT_BYTES` | no | `2000000` | Maximum size of the `avatar` image of `PATCH /api/v1/accounts/update_credentials`, in bytes; a larger one is refused with 422 `{"error":"File is too large"}` |
@@ -146,10 +148,9 @@ compares is the host of the activity's `actor`:
 `reject` and `accept` are also the answer `MrfConfig::rejected` gives the
 inbox extractor, the delivery enqueue and the publisher, so a refused host is
 turned away at the door and never sent anything, exactly as a `reject` row of
-`instance_policy_domains` does. Enabled policies and their lists are
-published in the federation block of `GET /api/v1/instance`,
-`GET /api/v2/instance` and NodeInfo as `SimplePolicy` beside an `mrf_simple`
-transparency object.
+`instance_policy_domains` does. What the instance publishes about these lists
+— and what it may keep back — is the transparency block at the end of this
+section.
 
 `anti_link_spam` is Pleroma's `AntiLinkSpamPolicy`
 (`lib/pleroma/web/activity_pub/mrf/anti_link_spam_policy.ex`). It refuses a
@@ -248,6 +249,40 @@ The three policies publish their configured subsets as the `mrf_keyword`,
 `mrf_hellthread` and `mrf_objectage` transparency objects beside their
 `KeywordPolicy`, `HellthreadPolicy` and `ObjectAgePolicy` names in
 `mrf_policies`.
+
+### Transparency: publishing the lists
+
+The moderation the instance does, it also says it does. `MRF_TRANSPARENCY`
+(default `true`) publishes the enabled chain in the `federation` block of
+`GET /api/v1/instance`, `GET /api/v2/instance` and `NodeInfo`: the
+Pleroma-style policy names under `mrf_policies`, every `simple` domain list
+under `mrf_simple` — all eleven keys, the empty ones as the empty array, the
+patterns verbatim, `*.evil.example` and all — and the operators' reasons in
+the separate `mrf_simple_info` object, as
+`{"reject": {"evil.example": {"reason": "bots"}}}`. The other policies add
+their own `mrf_<policy>` objects beside these.
+
+The same lists are `GET /api/v1/instance/domain_blocks`: a host on `reject`
+is a domain block of severity `suspend`, one on `federated_timeline_removal`,
+`followers_only`, `media_removal` or `media_nsfw` one of severity `silence`,
+each entry `{domain, digest, severity, comment}` with `digest` the lowercase
+hex `SHA-256` of the domain and `comment` the reason it was configured with.
+`GET /api/v1/instance/peers` leaves out every host the `reject` list names,
+the apex of a wildcard entry and everything below it.
+
+With `MRF_TRANSPARENCY=false` nothing of the moderation is published: the
+federation block is the three keys `{"enabled": true, "mrf_policies": [],
+"exclusions": false}`, the domain-block listing is `[]`, and the filters keep
+running exactly as before. `MRF_TRANSPARENCY_EXCLUSIONS` is the halfway
+setting — a comma list of host patterns, matched with the same rules the
+lists themselves use, so `*.example.com` hides that entry and every entry
+below it — and an excluded host is simply absent from the published lists and
+from `mrf_simple_info`, reason included. Using it is itself disclosed there
+as `"exclusions": true`, whether or not anything matched, so readers know the
+lists they are shown may not be the whole story. Exclusions hide what is
+published, never what is enforced: an excluded host is still refused its
+traffic, still absent from the domain-block listing, and still out of the
+peer list.
 
 ## Development
 

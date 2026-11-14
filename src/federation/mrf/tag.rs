@@ -47,12 +47,13 @@ use serde_json::{Map, Value, json};
 use crate::federation::{
     json,
     mrf::{
-        MrfContext, MrfPolicy, MrfResult,
+        MrfContext, MrfPolicy, MrfResult, Transparency,
         simple::{
             PUBLIC_ADDRESS, activity_host, activity_type, add_address, addresses_public,
             followers_collection, has_attachments, is_note_activity, limit_document,
             note_object_mut, remove_public, remove_reference, rewrite_each_document,
         },
+        single_block,
     },
 };
 
@@ -155,8 +156,11 @@ impl MrfPolicy for TagPolicy {
         Ok(activity)
     }
 
-    fn describe(&self) -> Value {
-        self.params.clone().unwrap_or_else(|| json!({}))
+    fn describe(&self, _transparency: &Transparency) -> Map<String, Value> {
+        single_block(
+            self.name(),
+            self.params.clone().unwrap_or_else(|| json!({})),
+        )
     }
 }
 
@@ -650,20 +654,22 @@ mod tests {
     }
 
     /// The policy is Pleroma's `TagPolicy`: it names itself, knows its six
-    /// tags and their strings, and describes back the subset it was
-    /// configured with — the empty object when nothing was.
+    /// tags and their strings, and publishes the subset it was configured
+    /// with as its one `mrf_tag` object — the empty object when nothing was.
     #[test]
     fn the_policy_names_itself_and_describes_its_config() {
         assert_eq!(TagPolicy::new(None).name(), "TagPolicy");
         assert_eq!(
-            TagPolicy::new(None).describe(),
-            json!({}),
-            "no key, nothing to describe"
+            Value::Object(TagPolicy::new(None).describe(&Transparency::open())),
+            json!({"mrf_tag": {}}),
+            "no key, nothing to describe but its own name"
         );
         assert_eq!(
-            TagPolicy::new(Some(json!({"echo": true}))).describe(),
-            json!({"echo": true}),
-            "the configured subset comes back verbatim"
+            Value::Object(
+                TagPolicy::new(Some(json!({"echo": true}))).describe(&Transparency::open())
+            ),
+            json!({"mrf_tag": {"echo": true}}),
+            "the configured subset comes back verbatim under the policy's key"
         );
         for tag in Tag::ALL {
             assert_eq!(Tag::from_key(tag.key()), Some(tag), "round-trips: {tag:?}");

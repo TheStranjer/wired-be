@@ -46,6 +46,15 @@
 //! eleven of one configuration, so a busy inbox matches instead of
 //! reparsing JSON, and [`rejected`](super::MrfConfig::rejected) answers
 //! from the very same rules.
+//!
+//! The same rules are what the instance documents publish:
+//! [`SimpleConfig::describe`] answers Pleroma's `mrf_simple` and
+//! `mrf_simple_info` objects for the federation metadata, and
+//! [`SimpleConfig::published`] is the per-list read
+//! [`crate::api::instance`] renders as Mastodon domain blocks. Both go
+//! through the operator's [`Transparency`], which keeps the hosts of
+//! `MRF_TRANSPARENCY_EXCLUSIONS` out of public output while they stay on
+//! the list and in force.
 
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
@@ -54,7 +63,7 @@ use tracing::warn;
 
 use crate::federation::{
     json,
-    mrf::{MrfContext, MrfPolicy, MrfResult},
+    mrf::{MrfContext, MrfPolicy, MrfResult, Transparency},
     note_parser::{OBJECT_TYPES, PUBLIC_RECIPIENTS},
 };
 
@@ -88,9 +97,14 @@ const ACTOR_FIELDS: [(List, &str); 3] = [
 /// The suffix of the followers-collection URL this policy falls back to
 /// (the convention Pleroma, Mastodon and [`super::super::actor`] all use).
 pub(super) const FOLLOWERS_SUFFIX: &str = "/followers";
-/// The transparency block's key for the per-entry reasons: Pleroma's
-/// separate `mrf_simple_info`, folded into this policy's one block.
-const INFO_KEY: &str = "info";
+/// The federation-metadata key this policy's list object is published
+/// under: Pleroma's `mrf_simple`.
+const SIMPLE_KEY: &str = "mrf_simple";
+/// The federation-metadata key of the per-entry reason object beside it:
+/// Pleroma's separate `mrf_simple_info`, kept separate for the same
+/// backwards-compatibility reason it states — the lists themselves shipped
+/// without reasons first.
+const SIMPLE_INFO_KEY: &str = "mrf_simple_info";
 
 /// One of the policy's domain lists, named by its configuration key.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -289,6 +303,17 @@ impl Entry {
     }
 }
 
+/// One list entry as public output shows it: the pattern exactly as
+/// configured — a `*.example.com` wildcard is masked by nothing — beside
+/// the reason the operator recorded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Publication<'a> {
+    /// The pattern as configured, lowercased and trimmed.
+    pub pattern: &'a str,
+    /// The reason recorded beside it; empty when the operator gave none.
+    pub reason: &'a str,
+}
+
 /// One compiled list entry: the pattern split into what it matches, beside
 /// the reason it carries.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -368,31 +393,31 @@ impl DomainMatcher {
         self.rules.is_empty()
     }
 
-    /// The list's transparency value: its patterns, as configured, in
-    /// order.
-    fn patterns(&self) -> Value {
-        Value::Array(
-            self.rules
-                .iter()
-                .map(|rule| Value::String(rule.pattern.clone()))
-                .collect(),
-        )
+    /// The matcher of a plain pattern list — no reasons: what the
+    /// transparency exclusions compile to, matched with the same rules the
+    /// policy lists themselves are matched with so that excluding
+    /// `*.example.com` hides that entry and every entry below it.
+    #[must_use]
+    pub fn from_patterns(patterns: &[String]) -> Self {
+        let entries = patterns
+            .iter()
+            .map(|pattern| Entry::new(pattern, None))
+            .collect::<Vec<Entry>>();
+        Self::new(&entries)
     }
 
-    /// The `{pattern: {"reason": …}}` object of the entries that carry
-    /// one; empty when none does.
-    fn reasons(&self) -> Map<String, Value> {
-        let mut reasons = Map::new();
-        for rule in &self.rules {
-            if rule.reason.is_empty() {
-                continue;
-            }
-            let _previous = reasons.insert(
-                rule.pattern.clone(),
-                json!({ "reason": rule.reason.text() }),
-            );
-        }
-        reasons
+    /// The entries public output may show: every rule's pattern verbatim
+    /// beside its reason, in configured order, with the hosts the
+    /// transparency settings exclude dropped.
+    fn published(&self, transparency: &Transparency) -> Vec<Publication<'_>> {
+        self.rules
+            .iter()
+            .filter(|rule| !transparency.hides(&rule.pattern))
+            .map(|rule| Publication {
+                pattern: &rule.pattern,
+                reason: rule.reason.text(),
+            })
+            .collect()
     }
 }
 
@@ -478,29 +503,66 @@ impl SimpleConfig {
         self.configured(List::Accept) && !self.matches(List::Accept, host)
     }
 
-    /// The policy's transparency block — Pleroma's `mrf_simple`: the
-    /// patterns of every list that holds something under its own key,
-    /// beside an `info` object holding the reasons of the entries that
-    /// carry one.
+    /// The entries of `list` public output may show, in configured order:
+    /// pattern verbatim beside reason, the excluded hosts dropped. A list
+    /// nothing usable was written into — or everything usable was written
+    /// out of, by way of an exclusion — answers the empty vector.
     #[must_use]
-    pub fn describe(&self) -> Value {
-        let mut block = Map::new();
+    pub fn published(&self, list: List, transparency: &Transparency) -> Vec<Publication<'_>> {
+        self.lists
+            .get(&list)
+            .map_or_else(Vec::new, |matcher| matcher.published(transparency))
+    }
+
+    /// The policy's transparency blocks, keyed for the federation
+    /// metadata: Pleroma's `mrf_simple`, every list under its own name
+    /// with the patterns it holds verbatim, beside `mrf_simple_info` — the
+    /// `{pattern: {"reason": …}}` object of each list whose visible
+    /// entries carry a reason, absent for a list whose entries carry none.
+    ///
+    /// Every list is published, not only the ones with something in them:
+    /// Pleroma maps its whole `:mrf_simple` keyword list, so an instance
+    /// that rejects nothing still says which lists it could fill. A host
+    /// the transparency settings exclude appears in neither object.
+    #[must_use]
+    pub fn describe(&self, transparency: &Transparency) -> Map<String, Value> {
+        let mut lists = Map::new();
         let mut info = Map::new();
-        for (list, matcher) in &self.lists {
-            if matcher.is_empty() {
-                continue;
-            }
-            let _pattern = block.insert(list.key().to_owned(), matcher.patterns());
-            let reasons = matcher.reasons();
+        for list in List::ALL {
+            let published = self.published(list, transparency);
+            let _pattern = lists.insert(
+                list.key().to_owned(),
+                Value::Array(
+                    published
+                        .iter()
+                        .map(|entry| Value::String(entry.pattern.to_owned()))
+                        .collect(),
+                ),
+            );
+            let reasons = reason_object(&published);
             if !reasons.is_empty() {
                 let _reason = info.insert(list.key().to_owned(), Value::Object(reasons));
             }
         }
-        if !info.is_empty() {
-            let _previous = block.insert(INFO_KEY.to_owned(), Value::Object(info));
-        }
-        Value::Object(block)
+        Map::from_iter([
+            (SIMPLE_KEY.to_owned(), Value::Object(lists)),
+            (SIMPLE_INFO_KEY.to_owned(), Value::Object(info)),
+        ])
     }
+}
+
+/// The `{pattern: {"reason": …}}` object of the published `entries` that
+/// carry one; empty when none does, which is what keeps a reasonless list
+/// out of `mrf_simple_info`.
+fn reason_object(entries: &[Publication<'_>]) -> Map<String, Value> {
+    let mut reasons = Map::new();
+    for entry in entries {
+        if entry.reason.is_empty() {
+            continue;
+        }
+        let _reason = reasons.insert(entry.pattern.to_owned(), json!({ "reason": entry.reason }));
+    }
+    reasons
 }
 
 /// The matcher of one configured list value. A value that is not an array
@@ -662,8 +724,8 @@ impl MrfPolicy for SimplePolicy {
         actor
     }
 
-    fn describe(&self) -> Value {
-        self.config.describe()
+    fn describe(&self, transparency: &Transparency) -> Map<String, Value> {
+        self.config.describe(transparency)
     }
 }
 
@@ -1149,7 +1211,11 @@ mod tests {
                 !config.rejected("anyone.example"),
                 "{params:?} configures no list at all"
             );
-            assert_eq!(config.describe(), json!({}), "and describes nothing");
+            assert_eq!(
+                config.describe(&Transparency::open())["mrf_simple"]["reject"],
+                json!([]),
+                "and it publishes an empty list wherever a rule could go"
+            );
         }
     }
 
@@ -1487,26 +1553,132 @@ mod tests {
         }
     }
 
-    /// The policy is Pleroma's `SimplePolicy`, and its transparency block
-    /// is the configured lists beside the reasons they carry.
+    /// The policy is Pleroma's `SimplePolicy`, and its transparency blocks
+    /// are `mrf_simple` — all eleven lists, the configured ones holding
+    /// their patterns verbatim — beside `mrf_simple_info`, the reasons the
+    /// entries carry.
     #[test]
     fn the_policy_names_itself_and_describes_its_lists() {
         let lists = json!({
-            "reject": [["evil.example", "bots"], "worse.example"],
+            "reject": [["evil.example", "bots"], "*.worse.example"],
             "accept": ["friend.example"],
-            "report_removal": [],
         });
         let policy = policy(&lists);
 
         assert_eq!(policy.name(), "SimplePolicy", "Pleroma's module name");
+        let described = policy.describe(&Transparency::open());
         assert_eq!(
-            policy.describe(),
-            json!({
-                "accept": ["friend.example"],
-                "reject": ["evil.example", "worse.example"],
-                "info": {"reject": {"evil.example": {"reason": "bots"}}},
-            }),
-            "the lists are published and the reasons beside them; an empty list says nothing"
+            described["mrf_simple"]["reject"],
+            json!(["evil.example", "*.worse.example"]),
+            "the patterns come out as configured, wildcard verbatim, in order"
+        );
+        assert_eq!(
+            described["mrf_simple"]["accept"],
+            json!(["friend.example"]),
+            "the allowlist is published too"
+        );
+        assert_eq!(
+            described["mrf_simple_info"],
+            json!({"reject": {"evil.example": {"reason": "bots"}}}),
+            "the reasons ride in the separate object Pleroma keeps them in, \
+             for the one list whose entries carry one"
+        );
+        let published = described["mrf_simple"]
+            .as_object()
+            .expect("the block is an object");
+        assert_eq!(
+            published.len(),
+            List::ALL.len(),
+            "every list is published, empty ones as the empty array, the way \
+             Pleroma maps its whole `:mrf_simple` config"
+        );
+        for list in List::ALL {
+            assert!(
+                published.contains_key(list.key()),
+                "`{}` names one of the published keys",
+                list.key()
+            );
+        }
+    }
+
+    /// The transparency exclusions reach both published objects: an
+    /// excluded host is simply not there, and a list left empty by
+    /// excluding all of it stays a published, empty key.
+    #[test]
+    fn the_excluded_hosts_are_missing_from_every_published_object() {
+        let lists = json!({
+            "reject": [["evil.example", "bots"], "*.partner.example", "press.example"],
+            "media_nsfw": ["press.example"],
+            "followers_only": ["quiet.example"],
+        });
+        let config = SimpleConfig::from_params(Some(&lists));
+        let transparency =
+            Transparency::hiding(&["*.partner.example".to_owned(), "press.example".to_owned()]);
+
+        let described = config.describe(&transparency);
+        assert_eq!(
+            described["mrf_simple"]["reject"],
+            json!(["evil.example"]),
+            "the two excluded patterns are gone, the third stands"
+        );
+        assert_eq!(
+            described["mrf_simple"]["media_nsfw"],
+            json!([]),
+            "a list emptied of its only entry is still a published list"
+        );
+        assert_eq!(
+            described["mrf_simple"]["followers_only"],
+            json!(["quiet.example"]),
+            "and an untouched list keeps what it had"
+        );
+        assert_eq!(
+            described["mrf_simple_info"],
+            json!({"reject": {"evil.example": {"reason": "bots"}}}),
+            "an excluded host's reason is gone with it"
+        );
+        assert!(
+            !transparency.hides("evil.example"),
+            "and the exclusion says nothing about the host it does not name"
+        );
+    }
+
+    /// [`SimpleConfig::published`] is the same read the two objects are
+    /// built from: pattern verbatim, reason as recorded, nothing excluded.
+    #[test]
+    fn publishing_lists_keeps_patterns_and_reasons_together() {
+        let config = SimpleConfig::from_params(Some(&json!({
+            "reject": [["evil.example", "bots"], "*.worse.example"],
+            "avatar_removal": [],
+        })));
+        let open = Transparency::open();
+        assert_eq!(
+            config.published(List::Reject, &open),
+            vec![
+                Publication {
+                    pattern: "evil.example",
+                    reason: "bots",
+                },
+                Publication {
+                    pattern: "*.worse.example",
+                    reason: "",
+                },
+            ],
+            "the entries in configured order, each with its reason"
+        );
+        assert!(
+            config.published(List::AvatarRemoval, &open).is_empty()
+                && config.published(List::Accept, &open).is_empty(),
+            "a list nothing usable was written into publishes nothing"
+        );
+        assert!(
+            config
+                .published(
+                    List::Reject,
+                    &Transparency::hiding(&["*.example".to_owned()])
+                )
+                .is_empty(),
+            "and one exclusion covers the whole list here: both entries sit \
+             under `*.example`"
         );
     }
 

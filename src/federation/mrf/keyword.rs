@@ -49,8 +49,9 @@ use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use crate::federation::mrf::{
-    MrfContext, MrfPolicy, MrfResult,
+    MrfContext, MrfPolicy, MrfResult, Transparency,
     simple::{is_note_activity, note_object_mut, rewrite_each_document, unlist_document},
+    single_block,
 };
 
 /// The key of this policy's parameters inside the `mrf` instance setting,
@@ -357,8 +358,11 @@ impl MrfPolicy for KeywordPolicy {
         Ok(activity)
     }
 
-    fn describe(&self) -> Value {
-        self.config.params.clone().unwrap_or_else(|| json!({}))
+    fn describe(&self, _transparency: &Transparency) -> Map<String, Value> {
+        single_block(
+            self.name(),
+            self.config.params.clone().unwrap_or_else(|| json!({})),
+        )
     }
 }
 
@@ -794,9 +798,9 @@ mod tests {
                 );
             }
             assert_eq!(
-                run.describe(),
-                config.unwrap_or_else(|| json!({})),
-                "and describes the block it was given, or nothing"
+                Value::Object(run.describe(&Transparency::open())),
+                json!({"mrf_keyword": config.unwrap_or_else(|| json!({}))}),
+                "and publishes the block it was given, or nothing, under its own key"
             );
         }
     }
@@ -814,24 +818,24 @@ mod tests {
                 "{params} is not a block, so it enforces nothing"
             );
             assert_eq!(
-                run.describe(),
-                json!({}),
+                Value::Object(run.describe(&Transparency::open())),
+                json!({"mrf_keyword": {}}),
                 "{params} is not a subset to echo"
             );
         }
     }
 
     /// The policy is Pleroma's `KeywordPolicy`: it names itself, and the
-    /// configured block comes back through `describe` verbatim — the
-    /// patterns are strings as written, so transparency shows exactly what
-    /// governs.
+    /// configured block comes back through `describe` verbatim under its
+    /// `mrf_keyword` key — the patterns are strings as written, so
+    /// transparency shows exactly what governs.
     #[test]
     fn the_policy_names_itself_and_describes_its_config() {
         assert_eq!(policy(None).name(), "KeywordPolicy");
         assert_eq!(
-            policy(None).describe(),
-            json!({}),
-            "no key, nothing to describe"
+            Value::Object(policy(None).describe(&Transparency::open())),
+            json!({"mrf_keyword": {}}),
+            "no key, nothing to describe but its own name"
         );
         let block = json!({
             "reject": ["word", "/regex/"],
@@ -839,9 +843,9 @@ mod tests {
             "replace": [["a", "b"]],
         });
         assert_eq!(
-            policy(Some(&block)).describe(),
-            block,
-            "the configured subset comes back verbatim"
+            Value::Object(policy(Some(&block)).describe(&Transparency::open())),
+            json!({"mrf_keyword": block}),
+            "the configured subset comes back verbatim under the policy's key"
         );
     }
 

@@ -9,10 +9,12 @@
 //! the documents, the three cached counters against local/remote
 //! fixtures, the priority-ordered rules, the contact account (present
 //! and absent), the config mirroring through non-default settings, the
-//! 60-second stats cache window, the distinct-and-capped peer list, the
-//! policy domains' digest and severity mapping, and the empty answers
-//! of the completeness endpoints. The cache helper's own expiry
-//! arithmetic is unit-tested where it lives, in `src/util/cache.rs`.
+//! 60-second stats cache window, the distinct-and-capped peer list with
+//! the rejected hosts kept out, the MRF transparency block — published
+//! lists, exclusions, and the switch that closes both — the domain lists'
+//! digest and severity mapping, and the empty answers of the completeness
+//! endpoints. The cache helper's own expiry arithmetic is unit-tested
+//! where it lives, in `src/util/cache.rs`.
 
 #![cfg(test)]
 
@@ -955,28 +957,39 @@ async fn the_rules_endpoint_serves_the_instance_rules() {
     );
 }
 
-/// Inserts one policy row directly: the table has no writer yet (the
-/// admin tickets add one), so the endpoint is tested by hand.
-async fn insert_policy(pool: &PgPool, domain: &str, action: &str, reason: &str) {
-    let inserted = sqlx::query(
-        "INSERT INTO instance_policy_domains (domain, action, reason) VALUES ($1, $2, $3)",
-    )
-    .bind(domain)
-    .bind(action)
-    .bind(reason)
-    .execute(pool)
-    .await
-    .expect("the policy row inserts");
-    assert_eq!(inserted.rows_affected(), 1, "the row is there");
+/// Writes the `mrf` instance setting the endpoints and the pipeline both
+/// read: the tests configure policy chains through the same row the admin
+/// tickets will own.
+async fn set_mrf(pool: &PgPool, setting: &Value) {
+    wired_be::models::instance_setting::set(pool, "mrf", setting)
+        .await
+        .expect("the mrf setting writes");
 }
 
-/// `GET /api/v1/instance/domain_blocks` answers the instance-policy
-/// domains with their lowercase-hex `SHA-256` digest and the severity
-/// their action maps to (reject is `suspend`, `silence` and
-/// `media_removal` both fold into `silence`) — and the empty array
-/// while no policy is recorded. No authentication.
+/// The `simple` lists the moderation tests configure: one host per
+/// severity arm of the mapping, one wildcard, one reason.
+const SIMPLE_LISTS: &str = r#"{
+    "policies": ["simple"],
+    "simple": {
+        "reject": [["blocked.example", "coordinated abuse"], "*.worse.example"],
+        "federated_timeline_removal": ["noisy.example"],
+        "followers_only": ["press.example"],
+        "media_removal": ["leech.example"],
+        "media_nsfw": [["lewd.example", "no nsfw"]],
+        "avatar_removal": ["faceless.example"]
+    }
+}"#;
+
+/// `GET /api/v1/instance/domain_blocks` renders the
+/// [`simple`](wired_be::federation::mrf::simple) policy's domain lists as
+/// Mastodon domain blocks: `reject` suspends, the four lists that keep a
+/// host's posts out of the public eye all silence, and every entry carries
+/// the lowercase-hex `SHA-256` of the domain it prints beside the
+/// operator's reason (empty when ungiven) — patterns verbatim, wildcards
+/// included. An instance that runs no `simple` policy answers the empty
+/// array. No authentication.
 #[tokio::test]
-async fn the_domain_blocks_endpoint_maps_policy_to_severities() {
+async fn the_domain_blocks_endpoint_maps_the_simple_lists_to_severities() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -984,15 +997,20 @@ async fn the_domain_blocks_endpoint_maps_policy_to_severities() {
         .send(&app)
         .await;
     assert_eq!(empty.status, StatusCode::OK, "the listing is served");
-    assert_eq!(empty.json_value(), json!([]), "no policy recorded yet");
+    assert_eq!(
+        empty.json_value(),
+        json!([]),
+        "no policy configured yet, and no `simple` policy means no blocks"
+    );
 
-    insert_policy(&pool, "blocked.example", "reject", "coordinated abuse").await;
-    insert_policy(&pool, "lewd.example", "media_removal", "no nsfw").await;
-    insert_policy(&pool, "silenced.example", "silence", "").await;
+    let setting: Value = serde_json::from_str(SIMPLE_LISTS).expect("the fixture is JSON");
+    set_mrf(&pool, &setting).await;
 
+    // A fresh app: the one above cached the empty configuration it read.
+    let configured = common::test_app(pool);
     let response = common::TestRequest::get("/api/v1/instance/domain_blocks")
         .bearer("not-a-real-token")
-        .send(&app)
+        .send(&configured)
         .await;
     assert_eq!(response.status, StatusCode::OK, "credentials are ignored");
     assert_eq!(
@@ -1000,25 +1018,93 @@ async fn the_domain_blocks_endpoint_maps_policy_to_severities() {
         json!([
             {
                 "domain": "blocked.example",
-                "digest": "1f30273176bf43428242811a3bd5e04653804cff849e2ac73a14aa6e00c66a48",
+                "digest": wired_be::api::instance::sha256_hex("blocked.example"),
                 "severity": "suspend",
                 "comment": "coordinated abuse",
             },
             {
-                "domain": "lewd.example",
-                "digest": "f50aaa39cbb6aefb278cf66e0ad8c74e1ce67b4707c0a9f1a0c8fbf33e02a126",
-                "severity": "silence",
-                "comment": "no nsfw",
+                "domain": "*.worse.example",
+                "digest": wired_be::api::instance::sha256_hex("*.worse.example"),
+                "severity": "suspend",
+                "comment": "",
             },
             {
-                "domain": "silenced.example",
-                "digest": "a31604814f94139582162dedb2ac91d8008fb44562daa4b35e834e4429d6c873",
+                "domain": "noisy.example",
+                "digest": wired_be::api::instance::sha256_hex("noisy.example"),
                 "severity": "silence",
                 "comment": "",
             },
+            {
+                "domain": "press.example",
+                "digest": wired_be::api::instance::sha256_hex("press.example"),
+                "severity": "silence",
+                "comment": "",
+            },
+            {
+                "domain": "leech.example",
+                "digest": wired_be::api::instance::sha256_hex("leech.example"),
+                "severity": "silence",
+                "comment": "",
+            },
+            {
+                "domain": "lewd.example",
+                "digest": wired_be::api::instance::sha256_hex("lewd.example"),
+                "severity": "silence",
+                "comment": "no nsfw",
+            },
         ]),
-        "each entry carries the domain, its sha256 digest, the mapped \
-         severity and the reason (empty when ungiven), by host"
+        "the rejected hosts first, then the softened lists in configuration \
+         order; the avatar strip is no domain block"
+    );
+}
+
+/// With `MRF_TRANSPARENCY` off the domain-block listing publishes nothing,
+/// and an excluded host is missing from it while the rest of its list
+/// stands: the listing is the transparency answer, not a second source of
+/// moderation facts.
+#[tokio::test]
+async fn domain_blocks_follow_the_transparency_settings() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let setting: Value = serde_json::from_str(SIMPLE_LISTS).expect("the fixture is JSON");
+    set_mrf(&pool, &setting).await;
+
+    let mut off = common::test_config();
+    off.mrf.transparency = Toggle::new(false);
+    let shut = common::test_app_with_config(pool.clone(), off);
+    let hidden = common::TestRequest::get("/api/v1/instance/domain_blocks")
+        .send(&shut)
+        .await;
+    assert_eq!(
+        hidden.json_value(),
+        json!([]),
+        "an instance that describes no filter lists no blocked domain, while \
+         the policy stays in force"
+    );
+
+    let mut excluding = common::test_config();
+    excluding.mrf.transparency_exclusions = vec!["press.example".to_owned()];
+    let partial = common::test_app_with_config(pool.clone(), excluding);
+    let blocks = common::TestRequest::get("/api/v1/instance/domain_blocks")
+        .send(&partial)
+        .await
+        .json_value();
+    let listed = blocks
+        .as_array()
+        .expect("the listing is an array")
+        .iter()
+        .map(|entry| entry["domain"].as_str().unwrap_or_default())
+        .collect::<Vec<&str>>();
+    assert_eq!(
+        listed,
+        vec![
+            "blocked.example",
+            "*.worse.example",
+            "noisy.example",
+            "leech.example",
+            "lewd.example",
+        ],
+        "the excluded host is simply not there, its list's neighbours are"
     );
 }
 
@@ -1182,7 +1268,7 @@ async fn mrf_policies_env_enables_the_federation_block() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let mut config = common::test_config();
-    config.mrf_policies = vec!["noop".to_owned()];
+    config.mrf.policies = vec!["noop".to_owned()];
     let app = common::test_app_with_config(pool, config);
     let response = common::TestRequest::get("/api/v1/instance")
         .send(&app)
@@ -1192,5 +1278,231 @@ async fn mrf_policies_env_enables_the_federation_block() {
         response.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
         json!(["NoOpPolicy"]),
         "the env list builds the advertised chain"
+    );
+}
+
+/// The eleven `mrf_simple` keys the block publishes: every list Pleroma
+/// maps out of its `:mrf_simple` config, the empty ones as the empty array.
+const SIMPLE_KEYS: [&str; 11] = [
+    "accept",
+    "reject",
+    "reject_deletes",
+    "federated_timeline_removal",
+    "followers_only",
+    "media_removal",
+    "media_nsfw",
+    "report_removal",
+    "avatar_removal",
+    "banner_removal",
+    "background_removal",
+];
+
+/// The federation block publishes the `simple` lists whole: every list
+/// under its own name in `mrf_simple`, the operators' reasons in the
+/// separate `mrf_simple_info` object beside it, both on the two document
+/// versions.
+#[tokio::test]
+async fn federation_publishes_the_simple_policy_lists() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let setting: Value = serde_json::from_str(SIMPLE_LISTS).expect("the fixture is JSON");
+    set_mrf(&pool, &setting).await;
+    let app = common::test_app(pool);
+    for path in ["/api/v1/instance", "/api/v2/instance"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::OK, "{path} answers");
+        let federation = response.json_value()["pleroma"]["metadata"]["federation"].clone();
+        assert_eq!(
+            federation["mrf_policies"],
+            json!(["SimplePolicy"]),
+            "{path}: the running policy, Pleroma-named"
+        );
+        assert_eq!(
+            federation["mrf_simple"]["reject"],
+            json!(["blocked.example", "*.worse.example"]),
+            "{path}: the patterns as configured, wildcard verbatim"
+        );
+        assert_eq!(
+            federation["mrf_simple"]["media_nsfw"],
+            json!(["lewd.example"]),
+            "{path}: every list that holds something is published"
+        );
+        assert_eq!(
+            federation["mrf_simple"]["accept"],
+            json!([]),
+            "{path}: and the lists that hold nothing are published empty, \
+             the way Pleroma maps its whole config"
+        );
+        for key in SIMPLE_KEYS {
+            assert!(
+                federation["mrf_simple"].get(key).is_some(),
+                "{path}: `{key}` is one of the published lists"
+            );
+        }
+        assert_eq!(
+            federation["mrf_simple_info"],
+            json!({
+                "reject": {"blocked.example": {"reason": "coordinated abuse"}},
+                "media_nsfw": {"lewd.example": {"reason": "no nsfw"}},
+            }),
+            "{path}: the reasons ride in the separate info object, for the \
+             lists whose entries carry one"
+        );
+        assert_eq!(
+            federation["quarantined_instances"],
+            json!([]),
+            "{path}: no instance is quarantined here"
+        );
+        assert!(
+            !federation["exclusions"].as_bool().unwrap_or(true),
+            "{path}: and nothing is held back"
+        );
+    }
+}
+
+/// `MRF_TRANSPARENCY=false` leaves the block the three fixed keys: no
+/// policy names, no lists, no quarantine key — the moderation stays in
+/// force, it is simply not described.
+#[tokio::test]
+async fn federation_publishes_nothing_when_transparency_is_off() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let setting: Value = serde_json::from_str(SIMPLE_LISTS).expect("the fixture is JSON");
+    set_mrf(&pool, &setting).await;
+    let mut config = common::test_config();
+    config.mrf.transparency = Toggle::new(false);
+    config.mrf.transparency_exclusions = vec!["press.example".to_owned()];
+    let app = common::test_app_with_config(pool, config);
+    for path in ["/api/v1/instance", "/api/v2/instance"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::OK, "{path} answers");
+        let document = response.json_value();
+        assert_eq!(
+            document["pleroma"]["metadata"]["federation"],
+            json!({"enabled": true, "mrf_policies": [], "exclusions": false}),
+            "{path}: the block is exactly the keys the switch leaves standing"
+        );
+        assert_eq!(
+            document["description"],
+            json!("A Pleroma-compatible instance"),
+            "{path}: and the rest of the document is unaffected"
+        );
+    }
+}
+
+/// An excluded host is gone from both published objects — pattern and
+/// reason — and the block discloses that its lists hold something back.
+#[tokio::test]
+async fn federation_exclusions_hide_hosts_and_are_disclosed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let setting: Value = serde_json::from_str(SIMPLE_LISTS).expect("the fixture is JSON");
+    set_mrf(&pool, &setting).await;
+    let mut config = common::test_config();
+    config.mrf.transparency_exclusions =
+        vec!["*.worse.example".to_owned(), "lewd.example".to_owned()];
+    let app = common::test_app_with_config(pool, config);
+    for path in ["/api/v1/instance", "/api/v2/instance"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        let federation = response.json_value()["pleroma"]["metadata"]["federation"].clone();
+        assert_eq!(
+            federation["mrf_simple"]["reject"],
+            json!(["blocked.example"]),
+            "{path}: the excluded pattern is out of its list"
+        );
+        assert_eq!(
+            federation["mrf_simple"]["media_nsfw"],
+            json!([]),
+            "{path}: a list emptied by exclusion stays a published, empty list"
+        );
+        assert_eq!(
+            federation["mrf_simple_info"],
+            json!({"reject": {"blocked.example": {"reason": "coordinated abuse"}}}),
+            "{path}: and the excluded host's reason went with it"
+        );
+        assert_eq!(
+            federation["mrf_policies"],
+            json!(["SimplePolicy"]),
+            "{path}: the policy is still named, and still running"
+        );
+        assert_eq!(
+            federation["exclusions"], true,
+            "{path}: using the exclusion list is itself disclosed"
+        );
+    }
+}
+
+/// A host the `simple` policy's `reject` list names leaves the peer
+/// listing — the apex of a wildcard entry and everything below it — while
+/// the rest of the mirrored world stays. The transparency settings do not
+/// enter: a host the instance refuses is not one it advertises, whether or
+/// not it publishes its lists.
+#[tokio::test]
+async fn peers_exclude_the_rejected_hosts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    mirror_remote(&pool, "remote.example").await;
+    mirror_remote(&pool, "evil.example").await;
+    mirror_remote(&pool, "cdn.evil.example").await;
+    mirror_remote(&pool, "quiet.example").await;
+    let setting: Value = serde_json::from_str(
+        r#"{"policies": ["simple"], "simple": {"reject": ["*.evil.example"]}}"#,
+    )
+    .expect("the fixture is JSON");
+    set_mrf(&pool, &setting).await;
+
+    for transparency in [true, false] {
+        let mut config = common::test_config();
+        config.mrf.transparency = Toggle::new(transparency);
+        let app = common::test_app_with_config(pool.clone(), config);
+        let peers: Vec<String> = common::TestRequest::get("/api/v1/instance/peers")
+            .send(&app)
+            .await
+            .json();
+        assert_eq!(
+            peers,
+            vec!["quiet.example".to_owned(), "remote.example".to_owned()],
+            "MRF_TRANSPARENCY={transparency}: the rejected apex and every \
+             host below it are out of the peer list"
+        );
+    }
+}
+
+/// A `simple` policy that is configured but not enabled hides no peer, and
+/// an `accept` allowlist hides none either: the peer listing follows the
+/// `reject` list alone.
+#[tokio::test]
+async fn peers_stay_listed_for_lists_that_are_not_rejections() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    mirror_remote(&pool, "peer.example").await;
+    mirror_remote(&pool, "stranger.example").await;
+
+    let off = json!({"policies": ["noop"], "simple": {"reject": ["peer.example"]}});
+    set_mrf(&pool, &off).await;
+    let disabled = common::test_app(pool.clone());
+    let peers: Vec<String> = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&disabled)
+        .await
+        .json();
+    assert_eq!(
+        peers,
+        vec!["peer.example".to_owned(), "stranger.example".to_owned()],
+        "a list behind a switched-off policy governs nothing, the peer list included"
+    );
+
+    let allowlist = json!({"policies": ["simple"], "simple": {"accept": ["peer.example"]}});
+    set_mrf(&pool, &allowlist).await;
+    // A fresh app: the previous one has the previous setting cached.
+    let allowlisted = common::test_app(pool);
+    let still_listed: Vec<String> = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&allowlisted)
+        .await
+        .json();
+    assert_eq!(
+        still_listed,
+        vec!["peer.example".to_owned(), "stranger.example".to_owned()],
+        "and an allowlist refuses a host from federating without naming it \
+         on the reject list"
     );
 }

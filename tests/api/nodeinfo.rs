@@ -541,3 +541,70 @@ async fn federation_reports_the_enabled_mrf_policies() {
     );
     assert_eq!(federation["enabled"], true, "still federating");
 }
+
+/// `metadata.federation` is the very answer the instance documents publish
+/// — the policy names beside their `mrf_simple` and `mrf_simple_info`
+/// objects, the exclusions marker, and with `MRF_TRANSPARENCY` off nothing
+/// but the three fixed keys.
+#[tokio::test]
+async fn federation_is_the_same_answer_the_instance_documents_give() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    wired_be::models::instance_setting::set(
+        &pool,
+        "mrf",
+        &json!({
+            "policies": ["simple"],
+            "simple": {
+                "reject": [["evil.example", "bots"]],
+                "followers_only": ["press.example"],
+            },
+        }),
+    )
+    .await
+    .expect("the setting writes");
+    for transparency in [true, false] {
+        let mut config = common::test_config();
+        config.mrf.transparency = Toggle::new(transparency);
+        config.mrf.transparency_exclusions = vec!["press.example".to_owned()];
+        let app = common::test_app_with_config(pool.clone(), config);
+        let nodeinfo = get_document(&app, "/nodeinfo/2.0").await;
+        let instance = common::TestRequest::get("/api/v1/instance")
+            .send(&app)
+            .await
+            .json_value();
+        let federation = nodeinfo["metadata"]["federation"].clone();
+        assert_eq!(
+            federation, instance["pleroma"]["metadata"]["federation"],
+            "MRF_TRANSPARENCY={transparency}: NodeInfo and the instance \
+             documents publish one answer"
+        );
+        if transparency {
+            assert_eq!(
+                federation["mrf_policies"],
+                json!(["SimplePolicy"]),
+                "the running policy is named"
+            );
+            assert_eq!(
+                federation["mrf_simple"]["reject"],
+                json!(["evil.example"]),
+                "and its lists are published"
+            );
+            assert_eq!(
+                federation["mrf_simple"]["followers_only"],
+                json!([]),
+                "the excluded host is missing from the list it was on"
+            );
+            assert_eq!(
+                federation["exclusions"], true,
+                "and the exclusion is disclosed"
+            );
+        } else {
+            assert_eq!(
+                federation,
+                json!({"enabled": true, "mrf_policies": [], "exclusions": false}),
+                "with transparency off the block is the three fixed keys"
+            );
+        }
+    }
+}

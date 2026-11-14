@@ -33,11 +33,12 @@
 //! [`describe`](MrfPolicy::describe).
 
 use scraper::{ElementRef, Html, Selector};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::federation::mrf::{
-    MrfContext, MrfPolicy, MrfResult,
+    MrfContext, MrfPolicy, MrfResult, Transparency,
     simple::{activity_host, activity_type, is_note_activity},
+    single_block,
 };
 
 /// The key of this policy's parameters inside the `mrf` instance setting,
@@ -91,8 +92,11 @@ impl MrfPolicy for AntiLinkSpamPolicy {
         Err("[AntiLinkSpamPolicy] the author has no posts nor followers".to_owned())
     }
 
-    fn describe(&self) -> Value {
-        self.params.clone().unwrap_or_else(|| json!({}))
+    fn describe(&self, _transparency: &Transparency) -> Map<String, Value> {
+        single_block(
+            self.name(),
+            self.params.clone().unwrap_or_else(|| json!({})),
+        )
     }
 }
 
@@ -372,20 +376,23 @@ mod tests {
     }
 
     /// The policy is Pleroma's `AntiLinkSpamPolicy`: it names itself and
-    /// describes back the subset it was configured with — the empty object
-    /// when nothing was.
+    /// publishes the subset it was configured with as its one
+    /// `mrf_antilinkspam` object — the empty object when nothing was.
     #[test]
     fn the_policy_names_itself_and_describes_its_config() {
         assert_eq!(AntiLinkSpamPolicy::new(None).name(), "AntiLinkSpamPolicy");
         assert_eq!(
-            AntiLinkSpamPolicy::new(None).describe(),
-            json!({}),
-            "no key, nothing to describe"
+            Value::Object(AntiLinkSpamPolicy::new(None).describe(&Transparency::open())),
+            json!({"mrf_antilinkspam": {}}),
+            "no key, nothing to describe but its own name"
         );
         assert_eq!(
-            AntiLinkSpamPolicy::new(Some(json!({"echo": true}))).describe(),
-            json!({"echo": true}),
-            "the configured subset comes back verbatim"
+            Value::Object(
+                AntiLinkSpamPolicy::new(Some(json!({"echo": true})))
+                    .describe(&Transparency::open())
+            ),
+            json!({"mrf_antilinkspam": {"echo": true}}),
+            "the configured subset comes back verbatim under the policy's key"
         );
     }
 

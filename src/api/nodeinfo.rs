@@ -20,7 +20,10 @@
 //! equivalent setting and Pleroma's shipped default otherwise. The
 //! `features` and `restrict_unauthenticated` lists come from
 //! [`crate::services::instance_meta`], the builder the `/api/v1/instance`
-//! endpoints share.
+//! endpoints share, and `metadata.federation` is the very same answer
+//! [`crate::api::instance`] publishes: the live [MRF
+//! chain](crate::federation::mrf) under the operator's `MRF_TRANSPARENCY`
+//! and `MRF_TRANSPARENCY_EXCLUSIONS` settings.
 
 use axum::{
     Json, Router,
@@ -150,17 +153,15 @@ async fn nodeinfo(
     document_response(version, &document)
 }
 
-/// The `metadata.federation` block as the live [MRF
-/// chain](crate::federation::mrf) describes itself: Pleroma-style policy
-/// names beside each policy's sanitized `mrf_<policy>` transparency
-/// object. The configuration read is the pipeline's own cached one —
+/// The `metadata.federation` block: what the live [MRF
+/// chain](crate::federation::mrf) publishes under the instance's
+/// transparency settings — Pleroma-style policy names beside the
+/// `mrf_simple`, `mrf_simple_info` and `mrf_<policy>` objects each policy
+/// keys for itself — or, with `MRF_TRANSPARENCY` off, nothing but the
+/// fixed keys. The configuration read is the pipeline's own cached one —
 /// the same answer [`crate::api::instance`] serves.
 async fn federation_block(state: &AppState) -> Federation {
-    let chain = mrf::active_chain(state).await;
-    Federation::with_mrf(
-        mrf::describe_policies(&chain),
-        mrf::describe_transparency(&chain),
-    )
+    Federation::with_mrf(&mrf::describe(state).await)
 }
 
 /// The two `NodeInfo` schema versions this server documents, the values the
@@ -463,40 +464,50 @@ struct Federation {
     /// The moderation filters in force, Pleroma-style names in chain
     /// order (Pleroma's `mrf, transparency` answer lists its policy
     /// modules; this server reports the [MRF
-    /// chain](crate::federation::mrf)'s own names).
+    /// chain](crate::federation::mrf)'s own names) — empty when
+    /// transparency is off, which publishes no policy at all.
     mrf_policies: Vec<String>,
-    /// Instances whose posts are held back; none is configured.
-    quarantined_instances: Vec<String>,
-    /// Whether the MRF transparency lists exclude anything; no exclusions
-    /// are configured, so every policy publishes its lists whole (Pleroma
-    /// derives this from `:mrf_simple`).
+    /// Instances whose posts are held back; none is configured. Absent
+    /// from the transparency-off answer, which keeps only the three keys
+    /// the switch leaves standing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarantined_instances: Option<Vec<&'static str>>,
+    /// Whether the published lists hold back any host
+    /// (`MRF_TRANSPARENCY_EXCLUSIONS` in use, Pleroma deriving the same
+    /// flag from its `[:mrf, :transparency_exclusions]`); with
+    /// transparency off, false.
     exclusions: bool,
-    /// Each policy's sanitized transparency block under its `mrf_<name>`
-    /// key, flattened into this object beside the fixed keys.
+    /// Each policy's transparency blocks under the keys they name
+    /// themselves — `mrf_simple`, `mrf_simple_info`, `mrf_<name>` —
+    /// flattened into this object beside the fixed keys.
     #[serde(flatten)]
     mrf_descriptions: Map<String, Value>,
 }
 
 impl Federation {
-    /// A plain federating instance with no moderation filters: the block
-    /// an empty chain describes itself as — what the live
-    /// [`federation_block`] collapses to on a chain with no policies.
-    /// Test support for the document builders; production always reads
-    /// the live chain.
+    /// A plain federating instance with no moderation filters and
+    /// transparency on: what an empty chain publishes, which is the answer
+    /// [`federation_block`] collapses to when nothing is configured. Test
+    /// support for the document builders; production always reads the live
+    /// chain and the live settings.
     #[cfg(test)]
     fn federating() -> Self {
-        Self::with_mrf(Vec::new(), Map::new())
+        let published = mrf::ChainTransparency {
+            published: true,
+            ..mrf::ChainTransparency::default()
+        };
+        Self::with_mrf(&published)
     }
 
-    /// The block of an instance whose MRF chain reports `policies` and
-    /// the transparency `descriptions` (see [`federation_block`]).
-    const fn with_mrf(policies: Vec<String>, descriptions: Map<String, Value>) -> Self {
+    /// The block of an instance whose chain published `described` (see
+    /// [`federation_block`]).
+    fn with_mrf(described: &mrf::ChainTransparency) -> Self {
         Self {
             enabled: true,
-            mrf_policies: policies,
-            quarantined_instances: Vec::new(),
-            exclusions: false,
-            mrf_descriptions: descriptions,
+            mrf_policies: described.policies.clone(),
+            quarantined_instances: described.quarantined_instances(),
+            exclusions: described.exclusions,
+            mrf_descriptions: described.descriptions.clone(),
         }
     }
 }

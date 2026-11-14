@@ -452,6 +452,9 @@ mod tests {
         );
     }
 
+    /// [`run`] turns the schedule over on its tick and stops with its
+    /// shutdown: two periods land as two rows, and nothing more arrives
+    /// after the run returns.
     #[tokio::test]
     async fn run_ticks_the_periodic_schedule_under_a_paused_clock() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -475,55 +478,67 @@ mod tests {
             every: Duration::from_secs(1),
         }];
 
-        // The first tick fires at once; the next lands only 10 s of virtual
-        // time later. Stepping 20 ms at a time wakes the shutdown future's
-        // poll on that rhythm — and the poll's own round trip is what hands
-        // the scheduler's inserts real time to land — while 900 steps still
-        // stop short of a third tick, so the finished scheduler holds
-        // exactly the two periods the keys below are asserted on.
-        let watched = pool.clone();
+        // The run's shutdown is the test's to give, not the queue's to
+        // report: a oneshot the driving loop fires once it has seen two
+        // periods itself. Reading the table inside the shutdown future held
+        // `run`'s `select!` inside that round trip on every pass, and one
+        // contended poll spanning ten seconds of virtual time is enough to
+        // miss a tick outright — `MissedTickBehavior::Skip` drops the period
+        // it could not serve and waits for the next — which is how a loaded
+        // suite used to push the second row past any budget the 10 s tick
+        // and the 20 ms step could leave room for.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let scheduler = tokio::spawn(run(pool.clone(), jobs, async move {
-            wait_for_count(&watched, "heartbeat", 2).await;
+            let _stopped = stop_rx.await;
         }));
-        let started = std::time::Instant::now();
-        let mut steps = 0_u32;
-        while !scheduler.is_finished() {
-            assert!(
-                steps < 900,
-                "the schedule never turned over a period: {steps} steps"
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "the scheduler wedged in real time"
-            );
-            steps += 1;
-            tokio::time::advance(Duration::from_millis(20)).await;
-            let _rows = count_jobs(&pool, "heartbeat").await;
-        }
+
+        // The first tick fires at once and the next 10 s of virtual time
+        // later, so two periods turn over in ~500 steps. The budget is far
+        // larger because one step is one round trip and a busy Postgres
+        // needs more of them; the loop stops the run itself as soon as the
+        // second row has landed, so a third tick at 1000 steps is out of
+        // reach either way.
+        drive_clock(&pool, 2_500, |rows| rows >= 2).await;
+        let _sent = stop_tx.send(());
+        drive_clock(&pool, 300, |_rows| scheduler.is_finished()).await;
         scheduler
             .await
             .expect("the scheduler task ran to completion");
 
         let keys = keys_for(&pool, "heartbeat").await;
+        let buckets = keys
+            .iter()
+            .filter_map(|key| {
+                let tail = key.strip_prefix("periodic:heartbeat:")?;
+                tail.parse::<i64>().ok()
+            })
+            .collect::<Vec<i64>>();
         assert_eq!(
+            buckets.len(),
             keys.len(),
-            2,
-            "one row for the current period, one for a later one"
+            "every row carries the ticket's `periodic:heartbeat:<bucket>` key: {keys:?}"
         );
         assert!(
-            keys[0].starts_with("periodic:heartbeat:")
-                && keys[1].starts_with("periodic:heartbeat:"),
-            "both rows carry the ticket's key prefix: {keys:?}"
+            buckets.len() >= 2,
+            "one row for the current period and one for a later one: {keys:?}"
         );
-        assert_ne!(keys[0], keys[1], "the two rows come from different buckets");
+        let mut periods = buckets.clone();
+        periods.sort_unstable();
+        periods.dedup();
+        assert_eq!(
+            periods.len(),
+            buckets.len(),
+            "the schedule turned over {buckets:?}: one row per period, no \
+             bucket claimed twice"
+        );
 
-        // `run` returned when the shutdown future resolved; 60 more seconds
-        // of virtual time (six tick periods) prove nothing keeps ticking
+        // `run` returned when the shutdown resolved; 60 more seconds of
+        // virtual time (six tick periods) prove nothing keeps ticking
         // behind it.
         tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(
-            count_jobs(&pool, "heartbeat").await,
-            2,
+            keys_for(&pool, "heartbeat").await,
+            keys,
             "the scheduler stopped with its shutdown"
         );
 
@@ -541,19 +556,36 @@ mod tests {
         tokio::time::resume();
     }
 
-    /// Resolves once `kind` has at least `want` rows.
+    /// Steps the paused clock 20 ms at a time until `ready` is satisfied by
+    /// the `heartbeat` row count of that step, and fails the test past
+    /// `budget` steps: the scheduler has to turn its schedule over (and has
+    /// to notice its shutdown) without the suite waiting on it.
     ///
-    /// The polls park on short virtual sleeps, which the driving test steps
-    /// forward; the deadline is a real-time guard, which is what watches a
-    /// paused runtime for a scheduler that never ticks.
-    async fn wait_for_count(pool: &PgPool, kind: &str, want: i64) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        while count_jobs(pool, kind).await < want {
+    /// The round trip is the point of a step, not the number it reads: a
+    /// task parked on Postgres is what lets the runtime drive the
+    /// scheduler's own inserts to completion while the virtual clock stands
+    /// still between steps.
+    async fn drive_clock<R>(pool: &PgPool, budget: u32, ready: R)
+    where
+        R: Fn(i64) -> bool,
+    {
+        let started = std::time::Instant::now();
+        let mut steps = 0_u32;
+        loop {
+            let rows = count_jobs(pool, "heartbeat").await;
+            if ready(rows) {
+                return;
+            }
             assert!(
-                std::time::Instant::now() < deadline,
-                "{kind} rows never reached {want}"
+                steps < budget,
+                "the schedule stalled at {rows} heartbeat rows after {steps} steps"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the scheduler wedged in real time"
+            );
+            steps += 1;
+            tokio::time::advance(Duration::from_millis(20)).await;
         }
     }
 

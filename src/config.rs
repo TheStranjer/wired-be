@@ -281,6 +281,19 @@ pub const ACCEPT_UNSOLICITED_PUBLIC_VAR: &str = "ACCEPT_UNSOLICITED_PUBLIC";
 /// names enabled without any `mrf` instance setting: the fallback of
 /// [`crate::federation::mrf`]'s configuration load.
 pub const MRF_POLICIES_VAR: &str = "MRF_POLICIES";
+/// Environment variable holding whether the moderation lists of the
+/// enabled policies are published at all.
+///
+/// The `mrf_policies` names beside every policy's transparency objects in
+/// the federation block of `GET /api/v1/instance`, `GET /api/v2/instance`
+/// and `NodeInfo`, and the list
+/// `GET /api/v1/instance/domain_blocks` renders, both come from this
+/// switch (see [`crate::federation::mrf`]).
+pub const MRF_TRANSPARENCY_VAR: &str = "MRF_TRANSPARENCY";
+/// Environment variable holding the comma-separated list of host patterns
+/// kept out of those published lists; using it is disclosed there as
+/// `"exclusions": true`.
+pub const MRF_TRANSPARENCY_EXCLUSIONS_VAR: &str = "MRF_TRANSPARENCY_EXCLUSIONS";
 /// Environment variable holding whether routes that mount a rate-limit
 /// bucket throttle their requests.
 pub const RATE_LIMITS_ENABLED_VAR: &str = "RATE_LIMITS_ENABLED";
@@ -613,6 +626,12 @@ pub const DEFAULT_FEDERATION_ENABLED: bool = true;
 /// anti-spam decision, Pleroma's
 /// `[:instance, :limit]`-style gate spelled as one switch.
 pub const DEFAULT_ACCEPT_UNSOLICITED_PUBLIC: bool = true;
+/// MRF transparency used when `MRF_TRANSPARENCY` is unset: the enabled
+/// policies publish their lists.
+///
+/// This is Pleroma's `[:mrf, :transparency]` default — an instance that
+/// moderates by domain tells its users so.
+pub const DEFAULT_MRF_TRANSPARENCY: bool = true;
 /// Rate limiting used when `RATE_LIMITS_ENABLED` is unset: routes that
 /// mount a bucket throttle, like Pleroma's `RateLimiterPlug`.
 pub const DEFAULT_RATE_LIMITS_ENABLED: bool = true;
@@ -661,6 +680,41 @@ impl Toggle {
 impl From<bool> for Toggle {
     fn from(value: bool) -> Self {
         Self(value)
+    }
+}
+
+/// The moderation-filter (MRF) settings: which policies run over every
+/// activity, and how much of what they decide the instance tells the world
+/// (see [`crate::federation::mrf`]).
+///
+/// The three settings ride together because the [`Config`] readers and the
+/// [`Debug`] impl below each have an 80-line budget (AGENTS.md) that one
+/// field per line would not fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MrfSettings {
+    /// The policy names from `MRF_POLICIES`, in chain order: the fallback
+    /// chain configuration, used whenever the `mrf` instance setting
+    /// carries no `policies` array of its own.
+    pub policies: Vec<String>,
+    /// Whether the policies publish their lists at all, from
+    /// `MRF_TRANSPARENCY` (Pleroma's `[:mrf, :transparency]`).
+    pub transparency: Toggle,
+    /// The host patterns kept out of what is published, from
+    /// `MRF_TRANSPARENCY_EXCLUSIONS` (comma list, Pleroma's
+    /// `[:mrf, :transparency_exclusions]`).
+    pub transparency_exclusions: Vec<String>,
+}
+
+impl MrfSettings {
+    /// The settings the test configuration writes: no policy without a
+    /// setting row, and the moderation published whole.
+    #[cfg(any(test, feature = "integration-tests"))]
+    const fn test_defaults() -> Self {
+        Self {
+            policies: Vec::new(),
+            transparency: Toggle::new(DEFAULT_MRF_TRANSPARENCY),
+            transparency_exclusions: Vec::new(),
+        }
     }
 }
 
@@ -1326,10 +1380,11 @@ pub struct Config {
     /// (`private`, `direct` and the author's followers-addressed posts are
     /// never gated — they were aimed at somebody here).
     pub accept_unsolicited_public: Toggle,
-    /// The MRF policy names from `MRF_POLICIES` (comma list): the fallback
-    /// chain configuration of [`crate::federation::mrf`], used whenever
-    /// the `mrf` instance setting carries no `policies` array of its own.
-    pub mrf_policies: Vec<String>,
+    /// The moderation-filter (MRF) settings, from `MRF_POLICIES`,
+    /// `MRF_TRANSPARENCY` and `MRF_TRANSPARENCY_EXCLUSIONS`: the fallback
+    /// chain of [`crate::federation::mrf`] and how much of what the chain
+    /// decides the instance publishes (see [`MrfSettings`]).
+    pub mrf: MrfSettings,
     /// The rate limiter settings, from `RATE_LIMITS_ENABLED`, `RATE_LIMITS`
     /// and `TRUST_PROXY_HEADERS` (see [`crate::rate_limit`]).
     pub rate_limit: RateLimitConfig,
@@ -1429,7 +1484,7 @@ impl Config {
             fetch,
             federation_enabled: federation_enabled(&lookup)?,
             accept_unsolicited_public: accept_unsolicited_public(&lookup)?,
-            mrf_policies: mrf_policies(&lookup),
+            mrf: mrf_settings(&lookup)?,
             rate_limit: rate_limit_settings(&lookup)?,
         })
     }
@@ -1583,7 +1638,7 @@ impl Config {
             },
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
             accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
-            mrf_policies: Vec::new(),
+            mrf: MrfSettings::test_defaults(),
             rate_limit: RateLimitConfig {
                 enabled: Toggle::new(false),
                 limits: rate_limit::default_limits(),
@@ -2229,14 +2284,27 @@ where
     .into())
 }
 
-/// Reads `MRF_POLICIES`: the comma-separated list of MRF policy names
-/// enabled without a database setting, empty when unset or blank (see
-/// [`crate::federation::mrf`]).
-fn mrf_policies<F>(lookup: &F) -> Vec<String>
+/// Reads the MRF group: the `MRF_POLICIES` fallback chain (empty when unset
+/// or blank), the `MRF_TRANSPARENCY` switch on publishing the moderation
+/// lists, and the `MRF_TRANSPARENCY_EXCLUSIONS` host patterns kept out of
+/// them (see [`crate::federation::mrf`]). Grouped because every [`Config`]
+/// reader works inside a line budget (AGENTS.md).
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidBoolean`] when `MRF_TRANSPARENCY` holds a
+/// value that is neither spelling.
+fn mrf_settings<F>(lookup: &F) -> Result<MrfSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    comma_list(&lookup(MRF_POLICIES_VAR).unwrap_or_default())
+    Ok(MrfSettings {
+        policies: comma_list(&lookup(MRF_POLICIES_VAR).unwrap_or_default()),
+        transparency: boolean(lookup, MRF_TRANSPARENCY_VAR, DEFAULT_MRF_TRANSPARENCY)?.into(),
+        transparency_exclusions: comma_list(
+            &lookup(MRF_TRANSPARENCY_EXCLUSIONS_VAR).unwrap_or_default(),
+        ),
+    })
 }
 
 /// What [`text_length_limits`] reads: the four default-or-parse profile
@@ -2865,11 +2933,11 @@ impl fmt::Debug for Config {
             .field("fetch", &self.fetch)
             .field("rate_limit", &self.rate_limit);
         // The federation trio — the enabled toggle, the unsolicited-public
-        // toggle and the policy-name list — closes the chain from a
-        // helper: the documented split that holds `fmt` inside Clippy's
-        // line budget. The fields stay named in `fmt`'s body, as the
-        // binding's and the call's arguments.
-        debug_federation(debug, fed, self.mrf_policies.as_slice())
+        // gate and the whole MRF group — closes the chain from a helper:
+        // the documented split that holds `fmt` inside Clippy's line
+        // budget. The fields stay named in `fmt`'s body, as the binding's
+        // and the call's arguments.
+        debug_federation(debug, fed, &self.mrf)
     }
 }
 
@@ -2883,19 +2951,21 @@ fn hide_secret(config: &Config) -> Option<&'static str> {
 }
 
 /// Completes the [`Config`] `Debug` struct: the federation toggles — the
-/// enabled switch and the unsolicited-public gate — and the enabled MRF
-/// policy names, then the whole document. Factored out of the [`Debug`]
-/// impl above to hold that function's line count inside Clippy's budget.
+/// enabled switch and the unsolicited-public gate — the enabled MRF policy
+/// names and the MRF transparency settings (the publish switch beside the
+/// hidden host patterns), then the whole document. Factored out of the
+/// [`Debug`] impl above to hold that function's line count inside Clippy's
+/// budget.
 fn debug_federation(
     debug: &mut fmt::DebugStruct<'_, '_>,
     toggles: (Toggle, Toggle),
-    mrf_policies: &[String],
+    mrf: &MrfSettings,
 ) -> fmt::Result {
     let (federation_enabled, accept_unsolicited_public) = toggles;
     debug
         .field("federation_enabled", &federation_enabled)
         .field("accept_unsolicited_public", &accept_unsolicited_public)
-        .field("mrf_policies", &mrf_policies)
+        .field("mrf", mrf)
         .finish()
 }
 
@@ -4275,7 +4345,7 @@ mod tests {
     fn mrf_policies_default_to_the_empty_chain() {
         let config = config_with(&[]);
         assert!(
-            config.mrf_policies.is_empty(),
+            config.mrf.policies.is_empty(),
             "no MRF policies without MRF_POLICIES or the `mrf` setting"
         );
     }
@@ -4285,21 +4355,108 @@ mod tests {
     fn mrf_policies_parses_a_comma_list() {
         let config = config_with(&[(MRF_POLICIES_VAR, "simple, keyword ,")]);
         assert_eq!(
-            config.mrf_policies,
+            config.mrf.policies,
             vec!["simple".to_owned(), "keyword".to_owned()],
             "MRF_POLICIES lists the chain in order"
         );
     }
 
-    /// `Debug` renders the MRF policy names (through the `Debug` chain's
-    /// federation helper, beside the toggle the helper also prints).
+    /// `Debug` renders the MRF group (through the `Debug` chain's
+    /// federation helper, beside the toggles the helper also prints).
     #[test]
     fn debug_shows_the_mrf_policies() {
         let config = config_with(&[(MRF_POLICIES_VAR, "noop,simple")]);
         let debug = format!("{config:?}");
         assert!(
-            debug.contains(r#"mrf_policies: ["noop", "simple"]"#),
+            debug.contains(r#"policies: ["noop", "simple"]"#),
             "the policy-name list is visible in Debug output: {debug}"
+        );
+    }
+
+    /// `MRF_TRANSPARENCY` is on by default: a moderating instance says so.
+    #[test]
+    fn mrf_transparency_is_on_by_default() {
+        let config = config_with(&[]);
+        assert!(
+            config.mrf.transparency.get(),
+            "the lists an instance moderates by are published unless its operator \
+             says otherwise (Pleroma's `[:mrf, :transparency]` default)"
+        );
+        assert!(
+            config.mrf.transparency_exclusions.is_empty(),
+            "and nothing is excluded without MRF_TRANSPARENCY_EXCLUSIONS"
+        );
+    }
+
+    /// `MRF_TRANSPARENCY` accepts the same two spellings as every other
+    /// toggle.
+    #[test]
+    fn mrf_transparency_parses_booleans() {
+        for (value, want) in [
+            ("true", true),
+            ("FALSE", false),
+            (" 0 ", false),
+            ("1", true),
+            ("", true),
+        ] {
+            let config = config_with(&[(MRF_TRANSPARENCY_VAR, value)]);
+            assert_eq!(
+                config.mrf.transparency.get(),
+                want,
+                "MRF_TRANSPARENCY={value:?} means {want} (unset publishes)"
+            );
+        }
+    }
+
+    /// A value that is neither spelling refuses startup rather than
+    /// silently publishing (or hiding) the lists.
+    #[test]
+    fn invalid_mrf_transparency_is_an_error() {
+        let err = try_config_with(&[(MRF_TRANSPARENCY_VAR, "maybe")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidBoolean(MRF_TRANSPARENCY_VAR),
+            "error variant"
+        );
+        assert!(
+            err.to_string()
+                .starts_with(&format!("invalid {MRF_TRANSPARENCY_VAR}: ")),
+            "message names the variable"
+        );
+    }
+
+    /// `MRF_TRANSPARENCY_EXCLUSIONS` is a comma list: trimmed, empties
+    /// dropped, order kept.
+    #[test]
+    fn mrf_transparency_exclusions_parse_a_comma_list() {
+        let config = config_with(&[(
+            MRF_TRANSPARENCY_EXCLUSIONS_VAR,
+            "*.partner.example, press.example ,",
+        )]);
+        assert_eq!(
+            config.mrf.transparency_exclusions,
+            vec!["*.partner.example".to_owned(), "press.example".to_owned()],
+            "the patterns arrive as written, ready to match the lists with"
+        );
+    }
+
+    /// `Debug` renders both transparency settings inside the MRF group:
+    /// the switch and the hidden patterns (which are not secret — the point
+    /// of the flag is that they are hidden from *anonymous* readers).
+    #[test]
+    fn debug_shows_the_mrf_transparency_settings() {
+        let config = config_with(&[
+            (MRF_TRANSPARENCY_VAR, "false"),
+            (MRF_TRANSPARENCY_EXCLUSIONS_VAR, "press.example"),
+        ]);
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("transparency: Toggle(false)"),
+            "the switch is visible in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains(r#"transparency_exclusions: ["press.example"]"#),
+            "and so is the hidden-pattern list: {debug}"
         );
     }
 
