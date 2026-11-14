@@ -241,6 +241,7 @@ fn job_registry() -> JobRegistry {
         jobs::maintenance::KIND_MEDIA,
         jobs::maintenance::handle_sweep_media,
     );
+    registry.register(jobs::instances::KIND_PROBE, jobs::instances::handle_probe);
     registry.register(jobs::imports::KIND_FOLLOWS, jobs::imports::handle_follows);
     registry.register(jobs::imports::KIND_BLOCKS, jobs::imports::handle_blocks);
     registry.register(jobs::imports::KIND_MUTES, jobs::imports::handle_mutes);

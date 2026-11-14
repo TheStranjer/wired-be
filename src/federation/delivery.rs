@@ -33,6 +33,22 @@
 //! a hostile header cannot park a delivery forever) and on the queue's
 //! [`backoff`](crate::jobs::backoff) otherwise, until the
 //! [`MAX_ATTEMPTS`] budget is spent.
+//!
+//! The attempt also keeps the [`instances`] reachability ledger, per host =
+//! the authority of the inbox: a `2xx` answer is a successful outbound
+//! exchange, so [`instance::touch`] first-sights the host and
+//! [`instance::set_reachable`] clears any mark there; a [`HttpError::Connect`]
+//! or [`HttpError::Timeout`] failure marks the host unreachable on any
+//! attempt, and so does a `5xx` answer once this attempt spends the
+//! [`MAX_ATTEMPTS`] budget (a `5xx` with retries still left says only *not
+//! now*). Everything else stays silent in the ledger: a permanent `4xx`
+//! refusal and an [`HttpError::InvalidUrl`] or [`HttpError::Blocked`]
+//! guard rejection tell nothing about the host being down. The marking
+//! itself is bookkeeping: [`instance::set_unreachable`] keeps an earlier
+//! mark in place, and a ledger write that fails is logged and never changes
+//! the job's outcome.
+//!
+//! [`instances`]: crate::models::instance
 
 use std::time::Duration;
 
@@ -47,13 +63,13 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     federation::{
-        mrf,
+        json, mrf,
         signature::{SignedHeaders, SigningKey, sign_request},
     },
     http_client::HttpError,
     jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_FEDERATOR_OUTGOING},
     models::{
-        instance_policy_domain,
+        instance, instance_policy_domain,
         job::{NewJob, enqueue},
         user::{self, User},
     },
@@ -211,14 +227,17 @@ pub fn handle(state: AppState, attempt: AttemptInfo, args: Value) -> HandlerFutu
 }
 
 /// Runs one delivery attempt: read the signing actor, prepare the activity,
-/// sign, `POST`, and classify the answer.
+/// sign, `POST`, classify the answer, and keep the reachability ledger of
+/// the inbox's host straight about what the answer said, as this module's
+/// docs describe.
 ///
 /// Failures are the job's, not the caller's: what cannot ever work (a
 /// malformed payload, an actor that is not a local signer, a URL or key that
 /// cannot be signed, a peer that refuses for good) is a
 /// [`JobError::Discard`], what may work later (a database hiccup, a timeout,
 /// a `5xx`, a throttle) a [`JobError::Retry`] or
-/// [`JobError::RetryAfter`].
+/// [`JobError::RetryAfter`]. Ledger writes never feed back into any of
+/// that: they only log.
 async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(), JobError> {
     let args = serde_json::from_value::<DeliveryArgs>(args)
         .map_err(|err| JobError::Discard(format!("malformed delivery arguments: {err}")))?;
@@ -251,12 +270,20 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
     .map_err(|err| {
         JobError::Discard(format!("cannot sign the delivery to {}: {err}", args.inbox))
     })?;
-    let response = state
+    let response = match state
         .http_client
         .post_bytes(&args.inbox, &delivery_headers(&signed), body)
         .await
-        .map_err(|err| transport_error(&err))?;
-    delivery_outcome(response.status, &response.headers, attempt)
+    {
+        Ok(response) => response,
+        Err(err) => {
+            note_transport_failure(&state, &args.inbox, &err).await;
+            return Err(transport_error(&err));
+        }
+    };
+    let outcome = delivery_outcome(response.status, &response.headers, attempt);
+    note_answer(&state, &args.inbox, response.status, attempt).await;
+    outcome
 }
 
 /// Parses an inbox into a deliverable URL: `http`/`https` with a host, and
@@ -410,6 +437,55 @@ fn transport_error(err: &HttpError) -> JobError {
     }
 }
 
+/// The ledger bookkeeping of a request that never turned into an answer: a
+/// refused connection or an elapsed timeout is the host being down, so
+/// [`instance::set_unreachable`] marks it on any attempt; the failures the
+/// address itself causes ([`HttpError::InvalidUrl`], [`HttpError::Blocked`])
+/// and the ones a delivery `POST` does not produce say nothing about the
+/// host. A write that fails is a lost ledger entry: logged, never the
+/// job's outcome, which [`transport_error`] still decides alone.
+async fn note_transport_failure(state: &AppState, inbox: &str, err: &HttpError) {
+    if !matches!(err, HttpError::Connect(_) | HttpError::Timeout) {
+        return;
+    }
+    let Some(host) = json::http_host(inbox) else {
+        return;
+    };
+    if let Err(write_err) = instance::set_unreachable(&state.db, &host, Utc::now()).await {
+        warn!(host = %host, %write_err, "could not mark the delivery target unreachable");
+    }
+}
+
+/// The ledger bookkeeping of a peer's answer, per its status: any `2xx` is a
+/// successful outbound exchange — [`instance::touch`] first-sights the host
+/// and [`instance::set_reachable`] clears any mark there; a `5xx` on the
+/// attempt that spends [`MAX_ATTEMPTS`] marks the host unreachable (a `5xx`
+/// with retries still left says only *not now*, and every other answer —
+/// the `4xx` refusals, `3xx`, `408`, `429` — says nothing). An inbox whose
+/// host no `http(s)` URL gives names is skipped, and a write that fails is
+/// logged, never the job's outcome, which [`delivery_outcome`] still
+/// decides alone.
+async fn note_answer(state: &AppState, inbox: &str, status: u16, attempt: AttemptInfo) {
+    let delivered = (200..=299).contains(&status);
+    let spent_5xx = (500..=599).contains(&status) && attempt.attempts >= attempt.max_attempts;
+    if !delivered && !spent_5xx {
+        return;
+    }
+    let Some(host) = json::http_host(inbox) else {
+        return;
+    };
+    if delivered {
+        if let Err(err) = instance::touch(&state.db, &host).await {
+            warn!(host = %host, %err, "could not record the delivery target's instance");
+        }
+        if let Err(err) = instance::set_reachable(&state.db, &host).await {
+            warn!(host = %host, %err, "could not clear the delivery target's unreachable mark");
+        }
+    } else if let Err(err) = instance::set_unreachable(&state.db, &host, Utc::now()).await {
+        warn!(host = %host, %err, "could not mark the delivery target unreachable");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -426,6 +502,7 @@ mod tests {
         routing::post,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use chrono::{DateTime, TimeZone as _};
     use serde_json::json;
     use sqlx::PgPool;
     use tokio::{net::TcpListener, task::JoinHandle};
@@ -456,6 +533,9 @@ mod tests {
     const ACTOR_KEY_ID: &str = "https://test.example/users/alice#main-key";
     /// The `headers` parameter a signed delivery POST must name.
     const SIGNED_LINES: &str = "(request-target) host date digest";
+    /// The host every loopback mock answers on: the ledger key a delivery to
+    /// a mock records the host under.
+    const LOOPBACK_HOST: &str = "127.0.0.1";
 
     /// The state under test: `pool`, the test config, and a client that may
     /// reach the loopback mocks.
@@ -493,6 +573,15 @@ mod tests {
     const fn second_attempt() -> AttemptInfo {
         AttemptInfo {
             attempts: 2,
+            max_attempts: MAX_ATTEMPTS,
+        }
+    }
+
+    /// The attempt that spends the [`MAX_ATTEMPTS`] budget: what a retryable
+    /// answer on it does is the last word this delivery says about the host.
+    const fn last_attempt() -> AttemptInfo {
+        AttemptInfo {
+            attempts: MAX_ATTEMPTS,
             max_attempts: MAX_ATTEMPTS,
         }
     }
@@ -648,6 +737,20 @@ mod tests {
             .into_response()
     }
 
+    /// A mock inbox that answers every request with `status` and nothing
+    /// else, plus the task serving it: the host is [`LOOPBACK_HOST`].
+    async fn answering_inbox(status: StatusCode) -> (String, JoinHandle<()>) {
+        let listener = bind().await;
+        let inbox = format!("{}{INBOX_PATH}", origin(&listener));
+        let server = spawn(
+            listener,
+            Router::new()
+                .route(INBOX_PATH, post(status_only))
+                .with_state(status),
+        );
+        (inbox, server)
+    }
+
     /// Runs one [`handle`] attempt as the actor `actor_id`, delivering to
     /// `inbox`.
     async fn attempt_to(
@@ -718,6 +821,38 @@ mod tests {
             .await
             .unwrap();
         count
+    }
+
+    /// The mark `host` carries in the reachability ledger: `None` when it
+    /// has no row at all, or a row carrying none.
+    async fn mark_of(pool: &PgPool, host: &str) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT unreachable_since FROM instances WHERE host = $1",
+        )
+        .bind(host)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .flatten()
+    }
+
+    /// Whether the reachability ledger holds a row for `host`.
+    async fn has_row(pool: &PgPool, host: &str) -> bool {
+        let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM instances WHERE host = $1")
+            .bind(host)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        rows > 0
+    }
+
+    /// One fixed minute in June 2025 — whole minutes round-trip through the
+    /// `timestamptz` columns unchanged, so a test comparing a mark it wrote
+    /// compares exactly.
+    fn stamp(day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 6, day, 0, 0, 0)
+            .single()
+            .expect("a real minute in June 2025")
     }
 
     /// Inserts a remote mirror named `nickname`, carrying the given inbox
@@ -1481,5 +1616,162 @@ mod tests {
             "a producer bug is a 422, got {err}"
         );
         assert_eq!(job_count(&pool).await, 0, "and nothing was queued");
+    }
+
+    /// A `2xx` answer to a host the ledger never saw creates its row, and
+    /// the same answer clears a mark a pre-marked host carries: the
+    /// successful outbound exchange is [`instance::touch`] plus
+    /// [`instance::set_reachable`].
+    #[tokio::test]
+    async fn a_2xx_answer_creates_the_row_and_clears_a_pre_mark() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        let state = test_state(&pool);
+        let (inbox, server) = answering_inbox(StatusCode::ACCEPTED).await;
+
+        attempt_to(&state, &inbox, alice.id, first_attempt())
+            .await
+            .unwrap();
+        assert!(
+            has_row(&pool, LOOPBACK_HOST).await,
+            "the first successful delivery first-sights the host in the ledger"
+        );
+        assert_eq!(
+            mark_of(&pool, LOOPBACK_HOST).await,
+            None,
+            "and the row it created carries no mark"
+        );
+
+        instance::set_unreachable(&pool, LOOPBACK_HOST, stamp(1))
+            .await
+            .unwrap();
+        attempt_to(&state, &inbox, alice.id, first_attempt())
+            .await
+            .unwrap();
+        assert_eq!(
+            mark_of(&pool, LOOPBACK_HOST).await,
+            None,
+            "the next 2xx clears the mark: the host answered again"
+        );
+        server.abort();
+    }
+
+    /// A connection the host refused marks it unreachable on the very first
+    /// attempt — and the job's outcome stays the retry [`transport_error`]
+    /// decides.
+    #[tokio::test]
+    async fn a_refused_connection_marks_the_host_unreachable() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        let state = test_state(&pool);
+        let listener = bind().await;
+        let inbox = format!("{}{INBOX_PATH}", origin(&listener));
+        drop(listener);
+
+        let outcome = attempt_to(&state, &inbox, alice.id, first_attempt()).await;
+
+        assert!(
+            matches!(outcome, Err(JobError::Retry(_))),
+            "a refused connection still retries, got {}",
+            outcome_text(&outcome)
+        );
+        assert!(
+            mark_of(&pool, LOOPBACK_HOST).await.is_some(),
+            "a host that refused the connection is marked unreachable"
+        );
+    }
+
+    /// A `500` marks the host only on the attempt that spends the budget;
+    /// the same answer while retries are left says only *not now* and
+    /// writes nothing, and either way the outcome stays the retry.
+    #[tokio::test]
+    async fn a_5xx_marks_only_on_the_attempt_that_spends_the_budget() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        let state = test_state(&pool);
+        let (inbox, server) = answering_inbox(StatusCode::INTERNAL_SERVER_ERROR).await;
+
+        let early = attempt_to(&state, &inbox, alice.id, first_attempt()).await;
+        assert!(
+            matches!(early, Err(JobError::Retry(_))),
+            "a 500 retries, got {}",
+            outcome_text(&early)
+        );
+        assert!(
+            !has_row(&pool, LOOPBACK_HOST).await,
+            "a 500 with retries left writes nothing to the ledger"
+        );
+
+        let last = attempt_to(&state, &inbox, alice.id, last_attempt()).await;
+        assert!(
+            matches!(last, Err(JobError::Retry(_))),
+            "the final 500 keeps the retry outcome, got {}",
+            outcome_text(&last)
+        );
+        assert!(
+            mark_of(&pool, LOOPBACK_HOST).await.is_some(),
+            "the 500 that spent the budget marks the host"
+        );
+        server.abort();
+    }
+
+    /// A permanent `4xx` refusal — even the final attempt's — discards the
+    /// delivery and leaves the host untouched in the ledger: a refusal
+    /// answers for the inbox, not for the host being down.
+    #[tokio::test]
+    async fn a_permanent_refusal_leaves_the_host_unmarked() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        let state = test_state(&pool);
+        let (inbox, server) = answering_inbox(StatusCode::NOT_FOUND).await;
+
+        let outcome = attempt_to(&state, &inbox, alice.id, last_attempt()).await;
+        server.abort();
+
+        assert!(
+            matches!(outcome, Err(JobError::Discard(_))),
+            "a 404 discards, got {}",
+            outcome_text(&outcome)
+        );
+        assert!(
+            !has_row(&pool, LOOPBACK_HOST).await,
+            "and the refusal wrote no ledger row"
+        );
+    }
+
+    /// The marking runs through [`instance::set_unreachable`]'s
+    /// only-if-null rule: a fresh failure against an already-marked host
+    /// keeps the earlier since — the column says when the host *went*
+    /// quiet.
+    #[tokio::test]
+    async fn a_fresh_failure_keeps_an_earlier_mark() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        let state = test_state(&pool);
+        let went_quiet = stamp(1);
+        instance::set_unreachable(&pool, LOOPBACK_HOST, went_quiet)
+            .await
+            .unwrap();
+        let listener = bind().await;
+        let inbox = format!("{}{INBOX_PATH}", origin(&listener));
+        drop(listener);
+
+        let outcome = attempt_to(&state, &inbox, alice.id, first_attempt()).await;
+
+        assert!(
+            matches!(outcome, Err(JobError::Retry(_))),
+            "the failed connection still retries, got {}",
+            outcome_text(&outcome)
+        );
+        assert_eq!(
+            mark_of(&pool, LOOPBACK_HOST).await,
+            Some(went_quiet),
+            "the later failure does not move the mark that says when the host went quiet"
+        );
     }
 }

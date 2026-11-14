@@ -285,6 +285,13 @@ pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
 /// follows are dropped at ingestion, unless a local user is mentioned or
 /// the status replies to a local one.
 pub const ACCEPT_UNSOLICITED_PUBLIC_VAR: &str = "ACCEPT_UNSOLICITED_PUBLIC";
+/// Environment variable holding how long a host whose delivery failed stays
+/// treated as reachable, in seconds, as `UNREACHABLE_GRACE_SECS`.
+///
+/// [`crate::models::instance::is_host_unreachable`] reads a host unreachable
+/// only when its `unreachable_since` mark is older than this span, so `0` —
+/// the default — makes any marked host unreachable at once.
+pub const UNREACHABLE_GRACE_SECS_VAR: &str = "UNREACHABLE_GRACE_SECS";
 /// Environment variable holding the comma-separated list of MRF policy
 /// names enabled without any `mrf` instance setting: the fallback of
 /// [`crate::federation::mrf`]'s configuration load.
@@ -656,6 +663,15 @@ pub const DEFAULT_FEDERATION_ENABLED: bool = true;
 /// anti-spam decision, Pleroma's
 /// `[:instance, :limit]`-style gate spelled as one switch.
 pub const DEFAULT_ACCEPT_UNSOLICITED_PUBLIC: bool = true;
+/// Unreachable-host grace period used when `UNREACHABLE_GRACE_SECS` is
+/// unset: `0`, so a host the delivery path has marked counts as unreachable
+/// with the mark itself.
+///
+/// Pleroma has no such window — its `Instances.filter_reachable/1` drops
+/// every host carrying `unreachable_since` — so `0` is the compatible
+/// reading; an operator raising it gives a host that refused one `POST` the
+/// grace of a retry cycle before the whole instance stops talking to it.
+pub const DEFAULT_UNREACHABLE_GRACE_SECS: usize = 0;
 /// MRF transparency used when `MRF_TRANSPARENCY` is unset: the enabled
 /// policies publish their lists.
 ///
@@ -1420,6 +1436,17 @@ pub struct Config {
     /// (`private`, `direct` and the author's followers-addressed posts are
     /// never gated — they were aimed at somebody here).
     pub accept_unsolicited_public: Toggle,
+    /// How long after a host was marked unreachable it still counts as
+    /// reachable for outbound federation, in seconds, from
+    /// `UNREACHABLE_GRACE_SECS`; `0` (the default) makes any marked host
+    /// unreachable at once.
+    ///
+    /// [`crate::federation::publisher`] turns it into a span and passes it to
+    /// [`is_host_unreachable`](crate::models::instance::is_host_unreachable),
+    /// which keeps a host deliverable while its `unreachable_since` mark is
+    /// younger than this window — the back-off floor a single failed `POST`
+    /// should not be able to defederate a peer over.
+    pub unreachable_grace_secs: usize,
     /// The moderation-filter (MRF) settings, from `MRF_POLICIES`,
     /// `MRF_TRANSPARENCY` and `MRF_TRANSPARENCY_EXCLUSIONS`: the fallback
     /// chain of [`crate::federation::mrf`] and how much of what the chain
@@ -1450,7 +1477,6 @@ impl Config {
         let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
         let (profile, limits, text, auth, exposure, mail) = wording_and_mail(&lookup, &base_url)?;
         let rest = rest_settings(&lookup)?;
-        let fetch = fetch_settings(&lookup)?;
         Ok(Self {
             database_url,
             bind_addr,
@@ -1522,9 +1548,10 @@ impl Config {
             rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup),
             translation: translation_settings(&lookup)?,
-            fetch,
+            fetch: rest.fetch,
             federation_enabled: federation_enabled(&lookup)?,
             accept_unsolicited_public: accept_unsolicited_public(&lookup)?,
+            unreachable_grace_secs: unreachable_grace_secs(&lookup)?,
             mrf: mrf_settings(&lookup)?,
             rate_limit: rate_limit_settings(&lookup)?,
         })
@@ -1682,6 +1709,7 @@ impl Config {
             },
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
             accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
+            unreachable_grace_secs: DEFAULT_UNREACHABLE_GRACE_SECS,
             mrf: MrfSettings::test_defaults(),
             rate_limit: test_rate_limit(),
         }
@@ -1846,12 +1874,13 @@ where
     Ok((validity_days, limit_days, purge))
 }
 
-/// The four reader groups that share no theme — [`upload_settings`],
-/// [`misc_toggles`], [`job_worker`] and [`backup_settings`] — flattened into
-/// one named bundle so [`Config::from_lookup`] binds all twelve of their
-/// fields with a single `let` and stays inside Clippy's line budget, the
-/// same move [`Groups`] spells for the wording and signup trios. The field
-/// names mirror the [`Config`] fields they hang on.
+/// The reader groups that share no theme — [`upload_settings`],
+/// [`misc_toggles`], [`job_worker`], [`backup_settings`] and
+/// [`fetch_settings`] — flattened into one named bundle so
+/// [`Config::from_lookup`] binds all thirteen of their fields with a single
+/// `let` and stays inside Clippy's line budget, the same move [`Groups`]
+/// spells for the wording and signup trios. The field names mirror the
+/// [`Config`] fields they hang on.
 #[derive(Debug)]
 struct RestSettings {
     /// Per-request limits for multipart uploads (`UPLOAD_LIMIT_BYTES` and
@@ -1882,14 +1911,17 @@ struct RestSettings {
     backup_limit_days: usize,
     /// Whether the backup purge sweep runs at all (`BACKUP_PURGE`).
     backup_purge: Toggle,
+    /// The settings that govern how this instance fetches and is fetched by
+    /// peers, from [`fetch_settings`].
+    fetch: FetchSettings,
 }
 
-/// Reads the four groups [`RestSettings`] bundles.
+/// Reads the five groups [`RestSettings`] bundles.
 ///
 /// # Errors
 ///
-/// Those of [`upload_settings`], [`misc_toggles`], [`job_worker`] and
-/// [`backup_settings`].
+/// Those of [`upload_settings`], [`misc_toggles`], [`job_worker`],
+/// [`backup_settings`] and [`fetch_settings`].
 fn rest_settings<F>(lookup: &F) -> Result<RestSettings, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -1898,6 +1930,7 @@ where
     let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(lookup)?;
     let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(lookup)?;
     let (backup_validity_days, backup_limit_days, backup_purge) = backup_settings(lookup)?;
+    let fetch = fetch_settings(lookup)?;
     Ok(RestSettings {
         upload_limits,
         avatar_limit_bytes,
@@ -1911,6 +1944,7 @@ where
         backup_validity_days,
         backup_limit_days,
         backup_purge,
+        fetch,
     })
 }
 
@@ -2418,6 +2452,26 @@ where
         DEFAULT_ACCEPT_UNSOLICITED_PUBLIC,
     )?
     .into())
+}
+
+/// Reads `UNREACHABLE_GRACE_SECS`, [`DEFAULT_UNREACHABLE_GRACE_SECS`] when
+/// unset: how long a host marked unreachable stays deliverable, so
+/// [`crate::federation::publisher`] can hold a freshly marked peer in the
+/// target set for one more retry cycle.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidNumber`] when the variable holds a value
+/// that is not a whole number.
+fn unreachable_grace_secs<F>(lookup: &F) -> Result<usize, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    number(
+        lookup,
+        UNREACHABLE_GRACE_SECS_VAR,
+        DEFAULT_UNREACHABLE_GRACE_SECS,
+    )
 }
 
 /// Reads the MRF group: the `MRF_POLICIES` fallback chain (empty when unset
@@ -3083,8 +3137,9 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
 /// trio — the streaming heartbeat, the mailer (whose `smtp_password` and
 /// [`hide_secret`]'s `secret_key_base` are the impl's redactions beside
 /// `database_url`), the media, translation and fetch services, and the
-/// federation, MRF and rate-limiter settings. The builder arrives borrowed
-/// and leaves borrowed, so `fmt` can close the document it opened.
+/// federation settings with the unreachable-host grace period, the MRF
+/// chain and the rate limiter. The builder arrives borrowed and leaves
+/// borrowed, so `fmt` can close the document it opened.
 fn debug_delivery_and_federation<'a, 'b, 'd>(
     debug: &'d mut fmt::DebugStruct<'a, 'b>,
     config: &Config,
@@ -3121,6 +3176,7 @@ fn debug_delivery_and_federation<'a, 'b, 'd>(
             "accept_unsolicited_public",
             &config.accept_unsolicited_public,
         )
+        .field("unreachable_grace_secs", &config.unreachable_grace_secs)
         .field("mrf", &config.mrf)
         .field("rate_limit", &config.rate_limit)
 }
@@ -4793,6 +4849,47 @@ mod tests {
         assert!(
             debug.contains("accept_unsolicited_public: Toggle(false)"),
             "the ingest gate toggle is visible in Debug output: {debug}"
+        );
+    }
+
+    /// The unreachable-host grace period: zero by default, so every marked
+    /// host counts, the environment overriding it, and `Debug` showing the
+    /// value.
+    #[test]
+    fn reads_custom_unreachable_grace_secs() {
+        let defaults = config_with(&[]);
+        assert_eq!(
+            defaults.unreachable_grace_secs, 0,
+            "default UNREACHABLE_GRACE_SECS"
+        );
+
+        let config = config_with(&[(UNREACHABLE_GRACE_SECS_VAR, "3600")]);
+        assert_eq!(
+            config.unreachable_grace_secs, 3600,
+            "custom UNREACHABLE_GRACE_SECS"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("unreachable_grace_secs: 3600"),
+            "the grace period is visible in Debug output: {debug}"
+        );
+    }
+
+    /// An empty `UNREACHABLE_GRACE_SECS` is the unset state, and anything
+    /// that is not a whole number refuses startup.
+    #[test]
+    fn invalid_unreachable_grace_secs_is_an_error() {
+        let blank = config_with(&[(UNREACHABLE_GRACE_SECS_VAR, "")]);
+        assert_eq!(
+            blank.unreachable_grace_secs, 0,
+            "an empty value is the default, not an error"
+        );
+
+        let err = try_config_with(&[(UNREACHABLE_GRACE_SECS_VAR, "an-hour")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNumber(UNREACHABLE_GRACE_SECS_VAR),
+            "error variant"
         );
     }
 

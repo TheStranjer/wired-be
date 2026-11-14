@@ -38,8 +38,10 @@
 //!   activities with public addressing and for the actor's own
 //!   `Delete`/`Undo`/`Update`, so relays keep their copies fresh;
 //! - inboxes whose host instance policy rejects — by its own table or by
-//!   the [`mrf`] domain lists — or that the (later) unreachable
-//!   ledger marks unreachable are dropped
+//!   the [`mrf`] domain lists — or whose
+//!   [`instances`](crate::models::instance) row carries an unreachable mark
+//!   older than [`UNREACHABLE_GRACE_SECS`](crate::config::UNREACHABLE_GRACE_SECS_VAR),
+//!   are dropped
 //!   ([`is_host_unreachable`](crate::models::instance::is_host_unreachable)),
 //!   and so is everything that is not an `http(s)` inbox URL on a foreign
 //!   authority;
@@ -208,7 +210,8 @@ async fn publish_filtered(
         candidates.extend(instance::relay_inboxes(&state.db).await?);
     }
     candidates.extend(opts.extra_inboxes);
-    let targets = deliverable_inboxes(&state.db, policy.as_ref(), actor, candidates).await?;
+    let grace = unreachable_grace(state.config.unreachable_grace_secs);
+    let targets = deliverable_inboxes(&state.db, policy.as_ref(), actor, candidates, grace).await?;
     for inbox in &targets {
         enqueue_delivery(state, inbox, actor, &activity).await?;
     }
@@ -421,7 +424,7 @@ fn names_reference(value: Option<&Value>, ap_id: &str) -> bool {
 /// The final target set: candidates deduplicated by URL, each kept only
 /// when it is an `http(s)` inbox on a foreign authority whose host neither
 /// instance policy rejects — by table row nor by the [`mrf`] domain lists
-/// ([`MrfConfig::rejected`]) — nor the unreachable ledger marks.
+/// ([`MrfConfig::rejected`]) — nor the unreachable ledger marks past `grace`.
 ///
 /// [`mrf`]: crate::federation::mrf
 /// [`MrfConfig::rejected`]: crate::federation::mrf::MrfConfig::rejected
@@ -430,6 +433,7 @@ async fn deliverable_inboxes(
     policy: &mrf::MrfConfig,
     actor: &User,
     candidates: Vec<String>,
+    grace: chrono::Duration,
 ) -> AppResult<Vec<String>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut inboxes = Vec::new();
@@ -442,7 +446,7 @@ async fn deliverable_inboxes(
         };
         if instance_policy_domain::is_rejected(pool, &host).await?
             || policy.rejected(&host)
-            || instance::is_host_unreachable(pool, &host).await?
+            || instance::is_host_unreachable(pool, &host, grace).await?
         {
             debug!(inbox = %candidate, "delivery target dropped: the host is refused");
             continue;
@@ -450,6 +454,20 @@ async fn deliverable_inboxes(
         inboxes.push(candidate);
     }
     Ok(inboxes)
+}
+
+/// The configured [`UNREACHABLE_GRACE_SECS`](crate::config::UNREACHABLE_GRACE_SECS_VAR)
+/// as the span [`is_host_unreachable`](crate::models::instance::is_host_unreachable)
+/// compares a mark against: `secs` seconds, and [`Duration::MAX`](chrono::Duration::MAX)
+/// for a value too large to represent as a span — the literal reading of a
+/// window that outlasts every mark is a gate that never closes, which is what
+/// such a value asks for.
+///
+/// The one conversion from the setting's `usize` seconds to the interval the
+/// lookup binds, done once per publish so the per-inbox loop passes a span.
+fn unreachable_grace(secs: usize) -> chrono::Duration {
+    chrono::Duration::try_seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+        .unwrap_or(chrono::Duration::MAX)
 }
 
 /// The host of `inbox`, when it is a deliverable `http(s)` URL on an
@@ -474,6 +492,7 @@ fn deliverable_host(inbox: &str, actor_ap_id: &str) -> Option<String> {
 mod tests {
     use std::sync::Arc;
 
+    use chrono::{Duration, Utc};
     use serde_json::json;
     use sqlx::PgPool;
 
@@ -496,6 +515,17 @@ mod tests {
     const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
     /// The activity id every fixture carries.
     const ACTIVITY_ID: &str = "https://test.example/activities/1";
+    /// The personal inbox the `other.example` mirror publishes.
+    const ERIN_INBOX: &str = "https://other.example/users/erin/inbox";
+    /// The id of the second activity a test publishes, so a re-publish of the
+    /// first one's inbox cannot be swallowed by the delivery's deduplication.
+    const CORRECTION_ID: &str = "https://test.example/activities/2";
+    /// The grace window [`Config::for_tests`] carries: zero seconds, so the
+    /// publisher skips a host the moment the ledger marks it.
+    const NO_GRACE: Duration = Duration::zero();
+    /// How far in the past a test's mark goes, so the comparison with the
+    /// database's clock is settled rather than a race.
+    const ONE_MINUTE_AGO: Duration = Duration::minutes(1);
 
     /// The state under test over `pool` and `config`.
     fn state_with(pool: &PgPool, config: Config) -> AppState {
@@ -619,6 +649,11 @@ mod tests {
         opts: PublishOpts,
     ) -> usize {
         publish(state, actor, activity, opts).await.unwrap()
+    }
+
+    /// [`publish_ok`] with the options every plain fan-out test uses.
+    async fn publish_default(state: &AppState, actor: &User, activity: &Value) -> usize {
+        publish_ok(state, actor, activity, PublishOpts::default()).await
     }
 
     /// The inboxes the `federator.deliver` jobs queued so far ask for,
@@ -1238,9 +1273,10 @@ mod tests {
         assert_eq!(job_count(&pool).await, 0, "and queues nothing");
     }
 
-    /// The instance hooks are callable placeholders with neutral answers,
-    /// and a self-broadcast runs through the relay arm without changing
-    /// the follower fan-out while the hook is empty.
+    /// The unreachable hook is the `instances` ledger and the relay hook is
+    /// still the empty placeholder: with no row for a host its inboxes are
+    /// targets, a mark under the default zero grace drops them out of the set,
+    /// and clearing the mark targets them again.
     #[tokio::test]
     async fn the_relay_and_unreachable_hooks_answer_the_placeholders() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -1250,21 +1286,72 @@ mod tests {
             "no relay is subscribed until the relay ticket lands"
         );
         assert!(
-            !instance::is_host_unreachable(&pool, "peer.example")
+            !instance::is_host_unreachable(&pool, "peer.example", NO_GRACE)
                 .await
                 .unwrap(),
-            "no host is unreachable until the instances ticket lands"
+            "a host with no instances row is reachable"
         );
 
         let alice = alice(&pool).await;
-        let erin = mirror(
-            &pool,
-            "erin",
-            "other.example",
-            "https://other.example/users/erin/inbox",
-            None,
-        )
-        .await;
+        let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+        followed(&pool, &erin, &alice).await;
+        let state = test_state(&pool);
+
+        let first_targets = publish_default(&state, &alice, &public_activity(&alice)).await;
+        assert_eq!(first_targets, 1, "the follower's host is a target at first");
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![ERIN_INBOX],
+            "and it is queued"
+        );
+
+        // A second activity: the queue's per-(activity, inbox) deduplication
+        // would otherwise hide whether the skipped fan-out found a target.
+        let correction = json!({
+            "id": CORRECTION_ID,
+            "type": "Create",
+            "actor": alice.ap_id,
+            "to": [PUBLIC],
+            "cc": [alice.followers_url],
+        });
+        instance::set_unreachable(&pool, "other.example", Utc::now() - ONE_MINUTE_AGO)
+            .await
+            .unwrap();
+        let marked_targets = publish_default(&state, &alice, &correction).await;
+        assert_eq!(
+            marked_targets, 0,
+            "the marked host drops out of the target set"
+        );
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![ERIN_INBOX],
+            "and nothing new is queued for it"
+        );
+
+        instance::set_reachable(&pool, "other.example")
+            .await
+            .unwrap();
+        let recovered_targets = publish_default(&state, &alice, &correction).await;
+        assert_eq!(
+            recovered_targets, 1,
+            "and the cleared host is a target again"
+        );
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![ERIN_INBOX, ERIN_INBOX],
+            "queued once more, for the activity the skip missed"
+        );
+    }
+
+    /// A self-broadcast runs the relay arm without changing the fan-out: the
+    /// hook still answers the empty list, so the actor's own `Update` reaches
+    /// its followers and nobody else.
+    #[tokio::test]
+    async fn an_actor_self_broadcast_runs_the_relay_arm() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = alice(&pool).await;
+        let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
         followed(&pool, &erin, &alice).await;
         let state = test_state(&pool);
         let update = json!({
@@ -1275,10 +1362,9 @@ mod tests {
             "to": [alice.followers_url],
         });
 
-        let count = publish_ok(&state, &alice, &update, PublishOpts::default()).await;
-
         assert_eq!(
-            count, 1,
+            publish_default(&state, &alice, &update).await,
+            1,
             "the actor's Update fans out to followers and consults the empty relay hook"
         );
     }

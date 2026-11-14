@@ -23,6 +23,7 @@ pub mod backups;
 pub mod deletion;
 pub mod idempotency;
 pub mod imports;
+pub mod instances;
 pub mod maintenance;
 pub mod mutes;
 pub mod polls;
