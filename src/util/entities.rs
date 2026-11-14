@@ -27,9 +27,11 @@ use crate::util::sanitize::escape_html;
 /// `[`, `{`, then `@` and a nickname of `[A-Za-z0-9_.-]` whose last character
 /// is alphanumeric or `_`, then an optional `@domain` of `[A-Za-z0-9.-]` with
 /// at least one dot and an alphanumeric last character — so sentence-final
-/// `.` and `-` fall out of the match. The lead is a capture group (re-emitted
-/// by [`linkify_entities`]) because the `regex` crate has no look-behind.
-const MENTION_PATTERN: &str = r"(?<lead>^|[\s(\[{])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9]))?";
+/// `.` and `-` fall out of the match — optionally suffixed with `:port`
+/// digits, which belong to the host the federation lookups key on. The lead
+/// is a capture group (re-emitted by [`linkify_entities`]) because the
+/// `regex` crate has no look-behind.
+const MENTION_PATTERN: &str = r"(?<lead>^|[\s(\[{])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9](?::[0-9]{1,5})?))?";
 
 /// The hashtag pattern: a leading start-of-text or any character that is not
 /// a letter or a number (so `a#b` and `1#b` do not match, while
@@ -56,6 +58,23 @@ const ANCHOR_CLOSE: &str = "</a>";
 /// failed to compile (it cannot; degradation then means "no mentions found"
 /// rather than a panic, which the lint gate forbids outside tests).
 static MENTION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(MENTION_PATTERN).ok());
+
+/// The mention pattern of [`linkify_entities`]: [`MENTION_PATTERN`] with one
+/// extra lead — the `>` that closes an HTML tag. The linkifier runs on
+/// rendered HTML, where a mention that opens the post sits right behind the
+/// `<p>` even though [`extract_mentions`], reading the same words as plain
+/// text, finds it at the start of the text; a literal `>` can never forge
+/// that lead, because [`escape_html`](crate::util::sanitize::escape_html)
+/// turns every `>` the source holds into `&gt;` before the HTML renders. So
+/// a `>` at a match's start is always a tag's close, granting it keeps the
+/// renderer's matches the extractor's: a leading mention is linked exactly
+/// when it is stored.
+const MENTION_LINK_PATTERN: &str = r"(?<lead>^|[\s(\[{>])@(?<nick>[A-Za-z0-9_.-]*[A-Za-z0-9_])(?:@(?<domain>(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]*[A-Za-z0-9](?::[0-9]{1,5})?))?";
+
+/// The compiled [`MENTION_LINK_PATTERN`], with the same `None` fallback as
+/// [`MENTION_RE`].
+static MENTION_LINK_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(MENTION_LINK_PATTERN).ok());
 
 /// The compiled [`HASHTAG_PATTERN`], with the same `None` fallback as
 /// [`MENTION_RE`].
@@ -191,7 +210,10 @@ pub fn hashtag_html(base_url: &str, tag: &str) -> String {
 /// with [`mention_html`] naming its local part; unknown mentions stay as
 /// they were written. The match rules are those of [`extract_mentions`] and
 /// [`extract_hashtags`]: in-URL mentions and digits-only tags are left
-/// alone, and the character that led a match stays in the text.
+/// alone, and the character that led a match stays in the text. One mention
+/// rule is the linkifier's own: on HTML input a tag's close leads a match
+/// the way start-of-text leads it on plain input, so the mention that opens
+/// a post links after its `<p>` too.
 #[must_use]
 pub fn linkify_entities(
     html_or_text: &str,
@@ -245,9 +267,12 @@ fn replace_hashtags(text: &str, base_url: &str) -> String {
 }
 
 /// Rewrites every mention match the callback resolves; unknown mentions and
-/// in-URL candidates stay as written.
+/// in-URL candidates stay as written. The lead set is
+/// [`MENTION_LINK_PATTERN`]'s — [`MENTION_PATTERN`]'s plus a tag's close —
+/// so the mention that opens the rendered text links just as the mention the
+/// extractor found at the head of the source does.
 fn replace_mentions(text: &str, mentions: MentionResolver<'_>) -> String {
-    let Some(re) = MENTION_RE.as_ref() else {
+    let Some(re) = MENTION_LINK_RE.as_ref() else {
         return text.to_owned();
     };
     re.replace_all(text, |caps: &Captures<'_>| {
@@ -467,6 +492,28 @@ mod tests {
     }
 
     #[test]
+    fn a_domain_may_carry_an_explicit_port() {
+        assert_eq!(
+            extract_mentions("hi @remote@127.0.0.1:34567!"),
+            vec![mention("remote", Some("127.0.0.1:34567"))],
+            "the port belongs to the domain; the trailing ! does not"
+        );
+        assert_eq!(
+            extract_mentions("@u@example.com:8080 and @v@host.example:x"),
+            vec![
+                mention("u", Some("example.com:8080")),
+                mention("v", Some("host.example")),
+            ],
+            "digits make a port, a letter does not — `:x` stays outside"
+        );
+        assert_eq!(
+            extract_mentions("@u@example.com:"),
+            vec![mention("u", Some("example.com"))],
+            "a bare trailing colon is no port"
+        );
+    }
+
+    #[test]
     fn domains_need_at_least_one_dot() {
         assert_eq!(
             extract_mentions("@u@examplecom"),
@@ -615,6 +662,30 @@ mod tests {
                 hashtag_html("https://example.com", "rust")
             ),
             "the known mention becomes its h-card, the unknown stays text, the tag links lowercased"
+        );
+    }
+
+    #[test]
+    fn linkify_links_a_leading_mention_behind_the_opening_tag() {
+        let resolver = &|m: &MentionRef| {
+            m.domain.is_none().then(|| {
+                let nick = &m.nickname;
+                format!("https://example.com/users/{nick}")
+            })
+        };
+        assert_eq!(
+            linkify_entities("<p>@bob, a word</p>", resolver, "https://example.com"),
+            format!(
+                "<p>{}, a word</p>",
+                mention_html("https://example.com/users/bob", "bob")
+            ),
+            "the mention that opens the post links behind its <p>, the way \
+             extract_mentions already counts it at the head of the text"
+        );
+        assert_eq!(
+            linkify_entities("<p>a&gt;@bob</p>", resolver, "https://example.com"),
+            "<p>a&gt;@bob</p>",
+            "an escaped greater-than is no tag close and never leads a mention"
         );
     }
 

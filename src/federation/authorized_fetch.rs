@@ -495,7 +495,11 @@ mod tests {
             .await
             .unwrap()
             .expect("the signing actor is now a stored mirror");
-        assert_eq!(mirror.nickname, "signer@127.0.0.1", "mirrored as any actor");
+        assert_eq!(
+            mirror.nickname,
+            format!("signer@{}", base.trim_start_matches("http://")),
+            "mirrored as any actor, the id's host and port as its domain"
+        );
         server.abort();
     }
 
@@ -583,7 +587,11 @@ mod tests {
             format!("{base}{TARGET_PATH}"),
             "the signer is the row the dereference stored"
         );
-        assert_eq!(signer.nickname, "signer@127.0.0.1", "mirrored as any actor");
+        assert_eq!(
+            signer.nickname,
+            format!("signer@{}", base.trim_start_matches("http://")),
+            "mirrored as any actor, the id's host and port as its domain"
+        );
         server.abort();
     }
 

@@ -221,6 +221,31 @@ pub async fn delete(pool: &PgPool, id: Uuid, user_id: Uuid) -> AppResult<bool> {
     Ok(deleted.rows_affected() > 0)
 }
 
+/// The filters of `user_id` that hide `context` from them: the active
+/// (non-expired, per [`list_active`]) ones whose [`context`](Filter::context)
+/// list names `context`.
+///
+/// This is the server-side set the timeline and notification listings drop
+/// matching rows for — the listing counterpart of Pleroma's
+/// `Filter.compose_regex/1`, which reads the same active set (through
+/// `get_active`). Both an irreversible and a warn filter that names the
+/// context hides its matches here: on a plain listing with no per-status
+/// `filtered` marker, "hide" and "drop" are the same act, the row leaves
+/// the page. An empty vector is not an error: the viewer hides nothing in
+/// that context.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn hiding_in(pool: &PgPool, user_id: Uuid, context: &str) -> AppResult<Vec<Filter>> {
+    Ok(list_active(pool, user_id)
+        .await?
+        .into_iter()
+        .filter(|found| found.context.iter().any(|name| name == context))
+        .collect())
+}
+
 /// Whether `text` contains `filter`'s phrase, case-insensitively; when
 /// [`whole_word`](Filter::whole_word) is set the occurrence must sit at
 /// word boundaries.
@@ -691,6 +716,66 @@ mod tests {
             .await
             .expect("the filters count");
         assert_eq!(left, 0, "and their filters with it");
+    }
+
+    /// A filter named `text` applying in `contexts`, for [`hiding_in`].
+    async fn seed_context(pool: &PgPool, user: &User, text: &str, contexts: &[&str]) {
+        let _row: Filter = create(
+            pool,
+            user.id,
+            &NewFilter {
+                phrase: text.to_owned(),
+                context: contexts.iter().map(|name| (*name).to_owned()).collect(),
+                ..NewFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hiding_in_keeps_the_context_naming_active_filters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        seed_context(&pool, &alice, "home-only", &["home"]).await;
+        seed_context(&pool, &alice, "both", &["home", "public"]).await;
+        seed_context(&pool, &alice, "elsewhere", &["notifications"]).await;
+        seed_expiry(&pool, &alice, "expired-home", Some(offset(-1))).await;
+
+        let hiding = hiding_in(&pool, alice.id, "home")
+            .await
+            .expect("the hiding set reads");
+        assert_eq!(
+            phrases(&hiding),
+            ["both", "home-only"],
+            "the home filters newest first; the notifications-only and the \
+             expired one are nobody's to hide"
+        );
+
+        let public = hiding_in(&pool, alice.id, "public")
+            .await
+            .expect("the public set reads");
+        assert_eq!(phrases(&public), ["both"], "only the filter naming public");
+
+        let unknown = hiding_in(&pool, alice.id, "thread")
+            .await
+            .expect("the thread set reads");
+        assert!(unknown.is_empty(), "no fixture filter names thread");
+    }
+
+    #[tokio::test]
+    async fn hiding_in_is_per_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        seed_context(&pool, &alice, "hers", &["home"]).await;
+
+        let hiding = hiding_in(&pool, bob.id, "home")
+            .await
+            .expect("bob's hiding set reads");
+        assert!(hiding.is_empty(), "alice's filter hides nothing for bob");
     }
 
     #[test]

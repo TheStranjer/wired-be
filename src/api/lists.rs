@@ -46,8 +46,10 @@
 //!   the form spelling both work) and adds those accounts, answering `{}`.
 //!   Mastodon's and Pleroma's rule applies: an account the caller does not
 //!   follow (no *accepted* `follows` row) may not be added — the 422
-//!   `{"error":"Validation failed: Account is not followed"}` — and an id
-//!   that names no account is the 404, checked for the whole batch before any
+//!   `{"error":"Validation failed: Account is not followed"}` — with the
+//!   caller's own account always listable (Mastodon's silent self-follow,
+//!   which lets an owner put themselves on their own list), and an id that
+//!   names no account is the 404, checked for the whole batch before any
 //!   of it is written. Adding a member twice writes nothing the second time.
 //! - `DELETE` takes `account_ids[]` in the body *or* the query
 //!   ([`ApiParams`], the spellings Pleroma accepts for this action) and
@@ -330,7 +332,8 @@ async fn list_list_accounts(
 /// name an account (else the 404) and every one of them has to be an account
 /// the caller follows with an *accepted* relationship (else the 422
 /// [`NOT_FOLLOWED`]) — Mastodon's `List` validation and the rule Pleroma's
-/// `add_to_list` enforces by only ever looking at followed accounts. A member
+/// `add_to_list` enforces by only ever looking at followed accounts, with the
+/// caller themselves excepted as their own silent follow. A member
 /// who is already on the list is left exactly where they are
 /// ([`list::add_members`]), so adding twice is one membership; an empty
 /// `account_ids` adds nobody and still answers `{}`.
@@ -464,7 +467,10 @@ async fn requested_accounts(state: &AppState, texts: &[String]) -> AppResult<Vec
 /// named must be one `follower` follows with an *accepted* relationship — a
 /// pending request is not a follow, the same fact [`follow::is_following`]
 /// states for a pair of rows, read here off [`follow::get`] because the
-/// endpoint has ids, not rows.
+/// endpoint has ids, not rows. The one exception is `follower` naming
+/// themselves: Mastodon gives every account a silent self-follow, so an owner
+/// is always member-worth of their own list, and that pair never appears in
+/// `follows` here.
 ///
 /// # Errors
 ///
@@ -473,6 +479,9 @@ async fn requested_accounts(state: &AppState, texts: &[String]) -> AppResult<Vec
 /// [`AppError::Database`].
 async fn ensure_followed(state: &AppState, follower: Uuid, targets: &[Uuid]) -> AppResult<()> {
     for target in targets {
+        if *target == follower {
+            continue;
+        }
         let granted = follow::get(&state.db, follower, *target).await?;
         if !granted.is_some_and(|row| row.state == FollowState::Accepted) {
             return Err(AppError::Unprocessable(NOT_FOLLOWED.to_owned()));

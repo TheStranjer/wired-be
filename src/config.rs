@@ -1054,7 +1054,10 @@ pub struct FetchLimits {
 pub struct FetchSettings {
     /// Whether outbound HTTP may connect to private, loopback and other
     /// reserved addresses, i.e. the SSRF guard is disabled, from
-    /// `HTTP_ALLOW_PRIVATE_HOSTS`. Development and tests only.
+    /// `HTTP_ALLOW_PRIVATE_HOSTS` — and, in the same breath, whether a
+    /// `WebFinger` lookup of a `nick@host:port` handle asks `http://` that
+    /// authority instead of the spec's `https://` (see
+    /// [`crate::federation::fetch_actor`]). Development and tests only.
     pub http_allow_private_hosts: bool,
     /// Whether outgoing actor `GET`s are HTTP-signed with the instance
     /// actor's key, from `SIGN_FETCHES` (see

@@ -1192,8 +1192,8 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
         assert_eq!(answer.status, StatusCode::OK, "the valid delivery");
         assert_eq!(
             answer.json.get("signer").and_then(Value::as_str),
-            Some("alice@127.0.0.1"),
-            "the on-the-fly mirror is the signer"
+            Some(format!("alice@{}", base.strip_prefix("http://").expect("http base")).as_str()),
+            "the on-the-fly mirror is the signer, its id's host and port"
         );
         assert_eq!(
             answer.json.get("bytes").and_then(Value::as_u64),
@@ -1417,7 +1417,7 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
         );
         assert_eq!(
             answer.json.get("signer").and_then(Value::as_str),
-            Some("alice@127.0.0.1"),
+            Some(format!("alice@{}", base.strip_prefix("http://").expect("http base")).as_str()),
             "the owner is the signer"
         );
         assert!(

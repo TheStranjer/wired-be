@@ -362,12 +362,14 @@ fn subject_names_domain(subject: Option<&str>, domain: &str) -> bool {
     })
 }
 
-/// Whether `actor` parses as a URL whose host equals `domain`
-/// (case-insensitively; URL parsing already lowercases hosts).
+/// Whether `actor` parses as a URL whose host (with its port, when it names
+/// one) equals `domain` (case-insensitively; URL parsing already lowercases
+/// hosts). A requested domain carrying a port only matches an actor URL on
+/// the same host and port — the containment a `host:port` handle asks for.
 fn actor_names_domain(actor: &str, domain: &str) -> bool {
     Url::parse(actor).is_ok_and(|url| {
-        url.host_str()
-            .is_some_and(|host| host.eq_ignore_ascii_case(domain))
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        !authority.is_empty() && authority.eq_ignore_ascii_case(domain)
     })
 }
 
@@ -379,19 +381,48 @@ fn actor_names_domain(actor: &str, domain: &str) -> bool {
 /// made of the handle alphabet `[A-Za-z0-9._-]` (Pleroma's `webfinger`
 /// regex, `[a-z0-9A-Z_\.-]+`); the domain must be a dotted hostname of ASCII
 /// letters, digits and interior hyphens whose top-level label starts with a
-/// letter — no port, IP literal or single label, because the lookup builds
-/// the authority straight out of it. The nickname is returned as given; the
-/// domain is lowercased.
+/// letter, or a dotted IPv4 address, either one optionally suffixed with
+/// `:port` (Mastodon's `Addressable` keeps the port in the domain likewise:
+/// an instance on an unusual port, and the loopback peers the suites drive,
+/// are addressable handles exactly like `nick@host.tld`). A single-label
+/// host stays out, because the lookup builds the authority straight out of
+/// the domain. The nickname is returned as given; the domain is lowercased.
 #[must_use]
 pub fn split_acct(acct: &str) -> Option<(String, String)> {
     let (nickname, domain) = strip_finger_prefixes(acct).split_once('@')?;
     if nickname.is_empty() || !nickname.chars().all(is_nickname_char) {
         return None;
     }
-    if !is_valid_domain(domain) {
+    let (host, port) = split_domain(domain);
+    if !is_valid_host(host) || !is_valid_port(port) {
         return None;
     }
     Some((nickname.to_owned(), domain.to_ascii_lowercase()))
+}
+
+/// The `host` and `:port` parts of a requested domain: the port is the text
+/// behind a `:` that follows a non-empty host; `None` carries no separator.
+/// IPv6 bracket forms are out of this instance's federation vocabulary, so
+/// a trailing colon-separated part is always read as a port.
+fn split_domain(domain: &str) -> (&str, Option<&str>) {
+    match domain.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => (host, Some(port)),
+        _ => (domain, None),
+    }
+}
+
+/// Whether `port` text names a usable TCP port: `None` means the scheme's
+/// default, anything else one to five digits resolving into `1..=65535`.
+/// `0`, non-digits and out-of-range numbers name nothing.
+fn is_valid_port(port: Option<&str>) -> bool {
+    port.is_none_or(|text| {
+        !text.is_empty()
+            && text.len() <= 5
+            && text.chars().all(|c| c.is_ascii_digit())
+            && text
+                .parse::<u32>()
+                .is_ok_and(|value| (1..=65535).contains(&value))
+    })
 }
 
 /// `acct` without its leading `@` and `acct:` prefixes (each optional, in
@@ -425,20 +456,35 @@ const fn is_nickname_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
 }
 
-/// Whether `domain` is a hostname [`split_acct`] accepts: dot-separated
-/// labels, at least two of them, each 1..=63 characters of ASCII letters,
-/// digits and interior hyphens, with the top-level label starting with a
-/// letter (so IPv4 literals and port numbers are out).
-fn is_valid_domain(domain: &str) -> bool {
-    domain.contains('.')
-        && domain.split('.').all(is_valid_label)
-        && domain
-            .split('.')
-            .next_back()
-            .is_some_and(|tld| tld.starts_with(|c: char| c.is_ascii_alphabetic()))
+/// Whether `host` is a hostname [`split_acct`] accepts: either a dotted
+/// domain of at least two labels, each 1..=63 characters of ASCII letters,
+/// digits and interior hyphens with the top-level label starting with a
+/// letter, or a dotted IPv4 address — four decimal octets of at most three
+/// digits each.
+fn is_valid_host(host: &str) -> bool {
+    is_valid_ipv4(host)
+        || (host.contains('.')
+            && host.split('.').all(is_valid_label)
+            && host
+                .split('.')
+                .next_back()
+                .is_some_and(|tld| tld.starts_with(|c: char| c.is_ascii_alphabetic())))
 }
 
-/// One DNS label as [`is_valid_domain`] requires it.
+/// Whether `host` is a dotted IPv4 address: exactly four labels of one to
+/// three ASCII digits each, every one of them at most `255`.
+fn is_valid_ipv4(host: &str) -> bool {
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4
+        && octets.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 3
+                && label.chars().all(|c| c.is_ascii_digit())
+                && label.parse::<u8>().is_ok()
+        })
+}
+
+/// One DNS label as [`is_valid_host`] requires it for a domain name.
 fn is_valid_label(label: &str) -> bool {
     !label.is_empty()
         && label.len() <= 63
@@ -941,6 +987,10 @@ mod tests {
             ("ACCT:alice@remote.example", "alice", "remote.example"),
             ("Alice.U-2@a1.example.io", "Alice.U-2", "a1.example.io"),
             ("alice@Remote.Example", "alice", "remote.example"),
+            ("alice@remote.example:8080", "alice", "remote.example:8080"),
+            ("alice@127.0.0.1:4000", "alice", "127.0.0.1:4000"),
+            ("alice@127.0.0.1", "alice", "127.0.0.1"),
+            ("alice@Remote.Example:80", "alice", "remote.example:80"),
         ] {
             assert_eq!(
                 split_acct(input),
@@ -961,8 +1011,15 @@ mod tests {
             "@remote.example",
             "acct:alice",
             "alice@remote",
-            "alice@remote.example:8080",
-            "alice@127.0.0.1",
+            "alice@remote.example:",
+            "alice@remote.example:0",
+            "alice@remote.example:65536",
+            "alice@remote.example:80x",
+            "alice@remote.example:notaport",
+            "alice@:8080",
+            "alice@127.0.0.1:0",
+            "alice@1.2.3",
+            "alice@127.0.0.256:1",
             "alice@-bad.example",
             "alice@bad-.example",
             "alice@exam_ple.example",
@@ -1236,7 +1293,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_handles_fail_before_any_request() {
-        for acct in ["alice", "@", "alice@localhost", "alice@remote.example:8080"] {
+        for acct in [
+            "alice",
+            "@",
+            "alice@localhost",
+            "alice@remote.example:70000",
+        ] {
             let error = resolve_acct_with_base(&client(), acct, None)
                 .await
                 .unwrap_err();
@@ -1245,6 +1307,48 @@ mod tests {
                 "{acct} is no handle, and no DNS is tried: {error:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_port_and_an_ip_literal_are_resolvable_handles() {
+        // A peer on `https://{host}:{port}` is addressable exactly like a
+        // plain domain: the containment rule matches the actor URL's
+        // authority against the requested domain, port included.
+        let body = json!({
+            "subject": "acct:alice@remote.example:8080",
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": "https://remote.example:8080/users/alice",
+            }],
+        })
+        .to_string();
+        let app = static_route("/.well-known/webfinger", Some(JRD_JSON), body);
+        assert_actor(
+            resolve_against(app, "alice@remote.example:8080").await,
+            "https://remote.example:8080/users/alice",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_port_actor_does_not_contain_a_portless_domain() {
+        // Subject and actor both name `remote.example:8080`, but the request
+        // is for plain `remote.example`: the authority differs, so this is
+        // the mismatched-domain refusal, not a pass on the bare host.
+        let body = json!({
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": "https://remote.example:8080/users/alice",
+            }],
+        })
+        .to_string();
+        let app = static_route("/.well-known/webfinger", Some(JRD_JSON), body);
+        let error = resolve_against(app, ACCT).await.unwrap_err();
+        assert!(
+            matches!(error, WebfingerError::DomainMismatch),
+            "the port is part of the authority: {error:?}"
+        );
     }
 
     #[tokio::test]

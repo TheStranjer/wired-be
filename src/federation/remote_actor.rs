@@ -384,7 +384,17 @@ fn parse_actor_id(json: &Value) -> Result<(String, String), ActorError> {
     let host = url
         .host_str()
         .ok_or_else(|| ActorError::Invalid("`id` has no host".to_owned()))?;
-    Ok((raw.to_owned(), host.to_owned()))
+    // A non-default port belongs to the host the handle names: Mastodon's
+    // `Addressable` domain keeps it, and decision 7's `user@host` nickname
+    // has to be the handle `WebFinger` was asked for — which for a peer on
+    // an explicit port carries that port. `Url::port()` reports `None` for a
+    // scheme's default (and for an unspelled port), so only a real,
+    // non-default port is appended.
+    let port = url
+        .port()
+        .map_or_else(String::new, |port| format!(":{port}"));
+    let domain = format!("{host}{port}");
+    Ok((raw.to_owned(), domain))
 }
 
 /// The `preferredUsername`: required, non-empty, and limited to the handle
@@ -652,6 +662,30 @@ mod tests {
             parsed.published,
             Some(parse_time("2022-01-31T12:34:56Z").unwrap()),
             "published"
+        );
+    }
+
+    #[test]
+    fn an_actor_id_on_an_explicit_port_keeps_it_in_the_handle() {
+        // The handle the mirror stores is the one a `WebFinger` lookup was
+        // asked for: `preferredUsername@host:port`, port included (and the
+        // scheme's default port folded away).
+        let mut document = fixture(MASTODON);
+        document["id"] = json!("https://mastodon.example:8443/users/alice");
+        document["publicKey"]["owner"] = json!("https://mastodon.example:8443/users/alice");
+        let parsed = parse_actor(&document).unwrap();
+        assert_eq!(
+            parsed.nickname, "alice@mastodon.example:8443",
+            "the non-default port belongs to the host"
+        );
+        assert_eq!(parsed.domain, "mastodon.example:8443", "and the domain");
+
+        document["id"] = json!("https://mastodon.example:443/users/alice");
+        document["publicKey"]["owner"] = json!("https://mastodon.example:443/users/alice");
+        let default = parse_actor(&document).unwrap();
+        assert_eq!(
+            default.nickname, "alice@mastodon.example",
+            "a spelled-out default port carries nothing"
         );
     }
 

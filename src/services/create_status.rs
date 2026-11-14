@@ -1095,7 +1095,9 @@ async fn quoted_original(state: &AppState, row: status::Status) -> AppResult<sta
 /// the winner's entity. The third arm — the pair is taken but its status has
 /// been deleted since — moves the key onto the fresh status
 /// ([`idempotency_key::reassign`]), because a dead post is not a
-/// replay-able answer.
+/// replay-able answer. A body naming a `quote_id` is a create like any
+/// other through this arm: the one committed write counts the original
+/// exactly once, and a replay or a lost race never counts it again.
 ///
 /// # Errors
 ///
@@ -1188,7 +1190,9 @@ async fn replayed_entity(state: &AppState, user: &User, row: &status::Status) ->
 /// is previewed, never stored. The one read the preview does perform is
 /// the mention lookup — [`render_status_fields`]'s own, network fetch of
 /// an unknown remote account included, since the rendered content is only
-/// honest if the mention links are.
+/// honest if the mention links are. A body naming a `quote_id` previews
+/// the same way: the in-memory row quotes nothing, the original is not
+/// gated, and no `quotes_count` moves.
 ///
 /// # Errors
 ///
@@ -2590,7 +2594,8 @@ mod tests {
         .pop()
         .expect("the remote mention resolved");
         server.abort();
-        assert_eq!(fetched.1.nickname, "alice@127.0.0.1", "mirror handle");
+        let mirror_acct = format!("alice@{}", base.trim_start_matches("http://"));
+        assert_eq!(fetched.1.nickname, mirror_acct, "mirror handle");
 
         let entity = created(
             &app_state,
@@ -2624,7 +2629,7 @@ mod tests {
         assert_eq!(
             value["mentions"],
             json!([{ "id": fetched.1.id.to_string(), "username": "alice",
-                     "url": fetched.1.ap_id, "acct": "alice@127.0.0.1" }]),
+                     "url": fetched.1.ap_id, "acct": mirror_acct }]),
             "and answered in the entity"
         );
     }
@@ -3640,7 +3645,7 @@ mod tests {
     }
 
     /// The live row behind a status id, for the counters and links a reply
-    /// moved on its parent.
+    /// or a quote moved on the row it names.
     async fn parent_row(pool: &PgPool, id: Uuid) -> status::Status {
         status::get_by_id(pool, id)
             .await
@@ -3657,7 +3662,7 @@ mod tests {
     }
 
     /// The `{"error": …}` body of the shared 404, plus its status code:
-    /// what an unanswerable reply parent owes the client.
+    /// what an unanswerable reply parent or quote original owes the client.
     async fn missed(err: AppError) {
         let (code, body) = wire(err).await;
         assert_eq!(code, StatusCode::NOT_FOUND, "the parent miss is a 404");
