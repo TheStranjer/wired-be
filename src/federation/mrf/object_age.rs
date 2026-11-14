@@ -41,11 +41,12 @@ use tracing::warn;
 
 use crate::{
     federation::mrf::{
-        MrfContext, MrfPolicy, MrfResult,
+        MrfContext, MrfPolicy, MrfResult, Transparency,
         simple::{
             activity_type, followers_collection, remove_reference, rewrite_each_document,
             unlist_document,
         },
+        single_block,
     },
     util::time::parse_time,
 };
@@ -250,8 +251,11 @@ impl MrfPolicy for ObjectAgePolicy {
         Ok(activity)
     }
 
-    fn describe(&self) -> Value {
-        self.params.clone().unwrap_or_else(|| json!({}))
+    fn describe(&self, _transparency: &Transparency) -> Map<String, Value> {
+        single_block(
+            self.name(),
+            self.params.clone().unwrap_or_else(|| json!({})),
+        )
     }
 }
 
@@ -618,29 +622,31 @@ mod tests {
                 _ => json!({}),
             };
             assert_eq!(
-                policy.describe(),
-                expected,
-                "and describes the block it was given, or nothing"
+                Value::Object(policy.describe(&Transparency::open())),
+                json!({"mrf_objectage": expected}),
+                "and publishes the block it was given, or nothing, under its own key"
             );
         }
     }
 
     /// The policy is Pleroma's `ObjectAgePolicy`: it names itself, knows
-    /// its three action names, and describes back the subset it was
-    /// configured with.
+    /// its three action names, and publishes the subset it was configured
+    /// with as its one `mrf_objectage` object.
     #[test]
     fn the_policy_names_itself_and_describes_its_config() {
         assert_eq!(ObjectAgePolicy::new(None).name(), "ObjectAgePolicy");
         assert_eq!(
-            ObjectAgePolicy::new(None).describe(),
-            json!({}),
-            "no key, nothing to describe"
+            Value::Object(ObjectAgePolicy::new(None).describe(&Transparency::open())),
+            json!({"mrf_objectage": {}}),
+            "no key, nothing to describe but its own name"
         );
         let block = json!({"threshold": 3600, "actions": ["delist"]});
         assert_eq!(
-            ObjectAgePolicy::new(Some(block.clone())).describe(),
-            block,
-            "the configured subset comes back verbatim"
+            Value::Object(
+                ObjectAgePolicy::new(Some(block.clone())).describe(&Transparency::open())
+            ),
+            json!({"mrf_objectage": block}),
+            "the configured subset comes back verbatim under the policy's key"
         );
         for action in Action::ALL {
             assert_eq!(

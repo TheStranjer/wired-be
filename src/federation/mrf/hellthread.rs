@@ -38,11 +38,12 @@ use tracing::warn;
 use crate::federation::{
     json,
     mrf::{
-        MrfContext, MrfPolicy, MrfResult,
+        MrfContext, MrfPolicy, MrfResult, Transparency,
         simple::{
             ADDRESS_FIELDS, FOLLOWERS_SUFFIX, is_note_activity, rewrite_each_document,
             unlist_document,
         },
+        single_block,
     },
     note_parser::PUBLIC_RECIPIENTS,
 };
@@ -165,8 +166,11 @@ impl MrfPolicy for HellthreadPolicy {
         Ok(activity)
     }
 
-    fn describe(&self) -> Value {
-        self.params.clone().unwrap_or_else(|| json!({}))
+    fn describe(&self, _transparency: &Transparency) -> Map<String, Value> {
+        single_block(
+            self.name(),
+            self.params.clone().unwrap_or_else(|| json!({})),
+        )
     }
 }
 
@@ -507,26 +511,30 @@ mod tests {
     }
 
     /// The policy is Pleroma's `HellthreadPolicy`: it names itself and
-    /// describes back the subset it was configured with — the empty object
-    /// when nothing usable was.
+    /// publishes the subset it was configured with as its one
+    /// `mrf_hellthread` object — the empty object when nothing usable was.
     #[test]
     fn the_policy_names_itself_and_describes_its_config() {
         assert_eq!(HellthreadPolicy::new(None).name(), "HellthreadPolicy");
         assert_eq!(
-            HellthreadPolicy::new(None).describe(),
-            json!({}),
-            "no key, nothing to describe"
+            Value::Object(HellthreadPolicy::new(None).describe(&Transparency::open())),
+            json!({"mrf_hellthread": {}}),
+            "no key, nothing to describe but its own name"
         );
         assert_eq!(
-            HellthreadPolicy::new(Some(json!("nope"))).describe(),
-            json!({}),
+            Value::Object(
+                HellthreadPolicy::new(Some(json!("nope"))).describe(&Transparency::open())
+            ),
+            json!({"mrf_hellthread": {}}),
             "a non-object block is no subset to echo"
         );
         let block = json!({"delist_threshold": 5, "reject_threshold": 15});
         assert_eq!(
-            HellthreadPolicy::new(Some(block.clone())).describe(),
-            block,
-            "the configured subset comes back verbatim"
+            Value::Object(
+                HellthreadPolicy::new(Some(block.clone())).describe(&Transparency::open())
+            ),
+            json!({"mrf_hellthread": block}),
+            "the configured subset comes back verbatim under the policy's key"
         );
     }
 }

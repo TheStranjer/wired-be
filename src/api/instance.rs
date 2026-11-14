@@ -31,6 +31,15 @@
 //! [`crate::state::AppState`]. Rules, the contact account and the peer list
 //! are read fresh on every request and answer the moment they change.
 //!
+//! The three moderation reads share one source, the [MRF
+//! configuration](crate::federation::mrf) the pipeline itself runs: the
+//! `federation` block publishes the policy names and their lists,
+//! `domain_blocks` renders the domain lists as Mastodon domain blocks, and
+//! `peers` keeps the rejected hosts out. All three answer through the
+//! operator's transparency settings — `MRF_TRANSPARENCY` switches the
+//! publishing off, and `MRF_TRANSPARENCY_EXCLUSIONS` hides hosts from what
+//! is published while they stay blocked.
+//!
 //! [`TimedCache`]: crate::util::cache::TimedCache
 //! [`LANGUAGES_TTL`]: crate::services::translate::LANGUAGES_TTL
 
@@ -45,9 +54,11 @@ use crate::{
     config::{Config, Toggle},
     entities::account::Account,
     error::AppResult,
-    federation::mrf,
+    federation::mrf::{
+        self, Transparency,
+        simple::{self, SimpleConfig},
+    },
     models::{
-        instance_policy_domain::{self, InstancePolicyDomain},
         instance_rule,
         instance_rule::InstanceRule,
         user::{NOT_INSTANCE_ACTOR, User},
@@ -274,16 +285,15 @@ async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance
     )))
 }
 
-/// The `pleroma.metadata.federation` block as the live [MRF
-/// chain](crate::federation::mrf) describes itself: Pleroma-style policy
-/// names beside each policy's sanitized `mrf_<policy>` transparency
-/// object. The configuration read is the pipeline's own cached one.
+/// The `pleroma.metadata.federation` block: what the live [MRF
+/// chain](crate::federation::mrf) publishes under the instance's
+/// transparency settings — Pleroma-style policy names beside the
+/// `mrf_simple`, `mrf_simple_info` and `mrf_<policy>` objects each policy
+/// keys for itself — or, with `MRF_TRANSPARENCY` off, nothing but the
+/// fixed keys. The configuration read is the pipeline's own cached one,
+/// and [`crate::api::nodeinfo`] builds its block from the same answer.
 async fn federation_block(state: &AppState) -> Federation {
-    let chain = mrf::active_chain(state).await;
-    Federation::with_mrf(
-        mrf::describe_policies(&chain),
-        mrf::describe_transparency(&chain),
-    )
+    Federation::with_mrf(&mrf::describe(state).await)
 }
 
 /// The [`Instance`] `stats` counters, read live.
@@ -337,14 +347,22 @@ async fn show_instance_v2(State(state): State<AppState>) -> AppResult<Json<Insta
 }
 
 /// [`show_peers`]: the peer list — distinct `users.domain`,
-/// alphabetically, at most [`PEER_LIMIT`] hosts — unless the instance
-/// restricts unauthenticated reads, in which case nothing is listed.
-async fn list_peers(pool: &PgPool) -> AppResult<Vec<String>> {
+/// alphabetically, at most [`PEER_LIMIT`] hosts — with the hosts the
+/// [`simple`](crate::federation::mrf::simple) policy's `reject` list names
+/// taken out: an instance does not advertise a peer it refuses to talk to.
+/// Unless the instance restricts unauthenticated reads, in which case
+/// nothing is listed at all.
+async fn list_peers(state: &AppState) -> AppResult<Vec<String>> {
     let peers = sqlx::query_scalar::<_, String>(PEERS_SQL)
         .bind(PEER_LIMIT)
-        .fetch_all(pool)
+        .fetch_all(&state.db)
         .await?;
-    Ok(peers)
+    let config = mrf::load_config(state).await;
+    let visible = peers
+        .into_iter()
+        .filter(|host| !config.on_reject_list(host))
+        .collect();
+    Ok(visible)
 }
 
 /// Whether the [`instance_meta`] access restrictions hide the federated
@@ -370,7 +388,7 @@ async fn show_peers(State(state): State<AppState>) -> AppResult<Json<Vec<String>
     if peers_restricted() {
         return Ok(Json(Vec::new()));
     }
-    Ok(Json(list_peers(&state.db).await?))
+    Ok(Json(list_peers(&state).await?))
 }
 
 /// `GET /api/v1/instance/rules` — the instance rules, the same entries
@@ -385,22 +403,29 @@ async fn show_rules(State(state): State<AppState>) -> AppResult<Json<Vec<Rule>>>
     Ok(Json(rules.iter().map(Rule::from_model).collect()))
 }
 
-/// `GET /api/v1/instance/domain_blocks` — the domains rejected or
-/// silenced by instance policy, from [`crate::models::instance_policy_domain`].
-/// No authentication.
+/// `GET /api/v1/instance/domain_blocks` — the domains this instance's own
+/// [`simple`](crate::federation::mrf::simple) domain lists restrict, in
+/// the shape Mastodon's domain-block listing documents: Pleroma's
+/// `domain_blocks.json` renders those very lists, and the severity a host
+/// takes is what its list does to it ([`DomainBlock::severity_of`]).
+///
+/// The answer is the transparency answer, because it is the transparency
+/// lists: the empty array while `MRF_TRANSPARENCY` is off, no host
+/// `MRF_TRANSPARENCY_EXCLUSIONS` keeps back, and every pattern verbatim —
+/// a `*.example.com` entry covers that domain and everything below it, and
+/// the listing says so in those words. No authentication.
 ///
 /// # Errors
 ///
 /// Any database failure arrives through `?` as
-/// [`AppError::Database`](crate::error::AppError).
+/// [`AppError::Database`](crate::error::AppError) — the `mrf` instance
+/// setting read is the pipeline's own cached one.
 async fn show_domain_blocks(State(state): State<AppState>) -> AppResult<Json<Vec<DomainBlock>>> {
-    let policies = instance_policy_domain::list(&state.db).await?;
-    Ok(Json(
-        policies
-            .iter()
-            .filter_map(DomainBlock::from_model)
-            .collect(),
-    ))
+    let config = mrf::load_config(&state).await;
+    Ok(Json(DomainBlock::published_all(
+        config.simple(),
+        &Transparency::from_config(&state.config),
+    )))
 }
 
 /// `GET /api/v1/instance/translation_languages` — the language pairs the
@@ -843,47 +868,57 @@ impl PleromaMetadata {
 }
 
 /// The `pleroma.metadata.federation` block — the same shape `NodeInfo`
-/// reports: a federating instance plus whatever the live MRF chain
-/// describes itself as.
+/// reports: a federating instance beside whatever the live MRF chain
+/// publishes under the operator's transparency settings.
 #[derive(Debug, Serialize)]
 struct Federation {
     /// Whether this instance federates.
     enabled: bool,
     /// The moderation filters in force, Pleroma-style names in chain
     /// order (the [MRF](crate::federation::mrf) chain's
-    /// [`describe_policies`](crate::federation::mrf::describe_policies)).
+    /// [`describe`](crate::federation::mrf::describe)); empty when
+    /// transparency is off, which publishes no policy at all.
     mrf_policies: Vec<String>,
-    /// Instances whose posts are held back; none is configured.
-    quarantined_instances: Vec<&'static str>,
-    /// Whether the MRF transparency lists exclude anything; no exclusions
-    /// are configured, so every policy publishes its lists whole.
+    /// Instances whose posts are held back; none is configured. Absent
+    /// from the transparency-off answer, which keeps only the three keys
+    /// the switch leaves standing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarantined_instances: Option<Vec<&'static str>>,
+    /// Whether the published lists hold back any host
+    /// (`MRF_TRANSPARENCY_EXCLUSIONS` in use); with transparency off,
+    /// false.
     exclusions: bool,
-    /// Each policy's sanitized transparency block under its `mrf_<name>`
-    /// key, flattened into this object beside the fixed keys.
+    /// Each policy's transparency blocks under the keys they name
+    /// themselves — `mrf_simple`, `mrf_simple_info`, `mrf_<name>` —
+    /// flattened into this object beside the fixed keys.
     #[serde(flatten)]
     mrf_descriptions: Map<String, Value>,
 }
 
 impl Federation {
-    /// A plain federating instance with no moderation filters: the block
-    /// an empty chain describes itself as — what the live
-    /// [`federation_block`] collapses to on a
-    /// chain with no policies. Test support for the document builders;
-    /// production always reads the live chain.
+    /// A plain federating instance with no moderation filters and
+    /// transparency on: what an empty chain publishes, which is the answer
+    /// [`federation_block`] collapses to when nothing is configured. Test
+    /// support for the document builders; production always reads the live
+    /// chain and the live settings.
     #[cfg(test)]
     fn federating() -> Self {
-        Self::with_mrf(Vec::new(), Map::new())
+        let published = mrf::ChainTransparency {
+            published: true,
+            ..mrf::ChainTransparency::default()
+        };
+        Self::with_mrf(&published)
     }
 
-    /// The block of an instance whose MRF chain reports `policies` and
-    /// the transparency `descriptions` (see [`federation_block`](federation_block)).
-    const fn with_mrf(policies: Vec<String>, descriptions: Map<String, Value>) -> Self {
+    /// The block of an instance whose chain published `described` (see
+    /// [`federation_block`]).
+    fn with_mrf(described: &mrf::ChainTransparency) -> Self {
         Self {
             enabled: true,
-            mrf_policies: policies,
-            quarantined_instances: Vec::new(),
-            exclusions: false,
-            mrf_descriptions: descriptions,
+            mrf_policies: described.policies.clone(),
+            quarantined_instances: described.quarantined_instances(),
+            exclusions: described.exclusions,
+            mrf_descriptions: described.descriptions.clone(),
         }
     }
 }
@@ -1237,50 +1272,104 @@ impl Contact {
     }
 }
 
-/// One entry of `GET /api/v1/instance/domain_blocks`: a domain this
-/// instance's own policy restricts, in the shape Mastodon's domain-block
-/// listing documents.
+/// One entry of `GET /api/v1/instance/domain_blocks`: a domain the
+/// [`simple`](crate::federation::mrf::simple) policy restricts, in the
+/// shape Mastodon's domain-block listing documents.
 ///
 /// The `digest` lets a client check the block without learning the
 /// domain (Mastodon hashes it the same way); this instance serves the
-/// domain in the clear anyway, so both are in the entry.
+/// domain in the clear anyway — it stands in the transparency lists too —
+/// so both are in the entry.
 #[derive(Debug, Serialize)]
 struct DomainBlock {
-    /// The blocked host.
+    /// The blocked host, verbatim from the configured pattern.
     domain: String,
     /// Lowercase hex `SHA-256` of [`domain`](Self::domain).
     digest: String,
     /// How the block reads to clients: `suspend` or `silence`
     /// ([`DomainBlock::severity_of`]).
     severity: &'static str,
-    /// Why the domain is blocked, empty when the instance gave no
-    /// reason.
+    /// Why the domain is blocked, empty when the operator gave no reason.
     comment: String,
 }
 
 impl DomainBlock {
-    /// Renders the stored policy `row`, `None` when its action maps to
-    /// no Mastodon severity — Pleroma's renderer likewise drops the
-    /// policy groups without a severity.
-    fn from_model(row: &InstancePolicyDomain) -> Option<Self> {
-        let severity = Self::severity_of(&row.action)?;
-        Some(Self {
-            digest: sha256_hex(&row.domain),
-            domain: row.domain.clone(),
+    /// The entry for one published list `pattern` beside its `reason`, at
+    /// `severity`: Pleroma's renderer hashes the host it prints and
+    /// carries the entry's reason as the comment.
+    fn new(pattern: &str, reason: &str, severity: &'static str) -> Self {
+        Self {
+            digest: sha256_hex(pattern),
+            domain: pattern.to_owned(),
             severity,
-            comment: row.reason.clone(),
-        })
+            comment: reason.to_owned(),
+        }
     }
 
-    /// The Mastodon severity of a policy `action`: a rejected domain is
-    /// suspended; silenced and media-scrubbed domains both stay visible
-    /// under `silence` (the ticket's mapping; Pleroma likewise folds its
-    /// soft blocks into one severity).
-    fn severity_of(action: &str) -> Option<&'static str> {
-        match action {
-            "reject" => Some("suspend"),
-            "silence" | "media_removal" => Some("silence"),
-            _ => None,
+    /// Every block the instance publishes from the `simple` domain `lists`
+    /// (the answer of [`mrf::MrfConfig::simple`]): one entry per host of each
+    /// list whose effect a client reads as a domain block, in
+    /// [`simple::List::ALL`] order — so the rejected hosts come first and
+    /// the softened ones follow, each group in the order it was
+    /// configured.
+    ///
+    /// The empty array comes back twice over: while transparency is off
+    /// (nothing of the instance's moderation is published, this listing
+    /// included, exactly as Pleroma's renderer answers `[]`), and for an
+    /// instance that does not run the `simple` policy at all — `None`
+    /// lists, which govern no traffic and restrict no domain.
+    fn published_all(lists: Option<&SimpleConfig>, transparency: &Transparency) -> Vec<Self> {
+        if !transparency.enabled() {
+            return Vec::new();
+        }
+        let Some(lists) = lists else {
+            return Vec::new();
+        };
+        simple::List::ALL
+            .iter()
+            .filter_map(|list| Self::for_list(*list, lists, transparency))
+            .flatten()
+            .collect()
+    }
+
+    /// The entries of one `list`, `None` when the list restricts nothing a
+    /// domain-block listing shows: the allowlist, the delete and report
+    /// gates and the three profile strips all act on traffic a client
+    /// never sees addressed to a blocked domain.
+    fn for_list(
+        list: simple::List,
+        lists: &SimpleConfig,
+        transparency: &Transparency,
+    ) -> Option<Vec<Self>> {
+        let severity = Self::severity_of(list)?;
+        Some(
+            lists
+                .published(list, transparency)
+                .iter()
+                .map(|entry| Self::new(entry.pattern, entry.reason, severity))
+                .collect(),
+        )
+    }
+
+    /// The Mastodon severity a `simple` list maps to: a rejected domain is
+    /// suspended; the four lists that keep a host's posts out of the
+    /// public eye — off the federated timeline, behind the author's
+    /// followers, stripped of attachments, marked sensitive — all read as
+    /// `silence` (the ticket's mapping; Pleroma likewise folds its soft
+    /// blocks into one severity, listing only two of these lists).
+    const fn severity_of(list: simple::List) -> Option<&'static str> {
+        match list {
+            simple::List::Reject => Some("suspend"),
+            simple::List::FederatedTimelineRemoval
+            | simple::List::FollowersOnly
+            | simple::List::MediaRemoval
+            | simple::List::MediaNsfw => Some("silence"),
+            simple::List::Accept
+            | simple::List::RejectDeletes
+            | simple::List::ReportRemoval
+            | simple::List::AvatarRemoval
+            | simple::List::BannerRemoval
+            | simple::List::BackgroundRemoval => None,
         }
     }
 }
@@ -1309,12 +1398,15 @@ impl ExtendedDescription {
     }
 }
 
-/// The lowercase hex `SHA-256` of `text` — Mastodon's domain-block
-/// digest: Pleroma's renderer writes it as `:crypto.hash(:sha256, host)`
-/// encoded with `Base.encode16(case: :lower)`. Also what
+/// The lowercase hex `SHA-256` of `text`: Mastodon's domain-block digest.
+///
+/// Pleroma's renderer writes it as `:crypto.hash(:sha256, host)` encoded
+/// with `Base.encode16(case: :lower)`. Also what
 /// [`crate::api::pleroma_account_settings`] derives email-confirmation
-/// tokens from.
-pub(crate) fn sha256_hex(text: &str) -> String {
+/// tokens from, and what the endpoint's tests hash the published domains
+/// with — which is why it is public.
+#[must_use]
+pub fn sha256_hex(text: &str) -> String {
     let mut hex = String::with_capacity(Sha256::output_size() * 2);
     for &byte in &Sha256::digest(text.as_bytes()) {
         hex.push(hex_digit(byte >> 4));
@@ -2058,64 +2150,128 @@ mod tests {
 
     #[test]
     fn domain_block_severities_follow_the_ticket_mapping() {
-        let policy = |action: &str| InstancePolicyDomain {
-            domain: "blocked.example".to_owned(),
-            action: action.to_owned(),
-            reason: "bots".to_owned(),
-            inserted_at: stamped(),
-        };
         assert_eq!(
-            DomainBlock::severity_of("reject"),
+            DomainBlock::severity_of(simple::List::Reject),
             Some("suspend"),
             "a rejected domain reads as suspended"
         );
+        for list in [
+            simple::List::FederatedTimelineRemoval,
+            simple::List::FollowersOnly,
+            simple::List::MediaRemoval,
+            simple::List::MediaNsfw,
+        ] {
+            assert_eq!(
+                DomainBlock::severity_of(list),
+                Some("silence"),
+                "the list that keeps a host's posts out of the public eye reads \
+                 as silence: {list:?}"
+            );
+        }
+        for list in [
+            simple::List::Accept,
+            simple::List::RejectDeletes,
+            simple::List::ReportRemoval,
+            simple::List::AvatarRemoval,
+            simple::List::BannerRemoval,
+            simple::List::BackgroundRemoval,
+        ] {
+            assert_eq!(
+                DomainBlock::severity_of(list),
+                None,
+                "the list that blocks no addressed domain renders no entry: {list:?}"
+            );
+        }
+    }
+
+    /// The listing is the `simple` lists: one entry per published host, at
+    /// its list's severity, the pattern verbatim — wildcard and all — and
+    /// the operator's reason as the comment.
+    #[test]
+    fn a_domain_block_holds_the_domain_digest_severity_and_comment() {
+        let lists = SimpleConfig::from_params(Some(&json!({
+            "reject": [["evil.example", "coordinated abuse"], "*.worse.example"],
+            "media_nsfw": ["lewd.example"],
+            "followers_only": ["press.example"],
+            "avatar_removal": ["faceless.example"],
+        })));
+        let rendered = serde_json::to_value(DomainBlock::published_all(
+            Some(&lists),
+            &Transparency::open(),
+        ))
+        .unwrap();
         assert_eq!(
-            DomainBlock::severity_of("silence"),
-            Some("silence"),
-            "a silenced domain keeps its name"
-        );
-        assert_eq!(
-            DomainBlock::severity_of("media_removal"),
-            Some("silence"),
-            "media scrubbing reads as silence too"
-        );
-        assert_eq!(
-            DomainBlock::severity_of("defederate"),
-            None,
-            "an unmapped action renders no entry"
-        );
-        assert!(
-            DomainBlock::from_model(&policy("defederate")).is_none(),
-            "the renderer drops unmapped rows"
+            rendered,
+            json!([
+                {
+                    "domain": "evil.example",
+                    "digest": sha256_hex("evil.example"),
+                    "severity": "suspend",
+                    "comment": "coordinated abuse",
+                },
+                {
+                    "domain": "*.worse.example",
+                    "digest": sha256_hex("*.worse.example"),
+                    "severity": "suspend",
+                    "comment": "",
+                },
+                {
+                    "domain": "press.example",
+                    "digest": sha256_hex("press.example"),
+                    "severity": "silence",
+                    "comment": "",
+                },
+                {
+                    "domain": "lewd.example",
+                    "digest": sha256_hex("lewd.example"),
+                    "severity": "silence",
+                    "comment": "",
+                },
+            ]),
+            "reject first, then the softened lists in `List::ALL` order, each \
+             entry with its digest and (empty) comment; the profile strip \
+             renders nothing"
         );
     }
 
+    /// The two ways the listing comes back empty: the instance publishes
+    /// no moderation at all, and the instance runs no `simple` policy, so
+    /// its configured lists govern nothing.
     #[test]
-    fn a_domain_block_holds_the_domain_digest_severity_and_comment() {
-        let row = InstancePolicyDomain {
-            domain: "blocked.example".to_owned(),
-            action: "reject".to_owned(),
-            reason: "coordinated abuse".to_owned(),
-            inserted_at: stamped(),
-        };
-        let block = DomainBlock::from_model(&row).expect("reject maps to a severity");
-        let rendered = serde_json::to_value(&block).unwrap();
+    fn without_transparency_or_simple_lists_nothing_is_blocked() {
+        let lists = SimpleConfig::from_params(Some(&json!({"reject": ["evil.example"]})));
+        assert!(
+            DomainBlock::published_all(Some(&lists), &Transparency::default()).is_empty(),
+            "MRF_TRANSPARENCY off publishes no domain blocks either"
+        );
+        assert!(
+            DomainBlock::published_all(None, &Transparency::open()).is_empty(),
+            "and no `simple` policy means no blocked domains"
+        );
+    }
+
+    /// An excluded host is missing from the listing, and only it: the rest
+    /// of the same list is still published.
+    #[test]
+    fn an_excluded_host_is_missing_from_the_listing() {
+        let lists = SimpleConfig::from_params(Some(&json!({
+            "reject": ["evil.example", "press.example"],
+        })));
+        let transparency = Transparency::hiding(&["press.example".to_owned()]);
+        let rendered =
+            serde_json::to_value(DomainBlock::published_all(Some(&lists), &transparency)).unwrap();
         assert_eq!(
             rendered,
-            json!({
-                "domain": "blocked.example",
-                "digest": sha256_hex("blocked.example"),
-                "severity": "suspend",
-                "comment": "coordinated abuse",
-            }),
-            "the entry shape the ticket documents"
+            json!([
+                {
+                    "domain": "evil.example",
+                    "digest": sha256_hex("evil.example"),
+                    "severity": "suspend",
+                    "comment": "",
+                },
+            ]),
+            "the excluded host is simply not there"
         );
-        let empty = InstancePolicyDomain {
-            reason: String::new(),
-            ..row
-        };
-        let unnamed = DomainBlock::from_model(&empty).expect("reject maps");
-        assert_eq!(unnamed.comment, "", "an ungiven reason is the empty string");
     }
 
     #[test]
