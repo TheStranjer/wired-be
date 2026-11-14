@@ -37,6 +37,7 @@ Everything else is forbidden. In particular, never run:
 ### How to run what you may run
 
 - **Run each command once and read its whole output.** Don't re-run the same command to "check again", to see if a failure is flaky, or hoping the result changes. If the output is long, redirect it to a file under `target/` and read the file; don't pipe `cargo` into `head` (it can kill the build with SIGPIPE) and don't hide failures with `| grep`.
+- **Never run tests (or any other check) in the background.** No `run_in_background`, no `&`, no detached or backgrounded shell sessions, no "start it and look at the output later". Either run `cargo test` / `scripts/ci.sh` in the foreground and wait for it to return, or don't run it. Never start a run you won't read to completion.
 - **Waiting is not a task.** If a command is slow, let it finish. A foreground command that returns has finished; one that doesn't return is hung, so stop and report it rather than polling around it.
 - **Two strikes.** If the same fix fails twice, stop and report what you tried and what the output said. Don't try a third variation of the same idea and never work around a block with a command from the forbidden list.
 - **Don't weaken the gate.** Never edit `scripts/ci.sh`, `.github/workflows/ci.yml`, `clippy.toml` or the `[lints]` table to make a failure go away; never `#[ignore]`, delete or loosen a failing test to get green; fix the code.
