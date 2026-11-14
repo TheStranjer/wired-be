@@ -77,10 +77,11 @@
 //! run [`on_reaction_changed`](crate::services::notify::on_reaction_changed)
 //! through this module's `after_reaction_changed` hook, creating the
 //! `pleroma:emoji_reaction` notification on the `PUT` and taking it back on
-//! the `DELETE`. Neither write federates anything yet: Pleroma's
-//! `react_with_emoji` runs the `EmojiReact` activity through its pipeline,
-//! which delivers it and broadcasts the `pleroma:emoji_reaction` socket
-//! event; both land at the same hook when those tickets arrive.
+//! the `DELETE`. The federation of the `EmojiReact` activity (and its
+//! `Undo`) lands through the same hook, delivered by
+//! [`crate::services::federation_out`] exactly as Pleroma's
+//! `react_with_emoji` runs it through its pipeline; the
+//! `pleroma:emoji_reaction` socket event still attaches at the same place.
 //!
 //! [`status_for_viewer_or_404`]: crate::api::helpers::status_for_viewer_or_404
 //! [`CustomEmoji`]: crate::models::custom_emoji::CustomEmoji
@@ -117,7 +118,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    services::{notify, render_status::render_status},
+    services::{federation_out, notify, render_status::render_status},
     state::AppState,
     util::emoji::Emoji,
 };
@@ -506,17 +507,19 @@ async fn local_emoji(pool: &PgPool, shortcode: &str) -> AppResult<Option<CustomE
 /// author of a new reaction — and its withdrawal, when the reaction is
 /// taken back — runs through here, landed from
 /// [`notify::on_reaction_changed`] (Pleroma's `EmojiReact` notification
-/// arm, whose potential receiver is the object's actor alone). The inbound
-/// `EmojiReact` handler runs it too
-/// ([`crate::federation::handlers::interactions`]): a mirrored remote
-/// reaction tells the local author exactly as a local one does, and the
-/// reaction's `Undo` takes that telling back. The federation ticket that
-/// sends an `EmojiReact` activity (and its `Undo`, when a reaction is
-/// withdrawn) wires the delivery in here too — the activity to send is
+/// arm, whose potential receiver is the object's actor alone). The
+/// federation of the `EmojiReact` activity (and its `Undo`, when a reaction
+/// is withdrawn) lands from
+/// [`federation_out::after_reaction_changed`] — the activity to send is
 /// [`ReactionRow::ap_id`], the triple it names is [`ReactionRow::user_id`],
 /// [`ReactionRow::status_id`] and [`ReactionRow::emoji`], and the queueing
-/// happens through `state` (decision 11). The same hook is where Pleroma's
-/// `pleroma:emoji_reaction` socket broadcast will land.
+/// happens through `state` (decision 11). The inbound `EmojiReact` handler
+/// runs it too ([`crate::federation::handlers::interactions`]): a mirrored
+/// remote reaction tells the local author exactly as a local one does, and
+/// the reaction's `Undo` takes that telling back — the federation half
+/// answering nothing, since a mirror row belongs to its maker's instance.
+/// The same hook is where Pleroma's `pleroma:emoji_reaction` socket
+/// broadcast will land.
 ///
 /// `reacting` states which way the write moved the fact: `true` for the reaction
 /// a `PUT` left behind — including a repeat, which restates the same fact
@@ -531,6 +534,7 @@ pub(crate) async fn after_reaction_changed(
     reacting: bool,
 ) {
     notify::on_reaction_changed(state, reaction, reacting).await;
+    federation_out::after_reaction_changed(state, reaction, reacting).await;
 }
 
 #[cfg(test)]

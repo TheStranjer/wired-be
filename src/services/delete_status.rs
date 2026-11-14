@@ -5,8 +5,9 @@
 //! `CommonAPI.delete` (`lib/pleroma/web/common_api.ex`); this module is the
 //! write it wraps — the tombstone of the row and of every live reblog of it,
 //! the counter steps, and the `after_status_deleted` hook the
-//! notification cleanup (and, once those tickets land, the `Delete`
-//! activity and the `status_deleted` stream push) hangs off. The endpoint
+//! notification cleanup (and, for a deleted reblog row, the withdrawal of
+//! its `Announce`; once the note ticket lands, the `Delete` activity and
+//! the `status_deleted` stream push) hangs off. The endpoint
 //! keeps its own gates — authentication, the visibility 404, the ownership
 //! rule, the pre-delete render — and calls [`delete_status`] for the write
 //! itself.
@@ -21,6 +22,7 @@ use tracing::{debug, warn};
 use crate::{
     error::AppResult,
     models::{conversation, notification, status},
+    services::federation_out,
     state::AppState,
 };
 
@@ -64,8 +66,11 @@ pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<
 /// conversation repoint that moves every participation which last saw the
 /// deleted status onto its thread's newest remaining direct status — or
 /// withdraws the participation when the thread has none (see
-/// [`conversation::repoint_after_delete`]). The federation
-/// ticket that sends the `Delete` activity (and, with it, the withdrawal
+/// [`conversation::repoint_after_delete`]). The federation of the
+/// withdrawal is wired in here too: for a REBLOG row
+/// [`federation_out::after_status_deleted`] sends the `Undo` of the
+/// `Announce` the row was — a deleted boost withdraws itself, it is never
+/// a `Delete`. The `Delete` of a plain status (and with it the withdrawal
 /// of every reblog this delete took down) and the streaming ticket that
 /// pushes `status_deleted` to the timelines that carried the post still
 /// land here, and the queueing will happen through `state` (decision 11).
@@ -81,6 +86,8 @@ pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<
 /// The cleanup is best-effort: the delete itself is already committed and
 /// must not answer a failure the client would retry against a gone
 /// status, so a cleanup that fails is logged, not returned.
+///
+/// [`federation_out::after_status_deleted`]: crate::services::federation_out::after_status_deleted
 async fn after_status_deleted(state: &AppState, status: &status::Status) {
     if let Err(err) = notification::delete_for_status(&state.db, status.id).await {
         warn!(
@@ -96,6 +103,7 @@ async fn after_status_deleted(state: &AppState, status: &status::Status) {
             "conversation repoint after status deletion failed"
         );
     }
+    federation_out::after_status_deleted(state, status).await;
 }
 
 #[cfg(test)]

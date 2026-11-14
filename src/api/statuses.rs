@@ -242,9 +242,10 @@
 //!
 //! A boost tells the original's author — the `after_reblog_changed` hook
 //! lands [`crate::services::notify`]'s reblog telling (and its withdrawal),
-//! Pleroma's `Announce` notification riding the same pipeline. What the
-//! write does not do yet is federate: the federation ticket that sends the
-//! `Announce` activity and its `Undo` lands in the same hook.
+//! Pleroma's `Announce` notification riding the same pipeline. The same
+//! hook federates the write: [`crate::services::federation_out`] sends the
+//! `Announce` the reblog row *is* (and its `Undo`), never for a boost of a
+//! `local`-visibility original.
 //!
 //! # The bookmark writes and the bookmarks listing
 //!
@@ -350,10 +351,11 @@
 //! A favourite tells the status's author — the `after_favourite_changed`
 //! hook lands [`crate::services::notify`]'s favourite telling (and its
 //! withdrawal), Pleroma's `Like` notification riding the same pipeline.
-//! What the write does not do yet is federate: the federation ticket that
-//! sends the `Like` activity and its `Undo` lands in the same hook, as the
-//! reactions' [`crate::api::emoji_reactions`] hook still waits for its
-//! `EmojiReact`. The bookmark writes have no such hook to wait
+//! The same hook federates the write: [`crate::services::federation_out`]
+//! sends the `Like` (and its `Undo`) to the status author — and, for a
+//! public status, the actor's followers. The reactions'
+//! [`crate::api::emoji_reactions`] hook lands the same pair of halves for
+//! its `EmojiReact`. The bookmark writes have no such hook to wait
 //! for — Pleroma's bookmark is a private row, never an activity.
 //!
 //! # The translation
@@ -394,13 +396,14 @@
 //! rows of the deleted statuses stay in the table, referenced by nothing
 //! live, until the cleanup job removes them.
 //!
-//! Nothing leaves this instance yet: the `Delete` activity and the
-//! `status_deleted` stream push still attach at the deletion service's
-//! `after_status_deleted` hook
+//! What leaves this instance is the boost's withdrawal: a deleted REBLOG
+//! row federates the `Undo` of the `Announce` it was, attached at the
+//! deletion service's `after_status_deleted` hook
 //! ([`crate::services::delete_status`] — the same landing point the
 //! expiration jobs run through), where the
 //! notification ticket has wired the cleanup that takes the deleted
-//! status's notifications with it.
+//! status's notifications with it. The `Delete` of a plain status and the
+//! `status_deleted` stream push still wait for their tickets there.
 //!
 //! # The edit, its history and its source
 //!
@@ -513,6 +516,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         create_status::{self, CreateStatusParams, EditStatusParams},
+        federation_out,
         filter::{self, FilterContext},
         notify,
         render_status::{render_status, render_statuses},
@@ -2473,15 +2477,16 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 /// Post-write hook of both favourite routes: the favourite telling of the
 /// status's author — and its withdrawal, when a favourite is undone — runs
 /// through here, landed from [`notify::on_favourite`] (Pleroma's
-/// `CommonAPI.favorite` pipeline runs the same pair). The inbound
-/// `Like` handler runs it too
+/// `CommonAPI.favorite` pipeline runs the same pair), and the federation
+/// of the `Like` (and its `Undo`) lands from
+/// [`federation_out::after_favourite_changed`]: the activity to send is
+/// [`FavouriteRow::ap_id`], the pair it names is [`FavouriteRow::user_id`]
+/// and [`FavouriteRow::status_id`], and the queueing happens through
+/// `state` (decision 11). The inbound `Like` handler runs it too
 /// ([`crate::federation::handlers::interactions`]): a mirrored remote like
 /// tells the local author exactly as a local one does, and the like's
-/// `Undo` takes that telling back. The federation ticket that *sends* the
-/// `Like` activity (and its `Undo`) wires its delivery into the same body:
-/// the activity to send is [`FavouriteRow::ap_id`], the pair it names is
-/// [`FavouriteRow::user_id`] and [`FavouriteRow::status_id`], and the
-/// queueing happens through `state` (decision 11).
+/// `Undo` takes that telling back — the federation half answering nothing
+/// for it, since a mirror row belongs to its maker's instance.
 ///
 /// `favouriting` states which way the write moved the fact: `true` for the
 /// favourite a `POST …/favourite` left behind — a repeat favourite never
@@ -2497,14 +2502,15 @@ pub(crate) async fn after_favourite_changed(
     favouriting: bool,
 ) {
     notify::on_favourite(state, favourite, favouriting).await;
+    federation_out::after_favourite_changed(state, favourite, favouriting).await;
 }
 
-/// Post-write hook of both reblog routes: the federation ticket that sends
-/// the `Announce` activity (and its `Undo`, when a reblog is withdrawn)
-/// wires the delivery in here — the activity to send is the row's own
-/// [`uri`](StatusRow::uri) (a reblog row *is* the `Announce`: decision 6
-/// stores it under `{BASE_URL}/activities/{id}`), the pair it names is the
-/// row's [`user_id`](StatusRow::user_id) and its
+/// Post-write hook of both reblog routes: the federation of the
+/// `Announce` activity (and its `Undo`, when a reblog is withdrawn) lands
+/// here, through [`federation_out::after_reblog_changed`] — the activity
+/// to send is the row's own [`uri`](StatusRow::uri) (a reblog row *is* the
+/// `Announce`: decision 6 stores it under `{BASE_URL}/activities/{id}`),
+/// the pair it names is the row's [`user_id`](StatusRow::user_id) and its
 /// [`reblog_of_id`](StatusRow::reblog_of_id), and the queueing happens
 /// through `state` (decision 11).
 /// The telling of the original's author — Pleroma's `Announce`
@@ -2512,7 +2518,9 @@ pub(crate) async fn after_favourite_changed(
 /// same body, from [`notify::on_reblog`]. The inbound `Announce` handler
 /// runs it too ([`crate::federation::handlers::interactions`]): a remote
 /// boost tells the local author of the boosted post exactly as a local one
-/// does, and the boost's `Undo` takes that telling back.
+/// does, and the boost's `Undo` takes that telling back — the federation
+/// half answering nothing, since a mirror boost belongs to its maker's
+/// instance.
 ///
 /// `reblog` is the row the write just created or tombstoned: on the
 /// withdrawal it is the tombstone, whose `uri` the `Undo` must name.
@@ -2526,6 +2534,7 @@ pub(crate) async fn after_favourite_changed(
 /// [`notify::on_reblog`]: crate::services::notify::on_reblog
 pub(crate) async fn after_reblog_changed(state: &AppState, reblog: &StatusRow, reblogging: bool) {
     notify::on_reblog(state, reblog, reblogging).await;
+    federation_out::after_reblog_changed(state, reblog, reblogging).await;
 }
 
 /// Post-write hook of both pin routes: the federation ticket that adds the

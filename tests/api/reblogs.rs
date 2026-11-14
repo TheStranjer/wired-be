@@ -23,9 +23,11 @@
 //! `(user_id, reblog_of_id)`: a repeat reblog restates the same row and one
 //! count, and a withdrawal with nothing to withdraw moves nothing.
 //!
-//! Nothing federates yet: the `Announce` and its `Undo` attach at the
-//! module's `after_reblog_changed` hook, so no delivery is asserted here.
-//! The boost notification that hook now also sends is the notification
+//! The `Announce` and its `Undo` federate at the module's
+//! `after_reblog_changed` hook; the queueing itself is the federation
+//! service's territory (`services::federation_out`'s tests own the
+//! deliveries), so no delivery is asserted here.
+//! The boost notification that hook also sends is the notification
 //! generation area's (`notification_generation.rs`), not this file's.
 //!
 //! [`Status`]: wired_be::entities::status::Status
