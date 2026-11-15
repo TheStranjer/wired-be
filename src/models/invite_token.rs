@@ -109,6 +109,20 @@ impl InviteType {
             (None, None) => Self::OneTime,
         }
     }
+
+    /// The `snake_case` text this variant carries in the `invite_type`
+    /// column — the same spelling the column's `CHECK` constraint allows,
+    /// the [`sqlx::Type`] rename produces, and the admin API's invite
+    /// entity answers with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneTime => "one_time",
+            Self::Reusable => "reusable",
+            Self::DateLimited => "date_limited",
+            Self::ReusableDateLimited => "reusable_date_limited",
+        }
+    }
 }
 
 /// What [`create`] is handed to mint one invite: the two limits, from which
@@ -436,6 +450,62 @@ mod tests {
             debug.contains(r#"token: "<redacted>""#),
             "the redaction marker names the field"
         );
+    }
+
+    #[test]
+    fn invite_types_spell_their_stored_text() {
+        let spellings = [
+            (InviteType::OneTime, "one_time"),
+            (InviteType::Reusable, "reusable"),
+            (InviteType::DateLimited, "date_limited"),
+            (InviteType::ReusableDateLimited, "reusable_date_limited"),
+        ];
+        for (kind, text) in spellings {
+            assert_eq!(kind.as_str(), text, "the entity spelling of {kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn as_str_agrees_with_the_column_text() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        for (kind, params) in [
+            (InviteType::OneTime, InviteParams::one_time()),
+            (
+                InviteType::Reusable,
+                InviteParams {
+                    expires_at: None,
+                    max_use: Some(2),
+                },
+            ),
+            (
+                InviteType::DateLimited,
+                InviteParams {
+                    expires_at: Some(day_shift(2)),
+                    max_use: None,
+                },
+            ),
+            (
+                InviteType::ReusableDateLimited,
+                InviteParams {
+                    expires_at: Some(day_shift(2)),
+                    max_use: Some(2),
+                },
+            ),
+        ] {
+            let created = create(&pool, &params).await.expect("the insert runs");
+            let stored: String =
+                sqlx::query_scalar("SELECT invite_type FROM invite_tokens WHERE id = $1")
+                    .bind(created.id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("the row reads back");
+            assert_eq!(
+                stored,
+                kind.as_str(),
+                "the sqlx rename and as_str spell the same text for {kind:?}"
+            );
+        }
     }
 
     #[tokio::test]

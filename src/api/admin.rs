@@ -29,10 +29,14 @@
 //! `.route(...)` lines; the [module docs of `crate::api::v1`](crate::api::v1)
 //! hold the no-fallback rule that applies to every router merged there.
 //! The runtime config store (`GET`/`POST /config`, WBE-206) joins as the
-//! [`config`] submodule.
+//! [`config`] submodule, and the registration invites (`users/invite_token`,
+//! `users/invites`, `users/revoke_invite`, `users/email_invite`, WBE-199)
+//! as the [`invites`] submodule — whose [`registration_router`]
+//! additionally rides on [`crate::app`] at the root.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
+//! [`registration_router`]: invites::registration_router
 
 use std::collections::HashMap;
 
@@ -53,6 +57,7 @@ use crate::{
 };
 
 pub mod config;
+pub mod invites;
 
 /// Default `page` when the parameter is absent or not a positive number
 /// (Pleroma's `page_params` first, over its `fetch_integer_param`).
@@ -79,6 +84,7 @@ pub fn router() -> Router<AppState> {
         .route("/moderation_log", get(list_moderation_log))
         .route("/stats", get(stats))
         .merge(config::router())
+        .merge(invites::router())
 }
 
 /// `GET /api/v1/pleroma/admin/moderation_log` — the log page Pleroma's

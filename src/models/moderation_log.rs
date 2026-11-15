@@ -21,9 +21,10 @@
 //! [`deactivate`], [`activate`], [`delete`], [`approve`], [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`report_update`], [`report_note`], [`status_update`],
-//! [`status_delete`], [`relay_follow`], [`relay_unfollow`] and
-//! [`config_change`] — compose the sentence word for word as Pleroma's
-//! `get_log_entry_message` clauses spell it, so later admin tickets call
+//! [`status_delete`], [`relay_follow`], [`relay_unfollow`],
+//! [`invite_create`], [`invite_revoke`] and [`config_change`] — compose
+//! the sentence word for word as Pleroma's `get_log_entry_message` clauses
+//! spell it, so later admin tickets call
 //! `moderation_log::deactivate(pool, &admin, &users)` and never
 //! hand-assemble a message. Actions without a helper here (the
 //! `announcement_*` family, …) join the set with the tickets that log
@@ -702,6 +703,71 @@ fn config_change_map(change: &ConfigChange<'_>) -> Value {
     Value::Object(entry)
 }
 
+/// Records an `invite_create`: `@admin created invite: {invite_id}`.
+///
+/// The admin API's `POST /users/invite_token` logs here. The invite is no
+/// user, so — like a deleted status — its id rides in `subject_id` as
+/// text and the subject columns stay empty.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn invite_create(
+    pool: &PgPool,
+    actor: &User,
+    invite_id: Uuid,
+) -> AppResult<ModerationLog> {
+    invite_action(pool, actor, invite_id, "invite_create", "created").await
+}
+
+/// Records an `invite_revoke`: `@admin revoked invite: {invite_id}`.
+///
+/// The admin API's `POST /users/revoke_invite` logs here. The invite row
+/// is gone when this records, which is exactly why the id is kept: the log
+/// line is the surviving trace of the revoked invite.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn invite_revoke(
+    pool: &PgPool,
+    actor: &User,
+    invite_id: Uuid,
+) -> AppResult<ModerationLog> {
+    invite_action(pool, actor, invite_id, "invite_revoke", "revoked").await
+}
+
+/// The two invite clauses share their sentence shape and their
+/// `subject_id` key; only the action name and the verb differ.
+async fn invite_action(
+    pool: &PgPool,
+    actor: &User,
+    invite_id: Uuid,
+    action: &str,
+    verb: &str,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} {verb} invite: {invite_id}", actor.nickname);
+    let mut data = Map::new();
+    put(
+        &mut data,
+        "subject_id",
+        Value::String(invite_id.to_string()),
+    );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
 /// The `@alice, @bob` list Pleroma's `users_to_nicknames_string` and
 /// `nicknames_to_string` build.
 fn mention_list(nicknames: &[String]) -> String {
@@ -1376,6 +1442,50 @@ mod tests {
                 serde_json::json!({"group": ":pleroma", "key": ":mrf", "delete": true}),
             ],
             "each pair with its write-or-delete flag"
+        );
+    }
+
+    /// The `invite_create` and `invite_revoke` entries: their sentences
+    /// name the invite id, the id rides in `subject_id` as text (the
+    /// invite is no user, and a revoked one has no row left), and the
+    /// subject columns stay empty.
+    #[tokio::test]
+    async fn invite_helpers_record_their_entries() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+        let invite = new_id();
+        let created = invite_create(&pool, &actor, invite)
+            .await
+            .expect("invite_create records");
+        assert_eq!(created.action, "invite_create", "the action column");
+        assert_eq!(
+            created.message,
+            format!("@mod created invite: {invite}"),
+            "the sentence names the invite id"
+        );
+        assert_eq!(
+            created.data.get("subject_id").and_then(Value::as_str),
+            Some(invite.to_string().as_str()),
+            "the invite rides in subject_id"
+        );
+        assert!(
+            created.subject_ids.is_empty() && created.subject_nicknames.is_empty(),
+            "an invite is not a user subject"
+        );
+        let revoked = invite_revoke(&pool, &actor, invite)
+            .await
+            .expect("invite_revoke records");
+        assert_eq!(revoked.action, "invite_revoke", "the action column");
+        assert_eq!(
+            revoked.message,
+            format!("@mod revoked invite: {invite}"),
+            "the revoke sentence, same shape"
+        );
+        assert_eq!(
+            revoked.data.get("subject_id").and_then(Value::as_str),
+            Some(invite.to_string().as_str()),
+            "and the revoked invite keeps its id in the data map"
         );
     }
 

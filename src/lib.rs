@@ -312,9 +312,12 @@ async fn wait_for_ctrl_c() {
 /// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
 /// [`api::html_pages`] (`/frontend_switcher`, `/embed/{id}`,
-/// `/notice/{id}/embed_player` and `/mailer/unsubscribe/{token}`) and the
+/// `/notice/{id}/embed_player` and `/mailer/unsubscribe/{token}`), the
 /// remote-interaction pages of [`api::remote_interaction`]
-/// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`).
+/// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`)
+/// and the invite registration link of
+/// [`api::admin::invites::registration_router`] (`/registration/{token}`,
+/// redirecting to the frontend's registration page).
 /// Paths no route matches get the standard JSON error response (decision 8).
 ///
 /// `state` is handed to [`api::router`] and [`api::oauth::router`] before
@@ -341,6 +344,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::misc::router())
             .merge(api::html_pages::router())
             .merge(api::remote_interaction::router())
+            .merge(api::admin::invites::registration_router())
             .fallback(not_found)
             .with_state(state),
     )
