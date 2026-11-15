@@ -23,8 +23,9 @@
 //! [`report_update`], [`report_note`], [`status_update`],
 //! [`status_delete`], [`relay_follow`], [`relay_unfollow`],
 //! [`invite_create`], [`invite_revoke`], [`config_change`],
-//! [`webhook_create`], [`webhook_update`], [`webhook_delete`] and
-//! [`webhook_rotate_secret`] — compose
+//! [`webhook_create`], [`webhook_update`], [`webhook_delete`],
+//! [`webhook_rotate_secret`], [`emoji_pack_create`],
+//! [`emoji_pack_update`] and [`emoji_pack_delete`] — compose
 //! the sentence word for word as Pleroma's `get_log_entry_message` clauses
 //! spell it, so later admin tickets call
 //! `moderation_log::deactivate(pool, &admin, &users)` and never
@@ -32,7 +33,10 @@
 //! `announcement_*` family, …) join the set with the tickets that log
 //! them. The webhook maintenance actions — [`webhook_create`],
 //! [`webhook_update`], [`webhook_delete`] and [`webhook_rotate_secret`] —
-//! name their row by id the way the invite pair does.
+//! name their row by id the way the invite pair does; the emoji-pack
+//! administration actions — [`emoji_pack_create`], [`emoji_pack_update`]
+//! and [`emoji_pack_delete`] — name their subject by its directory name,
+//! since a pack has no id.
 //!
 //! [`list`] is the read behind the endpoint: the newest-first `page` /
 //! `page_size` window over the [`LogListParams`] filters, beside the total
@@ -866,6 +870,85 @@ async fn webhook_action(
         "subject_id",
         Value::String(webhook_id.to_string()),
     );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records an `emoji_pack_create`: `@admin created emoji pack: {name}`.
+///
+/// The pack admin API's `POST /api/v1/pleroma/emoji/pack` logs here. A
+/// pack is no user and has no id — its directory name is its identity — so
+/// the name rides in `subject_id` as text and the subject columns stay
+/// empty, as with the invite and webhook actions.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn emoji_pack_create(
+    pool: &PgPool,
+    actor: &User,
+    pack: &str,
+) -> AppResult<ModerationLog> {
+    emoji_pack_action(pool, actor, pack, "emoji_pack_create", "created").await
+}
+
+/// Records an `emoji_pack_update`: `@admin updated emoji pack: {name}`.
+///
+/// The pack admin API's `PATCH /api/v1/pleroma/emoji/pack` logs here.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn emoji_pack_update(
+    pool: &PgPool,
+    actor: &User,
+    pack: &str,
+) -> AppResult<ModerationLog> {
+    emoji_pack_action(pool, actor, pack, "emoji_pack_update", "updated").await
+}
+
+/// Records an `emoji_pack_delete`: `@admin deleted emoji pack: {name}`.
+///
+/// The pack admin API's `DELETE /api/v1/pleroma/emoji/pack` logs here. The
+/// pack is gone when this records, which is exactly why the name is kept:
+/// the log line is the surviving trace of the deleted pack.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn emoji_pack_delete(
+    pool: &PgPool,
+    actor: &User,
+    pack: &str,
+) -> AppResult<ModerationLog> {
+    emoji_pack_action(pool, actor, pack, "emoji_pack_delete", "deleted").await
+}
+
+/// The three emoji-pack clauses share their sentence shape and their
+/// `subject_id` key (holding the pack's name); only the action name and
+/// the verb differ.
+async fn emoji_pack_action(
+    pool: &PgPool,
+    actor: &User,
+    pack: &str,
+    action: &str,
+    verb: &str,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} {verb} emoji pack: {pack}", actor.nickname);
+    let mut data = Map::new();
+    put(&mut data, "subject_id", Value::String(pack.to_owned()));
     record(
         pool,
         actor,
