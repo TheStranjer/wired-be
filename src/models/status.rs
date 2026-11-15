@@ -168,6 +168,21 @@ pub enum Counter {
     Quotes,
 }
 
+/// The four live-status counters behind `GET /api/v1/pleroma/admin/stats`'
+/// `status_visibility` block: one row of Pleroma's `CounterCache`
+/// (`lib/pleroma/counter_cache.ex`), read straight off `statuses`.
+#[derive(Debug, sqlx::FromRow)]
+pub struct StatusVisibilityCounts {
+    /// Live, non-reblog `public` statuses of the selected audience.
+    pub public: i64,
+    /// Live, non-reblog `unlisted` statuses of the selected audience.
+    pub unlisted: i64,
+    /// Live, non-reblog `private` statuses of the selected audience.
+    pub private: i64,
+    /// Live, non-reblog `direct` statuses of the selected audience.
+    pub direct: i64,
+}
+
 /// One row of `statuses`: one post, in any of the shapes decision 6 allows
 /// (root, reply, reblog, quote).
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -1016,6 +1031,58 @@ pub async fn public_replies_count(pool: &PgPool, object_id: Uuid) -> AppResult<i
         .fetch_one(pool)
         .await?;
     Ok(row)
+}
+
+/// The start of [`status_visibility_counts`]' statement: the four
+/// `count(*) FILTER` arms over the live, non-reblog rows, joined to the
+/// author so the audience clause can narrow by origin. The clause
+/// [`status_visibility_counts`] appends (local authors, or one domain's)
+/// is Pleroma's `CounterCache` distinction between `get_sum` and
+/// `get_by_instance` restated over this schema's `users.local` /
+/// `users.domain` columns.
+const STATUS_VISIBILITY_COUNTS_SQL: &str = "SELECT
+     count(*) FILTER (WHERE s.visibility = 'public')  AS public,
+     count(*) FILTER (WHERE s.visibility = 'unlisted') AS unlisted,
+     count(*) FILTER (WHERE s.visibility = 'private')  AS private,
+     count(*) FILTER (WHERE s.visibility = 'direct')   AS direct
+     FROM statuses s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.deleted_at IS NULL AND s.reblog_of_id IS NULL AND ";
+
+/// The four visibility counters behind `GET /api/v1/pleroma/admin/stats`.
+///
+/// A status is counted once, under its own visibility, when it is neither
+/// a tombstone nor a reblog row (the boost repeats somebody else's post;
+/// Pleroma's `activity_visibility` never counts `Announce` activities).
+/// `instance` selects the audience of the count: with `None` the
+/// answer is this instance's own — the statuses of local accounts; with
+/// a domain it is the statuses of the accounts mirrored from that domain
+/// (Pleroma's `CounterCache.get_by_instance`, keyed on the actor's host).
+/// A domain no account came from answers all zeros, like Pleroma's
+/// missing `counter_cache` row does.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn status_visibility_counts(
+    pool: &PgPool,
+    instance: Option<&str>,
+) -> AppResult<StatusVisibilityCounts> {
+    let mut builder = QueryBuilder::<Postgres>::new(STATUS_VISIBILITY_COUNTS_SQL);
+    match instance {
+        None => {
+            let _local: &mut _ = builder.push("u.local");
+        }
+        Some(domain) => {
+            let _domain: &mut _ = builder.push("u.domain = ").push_bind(domain);
+        }
+    }
+    let counts = builder
+        .build_query_as::<StatusVisibilityCounts>()
+        .fetch_one(pool)
+        .await?;
+    Ok(counts)
 }
 
 /// One page of `object_id`'s publicly visible replies, oldest first.

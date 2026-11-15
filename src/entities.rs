@@ -44,6 +44,7 @@
 //! attachments of its own row.
 
 pub mod account;
+pub mod admin;
 pub mod announcement;
 pub mod application;
 pub mod backup;

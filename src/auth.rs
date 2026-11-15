@@ -46,6 +46,13 @@
 //! [`AuthUser::require_any`] helpers enforce Mastodon scopes through
 //! [`Scopes::contains`], answering 403 with Pleroma's
 //! "Insufficient permissions: …." wording.
+//!
+//! [`admin`] adds the staff pair — [`AdminUser`](admin::AdminUser) and
+//! [`StaffUser`](admin::StaffUser) — that demands the resolved user hold
+//! the admin (or, for staff, the moderator-too) role before the admin
+//! endpoints' `admin:read` / `admin:write` scope gate is even asked.
+
+pub mod admin;
 
 use axum::{
     extract::FromRequestParts,
@@ -181,24 +188,8 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let Some(raw) = bearer_string(parts) else {
-            return Err(AppError::Unauthorized(NO_TOKEN.to_owned()));
-        };
-        match resolve(state, &raw).await? {
-            Auth::Valid(ctx) => {
-                let AuthContext { token, user, .. } = *ctx;
-                user.map_or_else(
-                    || Err(AppError::Forbidden(USER_REQUIRED.to_owned())),
-                    |user| Ok(Self(user, token)),
-                )
-            }
-            Auth::Deactivated => Err(AppError::Forbidden(DISABLED.to_owned())),
-            Auth::ApprovalPending => Err(AppError::forbidden_with_identifier(
-                AWAITING_APPROVAL,
-                AWAITING_APPROVAL_ID,
-            )),
-            Auth::Invalid => Err(AppError::Unauthorized(INVALID_TOKEN.to_owned())),
-        }
+        let (user, token) = user_identity(parts, state).await?;
+        Ok(Self(user, token))
     }
 }
 
@@ -278,6 +269,40 @@ impl AuthUser {
     /// token grants none of them.
     pub fn require_any(&self, needed: &[&str]) -> Result<(), AppError> {
         require_any_scope(&self.1, needed)
+    }
+}
+
+/// The user token behind a request: [`AuthUser`]'s resolution, shared by
+/// the admin extractors of [`admin`].
+///
+/// The bearer string of [`bearer_string`] must resolve through
+/// [`resolve`] to a live user token: no token at all is 401 [`NO_TOKEN`],
+/// an unknown or expired one 401 [`INVALID_TOKEN`] (a deactivated owner
+/// here reports 403 [`DISABLED`] and an unapproved one 403
+/// [`AWAITING_APPROVAL`] with [`AWAITING_APPROVAL_ID`], and an app-only
+/// token — which names no user to act as — 403 [`USER_REQUIRED`], all of
+/// them Pleroma's wordings from the [module docs](self).
+pub(crate) async fn user_identity(
+    parts: &Parts,
+    state: &AppState,
+) -> AppResult<(User, OauthToken)> {
+    let Some(raw) = bearer_string(parts) else {
+        return Err(AppError::Unauthorized(NO_TOKEN.to_owned()));
+    };
+    match resolve(state, &raw).await? {
+        Auth::Valid(ctx) => {
+            let AuthContext { token, user, .. } = *ctx;
+            user.map_or_else(
+                || Err(AppError::Forbidden(USER_REQUIRED.to_owned())),
+                |user| Ok((user, token)),
+            )
+        }
+        Auth::Deactivated => Err(AppError::Forbidden(DISABLED.to_owned())),
+        Auth::ApprovalPending => Err(AppError::forbidden_with_identifier(
+            AWAITING_APPROVAL,
+            AWAITING_APPROVAL_ID,
+        )),
+        Auth::Invalid => Err(AppError::Unauthorized(INVALID_TOKEN.to_owned())),
     }
 }
 
