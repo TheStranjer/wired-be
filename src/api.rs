@@ -48,6 +48,7 @@
 pub mod account_lists;
 pub mod accounts;
 pub mod activitypub;
+pub mod admin;
 pub mod announcements;
 pub mod apps;
 pub mod backups;

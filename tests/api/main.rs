@@ -42,6 +42,15 @@ mod accounts;
 /// The `ActivityPub` actor document (`GET /users/{nickname}`).
 mod activitypub;
 
+/// The admin foundation over HTTP (`/api/v1/pleroma/admin`, WBE-194): the
+/// [`AdminUser`]/[`StaffUser`] extractor matrix, the moderation-log
+/// listing with its filters, window, caps and refusals, and the
+/// visibility `stats`.
+///
+/// [`AdminUser`]: wired_be::auth::admin::AdminUser
+/// [`StaffUser`]: wired_be::auth::admin::StaffUser
+mod admin;
+
 /// The activity reads over HTTP: `GET /activities/{uuid}` and the `Create`
 /// of a status at `GET /users/{nickname}/statuses/{uuid}/activity`.
 mod ap_activities;

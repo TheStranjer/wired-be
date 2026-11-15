@@ -56,6 +56,7 @@ pub mod marker;
 pub mod media_attachment;
 pub mod mention;
 pub mod mfa_token;
+pub mod moderation_log;
 pub mod mute;
 pub mod notification;
 pub mod oauth_app;
