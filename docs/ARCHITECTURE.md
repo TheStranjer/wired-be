@@ -91,7 +91,8 @@ cite these decisions by number.
 
 15. **Ticket discipline**: do exactly what the ticket says, nothing more.
     Migrations are plain forward-only files `migrations/<timestamp>_<name>.sql`
-    (create with `sqlx migrate add <name>`). When a ticket extends an entity or
+    (create with `sqlx migrate add <name>`, and keep the name it generates:
+    a 14-digit `YYYYMMDDHHMMSS` timestamp). Never hand-number a new file. When a ticket extends an entity or
     endpoint from an earlier ticket, update the earlier tests rather than
     duplicating them. Update README/.env.example when adding config. Finish
     only when `scripts/ci.sh` exits 0.
