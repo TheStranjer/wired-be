@@ -5,7 +5,11 @@
 //! [`StaffUser`] gate, which guards no production route yet). The admin
 //! config store (WBE-206) — `GET`/`POST /config` over the whitelist
 //! registry, the `:mrf`/`:instance` consumers and the `config_change`
-//! log line — joins at the bottom of this file.
+//! log line — joins at the bottom of this file, and with it the admin
+//! invites (WBE-199): `users/invite_token`, `users/invites`,
+//! `users/revoke_invite` and `users/email_invite`, their `invite_create`
+//! and `invite_revoke` log lines, and the `GET /registration/{token}`
+//! redirect the invitation letters carry.
 //!
 //! The extractor matrix follows Pleroma's `UserIsAdminPlug` /
 //! `UserIsStaffPlug` order — a missing token is 401, an unusable one
@@ -26,6 +30,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     auth::admin::{AdminUser, StaffUser},
+    config::{Config, Toggle},
     error::AppError,
     models::{
         moderation_log,
@@ -1433,6 +1438,647 @@ async fn config_routes_answer_the_admin_gate() {
     let anonymous_post = post_configs(&app, "no-such-token", json!([])).await;
     common::assert_all_refused(
         &[anonymous_post],
+        StatusCode::UNAUTHORIZED,
+        INVALID_TOKEN,
+        "an unknown token on the POST",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Admin invites (WBE-199): `POST /users/invite_token`, `GET /users/invites`,
+// `POST /users/revoke_invite`, `POST /users/email_invite` and the root-level
+// `GET /registration/{token}` link. Pleroma's `AdminAPI.InviteController`
+// gates the read with `admin:read:invites` and the three POSTs with
+// `admin:write:invites`; this instance logs the two state changes into the
+// moderation log and mails the registration link the frontend serves.
+// ---------------------------------------------------------------------------
+
+/// The invite-creation route.
+const INVITE_CREATE: &str = "/api/v1/pleroma/admin/users/invite_token";
+/// The invite-listing route.
+const INVITE_LIST: &str = "/api/v1/pleroma/admin/users/invites";
+/// The invite-revocation route.
+const INVITE_REVOKE: &str = "/api/v1/pleroma/admin/users/revoke_invite";
+/// The emailed-invite route.
+const INVITE_EMAIL: &str = "/api/v1/pleroma/admin/users/email_invite";
+/// The registration-link route, merged at the app root.
+const REGISTRATION: &str = "/registration";
+/// The 400 body of the email route while `INVITES_ENABLED` is off.
+const INVITES_DISABLED: &str =
+    "To send invites you need to set the `invites_enabled` option to true.";
+/// The 400 body of the email route when the body names no `email`.
+const MISSING_EMAIL: &str = "Missing parameter: email";
+/// The 422 body of the revoke route when the body names no `token`.
+const MISSING_TOKEN: &str = "Missing parameter: token";
+/// The 404 body of the revoke route for a token no invite carries.
+const NOT_FOUND: &str = "Not found";
+
+/// An admin holding both invite scopes, as its bearer token.
+async fn invite_admin(pool: &PgPool, nickname: &str) -> String {
+    admin(pool, nickname, "admin:read:invites admin:write:invites")
+        .await
+        .1
+}
+
+/// `POST`s `body` to an invite route as `token`, over JSON.
+async fn post_invite(app: &Router, token: &str, path: &str, body: Value) -> common::TestResponse {
+    TestRequest::post(path)
+        .bearer(token)
+        .json(&body)
+        .send(app)
+        .await
+}
+
+/// A [`Config`] with invites on and mail up: the gate opens, and
+/// `deliver_later` really queues the letter.
+fn invites_open_config() -> Config {
+    let mut config = common::test_config();
+    config.invites_enabled = Toggle::new(true);
+    config.smtp_host = Some("smtp.example.org".to_owned());
+    config
+}
+
+/// The `invite_tokens` rows as `(id, token, invite_type)` texts, id order.
+async fn stored_invites(pool: &PgPool) -> Vec<(String, String, String)> {
+    sqlx::query_as("SELECT id::text, token, invite_type FROM invite_tokens ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .expect("the invite table reads back")
+}
+
+/// The queued `mailer.send` jobs' arguments, oldest first.
+async fn queued_letters(pool: &PgPool) -> Vec<Value> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT args FROM jobs WHERE queue = 'mailer' AND kind = 'mailer.send' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the mailer queue reads back")
+}
+
+/// Seeds one `invite_tokens` row under a controlled `id`, so the listing's
+/// order is fixed instead of riding on the millisecond the server minted
+/// its `UUIDv7`s in.
+async fn seed_invite(pool: &PgPool, id: u128, token: &str) {
+    let _seeded = sqlx::query(
+        "INSERT INTO invite_tokens (id, token, invite_type) VALUES ($1, $2, 'reusable')",
+    )
+    .bind(Uuid::from_u128(id))
+    .bind(token)
+    .execute(pool)
+    .await
+    .expect("the seed invite inserts");
+}
+
+/// A freshly minted entity answers its own seven whole keys: a uuid id
+/// text, the model's 22-character secret, and an unserved, unspent row.
+fn assert_fresh_entity(entity: &Value) {
+    assert_eq!(entity["used"], false, "a fresh invite is unspent");
+    assert_eq!(entity["uses"], 0, "and has served nothing");
+    let id = entity["id"].as_str().expect("the id is text");
+    assert!(Uuid::parse_str(id).is_ok(), "the id is uuid text: {id}");
+    assert_eq!(
+        entity["token"].as_str().map(str::len),
+        Some(22),
+        "the minted secret is the model's 22 characters"
+    );
+    assert_eq!(
+        entity.as_object().map(serde_json::Map::len),
+        Some(7),
+        "exactly the view's seven keys, no created_at: {entity}"
+    );
+}
+
+/// The `POST /users/invite_token` derivation: neither limit is the
+/// one-time invite, a cap is the reusable one, a date the date-limited
+/// one, and both together the combination — each answered as the entity
+/// with its stored limits, and each standing in the table. A
+/// form-encoded numeric string reads as the number it spells.
+#[tokio::test]
+async fn invite_tokens_derive_their_type_from_the_limits() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = invite_admin(&pool, "invitecreator").await;
+
+    let plain = post_invite(&app, &token, INVITE_CREATE, json!({})).await;
+    common::assert_answer(&plain, StatusCode::OK, "the plain invite");
+    let entity = plain.json_value();
+    assert_eq!(entity["invite_type"], "one_time", "neither limit");
+    assert_eq!(entity["expires_at"], Value::Null, "no expiry to name");
+    assert_eq!(entity["max_use"], Value::Null, "and no cap");
+    assert_fresh_entity(&entity);
+
+    let capped = post_invite(&app, &token, INVITE_CREATE, json!({"max_use": 5})).await;
+    let capped = capped.json_value();
+    assert_eq!(capped["invite_type"], "reusable", "a cap alone");
+    assert_eq!(capped["max_use"], 5, "and the cap round-trips");
+
+    let dated = post_invite(
+        &app,
+        &token,
+        INVITE_CREATE,
+        json!({"expires_at": "2099-01-01"}),
+    )
+    .await;
+    let dated = dated.json_value();
+    assert_eq!(dated["invite_type"], "date_limited", "a date alone");
+    assert_eq!(
+        dated["expires_at"], "2099-01-01",
+        "the plain YYYY-MM-DD day round-trips"
+    );
+
+    let both = post_invite(
+        &app,
+        &token,
+        INVITE_CREATE,
+        json!({"max_use": "3", "expires_at": "2099-01-01"}),
+    )
+    .await;
+    let both = both.json_value();
+    assert_eq!(
+        both["invite_type"], "reusable_date_limited",
+        "both limits together"
+    );
+    assert_eq!(both["max_use"], 3, "the string cap read as a number");
+    assert_eq!(both["expires_at"], "2099-01-01", "beside the date");
+
+    let form = TestRequest::post(INVITE_CREATE)
+        .bearer(&token)
+        .form(&[("max_use", "2")])
+        .send(&app)
+        .await;
+    common::assert_answer(&form, StatusCode::OK, "the form-encoded cap");
+    assert_eq!(
+        form.json_value()["invite_type"],
+        "reusable",
+        "and the same derivation from a urlencoded body"
+    );
+
+    let mut stored_types: Vec<String> = stored_invites(&pool)
+        .await
+        .into_iter()
+        .map(|(_, _, kind)| kind)
+        .collect();
+    stored_types.sort_unstable();
+    assert_eq!(
+        stored_types,
+        vec![
+            "date_limited".to_owned(),
+            "one_time".to_owned(),
+            "reusable".to_owned(),
+            "reusable".to_owned(),
+            "reusable_date_limited".to_owned(),
+        ],
+        "every answer stands in the table with its derived type"
+    );
+}
+
+/// The `GET /users/invites` answer: `{"invites": […]}`, newest first on
+/// the id's creation order, every entity whole.
+#[tokio::test]
+async fn the_invite_list_answers_newest_first() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = invite_admin(&pool, "invitelisten").await;
+
+    let empty = TestRequest::get(INVITE_LIST)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&empty, StatusCode::OK, "the fresh listing");
+    assert_eq!(
+        empty.json_value(),
+        json!({"invites": []}),
+        "an empty table lists as an empty array"
+    );
+
+    seed_invite(&pool, 1, "oldest-invite").await;
+    seed_invite(&pool, 2, "middle-invite").await;
+    seed_invite(&pool, 3, "newest-invite").await;
+
+    let listed = TestRequest::get(INVITE_LIST)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&listed, StatusCode::OK, "the seeded listing");
+    let page = listed.json_value();
+    let tokens: Vec<&str> = page["invites"]
+        .as_array()
+        .expect("the invites array")
+        .iter()
+        .map(|entry| entry["token"].as_str().expect("a token text"))
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["newest-invite", "middle-invite", "oldest-invite"],
+        "the newest invite leads the array"
+    );
+    assert_eq!(
+        page["invites"][0],
+        json!({
+            "id": Uuid::from_u128(3).to_string(),
+            "token": "newest-invite",
+            "used": false,
+            "expires_at": null,
+            "uses": 0,
+            "max_use": null,
+            "invite_type": "reusable",
+        }),
+        "each entry is the seven-key entity"
+    );
+}
+
+/// The `POST /users/revoke_invite` lifecycle: the named invite is deleted
+/// and answered as the entity it was, it drops out of the listing, a
+/// second revoke (or any unknown token) is the 404, and a body without
+/// `token` is the 422.
+#[tokio::test]
+async fn revoking_an_invite_deletes_it_and_answers_the_entity() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = invite_admin(&pool, "inviterevoker").await;
+
+    let created = post_invite(&app, &token, INVITE_CREATE, json!({"max_use": 2})).await;
+    common::assert_answer(&created, StatusCode::OK, "the create");
+    let entity = created.json_value();
+
+    let revoked = post_invite(
+        &app,
+        &token,
+        INVITE_REVOKE,
+        json!({"token": entity["token"].clone()}),
+    )
+    .await;
+    common::assert_answer(&revoked, StatusCode::OK, "the revoke");
+    assert_eq!(
+        revoked.json_value(),
+        entity,
+        "the entity exactly as the create answered it"
+    );
+
+    let listed = TestRequest::get(INVITE_LIST)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        listed.json_value(),
+        json!({"invites": []}),
+        "the revoked invite is deleted, not marked used"
+    );
+
+    let again = post_invite(
+        &app,
+        &token,
+        INVITE_REVOKE,
+        json!({"token": entity["token"].clone()}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[again],
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "revoking the gone invite again",
+    );
+    let bogus = post_invite(
+        &app,
+        &token,
+        INVITE_REVOKE,
+        json!({"token": "never-minted"}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[bogus],
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "an unknown token",
+    );
+
+    let bodiless = post_invite(&app, &token, INVITE_REVOKE, json!({})).await;
+    common::assert_all_refused(
+        &[bodiless],
+        StatusCode::UNPROCESSABLE_ENTITY,
+        MISSING_TOKEN,
+        "a revoke without a token",
+    );
+}
+
+/// The two invite writes land in the moderation log: `invite_create` and
+/// `invite_revoke` sentences naming the invite id, each findable by the
+/// listing's search with its action and `subject_id` in the data map.
+#[tokio::test]
+async fn invite_writes_record_the_moderation_log() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, token) = admin(&pool, "invitelogger", "admin:read admin:write").await;
+
+    let created = post_invite(&app, &token, INVITE_CREATE, json!({})).await;
+    let entity = created.json_value();
+    let id = entity["id"].as_str().expect("the id is text").to_owned();
+    let revoked = post_invite(
+        &app,
+        &token,
+        INVITE_REVOKE,
+        json!({"token": entity["token"].clone()}),
+    )
+    .await;
+    common::assert_answer(&revoked, StatusCode::OK, "the revoke");
+
+    for (search, verb, action) in [
+        ("created+invite", "created", "invite_create"),
+        ("revoked+invite", "revoked", "invite_revoke"),
+    ] {
+        let found = TestRequest::get(&format!("{LOG}?search={search}"))
+            .bearer(&token)
+            .send(&app)
+            .await;
+        let page = found.json_value();
+        assert_eq!(page["total"], json!(1), "one {action} line");
+        let entry = &page["items"][0];
+        assert_eq!(
+            entry["message"],
+            format!("@invitelogger {verb} invite: {id}"),
+            "the sentence names the invite id"
+        );
+        assert_eq!(entry["data"]["action"], action, "the action");
+        assert_eq!(
+            entry["data"]["subject_id"], id,
+            "and the invite rides in subject_id"
+        );
+        assert_eq!(
+            entry["data"]["actor"]["nickname"], "invitelogger",
+            "beside the acting admin, as every entry carries it"
+        );
+    }
+}
+
+/// The `POST /users/email_invite` success: 204 with an empty body, a
+/// one-time invite in the table, the `user_invitation` letter on the
+/// mailer queue carrying the `{BASE_URL}/registration/{token}` link —
+/// and the `invite_create` log line it records. The optional `name` is
+/// accepted (Pleroma's recipient display name; this mailer addresses
+/// bare recipients).
+#[tokio::test]
+async fn email_invite_letters_the_registration_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app_with_config(pool.clone(), invites_open_config());
+    let (_, token) = admin(&pool, "invitemailer", "admin:read admin:write").await;
+
+    let sent = post_invite(
+        &app,
+        &token,
+        INVITE_EMAIL,
+        json!({"email": "friend@example.org", "name": "Friend"}),
+    )
+    .await;
+    common::assert_answer(&sent, StatusCode::NO_CONTENT, "the emailed invite");
+    assert!(sent.body.is_empty(), "the 204 body is empty");
+
+    let stored = stored_invites(&pool).await;
+    assert_eq!(stored.len(), 1, "the letter mints one invite");
+    let (invite_id, invite_token, kind) = &stored[0];
+    assert_eq!(kind, "one_time", "and it is a one-time invite");
+
+    let letters = queued_letters(&pool).await;
+    assert_eq!(letters.len(), 1, "one queued send");
+    assert_eq!(
+        letters[0]["to"],
+        json!("friend@example.org"),
+        "the bare addressed recipient"
+    );
+    assert_eq!(
+        letters[0]["subject"],
+        json!("Invitation to Wired"),
+        "the instance-named subject"
+    );
+    assert_eq!(
+        letters[0]["text_body"],
+        json!(format!(
+            "You are invited to Wired.\n\n\
+             Open the following link to register:\n\n\
+             https://test.example/registration/{invite_token}\n"
+        )),
+        "the letter with its BASE_URL registration link"
+    );
+    assert_eq!(letters[0]["html_body"], Value::Null, "text only");
+
+    let logged = TestRequest::get(&format!("{LOG}?search=created+invite"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    let page = logged.json_value();
+    assert_eq!(page["total"], json!(1), "the emailed create is logged");
+    assert_eq!(
+        page["items"][0]["message"],
+        format!("@invitemailer created invite: {invite_id}"),
+        "naming the invite it minted"
+    );
+}
+
+/// The `POST /users/email_invite` refusals: with `INVITES_ENABLED` off —
+/// the suite default — the endpoint answers Pleroma's 400 and mints
+/// nothing; with it on, a body without an address (or with only blanks)
+/// is the 400 the ticket pins, still minting nothing.
+#[tokio::test]
+async fn email_invite_refuses_without_the_setting_or_the_address() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let closed = common::test_app(pool.clone());
+    let token = invite_admin(&pool, "invitegate").await;
+
+    let disabled = post_invite(
+        &closed,
+        &token,
+        INVITE_EMAIL,
+        json!({"email": "friend@example.org"}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[disabled],
+        StatusCode::BAD_REQUEST,
+        INVITES_DISABLED,
+        "the mail invite with invites_enabled off",
+    );
+    assert!(
+        stored_invites(&pool).await.is_empty(),
+        "the refusal minted no invite"
+    );
+
+    let open = common::test_app_with_config(pool.clone(), invites_open_config());
+    let missing = post_invite(&open, &token, INVITE_EMAIL, json!({"name": "Friend"})).await;
+    common::assert_all_refused(
+        &[missing],
+        StatusCode::BAD_REQUEST,
+        MISSING_EMAIL,
+        "the mail invite with no email parameter",
+    );
+    let blank = post_invite(&open, &token, INVITE_EMAIL, json!({"email": "   "})).await;
+    common::assert_all_refused(
+        &[blank],
+        StatusCode::BAD_REQUEST,
+        MISSING_EMAIL,
+        "the mail invite with a blank address",
+    );
+    assert!(
+        stored_invites(&pool).await.is_empty(),
+        "and neither refusal minted an invite"
+    );
+}
+
+/// The `GET /registration/{token}` link: a 302 to the same path on
+/// `FRONTEND_BASE_URL` — no auth, no lookup, so an unknown token rides
+/// the same redirect, a configured frontend splits the target, and the
+/// request's own encoding is echoed verbatim.
+#[tokio::test]
+async fn the_registration_link_redirects_to_the_frontend() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+
+    let unknown = TestRequest::get(&format!("{REGISTRATION}/no-such-invite"))
+        .send(&app)
+        .await;
+    common::assert_answer(&unknown, StatusCode::FOUND, "the unauthenticated link");
+    assert_eq!(
+        unknown.header("location"),
+        Some("https://test.example/registration/no-such-invite"),
+        "the frontend serves the page; an unknown token redirects the same"
+    );
+
+    let mut split = common::test_config();
+    split.frontend_base_url = "https://fe.example".to_owned();
+    let fe = common::test_app_with_config(pool.clone(), split);
+    let away = TestRequest::get(&format!("{REGISTRATION}/abc123"))
+        .send(&fe)
+        .await;
+    assert_eq!(
+        away.header("location"),
+        Some("https://fe.example/registration/abc123"),
+        "a separate frontend takes the link"
+    );
+
+    let encoded = TestRequest::get(&format!("{REGISTRATION}/a%2Fb"))
+        .send(&app)
+        .await;
+    assert_eq!(
+        encoded.header("location"),
+        Some("https://test.example/registration/a%2Fb"),
+        "the request's own encoding is echoed, not decoded"
+    );
+}
+
+/// The invite routes' scope half: the listing asks `admin:read:invites`
+/// and the writes `admin:write:invites`, each accepting its narrow alias
+/// and refusing the other class.
+#[tokio::test]
+async fn invite_routes_answer_the_scope_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, read_only) = admin(&pool, "inviteread", "admin:read:invites").await;
+    let (_, write_only) = admin(&pool, "invitewrite", "admin:write:invites").await;
+    let (_, unscoped) = admin(&pool, "inviteplain", "read write").await;
+
+    let created = post_invite(&app, &write_only, INVITE_CREATE, json!({})).await;
+    common::assert_answer(&created, StatusCode::OK, "the narrow write scope creates");
+    let emailed = post_invite(
+        &app,
+        &write_only,
+        INVITE_EMAIL,
+        json!({"email": "a@b.example"}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[emailed],
+        StatusCode::BAD_REQUEST,
+        INVITES_DISABLED,
+        "the write scope reaches the gate on the default instance",
+    );
+
+    let listed = TestRequest::get(INVITE_LIST)
+        .bearer(&read_only)
+        .send(&app)
+        .await;
+    common::assert_answer(&listed, StatusCode::OK, "the narrow read scope lists");
+
+    let revoke_with_read =
+        post_invite(&app, &read_only, INVITE_REVOKE, json!({"token": "x"})).await;
+    let create_with_read = post_invite(&app, &read_only, INVITE_CREATE, json!({})).await;
+    common::assert_all_refused(
+        &[revoke_with_read, create_with_read],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "the read scope never writes",
+    );
+
+    let list_with_write = TestRequest::get(INVITE_LIST)
+        .bearer(&write_only)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[list_with_write],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_READ,
+        "the write scope never lists",
+    );
+
+    let unscoped_post = post_invite(&app, &unscoped, INVITE_CREATE, json!({})).await;
+    common::assert_all_refused(
+        &[unscoped_post],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "an admin with no admin:write grant",
+    );
+}
+
+/// The invite routes' role and credential half: a moderator or a regular
+/// user holding the invite scopes is refused the role, an app-only token
+/// the user, and no token at all the credentials.
+#[tokio::test]
+async fn invite_routes_answer_the_role_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let scopes = "admin:read:invites admin:write:invites";
+    let (_, mod_invites) = moderator(&pool, "invitemod", scopes).await;
+    let (_, user_invites) = regular(&pool, "inviteuser", scopes).await;
+    let app_only = common::create_app_only_token(&pool, scopes).await;
+
+    for (token, who) in [
+        (&mod_invites, "a moderator"),
+        (&user_invites, "a regular user"),
+    ] {
+        let refused = TestRequest::get(INVITE_LIST).bearer(token).send(&app).await;
+        common::assert_all_refused(&[refused], StatusCode::FORBIDDEN, NOT_ADMIN, who);
+        let posted = post_invite(&app, token, INVITE_CREATE, json!({})).await;
+        common::assert_all_refused(&[posted], StatusCode::FORBIDDEN, NOT_ADMIN, who);
+    }
+
+    let app_only_refused = TestRequest::get(INVITE_LIST)
+        .bearer(&app_only)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[app_only_refused],
+        StatusCode::FORBIDDEN,
+        USER_REQUIRED,
+        "an app-only token",
+    );
+
+    let anonymous = TestRequest::get(INVITE_LIST).send(&app).await;
+    common::assert_all_refused(
+        &[anonymous],
+        StatusCode::UNAUTHORIZED,
+        NO_TOKEN,
+        "an anonymous GET",
+    );
+    let bogus = post_invite(&app, "no-such-token", INVITE_CREATE, json!({})).await;
+    common::assert_all_refused(
+        &[bogus],
         StatusCode::UNAUTHORIZED,
         INVALID_TOKEN,
         "an unknown token on the POST",
