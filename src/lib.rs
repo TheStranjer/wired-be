@@ -41,7 +41,7 @@ use crate::{
     error::AppError,
     http_client::HttpClient,
     jobs::{JobRegistry, Worker, scheduler},
-    services::{emoji_packs, instance_actor, media_proxy, vapid},
+    services::{emoji_packs, instance_actor, media_proxy, runtime_config, vapid},
     state::AppState,
     streaming::hub::Hub,
     uploads::UploaderBackend,
@@ -61,8 +61,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     MIGRATOR.run(pool).await
 }
 
-/// Starts the HTTP server, the job worker, the periodic scheduler and the
-/// streaming listener, and shuts everything down on ctrl-c.
+/// Starts the HTTP server, the job worker, the periodic scheduler and
+/// the streaming listener, and shuts everything down on ctrl-c or on a
+/// graceful restart requested through the admin API.
 ///
 /// Connects to PostgreSQL, applies [`MIGRATOR`], syncs the emoji packs
 /// (see [`crate::services::emoji_packs`]), provisions the instance actor
@@ -113,7 +114,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// recurring jobs, and a spawned
 /// [`run_pg_listener`](streaming::hub::run_pg_listener) task mirrors the
 /// other instances' [`Hub`] events onto this process' streaming bus,
-/// honoring the same ctrl-c shutdown as the other tasks.
+/// honoring the same shutdown signal as the other tasks.
 ///
 /// # Errors
 ///
@@ -160,12 +161,12 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     let scheduler_task = tokio::spawn(scheduler::run(
         state.db.clone(),
         scheduler::periodic_jobs(),
-        wait_for_ctrl_c(),
+        wait_for_shutdown(),
     ));
     let listener_task = tokio::spawn(streaming::hub::run_pg_listener(
         state.db.clone(),
         state.hub.clone(),
-        wait_for_ctrl_c(),
+        wait_for_shutdown(),
     ));
     // The socket peer rides into the services as `ConnectInfo`, which is
     // what the rate limiter counts anonymous requests against (see
@@ -174,10 +175,10 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
         listener,
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(wait_for_ctrl_c());
+    .with_graceful_shutdown(wait_for_shutdown());
     let outcome = tokio::join!(
         server,
-        worker.run(wait_for_ctrl_c()),
+        worker.run(wait_for_shutdown()),
         scheduler_task,
         listener_task
     )
@@ -290,10 +291,21 @@ pub fn job_registry() -> JobRegistry {
     registry
 }
 
-/// Resolves when the user presses ctrl-c, the process-wide shutdown signal.
-async fn wait_for_ctrl_c() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        error!(%err, "cannot listen for ctrl-c; the process must be stopped by signal");
+/// Resolves on the process-wide shutdown signal: the user pressing
+/// ctrl-c, or an admin's `GET /api/v1/pleroma/admin/restart` raising the
+/// graceful-restart flag that [`serve`] waits on here (the ctrl-c path
+/// reused, so both drain everything and the process then exits with code
+/// `0` — the supervisor's cue to start the next boot).
+async fn wait_for_shutdown() {
+    tokio::select! {
+        () = runtime_config::RuntimeConfig::wait_for_restart() => {
+            info!("graceful restart requested; draining");
+        }
+        signal = tokio::signal::ctrl_c() => {
+            if let Err(err) = signal {
+                error!(%err, "cannot listen for ctrl-c; the process must be stopped by signal");
+            }
+        }
     }
 }
 

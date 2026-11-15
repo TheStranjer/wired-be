@@ -17,7 +17,12 @@ A whitelisted subset of these settings can be overridden at runtime through
 the admin config store (`GET`/`POST /api/v1/pleroma/admin/config`, backed by
 the `config_entries` table); a stored override wins over its environment
 value, and the instance identity, registration flags and the MRF chain read
-through it live. See [Moderation filters (MRF)](#moderation-filters-mrf)
+through it live. `GET /api/v1/pleroma/admin/config/descriptions` documents
+every whitelisted key (types, descriptions and example values),
+`GET /api/v1/pleroma/admin/need_reboot` says whether a restart-requiring key
+changed since this boot, and `GET /api/v1/pleroma/admin/restart` asks the
+process to exit gracefully so its supervisor restarts it and the pending
+changes take effect. See [Moderation filters (MRF)](#moderation-filters-mrf)
 below.
 
 | Variable | Required | Default | Description |

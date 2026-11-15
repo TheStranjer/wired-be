@@ -2,6 +2,12 @@
 //! `(group, key)` pairs the admin config store accepts, beside what each
 //! one falls back to when the database holds no row.
 //!
+//! The registry is also the instance's config documentation: every entry
+//! carries its `description`, `kind` and `children` metadata (with the
+//! `suggestions` example values), the payload of the admin API's
+//! `GET /config/descriptions` — Pleroma's `config/description.exs` docs
+//! and policy knowledge docs, stated here as the whitelist's own data.
+//!
 //! The reference is Pleroma's `:database_config_whitelist`
 //! (`config/config.exs`) — the list `Pleroma.Web.AdminAPI.ConfigController`
 //! gates every `POST /api/pleroma/admin/config` entry against — with the
@@ -22,6 +28,7 @@
 //!
 //! [`runtime_config`]: crate::services::runtime_config
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
@@ -54,15 +61,147 @@ const MEDIA_PROXY_SUBKEYS: &[&str] = &["enabled", "blacklist", "max_bytes"];
 /// instance document spells it `max_toot_chars`.
 const INSTANCE_LIMIT: &str = "limit";
 
+/// The value type of a registry entry or one of its children: the
+/// `type` field of the admin API's description payload.
+///
+/// The names are the strings Pleroma's docs generator puts there
+/// (`lib/pleroma/docs/generator.ex` turns the atoms of
+/// `config/description.exs` into their string spelling), with
+/// [`ValueKind::AtomList`] spelled as Pleroma spells the tuple type
+/// `{:list, :atom}` — `[:atom]`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValueKind {
+    /// Text value (Pleroma's `:string`).
+    String,
+    /// `true` / `false` (Pleroma's `:boolean`).
+    Boolean,
+    /// Whole number (Pleroma's `:integer`).
+    Integer,
+    /// A list of names — Pleroma's `{:list, :atom}`, spelled `[:atom]`.
+    #[serde(rename = "[:atom]")]
+    AtomList,
+    /// A keyword list: a named set of subkeys (Pleroma's `:keyword`).
+    Keyword,
+    /// A map of named values (Pleroma's `:map`).
+    Map,
+    /// A container of documented subkeys (Pleroma's `:group`).
+    Group,
+}
+
+/// One example value of a [`ChildDescription`]'s `suggestions` — the
+/// fill-in hints Pleroma's admin frontends offer. A const-constructible
+/// stand-in for a [`Value`], serialized untagged as its JSON shape.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(untagged)]
+pub enum Suggestion {
+    /// A text example.
+    Text(&'static str),
+    /// A number example.
+    Count(i64),
+    /// A boolean example.
+    Flag(bool),
+}
+
+/// The description of one subkey or parameter — a `children` element of
+/// the admin API's description payload.
+///
+/// The data is Pleroma's docs metadata (`config/description.exs` and the
+/// policies' knowledge docs) carried here as registry data. A documented
+/// container nests its own subkeys in [`children`] — Pleroma's
+/// two-level `:map` entries, e.g. `:restrict_unauthenticated`.
+///
+/// [`children`]: ChildDescription::children
+#[derive(Debug, Serialize)]
+pub struct ChildDescription {
+    /// The subkey's name as the store and the wire spell it.
+    pub key: &'static str,
+    /// The subkey's value type, serialized as `type`.
+    #[serde(rename = "type")]
+    pub kind: ValueKind,
+    /// Human-readable documentation of what the subkey controls.
+    pub description: &'static str,
+    /// Example values; empty renders no `suggestions` field.
+    #[serde(skip_serializing_if = "no_suggestions")]
+    pub suggestions: &'static [Suggestion],
+    /// Documented subkeys of a container; empty renders no `children`
+    /// field.
+    #[serde(skip_serializing_if = "no_children")]
+    pub children: &'static [Self],
+}
+
+/// The `suggestions` absence predicate: an empty hint list renders no
+/// field, Pleroma's `format_child` only echoing what the docs carry.
+const fn no_suggestions(suggestions: &&[Suggestion]) -> bool {
+    suggestions.is_empty()
+}
+
+/// The `children` absence predicate of a leaf description.
+const fn no_children(children: &&[ChildDescription]) -> bool {
+    children.is_empty()
+}
+
+/// One element of the admin API's description payload: a registry entry
+/// with its documentation and children.
+///
+/// The whole payload is the array Pleroma's
+/// `ConfigController.descriptions` answers — here generated from the
+/// whitelist itself, so a registered key can never lack its description.
+#[derive(Debug, Serialize)]
+pub struct EntryDescription {
+    /// The configuration group, colon-spelled.
+    pub group: &'static str,
+    /// The configuration key, colon-spelled.
+    pub key: &'static str,
+    /// The entry's value type, serialized as `type`.
+    #[serde(rename = "type")]
+    pub kind: ValueKind,
+    /// Human-readable documentation of what the entry groups.
+    pub description: &'static str,
+    /// The entry's documented subkeys.
+    #[serde(skip_serializing_if = "no_children")]
+    pub children: &'static [ChildDescription],
+}
+
+/// The description payload of `GET /config/descriptions`: one element per
+/// registry entry, in [`entries`] order.
+///
+/// [`entries`]: entries()
+#[must_use]
+pub fn descriptions() -> Vec<EntryDescription> {
+    entries()
+        .iter()
+        .map(|entry| EntryDescription {
+            group: entry.group,
+            key: entry.key,
+            kind: entry.kind,
+            description: entry.description,
+            children: entry.children,
+        })
+        .collect()
+}
+
 /// One whitelisted runtime setting: what it is called, which subkeys the
-/// whitelist enumerates for it, whether changing it needs a restart, and
-/// where its value comes from while the database holds no row.
+/// whitelist enumerates for it, and whether changing it needs a restart.
+///
+/// Beside the gating data the entry carries its environment fallback
+/// (`defaults`) and the documentation metadata (`description`, `kind`,
+/// `children`) the admin API's `GET /config/descriptions` answers with.
 #[derive(Debug)]
 pub struct RegistryEntry {
     /// The configuration group, [`GROUP_PLEROMA`] for every entry.
     pub group: &'static str,
     /// The configuration key, colon-spelled as the admin API names it.
     pub key: &'static str,
+    /// The entry's value type for the description payload: the entries
+    /// the whitelist subkeys or the docs group are [`ValueKind::Group`],
+    /// the whole-policy parameter objects [`ValueKind::Keyword`].
+    pub kind: ValueKind,
+    /// What the entry is for, in the description payload's words.
+    pub description: &'static str,
+    /// The entry's documented subkeys, the description payload's
+    /// `children`; empty renders no `children` field.
+    pub children: &'static [ChildDescription],
     /// The whitelist's subkeys for this entry; empty means the whole
     /// value is one unit (Pleroma's bare `:mrf_simple`-style entries).
     pub subkeys: &'static [&'static str],
@@ -99,11 +238,323 @@ pub fn requires_restart(group: &str, key: &str) -> bool {
     find(group, key).is_some_and(|entry| entry.requires_restart)
 }
 
+/// A leaf description with no example values.
+const fn leaf(key: &'static str, kind: ValueKind, description: &'static str) -> ChildDescription {
+    ChildDescription {
+        key,
+        kind,
+        description,
+        suggestions: &[],
+        children: &[],
+    }
+}
+
+/// A leaf description with example values.
+const fn hinted(
+    key: &'static str,
+    kind: ValueKind,
+    description: &'static str,
+    suggestions: &'static [Suggestion],
+) -> ChildDescription {
+    ChildDescription {
+        key,
+        kind,
+        description,
+        suggestions,
+        children: &[],
+    }
+}
+
+/// A nested container description: the `:map` children of
+/// [`RESTRICT_UNAUTHENTICATED_CHILDREN`].
+const fn nested(
+    key: &'static str,
+    kind: ValueKind,
+    description: &'static str,
+    children: &'static [ChildDescription],
+) -> ChildDescription {
+    ChildDescription {
+        key,
+        kind,
+        description,
+        suggestions: &[],
+        children,
+    }
+}
+
+/// The `:instance` children: the nine whitelisted subkeys ([`RegistryEntry::subkeys`]),
+/// documented the way Pleroma's `config/description.exs` does.
+const INSTANCE_CHILDREN: [ChildDescription; 9] = [
+    hinted(
+        "name",
+        ValueKind::String,
+        "Name of the instance",
+        &[Suggestion::Text("Wired")],
+    ),
+    hinted(
+        "description",
+        ValueKind::String,
+        "The instance's description. It can be seen in nodeinfo and `/api/v1/instance`",
+        &[Suggestion::Text("Very cool instance")],
+    ),
+    hinted(
+        "email",
+        ValueKind::String,
+        "Email used to reach an Administrator/Moderator of the instance",
+        &[Suggestion::Text("email@example.com")],
+    ),
+    leaf(
+        "registrations_open",
+        ValueKind::Boolean,
+        "Enable registrations for anyone. Invitations require this setting to be disabled.",
+    ),
+    leaf(
+        "account_approval_required",
+        ValueKind::Boolean,
+        "Require users to be manually approved by an admin before signing in",
+    ),
+    leaf(
+        "account_activation_required",
+        ValueKind::Boolean,
+        "Require users to confirm their emails before signing in",
+    ),
+    leaf(
+        "invites_enabled",
+        ValueKind::Boolean,
+        "Enable user invitations for admins (depends on `registrations_open` being disabled)",
+    ),
+    hinted(
+        INSTANCE_LIMIT,
+        ValueKind::Integer,
+        "Posts character limit (CW/Subject included in the counter)",
+        &[Suggestion::Count(5_000)],
+    ),
+    hinted(
+        "max_media_attachments",
+        ValueKind::Integer,
+        "Maximum number of post media attachments",
+        &[Suggestion::Count(4)],
+    ),
+];
+
+/// The `:mrf` children: the one whitelisted subkey, the policy chain.
+const MRF_CHILDREN: [ChildDescription; 1] = [hinted(
+    "policies",
+    ValueKind::AtomList,
+    "The MRF policies applied to incoming activities, by short name.",
+    &[
+        Suggestion::Text("anti_link_spam"),
+        Suggestion::Text("hellthread"),
+        Suggestion::Text("keyword"),
+        Suggestion::Text("normalize_markup"),
+        Suggestion::Text("object_age"),
+        Suggestion::Text("simple"),
+        Suggestion::Text("tag"),
+    ],
+)];
+
+/// The `:mrf_simple` children: the eleven per-instance lists the policy
+/// reads, described in the words of Pleroma's `MRFSimple` knowledge doc.
+const MRF_SIMPLE_CHILDREN: [ChildDescription; 11] = [
+    leaf(
+        "accept",
+        ValueKind::AtomList,
+        "List of instances to accept, even if they violate the reject policies",
+    ),
+    leaf(
+        "reject",
+        ValueKind::AtomList,
+        "List of instances to reject all activities from",
+    ),
+    leaf(
+        "reject_deletes",
+        ValueKind::AtomList,
+        "List of instances whose Delete activities will be rejected",
+    ),
+    leaf(
+        "media_removal",
+        ValueKind::AtomList,
+        "List of instances to remove media from posts of",
+    ),
+    leaf(
+        "media_nsfw",
+        ValueKind::AtomList,
+        "List of instances to mark media in posts from as sensitive",
+    ),
+    leaf(
+        "avatar_removal",
+        ValueKind::AtomList,
+        "List of instances to remove the avatars of",
+    ),
+    leaf(
+        "banner_removal",
+        ValueKind::AtomList,
+        "List of instances to remove the banners of",
+    ),
+    leaf(
+        "background_removal",
+        ValueKind::AtomList,
+        "List of instances to remove the profiles' backgrounds of",
+    ),
+    leaf(
+        "report_removal",
+        ValueKind::AtomList,
+        "List of instances to reject reports from",
+    ),
+    leaf(
+        "federated_timeline_removal",
+        ValueKind::AtomList,
+        "List of instances to remove public posts from, so that they only appear in the local timeline",
+    ),
+    leaf(
+        "followers_only",
+        ValueKind::AtomList,
+        "List of instances whose followers-only posts will be rejected",
+    ),
+];
+
+/// The `:mrf_keyword` children: the three phrase lists the policy reads.
+const MRF_KEYWORD_CHILDREN: [ChildDescription; 3] = [
+    hinted(
+        "reject",
+        ValueKind::AtomList,
+        "List of phrases and regular expressions which will be rejected if they are found in a post's content.",
+        &[Suggestion::Text("/^buy\\s+now\\b/i")],
+    ),
+    leaf(
+        "federated_timeline_removal",
+        ValueKind::AtomList,
+        "List of phrases and regular expressions which will cause a post to be removed from the federated timeline.",
+    ),
+    hinted(
+        "replace",
+        ValueKind::AtomList,
+        "List of `[pattern, replacement]` pairs rewritten in a post's content.",
+        &[Suggestion::Text("bad word")],
+    ),
+];
+
+/// The `:mrf_hellthread` children: the two mention gates, with this
+/// repo's defaults as the example values.
+const MRF_HELLTHREAD_CHILDREN: [ChildDescription; 2] = [
+    hinted(
+        "delist_threshold",
+        ValueKind::Integer,
+        "The number of local users mentioned which will cause a post to be removed from public timelines. Set to `0` to disable delisting.",
+        &[Suggestion::Count(10)],
+    ),
+    hinted(
+        "reject_threshold",
+        ValueKind::Integer,
+        "The number of local users mentioned which will cause a post to be rejected entirely. Set to `0` to disable rejection.",
+        &[Suggestion::Count(20)],
+    ),
+];
+
+/// The `:mrf_object_age` children: the age gate and the actions it runs.
+const MRF_OBJECT_AGE_CHILDREN: [ChildDescription; 2] = [
+    hinted(
+        "threshold",
+        ValueKind::Integer,
+        "Age in seconds past which the configured actions run.",
+        &[Suggestion::Count(604_800)],
+    ),
+    hinted(
+        "actions",
+        ValueKind::AtomList,
+        "The actions to run on objects older than `threshold`.",
+        &[
+            Suggestion::Text("delist"),
+            Suggestion::Text("strip_followers"),
+            Suggestion::Text("reject"),
+        ],
+    ),
+];
+
+/// The `:media_proxy` children: the three reported subkeys.
+const MEDIA_PROXY_CHILDREN: [ChildDescription; 3] = [
+    leaf(
+        "enabled",
+        ValueKind::Boolean,
+        "Enables proxying of remote media via the instance's proxy",
+    ),
+    leaf(
+        "blacklist",
+        ValueKind::AtomList,
+        "List of hosts the proxy refuses to fetch media from",
+    ),
+    hinted(
+        "max_bytes",
+        ValueKind::Integer,
+        "Maximum file size (in bytes) allowed through the proxy",
+        &[Suggestion::Count(25_000_000)],
+    ),
+];
+
+/// The booleans under `:restrict_unauthenticated`'s `timelines` map.
+const RESTRICT_TIMELINES_CHILDREN: [ChildDescription; 3] = [
+    leaf(
+        "local",
+        ValueKind::Boolean,
+        "Disallow view public timeline.",
+    ),
+    leaf(
+        "federated",
+        ValueKind::Boolean,
+        "Disallow view federated timeline.",
+    ),
+    leaf(
+        "remote",
+        ValueKind::Boolean,
+        "Disallow viewing remote users' profiles' timelines.",
+    ),
+];
+
+/// The booleans under the `profiles` and `activities` maps.
+const RESTRICT_HALFS_CHILDREN: [ChildDescription; 2] = [
+    leaf(
+        "local",
+        ValueKind::Boolean,
+        "Disallow view local content in this area.",
+    ),
+    leaf(
+        "remote",
+        ValueKind::Boolean,
+        "Disallow view remote content in this area.",
+    ),
+];
+
+/// The `:restrict_unauthenticated` children: Pleroma's three nested
+/// maps, spelled out.
+const RESTRICT_UNAUTHENTICATED_CHILDREN: [ChildDescription; 3] = [
+    nested(
+        "timelines",
+        ValueKind::Map,
+        "Settings for public and federated timelines.",
+        &RESTRICT_TIMELINES_CHILDREN,
+    ),
+    nested(
+        "profiles",
+        ValueKind::Map,
+        "Settings for user profiles.",
+        &RESTRICT_HALFS_CHILDREN,
+    ),
+    nested(
+        "activities",
+        ValueKind::Map,
+        "Settings for statuses.",
+        &RESTRICT_HALFS_CHILDREN,
+    ),
+];
+
 /// The whole registry: the eight entries the ticket whitelists.
 static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_INSTANCE,
+        kind: ValueKind::Group,
+        description: "Instance-related settings",
+        children: &INSTANCE_CHILDREN,
         subkeys: &[
             "name",
             "description",
@@ -121,6 +572,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_MRF,
+        kind: ValueKind::Group,
+        description: "General MRF settings",
+        children: &MRF_CHILDREN,
         subkeys: &["policies"],
         requires_restart: false,
         defaults: mrf_defaults,
@@ -128,6 +582,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_MRF_SIMPLE,
+        kind: ValueKind::Keyword,
+        description: "Simple policy: the per-instance lists it applies",
+        children: &MRF_SIMPLE_CHILDREN,
         subkeys: &[],
         requires_restart: false,
         defaults: empty_defaults,
@@ -135,6 +592,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_MRF_KEYWORD,
+        kind: ValueKind::Keyword,
+        description: "Keyword policy: the phrase filters and replacements it applies",
+        children: &MRF_KEYWORD_CHILDREN,
         subkeys: &[],
         requires_restart: false,
         defaults: empty_defaults,
@@ -142,6 +602,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_MRF_HELLTHREAD,
+        kind: ValueKind::Keyword,
+        description: "Hellthread policy: the mention thresholds it gates on",
+        children: &MRF_HELLTHREAD_CHILDREN,
         subkeys: &[],
         requires_restart: false,
         defaults: empty_defaults,
@@ -149,6 +612,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_MRF_OBJECT_AGE,
+        kind: ValueKind::Keyword,
+        description: "Object age policy: the age gate and the actions it runs",
+        children: &MRF_OBJECT_AGE_CHILDREN,
         subkeys: &[],
         requires_restart: false,
         defaults: empty_defaults,
@@ -156,6 +622,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_MEDIA_PROXY,
+        kind: ValueKind::Group,
+        description: "Media proxy",
+        children: &MEDIA_PROXY_CHILDREN,
         subkeys: MEDIA_PROXY_SUBKEYS,
         requires_restart: true,
         defaults: media_proxy_defaults,
@@ -163,6 +632,9 @@ static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_RESTRICT_UNAUTHENTICATED,
+        kind: ValueKind::Group,
+        description: "Disallow viewing timelines, user profiles and statuses for unauthenticated users.",
+        children: &RESTRICT_UNAUTHENTICATED_CHILDREN,
         subkeys: &[],
         requires_restart: true,
         defaults: restrict_unauthenticated_defaults,
@@ -411,5 +883,200 @@ mod tests {
             json!(false),
             "and the siblings stay open"
         );
+    }
+
+    /// The `GET /config/descriptions` payload: one documented object per
+    /// registry entry in table order, the `:instance` element spelled
+    /// like the ticket's example, leaves without example values
+    /// rendering no `suggestions` field, and every subkey-whitelisted
+    /// entry documenting exactly its whitelist's children.
+    #[test]
+    fn descriptions_document_every_whitelisted_key() {
+        let rendered = serde_json::to_value(descriptions()).expect("the payload serializes");
+        let Value::Array(objects) = &rendered else {
+            panic!("the payload is an array");
+        };
+        assert_eq!(objects.len(), entries().len(), "one object per entry");
+        let keys: Vec<&str> = objects
+            .iter()
+            .map(|object| {
+                assert_eq!(
+                    object["group"],
+                    json!(":pleroma"),
+                    "every entry is :pleroma"
+                );
+                assert!(
+                    object["description"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty()),
+                    "no entry goes undocumented"
+                );
+                object["key"].as_str().expect("the key is a string")
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                KEY_INSTANCE,
+                KEY_MRF,
+                KEY_MRF_SIMPLE,
+                KEY_MRF_KEYWORD,
+                KEY_MRF_HELLTHREAD,
+                KEY_MRF_OBJECT_AGE,
+                KEY_MEDIA_PROXY,
+                KEY_RESTRICT_UNAUTHENTICATED,
+            ],
+            "the ticket's order, the ticket's eight keys"
+        );
+    }
+
+    /// The ticket's example element in full: `:instance` as a `group`
+    /// whose children carry `key`, `type`, `description` and the
+    /// `suggestions` hint only where the docs have one.
+    #[test]
+    fn the_instance_element_is_the_tickets_example() {
+        let rendered = serde_json::to_value(descriptions()).expect("the payload serializes");
+        let Value::Array(objects) = &rendered else {
+            panic!("the payload is an array");
+        };
+        let instance = &objects[0];
+        assert_eq!(instance["key"], json!(KEY_INSTANCE), "the example key");
+        assert_eq!(instance["type"], json!("group"), "a documented container");
+        assert_eq!(
+            instance["description"],
+            json!("Instance-related settings"),
+            "Pleroma's `config/description.exs` wording"
+        );
+        let Value::Array(children) = &instance["children"] else {
+            panic!("children is an array");
+        };
+        assert_eq!(children.len(), 9, "one child per whitelisted subkey");
+        assert_eq!(children[0]["key"], json!("name"), "the example child");
+        assert_eq!(children[0]["type"], json!("string"), "its type");
+        assert_eq!(
+            children[0]["description"],
+            json!("Name of the instance"),
+            "and its description"
+        );
+        assert_eq!(
+            children[0]["suggestions"],
+            json!(["Wired"]),
+            "the example value, as the ticket's example shows one"
+        );
+        let registrations = &children[3];
+        assert_eq!(registrations["key"], json!("registrations_open"));
+        assert_eq!(registrations["type"], json!("boolean"), "booleans type");
+        assert!(
+            registrations.get("suggestions").is_none(),
+            "a leaf without hints renders no suggestions field"
+        );
+    }
+
+    /// The children track the whitelist: every subkey-whitelisted entry
+    /// documents exactly those subkeys; the whole-value policy entries
+    /// document their parameters, and the `policies` chain names the
+    /// registry's own type spelling `[:atom]` with the wired policies as
+    /// suggestions.
+    #[test]
+    fn children_follow_the_subkeys_and_the_policies() {
+        for entry in entries() {
+            let Value::Array(children) =
+                serde_json::to_value(entry.children).expect("children serialize")
+            else {
+                panic!("children are an array");
+            };
+            assert!(!children.is_empty(), "{} carries child metadata", entry.key);
+            if entry.subkeys.is_empty() {
+                continue;
+            }
+            let documented: Vec<&str> = children
+                .iter()
+                .map(|child| child["key"].as_str().expect("a string key"))
+                .collect();
+            assert_eq!(
+                documented, entry.subkeys,
+                "{} documents its whitelisted subkeys",
+                entry.key
+            );
+        }
+        let mrf = find(GROUP_PLEROMA, KEY_MRF).expect("registered");
+        assert_eq!(mrf.kind, ValueKind::Group, ":mrf is a documented group");
+        let policies = &mrf.children[0];
+        let rendered = serde_json::to_value(policies).expect("the child serializes");
+        assert_eq!(
+            rendered["type"],
+            json!("[:atom]"),
+            "the list-of-names spelling"
+        );
+        let suggestions = rendered["suggestions"].as_array().expect("suggestions");
+        assert!(
+            suggestions.contains(&json!("simple")) && suggestions.contains(&json!("keyword")),
+            "the wired policy names are offered as examples"
+        );
+    }
+
+    /// The nested `:map` documentation survives to the payload:
+    /// `:restrict_unauthenticated` groups its halves, and each half
+    /// nests its own booleans.
+    #[test]
+    fn nested_maps_carry_their_own_children() {
+        let rendered = serde_json::to_value(descriptions()).expect("the payload serializes");
+        let Value::Array(objects) = &rendered else {
+            panic!("the payload is an array");
+        };
+        let restricted = &objects[7];
+        assert_eq!(restricted["key"], json!(KEY_RESTRICT_UNAUTHENTICATED));
+        assert_eq!(restricted["type"], json!("group"));
+        let Value::Array(halves) = &restricted["children"] else {
+            panic!("the halves are an array");
+        };
+        assert_eq!(halves.len(), 3, "timelines, profiles, activities");
+        assert_eq!(halves[0]["key"], json!("timelines"));
+        assert_eq!(halves[0]["type"], json!("map"), "a map of booleans");
+        let Value::Array(fields) = &halves[0]["children"] else {
+            panic!("the map nests its fields");
+        };
+        assert_eq!(fields.len(), 3, "local, federated and remote");
+        assert_eq!(fields[0]["type"], json!("boolean"));
+        assert!(
+            halves[1].get("children").is_some() && halves[2].get("children").is_some(),
+            "every documented container renders its children"
+        );
+    }
+
+    /// The `type` strings stay inside the ticket's vocabulary everywhere
+    /// in the payload, at every nesting depth.
+    #[test]
+    fn every_type_is_a_ticket_spelling() {
+        const VOCABULARY: [&str; 7] = [
+            "string", "boolean", "integer", "[:atom]", "keyword", "map", "group",
+        ];
+        let rendered = serde_json::to_value(descriptions()).expect("the payload serializes");
+        let Value::Array(objects) = &rendered else {
+            panic!("the payload is an array");
+        };
+        let mut seen = Vec::new();
+        for object in objects {
+            seen.push(object["type"].as_str().expect("every entry has a type"));
+            collect_child_types(&object["children"], &mut seen);
+        }
+        for name in &seen {
+            assert!(VOCABULARY.contains(name), "{name} is not a ticket type");
+        }
+        assert_eq!(
+            seen.first().copied(),
+            Some("group"),
+            "the example entry types as the example spells it"
+        );
+    }
+
+    /// Walks one `children` array, adding each `type` to `seen`.
+    fn collect_child_types<'a>(children: &'a Value, seen: &mut Vec<&'a str>) {
+        if let Value::Array(items) = children {
+            for child in items {
+                seen.push(child["type"].as_str().expect("every child has a type"));
+                collect_child_types(&child["children"], seen);
+            }
+        }
     }
 }
