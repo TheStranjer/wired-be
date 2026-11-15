@@ -51,7 +51,9 @@
 //! `GET /instance/{name}.html`, WBE-205) as the [`apps_docs`] submodule,
 //! and the federation maintenance routes (the `/relay` ledger trio,
 //! `DELETE /instances/{instance}` and `POST /reload_emoji`, WBE-203) as
-//! the [`federation`] submodule.
+//! the [`federation`] submodule, and the moderation move of a filed report
+//! (`PATCH /reports`, whose state change is the `report.updated` webhook
+//! event, WBE-212) as the [`reports`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -81,6 +83,7 @@ pub mod config;
 pub mod federation;
 pub mod invites;
 pub mod ops;
+pub mod reports;
 pub mod users;
 pub mod webhooks;
 
@@ -118,6 +121,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(federation::router())
         .merge(invites::router())
         .merge(ops::router(config))
+        .merge(reports::router())
         .merge(users::router())
         .merge(webhooks::router())
 }

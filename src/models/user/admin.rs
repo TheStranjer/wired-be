@@ -2,6 +2,10 @@
 //! `GET /api/v1/pleroma/admin/users` and the nickname-or-id lookup behind
 //! `GET /api/v1/pleroma/admin/users/{nickname}` (WBE-195).
 //!
+//! [`staff_with_email`] is the third read: the active local admins and
+//! moderators that hold an address, which is who the report letter goes to
+//! (WBE-212).
+//!
 //! The reference is `Pleroma.Web.AdminAPI.Search.user`
 //! (`lib/pleroma/web/admin_api/search.ex`) over `Pleroma.User.Query.build`
 //! (`lib/pleroma/user/query.ex`): one `WHERE` clause assembled from the
@@ -342,6 +346,34 @@ fn push_page(builder: &mut QueryBuilder<Postgres>, params: &ListParams) {
 fn page_window(params: &ListParams) -> (i64, i64) {
     let size = params.page_size.max(0);
     (size, (params.page - 1).max(0).saturating_mul(size))
+}
+
+/// [`staff_with_email`]: the staff predicate of
+/// [`crate::api::nodeinfo`]'s `staffAccounts` list — an admin or a
+/// moderator this instance owns and that is active — narrowed to the rows
+/// holding an address and ordered by id so the letters go out in creation
+/// order.
+const STAFF_WITH_EMAIL_SQL: &str = "SELECT * FROM users \
+     WHERE (is_admin OR is_moderator) AND local AND is_active \
+       AND email IS NOT NULL \
+     ORDER BY id";
+
+/// Every staff account the instance can write to: the active local admins
+/// and moderators that gave an address.
+///
+/// The recipients of the report letter
+/// ([`crate::services::webhooks`]'s `report.created` mailing) — Pleroma's
+/// `all_users_with_privilege(:reports_manage_reports)` filtered to the ones
+/// with an `email`.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn staff_with_email(pool: &PgPool) -> AppResult<Vec<User>> {
+    let rows = sqlx::query_as::<_, User>(STAFF_WITH_EMAIL_SQL)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -855,5 +887,63 @@ mod tests {
             "metacharacters stay literal"
         );
         assert_eq!(contains_pattern(""), "%%", "an empty needle matches all");
+    }
+
+    #[tokio::test]
+    async fn staff_with_email_answers_the_mailable_staff_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        seeded(&pool, "rooty", |user| NewUser {
+            is_admin: Flag::new(true),
+            email: Some("rooty@example.org".to_owned()),
+            ..user
+        })
+        .await;
+        seeded(&pool, "moddy", |user| NewUser {
+            is_moderator: Flag::new(true),
+            email: Some("moddy@example.org".to_owned()),
+            ..user
+        })
+        .await;
+        seeded(&pool, "silentmod", |user| NewUser {
+            is_moderator: Flag::new(true),
+            ..user
+        })
+        .await;
+        seeded(&pool, "offduty", |user| NewUser {
+            is_admin: Flag::new(true),
+            is_active: Flag::new(false),
+            email: Some("offduty@example.org".to_owned()),
+            ..user
+        })
+        .await;
+        seeded(&pool, "member", |user| NewUser {
+            email: Some("member@example.org".to_owned()),
+            ..user
+        })
+        .await;
+        seeded(&pool, "remotecrew", |user| NewUser {
+            local: Flag::new(false),
+            domain: Some("remote.example".to_owned()),
+            is_admin: Flag::new(true),
+            email: Some("remotecrew@remote.example".to_owned()),
+            ..user
+        })
+        .await;
+
+        let staff = staff_with_email(&pool).await.expect("the read runs");
+        let nicknames: Vec<&str> = staff
+            .iter()
+            .map(|account| account.nickname.as_str())
+            .collect();
+        assert_eq!(
+            nicknames,
+            vec!["rooty", "moddy"],
+            "only an active local admin or moderator with an address is mailable, in creation order"
+        );
+        assert!(
+            staff.iter().all(|account| account.email.is_some()),
+            "every answer holds an address to write to"
+        );
     }
 }

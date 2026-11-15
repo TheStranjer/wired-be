@@ -86,6 +86,12 @@
 //! the [`push.deliver`](crate::jobs::web_push) job runs and the [`notify`]
 //! hook queues jobs through.
 //!
+//! [`webhooks`] is the same shape pointed at third-party endpoints: the
+//! fan-out that turns a `report.created`, `report.updated` or
+//! `account.created` event into one HMAC-signed `POST` per subscribed
+//! webhook, queued as a [`webhooks.deliver`](webhooks::KIND_DELIVER) job and
+//! delivered by the classified attempt beside it.
+//!
 //! [`filter`] is the read side's last pass: the pure post-processing step
 //! that applies a viewer's active v1 phrase filters to an already-rendered
 //! status page — warning matches annotated, irreversible matches removed,
@@ -135,3 +141,4 @@ pub mod timeline;
 pub mod translate;
 pub mod vapid;
 pub mod web_push;
+pub mod webhooks;

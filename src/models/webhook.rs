@@ -16,8 +16,10 @@
 //! [`set_enabled`] and [`rotate_secret`] raise `updated_at` and change
 //! only what their parameters carry — [`WebhookChanges`]'s `None` fields
 //! stay as stored, the PATCH's present-only rule. [`list`] answers a
-//! `LIMIT`/`OFFSET` window in creation order on the id (decision 4), and
-//! [`get`] and [`delete`] work one row by id. `secret` is secret material:
+//! `LIMIT`/`OFFSET` window in creation order on the id (decision 4),
+//! [`enabled_for_event`] is the fan-out read the delivery service queues
+//! through, and [`get`] and [`delete`] work one row by id. `secret` is
+//! secret material:
 //! the manual [`Debug`](Webhook) impl below redacts it.
 
 use std::fmt;
@@ -48,6 +50,12 @@ const SELECT_SQL: &str = "SELECT * FROM webhooks WHERE id = $1";
 /// creation order (decision 4) — the order the admin listing answers.
 const LIST_SQL: &str = "SELECT * FROM webhooks ORDER BY id LIMIT $1 OFFSET $2";
 
+/// [`enabled_for_event`]: the delivery fan-out's read — Pleroma's
+/// `Webhook.get_by_type`, `where(^type in w.events)` and
+/// `where(w.enabled == true)` in one statement.
+const ENABLED_FOR_EVENT_SQL: &str =
+    "SELECT * FROM webhooks WHERE enabled AND $1 = ANY(events) ORDER BY id";
+
 /// [`update`]: the present-only PATCH — every `COALESCE` keeps the stored
 /// value when its parameter is `NULL`.
 const UPDATE_SQL: &str = "UPDATE webhooks \
@@ -68,9 +76,12 @@ const SET_ENABLED_SQL: &str =
 const ROTATE_SQL: &str =
     "UPDATE webhooks SET secret = $2, updated_at = now() WHERE id = $1 RETURNING *";
 
-/// The event types a webhook may subscribe to; [`is_known_event`] is the
-/// membership test the admin API validates bodies against. A delivery
-/// ticket will name the event each of these fires for.
+/// The event types a webhook may subscribe to.
+///
+/// [`is_known_event`] is the membership test the admin API validates bodies
+/// against; the three are what [`crate::services::webhooks`] emits —
+/// `report.created` when a report is filed, `report.updated` when moderation
+/// moves one, and `account.created` when a local account is registered.
 pub const KNOWN_EVENTS: [&str; 3] = ["report.created", "report.updated", "account.created"];
 
 /// Whether `event` is one of [`KNOWN_EVENTS`].
@@ -168,6 +179,24 @@ pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Option<Webhook>> {
         .fetch_optional(pool)
         .await?;
     Ok(row)
+}
+
+/// Every webhook to notify of `event`: the enabled rows whose `events`
+/// array carries it.
+///
+/// Creation order (decision 4), the fan-out read of
+/// [`crate::services::webhooks::emit`] — Pleroma's `Webhook.get_by_type`.
+/// A disabled webhook is never among them, whatever it subscribes to.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn enabled_for_event(pool: &PgPool, event: &str) -> AppResult<Vec<Webhook>> {
+    let rows = sqlx::query_as::<_, Webhook>(ENABLED_FOR_EVENT_SQL)
+        .bind(event)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// One page of webhooks: `limit` rows starting at `offset`, in creation
@@ -501,6 +530,77 @@ mod tests {
         );
         let past = list(&pool, 2, 9).await.expect("the empty window runs");
         assert!(past.is_empty(), "a window past the table is empty");
+    }
+
+    #[tokio::test]
+    async fn enabled_for_event_selects_the_subscribed_enabled_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let subscribed = create(
+            &pool,
+            "https://example.org/on",
+            &["report.created".to_owned()],
+            true,
+        )
+        .await
+        .expect("the subscribed webhook inserts");
+        let _other_event = create(
+            &pool,
+            "https://example.org/other-event",
+            &["account.created".to_owned()],
+            true,
+        )
+        .await
+        .expect("the second webhook inserts");
+        let _disabled = create(
+            &pool,
+            "https://example.org/off",
+            &["report.created".to_owned()],
+            false,
+        )
+        .await
+        .expect("the disabled webhook inserts");
+        let _unsubscribed = create(&pool, "https://example.org/no-events", &[], true)
+            .await
+            .expect("the unsubscribed webhook inserts");
+        let multi = create(
+            &pool,
+            "https://example.org/both",
+            &["report.created".to_owned(), "report.updated".to_owned()],
+            true,
+        )
+        .await
+        .expect("the multi-event webhook inserts");
+
+        let hits = enabled_for_event(&pool, "report.created")
+            .await
+            .expect("the fan-out read runs");
+        let ids: Vec<Uuid> = hits.iter().map(|hook| hook.id).collect();
+        assert!(
+            ids.contains(&subscribed.id) && ids.contains(&multi.id),
+            "both subscribed enabled rows answer, the multi-event one included: {ids:?}"
+        );
+        assert_eq!(ids.len(), 2, "the disabled and unsubscribed rows stay out");
+        assert!(
+            enabled_for_event(&pool, "report.deleted")
+                .await
+                .expect("the unknown event read runs")
+                .is_empty(),
+            "an event nobody subscribes to fans out to nothing"
+        );
+
+        let off = set_enabled(&pool, subscribed.id, false)
+            .await
+            .expect("the disable runs");
+        assert!(off.is_some(), "the row exists to disable");
+        assert!(
+            !enabled_for_event(&pool, "report.created")
+                .await
+                .expect("the read after disabling runs")
+                .iter()
+                .any(|hook| hook.id == subscribed.id),
+            "disabling takes the row out of the fan-out"
+        );
     }
 
     #[test]

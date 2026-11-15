@@ -54,14 +54,15 @@
 //! moderator; moving it through moderation is the admin tickets' business,
 //! which is what [`report::set_state`] and [`report::assign`] are there for.
 //!
-//! Filing is also the moment the later tickets act on: the admin
-//! notification and the email to the admins hang off this write, and the
-//! route calls this module's `after_report_created` hook as their landing
-//! point. The hook's federating half has landed:
-//! [`crate::services::federation_out::after_report_created`] forwards the
-//! report's `Flag` to a REMOTE target's instance when the reporter asked
-//! for it (`forward = true`), and stays silent for a local target or an
-//! unforwarded filing.
+//! Filing is also the moment the later tickets act on: the route calls this
+//! module's `after_report_created` hook as its landing point, and that hook
+//! runs the three things a fresh report owes — the forwarding `Flag`
+//! ([`crate::services::federation_out::after_report_created`], for a REMOTE
+//! target the reporter asked to involve), the signed `report.created` webhook
+//! event ([`crate::services::webhooks::report_created`], queued as a
+//! [`webhooks.deliver`](crate::services::webhooks::KIND_DELIVER) job) and the
+//! [`report_to_admin`](crate::mailer::templates::report_to_admin) letter to
+//! every mailable staff account.
 //!
 //! [`report::create`]: crate::models::report::create
 //! [`report::set_state`]: crate::models::report::set_state
@@ -70,7 +71,7 @@
 
 use axum::{Json, Router, extract::State, routing::post};
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -79,14 +80,15 @@ use crate::{
     entities::report::Report,
     error::{AppError, AppResult},
     extract::ApiBody,
+    mailer,
     models::{
         instance_rule, report,
         report::{Category, Report as ReportRow},
         status, status_visibility,
-        user::User,
+        user::{self, User},
     },
     oauth::scopes::WRITE_REPORTS,
-    services::federation_out,
+    services::{federation_out, webhooks},
     state::AppState,
     util::id::parse_id,
 };
@@ -356,14 +358,18 @@ async fn cited_rule_ids(state: &AppState, values: Option<IdValues>) -> AppResult
     }
 }
 
-/// Post-write hook of `POST /api/v1/reports`: forwards the report's `Flag`
-/// to a REMOTE target's instance when the reporter asked for it, through
-/// [`federation_out::after_report_created`] (whose delivery queues through
-/// the job table, decision 11), and nothing else yet.
+/// Post-write hook of `POST /api/v1/reports`: three things happen once a
+/// report is stored, in the order Pleroma does them in
+/// `ActivityPub.flag/1` — forward, announce, write to the staff.
 ///
-/// The ticket that notifies the admins of a new report — the
-/// `admin:reports` notification and the email to the instance's admins —
-/// still wires itself in here, reading the filed report from `state`.
+/// - [`federation_out::after_report_created`] forwards the report's `Flag` to
+///   a REMOTE target's instance when the reporter asked for it (its delivery
+///   queues through the job table, decision 11), and stays silent for a local
+///   target or an unforwarded filing.
+/// - [`webhooks::report_created`] queues the signed `report.created` event
+///   for every enabled webhook subscribed to it (decision 11 again: the
+///   delivery is a job, not part of this request).
+/// - [`email_staff`] posts the report to the staff mailboxes.
 ///
 /// The inbound federation `Flag` ([`crate::federation::handlers::misc`])
 /// runs the same hook on the report it files, so whatever stands here
@@ -372,14 +378,111 @@ async fn cited_rule_ids(state: &AppState, values: Option<IdValues>) -> AppResult
 /// construction a local account.
 pub(crate) async fn after_report_created(state: &AppState, report: &ReportRow) {
     federation_out::after_report_created(state, report).await;
+    webhooks::report_created(state, report).await;
+    email_staff(state, report).await;
+}
+
+/// The two accounts a filed report names, as
+/// [`report_to_admin`](mailer::templates::report_to_admin) addresses them.
+#[derive(Debug)]
+struct Parties {
+    /// The nickname of the account that filed the report.
+    reporter: String,
+    /// The nickname of the account the report is about.
+    target: String,
+}
+
+/// The staff letters a filed report owes: Pleroma's `AdminEmail.report`
+/// ([`report_to_admin`](mailer::templates::report_to_admin) here) to every
+/// local admin or moderator that left an address — the recipients of
+/// Pleroma's `all_users_with_privilege(:reports_manage_reports)` filtered to
+/// the mailable ones, with the reporter left out of its own report's letters
+/// as Pleroma leaves it out.
+///
+/// While `SMTP_HOST` is unset nothing is queued at all
+/// ([`mailer::deliver_later`] drops the letter), so the reads are skipped
+/// rather than run for a letter that will never be written. A failure at any
+/// step is logged and costs at most one recipient's letter: the report itself
+/// is filed, and a missing notification has never been a reason to undo one.
+async fn email_staff(state: &AppState, row: &ReportRow) {
+    if state.config.smtp_host.is_none() {
+        debug!(report = %row.id, "mail is off: no staff letter is queued for this report");
+        return;
+    }
+    let staff = match user::admin::staff_with_email(&state.db).await {
+        Ok(staff) => staff,
+        Err(err) => {
+            warn!(%err, report = %row.id, "the staff listing failed, no report letter is queued");
+            return;
+        }
+    };
+    if staff.is_empty() {
+        debug!(report = %row.id, "the instance has no mailable staff account");
+        return;
+    }
+    let Some(parties) = report_parties(state, row).await else {
+        debug!(report = %row.id, "a report account is gone, no staff letter can name them");
+        return;
+    };
+    for staffer in staff {
+        if staffer.id == row.reporter_id {
+            continue;
+        }
+        let Some(address) = staffer.email.as_deref() else {
+            continue;
+        };
+        let letter = mailer::templates::report_to_admin(
+            &state.config,
+            address,
+            &parties.reporter,
+            &parties.target,
+            &row.comment,
+        );
+        if let Err(err) = mailer::deliver_later(state, letter).await {
+            warn!(%err, report = %row.id, "a staff report letter could not be queued");
+        }
+    }
+}
+
+/// The nicknames [`email_staff`] writes into a letter, `None` when either
+/// account is already gone — a deletion cascade that beat the hook, and a
+/// letter about accounts that no longer exist is not written.
+async fn report_parties(state: &AppState, row: &ReportRow) -> Option<Parties> {
+    let reporter = nickname_of(state, row.reporter_id).await?;
+    let target = nickname_of(state, row.target_id).await?;
+    Some(Parties { reporter, target })
+}
+
+/// The nickname of the account behind `id`, `None` when no account carries it
+/// or the read failed.
+async fn nickname_of(state: &AppState, id: Uuid) -> Option<String> {
+    match user::get_by_id(&state.db, id).await {
+        Ok(Some(account)) => Some(account.nickname),
+        Ok(None) => None,
+        Err(err) => {
+            warn!(%err, account = %id, "the report letter's account could not be read");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::{Value, json};
+    use sqlx::PgPool;
 
     use super::*;
-    use crate::config::DEFAULT_MAX_REPORT_COMMENT;
+    use crate::{
+        config::{Config, DEFAULT_MAX_REPORT_COMMENT, TEST_BASE_URL},
+        http_client::HttpClient,
+        mailer::MemoryTransport,
+        models::job::Job,
+        rate_limit::RateLimiter,
+        streaming::hub::Hub,
+        uploads::UploaderBackend,
+    };
 
     /// Parses `value` as the endpoint's parameters and validates the body-only
     /// ones, as the handler would before it looks anything up.
@@ -544,5 +647,264 @@ mod tests {
         ids(body_with(key, value), "bad")
             .expect_err("the fixture ids are invalid")
             .to_string()
+    }
+
+    /// Test state over `pool` on `config`, with the recording transport: the
+    /// shape both helpers below build.
+    fn state_with(pool: &PgPool, config: Config) -> AppState {
+        let config = Arc::new(config);
+        AppState {
+            db: pool.clone(),
+            hub: Hub::new(pool),
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
+            translation_languages_cache: Arc::default(),
+            rate_limiter: Arc::new(RateLimiter::from_config(config.as_ref())),
+            mailer: Arc::new(MemoryTransport::new()),
+        }
+    }
+
+    /// The mail-enabled state: [`email_staff`] queues a letter only when a
+    /// relay is configured, and the suite's default config names none.
+    ///
+    /// [`email_staff`]: super::email_staff
+    fn mail_state(pool: &PgPool) -> AppState {
+        let mut config = Config::for_tests();
+        config.smtp_host = Some("smtp.example.org".to_owned());
+        state_with(pool, config)
+    }
+
+    /// Every queued `mailer.send` job, oldest first.
+    async fn letters(pool: &PgPool) -> Vec<Job> {
+        sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE kind = $1 ORDER BY id")
+            .bind(mailer::KIND_SEND)
+            .fetch_all(pool)
+            .await
+            .expect("the job read runs")
+    }
+
+    /// A local account named `nickname` with `address` as its email and the
+    /// admin role when `admin` says so.
+    async fn person(pool: &PgPool, nickname: &str, address: &str, admin: bool) -> User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                email: Some(address.to_owned()),
+                is_admin: user::Flag::new(admin),
+                ..user::NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname))
+            },
+        )
+        .await
+        .expect("the account fixture inserts")
+    }
+
+    /// `reporter`'s filed report about `target`, with a comment the letter
+    /// quotes.
+    async fn filed_row(pool: &PgPool, reporter: &User, target: &User) -> ReportRow {
+        report::create(
+            pool,
+            TEST_BASE_URL,
+            reporter,
+            target,
+            &report::NewReport {
+                comment: "a letter, please".to_owned(),
+                category: Category::Other,
+                forwarded: false,
+                rule_ids: vec![],
+                status_ids: vec![],
+            },
+        )
+        .await
+        .expect("the report fixture files")
+    }
+
+    /// The recipients the queued letters name, oldest first.
+    async fn recipients(pool: &PgPool) -> Vec<String> {
+        letters(pool)
+            .await
+            .iter()
+            .map(|job| {
+                job.args["to"]
+                    .as_str()
+                    .expect("a queued letter names its recipient")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_filed_report_letters_every_mailable_staff_account() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = mail_state(&pool);
+        let boss = person(&pool, "letter-boss", "boss@example.org", true).await;
+        let _deputy = person(&pool, "letter-deputy", "deputy@example.org", true).await;
+        let reporter = person(&pool, "letter-reporter", "ring@example.org", false).await;
+        let target = person(&pool, "letter-target", "target@example.org", false).await;
+        let row = filed_row(&pool, &reporter, &target).await;
+
+        email_staff(&state, &row).await;
+
+        assert_eq!(
+            recipients(&pool).await,
+            vec![
+                "boss@example.org".to_owned(),
+                "deputy@example.org".to_owned()
+            ],
+            "one letter per mailable staff account, in creation order"
+        );
+        let queued = letters(&pool).await;
+        let first = queued.first().expect("the admin's letter");
+        assert_eq!(
+            first.queue,
+            crate::jobs::QUEUE_MAILER,
+            "on the mailer queue"
+        );
+        assert_eq!(first.args["subject"], "Wired Report", "the subject");
+        assert!(
+            first.args["text_body"]
+                .as_str()
+                .is_some_and(|body| body.contains("@letter-reporter")
+                    && body.contains("@letter-target")
+                    && body.contains("a letter, please")),
+            "the body names both accounts and quotes the comment: {}",
+            first.args["text_body"]
+        );
+        assert!(boss.is_admin.get(), "the fixture's own admin");
+    }
+
+    #[tokio::test]
+    async fn the_reporter_is_left_out_of_its_own_reports_letters() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = mail_state(&pool);
+        let boss = person(&pool, "self-boss", "boss2@example.org", true).await;
+        let target = person(&pool, "self-target", "target2@example.org", false).await;
+        let row = filed_row(&pool, &boss, &target).await;
+
+        email_staff(&state, &row).await;
+
+        assert!(
+            recipients(&pool).await.is_empty(),
+            "the instance's only staffer filed the report, so nobody is written to"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_staff_account_without_an_address_gets_no_letter() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = mail_state(&pool);
+        let _silent = user::insert(
+            &pool,
+            &user::NewUser {
+                is_moderator: user::Flag::new(true),
+                ..user::NewUser::local(
+                    "silent-mod",
+                    &user::local_ap_id(TEST_BASE_URL, "silent-mod"),
+                )
+            },
+        )
+        .await
+        .expect("the addressless moderator inserts");
+        let reporter = person(&pool, "silent-reporter", "ring2@example.org", false).await;
+        let target = person(&pool, "silent-target", "target3@example.org", false).await;
+        let row = filed_row(&pool, &reporter, &target).await;
+
+        email_staff(&state, &row).await;
+
+        assert!(
+            recipients(&pool).await.is_empty(),
+            "a staffer with no mailbox is not written to"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_that_names_no_accounts_letters_nobody() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = mail_state(&pool);
+        let boss = person(&pool, "orphan-boss", "boss3@example.org", true).await;
+        let reporter = person(&pool, "orphan-reporter", "ring3@example.org", false).await;
+        let target = person(&pool, "orphan-target", "target4@example.org", false).await;
+        let row = filed_row(&pool, &reporter, &target).await;
+
+        email_staff(
+            &state,
+            &ReportRow {
+                target_id: Uuid::now_v7(),
+                ..row.clone()
+            },
+        )
+        .await;
+
+        assert!(
+            recipients(&pool).await.is_empty(),
+            "a report whose target the cascade already took names nobody to write about"
+        );
+        email_staff(&state, &row).await;
+        assert_eq!(
+            recipients(&pool).await,
+            vec!["boss3@example.org".to_owned()],
+            "and the same hook on a whole row writes the letter"
+        );
+        assert!(boss.is_admin.get(), "the fixture's own admin");
+    }
+
+    #[tokio::test]
+    async fn no_relay_means_no_letter_and_no_reads() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = state_with(&pool, Config::for_tests());
+        let boss = person(&pool, "quiet-boss", "boss4@example.org", true).await;
+        let reporter = person(&pool, "quiet-reporter", "ring4@example.org", false).await;
+        let target = person(&pool, "quiet-target", "target5@example.org", false).await;
+        let row = filed_row(&pool, &reporter, &target).await;
+
+        email_staff(&state, &row).await;
+
+        assert!(
+            letters(&pool).await.is_empty(),
+            "`SMTP_HOST` unset drops the letter before anything is read"
+        );
+        assert_eq!(
+            boss.email.as_deref(),
+            Some("boss4@example.org"),
+            "the staffer was there all along"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_staff_read_is_logged_and_not_raised() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/wired_no_such_database")
+            .expect("a lazy pool needs no server");
+        let state = mail_state(&pool);
+        let now = chrono::Utc::now();
+        let row = ReportRow {
+            id: Uuid::now_v7(),
+            reporter_id: Uuid::now_v7(),
+            target_id: Uuid::now_v7(),
+            comment: String::new(),
+            category: Category::Other,
+            forwarded: false,
+            state: report::ReportState::Open,
+            assigned_to: None,
+            action_taken_at: None,
+            rule_ids: vec![],
+            ap_id: None,
+            inserted_at: now,
+            updated_at: now,
+        };
+
+        email_staff(&state, &row).await;
+
+        assert!(
+            report::get(&pool, row.id).await.is_err(),
+            "the pool this test ran on really cannot answer a read"
+        );
     }
 }
