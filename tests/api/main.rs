@@ -51,6 +51,13 @@ mod activitypub;
 /// [`StaffUser`]: wired_be::auth::admin::StaffUser
 mod admin;
 
+/// The admin users endpoints over HTTP (`GET /api/v1/pleroma/admin/users`
+/// and `GET …/users/{nickname}`, WBE-195): the eight filters and their
+/// combinations, the query and the named criteria, the page window beside
+/// its total, the admin account entity, the handle and id lookups, and the
+/// `admin:read:accounts` gate.
+mod admin_users;
+
 /// The activity reads over HTTP: `GET /activities/{uuid}` and the `Create`
 /// of a status at `GET /users/{nickname}/statuses/{uuid}/activity`.
 mod ap_activities;

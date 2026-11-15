@@ -7,6 +7,9 @@
 //! needed — by pure functions. Nothing here touches the database or a
 //! request, so every entity is testable with `serde_json::to_value`
 //! alone. [`account`] renders the Mastodon `Account` entity,
+//! [`admin_account`] the admin API's account entity — the moderation
+//! console's row behind `GET /api/v1/pleroma/admin/users` and its show
+//! endpoint —
 //! [`announcement`] the Mastodon `Announcement` entity,
 //! [`application`] the Mastodon `Application` entity,
 //! [`media_attachment`] the Mastodon `Attachment` entity,
@@ -45,6 +48,7 @@
 
 pub mod account;
 pub mod admin;
+pub mod admin_account;
 pub mod announcement;
 pub mod application;
 pub mod backup;

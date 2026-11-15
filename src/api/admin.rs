@@ -25,6 +25,10 @@
 //!   accounts when it is
 //!   ([`status_visibility_counts`](crate::models::status::status_visibility_counts)).
 //!
+//! The account reads the [`users`] submodule serves — `GET /users` and
+//! `GET /users/{nickname}` — are listed there, along with the invite
+//! actions of [`invites`] and the webhook routes of [`webhooks`].
+//!
 //! Later admin tickets join this same file with more `.merge(...)` /
 //! `.route(...)` lines; the [module docs of `crate::api::v1`](crate::api::v1)
 //! hold the no-fallback rule that applies to every router merged there.
@@ -32,9 +36,11 @@
 //! [`config`] submodule, the registration invites (`users/invite_token`,
 //! `users/invites`, `users/revoke_invite`, `users/email_invite`, WBE-199)
 //! as the [`invites`] submodule — whose [`registration_router`]
-//! additionally rides on [`crate::app`] at the root — and the webhook
+//! additionally rides on [`crate::app`] at the root — the webhook
 //! maintenance API (`/webhooks` and its `{id}` actions, WBE-209) as the
-//! [`webhooks`] submodule.
+//! [`webhooks`] submodule, and the admin's view of the accounts table
+//! (`GET /users` and `GET /users/{nickname}`, WBE-195) as the [`users`]
+//! submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -60,6 +66,7 @@ use crate::{
 
 pub mod config;
 pub mod invites;
+pub mod users;
 pub mod webhooks;
 
 /// Default `page` when the parameter is absent or not a positive number
@@ -88,6 +95,7 @@ pub fn router() -> Router<AppState> {
         .route("/stats", get(stats))
         .merge(config::router())
         .merge(invites::router())
+        .merge(users::router())
         .merge(webhooks::router())
 }
 
@@ -167,15 +175,28 @@ fn text_of(params: &HashMap<String, String>, key: &str) -> Option<String> {
 /// A defaulted integer page parameter, Pleroma's `fetch_integer_param`:
 /// anything unparsable or non-positive keeps the default.
 fn page_number(params: &HashMap<String, String>, key: &str, default: i64) -> i64 {
-    text_of(params, key)
-        .and_then(|text| text.parse::<i64>().ok())
+    page_number_of(text_of(params, key).as_deref(), default)
+}
+
+/// [`page_number`] for a request whose parameters were read off the raw
+/// query string rather than a map: the same rule, applied to one value's
+/// text. The admin submodules share it, so a `page` defaults identically
+/// everywhere.
+fn page_number_of(text: Option<&str>, default: i64) -> i64 {
+    text.and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value >= 1)
         .unwrap_or(default)
 }
 
 /// `page_size` with its default and its cap.
 fn page_size(params: &HashMap<String, String>) -> i64 {
-    page_number(params, "page_size", DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE)
+    page_size_of(text_of(params, "page_size").as_deref())
+}
+
+/// [`page_size`] for one value's text, shared the way
+/// [`page_number_of`] is.
+fn page_size_of(text: Option<&str>) -> i64 {
+    page_number_of(text, DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE)
 }
 
 /// One date bound, `end_of_day` deciding whether a plain `YYYY-MM-DD`
