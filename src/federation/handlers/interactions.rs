@@ -52,8 +52,16 @@
 //!   anything else, direct), and whose `inserted_at` is the activity's
 //!   `published`. A pair that holds a live boost — or an id a row already
 //!   carries — restates a fact and is ignored. No follow relation is asked
-//!   of the actor, which is what lets a relay's re-broadcasts through
-//!   (the relay ticket owns the other side of that pairing); a peer whose
+//!   of the actor, which is what lets a relay's re-broadcasts through:
+//!   when the actor is a relay this instance follows and that has accepted
+//!   the follow (the [`crate::models::relay`] table, the relay
+//!   ticket's other half of that pairing), the `Announce` folds as ingest
+//!   only — the target step's
+//!   [`resolve_status`](crate::federation::fetch_object::resolve_status)
+//!   fetch has already
+//!   mirrored the announced object as an ordinary public remote status —
+//!   and no reblog row is created, because a relay re-broadcasts rather
+//!   than boosts. A peer whose
 //!   domain the instance rejects never reaches this code — the dispatcher's
 //!   policy stage applies that, and a blocked author's domain with it.
 //! * The `Undo` routes ([`handle_undo_like`], [`handle_undo_emoji_react`],
@@ -90,7 +98,7 @@ use crate::{
     },
     models::{
         emoji_reaction::{self, NewReaction},
-        favourite,
+        favourite, relay,
         status::{self, Status, Visibility},
         status_visibility,
         user::User,
@@ -287,9 +295,9 @@ async fn apply_emoji_react(
     }
 }
 
-/// The body of [`handle_announce`]: the shared target step, the
-/// boostability rule, the duplicate read, and the reblog row the activity
-/// itself describes.
+/// The body of [`handle_announce`]: the shared target step, the relay arm,
+/// the boostability rule, the duplicate read, and the reblog row the
+/// activity itself describes.
 async fn apply_announce(
     state: AppState,
     view: ActivityView,
@@ -303,6 +311,14 @@ async fn apply_announce(
     let Some(target) = resolve_target(&state, &view, &signer).await? else {
         return Ok(Outcome::Ignored(NO_TARGET));
     };
+    if is_accepted_relay(&state, &signer).await? {
+        debug!(
+            status = %target.id,
+            actor = %signer.nickname,
+            "a relay Announce's object was resolved and ingested; no reblog row is folded"
+        );
+        return Ok(Outcome::Handled);
+    }
     if !boostable(target.visibility) {
         debug!(status = %target.id, visibility = target.visibility.as_str(),
                "a boost of a status that is not public or unlisted");
@@ -589,6 +605,19 @@ async fn interaction_target(
 /// public post the instance's users never followed anybody for.
 const fn boostable(visibility: Visibility) -> bool {
     matches!(visibility, Visibility::Public | Visibility::Unlisted)
+}
+
+/// Whether `signer` is a relay this instance follows and that has accepted
+/// the follow ([`relay::is_accepted`]): its `Announce`es are the
+/// re-broadcasts the subscription exists to receive — the object rides in
+/// through [`resolve_target`]'s fetch and stands as an ordinary public
+/// remote status, and no reblog row names the relay as its booster. A
+/// still-`pending` subscription has not opened that door: its actor folds
+/// like any other one until its `Accept` arrives.
+async fn is_accepted_relay(state: &AppState, signer: &User) -> Result<bool, FederationError> {
+    relay::is_accepted(&state.db, &signer.ap_id)
+        .await
+        .map_err(|err| transient("the relay read", &err))
 }
 
 /// Whether this `Announce` is already folded: the pair holds a live reblog

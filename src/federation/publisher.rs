@@ -34,7 +34,8 @@
 //!   mirrors and local rows are not delivery targets, and neither the actor
 //!   nor this instance's own actor ever receives a copy);
 //! - relay inboxes ([`relay_inboxes`](crate::models::instance::relay_inboxes),
-//!   the empty placeholder until the relay ticket lands) join the set for
+//!   the `inbox` of every relay this instance follows and that has
+//!   accepted the follow) join the set for
 //!   activities with public addressing and for the actor's own
 //!   `Delete`/`Undo`/`Update`, so relays keep their copies fresh;
 //! - inboxes whose host instance policy rejects — by its own table or by
@@ -62,9 +63,10 @@
 //!
 //! A `local`-visibility status never reaches this module: callers must not
 //! call [`publish`] for one (an activity addressed only to `Public` with
-//! no followers and no mentions simply computes the empty set and enqueues
-//! nothing, which is also what happens to a `local` status published by
-//! mistake while the relay hook is still empty).
+//! no followers and no mentions otherwise enqueues nothing but the relay
+//! fan-out the accepted subscriptions open — which is exactly what a
+//! relay is subscribed to hear, and the reason a `local` status must
+//! never reach here by mistake).
 
 use std::collections::HashSet;
 
@@ -505,6 +507,7 @@ mod tests {
             follow::FollowState,
             instance_setting,
             job::Job,
+            relay,
             user::{NewUser, insert, local_ap_id},
         },
         services::instance_actor::ensure_instance_actor,
@@ -517,6 +520,8 @@ mod tests {
     const ACTIVITY_ID: &str = "https://test.example/activities/1";
     /// The personal inbox the `other.example` mirror publishes.
     const ERIN_INBOX: &str = "https://other.example/users/erin/inbox";
+    /// The inbox the relay fixtures publish.
+    const RELAY_INBOX: &str = "https://relay.example/inbox";
     /// The id of the second activity a test publishes, so a re-publish of the
     /// first one's inbox cannot be swallowed by the delivery's deduplication.
     const CORRECTION_ID: &str = "https://test.example/activities/2";
@@ -1273,18 +1278,78 @@ mod tests {
         assert_eq!(job_count(&pool).await, 0, "and queues nothing");
     }
 
-    /// The unreachable hook is the `instances` ledger and the relay hook is
-    /// still the empty placeholder: with no row for a host its inboxes are
-    /// targets, a mark under the default zero grace drops them out of the set,
-    /// and clearing the mark targets them again.
+    /// The relay hook answers the `relays` table: an accepted relay's
+    /// inbox joins the fan-out of a public activity, a `pending`
+    /// subscription stays out of it, and a non-public activity of the
+    /// same actor carries the relay's inbox nowhere.
     #[tokio::test]
-    async fn the_relay_and_unreachable_hooks_answer_the_placeholders() {
+    async fn the_relay_hook_adds_the_accepted_inboxes_to_the_fan_out() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         assert!(
             instance::relay_inboxes(&pool).await.unwrap().is_empty(),
-            "no relay is subscribed until the relay ticket lands"
+            "no relay is subscribed until one is followed and accepted"
         );
+
+        let alice = alice(&pool).await;
+        let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+        followed(&pool, &erin, &alice).await;
+        let _subscription = relay::upsert(&pool, "https://relay.example/relay", RELAY_INBOX)
+            .await
+            .unwrap();
+        let state = test_state(&pool);
+
+        // The relay stands subscribed but unaccepted: a public activity
+        // reaches the follower alone until the relay's `Accept` folds.
+        let pending_targets = publish_default(&state, &alice, &public_activity(&alice)).await;
+        assert_eq!(pending_targets, 1, "the pending relay is not a target");
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![ERIN_INBOX],
+            "and it is queued nothing"
+        );
+
+        let _granted = relay::mark_accepted(&pool, "https://relay.example/relay")
+            .await
+            .unwrap();
+        let granted_targets = publish_default(&state, &alice, &public_activity(&alice)).await;
+        assert_eq!(
+            granted_targets, 2,
+            "the accepted relay's inbox joins the public fan-out"
+        );
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![ERIN_INBOX, RELAY_INBOX],
+            "the queue holds the follower's delivery and the relay's"
+        );
+
+        // A non-public activity of the same actor — no public address, no
+        // self-broadcast type — never carries the relay's inbox.
+        let private = json!({
+            "id": CORRECTION_ID,
+            "type": "Create",
+            "actor": alice.ap_id,
+            "to": [erin.ap_id],
+        });
+        let quiet_targets = publish_default(&state, &alice, &private).await;
+        assert_eq!(
+            quiet_targets, 1,
+            "the private activity fans out to the addressed recipient alone"
+        );
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![ERIN_INBOX, ERIN_INBOX, RELAY_INBOX],
+            "and the relay gets no copy of it"
+        );
+    }
+
+    /// The unreachable hook answers the `instances` ledger: with no row
+    /// for a host its inboxes are targets, a mark under the default zero
+    /// grace drops them out, and clearing the mark targets them again.
+    #[tokio::test]
+    async fn the_unreachable_hook_drops_and_restores_a_marked_host() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             !instance::is_host_unreachable(&pool, "peer.example", NO_GRACE)
                 .await
@@ -1343,9 +1408,9 @@ mod tests {
         );
     }
 
-    /// A self-broadcast runs the relay arm without changing the fan-out: the
-    /// hook still answers the empty list, so the actor's own `Update` reaches
-    /// its followers and nobody else.
+    /// The self-broadcast arm runs the relay hook without any subscription
+    /// standing: the actor's own `Update` consults the `relays` table, finds
+    /// no accepted relay, and reaches its followers only.
     #[tokio::test]
     async fn an_actor_self_broadcast_runs_the_relay_arm() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -1365,7 +1430,7 @@ mod tests {
         assert_eq!(
             publish_default(&state, &alice, &update).await,
             1,
-            "the actor's Update fans out to followers and consults the empty relay hook"
+            "the actor's Update fans out to followers and consults the empty relay ledger"
         );
     }
 

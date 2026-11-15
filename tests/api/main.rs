@@ -327,6 +327,12 @@ mod rate_limit;
 /// twin and the `…/reblogged_by` listing).
 mod reblogs;
 
+/// Relays over federation: the instance actor's follow of a relay, the
+/// accepted relay's fan-out and Announce fold, and the `/relay` endpoints
+/// (`src/services/relay.rs`, `src/federation/handlers/interactions.rs`,
+/// `src/api/activitypub.rs`).
+mod relays;
+
 /// `GET /api/v1/accounts/relationships`.
 mod relationships;
 

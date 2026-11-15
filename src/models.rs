@@ -66,6 +66,7 @@ pub mod password_reset;
 pub mod pinned_status;
 pub mod poll;
 pub mod relationship;
+pub mod relay;
 pub mod report;
 pub mod scheduled_status;
 pub mod scrobble;
