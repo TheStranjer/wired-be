@@ -59,6 +59,13 @@ pub const PACK_FILE: &str = "pack.json";
 /// Body of the 403 the archive endpoint answers for a pack whose files are
 /// not shared.
 pub const PACK_NOT_SHARED: &str = "Pack is not shared";
+/// Body of the 400 [`create_pack`] answers when the pack directory already
+/// exists (Pleroma's `File.mkdir` `:eexist`; the admin ticket pins the
+/// status at 400, not Pleroma's 409).
+pub const PACK_EXISTS: &str = "Pack already exists";
+/// The manifest [`create_pack`] writes: empty metadata and no files —
+/// Pleroma's `save_pack(%Pack{})` of a freshly `mkdir`ed directory.
+pub const NEW_PACK_MANIFEST: &str = r#"{"pack": {}, "files": {}}"#;
 
 /// The metadata block of a `pack.json`: all of it optional on read (an
 /// empty manifest `{"files": {}}` is what Pleroma's `create` writes), with
@@ -216,6 +223,59 @@ pub async fn save_pack(dir: &Path, name: &str, pack: &Pack) -> AppResult<()> {
         .map_err(|err| io_error("write pack manifest", &manifest, &err))?;
     debug!(pack = name, files = pack.files.len(), "saved emoji pack");
     Ok(())
+}
+
+/// Creates pack `name` under the packs root `dir`: a fresh directory and
+/// the default [`NEW_PACK_MANIFEST`], Pleroma's `create` (`File.mkdir`
+/// followed by `save_pack(%Pack{})`).
+///
+/// The directory is the existence boundary, as in Pleroma: a name whose
+/// directory is there already exists whether or not it holds a manifest.
+/// Existing files are never touched.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] if `name` is not [`pack_name_valid`] or the
+/// pack already exists ([`PACK_EXISTS`]), [`AppError::Internal`] for any
+/// other filesystem failure.
+pub async fn create_pack(dir: &Path, name: &str) -> AppResult<()> {
+    let path = pack_dir(dir, name)?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|err| io_error("create emoji packs root", dir, &err))?;
+    match tokio::fs::create_dir(&path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(AppError::BadRequest(PACK_EXISTS.to_owned()));
+        }
+        Err(err) => return Err(io_error("create pack directory", &path, &err)),
+    }
+    let manifest = path.join(PACK_FILE);
+    tokio::fs::write(&manifest, NEW_PACK_MANIFEST)
+        .await
+        .map_err(|err| io_error("write pack manifest", &manifest, &err))?;
+    debug!(pack = name, "created emoji pack");
+    Ok(())
+}
+
+/// Removes pack `name` — the whole directory with its files — from the
+/// packs root `dir`, Pleroma's `delete` (`File.rm_rf`).
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] if `name` is not [`pack_name_valid`],
+/// [`AppError::NotFound`] if the pack directory does not exist, and
+/// [`AppError::Internal`] for any other filesystem failure.
+pub async fn delete_pack(dir: &Path, name: &str) -> AppResult<()> {
+    let path = pack_dir(dir, name)?;
+    match tokio::fs::remove_dir_all(&path).await {
+        Ok(()) => {
+            debug!(pack = name, "deleted emoji pack");
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(AppError::NotFound),
+        Err(err) => Err(io_error("delete pack directory", &path, &err)),
+    }
 }
 
 /// Every pack under the packs root `dir`, ordered by name.
@@ -601,6 +661,117 @@ mod tests {
             std::fs::read(dir.path().join("outside.txt")).unwrap(),
             b"secret",
             "the file outside any pack stayed as it was"
+        );
+    }
+
+    /// The error a refused [`create_pack`] of an occupied name carries.
+    fn exists_error(err: &AppError) -> bool {
+        matches!(err, AppError::BadRequest(_)) && err.to_string() == PACK_EXISTS
+    }
+
+    #[tokio::test]
+    async fn create_pack_makes_the_directory_and_the_default_manifest() {
+        let dir = temp_dir();
+        create_pack(dir.path(), "fresh").await.unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("fresh").join(PACK_FILE)).unwrap();
+        assert_eq!(raw, NEW_PACK_MANIFEST, "the manifest is the pinned default");
+        assert_eq!(
+            load_pack(dir.path(), "fresh").await.unwrap(),
+            Pack::default(),
+            "and it parses back as the empty pack"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_pack_makes_a_missing_root_but_never_leaves_it() {
+        let dir = temp_dir();
+        let root = dir.path().join("emoji");
+        create_pack(&root, "late").await.unwrap();
+        assert!(
+            root.join("late").join(PACK_FILE).exists(),
+            "root and pack created"
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_an_existing_pack_reports_exists_and_changes_nothing() {
+        let dir = temp_dir();
+        seed_pack(dir.path(), "cats", &[("cat", "cat.png")]).await;
+        let err = create_pack(dir.path(), "cats").await.unwrap_err();
+        assert!(exists_error(&err), "an occupied name is PACK_EXISTS: {err}");
+        let kept = load_pack(dir.path(), "cats").await.unwrap();
+        assert_eq!(
+            kept.files.get("cat").map(String::as_str),
+            Some("cat.png"),
+            "the manifest survived the refused create"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("cats").join("cat.png")).unwrap(),
+            PNG_BYTES,
+            "and so did the files"
+        );
+        // A half-installed pack — a directory without a manifest — also
+        // exists as far as Pleroma's `File.mkdir` is concerned.
+        std::fs::create_dir_all(dir.path().join("bare")).unwrap();
+        let bare_err = create_pack(dir.path(), "bare").await.unwrap_err();
+        assert!(
+            exists_error(&bare_err),
+            "a bare directory exists too: {bare_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_pack_removes_the_directory_and_reports_absent_packs() {
+        let dir = temp_dir();
+        seed_pack(
+            dir.path(),
+            "cats",
+            &[("cat", "cat.png"), ("kitten", "sub/kitten.png")],
+        )
+        .await;
+        seed_pack(dir.path(), "dogs", &[("dog", "dog.png")]).await;
+        delete_pack(dir.path(), "cats").await.unwrap();
+        assert!(
+            !dir.path().join("cats").exists(),
+            "the whole pack directory is gone"
+        );
+        assert!(
+            dir.path().join("dogs").join(PACK_FILE).exists(),
+            "sibling packs stay"
+        );
+        let err = delete_pack(dir.path(), "cats").await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound), "twice is a 404: {err}");
+    }
+
+    #[tokio::test]
+    async fn create_and_delete_reject_unusable_names_before_the_filesystem() {
+        let dir = temp_dir();
+        write_file(&dir.path().join("outside.txt"), b"secret");
+        for name in [
+            "../outside.txt",
+            "..",
+            ".",
+            "",
+            ".hidden",
+            "a/b",
+            "/abs",
+            "é",
+        ] {
+            let create_err = create_pack(dir.path(), name).await.unwrap_err();
+            assert!(
+                matches!(create_err, AppError::BadRequest(_)),
+                "create rejects {name:?} with a 400: {create_err}"
+            );
+            let delete_err = delete_pack(dir.path(), name).await.unwrap_err();
+            assert!(
+                matches!(delete_err, AppError::BadRequest(_)),
+                "delete rejects {name:?} with a 400: {delete_err}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("outside.txt")).unwrap(),
+            b"secret",
+            "the file outside any pack is neither touched nor removed"
         );
     }
 
