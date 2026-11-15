@@ -52,6 +52,11 @@
 //! Pleroma's `RichMedia.Parser` and `RichMedia.Card`. The fetch, the storage
 //! and the job that runs them are not here.
 //!
+//! [`relay`] is the instance's side of the public relays: the instance
+//! actor's `Follow` of a relay actor and its withdrawal, the
+//! [`relays`](crate::models::relay) subscription the publisher fans public
+//! activities to, and the ledger the admin API drives from here.
+//!
 //! [`schedule_status`] is the same body's parked twin: it decides what a
 //! `scheduled_at` create may store — the create's own checks first, then the
 //! window, the per-account limits and the media reservation — and hands the
@@ -110,6 +115,7 @@ pub mod media_processing;
 pub mod media_proxy;
 pub mod mentions;
 pub mod notify;
+pub mod relay;
 pub mod render_status;
 pub mod rich_media;
 pub mod schedule_status;

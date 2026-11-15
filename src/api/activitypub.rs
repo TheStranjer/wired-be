@@ -33,9 +33,16 @@
 //! `/followers`, `/following`, `/collections/featured`) and
 //! `GET /objects/{uuid}/replies`, built by [`crate::federation::collections`]
 //! from the same controller's `outbox/2`, `followers/2`, `following/2`,
-//! `pinned/2` and `object_replies/2` actions — and the three inbox
+//! `pinned/2` and `object_replies/2` actions — and the four inbox
 //! `POST`s of the actors those documents name (`inbox/2` feeding
-//! `Federator.incoming_ap_doc`).
+//! `Federator.incoming_ap_doc/1`): the shared `/inbox`, the instance
+//! actor's `/internal/fetch/inbox`, the relay actor's `/relay/inbox` and
+//! the personal `/users/{nickname}/inbox`. The three relay documents
+//! beside the shared inbox — `GET /relay` (an alias of the instance
+//! actor's `/internal/fetch` JSON: this instance does not *serve* relays)
+//! and the empty `/relay/following` and `/relay/followers` collections —
+//! complete the same controller's `relay`, `relay_following` and
+//! `relay_followers` actions.
 //!
 //! Beside the federation face sits the client-to-server one, Pleroma's
 //! `ActivityPubController` actions `read_inbox`, `update_outbox`,
@@ -217,6 +224,12 @@ const AP_MEDIA_TYPES: [&str; 2] = ["application/activity+json", "application/ld+
 /// The media type whose presence in `Accept` means "this is a browser":
 /// Pleroma's HTML clients are sent to the frontend, and so here.
 const HTML_MEDIA_TYPE: &str = "text/html";
+/// The `ActivityPub` address this instance's relay-facing actor document
+/// is served at (Pleroma's `relay` route, `/relay`): here an alias of
+/// [`INSTANCE_ACTOR_PATH`](crate::services::instance_actor::INSTANCE_ACTOR_PATH)'s
+/// document, with the two empty subscription collections and the shared
+/// inbox handler beside it.
+const RELAY_PATH: &str = "/relay";
 /// 400 body when an authenticated activity carries no string `id`, no
 /// string `type` or no `actor` (see [`require_activity_fields`]).
 const INVALID_ACTIVITY: &str = "Invalid activity";
@@ -258,9 +271,12 @@ const INBOX_PAGE_SIZE: i64 = 20;
 /// (`get_object`, `get_scoped_object` and `get_notice`), the activity
 /// reads (`get_activity` and `get_notice_activity`), the activity
 /// collections beside the actor (the account's outbox, followers,
-/// following and featured list, an object's replies), and the three
-/// inbox routes that accept their deliveries (`POST /inbox`,
-/// `POST /users/{nickname}/inbox` and `POST /internal/fetch/inbox`).
+/// following and featured list, an object's replies), and the four inbox
+/// routes that accept their deliveries (`POST /inbox`,
+/// `POST /users/{nickname}/inbox`, `POST /internal/fetch/inbox` and
+/// `POST /relay/inbox`), beside the three relay `GET`s — the actor
+/// document `/relay` and the empty `/relay/following` and
+/// `/relay/followers` collections.
 /// On top of these live the four OAuth-authenticated client-to-server
 /// routes: `GET /users/{nickname}/inbox`, `POST /users/{nickname}/outbox`,
 /// `GET /api/ap/whoami` and `POST /api/ap/upload_media`.
@@ -290,9 +306,13 @@ pub fn router(config: &Config) -> Router<AppState> {
         .route("/users/{nickname}/collections/featured", get(get_featured))
         .route("/objects/{uuid}/replies", get(get_replies))
         .route("/internal/fetch", get(get_instance_actor))
+        .route("/relay", get(get_relay))
+        .route("/relay/following", get(get_relay_following))
+        .route("/relay/followers", get(get_relay_followers))
         .route(LITEPUB_SCHEMA_PATH, get(litepub_schema))
         .route("/inbox", post(inbox))
         .route("/internal/fetch/inbox", post(inbox))
+        .route("/relay/inbox", post(inbox))
         .route("/api/ap/whoami", get(whoami))
         .route(
             "/api/ap/upload_media",
@@ -938,6 +958,67 @@ async fn get_instance_actor(State(state): State<AppState>) -> Response {
     }
 }
 
+/// `GET /relay` — this instance's relay-facing actor document. Serving
+/// relays to others is not supported (the ticket): where Pleroma answers
+/// this address with a dedicated `relay` service actor, here the answer
+/// is the very JSON `GET /internal/fetch` serves — the same actor the
+/// relay `Follow`s this instance sends are signed by, so a peer that
+/// dereferences it and a peer that received its follow are looking at
+/// one identity. The usual federation negotiation: an `Accept` naming an
+/// `ActivityPub` media type gets the document, anything else the plain
+/// 404. Like `/internal/fetch` the route is not gated by
+/// `AUTHORIZED_FETCH`, and for the same reason — it is the document a
+/// peer reads to learn the key it has to sign with.
+async fn get_relay(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let outcome = relay_actor_document(&state, &headers).await;
+    with_vary(outcome)
+}
+
+/// The body of [`get_relay`]: the negotiation, then the instance actor,
+/// provisioned lazily exactly as `GET /internal/fetch` provisions it.
+async fn relay_actor_document(state: &AppState, headers: &HeaderMap) -> AppResult<Response> {
+    if !wants_activity_json(headers) {
+        return Err(AppError::RouteNotFound);
+    }
+    let actor = instance_actor::ensure_instance_actor(&state.db, &state.config).await?;
+    Ok(actor_response(&actor, &state.config))
+}
+
+/// `GET /relay/following` — whom this instance follows in the relay role:
+/// the empty `OrderedCollection`. It follows no subscribers as a relay
+/// (that feature is not supported), and Pleroma's `relay_following` —
+/// which renders the relay actor's own, ordinarily empty, following
+/// collection — is answered here with the bare root, no account lookup
+/// and no `AUTHORIZED_FETCH` gate.
+async fn get_relay_following(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    relay_collection(&state, &headers, "following")
+}
+
+/// `GET /relay/followers` — who follows this instance's relay actor:
+/// [`get_relay_following`]'s twin. Nobody subscribes to an instance that
+/// does not serve relays, so the collection is the same empty root at the
+/// `/followers` address.
+async fn get_relay_followers(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    relay_collection(&state, &headers, "followers")
+}
+
+/// The two relay collections' shared answer: the negotiation, then one
+/// empty `OrderedCollection` root at `{BASE_URL}/relay/{side}`.
+fn relay_collection(state: &AppState, headers: &HeaderMap, side: &str) -> Response {
+    let outcome = if wants_activity_json(headers) {
+        let id = format!("{}{RELAY_PATH}/{side}", state.config.base_url);
+        Ok(collections::collection_root(
+            &id,
+            ORDERED_COLLECTION,
+            Some(0),
+            &state.config,
+        ))
+    } else {
+        Err(AppError::RouteNotFound)
+    };
+    with_vary(document(outcome))
+}
+
 /// `GET /schemas/litepub-0.1.jsonld` — the JSON-LD context document every
 /// `Note`/`Question` and activity this instance serves references from its
 /// `@context`, the counterpart of Pleroma's static
@@ -949,9 +1030,12 @@ async fn litepub_schema() -> Json<Value> {
     Json(litepub_context_json())
 }
 
-/// Either shared inbox — the instance's `POST /inbox` and the instance
-/// actor's `POST /internal/fetch/inbox`, the two paths Pleroma's `inbox`
-/// action answers on besides the personal one. A delivery accepted here
+/// Either shared inbox — the instance's `POST /inbox`, the instance
+/// actor's `POST /internal/fetch/inbox` and the relay actor's
+/// `POST /relay/inbox`, the paths Pleroma's `inbox` action answers on
+/// besides the personal one (its `/relay` route is a different service
+/// actor; here the same instance actor stands behind both addresses, so
+/// the same queueing handler answers all three). A delivery accepted here
 /// is queued with a null `inbox_owner`: no local account claims it, the
 /// instance does.
 async fn inbox(State(state): State<AppState>, request: Request) -> Response {

@@ -31,24 +31,21 @@
 //! specified yet, so nothing here writes them
 //! (`docs/ARCHITECTURE.md` decision 15).
 //!
-//! [`relay_inboxes`] stays exactly the placeholder it was: the relay ticket
-//! owns it and the subscriptions it will read. Both it and
+//! [`relay_inboxes`] is the relay ticket's hook into this module: the
+//! [`relays`](crate::models::relay) table owns the subscriptions, and this
+//! is the read the publisher folds into its fan-out. Both it and
 //! [`is_host_unreachable`] are plain `fn`s returning a [`BoxFuture`] rather
 //! than `async` fns (the shape [`crate::federation::mrf::filter_incoming`]
-//! set for exactly this reason): the placeholder must not be an `async` fn
-//! that awaits nothing, which the denied `unused_async` lint would reject,
-//! and keeping the shape for the real lookup leaves every call site in the
-//! publisher spelled the same. Both hand back an [`AppResult`]: the
-//! placeholder cannot fail, but its callers must not have to change when a
-//! module's body does.
-
-use std::future::ready;
+//! set for exactly this reason): keeping one shape for both leaves every
+//! call site in the publisher spelled the same. Both hand back an
+//! [`AppResult`]: a database that cannot answer arrives as an error rather
+//! than as a silently empty set.
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, models::relay};
 
 /// [`is_host_unreachable`]: the one fact the publisher needs, asked as an
 /// existence check so an unmarked or never-seen host costs a `false` and not
@@ -200,20 +197,22 @@ pub async fn list_unreachable(pool: &PgPool) -> AppResult<Vec<(String, DateTime<
     Ok(rows)
 }
 
-/// The inbox URLs of the relays subscribed to this instance.
+/// The inbox URLs of the relays this instance follows *and that have
+/// accepted the follow*.
 ///
-/// The relay ticket (Pleroma's `Pleroma.Web.ActivityPub.Relay` with its
-/// `followed_inboxes/0`) fills this in from the stored `Follow`-of-`Relay`
-/// subscriptions. Until then no relay follows this instance, so the neutral
-/// answer is the empty list.
-pub fn relay_inboxes(_pool: &PgPool) -> BoxFuture<'_, AppResult<Vec<String>>> {
-    Box::pin(ready(Ok(Vec::new())))
+/// Pleroma's `Relay.followed_inboxes/0`, the set the
+/// [publisher](crate::federation::publisher) adds for public
+/// `Create`/`Announce`/`Update`/`Delete` activities. A `pending`
+/// subscription has not been granted yet, so its inbox joins the set only
+/// when the relay's `Accept` folds
+/// ([`mark_accepted`](crate::models::relay::mark_accepted)).
+pub fn relay_inboxes(pool: &PgPool) -> BoxFuture<'_, AppResult<Vec<String>>> {
+    Box::pin(relay::accepted_inboxes(pool))
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone as _};
-    use sqlx::postgres::PgPoolOptions;
 
     use super::*;
 
@@ -225,13 +224,6 @@ mod tests {
     const NO_GRACE: Duration = Duration::zero();
     /// The host every single-host test here is about.
     const HOST: &str = "peer.example";
-
-    /// A lazy pool for the relay placeholder's test, which never queries.
-    fn lazy_pool() -> PgPool {
-        PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("a lazy pool needs no database")
-    }
 
     /// One fixed moment in June 2025 — a whole minute, so the microsecond
     /// precision the `timestamptz` columns keep round-trips it unchanged and
@@ -280,16 +272,66 @@ mod tests {
         row(pool, host).await.2
     }
 
-    /// Until the relay ticket lands, nothing is subscribed to relay.
+    /// A relay subscription hands its inbox to the publisher only once the
+    /// relay has accepted the follow: a `pending` row is not a fan-out
+    /// target, and the grant is what opens one.
     #[tokio::test]
-    async fn nobody_relays_for_now() {
-        let pool = lazy_pool();
+    async fn relay_inboxes_answers_the_accepted_subscriptions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         assert!(
             relay_inboxes(&pool)
                 .await
-                .expect("the placeholder never fails")
+                .expect("the lookup runs")
                 .is_empty(),
-            "the hook answers the empty list"
+            "no subscriptions, no relay inboxes"
+        );
+
+        let _waiting = relay::upsert(
+            &pool,
+            "https://waiting.example/relay",
+            "https://waiting.example/inbox",
+        )
+        .await
+        .expect("the pending subscription stores");
+        let _granted_row = relay::upsert(
+            &pool,
+            "https://granted.example/relay",
+            "https://granted.example/inbox",
+        )
+        .await
+        .expect("the second subscription stores");
+        let _moved = relay::mark_accepted(&pool, "https://granted.example/relay")
+            .await
+            .expect("the grant runs");
+
+        let inboxes = relay_inboxes(&pool).await.unwrap();
+        assert_eq!(
+            inboxes,
+            vec!["https://granted.example/inbox".to_owned()],
+            "the accepted relay only, until the other one answers"
+        );
+
+        let _waiting_granted = relay::mark_accepted(&pool, "https://waiting.example/relay")
+            .await
+            .expect("the second grant runs");
+        // Age the first subscription so the ordering it expects is settled
+        // rather than a race against the microsecond clock.
+        let _aged = sqlx::query(
+            "UPDATE relays SET inserted_at = now() - interval '1 minute' WHERE actor_ap_id = $1",
+        )
+        .bind("https://waiting.example/relay")
+        .execute(&pool)
+        .await
+        .expect("the stamp is settable");
+        let both = relay_inboxes(&pool).await.unwrap();
+        assert_eq!(
+            both,
+            vec![
+                "https://waiting.example/inbox".to_owned(),
+                "https://granted.example/inbox".to_owned(),
+            ],
+            "and both subscriptions deliver, oldest follow first"
         );
     }
 

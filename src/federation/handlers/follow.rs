@@ -64,6 +64,7 @@ use crate::{
         block,
         follow::{self, Follow, FollowState},
         notification::{self, TYPE_FOLLOW, TYPE_FOLLOW_REQUEST},
+        relay,
         user::{self, User},
     },
     services::{
@@ -250,6 +251,19 @@ async fn apply_accept(
     let _granted = follow::accept(&state.db, row.id)
         .await
         .map_err(|err| transient("follow acceptance", &err))?;
+    // The relay arm (see `crate::services::relay`): when the followee is a
+    // relay this instance follows, granting the follow also turns the
+    // subscription accepted, opening its inbox to the publisher's fan-out.
+    // For every other followee this writes nothing.
+    let relay_granted = relay::mark_accepted(&state.db, &signer.ap_id)
+        .await
+        .map_err(|err| transient("relay acceptance", &err))?;
+    if relay_granted {
+        debug!(
+            relay = %signer.ap_id,
+            "an inbound Accept granted a relay follow: the subscription stands accepted"
+        );
+    }
     debug!(
         follower = %row.follower_id,
         followee = %signer.nickname,
