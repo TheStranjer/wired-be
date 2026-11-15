@@ -50,15 +50,15 @@ use crate::{
 /// The `actor_type` value that makes the entity's `group` flag true.
 const GROUP_ACTOR_TYPE: &str = "Group";
 
-/// Path appended to [`Config::base_url`] for the default avatar, matching
-/// Pleroma's `[:assets, :default_user_avatar]` fallback
+/// Path appended to [`Config::frontend_base_url`] for the default avatar,
+/// matching Pleroma's `[:assets, :default_user_avatar]` fallback
 /// (`lib/pleroma/user.ex`, `avatar_url/2`). Crate-visible because the
 /// `push.deliver` job renders the same fallback into a payload's `icon`
 /// (see [`crate::jobs::web_push`]).
 pub(crate) const DEFAULT_AVATAR_PATH: &str = "/images/avi.png";
 
-/// Path appended to [`Config::base_url`] for the default banner, matching
-/// Pleroma's `banner_url/2` fallback.
+/// Path appended to [`Config::frontend_base_url`] for the default banner,
+/// matching Pleroma's `banner_url/2` fallback.
 const DEFAULT_BANNER_PATH: &str = "/images/banner.png";
 
 /// Format of `last_status_at`: a bare `YYYY-MM-DD` date, the counterpart
@@ -688,16 +688,18 @@ pub fn local_url(config: &Config, nickname: &str) -> String {
 }
 
 /// The avatar/banner URL a remote user's profile renders with: the stored
-/// `stored_url`, or `{base_url}{default_path}` when unset, then through
-/// the media proxy helper — remote users only (ticket), so a local user's
-/// images pass through untouched.
+/// `stored_url`, or `{frontend_base_url}{default_path}` when unset, then
+/// through the media proxy helper — remote users only (ticket), so a local
+/// user's images pass through untouched. The default assets are shipped by
+/// the frontend, so the fallback hangs off [`Config::frontend_base_url`],
+/// not the API's own origin.
 fn profile_image(
     user: &User,
     config: &Config,
     stored_url: Option<&str>,
     default_path: &str,
 ) -> String {
-    let fallback = format!("{}{default_path}", config.base_url);
+    let fallback = format!("{}{default_path}", config.frontend_base_url);
     let url = stored_url.unwrap_or(&fallback);
     if user.local.get() {
         url.to_owned()
@@ -1151,6 +1153,43 @@ mod tests {
             value["fqn"],
             serde_json::json!("alice@test.example"),
             "a local nickname gains the config domain"
+        );
+    }
+
+    /// The unset avatar/banner fall back to the paths under
+    /// `FRONTEND_BASE_URL` when that origin differs from `BASE_URL`, and
+    /// stay where they were on the default config, where the variable is
+    /// unset and the two origins are equal.
+    #[test]
+    fn default_images_follow_the_frontend_origin() {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
+        alice.local = Flag::new(true);
+        let value = render(&alice, &config);
+        for (key, path) in [
+            ("avatar", DEFAULT_AVATAR_PATH),
+            ("avatar_static", DEFAULT_AVATAR_PATH),
+            ("header", DEFAULT_BANNER_PATH),
+            ("header_static", DEFAULT_BANNER_PATH),
+        ] {
+            let url = value[key].as_str().unwrap();
+            assert!(
+                url.starts_with("https://fe.example") && url.ends_with(path),
+                "{key} falls back to {path} under the frontend origin: {url}"
+            );
+        }
+
+        let defaults = render(&alice, &Config::for_tests());
+        assert_eq!(
+            defaults["avatar"],
+            serde_json::json!(format!("{BASE}{DEFAULT_AVATAR_PATH}")),
+            "with FRONTEND_BASE_URL unset the avatar URL is unchanged"
+        );
+        assert_eq!(
+            defaults["header"],
+            serde_json::json!(format!("{BASE}{DEFAULT_BANNER_PATH}")),
+            "with FRONTEND_BASE_URL unset the header URL is unchanged"
         );
     }
 

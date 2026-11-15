@@ -468,6 +468,7 @@ fn other_config() -> Config {
     config.contact_email = Some("admin@example.org".to_owned());
     config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
     config.base_url = "http://snatter.example:4000".to_owned();
+    config.frontend_base_url = "http://snatter.example:4000".to_owned();
     config.max_status_chars = 300;
     config.max_media_attachments = 6;
     config.max_poll_options = 12;
@@ -507,7 +508,7 @@ async fn identity_fields_mirror_the_config() {
     );
     assert_eq!(
         document["thumbnail"], "http://snatter.example:4000/images/thumbnail.jpg",
-        "the thumbnail follows BASE_URL"
+        "the thumbnail follows FRONTEND_BASE_URL"
     );
     assert_eq!(
         document["registrations"], false,
@@ -796,7 +797,7 @@ async fn the_v2_document_follows_the_config_and_fixtures() {
     );
     assert_eq!(
         document["thumbnail"]["url"], "http://snatter.example:4000/images/thumbnail.jpg",
-        "the wrapped thumbnail follows BASE_URL"
+        "the wrapped thumbnail follows FRONTEND_BASE_URL"
     );
     assert_eq!(
         document["configuration"]["urls"]["streaming"], "ws://snatter.example:4000",

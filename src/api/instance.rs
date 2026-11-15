@@ -96,10 +96,11 @@ const MASTODON_API_LEVEL: &str = "2.7.2";
 /// The Pleroma release whose HTTP interface this server replicates
 /// (decision 1), kept in the version's compatibility comment.
 const PLEROMA_COMPATIBILITY_VERSION: &str = "2.10.2";
-/// Path appended to [`Config::base_url`] for the instance thumbnail
-/// (Pleroma's `[:instance, :instance_thumbnail]`, whose default is an
-/// image under the static root; wired-be serves API only, so the URL is
-/// advertised whether or not a file sits behind it).
+/// Path appended to [`Config::frontend_base_url`] for the instance
+/// thumbnail (Pleroma's `[:instance, :instance_thumbnail]`, whose default
+/// is an image under the static root; wired-be serves API only, so the
+/// frontend ships the file and the URL is advertised whether or not it
+/// sits behind it).
 const THUMBNAIL_PATH: &str = "/images/thumbnail.jpg";
 /// Characters one poll option may hold (Pleroma's `[:instance,
 /// :poll_limits]` `max_option_chars`).
@@ -581,7 +582,7 @@ impl Instance {
                 streaming_api: streaming_api_url(config),
             },
             stats: *stats,
-            thumbnail: format!("{}{THUMBNAIL_PATH}", config.base_url),
+            thumbnail: format!("{}{THUMBNAIL_PATH}", config.frontend_base_url),
             languages: config.instance_languages.clone(),
             registrations: config.registrations_open,
             approval_required: config.registrations_approval_required.get(),
@@ -1089,15 +1090,15 @@ struct UsageUsers {
 #[derive(Debug, Serialize)]
 struct Thumbnail {
     /// The instance thumbnail URL ([`THUMBNAIL_PATH`] under
-    /// [`Config::base_url`]).
+    /// [`Config::frontend_base_url`]).
     url: String,
 }
 
 impl Thumbnail {
-    /// The thumbnail block for `config`'s origin.
+    /// The thumbnail block for `config`'s frontend origin.
     fn for_config(config: &Config) -> Self {
         Self {
-            url: format!("{}{THUMBNAIL_PATH}", config.base_url),
+            url: format!("{}{THUMBNAIL_PATH}", config.frontend_base_url),
         }
     }
 }
@@ -1658,6 +1659,47 @@ mod tests {
         );
     }
 
+    /// Both documents' thumbnails hang under `FRONTEND_BASE_URL`, where the
+    /// frontend ships the file, not under `BASE_URL`; the identity tests
+    /// above pin the unchanged URL for the default config, where the
+    /// variable is unset and the two origins are equal.
+    #[test]
+    fn the_thumbnail_hangs_off_the_frontend_origin() {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        let stats = InstanceStats {
+            users: 0,
+            statuses: 0,
+            domains: 0,
+        };
+        let v1 = serde_json::to_value(Instance::build(
+            &config,
+            &stats,
+            &[],
+            None,
+            pleroma_block(&config),
+        ))
+        .unwrap();
+        let thumbnail = v1["thumbnail"].as_str().unwrap();
+        assert!(
+            thumbnail.starts_with("https://fe.example") && thumbnail.ends_with(THUMBNAIL_PATH),
+            "the v1 thumbnail follows FRONTEND_BASE_URL: {thumbnail}"
+        );
+        let v2 = serde_json::to_value(InstanceV2::build(
+            &config,
+            &[],
+            None,
+            TEST_VAPID_KEY,
+            pleroma_block(&config),
+        ))
+        .unwrap();
+        let wrapped = v2["thumbnail"]["url"].as_str().unwrap();
+        assert!(
+            wrapped.starts_with("https://fe.example") && wrapped.ends_with(THUMBNAIL_PATH),
+            "the v2 thumbnail block follows FRONTEND_BASE_URL: {wrapped}"
+        );
+    }
+
     /// `invites_enabled` is the `INVITES_ENABLED` setting, on both sides
     /// of its default.
     #[test]
@@ -1854,6 +1896,7 @@ mod tests {
         config.contact_email = Some("admin@example.org".to_owned());
         config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
         config.base_url = "http://snatter.example:4000".to_owned();
+        config.frontend_base_url = "http://snatter.example:4000".to_owned();
         config.max_status_chars = 300;
         config.max_media_attachments = 6;
         config.max_poll_options = 12;
@@ -2101,6 +2144,7 @@ mod tests {
         config.contact_email = Some("admin@example.org".to_owned());
         config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
         config.base_url = "http://snatter.example:4000".to_owned();
+        config.frontend_base_url = "http://snatter.example:4000".to_owned();
         config.max_status_chars = 300;
         config.max_media_attachments = 6;
         config.max_poll_options = 12;
