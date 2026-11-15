@@ -19,6 +19,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::error::AppResult;
 
@@ -82,6 +83,24 @@ const ACCEPTED_INBOXES_SQL: &str = "SELECT inbox FROM relays \
 /// and accepted alike.
 const LIST_SQL: &str = "SELECT actor_ap_id, inbox, state, inserted_at FROM relays \
                         ORDER BY inserted_at, actor_ap_id";
+
+/// [`list_with_followed_back`]: the same ledger walk, each row answered
+/// beside the one fact the admin API adds — whether the relay's mirror
+/// holds an *accepted* follow of the instance actor (`$1`). The join runs
+/// through `users` because the relationship names ids while the ledger
+/// keys on the actor URL.
+const LIST_WITH_FOLLOWED_BACK_SQL: &str = "SELECT r.actor_ap_id, \
+    EXISTS (SELECT 1 FROM follows f \
+             JOIN users u ON u.id = f.follower_id \
+            WHERE f.followee_id = $1 AND f.state = 'accepted' \
+              AND u.ap_id = r.actor_ap_id) AS followed_back \
+    FROM relays r ORDER BY r.inserted_at, r.actor_ap_id";
+
+/// [`is_followed_back`]: the one fact for the single relay the follow
+/// answer names, on the same terms as [`list_with_followed_back`].
+const IS_FOLLOWED_BACK_SQL: &str = "SELECT EXISTS (SELECT 1 FROM follows f \
+     JOIN users u ON u.id = f.follower_id \
+    WHERE f.followee_id = $1 AND f.state = 'accepted' AND u.ap_id = $2)";
 
 /// [`delete`]: the withdrawal of the follow; whether a row stood there is
 /// the answer.
@@ -185,6 +204,61 @@ pub async fn list(pool: &PgPool) -> AppResult<Vec<Relay>> {
     Ok(rows)
 }
 
+/// One row of the admin ledger: the relay actor's id beside whether that
+/// relay follows this instance back.
+///
+/// The `{"actor", "followed_back"}` pair Pleroma's `Relay.list` answers
+/// (`GET /api/v1/pleroma/admin/relay`, see
+/// [`crate::api::admin::federation`]).
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct RelayListing {
+    /// The relay actor's `ActivityPub` id — the ledger's key.
+    pub actor_ap_id: String,
+    /// Whether the relay's mirror holds an accepted follow of the
+    /// instance actor the listing was asked against.
+    pub followed_back: bool,
+}
+
+/// The whole ledger in the admin API's shape: one entry per relay row,
+/// oldest subscription first, each stating whether `instance_id` — the
+/// instance actor — is followed back by the relay.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn list_with_followed_back(
+    pool: &PgPool,
+    instance_id: Uuid,
+) -> AppResult<Vec<RelayListing>> {
+    let rows = sqlx::query_as::<_, RelayListing>(LIST_WITH_FOLLOWED_BACK_SQL)
+        .bind(instance_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Whether the relay `relay_ap_id` follows the instance actor
+/// `instance_id` back with an accepted follow — the flag a follow answer
+/// carries, asked for one relay instead of the whole ledger.
+///
+/// # Errors
+///
+/// Any database failure (connection) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn is_followed_back(
+    pool: &PgPool,
+    instance_id: Uuid,
+    relay_ap_id: &str,
+) -> AppResult<bool> {
+    let followed = sqlx::query_scalar::<_, bool>(IS_FOLLOWED_BACK_SQL)
+        .bind(instance_id)
+        .bind(relay_ap_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(followed)
+}
+
 /// Removes the subscription to `actor_ap_id`, reporting whether a row
 /// stood there: [`crate::services::relay::unfollow_relay`] calls it after
 /// the `Undo` has been queued.
@@ -204,6 +278,10 @@ pub async fn delete(pool: &PgPool, actor_ap_id: &str) -> AppResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{
+        follow,
+        user::{NewUser, User, insert},
+    };
 
     /// The relay every single-relay test here is about.
     const RELAY: &str = "https://relay.example/relay";
@@ -402,5 +480,149 @@ mod tests {
             !is_accepted(&pool, RELAY).await.unwrap(),
             "an unfollowed relay is nobody's target again"
         );
+    }
+
+    /// The actor id the stand-in instance actor carries in the
+    /// followed-back fixtures.
+    const INSTANCE_ACTOR: &str = "https://test.example/internal/fetch";
+    /// A second relay, whose subscription is never followed back.
+    const TWO: &str = "https://two.example/relay";
+    /// A third relay, whose follow of the instance actor was rejected.
+    const THREE: &str = "https://three.example/relay";
+
+    /// A local account standing in for the instance actor — the followee
+    /// the followed-back read asks about.
+    async fn instance_actor(pool: &PgPool) -> User {
+        insert(pool, &NewUser::local("instance", INSTANCE_ACTOR))
+            .await
+            .expect("the instance actor inserts")
+    }
+
+    /// The mirror of relay actor `ap_id`, hosted on `host`.
+    async fn mirror(pool: &PgPool, ap_id: &str, host: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("relay@{host}"),
+                ap_id: ap_id.to_owned(),
+                domain: Some(host.to_owned()),
+                actor_type: "Application".to_owned(),
+                inbox: Some(format!("{ap_id}/inbox")),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the relay mirror inserts")
+    }
+
+    /// Age a subscription's `inserted_at` so a listing's order is settled
+    /// rather than a race against the microsecond clock.
+    async fn age(pool: &PgPool, actor_ap_id: &str) {
+        let _aged = sqlx::query(
+            "UPDATE relays SET inserted_at = now() - interval '1 minute' WHERE actor_ap_id = $1",
+        )
+        .bind(actor_ap_id)
+        .execute(pool)
+        .await
+        .expect("the stamp is settable");
+    }
+
+    /// [`list_with_followed_back`] states every ledger row with whether
+    /// that relay's mirror holds an accepted follow of the instance
+    /// actor: the granted one reads true, the never-following and the
+    /// rejected ones false, and the ledger's order stands.
+    #[tokio::test]
+    async fn the_admin_listing_states_the_accepted_follow_backs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let instance = instance_actor(&pool).await;
+        let backer = mirror(&pool, RELAY, "relay.example").await;
+        let _quiet = mirror(&pool, TWO, "two.example").await;
+        let rejecter = mirror(&pool, THREE, "three.example").await;
+
+        let _first = upsert(&pool, RELAY, INBOX).await.unwrap();
+        let _second = upsert(&pool, TWO, "https://two.example/inbox")
+            .await
+            .unwrap();
+        let _third = upsert(&pool, THREE, "https://three.example/inbox")
+            .await
+            .unwrap();
+        age(&pool, RELAY).await;
+
+        let _granted = follow::follow(&pool, "https://test.example", &backer, &instance)
+            .await
+            .expect("the accepted follow records");
+        let withdrawn = follow::follow(&pool, "https://test.example", &rejecter, &instance)
+            .await
+            .expect("the second follow records");
+        let _rejected = follow::reject(&pool, withdrawn.id)
+            .await
+            .expect("the rejection stands");
+
+        let listed = list_with_followed_back(&pool, instance.id).await.unwrap();
+        assert_eq!(listed.len(), 3, "one entry per ledger row");
+        assert_eq!(listed[0].actor_ap_id, RELAY, "oldest subscription first");
+        assert!(
+            listed[0].followed_back,
+            "the relay with the accepted follow reads true"
+        );
+        assert_eq!(listed[1].actor_ap_id, TWO, "then the quiet one");
+        assert!(
+            !listed[1].followed_back,
+            "a relay that never follows back reads false"
+        );
+        assert_eq!(listed[2].actor_ap_id, THREE, "then the rejecter");
+        assert!(
+            !listed[2].followed_back,
+            "a rejected follow is no follow back"
+        );
+    }
+
+    /// [`is_followed_back`] answers the same fact for one actor: true for
+    /// the granted pair, false for a stranger, and false when the asking
+    /// about names a different followee.
+    #[tokio::test]
+    async fn is_followed_back_answers_for_one_relay() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let instance = instance_actor(&pool).await;
+        let stranger = mirror(&pool, TWO, "two.example").await;
+        let somebody = somebody_else(&pool).await;
+
+        let _granted = follow::follow(&pool, "https://test.example", &stranger, &instance)
+            .await
+            .expect("the follow of the instance actor records");
+        let _aside = follow::follow(&pool, "https://test.example", &stranger, &somebody)
+            .await
+            .expect("and so does the follow of another account");
+
+        assert!(
+            is_followed_back(&pool, instance.id, TWO).await.unwrap(),
+            "the accepted follow of the instance actor counts"
+        );
+        assert!(
+            !is_followed_back(&pool, instance.id, "https://nobody.example/relay")
+                .await
+                .unwrap(),
+            "an unknown actor follows nobody"
+        );
+        assert!(
+            !is_followed_back(&pool, somebody.id, RELAY).await.unwrap(),
+            "an actor that follows nobody of interest reads false"
+        );
+        assert!(
+            !is_followed_back(&pool, instance.id, THREE).await.unwrap(),
+            "an unmirrored ledger actor reads false"
+        );
+    }
+
+    /// A second local account, the wrong target of a follow-back test.
+    async fn somebody_else(pool: &PgPool) -> User {
+        insert(
+            pool,
+            &NewUser::local("someone-else", "https://test.example/users/someone-else"),
+        )
+        .await
+        .expect("the other local account inserts")
     }
 }

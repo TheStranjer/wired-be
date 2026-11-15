@@ -42,11 +42,14 @@
 //! maintenance API (`/webhooks` and its `{id}` actions, WBE-209) as the
 //! [`webhooks`] submodule, the admin's view of the accounts table
 //! (`GET /users` and `GET /users/{nickname}`, WBE-195) as the [`users`]
-//! submodule, and the OAuth-app maintenance and instance-document
+//! submodule, the OAuth-app maintenance and instance-document
 //! endpoints (`/oauth_app` and its `{id}` actions, the
 //! `/instance_document/{name}` trio, and — riding on [`crate::app`] at
 //! the root like the registration link — the public
-//! `GET /instance/{name}.html`, WBE-205) as the [`apps_docs`] submodule.
+//! `GET /instance/{name}.html`, WBE-205) as the [`apps_docs`] submodule,
+//! and the federation maintenance routes (the `/relay` ledger trio,
+//! `DELETE /instances/{instance}` and `POST /reload_emoji`, WBE-203) as
+//! the [`federation`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -73,6 +76,7 @@ use crate::{
 
 pub mod apps_docs;
 pub mod config;
+pub mod federation;
 pub mod invites;
 pub mod ops;
 pub mod users;
@@ -109,6 +113,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .route("/stats", get(stats))
         .merge(apps_docs::router(config))
         .merge(config::router())
+        .merge(federation::router())
         .merge(invites::router())
         .merge(ops::router(config))
         .merge(users::router())

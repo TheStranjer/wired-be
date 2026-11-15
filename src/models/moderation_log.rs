@@ -22,6 +22,7 @@
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`report_update`], [`report_note`], [`status_update`],
 //! [`status_delete`], [`relay_follow`], [`relay_unfollow`],
+//! [`delete_instance`], [`reload_emoji`],
 //! [`invite_create`], [`invite_revoke`], [`config_change`],
 //! [`webhook_create`], [`webhook_update`], [`webhook_delete`],
 //! [`webhook_rotate_secret`], [`emoji_pack_create`],
@@ -655,6 +656,54 @@ async fn relay_action(
             subjects: Vec::new(),
             message,
             data,
+        },
+    )
+    .await
+}
+
+/// Records a `delete_instance`: `@admin deleted instance: host`. The
+/// subject is a domain, not an account, so it rides in `data.target` —
+/// the same spot a relay target occupies.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn delete_instance(pool: &PgPool, actor: &User, host: &str) -> AppResult<ModerationLog> {
+    let message = format!("@{} deleted instance: {host}", actor.nickname);
+    let mut data = Map::new();
+    put(&mut data, "target", Value::String(host.to_owned()));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "delete_instance".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records a `reload_emoji`: `@admin reloaded emoji`. There is no subject
+/// — the action resyncs the whole on-disk pack set — so beside the
+/// actor/action/message keys [`record`] owns, the data map stays empty.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn reload_emoji(pool: &PgPool, actor: &User) -> AppResult<ModerationLog> {
+    let message = format!("@{} reloaded emoji", actor.nickname);
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "reload_emoji".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data: Map::new(),
         },
     )
     .await
@@ -1585,6 +1634,56 @@ mod tests {
             unfollowed.data.get("target").and_then(Value::as_str),
             Some("https://relay.example"),
             "the relay target rides in the data map"
+        );
+    }
+
+    /// The federation admin pair: `delete_instance` states the domain in
+    /// the sentence and carries it as `target`; `reload_emoji` names its
+    /// action and nothing else — the whole pack set is its subject.
+    #[tokio::test]
+    async fn the_federation_entries_state_their_subjects() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+
+        let deleted = delete_instance(&pool, &actor, "peer.example")
+            .await
+            .expect("delete_instance records");
+        assert_eq!(
+            deleted.message, "@mod deleted instance: peer.example",
+            "the delete_instance sentence"
+        );
+        assert_eq!(
+            deleted.data.get("action").and_then(Value::as_str),
+            Some("delete_instance"),
+            "the action names the entry"
+        );
+        assert_eq!(
+            deleted.data.get("target").and_then(Value::as_str),
+            Some("peer.example"),
+            "the domain rides in the data map"
+        );
+        assert!(
+            deleted.subject_ids.is_empty(),
+            "a domain is no account subject"
+        );
+
+        let reloaded = reload_emoji(&pool, &actor)
+            .await
+            .expect("reload_emoji records");
+        assert_eq!(
+            reloaded.message, "@mod reloaded emoji",
+            "the reload_emoji sentence"
+        );
+        assert_eq!(
+            reloaded.data.get("action").and_then(Value::as_str),
+            Some("reload_emoji"),
+            "and its action"
+        );
+        assert!(
+            reloaded.data.get("target").is_none(),
+            "there is no subject to name: {}",
+            reloaded.data
         );
     }
 

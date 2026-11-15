@@ -1,6 +1,9 @@
-//! The admin API's JSON shapes: the moderation-log page, the stats
-//! counters, the invite, webhook and ops entities, and the OAuth-app and
-//! instance-document answers (WBE-199, WBE-209, WBE-208, WBE-205).
+//! The admin API's JSON shapes (WBE-199, WBE-209, WBE-208, WBE-205,
+//! WBE-203).
+//!
+//! They cover the moderation-log page, the stats counters, the invite,
+//! webhook and ops entities, the OAuth-app and instance-document
+//! answers, and the relay ledger.
 //!
 //! Pleroma renders all of them through
 //! `Pleroma.Web.AdminAPI.ModerationLogView`
@@ -26,7 +29,7 @@ use serde_json::Value;
 use crate::{
     config::FrontendConfig,
     models::{
-        invite_token::InviteToken, moderation_log, oauth_app::OauthApp,
+        invite_token::InviteToken, moderation_log, oauth_app::OauthApp, relay::RelayListing,
         status::StatusVisibilityCounts, webhook::Webhook,
     },
 };
@@ -310,6 +313,51 @@ pub struct FrontendInstallStatus {
 impl FrontendInstallStatus {
     /// The success body.
     pub const OK: Self = Self { status: "ok" };
+}
+
+/// One relay of the admin ledger: the followed actor's `ActivityPub` id
+/// beside whether that relay follows this instance back.
+///
+/// Pleroma's `{actor, followed_back}` map, one per `Relay.list` entry
+/// (`lib/pleroma/web/activity_pub/relay.ex`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdminRelay {
+    /// The relay actor's `ActivityPub` id (the `relays` row's key).
+    pub actor: String,
+    /// Whether the relay's mirror holds an accepted follow of the
+    /// instance actor.
+    pub followed_back: bool,
+}
+
+/// The `GET /api/v1/pleroma/admin/relay` answer: every relay subscription
+/// in Pleroma's `{actor, followed_back}` shape, under the `relays` key
+/// `RelayController.index` renders.
+#[derive(Debug, Serialize)]
+pub struct AdminRelayList {
+    /// The ledger, oldest subscription first.
+    pub relays: Vec<AdminRelay>,
+}
+
+impl AdminRelay {
+    /// Renders one [`RelayListing`] row under the `actor` name Pleroma's
+    /// map gives the actor id.
+    #[must_use]
+    pub fn from_listing(listing: &RelayListing) -> Self {
+        Self {
+            actor: listing.actor_ap_id.clone(),
+            followed_back: listing.followed_back,
+        }
+    }
+}
+
+impl AdminRelayList {
+    /// Renders the whole ledger read, keeping the model's order.
+    #[must_use]
+    pub fn from_listings(listings: &[RelayListing]) -> Self {
+        Self {
+            relays: listings.iter().map(AdminRelay::from_listing).collect(),
+        }
+    }
 }
 
 /// One OAuth application, the admin API's shape.
@@ -626,7 +674,7 @@ mod tests {
         assert_eq!(entries[0]["name"], "Admin Client", "rendered as the entity");
     }
 
-    /// The two instance-document answers: the URL object, and the empty
+    /// The document answers: the URL object, and the empty
     /// object — which a derived unit-struct render would get wrong, hence
     /// the manual `Serialize`.
     #[test]
@@ -642,5 +690,46 @@ mod tests {
         );
         let ack = serde_json::to_value(InstanceDocumentAck).expect("the ack serializes");
         assert_eq!(ack, json!({}), "the delete body is the empty object");
+    }
+
+    /// Two ledger rows for the relay renders: one followed back, one not.
+    fn relay_listings() -> [RelayListing; 2] {
+        [
+            RelayListing {
+                actor_ap_id: "https://relay.example/relay".to_owned(),
+                followed_back: true,
+            },
+            RelayListing {
+                actor_ap_id: "https://quiet.example/relay".to_owned(),
+                followed_back: false,
+            },
+        ]
+    }
+
+    /// The listing renders Pleroma's `{actor, followed_back}` pair per
+    /// ledger row under the `relays` key, order kept and nothing else;
+    /// the single answer is one such pair bare.
+    #[test]
+    fn the_relay_entries_render_the_paired_keys() {
+        let listings = relay_listings();
+        let rendered = serde_json::to_value(AdminRelayList::from_listings(&listings))
+            .expect("the list serializes");
+        assert_eq!(
+            rendered,
+            json!({
+                "relays": [
+                    {"actor": "https://relay.example/relay", "followed_back": true},
+                    {"actor": "https://quiet.example/relay", "followed_back": false},
+                ]
+            }),
+            "two entries, the model's order, exactly the pinned keys"
+        );
+        let single = serde_json::to_value(AdminRelay::from_listing(&listings[0]))
+            .expect("the entry serializes");
+        assert_eq!(
+            single,
+            json!({"actor": "https://relay.example/relay", "followed_back": true}),
+            "the follow answer carries no wrapper"
+        );
     }
 }

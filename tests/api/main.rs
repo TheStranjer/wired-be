@@ -59,6 +59,14 @@ mod admin;
 /// refusals, and both areas' scope gates.
 mod admin_apps_docs;
 
+/// The admin federation endpoints over HTTP (WBE-203): the `/relay`
+/// follow / unfollow lifecycle against a mock relay and its
+/// `{actor, followed_back}` ledger, `DELETE /instances/{instance}`
+/// staging the domain's `users.delete_remote` sweeps and clearing the
+/// `instances` row, `POST /reload_emoji` resyncing packs from disk, and
+/// the `admin:read:relays`-family scope gate on all five routes.
+mod admin_federation;
+
 /// The admin ops endpoints over HTTP: the media-proxy cache ledger, the
 /// frontend catalogue and installer, and the admin backup trigger.
 mod admin_ops;
