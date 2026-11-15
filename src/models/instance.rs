@@ -197,6 +197,30 @@ pub async fn list_unreachable(pool: &PgPool) -> AppResult<Vec<(String, DateTime<
     Ok(rows)
 }
 
+/// [`delete`]: the withdrawal of the ledger entry itself; whether a row
+/// stood there is the answer.
+const DELETE_SQL: &str = "DELETE FROM instances WHERE host = $1";
+
+/// Removes `host`'s row from the ledger, reporting whether one stood
+/// there.
+///
+/// This is the instance-deletion act of
+/// `DELETE /api/v1/pleroma/admin/instances/{instance}`
+/// ([`crate::api::admin::federation`]), which clears the host's mirrored
+/// accounts through [`users.delete_remote`](crate::jobs::deletion::KIND_DELETE_REMOTE)
+/// first. Unknown hosts are the false answer, not an error — the admin
+/// deletion of a never-seen domain is a legal no-op, exactly as Pleroma's
+/// worker's `nil -> :ok` arm reads it.
+///
+/// # Errors
+///
+/// Any database failure (connection) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete(pool: &PgPool, host: &str) -> AppResult<bool> {
+    let gone = sqlx::query(DELETE_SQL).bind(host).execute(pool).await?;
+    Ok(gone.rows_affected() > 0)
+}
+
 /// The inbox URLs of the relays this instance follows *and that have
 /// accepted the follow*.
 ///
@@ -616,5 +640,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 1, "five writes, one row");
+    }
+
+    /// [`delete`] takes the ledger row with it and reports whether one
+    /// stood there: a marked host withdraws once, a repeat and a never-
+    /// seen host are silent no-ops, and no other host's row is touched.
+    #[tokio::test]
+    async fn delete_withdraws_the_ledger_row_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        set_unreachable(&pool, HOST, stamp(1, 0)).await.unwrap();
+        touch(&pool, "other.example").await.unwrap();
+
+        assert!(delete(&pool, HOST).await.unwrap(), "the row was there");
+        assert!(
+            !unreachable(&pool, HOST).await,
+            "the deleted host is gone from the ledger entirely"
+        );
+        assert!(
+            !delete(&pool, HOST).await.unwrap(),
+            "a repeat finds nothing to delete"
+        );
+        assert!(
+            !delete(&pool, "never-seen.example").await.unwrap(),
+            "an unknown host is a no-op, not an error"
+        );
+
+        let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM instances WHERE host = $1")
+            .bind(HOST)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "no row stands behind the deleted host");
+        let kept = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM instances WHERE host = $1")
+            .bind("other.example")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept, 1, "and the neighbouring row is untouched");
     }
 }

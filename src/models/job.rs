@@ -12,7 +12,8 @@
 //! | `completed` | finished successfully (terminal)                      |
 //! | `discarded` | failed for good (terminal)                            |
 //!
-//! [`enqueue`] inserts, [`claim_next`] hands one due job to one worker,
+//! [`enqueue`] inserts, [`enqueue_batch`] many in one transaction,
+//! [`claim_next`] hands one due job to one worker,
 //! [`complete`] and [`fail`] end an attempt, [`rescue_stuck`] recovers
 //! jobs whose worker died mid-flight, and [`cancel_pending`] takes back a
 //! keyed job no worker has started yet — the cancel half of re-queueing
@@ -82,6 +83,16 @@ pub struct NewJob<'a> {
     pub unique_key: Option<&'a str>,
 }
 
+/// [`enqueue`] and [`enqueue_batch`] share this statement: one row per
+/// execution, the `Option`al fields falling to the column defaults
+/// through `COALESCE`, and the deduplication contract living in the
+/// partial unique index the `ON CONFLICT DO NOTHING` rides on.
+const INSERT_JOB_SQL: &str =
+    "INSERT INTO jobs (id, queue, kind, args, run_at, max_attempts, unique_key)
+         VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($6, 5), $7)
+         ON CONFLICT DO NOTHING
+         RETURNING *";
+
 /// Inserts a new job and returns its row, or `None` when the row was
 /// dropped by deduplication.
 ///
@@ -97,22 +108,53 @@ pub struct NewJob<'a> {
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn enqueue(pool: &PgPool, new_job: NewJob<'_>) -> AppResult<Option<Job>> {
-    let inserted = sqlx::query_as::<_, Job>(
-        "INSERT INTO jobs (id, queue, kind, args, run_at, max_attempts, unique_key)
-         VALUES ($1, $2, $3, $4, COALESCE($5, now()), COALESCE($6, 5), $7)
-         ON CONFLICT DO NOTHING
-         RETURNING *",
-    )
-    .bind(new_id())
-    .bind(new_job.queue)
-    .bind(new_job.kind)
-    .bind(new_job.args)
-    .bind(new_job.run_at)
-    // 5 mirrors the `max_attempts` column default.
-    .bind(new_job.max_attempts)
-    .bind(new_job.unique_key)
-    .fetch_optional(pool)
-    .await?;
+    let inserted = sqlx::query_as::<_, Job>(INSERT_JOB_SQL)
+        .bind(new_id())
+        .bind(new_job.queue)
+        .bind(new_job.kind)
+        .bind(new_job.args)
+        .bind(new_job.run_at)
+        // 5 mirrors the `max_attempts` column default.
+        .bind(new_job.max_attempts)
+        .bind(new_job.unique_key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(inserted)
+}
+
+/// Inserts many jobs in one transaction on one connection and reports how
+/// many rows actually went in.
+///
+/// The batch is the instance-deletion queueing of
+/// `DELETE /api/v1/pleroma/admin/instances/{instance}`
+/// ([`crate::api::admin::federation`]): one
+/// [`users.delete_remote`](crate::jobs::deletion::KIND_DELETE_REMOTE)
+/// sweep per doomed account, all of them committed together — a failure
+/// partway through aborts the transaction, so the queue never learns half
+/// a deletion. Deduplication applies per row exactly as in [`enqueue`]: a
+/// keyed job a live row already carries is skipped and not counted.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn enqueue_batch(pool: &PgPool, jobs: &[NewJob<'_>]) -> AppResult<u64> {
+    let mut tx = pool.begin().await?;
+    let mut inserted = 0_u64;
+    for new_job in jobs {
+        let written = sqlx::query(INSERT_JOB_SQL)
+            .bind(new_id())
+            .bind(new_job.queue)
+            .bind(new_job.kind)
+            .bind(&new_job.args)
+            .bind(new_job.run_at)
+            .bind(new_job.max_attempts)
+            .bind(new_job.unique_key)
+            .execute(&mut *tx)
+            .await?;
+        inserted += written.rows_affected();
+    }
+    tx.commit().await?;
     Ok(inserted)
 }
 
@@ -782,6 +824,69 @@ mod tests {
             fetch(&pool, unkeyed.id).await.state,
             "available",
             "and the unkeyed job is left alone"
+        );
+    }
+
+    /// [`enqueue_batch`] commits the whole set in one call and counts what
+    /// went in: every row is claimable afterwards, the per-row dedup of
+    /// [`enqueue`] holds inside a batch, an empty batch is a clean no-op,
+    /// and the `None` defaults land on the column defaults like always.
+    #[tokio::test]
+    async fn enqueue_batch_inserts_the_whole_set() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let jobs = vec![
+            NewJob {
+                args: json!({ "user_id": "11111111-1111-1111-1111-111111111111" }),
+                ..new_job("default", "users.delete_remote")
+            },
+            new_job("default", "users.delete_remote"),
+            new_job("other", "some.other"),
+        ];
+        let inserted = enqueue_batch(&pool, &jobs).await.unwrap();
+        assert_eq!(inserted, 3, "three asked, three in");
+
+        let total = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 3, "all three stand in the table");
+        let claimed = claim_next(&pool, &["default"]).await.unwrap();
+        assert!(
+            matches!(&claimed, Some(job) if job.kind == "users.delete_remote"),
+            "the batch is due and claimable at once"
+        );
+        let stored = fetch(&pool, claimed.expect("just claimed").id).await;
+        assert_eq!(stored.max_attempts, 5, "defaults fall to the columns");
+
+        // The keyed arm of the shared statement: a live row with the same
+        // key swallows its batch twin, and the unkeyed rows still ride.
+        let _first = enqueue(
+            &pool,
+            NewJob {
+                unique_key: Some("dup"),
+                ..new_job("default", "keyed")
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the live keyed job inserts");
+        let mixed = vec![
+            new_job("default", "plain-a"),
+            NewJob {
+                unique_key: Some("dup"),
+                ..new_job("default", "keyed-dup")
+            },
+            new_job("default", "plain-b"),
+        ];
+        let dup_count = enqueue_batch(&pool, &mixed).await.unwrap();
+        assert_eq!(dup_count, 2, "the duplicate key is skipped, the rest rides");
+
+        assert_eq!(
+            enqueue_batch(&pool, &[]).await.unwrap(),
+            0,
+            "nothing asked, nothing inserted"
         );
     }
 }

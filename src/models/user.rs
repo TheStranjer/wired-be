@@ -1543,6 +1543,47 @@ where
     Ok(())
 }
 
+/// The statement behind [`mark_deleted_by_domain`]: [`MARK_DELETED_SQL`]'s
+/// mark applied to every remote mirror of one domain at once, its
+/// data-modifying CTE handing the stamped ids back in `UUIDv7` text order
+/// — decision 4's sort, so approximately the order the accounts were
+/// mirrored and, more usefully, a settled order the caller's queueing
+/// and the tests' assertions can both rely on.
+const MARK_DELETED_BY_DOMAIN_SQL: &str = "WITH marked AS ( \
+    UPDATE users SET is_active = false, deleted_at = now(), updated_at = now() \
+    WHERE domain = $1 AND local = false AND deleted_at IS NULL \
+    RETURNING id \
+) SELECT id FROM marked ORDER BY id";
+
+/// Deactivates every remote mirror of the domain `domain` and stamps
+/// [`deleted_at`](User::deleted_at) on it, answering with the ids it
+/// stamped.
+///
+/// This is the synchronous first act of
+/// `DELETE /api/v1/pleroma/admin/instances/{instance}`
+/// ([`crate::api::admin::federation`]), where each returned id then rides
+/// its own [`users.delete_remote`](crate::jobs::deletion::KIND_DELETE_REMOTE)
+/// sweep — the same mark-then-queue pair
+/// [`crate::federation::handlers::actor`] applies to a single actor's
+/// self-deletion.
+///
+/// Rows already stamped are not returned and not re-marked: their accounts
+/// are deleted, and the sweep a deletion implies was queued when the mark
+/// went on. Local rows carry no [`domain`](User::domain) and are out of the
+/// statement's reach by construction.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn mark_deleted_by_domain(pool: &PgPool, domain: &str) -> AppResult<Vec<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(MARK_DELETED_BY_DOMAIN_SQL)
+        .bind(domain)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
 /// The `UPDATE` behind [`purge_personal_data`]: nulls the two personal
 /// columns, blanks the display name, and refreshes `updated_at`.
 const PURGE_PERSONAL_DATA_SQL: &str = "UPDATE users
@@ -3562,6 +3603,83 @@ mod tests {
                 .unwrap(),
             None,
             "and for the tags"
+        );
+    }
+
+    /// A remote mirror of `domain` named `nickname`, inserted.
+    async fn mirror_of(pool: &PgPool, nickname: &str, domain: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("{nickname}@{domain}"),
+                ap_id: format!("https://{domain}/users/{nickname}"),
+                domain: Some(domain.to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the mirror fixture inserts")
+    }
+
+    /// `id`'s row, insisted upon.
+    async fn must_get(pool: &PgPool, id: Uuid) -> User {
+        get_by_id(pool, id)
+            .await
+            .expect("the read runs")
+            .expect("the row stands")
+    }
+
+    /// [`mark_deleted_by_domain`] stamps every remote mirror of one
+    /// domain in one pass and answers the stamped ids: an already-stamped
+    /// row is left out, a local row and another domain's mirror stand
+    /// untouched, and a repeat pass marks nothing again.
+    #[tokio::test]
+    async fn mark_deleted_by_domain_sweeps_one_domains_mirrors() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let bob = mirror_of(&pool, "bob", "sweep.example").await;
+        let carol = mirror_of(&pool, "carol", "sweep.example").await;
+        let already = mirror_of(&pool, "dave", "sweep.example").await;
+        mark_deleted(&pool, already.id)
+            .await
+            .expect("the pre-stamp lands");
+        let alice = insert(
+            &pool,
+            &NewUser::local("alice", "https://test.example/users/alice"),
+        )
+        .await
+        .expect("the local fixture inserts");
+        let erin = mirror_of(&pool, "erin", "keep.example").await;
+
+        let doomed = mark_deleted_by_domain(&pool, "sweep.example")
+            .await
+            .unwrap();
+        let mut expected = vec![bob.id, carol.id];
+        expected.sort_unstable();
+        assert_eq!(doomed, expected, "the two fresh mirrors, id-ordered");
+
+        for id in [bob.id, carol.id] {
+            let gone = must_get(&pool, id).await;
+            assert!(!gone.is_active.get(), "{id} is deactivated");
+            assert!(gone.deleted_at.is_some(), "{id} carries the stamp");
+        }
+        let kept = must_get(&pool, erin.id).await;
+        assert!(
+            kept.is_active.get() && kept.deleted_at.is_none(),
+            "another domain stands untouched"
+        );
+        let local = must_get(&pool, alice.id).await;
+        assert!(
+            local.is_active.get() && local.deleted_at.is_none(),
+            "the local row is out of the statement's reach"
+        );
+
+        let second_pass = mark_deleted_by_domain(&pool, "sweep.example")
+            .await
+            .unwrap();
+        assert!(
+            second_pass.is_empty(),
+            "a repeat pass restamps nobody, the pre-stamped row included"
         );
     }
 }
