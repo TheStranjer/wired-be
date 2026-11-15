@@ -27,7 +27,9 @@
 //!
 //! The account reads the [`users`] submodule serves — `GET /users` and
 //! `GET /users/{nickname}` — are listed there, along with the invite
-//! actions of [`invites`] and the webhook routes of [`webhooks`].
+//! actions of [`invites`] and the webhook routes of [`webhooks`]. The
+//! media-proxy cache ledger, the frontend installer and the admin's backup
+//! trigger (WBE-208) are the [`ops`] submodule.
 //!
 //! Later admin tickets join this same file with more `.merge(...)` /
 //! `.route(...)` lines; the [module docs of `crate::api::v1`](crate::api::v1)
@@ -57,6 +59,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::{
     auth::admin::AdminUser,
+    config::Config,
     entities::admin::{AdminStats, ModerationLogPage},
     error::{AppError, AppResult},
     models::{moderation_log, status},
@@ -66,6 +69,7 @@ use crate::{
 
 pub mod config;
 pub mod invites;
+pub mod ops;
 pub mod users;
 pub mod webhooks;
 
@@ -89,12 +93,17 @@ const CLASS_READ: &str = "read";
 
 /// The `/api/v1/pleroma/admin` router, nested into [`crate::api::v1`].
 /// Later admin tickets extend it with more `.merge(...)` lines.
-pub fn router() -> Router<AppState> {
+///
+/// `config` reaches [`ops::router`], the one merged router whose routes
+/// carry a body limit of their own (the frontend install's uploaded zip;
+/// see [`crate::extract::multipart::upload_body_limit`]).
+pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/moderation_log", get(list_moderation_log))
         .route("/stats", get(stats))
         .merge(config::router())
         .merge(invites::router())
+        .merge(ops::router(config))
         .merge(users::router())
         .merge(webhooks::router())
 }
