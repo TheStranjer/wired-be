@@ -337,6 +337,7 @@ async fn list_frontends(
     admin.require(CLASS_READ, AREA_FRONTENDS)?;
     let frontends = state
         .config
+        .statics
         .frontends
         .available
         .iter()
@@ -350,7 +351,7 @@ async fn list_frontends(
 /// `frontend_controller.ex`). An entry without a ref is flagged by its
 /// `<name>` directory alone.
 fn frontend_installed(config: &Config, entry: &FrontendConfig) -> bool {
-    let mut path = config.frontends.dir.join(&entry.name);
+    let mut path = config.statics.frontends.dir.join(&entry.name);
     if let Some(reference) = &entry.reference {
         path.push(reference);
     }
@@ -422,12 +423,13 @@ async fn install_frontend(
     };
     let destination = state
         .config
+        .statics
         .frontends
         .dir
         .join(&install.name)
         .join(&install.reference);
     land_archive(
-        &state.config.frontends.dir,
+        &state.config.statics.frontends.dir,
         destination,
         install.build_dir.as_deref(),
         archive,
@@ -461,6 +463,7 @@ fn resolve_install(config: &Config, params: &InstallParams, has_file: bool) -> A
         .ok_or_else(|| AppError::BadRequest(MISSING_NAME.to_owned()))?
         .to_owned();
     let entry = config
+        .statics
         .frontends
         .available
         .iter()
@@ -808,7 +811,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::FrontendSettings;
 
     /// Whether `err` is the install refusal naming `detail` — the ticket's
     /// pinned prefix, with the tail left to the reason.
@@ -826,7 +828,7 @@ mod tests {
     /// applied directly (the fields, not the environment).
     fn config_with_frontends(frontends: &[(&str, Option<&str>)]) -> Config {
         let mut config = Config::for_tests();
-        config.frontends.available = frontends
+        config.statics.frontends.available = frontends
             .iter()
             .map(|(name, reference)| FrontendConfig {
                 name: (*name).to_owned(),
@@ -952,19 +954,14 @@ mod tests {
 
     #[test]
     fn the_config_entry_supplies_what_the_request_omits() {
-        let config = Config {
-            frontends: FrontendSettings {
-                dir: Config::for_tests().frontends.dir,
-                available: vec![FrontendConfig {
-                    name: "plume".to_owned(),
-                    git: Some("https://example.org/plume".to_owned()),
-                    build_url: Some("https://build.example/${ref}.zip".to_owned()),
-                    reference: Some("stable".to_owned()),
-                    build_dir: Some("output".to_owned()),
-                }],
-            },
-            ..Config::for_tests()
-        };
+        let mut config = Config::for_tests();
+        config.statics.frontends.available = vec![FrontendConfig {
+            name: "plume".to_owned(),
+            git: Some("https://example.org/plume".to_owned()),
+            build_url: Some("https://build.example/${ref}.zip".to_owned()),
+            reference: Some("stable".to_owned()),
+            build_dir: Some("output".to_owned()),
+        }];
 
         let from_config = resolved(
             &config,
@@ -993,19 +990,14 @@ mod tests {
         );
         assert_eq!(overridden.reference, "nightly", "the request wins");
 
-        let no_ref = Config {
-            frontends: FrontendSettings {
-                dir: Config::for_tests().frontends.dir,
-                available: vec![FrontendConfig {
-                    name: "bare".to_owned(),
-                    git: None,
-                    build_url: Some("https://build.example/x.zip".to_owned()),
-                    reference: None,
-                    build_dir: None,
-                }],
-            },
-            ..Config::for_tests()
-        };
+        let mut no_ref = Config::for_tests();
+        no_ref.statics.frontends.available = vec![FrontendConfig {
+            name: "bare".to_owned(),
+            git: None,
+            build_url: Some("https://build.example/x.zip".to_owned()),
+            reference: None,
+            build_dir: None,
+        }];
         let defaulted = resolved(
             &no_ref,
             &InstallParams {
@@ -1178,35 +1170,31 @@ mod tests {
     #[test]
     fn the_frontends_read_both_build_paths() {
         let root = tempfile::tempdir().expect("a frontends dir");
-        let config = Config {
-            frontends: FrontendSettings {
-                dir: root.path().to_path_buf(),
-                available: vec![
-                    FrontendConfig {
-                        name: "plume".to_owned(),
-                        git: None,
-                        build_url: None,
-                        reference: Some("stable".to_owned()),
-                        build_dir: None,
-                    },
-                    FrontendConfig {
-                        name: "soap".to_owned(),
-                        git: None,
-                        build_url: None,
-                        reference: Some("master".to_owned()),
-                        build_dir: None,
-                    },
-                    FrontendConfig {
-                        name: "bare".to_owned(),
-                        git: None,
-                        build_url: None,
-                        reference: None,
-                        build_dir: None,
-                    },
-                ],
+        let mut config = Config::for_tests();
+        config.statics.frontends.dir = root.path().to_path_buf();
+        config.statics.frontends.available = vec![
+            FrontendConfig {
+                name: "plume".to_owned(),
+                git: None,
+                build_url: None,
+                reference: Some("stable".to_owned()),
+                build_dir: None,
             },
-            ..Config::for_tests()
-        };
+            FrontendConfig {
+                name: "soap".to_owned(),
+                git: None,
+                build_url: None,
+                reference: Some("master".to_owned()),
+                build_dir: None,
+            },
+            FrontendConfig {
+                name: "bare".to_owned(),
+                git: None,
+                build_url: None,
+                reference: None,
+                build_dir: None,
+            },
+        ];
         std::fs::create_dir_all(root.path().join("plume").join("stable"))
             .expect("the installed dir");
         std::fs::write(
@@ -1217,15 +1205,15 @@ mod tests {
         std::fs::create_dir_all(root.path().join("bare")).expect("the bare dir");
 
         assert!(
-            frontend_installed(&config, &config.frontends.available[0]),
+            frontend_installed(&config, &config.statics.frontends.available[0]),
             "plume/stable stands"
         );
         assert!(
-            !frontend_installed(&config, &config.frontends.available[1]),
+            !frontend_installed(&config, &config.statics.frontends.available[1]),
             "soap/master was never built"
         );
         assert!(
-            frontend_installed(&config, &config.frontends.available[2]),
+            frontend_installed(&config, &config.statics.frontends.available[2]),
             "a refless entry reads its name directory"
         );
     }

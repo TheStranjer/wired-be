@@ -40,9 +40,13 @@
 //! as the [`invites`] submodule — whose [`registration_router`]
 //! additionally rides on [`crate::app`] at the root — the webhook
 //! maintenance API (`/webhooks` and its `{id}` actions, WBE-209) as the
-//! [`webhooks`] submodule, and the admin's view of the accounts table
+//! [`webhooks`] submodule, the admin's view of the accounts table
 //! (`GET /users` and `GET /users/{nickname}`, WBE-195) as the [`users`]
-//! submodule.
+//! submodule, and the OAuth-app maintenance and instance-document
+//! endpoints (`/oauth_app` and its `{id}` actions, the
+//! `/instance_document/{name}` trio, and — riding on [`crate::app`] at
+//! the root like the registration link — the public
+//! `GET /instance/{name}.html`, WBE-205) as the [`apps_docs`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -67,6 +71,7 @@ use crate::{
     util::id::parse_id,
 };
 
+pub mod apps_docs;
 pub mod config;
 pub mod invites;
 pub mod ops;
@@ -94,13 +99,15 @@ const CLASS_READ: &str = "read";
 /// The `/api/v1/pleroma/admin` router, nested into [`crate::api::v1`].
 /// Later admin tickets extend it with more `.merge(...)` lines.
 ///
-/// `config` reaches [`ops::router`], the one merged router whose routes
-/// carry a body limit of their own (the frontend install's uploaded zip;
-/// see [`crate::extract::multipart::upload_body_limit`]).
+/// `config` reaches [`ops::router`] and [`apps_docs::router`], the merged
+/// routers whose routes carry a body limit of their own (the frontend
+/// install's uploaded zip and the instance-document upload; see
+/// [`crate::extract::multipart::upload_body_limit`]).
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/moderation_log", get(list_moderation_log))
         .route("/stats", get(stats))
+        .merge(apps_docs::router(config))
         .merge(config::router())
         .merge(invites::router())
         .merge(ops::router(config))

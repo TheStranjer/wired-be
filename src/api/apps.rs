@@ -127,10 +127,12 @@ struct CreateAppParams {
 
 /// `redirect_uris` as clients send it: one string — which may itself
 /// hold several space- or newline-separated URIs — or a list (a JSON
-/// array, or form `redirect_uris[]=…` keys).
+/// array, or form `redirect_uris[]=…` keys). Shared with the admin
+/// app routes ([`crate::api::admin::apps_docs`]), which read the same
+/// two spellings.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum RedirectUris {
+pub(crate) enum RedirectUris {
     /// A single string, passed through to storage verbatim.
     Single(String),
     /// A list of URIs, joined into the stored newline-separated form.
@@ -142,7 +144,7 @@ enum RedirectUris {
 /// `normalize_redirect_uris`, `lib/pleroma/web/o_auth/app.ex`); a lone
 /// string is kept as the client sent it. The empty or blank result this
 /// can leave is what the endpoint rejects with 422.
-fn normalize_redirect_uris(input: RedirectUris) -> String {
+pub(crate) fn normalize_redirect_uris(input: RedirectUris) -> String {
     match input {
         RedirectUris::Single(text) => text,
         RedirectUris::Multiple(uris) => uris

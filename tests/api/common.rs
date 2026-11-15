@@ -134,6 +134,22 @@ pub fn test_config_with_emoji_dir(emoji_dir: &Path) -> Config {
     config
 }
 
+/// [`test_config`] with the instance-document store moved to `docs_dir`,
+/// for tests that upload and read documents and must not write into the
+/// repository. The document names keep their defaults.
+#[must_use]
+pub fn test_config_with_instance_docs_dir(docs_dir: &Path) -> Config {
+    let mut config = test_config();
+    config.statics.documents.dir = docs_dir.to_path_buf();
+    config
+}
+
+/// The real application router, reading and writing instance documents
+/// in `docs_dir`.
+pub fn test_app_with_instance_docs_dir(pool: PgPool, docs_dir: &Path) -> Router {
+    test_app_with_config(pool, test_config_with_instance_docs_dir(docs_dir))
+}
+
 /// The local-file [`UploaderBackend`] storing in `uploads_dir`: the same
 /// storage [`test_app_with_uploads_dir`] serves from.
 ///
