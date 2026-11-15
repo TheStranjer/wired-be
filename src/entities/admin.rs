@@ -1,6 +1,6 @@
 //! The admin API's JSON shapes: the moderation-log page, the stats
-//! counters and the registration-invite entity behind the `users/*`
-//! invite endpoints (WBE-199).
+//! counters, the registration-invite entity (WBE-199) and the webhook
+//! entity behind the `webhooks/*` maintenance endpoints (WBE-209).
 //!
 //! Pleroma renders all of them through
 //! `Pleroma.Web.AdminAPI.ModerationLogView`
@@ -20,7 +20,9 @@ use chrono::NaiveDate;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::models::{invite_token::InviteToken, moderation_log, status::StatusVisibilityCounts};
+use crate::models::{
+    invite_token::InviteToken, moderation_log, status::StatusVisibilityCounts, webhook::Webhook,
+};
 
 /// One entry of the moderation log listing, Pleroma's
 /// `ModerationLogView` `"show.json"`.
@@ -177,6 +179,50 @@ impl InviteList {
     }
 }
 
+/// One webhook, the admin API's `show.json`.
+///
+/// Pleroma's `WebhookView` (`lib/pleroma/web/admin_api/views/webhook_view.ex`)
+/// without its two timestamps — the entity is the six keys the ticket
+/// names. `id` is the `UUIDv7` as lowercase hyphenated text (decision 4)
+/// and `secret` the stored signing hex, answered to admins verbatim.
+#[derive(Debug, Serialize)]
+pub struct AdminWebhook {
+    /// The row's `UUIDv7` as text.
+    pub id: String,
+    /// Where events are delivered.
+    pub url: String,
+    /// The subscribed event types.
+    pub events: Vec<String>,
+    /// The signing secret.
+    pub secret: String,
+    /// Whether deliveries happen at all.
+    pub enabled: bool,
+    /// Whether the instance itself installed this webhook.
+    pub internal: bool,
+}
+
+impl AdminWebhook {
+    /// Renders one [`Webhook`] row in the admin API's shape.
+    #[must_use]
+    pub fn from_webhook(webhook: &Webhook) -> Self {
+        Self {
+            id: webhook.id.to_string(),
+            url: webhook.url.clone(),
+            events: webhook.events.clone(),
+            secret: webhook.secret.clone(),
+            enabled: webhook.enabled,
+            internal: webhook.internal,
+        }
+    }
+
+    /// Renders a whole listing page, in the row order [`Webhook`]s come
+    /// in — the id-ordered window the model reads.
+    #[must_use]
+    pub fn from_rows(webhooks: &[Webhook]) -> Vec<Self> {
+        webhooks.iter().map(Self::from_webhook).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone as _, Utc};
@@ -257,5 +303,54 @@ mod tests {
         assert_eq!(entries.len(), 2, "both invites");
         assert_eq!(entries[0]["max_use"], json!(3), "the newer one first");
         assert_eq!(entries[1]["max_use"], json!(null), "then the older");
+    }
+
+    /// A stored webhook row for the render tests.
+    fn webhook(internal: bool) -> Webhook {
+        Webhook {
+            id: Uuid::parse_str("0198fc3a-0000-7000-8000-000000000042").expect("test uuid"),
+            url: "https://example.org/hook".to_owned(),
+            events: vec!["report.created".to_owned(), "account.created".to_owned()],
+            secret: "ab".repeat(32),
+            enabled: true,
+            internal,
+            inserted_at: Utc.with_ymd_and_hms(2026, 1, 31, 12, 34, 56).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 2, 1, 9, 0, 0).unwrap(),
+        }
+    }
+
+    /// The entity carries exactly the ticket's six keys — no timestamps —
+    /// the secret answered verbatim.
+    #[test]
+    fn a_webhook_renders_the_six_pinned_keys() {
+        let rendered = serde_json::to_value(AdminWebhook::from_webhook(&webhook(false)))
+            .expect("the entity serializes");
+        assert_eq!(
+            rendered,
+            json!({
+                "id": "0198fc3a-0000-7000-8000-000000000042",
+                "url": "https://example.org/hook",
+                "events": ["report.created", "account.created"],
+                "secret": "ab".repeat(32),
+                "enabled": true,
+                "internal": false,
+            }),
+            "no created_at, no surprises"
+        );
+    }
+
+    /// The page render keeps the rows in the order the model read them.
+    #[test]
+    fn the_page_render_keeps_the_row_order() {
+        let rows = vec![webhook(false), webhook(true)];
+        let rendered =
+            serde_json::to_value(AdminWebhook::from_rows(&rows)).expect("the page serializes");
+        let entries = rendered.as_array().expect("a JSON array");
+        assert_eq!(entries.len(), 2, "both rows");
+        assert_eq!(
+            entries[1]["internal"],
+            json!(true),
+            "the second row is the internal one"
+        );
     }
 }

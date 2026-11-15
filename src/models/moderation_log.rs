@@ -22,13 +22,17 @@
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`report_update`], [`report_note`], [`status_update`],
 //! [`status_delete`], [`relay_follow`], [`relay_unfollow`],
-//! [`invite_create`], [`invite_revoke`] and [`config_change`] — compose
+//! [`invite_create`], [`invite_revoke`], [`config_change`],
+//! [`webhook_create`], [`webhook_update`], [`webhook_delete`] and
+//! [`webhook_rotate_secret`] — compose
 //! the sentence word for word as Pleroma's `get_log_entry_message` clauses
 //! spell it, so later admin tickets call
 //! `moderation_log::deactivate(pool, &admin, &users)` and never
 //! hand-assemble a message. Actions without a helper here (the
 //! `announcement_*` family, …) join the set with the tickets that log
-//! them.
+//! them. The webhook maintenance actions — [`webhook_create`],
+//! [`webhook_update`], [`webhook_delete`] and [`webhook_rotate_secret`] —
+//! name their row by id the way the invite pair does.
 //!
 //! [`list`] is the read behind the endpoint: the newest-first `page` /
 //! `page_size` window over the [`LogListParams`] filters, beside the total
@@ -754,6 +758,113 @@ async fn invite_action(
         &mut data,
         "subject_id",
         Value::String(invite_id.to_string()),
+    );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records a `webhook_create`: `@admin created webhook: {webhook_id}`.
+///
+/// The admin API's `POST /webhooks` logs here. A webhook is no user, so —
+/// like an invite — its id rides in `subject_id` as text and the subject
+/// columns stay empty.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn webhook_create(
+    pool: &PgPool,
+    actor: &User,
+    webhook_id: Uuid,
+) -> AppResult<ModerationLog> {
+    webhook_action(pool, actor, webhook_id, "webhook_create", "created").await
+}
+
+/// Records a `webhook_update`: `@admin updated webhook: {webhook_id}`.
+///
+/// The admin API's `PATCH /webhooks/{id}` logs here.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn webhook_update(
+    pool: &PgPool,
+    actor: &User,
+    webhook_id: Uuid,
+) -> AppResult<ModerationLog> {
+    webhook_action(pool, actor, webhook_id, "webhook_update", "updated").await
+}
+
+/// Records a `webhook_delete`: `@admin deleted webhook: {webhook_id}`.
+///
+/// The admin API's `DELETE /webhooks/{id}` logs here. The row is gone when
+/// this records, which is exactly why the id is kept: the log line is the
+/// surviving trace of the deleted webhook.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn webhook_delete(
+    pool: &PgPool,
+    actor: &User,
+    webhook_id: Uuid,
+) -> AppResult<ModerationLog> {
+    webhook_action(pool, actor, webhook_id, "webhook_delete", "deleted").await
+}
+
+/// Records a `webhook_rotate_secret`:
+/// `@admin rotated secret for webhook: {webhook_id}`.
+///
+/// The admin API's `POST /webhooks/{id}/rotate_secret` logs here. The new
+/// secret itself never reaches the log: the line names the row, not its
+/// secret material.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn webhook_rotate_secret(
+    pool: &PgPool,
+    actor: &User,
+    webhook_id: Uuid,
+) -> AppResult<ModerationLog> {
+    webhook_action(
+        pool,
+        actor,
+        webhook_id,
+        "webhook_rotate_secret",
+        "rotated secret for",
+    )
+    .await
+}
+
+/// The four webhook clauses share their sentence shape and their
+/// `subject_id` key; only the action name and the verb differ.
+async fn webhook_action(
+    pool: &PgPool,
+    actor: &User,
+    webhook_id: Uuid,
+    action: &str,
+    verb: &str,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} {verb} webhook: {webhook_id}", actor.nickname);
+    let mut data = Map::new();
+    put(
+        &mut data,
+        "subject_id",
+        Value::String(webhook_id.to_string()),
     );
     record(
         pool,
