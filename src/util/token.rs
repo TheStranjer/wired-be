@@ -37,8 +37,16 @@ pub fn random_hex(bytes: usize) -> String {
     // `fill_bytes` on the OS CSPRNG of this platform cannot fail; rand
     // aborts internally if the kernel ever refuses to deliver entropy.
     rand::rngs::OsRng.fill_bytes(&mut buf);
-    buf.iter().fold(
-        String::with_capacity(bytes.saturating_mul(2)),
+    to_hex(&buf)
+}
+
+/// `bytes` as lowercase hex, two characters per byte: the spelling random
+/// secrets are stored in and the one an HMAC digest is announced in (see
+/// [`crate::services::webhooks`]'s signed deliveries).
+#[must_use]
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
         |mut hex, byte| {
             let written: std::fmt::Result = write!(hex, "{byte:02x}");
             debug_assert!(written.is_ok(), "a String buffer never fails to grow");

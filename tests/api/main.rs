@@ -427,5 +427,12 @@ mod translate;
 /// `PATCH /api/v1/accounts/update_credentials`.
 mod update_credentials;
 
+/// Signed event deliveries over HTTP (WBE-212): the `report.created`,
+/// `report.updated` and `account.created` jobs the real endpoints queue, the
+/// staff letter a filing writes, the admin `PATCH /reports` state change with
+/// its 204/400 answers and its scope gate, and one delivery performed against
+/// a mock endpoint that checks the signature (`src/services/webhooks.rs`).
+mod webhooks;
+
 /// WebFinger and host-meta (`/.well-known/webfinger`, `/.well-known/host-meta`).
 mod well_known;

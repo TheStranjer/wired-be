@@ -269,6 +269,10 @@ pub fn job_registry() -> JobRegistry {
         jobs::scheduled_statuses::handle_sweep,
     );
     registry.register(jobs::web_push::KIND_DELIVER, jobs::web_push::handle_deliver);
+    registry.register(
+        services::webhooks::KIND_DELIVER,
+        services::webhooks::handle_deliver,
+    );
     registry.register(jobs::rich_media::KIND_FETCH, jobs::rich_media::handle_fetch);
     registry.register(jobs::polls::KIND_END_NOTIFY, jobs::polls::handle_end_notify);
     registry.register(mailer::KIND_SEND, mailer::handle);

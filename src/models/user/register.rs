@@ -49,6 +49,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     models::invite_token::{self, InviteToken},
+    services::webhooks,
     state::AppState,
     util::{
         format::text_to_html,
@@ -273,6 +274,12 @@ impl From<RegisterError> for AppError {
 /// registration's rule): the proof exists, the letter would ask for it
 /// again.
 ///
+/// A row that exists is announced: [`webhooks::account_created`] queues the
+/// signed `account.created` event for every subscribed webhook, the way
+/// Pleroma's `User.handle_creation` triggers it for any account the instance
+/// creates — which is why the event hangs off this one path instead of off a
+/// single endpoint.
+///
 /// # Errors
 ///
 /// [`RegisterError::Invalid`] with every failed rule keyed by field when
@@ -300,6 +307,7 @@ pub async fn create_local_user(
     if !user.email_confirmed.get() {
         confirmation::send(state, &user).await?;
     }
+    webhooks::account_created(state, &user).await;
     Ok(user)
 }
 
