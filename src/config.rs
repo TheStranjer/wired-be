@@ -186,6 +186,12 @@ pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
 /// Environment variable holding the comma-separated list of frontends
 /// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
 pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
+/// Environment variable holding the directory admin-installed frontends
+/// live in (`src/api/admin/ops.rs`, WBE-208).
+pub const FRONTENDS_DIR_VAR: &str = "FRONTENDS_DIR";
+/// Environment variable holding the installable frontends, as the JSON
+/// text of a [`FrontendConfig`] array.
+pub const FRONTENDS_AVAILABLE_VAR: &str = "FRONTENDS_AVAILABLE";
 /// Environment variable holding the job worker's concurrent handler count.
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.
@@ -235,6 +241,12 @@ pub const MEDIA_PROXY_MAX_BYTES_VAR: &str = "MEDIA_PROXY_MAX_BYTES";
 /// Environment variable holding the comma-separated list of hosts the
 /// media proxy never proxies.
 pub const MEDIA_PROXY_BLACKLIST_VAR: &str = "MEDIA_PROXY_BLACKLIST";
+/// Environment variable holding how many served URLs the media proxy
+/// cache table keeps at most; the oldest are pruned past it.
+pub const MEDIA_PROXY_CACHE_LIMIT_VAR: &str = "MEDIA_PROXY_CACHE_LIMIT";
+/// Environment variable holding the origin `PURGE` invalidation requests
+/// for proxied media are sent to; unset means no purge requests are made.
+pub const MEDIA_PROXY_PURGE_URL_VAR: &str = "MEDIA_PROXY_PURGE_URL";
 /// Environment variable holding the comma-separated list of hosts rich
 /// media card fetching never visits.
 pub const RICH_MEDIA_IGNORE_HOSTS_VAR: &str = "RICH_MEDIA_IGNORE_HOSTS";
@@ -601,6 +613,20 @@ pub const DEFAULT_MEDIA_PROXY_ENABLED: bool = false;
 /// 50 MB, the order of magnitude Pleroma's `max_body_length` media
 /// proxying allows.
 pub const DEFAULT_MEDIA_PROXY_MAX_BYTES: usize = 50_000_000;
+/// Media-proxy cache ledger size used when `MEDIA_PROXY_CACHE_LIMIT` is
+/// unset: 100 000 served URLs kept, the oldest pruned past that.
+pub const DEFAULT_MEDIA_PROXY_CACHE_LIMIT: usize = 100_000;
+/// Directory admin-installed frontends live in when `FRONTENDS_DIR` is
+/// unset: `./frontends`, relative to the working directory.
+///
+/// The same shape as [`DEFAULT_UPLOADS_DIR`]'s and
+/// [`DEFAULT_EMOJI_DIR`]'s defaults, and Pleroma's
+/// `Pleroma.Frontend.dir()` (`lib/pleroma/frontend.ex`) with its
+/// `static_dir` parent step folded into the one setting.
+pub const DEFAULT_FRONTENDS_DIR: &str = "./frontends";
+/// Frontend list used when `FRONTENDS_AVAILABLE` is unset: nothing is
+/// installable, so `GET /api/v1/pleroma/admin/frontends` answers `[]`.
+pub const DEFAULT_FRONTENDS_AVAILABLE: &str = "[]";
 /// The media-proxy defaults together as a [`MediaProxyConfig`], spelled
 /// once for [`Config::test_defaults`]'s literal; the real read of the same
 /// group is the `media_proxy_settings` function.
@@ -611,6 +637,8 @@ const TEST_MEDIA_PROXY: MediaProxyConfig = MediaProxyConfig {
     base_url: None,
     max_bytes: DEFAULT_MEDIA_PROXY_MAX_BYTES,
     blacklist: Vec::new(),
+    cache_limit: DEFAULT_MEDIA_PROXY_CACHE_LIMIT,
+    purge_url: None,
 };
 /// The rate-limiter test defaults as a [`RateLimitConfig`], spelled once
 /// for [`Config::test_defaults`]'s literal like [`TEST_UPLOAD_LIMITS`] and
@@ -623,6 +651,27 @@ fn test_rate_limit() -> RateLimitConfig {
         enabled: Toggle::new(false),
         limits: rate_limit::default_limits(),
         trust_proxy_headers: Toggle::new(DEFAULT_TRUST_PROXY_HEADERS),
+    }
+}
+/// The frontend-install defaults as a [`FrontendSettings`], spelled once
+/// for [`Config::test_defaults`]'s literal like [`TEST_MEDIA_PROXY`]; a
+/// function rather than a `const` because [`PathBuf::from`] is not a
+/// `const fn`.
+#[cfg(any(test, feature = "integration-tests"))]
+fn test_frontends() -> FrontendSettings {
+    FrontendSettings {
+        dir: PathBuf::from(DEFAULT_FRONTENDS_DIR),
+        available: Vec::new(),
+    }
+}
+/// The outbound-fetch defaults as a [`FetchSettings`] with the SSRF guard
+/// off, spelled once for [`Config::test_defaults`]'s literal like
+/// [`test_frontends`]: the suites talk to local mini-servers.
+#[cfg(any(test, feature = "integration-tests"))]
+fn test_fetch() -> FetchSettings {
+    FetchSettings {
+        http_allow_private_hosts: true,
+        ..FetchSettings::default()
     }
 }
 /// Minimum length, in characters, of `MEDIA_PROXY_SECRET` when the media
@@ -846,7 +895,7 @@ impl fmt::Debug for OauthProvider {
     }
 }
 
-/// Media proxy settings, from the five `MEDIA_PROXY_*` variables.
+/// Media proxy settings, from the seven `MEDIA_PROXY_*` variables.
 ///
 /// When [`enabled`](Self::enabled) is set, remote media URLs in API
 /// responses are rewritten to signed links this instance serves itself
@@ -870,6 +919,14 @@ pub struct MediaProxyConfig {
     /// Hosts that are never proxied, from `MEDIA_PROXY_BLACKLIST`;
     /// compared case-insensitively against the URL's host.
     pub blacklist: Vec<String>,
+    /// How many served URLs the media-proxy cache ledger keeps at most,
+    /// from `MEDIA_PROXY_CACHE_LIMIT`; [`record`](crate::models::media_proxy_cache::record)
+    /// prunes the oldest rows past it.
+    pub cache_limit: usize,
+    /// Origin `PURGE` cache-invalidation requests are sent to, from
+    /// `MEDIA_PROXY_PURGE_URL` with any trailing slash trimmed; `None`
+    /// (the default) means the admin purge endpoint sends no requests.
+    pub purge_url: Option<String>,
 }
 
 /// Redacts [`secret`](Self::secret), which is signing key material.
@@ -881,8 +938,84 @@ impl fmt::Debug for MediaProxyConfig {
             .field("base_url", &self.base_url)
             .field("max_bytes", &self.max_bytes)
             .field("blacklist", &self.blacklist)
+            .field("cache_limit", &self.cache_limit)
+            .field("purge_url", &self.purge_url)
             .finish()
     }
+}
+
+/// One installable frontend, as one element of the
+/// `FRONTENDS_AVAILABLE` JSON array.
+///
+/// Pleroma's `[:frontends, :available]` keyword list, expressed as data
+/// (see `Pleroma.Frontend.install`, `lib/pleroma/frontend.ex`). `name` is
+/// the directory segment the frontend installs under and the answer's
+/// identity; the four optional fields carry Pleroma's own meaning: `git`
+/// is the source repository for the admin UI, `build_url` the pre-built-
+/// archive address (`${ref}` stands for the ref), `reference` the build
+/// ref (Pleroma's `ref` key), and `build_dir` the archive subdirectory to
+/// install (default `dist`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct FrontendConfig {
+    /// Frontend name: the answer's identity and the install directory's
+    /// first segment, e.g. `plume`.
+    pub name: String,
+    /// The source repository, answered verbatim; `None` when unset.
+    #[serde(default)]
+    pub git: Option<String>,
+    /// The build-archive download URL, `None` when unset — then only an
+    /// uploaded file can install this frontend.
+    #[serde(default)]
+    pub build_url: Option<String>,
+    /// The build ref, from the JSON `ref` key; `None` falls back to
+    /// the `master` default at install and to the name's top directory
+    /// for the installed flag.
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
+    /// The archive subdirectory to install; `None` means `dist`.
+    #[serde(default)]
+    pub build_dir: Option<String>,
+}
+
+/// The two settings that locate and describe installed frontends, from
+/// `FRONTENDS_DIR` and `FRONTENDS_AVAILABLE`
+/// (see [`crate::api::admin::ops`]).
+///
+/// They ride together on one [`Config`] field because the [`Config`]
+/// readers and the [`Debug`] impl each have an 80-line budget (AGENTS.md)
+/// and these are the two halves of one admin-API feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontendSettings {
+    /// Directory installed frontends live in, from `FRONTENDS_DIR`; the
+    /// installed flag reads `dir/<name>/<ref>`.
+    pub dir: PathBuf,
+    /// The installable frontends, from `FRONTENDS_AVAILABLE`; empty when
+    /// none is configured.
+    pub available: Vec<FrontendConfig>,
+}
+
+/// Reads the two `FRONTENDS_*` settings into a [`FrontendSettings`].
+///
+/// # Errors
+///
+/// [`ConfigError::InvalidFrontends`] when `FRONTENDS_AVAILABLE` is neither
+/// unset, blank, nor a JSON array of frontend objects.
+fn frontend_settings<F>(lookup: &F) -> Result<FrontendSettings, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let configured = lookup(FRONTENDS_AVAILABLE_VAR).unwrap_or_default();
+    let text = if configured.trim().is_empty() {
+        DEFAULT_FRONTENDS_AVAILABLE
+    } else {
+        configured.as_str()
+    };
+    let available =
+        serde_json::from_str(text).map_err(|err| ConfigError::InvalidFrontends(err.to_string()))?;
+    Ok(FrontendSettings {
+        dir: directory(lookup, FRONTENDS_DIR_VAR, DEFAULT_FRONTENDS_DIR),
+        available,
+    })
 }
 
 /// Which service translates statuses, the value of
@@ -1413,6 +1546,10 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
+    /// Where installed frontends live and which ones the admin may
+    /// install, from the two `FRONTENDS_*` variables
+    /// (see [`crate::api::admin::ops`]).
+    pub frontends: FrontendSettings,
     /// Hosts rich media card fetching never visits, from
     /// `RICH_MEDIA_IGNORE_HOSTS` (a comma-separated list, empty by
     /// default): a link to one of them is never fetched and gets no card.
@@ -1486,12 +1623,10 @@ impl Config {
     /// Returns [`ConfigError`] if a required variable is missing or a value is invalid.
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, ConfigError> {
         let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
-        let (profile, limits, text, auth, exposure, mail) = wording_and_mail(&lookup, &base_url)?;
-        let rest = rest_settings(&lookup)?;
+        let (profile, limits, text, auth, exposure, mail, rest) = groups(&lookup, &base_url)?;
         Ok(Self {
             database_url,
             bind_addr,
-            // Read before `base_url` is moved below: it defaults onto it.
             frontend_base_url: frontend_base_url(&lookup, &base_url),
             base_url,
             instance_name: profile.name,
@@ -1555,6 +1690,7 @@ impl Config {
             mail_from: mail.from,
             secret_key_base: secret_key_base(&lookup),
             media_proxy: media_proxy_settings(&lookup)?,
+            frontends: frontend_settings(&lookup)?,
             rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
             rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup),
@@ -1710,14 +1846,12 @@ impl Config {
             mail_from: default_mail_from(domain_of(TEST_BASE_URL)),
             secret_key_base: None,
             media_proxy: TEST_MEDIA_PROXY,
+            frontends: test_frontends(),
             rich_media_ignore_hosts: comma_list(DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
             rich_media_remote: Toggle::new(DEFAULT_RICH_MEDIA_REMOTE),
             vapid: VapidConfig::default(),
             translation: TranslationConfig::default(),
-            fetch: FetchSettings {
-                http_allow_private_hosts: true,
-                ..FetchSettings::default()
-            },
+            fetch: test_fetch(),
             federation_enabled: Toggle::new(DEFAULT_FEDERATION_ENABLED),
             accept_unsolicited_public: Toggle::new(DEFAULT_ACCEPT_UNSOLICITED_PUBLIC),
             unreachable_grace_secs: DEFAULT_UNREACHABLE_GRACE_SECS,
@@ -2178,10 +2312,10 @@ where
     })
 }
 
-/// Reads one directory-location variable (`UPLOADS_DIR`, `EMOJI_DIR`):
-/// the configured value trimmed, or `default` when it is unset or blank.
-/// Factored out of [`Config::from_lookup`], which has a size budget
-/// (AGENTS.md), because each path keeps its own field there.
+/// Reads one directory-location variable (`UPLOADS_DIR`, `EMOJI_DIR`,
+/// `FRONTENDS_DIR`): the configured value trimmed, or `default` when it is
+/// unset or blank. Factored out of [`Config::from_lookup`], which has a
+/// size budget (AGENTS.md), because each path keeps its own field there.
 fn directory<F>(lookup: &F, var: &'static str, default: &str) -> PathBuf
 where
     F: Fn(&str) -> Option<String>,
@@ -2697,9 +2831,10 @@ where
 /// type to spell inline.
 type Signup = (AuthSettings, ExposureSettings, MailerSettings);
 
-/// What [`wording_and_mail`] answers: [`Wording`] and [`Signup`] flattened
-/// into one six-value tuple, so [`Config::from_lookup`] binds all six
-/// groups with a single `let` and stays inside Clippy's line budget.
+/// What [`groups`] answers: [`Wording`], [`Signup`] and [`RestSettings`]
+/// flattened into one seven-value tuple, so [`Config::from_lookup`] binds
+/// all seven groups with a single `let` and stays inside Clippy's line
+/// budget.
 type Groups = (
     InstanceProfile,
     ContentLimits,
@@ -2707,6 +2842,7 @@ type Groups = (
     AuthSettings,
     ExposureSettings,
     MailerSettings,
+    RestSettings,
 );
 
 /// [`profile_and_limits`] and [`signup_and_mail`] in one call: the
@@ -2714,13 +2850,21 @@ type Groups = (
 /// trio, flattened. `base_url` is the instance origin, whose domain the
 /// mailer's `From:` default is derived from (the pair the two grouped
 /// readers used to take apart).
-fn wording_and_mail<F>(lookup: &F, base_url: &str) -> Result<Groups, ConfigError>
+fn groups<F>(lookup: &F, base_url: &str) -> Result<Groups, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
     let (profile, limits, text) = profile_and_limits(lookup)?;
     let (auth, exposure, mail) = signup_and_mail(lookup, domain_of(base_url))?;
-    Ok((profile, limits, text, auth, exposure, mail))
+    Ok((
+        profile,
+        limits,
+        text,
+        auth,
+        exposure,
+        mail,
+        rest_settings(lookup)?,
+    ))
 }
 
 /// Reads the three groups behind who may get an account and how they are
@@ -2833,7 +2977,7 @@ where
     serde_json::from_str(text).map_err(|err| ConfigError::InvalidOauthProviders(err.to_string()))
 }
 
-/// Reads the five settings that configure the media proxy
+/// Reads the seven settings that configure the media proxy
 /// (see [`crate::services::media_proxy`]). Grouped because each is a
 /// plain default-or-parse and [`Config::from_lookup`] has a size budget
 /// (AGENTS.md); enabling the proxy without a long-enough secret is an
@@ -2864,12 +3008,22 @@ where
         DEFAULT_MEDIA_PROXY_MAX_BYTES,
     )?;
     let blacklist = comma_list(&lookup(MEDIA_PROXY_BLACKLIST_VAR).unwrap_or_default());
+    let cache_limit = number(
+        lookup,
+        MEDIA_PROXY_CACHE_LIMIT_VAR,
+        DEFAULT_MEDIA_PROXY_CACHE_LIMIT,
+    )?;
+    let purge_url = lookup(MEDIA_PROXY_PURGE_URL_VAR)
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty());
     Ok(MediaProxyConfig {
         enabled,
         secret,
         base_url,
         max_bytes,
         blacklist,
+        cache_limit,
+        purge_url,
     })
 }
 
@@ -3115,6 +3269,7 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
         )
         .field("uploads_dir", &config.uploads_dir)
         .field("emoji_dir", &config.emoji_dir)
+        .field("frontends", &config.frontends)
         .field("media_base_url", &config.media_base_url)
         .field("accounts_email_optional", &config.accounts_email_optional)
         .field("min_password_length", &config.min_password_length)
@@ -3219,6 +3374,9 @@ pub enum ConfigError {
     /// than [`MIN_MEDIA_PROXY_SECRET_CHARS`] requires; the value is the
     /// variable name.
     ShortMediaProxySecret(&'static str),
+    /// `FRONTENDS_AVAILABLE` is not the JSON text of an array of frontend
+    /// objects; the value is what the JSON parser said.
+    InvalidFrontends(String),
     /// `RATE_LIMITS` holds an entry that is not a `bucket=max:window_secs`
     /// triple (or a degenerate one); the value is the parser's reason.
     InvalidRateLimits(String),
@@ -3254,6 +3412,10 @@ impl fmt::Display for ConfigError {
                 f,
                 "invalid {var}: expected at least {MIN_MEDIA_PROXY_SECRET_CHARS} characters"
             ),
+            Self::InvalidFrontends(detail) => write!(
+                f,
+                "invalid {FRONTENDS_AVAILABLE_VAR}: expected a JSON array of frontend objects: {detail}"
+            ),
             Self::InvalidRateLimits(detail) => {
                 write!(f, "invalid {RATE_LIMITS_VAR}: {detail}")
             }
@@ -3278,6 +3440,7 @@ impl Error for ConfigError {
             | Self::InvalidSmtpTls(_)
             | Self::InvalidTranslationProvider(_)
             | Self::ShortMediaProxySecret(_)
+            | Self::InvalidFrontends(_)
             | Self::InvalidRateLimits(_)
             | Self::InvalidRestrictUnauthenticated(_) => None,
         }
@@ -5353,6 +5516,128 @@ mod tests {
             vec!["evil.example".to_owned(), "cdn-only.example".to_owned()],
             "the blacklist is a trimmed comma list"
         );
+    }
+
+    #[test]
+    fn media_proxy_cache_ledger_defaults() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.media_proxy.cache_limit, 100_000,
+            "default MEDIA_PROXY_CACHE_LIMIT"
+        );
+        assert_eq!(
+            config.media_proxy.purge_url, None,
+            "no PURGE forwarding until the operator names a cache"
+        );
+        for blank in ["", "   ", "  /  "] {
+            let blank_purge = config_with(&[(MEDIA_PROXY_PURGE_URL_VAR, blank)]);
+            assert_eq!(
+                blank_purge.media_proxy.purge_url, None,
+                "MEDIA_PROXY_PURGE_URL={blank:?} means unset"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_media_proxy_cache_limit_and_purge_url() {
+        let config = config_with(&[
+            (MEDIA_PROXY_CACHE_LIMIT_VAR, "500"),
+            (MEDIA_PROXY_PURGE_URL_VAR, " http://cache.example/ "),
+        ]);
+        assert_eq!(config.media_proxy.cache_limit, 500, "custom row cap");
+        assert_eq!(
+            config.media_proxy.purge_url.as_deref(),
+            Some("http://cache.example"),
+            "MEDIA_PROXY_PURGE_URL is trimmed and loses its trailing slash"
+        );
+        let debug = format!("{:?}", config.media_proxy);
+        assert!(
+            debug.contains("cache_limit: 500")
+                && debug.contains("purge_url: Some(\"http://cache.example\")"),
+            "both ledger settings are visible in Debug output: {debug}"
+        );
+        let err = try_config_with(&[(MEDIA_PROXY_CACHE_LIMIT_VAR, "many")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNumber(MEDIA_PROXY_CACHE_LIMIT_VAR),
+            "a non-number cap is refused"
+        );
+    }
+
+    #[test]
+    fn frontends_default_to_the_stock_directory_and_no_catalogue() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.frontends.dir,
+            PathBuf::from("./frontends"),
+            "default FRONTENDS_DIR"
+        );
+        assert!(
+            config.frontends.available.is_empty(),
+            "nothing is installable until the operator names it"
+        );
+        for blank in ["", "   "] {
+            let blank_catalogue = config_with(&[(FRONTENDS_AVAILABLE_VAR, blank)]);
+            assert!(
+                blank_catalogue.frontends.available.is_empty(),
+                "FRONTENDS_AVAILABLE={blank:?} means no frontends"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_frontends_catalogue() {
+        let config = config_with(&[
+            (FRONTENDS_DIR_VAR, "/srv/frontends"),
+            (
+                FRONTENDS_AVAILABLE_VAR,
+                r#"[{"name":"pleroma-fe","git":"https://example.com/fe","build_url":"https://build.example/${ref}.zip","ref":"stable","build_dir":"www"},
+                    {"name":"volar"}]"#,
+            ),
+        ]);
+        assert_eq!(
+            config.frontends.dir,
+            PathBuf::from("/srv/frontends"),
+            "custom FRONTENDS_DIR"
+        );
+        assert_eq!(config.frontends.available.len(), 2, "two entries");
+        assert_eq!(
+            config.frontends.available[0],
+            FrontendConfig {
+                name: "pleroma-fe".to_owned(),
+                git: Some("https://example.com/fe".to_owned()),
+                build_url: Some("https://build.example/${ref}.zip".to_owned()),
+                reference: Some("stable".to_owned()),
+                build_dir: Some("www".to_owned()),
+            },
+            "the full entry"
+        );
+        assert_eq!(
+            config.frontends.available[1],
+            FrontendConfig {
+                name: "volar".to_owned(),
+                git: None,
+                build_url: None,
+                reference: None,
+                build_dir: None,
+            },
+            "every field but the name is optional"
+        );
+    }
+
+    #[test]
+    fn invalid_frontends_available_is_an_error() {
+        for broken in ["{not json}", r#"[{"git":"https://example.com"}]"#] {
+            let err = try_config_with(&[(FRONTENDS_AVAILABLE_VAR, broken)]).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidFrontends(_)),
+                "FRONTENDS_AVAILABLE={broken:?} is refused, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(FRONTENDS_AVAILABLE_VAR),
+                "the message names the variable: {err}"
+            );
+        }
     }
 
     #[test]

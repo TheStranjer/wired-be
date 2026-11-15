@@ -161,10 +161,14 @@ fn too_recent_error(limit_days: usize) -> AppError {
 /// Enqueues the [`QUEUE_BACKGROUND`] job that builds the backup `backup_id`
 /// was recorded under, carrying `{"backup_id": "<uuid>"}` for the handler.
 ///
+/// `pub(crate)` because the admin's `POST /admin/backups` (WBE-208) queues
+/// through the very same service, differing only in skipping the rate gate
+/// and acting for another account (see [`super::ops`]'s `create_backup`).
+///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
-async fn enqueue_backup_job(pool: &PgPool, backup_id: Uuid) -> AppResult<()> {
+pub(crate) async fn enqueue_backup_job(pool: &PgPool, backup_id: Uuid) -> AppResult<()> {
     let queued = NewJob {
         queue: QUEUE_BACKGROUND,
         kind: KIND_RUN,
@@ -178,8 +182,10 @@ async fn enqueue_backup_job(pool: &PgPool, backup_id: Uuid) -> AppResult<()> {
 }
 
 /// Renders `rows` as entities, newest first as read, each carrying its
-/// download URL (see [`download_url`]).
-fn render_entities(uploader: &UploaderBackend, rows: &[backup::Backup]) -> Vec<Backup> {
+/// download URL (see [`download_url`]). `pub(crate)` for the admin's
+/// backup trigger, which answers the same array (WBE-208,
+/// [`super::ops`]).
+pub(crate) fn render_entities(uploader: &UploaderBackend, rows: &[backup::Backup]) -> Vec<Backup> {
     rows.iter()
         .map(|row| Backup::from_row(row, &download_url(uploader, row)))
         .collect()

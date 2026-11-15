@@ -29,10 +29,10 @@ use crate::{
 /// [`polls::router`], [`reports::router`], [`search::router`] and
 /// [`statuses::router`], the merged routers whose routes mount the rate
 /// limiter, and — as
-/// [`state.config`] — [`media::router`] and [`pleroma_settings::router`],
-/// whose upload routes carry their own body limit (see
-/// [`crate::extract::multipart::upload_body_limit`]), which axum's
-/// multipart extractor cannot read from the state on its own.
+/// [`state.config`] — [`media::router`], [`pleroma_settings::router`] and
+/// [`admin::router`], whose upload/install routes carry their own body
+/// limit (see [`crate::extract::multipart::upload_body_limit`]), which
+/// axum's multipart extractor cannot read from the state on its own.
 ///
 /// [`state.config`]: AppState::config
 pub fn router(state: &AppState) -> Router<AppState> {
@@ -70,7 +70,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(tags::router())
         .merge(timelines::router())
         .nest("/pleroma", misc::util_router())
-        .nest("/pleroma/admin", admin::router())
+        .nest("/pleroma/admin", admin::router(&state.config))
         .nest("/pleroma/apps", oauth_tokens::apps_router())
         .nest("/pleroma/backups", backups::router())
         .nest(

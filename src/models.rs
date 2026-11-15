@@ -54,6 +54,7 @@ pub mod link_card;
 pub mod list;
 pub mod marker;
 pub mod media_attachment;
+pub mod media_proxy_cache;
 pub mod mention;
 pub mod mfa_token;
 pub mod moderation_log;

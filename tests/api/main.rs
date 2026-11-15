@@ -51,6 +51,10 @@ mod activitypub;
 /// [`StaffUser`]: wired_be::auth::admin::StaffUser
 mod admin;
 
+/// The admin ops endpoints over HTTP: the media-proxy cache ledger, the
+/// frontend catalogue and installer, and the admin backup trigger.
+mod admin_ops;
+
 /// The admin users endpoints over HTTP (`GET /api/v1/pleroma/admin/users`
 /// and `GET …/users/{nickname}`, WBE-195): the eight filters and their
 /// combinations, the query and the named criteria, the page window beside

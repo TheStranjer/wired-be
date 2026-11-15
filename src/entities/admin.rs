@@ -1,6 +1,6 @@
 //! The admin API's JSON shapes: the moderation-log page, the stats
-//! counters, the registration-invite entity (WBE-199) and the webhook
-//! entity behind the `webhooks/*` maintenance endpoints (WBE-209).
+//! counters and the invite, webhook and ops entities (WBE-199, WBE-209,
+//! WBE-208).
 //!
 //! Pleroma renders all of them through
 //! `Pleroma.Web.AdminAPI.ModerationLogView`
@@ -20,8 +20,11 @@ use chrono::NaiveDate;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::models::{
-    invite_token::InviteToken, moderation_log, status::StatusVisibilityCounts, webhook::Webhook,
+use crate::{
+    config::FrontendConfig,
+    models::{
+        invite_token::InviteToken, moderation_log, status::StatusVisibilityCounts, webhook::Webhook,
+    },
 };
 
 /// One entry of the moderation log listing, Pleroma's
@@ -221,6 +224,88 @@ impl AdminWebhook {
     pub fn from_rows(webhooks: &[Webhook]) -> Vec<Self> {
         webhooks.iter().map(Self::from_webhook).collect()
     }
+}
+
+/// The `GET /api/v1/pleroma/admin/media_proxy_caches` answer: one page of
+/// the served-URL ledger beside its window size and the filtered total.
+///
+/// Pleroma's `index.json` `{urls, page_size, count}`
+/// (`lib/pleroma/web/admin_api/views/media_proxy_cache_view.ex`).
+#[derive(Debug, Serialize)]
+pub struct MediaProxyCachePage {
+    /// The page's URLs, in `url` order.
+    pub urls: Vec<String>,
+    /// The effective `page_size` the window was cut with.
+    pub page_size: i64,
+    /// How many ledger entries the filter selects, pages included.
+    pub count: i64,
+}
+
+/// The `POST /api/v1/pleroma/admin/media_proxy_caches/{delete,purge}`
+/// answer: the ticket's `{"urls":[...]}` — the set the request named,
+/// handed back as processed.
+#[derive(Debug, Serialize)]
+pub struct MediaProxyCacheUrls {
+    /// The URLs the action took.
+    pub urls: Vec<String>,
+}
+
+impl MediaProxyCacheUrls {
+    /// Echoes `urls` as the answer body.
+    #[must_use]
+    pub fn new(urls: &[String]) -> Self {
+        Self {
+            urls: urls.to_vec(),
+        }
+    }
+}
+
+/// One installable frontend of `GET /api/v1/pleroma/admin/frontends`: the
+/// `FRONTENDS_AVAILABLE` entry's four keys beside its installed flag.
+///
+/// Pleroma's `FrontendView`
+/// (`lib/pleroma/web/admin_api/views/frontend_view.ex`) narrowed to the
+/// five keys the ticket pins.
+#[derive(Debug, Serialize)]
+pub struct AdminFrontend {
+    /// The frontend name, its identity and install-directory segment.
+    pub name: String,
+    /// The source repository, `None` rendered as `null`.
+    pub git: Option<String>,
+    /// The build-archive download URL, `None` rendered as `null`.
+    pub build_url: Option<String>,
+    /// The build ref — the JSON key is `ref`, a Rust keyword.
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    /// Whether `FRONTENDS_DIR/<name>/<ref>` stands on disk.
+    pub installed: bool,
+}
+
+impl AdminFrontend {
+    /// Renders one configured frontend with its installed flag.
+    #[must_use]
+    pub fn from_config(frontend: &FrontendConfig, installed: bool) -> Self {
+        Self {
+            name: frontend.name.clone(),
+            git: frontend.git.clone(),
+            build_url: frontend.build_url.clone(),
+            reference: frontend.reference.clone(),
+            installed,
+        }
+    }
+}
+
+/// The `POST /api/v1/pleroma/admin/frontends/install` answer, the ticket's
+/// `{"status":"ok"}`.
+#[derive(Debug, Serialize)]
+pub struct FrontendInstallStatus {
+    /// The always-`ok` status: a failure answers an error body instead.
+    pub status: &'static str,
+}
+
+impl FrontendInstallStatus {
+    /// The success body.
+    pub const OK: Self = Self { status: "ok" };
 }
 
 #[cfg(test)]

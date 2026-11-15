@@ -227,6 +227,26 @@ impl HttpClient {
         read_body(request.send().await?, usize::MAX).await
     }
 
+    /// Sends `method` to `url` with `headers` and reads the full response:
+    /// the generic call behind the verbs this client is not otherwise
+    /// spelled for — today the media cache's `PURGE` invalidation request
+    /// (see [`crate::api::admin::ops`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`HttpClient::post_bytes`]; `method` itself is whatever
+    /// `reqwest` accepts, an unparsable one having failed long before this
+    /// call at its [`Method::from_bytes`] construction site.
+    pub async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, HttpError> {
+        let request = self.build_request(method, url, headers).await?;
+        read_body(request.send().await?, usize::MAX).await
+    }
+
     /// Validates `url` (`http`/`https` only), passes it through the SSRF
     /// guard, and assembles an un-sent request carrying `headers` on top
     /// of the client defaults. The guard runs after header validation so
@@ -511,7 +531,7 @@ mod tests {
         extract::State,
         http::{HeaderMap, Method, StatusCode, Uri, header},
         response::Response,
-        routing::{get, post},
+        routing::{any, get, post},
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use serde_json::Value;
@@ -895,6 +915,50 @@ mod tests {
             "the body round-trips"
         );
         server.abort();
+    }
+
+    /// Answers with the request's own method name.
+    async fn echo_method(method: Method) -> String {
+        method.as_str().to_owned()
+    }
+
+    #[tokio::test]
+    async fn request_sends_an_extension_method_verbatim() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/verb");
+        let server = spawn_server(listener, Router::new().route("/verb", any(echo_method)));
+        let client = HttpClient::new_for_tests(TEST_UA);
+        // The exact construction the media cache purge path uses.
+        let purge = Method::from_bytes(b"PURGE").unwrap();
+
+        let response = client
+            .request(purge, &url, &[("x-marker", "yes")])
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200, "peer answered");
+        assert_eq!(
+            String::from_utf8_lossy(&response.body),
+            "PURGE",
+            "the uncommon verb arrives as sent, headers included"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_passes_the_guard_to_uncommon_verbs_too() {
+        let client = HttpClient::new(TEST_UA);
+        let result = client
+            .request(
+                Method::from_bytes(b"PURGE").unwrap(),
+                "http://127.0.0.1:9/purge",
+                &[],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(HttpError::Blocked(_))),
+            "a PURGE to loopback must be blocked like any other verb, got {result:?}"
+        );
     }
 
     #[tokio::test]

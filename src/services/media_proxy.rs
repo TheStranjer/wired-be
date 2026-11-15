@@ -31,6 +31,13 @@
 //!   cached for a day and locked down by a `default-src 'none'` CSP;
 //!   `Range` and `If-None-Match`/`If-Modified-Since` are forwarded
 //!   upstream and the `206`/`304` answers passed back.
+//!
+//! Every URL this route serves is also recorded in the admin-visible
+//! media-proxy cache ledger ([`crate::models::media_proxy_cache`],
+//! WBE-208), kept within `MEDIA_PROXY_CACHE_LIMIT` rows, and
+//! [`purge_target`] mints the address a `PURGE` invalidation request for
+//! a URL goes to when `MEDIA_PROXY_PURGE_URL` is configured — the
+//! admin's `POST /media_proxy_caches/{delete,purge}` actions use both.
 
 use std::{error::Error, fmt};
 
@@ -53,6 +60,7 @@ use crate::{
     config::Config,
     error::AppError,
     http_client::{HttpError, HttpResponse},
+    models::media_proxy_cache,
     state::AppState,
 };
 
@@ -119,8 +127,7 @@ pub fn proxy_url(config: &Config, remote_url: &str) -> String {
     let Some((secret, parsed)) = proxy_target(config, remote_url) else {
         return remote_url.to_owned();
     };
-    let encoded = URL_SAFE_NO_PAD.encode(remote_url.as_bytes());
-    let Some(sig) = encoded_signature(secret, &encoded) else {
+    let Some(path) = signed_link(secret, &parsed, remote_url) else {
         return remote_url.to_owned();
     };
     let base = config
@@ -128,12 +135,47 @@ pub fn proxy_url(config: &Config, remote_url: &str) -> String {
         .base_url
         .as_deref()
         .unwrap_or(&config.base_url);
-    let mut link = format!("{base}{PROXY_PATH}/{sig}/{encoded}");
-    if let Some(filename) = filename_for(&parsed) {
-        link.push('/');
-        link.push_str(&filename);
+    format!("{base}{path}")
+}
+
+/// The signed proxy path `/proxy/{sig}/{b64url(url)}[/{filename}]` for
+/// `remote_url` under `secret` — the body of the link [`proxy_url`] hangs
+/// off its base and [`purge_target`] off the purge origin. `None` only
+/// when the signature cannot be minted; the caller has already gated
+/// scheme, locality and blacklist.
+fn signed_link(secret: &str, parsed: &Url, remote_url: &str) -> Option<String> {
+    let encoded = URL_SAFE_NO_PAD.encode(remote_url.as_bytes());
+    let sig = encoded_signature(secret, &encoded)?;
+    let mut path = format!("{PROXY_PATH}/{sig}/{encoded}");
+    if let Some(filename) = filename_for(parsed) {
+        path.push('/');
+        path.push_str(&filename);
     }
-    link
+    Some(path)
+}
+
+/// The address a `PURGE` cache-invalidation request for media `url` goes
+/// to: the signed proxy link re-hung on the purge origin.
+///
+/// The admin purge endpoint's outbound half (WBE-208) — exactly what a
+/// cache fronting the `/proxy` routes holds the bytes under. `None` —
+/// send nothing — when the media proxy is off (no link exists to purge),
+/// `MEDIA_PROXY_PURGE_URL` is unset (the ticket's "skipped when unset"),
+/// or `url` is no signable http(s) URL.
+#[must_use]
+pub fn purge_target(config: &Config, url: &str) -> Option<String> {
+    let proxy = &config.media_proxy;
+    if !proxy.enabled {
+        return None;
+    }
+    let purge = proxy.purge_url.as_deref()?;
+    let secret = proxy.secret.as_deref()?;
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let path = signed_link(secret, &parsed, url)?;
+    Some(format!("{purge}{path}"))
 }
 
 /// The pieces [`proxy_url`] needs — the secret and the parsed URL — when
@@ -318,7 +360,10 @@ async fn serve_proxy_named(
 /// Validate a link and fetch its bytes: [`decode`] first (a bad signature
 /// is the 403), then only the range/validator request headers are
 /// forwarded upstream, and the body is capped at
-/// `MEDIA_PROXY_MAX_BYTES` — the fetch aborts beyond it.
+/// `MEDIA_PROXY_MAX_BYTES` — the fetch aborts beyond it. A URL whose
+/// upstream fetch completed is recorded in the admin-visible cache ledger
+/// (WBE-208, see [`crate::models::media_proxy_cache`]) before the answer
+/// is mapped.
 async fn fetch_proxied(
     state: &AppState,
     sig: &str,
@@ -332,7 +377,10 @@ async fn fetch_proxied(
         .get_limited(&url, &forwarded, state.config.media_proxy.max_bytes)
         .await
     {
-        Ok(upstream) => upstream_response(&upstream),
+        Ok(upstream) => {
+            record_served(state, &url).await;
+            upstream_response(&upstream)
+        }
         Err(HttpError::TooLarge) => {
             warn!(%url, "media proxy: upstream body exceeds the byte cap");
             Err(AppError::PayloadTooLarge(TOO_LARGE_MESSAGE.to_owned()))
@@ -341,6 +389,19 @@ async fn fetch_proxied(
             error!(%err, %url, "media proxy: upstream fetch failed");
             Err(AppError::UpstreamFailure(UPSTREAM_MESSAGE.to_owned()))
         }
+    }
+}
+
+/// Add `url` to the media-proxy cache ledger and prune the table back to
+/// `MEDIA_PROXY_CACHE_LIMIT` rows (see
+/// [`record`](crate::models::media_proxy_cache::record)). The ledger is a
+/// side note to the response it just served: a database failure is logged
+/// and swallowed, never a 500 over a byte that arrived fine.
+async fn record_served(state: &AppState, url: &str) {
+    if let Err(err) =
+        media_proxy_cache::record(&state.db, url, state.config.media_proxy.cache_limit).await
+    {
+        warn!(%err, %url, "media proxy: recording the served url failed");
     }
 }
 
@@ -459,8 +520,9 @@ mod tests {
     use super::*;
     use crate::config::{
         BASE_URL_VAR, DATABASE_URL_VAR, MEDIA_BASE_URL_VAR, MEDIA_PROXY_BASE_URL_VAR,
-        MEDIA_PROXY_BLACKLIST_VAR, MEDIA_PROXY_ENABLED_VAR, MEDIA_PROXY_MAX_BYTES_VAR,
-        MEDIA_PROXY_SECRET_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+        MEDIA_PROXY_BLACKLIST_VAR, MEDIA_PROXY_CACHE_LIMIT_VAR, MEDIA_PROXY_ENABLED_VAR,
+        MEDIA_PROXY_MAX_BYTES_VAR, MEDIA_PROXY_PURGE_URL_VAR, MEDIA_PROXY_SECRET_VAR,
+        TEST_BASE_URL, TEST_DATABASE_URL,
     };
 
     /// A signing secret comfortably past the 32-character minimum.
@@ -910,6 +972,69 @@ mod tests {
             proxy_url(&Config::for_tests(), REMOTE),
             REMOTE,
             "the shared test config leaves every entity URL untouched"
+        );
+    }
+
+    #[test]
+    fn cache_limit_defaults_to_one_hundred_thousand() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.media_proxy.cache_limit, 100_000,
+            "the ticket default"
+        );
+        let custom = config_with(&[(MEDIA_PROXY_CACHE_LIMIT_VAR, "5")]);
+        assert_eq!(custom.media_proxy.cache_limit, 5, "a custom limit reads");
+    }
+
+    #[test]
+    fn the_purge_target_rehangs_the_signed_link_on_the_purge_origin() {
+        let config = enabled_config(&[(MEDIA_PROXY_PURGE_URL_VAR, "https://cdn.example/")]);
+        assert_eq!(
+            config.media_proxy.purge_url.as_deref(),
+            Some("https://cdn.example"),
+            "the trailing slash is trimmed on the read"
+        );
+        let target =
+            purge_target(&config, REMOTE).expect("an enabled proxy with a purge url purges");
+        let (sig, encoded) = sig_and_encoded(&target);
+        assert!(
+            target.starts_with("https://cdn.example/proxy/"),
+            "the request goes to the purge origin, not the instance: {target}"
+        );
+        assert!(
+            target.ends_with("/cat.gif"),
+            "the filename segment rides along: {target}"
+        );
+        assert_eq!(
+            decode(&config, &sig, &encoded).unwrap(),
+            REMOTE,
+            "the target carries exactly this url's signed link"
+        );
+    }
+
+    #[test]
+    fn the_purge_target_is_none_without_a_purge_url_or_an_enabled_proxy() {
+        assert_eq!(
+            purge_target(&enabled_config(&[]), REMOTE),
+            None,
+            "no MEDIA_PROXY_PURGE_URL means no purge request, the ticket's skip"
+        );
+        let disabled = config_with(&[(MEDIA_PROXY_PURGE_URL_VAR, "https://cdn.example")]);
+        assert_eq!(
+            purge_target(&disabled, REMOTE),
+            None,
+            "a disabled proxy has no cached link to purge"
+        );
+        let config = enabled_config(&[(MEDIA_PROXY_PURGE_URL_VAR, "https://cdn.example")]);
+        assert_eq!(
+            purge_target(&config, "not a url"),
+            None,
+            "an unparsable url signs to nothing"
+        );
+        assert_eq!(
+            purge_target(&config, "ftp://remote.example/x"),
+            None,
+            "and a non-http scheme likewise"
         );
     }
 }
