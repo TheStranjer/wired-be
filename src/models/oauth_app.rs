@@ -1,5 +1,6 @@
 //! The `oauth_apps` table: client applications registered through
-//! `POST /api/v1/apps`.
+//! `POST /api/v1/apps` and administered through
+//! `…/api/v1/pleroma/admin/oauth_app` (WBE-205).
 //!
 //! The reference shape is Pleroma's `App` schema
 //! (`lib/pleroma/web/o_auth/app.ex`): a name, its redirect URIs stored as
@@ -11,9 +12,12 @@
 //!
 //! [`create`] mints the primary key (`UUIDv7`, decision 4) and the
 //! credential pair itself, mirroring Pleroma's `register_changeset`;
-//! callers supply only the registration fields. `client_secret` is
-//! secret material: the manual `Debug` impl redacts it, so it can never
-//! reach a log line.
+//! callers supply only the registration fields. [`create_as_admin`],
+//! [`search`], [`update`] and [`delete`] are the admin API's half: the
+//! same minting with the admin-managed `trusted` flag bound, the exact-
+//! filter listing, the `COALESCE`-present-only write and the removal.
+//! `client_secret` is secret material: the manual `Debug` impl redacts
+//! it, so it can never reach a log line.
 
 use std::fmt;
 
@@ -190,6 +194,207 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<OauthA
         .fetch_all(pool)
         .await?;
     Ok(apps)
+}
+
+/// The filter and window of `GET /api/v1/pleroma/admin/oauth_app`
+/// (Pleroma's `App.search` parameter map, `lib/pleroma/web/o_auth/app.ex`).
+#[derive(Clone, Debug, Default)]
+pub struct AppSearchParams {
+    /// Keep only apps whose `client_name` equals this exactly (Pleroma's
+    /// `name` filter, mapped to the column by the controller).
+    pub name: Option<String>,
+    /// Keep only the app whose `client_id` equals this exactly.
+    pub client_id: Option<String>,
+    /// Keep only apps with this `trusted` value; `None` filters nothing.
+    /// Pleroma's `OpenAPI` default of `false` quietly filters the
+    /// untrusted half of the table out of an unfiltered index; the ticket
+    /// spells the parameter optional, so optional it is.
+    pub trusted: Option<bool>,
+    /// 1-based page number.
+    pub page: i64,
+    /// Rows per page.
+    pub page_size: i64,
+}
+
+/// One page of the admin listing: the window's rows beside the total.
+#[derive(Debug)]
+pub struct AppSearchPage {
+    /// The apps on this page, newest first (`UUIDv7` text order,
+    /// decision 4).
+    pub apps: Vec<OauthApp>,
+    /// How many apps the instance has in total. Pleroma's `App.search`
+    /// aggregates the whole table — `Repo.aggregate(__MODULE__, :count,
+    /// :id)` — not the filtered query, so the number does not move with
+    /// the filters and is reproduced as written.
+    pub count: i64,
+}
+
+/// The row shape of the total-count half of [`search`].
+#[derive(Debug, sqlx::FromRow)]
+struct AppCount {
+    /// The aggregate, `bigint` as `i64`.
+    count: i64,
+}
+
+/// The `SELECT` behind [`search`]: the three exact filters as
+/// `$n IS NULL OR`-guards, newest app first, one `LIMIT`/`OFFSET` window.
+const SEARCH_SQL: &str = "SELECT * FROM oauth_apps
+   WHERE ($1::text IS NULL OR client_name = $1)
+     AND ($2::text IS NULL OR client_id = $2)
+     AND ($3::bool IS NULL OR trusted = $3)
+   ORDER BY id DESC
+   LIMIT $4 OFFSET $5";
+
+/// The whole-table total [`search`] reports beside its window
+/// (Pleroma's unfilled `count`).
+const COUNT_ALL_SQL: &str = "SELECT count(*) AS count FROM oauth_apps";
+
+/// Runs the admin listing: the filtered, windowed rows and the
+/// whole-table count, in one round-trip pair.
+///
+/// A page past the end yields an empty `apps` beside the still-total
+/// `count`; the filters are exact matches, not patterns.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn search(pool: &PgPool, params: &AppSearchParams) -> AppResult<AppSearchPage> {
+    let offset = (params.page - 1).saturating_mul(params.page_size);
+    let apps = sqlx::query_as::<_, OauthApp>(SEARCH_SQL)
+        .bind(params.name.as_deref())
+        .bind(params.client_id.as_deref())
+        .bind(params.trusted)
+        .bind(params.page_size)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    let total = sqlx::query_as::<_, AppCount>(COUNT_ALL_SQL)
+        .fetch_one(pool)
+        .await?;
+    Ok(AppSearchPage {
+        apps,
+        count: total.count,
+    })
+}
+
+/// What [`create_as_admin`] inserts, besides what it mints itself (`id`,
+/// `client_id`, `client_secret`) and what the database stamps: the admin
+/// registration form.
+///
+/// It is every [`NewOauthApp`] field plus the `trusted` flag only admins
+/// manage.
+#[derive(Clone, Debug)]
+pub struct AdminNewApp {
+    /// Application name to store.
+    pub client_name: String,
+    /// Redirect URIs in their stored spelling (space/newline separated).
+    pub redirect_uris: String,
+    /// Scopes as one space-separated string.
+    pub scopes: String,
+    /// Optional homepage URL.
+    pub website: Option<String>,
+    /// Whether the app skips the authorization consent screen.
+    pub trusted: bool,
+}
+
+/// The `INSERT` behind [`create_as_admin`]: [`INSERT_SQL`]'s column list
+/// with `trusted` bound from the form instead of left to the column
+/// default, and `user_id` left out — an admin-registered app has no
+/// owner (Pleroma's admin `App.create` passes no user either).
+const INSERT_ADMIN_SQL: &str = "INSERT INTO oauth_apps (
+     id, client_name, redirect_uris, scopes, website, client_id,
+     client_secret, trusted
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *";
+
+/// Inserts an app through the admin API and returns the stored row.
+///
+/// The id and the credential pair are minted exactly as [`create`] mints
+/// them; the difference is the flag: `trusted` is the admin's to set.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn create_as_admin(pool: &PgPool, form: &AdminNewApp) -> AppResult<OauthApp> {
+    let app = sqlx::query_as::<_, OauthApp>(INSERT_ADMIN_SQL)
+        .bind(new_id())
+        .bind(form.client_name.as_str())
+        .bind(form.redirect_uris.as_str())
+        .bind(form.scopes.as_str())
+        .bind(form.website.as_deref())
+        .bind(random_token(CREDENTIAL_BYTES))
+        .bind(random_token(CREDENTIAL_BYTES))
+        .bind(form.trusted)
+        .fetch_one(pool)
+        .await?;
+    Ok(app)
+}
+
+/// The present-only changes of `PATCH /api/v1/pleroma/admin/oauth_app/{id}`.
+///
+/// `None` keeps the stored column, `Some` writes over it. `website`
+/// cannot be nulled — sending `null` reads as absent, the same way every
+/// other `Option` body field in this project does.
+#[derive(Clone, Debug, Default)]
+pub struct AppChanges {
+    /// New application name.
+    pub client_name: Option<String>,
+    /// New redirect URIs, in their stored spelling.
+    pub redirect_uris: Option<String>,
+    /// New scope string.
+    pub scopes: Option<String>,
+    /// New homepage URL.
+    pub website: Option<String>,
+    /// New trusted flag.
+    pub trusted: Option<bool>,
+}
+
+/// The `UPDATE` behind [`update`]: every mutable column through a
+/// `COALESCE` that keeps the stored value when the parameter is `NULL`,
+/// `updated_at` re-stamped, the row handed back whole.
+const UPDATE_SQL: &str = "UPDATE oauth_apps
+     SET client_name   = COALESCE($2, client_name),
+         redirect_uris = COALESCE($3, redirect_uris),
+         scopes        = COALESCE($4, scopes),
+         website       = COALESCE($5, website),
+         trusted       = COALESCE($6, trusted),
+         updated_at    = now()
+   WHERE id = $1
+RETURNING *";
+
+/// Applies [`AppChanges`] to the app behind `id` and returns the updated
+/// row, `None` when no row carries that id.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn update(pool: &PgPool, id: Uuid, changes: &AppChanges) -> AppResult<Option<OauthApp>> {
+    let app = sqlx::query_as::<_, OauthApp>(UPDATE_SQL)
+        .bind(id)
+        .bind(changes.client_name.as_deref())
+        .bind(changes.redirect_uris.as_deref())
+        .bind(changes.scopes.as_deref())
+        .bind(changes.website.as_deref())
+        .bind(changes.trusted)
+        .fetch_optional(pool)
+        .await?;
+    Ok(app)
+}
+
+/// Deletes the app behind `id`, reporting whether a row went.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<bool> {
+    let outcome = sqlx::query("DELETE FROM oauth_apps WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(outcome.rows_affected() > 0)
 }
 
 #[cfg(test)]
@@ -433,5 +638,203 @@ mod tests {
             .unwrap()
             .expect("the fixture token is stored");
         assert_eq!(found.app_id, tokened.id, "and names the tokened app");
+    }
+
+    /// An [`AdminNewApp`] named `name`, everything else stock.
+    fn admin_form(name: &str) -> AdminNewApp {
+        AdminNewApp {
+            client_name: name.to_owned(),
+            redirect_uris: "https://client.example/callback".to_owned(),
+            scopes: "read".to_owned(),
+            website: None,
+            trusted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_as_admin_stores_the_trusted_flag_and_mints_credentials() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let app = create_as_admin(
+            &pool,
+            &AdminNewApp {
+                trusted: true,
+                website: Some("https://admin.example".to_owned()),
+                ..admin_form("Admin App")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(app.trusted, "the flag the admin set is stored");
+        assert_eq!(app.client_name, "Admin App", "the name round trips");
+        assert_eq!(app.user_id, None, "an admin app has no owner");
+        assert_eq!(app.client_id.len(), 43, "the credential pair is minted");
+        assert_eq!(app.client_secret.len(), 43, "as the client register does");
+
+        let untrusted = create_as_admin(&pool, &admin_form("Plain Admin App"))
+            .await
+            .unwrap();
+        assert!(!untrusted.trusted, "and false stays false");
+    }
+
+    #[tokio::test]
+    async fn search_filters_each_way_and_counts_the_whole_table() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let keep = create_as_admin(&pool, &admin_form("Keep")).await.unwrap();
+        let drop_it = create_as_admin(&pool, &admin_form("Drop")).await.unwrap();
+        let trusted = create_as_admin(
+            &pool,
+            &AdminNewApp {
+                trusted: true,
+                ..admin_form("Keep")
+            },
+        )
+        .await
+        .unwrap();
+        let window = |page: i64, page_size: i64| AppSearchParams {
+            name: None,
+            client_id: None,
+            trusted: None,
+            page,
+            page_size,
+        };
+
+        let all = search(&pool, &window(1, 50)).await.unwrap();
+        assert_eq!(all.count, 3, "the total is the whole table");
+        assert_eq!(all.apps.len(), 3, "and unfiltered all three show");
+        assert_eq!(all.apps[0].id, trusted.id, "newest first");
+
+        let named = AppSearchParams {
+            name: Some("Keep".to_owned()),
+            ..window(1, 50)
+        };
+        let by_name = search(&pool, &named).await.unwrap();
+        assert_eq!(by_name.apps.len(), 2, "the exact name filter");
+        assert_eq!(by_name.count, 3, "the count ignores the filter");
+
+        let by_client_id = AppSearchParams {
+            client_id: Some(drop_it.client_id.clone()),
+            ..window(1, 50)
+        };
+        let found = search(&pool, &by_client_id).await.unwrap();
+        assert_eq!(found.apps.len(), 1, "the client id finds one");
+        assert_eq!(found.apps[0].id, drop_it.id, "and it is the right one");
+
+        let trusted_only = AppSearchParams {
+            trusted: Some(true),
+            ..window(1, 50)
+        };
+        let flagged = search(&pool, &trusted_only).await.unwrap();
+        assert_eq!(flagged.apps.len(), 1, "the flag filter");
+        assert_eq!(flagged.apps[0].id, trusted.id, "the trusted app only");
+
+        let windowed = search(&pool, &window(2, 2)).await.unwrap();
+        assert_eq!(
+            windowed.apps.len(),
+            1,
+            "the second page takes the remainder"
+        );
+        assert_eq!(windowed.apps[0].id, keep.id, "oldest of the three");
+
+        let past = search(&pool, &window(9, 50)).await.unwrap();
+        assert!(past.apps.is_empty(), "a page past the end is empty");
+        assert_eq!(past.count, 3, "and the count still says three");
+    }
+
+    #[tokio::test]
+    async fn update_is_present_only_and_names_the_row_it_missed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let app = create_as_admin(
+            &pool,
+            &AdminNewApp {
+                website: Some("https://before.example".to_owned()),
+                ..admin_form("Renamed")
+            },
+        )
+        .await
+        .unwrap();
+
+        let touched = update(
+            &pool,
+            app.id,
+            &AppChanges {
+                trusted: Some(true),
+                ..AppChanges::default()
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the row is there");
+        assert!(touched.trusted, "the flag moved");
+        assert_eq!(touched.client_name, "Renamed", "everything else stayed");
+        assert_eq!(
+            touched.website.as_deref(),
+            Some("https://before.example"),
+            "including the website"
+        );
+        assert_eq!(
+            touched.client_id, app.client_id,
+            "credentials are never rewritten"
+        );
+
+        let rewritten = update(
+            &pool,
+            app.id,
+            &AppChanges {
+                client_name: Some("Finally".to_owned()),
+                redirect_uris: Some("https://after.example/cb".to_owned()),
+                scopes: Some("read write".to_owned()),
+                website: Some("https://after.example".to_owned()),
+                trusted: Some(false),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("the row is still there");
+        assert_eq!(rewritten.client_name, "Finally", "name");
+        assert_eq!(
+            rewritten.redirect_uris, "https://after.example/cb",
+            "redirect uris"
+        );
+        assert_eq!(rewritten.scopes, "read write", "scopes");
+        assert_eq!(
+            rewritten.website.as_deref(),
+            Some("https://after.example"),
+            "website"
+        );
+        assert!(!rewritten.trusted, "and trusted back to false");
+
+        let missed = update(
+            &pool,
+            new_id(),
+            &AppChanges {
+                client_name: Some("ghost".to_owned()),
+                ..AppChanges::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(missed.is_none(), "an unknown id updates nothing");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_row_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let app = create_as_admin(&pool, &admin_form("Doomed")).await.unwrap();
+        assert!(
+            delete(&pool, app.id).await.unwrap(),
+            "the first delete takes the row"
+        );
+        assert!(
+            get_by_id(&pool, app.id).await.unwrap().is_none(),
+            "and it is gone"
+        );
+        assert!(
+            !delete(&pool, app.id).await.unwrap(),
+            "a second delete finds nothing to remove"
+        );
     }
 }

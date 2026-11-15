@@ -44,11 +44,14 @@
 //! [`password_reset::auth_router`] joins it at `POST /auth/password`, the
 //! address Pleroma routes the reset request on outside `/api` (its two
 //! `/api/v1/pleroma/password_reset` pages ride on [`v1`]).
-//! [`admin::invites::registration_router`] is the one router of a nested
-//! area that [`crate::app`] merges at the root: the invite link
+//! [`admin::invites::registration_router`] and
+//! [`admin::apps_docs::public_router`] are the routers of a nested area
+//! that [`crate::app`] merges at the root: the invite link
 //! `GET /registration/{token}` lives at the top-level path Pleroma's
-//! `redirect_url` names, while the invite maintenance routes ride on
-//! [`v1`] under `/pleroma/admin`.
+//! `redirect_url` names, and the public instance documents
+//! `GET /instance/{name}.html` at the top-level path Pleroma's
+//! `InstanceStatic` plug serves, while the maintenance routes of both
+//! areas ride on [`v1`] under `/pleroma/admin`.
 
 pub mod account_lists;
 pub mod accounts;

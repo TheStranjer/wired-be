@@ -1,6 +1,6 @@
 //! The admin API's JSON shapes: the moderation-log page, the stats
-//! counters and the invite, webhook and ops entities (WBE-199, WBE-209,
-//! WBE-208).
+//! counters, the invite, webhook and ops entities, and the OAuth-app and
+//! instance-document answers (WBE-199, WBE-209, WBE-208, WBE-205).
 //!
 //! Pleroma renders all of them through
 //! `Pleroma.Web.AdminAPI.ModerationLogView`
@@ -16,14 +16,18 @@
 //! [`crate::models::status`]'s live counters, and the invite entity is
 //! the seven keys `InviteView` takes off the row.
 
+use std::fmt;
+
 use chrono::NaiveDate;
 use serde::Serialize;
+use serde::ser::SerializeMap as _;
 use serde_json::Value;
 
 use crate::{
     config::FrontendConfig,
     models::{
-        invite_token::InviteToken, moderation_log, status::StatusVisibilityCounts, webhook::Webhook,
+        invite_token::InviteToken, moderation_log, oauth_app::OauthApp,
+        status::StatusVisibilityCounts, webhook::Webhook,
     },
 };
 
@@ -308,6 +312,114 @@ impl FrontendInstallStatus {
     pub const OK: Self = Self { status: "ok" };
 }
 
+/// One OAuth application, the admin API's shape.
+///
+/// Pleroma's `AdminAPI.OAuthAppView` is `MastodonAPI.AppView`'s
+/// `show.json` with the `admin: true` arm adding `trusted` and the row
+/// `id` (`lib/pleroma/web/admin_api/views/o_auth_app_view.ex`), and the
+/// ticket pins those seven keys. `id` is the `UUIDv7` as lowercase
+/// hyphenated text (decision 4); `client_secret` is secret material the
+/// admin answer carries verbatim — which is why the manual `Debug` impl
+/// below redacts it, as the stored row's does.
+#[derive(Serialize)]
+pub struct AdminOauthApp {
+    /// The row's `UUIDv7` as text.
+    pub id: String,
+    /// The application name (`client_name`).
+    pub name: String,
+    /// The public OAuth client id.
+    pub client_id: String,
+    /// The OAuth client secret. Never in `Debug` output.
+    pub client_secret: String,
+    /// The redirect URIs, exactly as stored (`redirect_uri`, singular —
+    /// Pleroma's view name).
+    pub redirect_uri: String,
+    /// The application homepage, `None` rendered as `null`.
+    pub website: Option<String>,
+    /// Whether the app skips the authorization consent screen.
+    pub trusted: bool,
+}
+
+/// `client_secret` is secret material and renders as `<redacted>`;
+/// everything else shows.
+impl fmt::Debug for AdminOauthApp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminOauthApp")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("website", &self.website)
+            .field("trusted", &self.trusted)
+            .finish()
+    }
+}
+
+impl AdminOauthApp {
+    /// Renders one stored [`OauthApp`] row in the admin API's shape.
+    #[must_use]
+    pub fn from_app(app: &OauthApp) -> Self {
+        Self {
+            id: app.id.to_string(),
+            name: app.client_name.clone(),
+            client_id: app.client_id.clone(),
+            client_secret: app.client_secret.clone(),
+            redirect_uri: app.redirect_uris.clone(),
+            website: app.website.clone(),
+            trusted: app.trusted,
+        }
+    }
+
+    /// Renders a listing page's rows, in the order
+    /// [`search`](crate::models::oauth_app::search) read them (newest
+    /// first).
+    #[must_use]
+    pub fn from_rows(apps: &[OauthApp]) -> Vec<Self> {
+        apps.iter().map(Self::from_app).collect()
+    }
+}
+
+/// The `GET /api/v1/pleroma/admin/oauth_app` answer: the page's apps
+/// beside the window size and the total.
+///
+/// Pleroma's `index.json` `{apps, count, page_size}`
+/// (`lib/pleroma/web/mastodon_api/views/app_view.ex`, the `admin: true`
+/// arm); `count` is the whole-table total the model reports, not the
+/// filtered one — Pleroma's `App.search` aggregates `Repo.all` and the
+/// answer keeps that meaning.
+#[derive(Debug, Serialize)]
+pub struct AdminOauthAppPage {
+    /// The page's apps, newest first.
+    pub apps: Vec<AdminOauthApp>,
+    /// How many apps the instance has registered, filters aside.
+    pub count: i64,
+    /// The effective `page_size` the window was cut with.
+    pub page_size: i64,
+}
+
+/// The `PATCH /api/v1/pleroma/admin/instance_document/{name}` answer:
+/// Pleroma's `InstanceDocumentController.update` body, the public address
+/// of the document just written (`%{"url" => url}`).
+#[derive(Debug, Serialize)]
+pub struct InstanceDocumentUrl {
+    /// The `{BASE_URL}/instance/<name>.html` the document is served at.
+    pub url: String,
+}
+
+/// The `DELETE /api/v1/pleroma/admin/instance_document/{name}` answer:
+/// Pleroma's `json(conn, %{})` — the empty JSON object. A unit struct's
+/// derived `Serialize` would write `null`, so this renders the map
+/// itself.
+#[derive(Debug)]
+pub struct InstanceDocumentAck;
+
+impl Serialize for InstanceDocumentAck {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_map(Some(0))?.end()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone as _, Utc};
@@ -437,5 +549,98 @@ mod tests {
             json!(true),
             "the second row is the internal one"
         );
+    }
+
+    /// A stored app with recognizable values in every column the admin
+    /// entity reads.
+    fn stored_app() -> OauthApp {
+        OauthApp {
+            id: Uuid::parse_str("0198fc3a-0000-7000-8000-000000000042").expect("test uuid"),
+            client_name: "Admin Client".to_owned(),
+            redirect_uris: "https://a.example/cb\nhttps://b.example/cb".to_owned(),
+            scopes: "read write".to_owned(),
+            website: None,
+            client_id: "cid".to_owned(),
+            client_secret: "top-secret".to_owned(),
+            trusted: true,
+            user_id: None,
+            inserted_at: Utc.with_ymd_and_hms(2026, 1, 31, 12, 34, 56).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 2, 1, 9, 0, 0).unwrap(),
+        }
+    }
+
+    /// The app entity carries exactly the ticket's seven keys, the
+    /// redirect URIs under the singular `redirect_uri` name Pleroma's
+    /// view uses.
+    #[test]
+    fn an_oauth_app_renders_the_seven_pinned_keys() {
+        let rendered = serde_json::to_value(AdminOauthApp::from_app(&stored_app()))
+            .expect("the entity serializes");
+        assert_eq!(
+            rendered,
+            json!({
+                "id": "0198fc3a-0000-7000-8000-000000000042",
+                "name": "Admin Client",
+                "client_id": "cid",
+                "client_secret": "top-secret",
+                "redirect_uri": "https://a.example/cb\nhttps://b.example/cb",
+                "website": null,
+                "trusted": true,
+            }),
+            "no scopes, no timestamps — the seven keys and nothing else"
+        );
+    }
+
+    /// `client_secret` is secret material: the entity's `Debug` redacts
+    /// it while the JSON keeps it (admins are owed the pair).
+    #[test]
+    fn the_app_debug_redacts_the_client_secret() {
+        let entity = AdminOauthApp::from_app(&stored_app());
+        let debug = format!("{entity:?}");
+        assert!(
+            !debug.contains("top-secret"),
+            "the client secret must not leak"
+        );
+        assert!(
+            debug.contains(r#"client_secret: "<redacted>""#),
+            "the redaction marker names the field"
+        );
+        assert!(debug.contains("cid"), "the public id still shows");
+    }
+
+    /// The page wraps the rendered apps beside the total and the window
+    /// size, the three keys Pleroma's `index.json` names.
+    #[test]
+    fn the_app_page_renders_apps_count_and_page_size() {
+        let apps = AdminOauthApp::from_rows(&[stored_app()]);
+        let rendered = serde_json::to_value(AdminOauthAppPage {
+            apps,
+            count: 7,
+            page_size: 50,
+        })
+        .expect("the page serializes");
+        assert_eq!(rendered["count"], json!(7), "the whole-table total");
+        assert_eq!(rendered["page_size"], json!(50), "the effective window");
+        let entries = rendered["apps"].as_array().expect("the apps array");
+        assert_eq!(entries.len(), 1, "the one row");
+        assert_eq!(entries[0]["name"], "Admin Client", "rendered as the entity");
+    }
+
+    /// The two instance-document answers: the URL object, and the empty
+    /// object — which a derived unit-struct render would get wrong, hence
+    /// the manual `Serialize`.
+    #[test]
+    fn the_document_answers_render_the_pinned_bodies() {
+        let rendered = serde_json::to_value(InstanceDocumentUrl {
+            url: "https://test.example/instance/terms-of-service.html".to_owned(),
+        })
+        .expect("the url object serializes");
+        assert_eq!(
+            rendered,
+            json!({"url": "https://test.example/instance/terms-of-service.html"}),
+            "one key, the public address"
+        );
+        let ack = serde_json::to_value(InstanceDocumentAck).expect("the ack serializes");
+        assert_eq!(ack, json!({}), "the delete body is the empty object");
     }
 }

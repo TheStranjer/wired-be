@@ -51,6 +51,14 @@ mod activitypub;
 /// [`StaffUser`]: wired_be::auth::admin::StaffUser
 mod admin;
 
+/// The admin OAuth-app maintenance and instance-document endpoints over
+/// HTTP (`/oauth_app`, `/instance_document/{name}` and the public
+/// `GET /instance/{name}.html`, WBE-205): the CRUD walk and its filters,
+/// the `trusted` flag, the `{"errors": …}` refusals, the document
+/// upload/read/delete cycle with its headers, size gate and traversal
+/// refusals, and both areas' scope gates.
+mod admin_apps_docs;
+
 /// The admin ops endpoints over HTTP: the media-proxy cache ledger, the
 /// frontend catalogue and installer, and the admin backup trigger.
 mod admin_ops;

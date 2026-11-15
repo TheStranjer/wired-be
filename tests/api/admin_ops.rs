@@ -59,7 +59,7 @@ fn ops_config(purge_url: Option<&str>) -> Config {
 /// built from `build_url`.
 fn frontend_config(dir: &std::path::Path, build_url: &str) -> Config {
     let mut config = ops_config(None);
-    config.frontends = FrontendSettings {
+    config.statics.frontends = FrontendSettings {
         dir: dir.to_path_buf(),
         available: vec![FrontendConfig {
             name: "pleroma-fe".to_owned(),

@@ -33,6 +33,15 @@
 //! renders a fresh form (Pleroma's existing-token short-circuit joins
 //! whichever ticket gives `/oauth` sessions). `lang` sets the page's
 //! language attribute.
+//!
+//! Trusted apps and the consent form (WBE-205): admins set the
+//! `oauth_apps.trusted` flag through
+//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`, and Pleroma's
+//! `OAuthController.authorize` skips the confirmation screen for an app
+//! carrying it. This endpoint does not act on the flag yet — every
+//! visit renders the form; skipping the consent for trusted apps is
+//! left to the ticket that reworks this flow, and until then the flag
+//! is stored, listed and answered but inert here.
 
 use std::fmt;
 

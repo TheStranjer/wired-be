@@ -110,6 +110,14 @@ pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
 pub const UPLOADS_DIR_VAR: &str = "UPLOADS_DIR";
 /// Environment variable holding the directory emoji packs are stored in.
 pub const EMOJI_DIR_VAR: &str = "EMOJI_DIR";
+/// Environment variable holding the directory the instance documents
+/// (static HTML pages like the terms of service) are stored in, each
+/// written as `<name>.html` (see [`crate::api::admin::apps_docs`]).
+pub const INSTANCE_DOCS_DIR_VAR: &str = "INSTANCE_DOCS_DIR";
+/// Environment variable holding the comma-separated list of instance
+/// document names the admin and public document routes serve
+/// (see [`crate::api::admin::apps_docs`]).
+pub const INSTANCE_DOCUMENT_NAMES_VAR: &str = "INSTANCE_DOCUMENT_NAMES";
 /// Environment variable holding the public prefix of uploaded files' URLs.
 pub const MEDIA_BASE_URL_VAR: &str = "MEDIA_BASE_URL";
 /// Environment variable holding whether registration may omit the email
@@ -499,6 +507,18 @@ pub const DEFAULT_UPLOADS_DIR: &str = "./uploads";
 /// Pleroma keeps them in an `emoji` subdirectory of its static dir
 /// (`lib/pleroma/emoji/pack.ex`), one directory per pack.
 pub const DEFAULT_EMOJI_DIR: &str = "./emoji";
+/// Directory the instance documents live in when `INSTANCE_DOCS_DIR` is
+/// unset, relative to the working directory.
+///
+/// Pleroma keeps them under `[:instance, :static_dir]` (its default
+/// `instance/static`, `Pleroma.Web.InstanceDocument`), which the
+/// `InstanceStatic` plug serves at the top level; the same shape with one
+/// setting folded in.
+pub const DEFAULT_INSTANCE_DOCS_DIR: &str = "./instance";
+/// Document names used when `INSTANCE_DOCUMENT_NAMES` is unset: the two
+/// documents Pleroma's `Pleroma.Web.InstanceDocument` map knows, spelled
+/// as the `<name>.html` storage this server writes them under.
+pub const DEFAULT_INSTANCE_DOCUMENT_NAMES: &str = "terms-of-service,instance-panel";
 /// Path appended to `BASE_URL` for the media URL prefix when
 /// `MEDIA_BASE_URL` is unset: the route in [`crate::api::media_files`].
 pub const DEFAULT_MEDIA_URL_PATH: &str = "/media";
@@ -653,20 +673,27 @@ fn test_rate_limit() -> RateLimitConfig {
         trust_proxy_headers: Toggle::new(DEFAULT_TRUST_PROXY_HEADERS),
     }
 }
-/// The frontend-install defaults as a [`FrontendSettings`], spelled once
-/// for [`Config::test_defaults`]'s literal like [`TEST_MEDIA_PROXY`]; a
+/// The admin-managed static content defaults — no installable frontend,
+/// the stock document pair — as a [`StaticSettings`], spelled once for
+/// [`Config::test_defaults`]'s literal like [`TEST_MEDIA_PROXY`]; a
 /// function rather than a `const` because [`PathBuf::from`] is not a
 /// `const fn`.
 #[cfg(any(test, feature = "integration-tests"))]
-fn test_frontends() -> FrontendSettings {
-    FrontendSettings {
-        dir: PathBuf::from(DEFAULT_FRONTENDS_DIR),
-        available: Vec::new(),
+fn test_statics() -> StaticSettings {
+    StaticSettings {
+        frontends: FrontendSettings {
+            dir: PathBuf::from(DEFAULT_FRONTENDS_DIR),
+            available: Vec::new(),
+        },
+        documents: InstanceDocumentSettings {
+            dir: PathBuf::from(DEFAULT_INSTANCE_DOCS_DIR),
+            names: comma_list(DEFAULT_INSTANCE_DOCUMENT_NAMES),
+        },
     }
 }
 /// The outbound-fetch defaults as a [`FetchSettings`] with the SSRF guard
 /// off, spelled once for [`Config::test_defaults`]'s literal like
-/// [`test_frontends`]: the suites talk to local mini-servers.
+/// [`test_statics`]: the suites talk to local mini-servers.
 #[cfg(any(test, feature = "integration-tests"))]
 fn test_fetch() -> FetchSettings {
     FetchSettings {
@@ -981,9 +1008,9 @@ pub struct FrontendConfig {
 /// `FRONTENDS_DIR` and `FRONTENDS_AVAILABLE`
 /// (see [`crate::api::admin::ops`]).
 ///
-/// They ride together on one [`Config`] field because the [`Config`]
-/// readers and the [`Debug`] impl each have an 80-line budget (AGENTS.md)
-/// and these are the two halves of one admin-API feature.
+/// It rides inside [`StaticSettings`], the one [`Config`] field for the
+/// admin-managed static trees, because the [`Config`] readers and the
+/// [`Debug`] impl each have an 80-line budget (AGENTS.md).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrontendSettings {
     /// Directory installed frontends live in, from `FRONTENDS_DIR`; the
@@ -1015,6 +1042,75 @@ where
     Ok(FrontendSettings {
         dir: directory(lookup, FRONTENDS_DIR_VAR, DEFAULT_FRONTENDS_DIR),
         available,
+    })
+}
+
+/// The two settings that locate the instance documents and say which names
+/// exist, from `INSTANCE_DOCS_DIR` and `INSTANCE_DOCUMENT_NAMES`
+/// (see [`crate::api::admin::apps_docs`]).
+///
+/// It rides inside [`StaticSettings`] for the same line-budget reason
+/// [`FrontendSettings`] does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceDocumentSettings {
+    /// Directory the `<name>.html` documents are stored in, from
+    /// `INSTANCE_DOCS_DIR`.
+    pub dir: PathBuf,
+    /// The document names the admin and public routes serve, from
+    /// `INSTANCE_DOCUMENT_NAMES`; the names outside this list are the
+    /// routes' 404.
+    pub names: Vec<String>,
+}
+
+/// Reads the two `INSTANCE_DOCUMENT*` settings into an
+/// [`InstanceDocumentSettings`]: the directory with the shared
+/// [`directory`] reader, the names with the shared [`comma_list`] split
+/// over their documented default. A set-but-blank
+/// `INSTANCE_DOCUMENT_NAMES` names no documents, exactly as an operator
+/// writing it means.
+fn instance_document_settings<F>(lookup: &F) -> InstanceDocumentSettings
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let names = lookup(INSTANCE_DOCUMENT_NAMES_VAR)
+        .unwrap_or_else(|| DEFAULT_INSTANCE_DOCUMENT_NAMES.to_owned());
+    InstanceDocumentSettings {
+        dir: directory(lookup, INSTANCE_DOCS_DIR_VAR, DEFAULT_INSTANCE_DOCS_DIR),
+        names: comma_list(&names),
+    }
+}
+
+/// The two admin-managed static file trees: the frontends the installer
+/// lands and the documents the instance-document routes serve.
+///
+/// Pleroma keeps both under one `[:instance, :static_dir]`; this server
+/// gives each its own directory variable, and they share one [`Config`]
+/// field because the [`Config`] readers and the [`Debug`] impl each have
+/// an 80-line budget (AGENTS.md) and both feed admin-served static
+/// content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticSettings {
+    /// The installed and installable frontends
+    /// (see [`crate::api::admin::ops`]).
+    pub frontends: FrontendSettings,
+    /// The instance documents
+    /// (see [`crate::api::admin::apps_docs`]).
+    pub documents: InstanceDocumentSettings,
+}
+
+/// Reads the four `FRONTENDS_*` and `INSTANCE_DOCUMENT*` settings into the
+/// one [`StaticSettings`].
+///
+/// # Errors
+///
+/// Those of [`frontend_settings`].
+fn statics_settings<F>(lookup: &F) -> Result<StaticSettings, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    Ok(StaticSettings {
+        frontends: frontend_settings(lookup)?,
+        documents: instance_document_settings(lookup),
     })
 }
 
@@ -1546,10 +1642,12 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
-    /// Where installed frontends live and which ones the admin may
-    /// install, from the two `FRONTENDS_*` variables
-    /// (see [`crate::api::admin::ops`]).
-    pub frontends: FrontendSettings,
+    /// The admin-managed static content: the installed/installable
+    /// frontends and the instance documents, from the `FRONTENDS_*` and
+    /// `INSTANCE_DOCUMENT*` variables
+    /// (see [`crate::api::admin::ops`] and
+    /// [`crate::api::admin::apps_docs`]).
+    pub statics: StaticSettings,
     /// Hosts rich media card fetching never visits, from
     /// `RICH_MEDIA_IGNORE_HOSTS` (a comma-separated list, empty by
     /// default): a link to one of them is never fetched and gets no card.
@@ -1690,7 +1788,7 @@ impl Config {
             mail_from: mail.from,
             secret_key_base: secret_key_base(&lookup),
             media_proxy: media_proxy_settings(&lookup)?,
-            frontends: frontend_settings(&lookup)?,
+            statics: statics_settings(&lookup)?,
             rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
             rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup),
@@ -1846,7 +1944,7 @@ impl Config {
             mail_from: default_mail_from(domain_of(TEST_BASE_URL)),
             secret_key_base: None,
             media_proxy: TEST_MEDIA_PROXY,
-            frontends: test_frontends(),
+            statics: test_statics(),
             rich_media_ignore_hosts: comma_list(DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
             rich_media_remote: Toggle::new(DEFAULT_RICH_MEDIA_REMOTE),
             vapid: VapidConfig::default(),
@@ -3269,7 +3367,7 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
         )
         .field("uploads_dir", &config.uploads_dir)
         .field("emoji_dir", &config.emoji_dir)
-        .field("frontends", &config.frontends)
+        .field("statics", &config.statics)
         .field("media_base_url", &config.media_base_url)
         .field("accounts_email_optional", &config.accounts_email_optional)
         .field("min_password_length", &config.min_password_length)
@@ -5568,18 +5666,18 @@ mod tests {
     fn frontends_default_to_the_stock_directory_and_no_catalogue() {
         let config = config_with(&[]);
         assert_eq!(
-            config.frontends.dir,
+            config.statics.frontends.dir,
             PathBuf::from("./frontends"),
             "default FRONTENDS_DIR"
         );
         assert!(
-            config.frontends.available.is_empty(),
+            config.statics.frontends.available.is_empty(),
             "nothing is installable until the operator names it"
         );
         for blank in ["", "   "] {
             let blank_catalogue = config_with(&[(FRONTENDS_AVAILABLE_VAR, blank)]);
             assert!(
-                blank_catalogue.frontends.available.is_empty(),
+                blank_catalogue.statics.frontends.available.is_empty(),
                 "FRONTENDS_AVAILABLE={blank:?} means no frontends"
             );
         }
@@ -5596,13 +5694,13 @@ mod tests {
             ),
         ]);
         assert_eq!(
-            config.frontends.dir,
+            config.statics.frontends.dir,
             PathBuf::from("/srv/frontends"),
             "custom FRONTENDS_DIR"
         );
-        assert_eq!(config.frontends.available.len(), 2, "two entries");
+        assert_eq!(config.statics.frontends.available.len(), 2, "two entries");
         assert_eq!(
-            config.frontends.available[0],
+            config.statics.frontends.available[0],
             FrontendConfig {
                 name: "pleroma-fe".to_owned(),
                 git: Some("https://example.com/fe".to_owned()),
@@ -5613,7 +5711,7 @@ mod tests {
             "the full entry"
         );
         assert_eq!(
-            config.frontends.available[1],
+            config.statics.frontends.available[1],
             FrontendConfig {
                 name: "volar".to_owned(),
                 git: None,
@@ -5638,6 +5736,68 @@ mod tests {
                 "the message names the variable: {err}"
             );
         }
+    }
+
+    #[test]
+    fn instance_documents_default_to_the_stock_pair_and_directory() {
+        let config = config_with(&[]);
+        assert_eq!(
+            config.statics.documents.dir,
+            PathBuf::from("./instance"),
+            "default INSTANCE_DOCS_DIR"
+        );
+        assert_eq!(
+            config.statics.documents.names,
+            vec!["terms-of-service".to_owned(), "instance-panel".to_owned()],
+            "the two documents Pleroma's InstanceDocument map knows"
+        );
+        let blank = config_with(&[(INSTANCE_DOCUMENT_NAMES_VAR, "  ")]);
+        assert!(
+            blank.statics.documents.names.is_empty(),
+            "a set-but-blank list names no documents"
+        );
+        assert!(
+            config_with(&[(INSTANCE_DOCS_DIR_VAR, "  ")])
+                .statics
+                .documents
+                .dir
+                .ends_with("instance"),
+            "a blank directory falls back to the default"
+        );
+    }
+
+    #[test]
+    fn reads_the_instance_document_settings() {
+        let config = config_with(&[
+            (INSTANCE_DOCS_DIR_VAR, " /srv/docs "),
+            (
+                INSTANCE_DOCUMENT_NAMES_VAR,
+                "terms-of-service, privacy ,about",
+            ),
+        ]);
+        assert_eq!(
+            config.statics.documents.dir,
+            PathBuf::from("/srv/docs"),
+            "custom INSTANCE_DOCS_DIR, trimmed"
+        );
+        assert_eq!(
+            config.statics.documents.names,
+            vec![
+                "terms-of-service".to_owned(),
+                "privacy".to_owned(),
+                "about".to_owned(),
+            ],
+            "the names are trimmed, blanks between the commas drop"
+        );
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("statics: StaticSettings"),
+            "the store renders in Debug: {debug}"
+        );
+        assert!(
+            debug.contains("dir: \"/srv/docs\""),
+            "the documents directory renders"
+        );
     }
 
     #[test]

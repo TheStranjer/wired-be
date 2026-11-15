@@ -317,7 +317,10 @@ async fn wait_for_ctrl_c() {
 /// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`)
 /// and the invite registration link of
 /// [`api::admin::invites::registration_router`] (`/registration/{token}`,
-/// redirecting to the frontend's registration page).
+/// redirecting to the frontend's registration page), and the public
+/// instance documents of [`api::admin::apps_docs::public_router`]
+/// (`/instance/{name}.html`, the terms-of-service pages an admin
+/// uploads).
 /// Paths no route matches get the standard JSON error response (decision 8).
 ///
 /// `state` is handed to [`api::router`] and [`api::oauth::router`] before
@@ -345,6 +348,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::html_pages::router())
             .merge(api::remote_interaction::router())
             .merge(api::admin::invites::registration_router())
+            .merge(api::admin::apps_docs::public_router())
             .fallback(not_found)
             .with_state(state),
     )
