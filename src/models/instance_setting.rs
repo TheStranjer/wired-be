@@ -4,9 +4,11 @@
 //! Pleroma keeps these in its runtime configuration
 //! (`Pleroma.Config`, e.g. the `:frontend_configurations` key the API
 //! serves at `/api/pleroma/frontend_configurations`); here each one is a
-//! row so later admin-API tickets can edit settings at runtime. This
-//! module is the whole data layer for the table: [`get`] reads one key's
-//! value, [`set`] writes (creating or replacing) it.
+//! row. This module is the whole data layer for the table: [`get`] reads
+//! one key's value, [`set`] writes (creating or replacing) it. The
+//! admin-changeable runtime configuration lives in the separate
+//! whitelist-gated store, [`config_entries`](crate::services::runtime_config)
+//! (WBE-206); the MRF chain reads from there, not from this table.
 
 use serde_json::Value;
 use sqlx::PgPool;

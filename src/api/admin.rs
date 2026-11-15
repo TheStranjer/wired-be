@@ -28,6 +28,8 @@
 //! Later admin tickets join this same file with more `.merge(...)` /
 //! `.route(...)` lines; the [module docs of `crate::api::v1`](crate::api::v1)
 //! hold the no-fallback rule that applies to every router merged there.
+//! The runtime config store (`GET`/`POST /config`, WBE-206) joins as the
+//! [`config`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -49,6 +51,8 @@ use crate::{
     state::AppState,
     util::id::parse_id,
 };
+
+pub mod config;
 
 /// Default `page` when the parameter is absent or not a positive number
 /// (Pleroma's `page_params` first, over its `fetch_integer_param`).
@@ -74,6 +78,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/moderation_log", get(list_moderation_log))
         .route("/stats", get(stats))
+        .merge(config::router())
 }
 
 /// `GET /api/v1/pleroma/admin/moderation_log` — the log page Pleroma's

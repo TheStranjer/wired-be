@@ -92,6 +92,15 @@
 //! the viewer's own statuses exempt — which [`timeline_response`] and the
 //! notification and thread reads run between the render and the response.
 //!
+//! [`config_registry`] is the whitelist of runtime-configurable settings:
+//! the eight `:pleroma` entries the admin config API may change, each with
+//! its subkeys, its restart flag and its env-derived defaults.
+//! [`runtime_config`] is the store beside it: the `config_entries` table,
+//! the two value forms the API and the jsonb column exchange (keyword
+//! lists as `{"tuple": […]}` arrays), and the effective-value resolution
+//! the MRF pipeline and the instance documents read through — Pleroma's
+//! `ConfigDB` and `Config` pair.
+//!
 //! [`ingest`] is the inbound half of the same post lifecycle: it folds a
 //! remote `Note`-family object a `Create` delivered into a stored status —
 //! the dedupe on its `uri`, the reply/quote/context links resolved against
@@ -103,6 +112,7 @@
 //!
 //! [`timeline_response`]: crate::api::helpers::timeline_response
 
+pub mod config_registry;
 pub mod create_status;
 pub mod delete_status;
 pub mod emoji_packs;
@@ -118,6 +128,7 @@ pub mod notify;
 pub mod relay;
 pub mod render_status;
 pub mod rich_media;
+pub mod runtime_config;
 pub mod schedule_status;
 pub mod streaming;
 pub mod timeline;

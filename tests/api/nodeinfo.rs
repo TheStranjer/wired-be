@@ -520,9 +520,14 @@ async fn registrations_toggle_and_shared_metadata_follow_the_builders() {
 async fn federation_reports_the_enabled_mrf_policies() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    wired_be::models::instance_setting::set(&pool, "mrf", &json!({"policies": ["noop"]}))
-        .await
-        .expect("the setting writes");
+    wired_be::services::runtime_config::write(
+        &pool,
+        ":pleroma",
+        ":mrf",
+        &json!({"policies": ["noop"]}),
+    )
+    .await
+    .expect("the mrf entry writes");
     let app = common::test_app(pool);
     let document = get_document(&app, "/nodeinfo/2.0").await;
     let federation = &document["metadata"]["federation"];
@@ -547,9 +552,10 @@ async fn federation_reports_the_enabled_mrf_policies() {
 async fn federation_is_the_same_answer_the_instance_documents_give() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    wired_be::models::instance_setting::set(
+    wired_be::services::runtime_config::write(
         &pool,
-        "mrf",
+        ":pleroma",
+        ":mrf",
         &json!({
             "policies": ["simple"],
             "simple": {
@@ -559,7 +565,7 @@ async fn federation_is_the_same_answer_the_instance_documents_give() {
         }),
     )
     .await
-    .expect("the setting writes");
+    .expect("the mrf entry writes");
     for transparency in [true, false] {
         let mut config = common::test_config();
         config.mrf.transparency = Toggle::new(transparency);

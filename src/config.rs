@@ -1,4 +1,8 @@
 //! Runtime configuration, read from environment variables.
+//!
+//! This is the boot-time baseline; the admin config store
+//! ([`crate::services::runtime_config`]) overlays a whitelisted subset of
+//! it with DB rows at request time.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -740,8 +744,9 @@ impl From<bool> for Toggle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MrfSettings {
     /// The policy names from `MRF_POLICIES`, in chain order: the fallback
-    /// chain configuration, used whenever the `mrf` instance setting
-    /// carries no `policies` array of its own.
+    /// chain configuration, used whenever the config store's `:mrf`
+    /// entry carries no `policies` array of its own (see
+    /// [`crate::services::runtime_config`]).
     pub policies: Vec<String>,
     /// Whether the policies publish their lists at all, from
     /// `MRF_TRANSPARENCY` (Pleroma's `[:mrf, :transparency]`).

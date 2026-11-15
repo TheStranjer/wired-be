@@ -583,10 +583,8 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         federation::signature::signing_string,
-        models::{
-            instance_setting,
-            user::{INSTANCE_ACTOR_NICKNAME, NewUser, get_by_nickname, insert, local_ap_id},
-        },
+        models::user::{INSTANCE_ACTOR_NICKNAME, NewUser, get_by_nickname, insert, local_ap_id},
+        services::runtime_config,
         uploads::UploaderBackend,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM, verify_sha256},
     };
@@ -847,16 +845,17 @@ mod tests {
                 .route("/users/alice", get(profiled_actor))
                 .with_state(peer_at(&base)),
         );
-        instance_setting::set(
+        runtime_config::write(
             &pool,
-            "mrf",
+            ":pleroma",
+            ":mrf",
             &json!({
                 "policies": ["simple"],
                 "simple": {"avatar_removal": ["127.0.0.1"]},
             }),
         )
         .await
-        .expect("the setting writes");
+        .expect("the mrf entry writes");
         let state = test_state(pool);
 
         let mirrored = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();

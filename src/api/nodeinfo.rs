@@ -42,7 +42,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::mrf,
     models::user::NOT_INSTANCE_ACTOR,
-    services::instance_meta,
+    services::{instance_meta, runtime_config::RuntimeConfig},
     state::AppState,
 };
 
@@ -142,15 +142,18 @@ async fn nodeinfo(
 ) -> AppResult<Response> {
     let version = SchemaVersion::from_segment(&segment)
         .ok_or_else(|| AppError::NotFoundMessage(UNHANDLED_VERSION.to_owned()))?;
+    let config = RuntimeConfig::new(&state.db, &state.config)
+        .effective_config()
+        .await?;
     let users = read_user_counts(&state.db).await?;
     let local_posts = read_local_post_count(&state.db).await?;
     let staff_accounts = read_staff_accounts(&state.db).await?;
     let federation = federation_block(&state).await;
     let document = NodeInfo::build(
         version,
-        &state.config,
+        &config,
         Usage { users, local_posts },
-        Metadata::build(&state.config, staff_accounts, federation),
+        Metadata::build(&config, staff_accounts, federation),
     );
     document_response(version, &document)
 }

@@ -639,10 +639,8 @@ mod tests {
         config::Config,
         federation::signature::{SigningKey, sign_request},
         http_client::HttpClient,
-        models::{
-            instance_setting,
-            user::{NewUser, get_by_ap_id, insert},
-        },
+        models::user::{NewUser, get_by_ap_id, insert},
+        services::runtime_config,
         uploads::UploaderBackend,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
@@ -873,9 +871,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
     /// the row the pipeline reads as its policy, beside the table the
     /// extractor also consults.
     async fn set_mrf_lists(pool: &PgPool, lists: &Value) {
-        instance_setting::set(
+        runtime_config::write(
             pool,
-            "mrf",
+            ":pleroma",
+            ":mrf",
             &json!({"policies": ["simple"], "simple": lists}),
         )
         .await
@@ -1705,9 +1704,10 @@ NzIC9UQns76BYFUuAk27/0uJTKHbq7uoQfVVsfroyNDlV1zZ7TQZAgMBAAE=
     async fn a_disabled_mrf_policy_leaves_the_door_open() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(
+        runtime_config::write(
             &pool,
-            "mrf",
+            ":pleroma",
+            ":mrf",
             &json!({"policies": ["noop"], "simple": {"reject": [LOOPBACK_HOST]}}),
         )
         .await

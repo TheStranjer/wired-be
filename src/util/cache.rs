@@ -65,6 +65,17 @@ impl<T> TimedCache<T> {
 }
 
 impl<T: Clone> TimedCache<T> {
+    /// Drops the stored entry: the next [`get`](Self::get) misses until
+    /// a fresh insert, whatever the deadline thought. Used when a write
+    /// makes the cached value stale before its window closes — the admin
+    /// config store clearing the MRF chain's cache after a `:mrf*` row
+    /// changed
+    /// ([`crate::api::admin::config`]) is that case.
+    pub fn clear(&self) {
+        let mut slot = self.slot();
+        *slot = None;
+    }
+
     /// The cached value, when one is stored and `now` has not reached its
     /// expiry. A read never extends freshness: the deadline is fixed at
     /// insert time.
@@ -129,6 +140,23 @@ mod tests {
             cache.get(after(-100)),
             None,
             "the past holds nothing either"
+        );
+    }
+
+    /// [`clear`] empties a fresh slot: the value is gone well before its
+    /// deadline, and the next read misses until a new insert.
+    #[test]
+    fn a_cleared_cache_drops_even_a_fresh_entry() {
+        let cache = cache();
+        cache.insert(now(), "here".to_owned());
+        assert_eq!(cache.get(now()).as_deref(), Some("here"), "fresh at first");
+        cache.clear();
+        assert_eq!(cache.get(now()), None, "the clear dropped the fresh value");
+        cache.insert(now(), "again".to_owned());
+        assert_eq!(
+            cache.get(now()).as_deref(),
+            Some("again"),
+            "and the slot takes a new insert"
         );
     }
 

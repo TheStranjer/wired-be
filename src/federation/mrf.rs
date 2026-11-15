@@ -14,13 +14,16 @@
 //! Policies are synchronous and perform no IO: everything a policy can
 //! consult is preloaded into the [`MrfContext`] — the configuration
 //! document, one shared "now", and the local domain — before the chain
-//! runs. The configuration itself comes from the `mrf` row of the
-//! [`instance_settings`](crate::models::instance_setting) table, as JSON
-//! of the shape `{"policies": ["simple", …], "simple": {…}, …}`, with the
-//! `MRF_POLICIES` environment variable (a comma list) as the fallback for
-//! deployments that enable policies without any database row; reads are
-//! cached in memory for [`MRF_CONFIG_TTL`], so a busy inbox costs one
-//! query per window.
+//! runs. The configuration itself comes from the admin config store: the
+//! `:mrf` entry's fields with the `:mrf_simple`, `:mrf_keyword`,
+//! `:mrf_hellthread` and `:mrf_object_age` entries under their policy
+//! keys (see [`crate::services::runtime_config`]), composed by
+//! [`RuntimeConfig::mrf_document`], with the `MRF_POLICIES` environment
+//! variable (a comma list) as the fallback for deployments that enable
+//! policies without any stored row; reads are cached in memory for
+//! [`MRF_CONFIG_TTL`], so a busy inbox costs one query per window, and
+//! `POST /api/v1/pleroma/admin/config` clears that cache when a `:mrf*`
+//! entry changes.
 //!
 //! The pipeline ships Pleroma's no-op policy
 //! ([`NoOpPolicy`], `lib/pleroma/web/activity_pub/mrf/noop_policy.ex`) and
@@ -90,7 +93,8 @@ use tracing::warn;
 use crate::{
     config::Config,
     federation::{dispatch::ActivityView, json},
-    models::{instance_setting, user},
+    models::user,
+    services::runtime_config::RuntimeConfig,
     state::AppState,
     util::cache::TimedCache,
 };
@@ -185,15 +189,18 @@ pub struct MrfContext {
     pub target_tags: Vec<String>,
 }
 
-/// The `mrf` instance setting, resolved against the `MRF_POLICIES`
-/// fallback: the enabled policy names in chain order, beside the setting
+/// The MRF configuration, resolved from the config store against the
+/// `MRF_POLICIES` fallback.
+///
+/// The enabled policy names in chain order, beside the parameter
 /// document the individual policies read their parameters from.
 #[derive(Clone, Debug)]
 pub struct MrfConfig {
     /// The enabled policies, in the order the chain runs them.
     policies: Vec<String>,
-    /// The whole setting object as stored; each policy reads its own key
-    /// through [`params_for`](Self::params_for).
+    /// The whole composed document, per [`RuntimeConfig::mrf_document`]:
+    /// each policy reads its own key through
+    /// [`params_for`](Self::params_for).
     params: Map<String, Value>,
     /// The domain lists of the `simple` policy, compiled once here: the
     /// chain's policy and [`rejected`](Self::rejected) share these rules,
@@ -326,7 +333,7 @@ fn policy_names(params: &Map<String, Value>) -> Option<Vec<String>> {
     )
 }
 
-/// How long a read of the `mrf` instance setting may be served from the
+/// How long a read of the stored `:mrf*` entries may be served from the
 /// in-memory cache.
 pub const MRF_CONFIG_TTL: TimeDelta = TimeDelta::seconds(30);
 
@@ -445,9 +452,6 @@ impl Default for TimedCache<Arc<MrfConfig>> {
         Self::new(MRF_CONFIG_TTL)
     }
 }
-
-/// The instance setting row the configuration is stored under.
-const SETTING_KEY: &str = "mrf";
 
 /// The `ActivityStreams` type whose target the `tag` policy's subscription
 /// rules address: the only activity shape that preloads `target_tags`.
@@ -626,7 +630,7 @@ impl MrfPolicy for NoOpPolicy {
 }
 
 /// The instance's current configuration: the cached read while it is
-/// fresh, the `mrf` instance setting re-read otherwise.
+/// fresh, the stored `:mrf*` entries re-read otherwise.
 #[must_use]
 pub async fn load_config(state: &AppState) -> Arc<MrfConfig> {
     load_config_at(state, Utc::now()).await
@@ -642,14 +646,15 @@ async fn load_config_at(state: &AppState, now: DateTime<Utc>) -> Arc<MrfConfig> 
     }
 }
 
-/// Reads the setting and caches the answer. A failed read falls back to
-/// the env configuration without caching it, so the next activity tries
-/// the database again.
+/// Reads the config store and caches the answer. A failed read falls back
+/// to the env configuration without caching it, so the next activity
+/// tries the database again.
 async fn reload(state: &AppState, now: DateTime<Utc>) -> Arc<MrfConfig> {
-    let stored = match instance_setting::get(&state.db, SETTING_KEY).await {
+    let store = RuntimeConfig::new(&state.db, &state.config);
+    let stored = match store.mrf_document().await {
         Ok(stored) => stored,
         Err(err) => {
-            warn!(%err, "the `mrf` instance setting could not be read; using the MRF_POLICIES fallback uncached");
+            warn!(%err, "the stored `:mrf*` entries could not be read; using the MRF_POLICIES fallback uncached");
             return Arc::new(MrfConfig::resolve(None, &state.config.mrf.policies));
         }
     };
@@ -837,9 +842,15 @@ mod tests {
         config::{Config, Toggle},
         federation::dispatch::ObjectRef,
         http_client::HttpClient,
-        models::instance_setting,
+        services::{config_registry, runtime_config},
         uploads::UploaderBackend,
     };
+
+    /// Writes a `:mrf*` entry into the admin config store: the source the
+    /// pipeline's configuration load now reads.
+    async fn set_mrf_entry(pool: &PgPool, key: &str, value: &Value) -> crate::error::AppResult<()> {
+        runtime_config::write(pool, config_registry::GROUP_PLEROMA, key, value).await
+    }
 
     /// Every `(label, note)` a fake policy ran with, in order. Policies
     /// cannot capture counters through the trait object, so the fakes
@@ -1478,13 +1489,13 @@ mod tests {
         );
     }
 
-    /// The configuration load reads the `mrf` instance setting, caches it
+    /// The configuration load reads the stored `:mrf` entry, caches it
     /// for [`MRF_CONFIG_TTL`], and re-reads it once the window lapses.
     #[tokio::test]
     async fn the_setting_is_read_once_per_cache_window() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(&pool, "mrf", &json!({"policies": ["noop"]}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": ["noop"]}))
             .await
             .expect("the setting writes");
         let state = test_state(&pool);
@@ -1496,7 +1507,7 @@ mod tests {
             "the row is what loaded"
         );
 
-        instance_setting::set(&pool, "mrf", &json!({"policies": []}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": []}))
             .await
             .expect("the rewrite writes");
         let inside = load_config_at(&state, after(29)).await;
@@ -1545,7 +1556,7 @@ mod tests {
     async fn the_incoming_filter_runs_the_configured_chain() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(&pool, "mrf", &json!({"policies": ["ghost", "noop"]}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": ["ghost", "noop"]}))
             .await
             .expect("the setting writes");
         let state = test_state(&pool);
@@ -1599,7 +1610,7 @@ mod tests {
     async fn the_context_arrives_preloaded() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(&pool, "mrf", &json!({"noop": {"probe": true}}))
+        set_mrf_entry(&pool, ":mrf", &json!({"noop": {"probe": true}}))
             .await
             .expect("the setting writes");
         let state = test_state(&pool);
@@ -1697,7 +1708,7 @@ mod tests {
         let create = create_note(&alice.ap_id);
         let follow = follow_of(&alice.ap_id, &carol.ap_id);
 
-        instance_setting::set(&pool, "mrf", &json!({"policies": []}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": []}))
             .await
             .expect("the setting writes");
         let bare = activity_context(&test_state(&pool), &create).await;
@@ -1707,7 +1718,7 @@ mod tests {
         let bare_follow = activity_context(&test_state(&pool), &follow).await;
         assert!(bare_follow.target_tags.is_empty(), "nor a Follow target's");
 
-        instance_setting::set(&pool, "mrf", &json!({"policies": ["anti_link_spam"]}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": ["anti_link_spam"]}))
             .await
             .expect("the rewrite writes");
         let counted = activity_context(&test_state(&pool), &create).await;
@@ -1715,7 +1726,7 @@ mod tests {
         assert_eq!(counted.author_status_count, Some(3), "and only they");
         assert!(counted.author_tags.is_empty(), "the tag facts stay unread");
 
-        instance_setting::set(&pool, "mrf", &json!({"policies": ["tag"]}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": ["tag"]}))
             .await
             .expect("the rewrite writes");
         let tagged = activity_context(&test_state(&pool), &create).await;
@@ -1762,7 +1773,7 @@ mod tests {
     async fn the_incoming_filter_rejects_a_linked_note_from_a_new_author() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(&pool, "mrf", &json!({"policies": ["anti_link_spam"]}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": ["anti_link_spam"]}))
             .await
             .expect("the setting writes");
         let newcomer = user::insert(
@@ -1814,7 +1825,7 @@ mod tests {
     async fn the_incoming_filter_rejects_a_follow_of_a_tagged_local_user() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(&pool, "mrf", &json!({"policies": ["tag"]}))
+        set_mrf_entry(&pool, ":mrf", &json!({"policies": ["tag"]}))
             .await
             .expect("the setting writes");
         let alice = preloaded_author(&pool).await;
