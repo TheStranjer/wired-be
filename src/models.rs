@@ -79,3 +79,4 @@ pub mod user;
 pub mod user_identity;
 pub mod user_search;
 pub mod web_push_subscription;
+pub mod webhook;

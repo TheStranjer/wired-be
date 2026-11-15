@@ -17,7 +17,10 @@
 //! `admin:read` scope gate. The log entries are seeded through the model
 //! helpers (the write endpoints arrive with the later admin tickets), and
 //! time is made controllable by back-dating `inserted_at` rather than
-//! sleeping.
+//! sleeping. The webhook maintenance API (WBE-209) — `/webhooks` CRUD,
+//! the enable / disable / rotate_secret actions, their `{"errors": …}`
+//! validations, the internal protection and the `webhook_*` log lines —
+//! joins at the bottom of the file.
 //!
 //! [`AdminUser`]: wired_be::auth::admin::AdminUser
 //! [`StaffUser`]: wired_be::auth::admin::StaffUser
@@ -2077,6 +2080,950 @@ async fn invite_routes_answer_the_role_gate() {
         "an anonymous GET",
     );
     let bogus = post_invite(&app, "no-such-token", INVITE_CREATE, json!({})).await;
+    common::assert_all_refused(
+        &[bogus],
+        StatusCode::UNAUTHORIZED,
+        INVALID_TOKEN,
+        "an unknown token on the POST",
+    );
+}
+
+/// The webhook listing, creation, update and action routes all live under
+/// this prefix.
+const WEBHOOKS: &str = "/api/v1/pleroma/admin/webhooks";
+/// The 403 body of any write onto an internal webhook (Pleroma's
+/// `FallbackController` `:forbidden` wording).
+const FORBIDDEN: &str = "Forbidden";
+/// The 422 body of deleting an internal webhook (pinned by the ticket).
+const CANNOT_DELETE_INTERNAL: &str = "Cannot delete internal webhook";
+
+/// An admin holding both webhook scopes, as its bearer token.
+async fn webhook_admin(pool: &PgPool, nickname: &str) -> String {
+    admin(pool, nickname, "admin:read:webhooks admin:write:webhooks")
+        .await
+        .1
+}
+
+/// `POST`s `body` to a webhook route as `token`, over JSON.
+async fn post_webhook(app: &Router, token: &str, path: &str, body: Value) -> common::TestResponse {
+    TestRequest::post(path)
+        .bearer(token)
+        .json(&body)
+        .send(app)
+        .await
+}
+
+/// `GET`s `path` as `token`.
+async fn get_webhook(app: &Router, token: &str, path: &str) -> common::TestResponse {
+    TestRequest::get(path).bearer(token).send(app).await
+}
+
+/// `PATCH`es `body` to `/webhooks/{id}` as `token`.
+async fn patch_webhook(app: &Router, token: &str, id: &str, body: Value) -> common::TestResponse {
+    TestRequest::patch(&format!("{WEBHOOKS}/{id}"))
+        .bearer(token)
+        .json(&body)
+        .send(app)
+        .await
+}
+
+/// `DELETE`s `/webhooks/{id}` as `token`.
+async fn delete_webhook(app: &Router, token: &str, id: &str) -> common::TestResponse {
+    TestRequest::delete(&format!("{WEBHOOKS}/{id}"))
+        .bearer(token)
+        .send(app)
+        .await
+}
+
+/// `POST`s an empty body to `/webhooks/{id}{suffix}` as `token`: the
+/// action routes carry no parameters.
+async fn act_on_webhook(app: &Router, token: &str, id: &str, suffix: &str) -> common::TestResponse {
+    post_webhook(app, token, &format!("{WEBHOOKS}/{id}{suffix}"), json!({})).await
+}
+
+/// Creates a webhook through the API, asserting the 200, and returns its
+/// entity with the id text.
+async fn create_webhook(app: &Router, token: &str, body: Value) -> (Value, String) {
+    let created = post_webhook(app, token, WEBHOOKS, body).await;
+    common::assert_answer(&created, StatusCode::OK, "the create");
+    let entity = created.json_value();
+    let id = entity["id"].as_str().expect("the id is text").to_owned();
+    (entity, id)
+}
+
+/// The ids the webhook listing answers, in order.
+fn listed_ids(response: &common::TestResponse) -> Vec<String> {
+    response
+        .json_value()
+        .as_array()
+        .expect("the array")
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("the id is text").to_owned())
+        .collect()
+}
+
+/// Seeds one `webhooks` row under a controlled `id`, so the listing's
+/// order and the internal-protection tests command the table instead of
+/// riding on the instant the API minted its `UUIDv7`s. The fixed seed
+/// secret is 64 `s`s, the minted shape without the randomness.
+async fn seed_webhook(pool: &PgPool, id: u128, url: &str, internal: bool) -> Uuid {
+    let seeded_id = Uuid::from_u128(id);
+    let _seeded = sqlx::query(
+        "INSERT INTO webhooks (id, url, events, secret, enabled, internal) \
+         VALUES ($1, $2, '{report.created}', $3, true, $4)",
+    )
+    .bind(seeded_id)
+    .bind(url)
+    .bind("s".repeat(64))
+    .bind(internal)
+    .execute(pool)
+    .await
+    .expect("the seed webhook inserts");
+    seeded_id
+}
+
+/// The `webhooks` row behind `id` as `(url, events, secret, enabled,
+/// internal)`, `None` when the table no longer carries it.
+async fn stored_webhook(
+    pool: &PgPool,
+    id: Uuid,
+) -> Option<(String, Vec<String>, String, bool, bool)> {
+    sqlx::query_as::<_, (String, Vec<String>, String, bool, bool)>(
+        "SELECT url, events, secret, enabled, internal FROM webhooks WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .expect("the webhook row reads back")
+}
+
+/// Exactly the ticket's six entity keys — no `created_at`, no `internal`
+/// surprises.
+fn assert_webhook_keys(entity: &Value) {
+    assert_eq!(
+        entity.as_object().map(serde_json::Map::len),
+        Some(6),
+        "exactly the six keys the ticket pins: {entity}"
+    );
+}
+
+/// The minted signing secret: 32 random bytes as lowercase hex.
+fn assert_secret(entity: &Value) {
+    let secret = entity["secret"].as_str().expect("the secret is text");
+    assert_eq!(secret.len(), 64, "32 bytes are 64 hex characters");
+    assert!(
+        secret
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "the secret is lowercase hex: {secret}"
+    );
+}
+
+/// The CRUD round trip: a create mints the id and secret and answers the
+/// six-key entity; the show and the bare-array listing answer the same
+/// entity; the delete 204s, and the gone id is the 404
+/// `{"error":"Not found"}` on the show and the delete alike.
+#[tokio::test]
+async fn webhook_crud_roundtrip() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookcruder").await;
+
+    let (entity, id) = create_webhook(
+        &app,
+        &token,
+        json!({"url": "https://example.org/hook",
+               "events": ["report.created", "account.created"]}),
+    )
+    .await;
+    assert_webhook_keys(&entity);
+    assert_secret(&entity);
+    assert!(Uuid::parse_str(&id).is_ok(), "the id is uuid text: {id}");
+    assert_eq!(entity["url"], json!("https://example.org/hook"), "the url");
+    let events = json!(["report.created", "account.created"]);
+    assert_eq!(entity["events"], events, "and the events");
+    assert_eq!(
+        entity["enabled"],
+        json!(true),
+        "the gate defaults to enabled"
+    );
+    assert_eq!(
+        entity["internal"],
+        json!(false),
+        "a created webhook is external"
+    );
+
+    let shown = get_webhook(&app, &token, &format!("{WEBHOOKS}/{id}")).await;
+    common::assert_answer(&shown, StatusCode::OK, "the show");
+    assert_eq!(
+        shown.json_value(),
+        entity,
+        "the show answers the stored entity"
+    );
+
+    let listed = get_webhook(&app, &token, WEBHOOKS).await;
+    common::assert_answer(&listed, StatusCode::OK, "the index");
+    assert_eq!(listed.json_value(), json!([entity]), "Pleroma's bare array");
+
+    let deleted = delete_webhook(&app, &token, &id).await;
+    assert_eq!(
+        deleted.status,
+        StatusCode::NO_CONTENT,
+        "the delete is a 204"
+    );
+    let row_id = Uuid::parse_str(&id).expect("the test id parses");
+    assert!(
+        stored_webhook(&pool, row_id).await.is_none(),
+        "the row is gone"
+    );
+
+    let gone = get_webhook(&app, &token, &format!("{WEBHOOKS}/{id}")).await;
+    let again = delete_webhook(&app, &token, &id).await;
+    common::assert_all_refused(
+        &[gone, again],
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "the deleted webhook, on the show and the delete alike",
+    );
+}
+
+/// A present-only `PATCH` moves exactly the fields it carries and keeps
+/// the rest of the row — the secret included; a form-encoded create passes
+/// the same validation and reads its stringly-typed gate and array key.
+#[tokio::test]
+async fn webhook_patch_moves_only_the_present_fields() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookpatcher").await;
+
+    let (entity, id) = create_webhook(
+        &app,
+        &token,
+        json!({"url": "https://example.org/hook",
+               "events": ["report.created", "account.created"]}),
+    )
+    .await;
+
+    let gated = patch_webhook(&app, &token, &id, json!({"enabled": false})).await;
+    common::assert_answer(&gated, StatusCode::OK, "the gate patch");
+    let gated_entity = gated.json_value();
+    assert_eq!(gated_entity["enabled"], json!(false), "the gate moved");
+    assert_eq!(gated_entity["url"], entity["url"], "an absent url is kept");
+    assert_eq!(
+        gated_entity["events"], entity["events"],
+        "an absent events list is kept"
+    );
+    assert_eq!(
+        gated_entity["secret"], entity["secret"],
+        "an update never turns the secret"
+    );
+
+    let moved = patch_webhook(
+        &app,
+        &token,
+        &id,
+        json!({"url": "http://example.org/moved", "events": ["report.updated"]}),
+    )
+    .await;
+    common::assert_answer(&moved, StatusCode::OK, "the move patch");
+    let moved_entity = moved.json_value();
+    let moved_url = json!("http://example.org/moved");
+    assert_eq!(
+        moved_entity["url"], moved_url,
+        "plain http is a delivery target too"
+    );
+    let one_event = json!(["report.updated"]);
+    assert_eq!(moved_entity["events"], one_event, "the events moved");
+    assert_eq!(
+        moved_entity["enabled"],
+        json!(false),
+        "the gate stands at disabled"
+    );
+    let row_id = Uuid::parse_str(&id).expect("the test id parses");
+    let stored = stored_webhook(&pool, row_id).await.expect("the row stands");
+    assert_eq!(
+        stored.0, "http://example.org/moved",
+        "the row matches the answer"
+    );
+    assert_eq!(
+        stored.1,
+        vec!["report.updated".to_owned()],
+        "url and events as answered"
+    );
+    assert!(!stored.3, "and the gate");
+
+    let formed = TestRequest::post(WEBHOOKS)
+        .bearer(&token)
+        .form(&[
+            ("url", "https://example.org/form-hook"),
+            ("events[]", "report.created"),
+            ("enabled", "false"),
+        ])
+        .send(&app)
+        .await;
+    common::assert_answer(&formed, StatusCode::OK, "the form create");
+    let formed_entity = formed.json_value();
+    assert_webhook_keys(&formed_entity);
+    let form_events = json!(["report.created"]);
+    assert_eq!(
+        formed_entity["events"], form_events,
+        "the form array key reaches the row"
+    );
+    assert_eq!(
+        formed_entity["enabled"],
+        json!(false),
+        "and the stringly-typed gate"
+    );
+}
+
+/// Every `{id}` route answers the same missing row alike: an unknown uuid
+/// and text that is no id both get the 404 `{"error":"Not found"}`, on
+/// the show, the patch, the delete and all three action routes.
+#[tokio::test]
+async fn unknown_ids_are_the_pinned_404_on_every_id_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookmisser").await;
+
+    for id in [Uuid::now_v7().to_string(), "not-a-uuid".to_owned()] {
+        let responses = [
+            TestRequest::get(&format!("{WEBHOOKS}/{id}"))
+                .bearer(&token)
+                .send(&app)
+                .await,
+            TestRequest::patch(&format!("{WEBHOOKS}/{id}"))
+                .bearer(&token)
+                .json(&json!({"enabled": false}))
+                .send(&app)
+                .await,
+            TestRequest::delete(&format!("{WEBHOOKS}/{id}"))
+                .bearer(&token)
+                .send(&app)
+                .await,
+            post_webhook(&app, &token, &format!("{WEBHOOKS}/{id}/enable"), json!({})).await,
+            post_webhook(&app, &token, &format!("{WEBHOOKS}/{id}/disable"), json!({})).await,
+            post_webhook(
+                &app,
+                &token,
+                &format!("{WEBHOOKS}/{id}/rotate_secret"),
+                json!({}),
+            )
+            .await,
+        ];
+        common::assert_all_refused(
+            &responses,
+            StatusCode::NOT_FOUND,
+            NOT_FOUND,
+            &format!("the routes on /{id}"),
+        );
+    }
+}
+
+/// The create's body validation, over HTTP: a missing `url`, an
+/// unroutable `url` and an unknown event each answer the pinned 400
+/// `{"errors": …}` shape, an unreadable `enabled` is the extractor's 422,
+/// and no refused body writes a row.
+#[tokio::test]
+async fn webhook_creates_are_validated() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookvalidator").await;
+
+    let bodiless = post_webhook(
+        &app,
+        &token,
+        WEBHOOKS,
+        json!({"events": ["report.created"]}),
+    )
+    .await;
+    common::assert_answer(&bodiless, StatusCode::BAD_REQUEST, "a create without a url");
+    assert_eq!(
+        bodiless.json_value(),
+        json!({"errors": {"url": ["Missing parameter: url"]}}),
+        "the missing-parameter shape"
+    );
+
+    let unroutable = post_webhook(
+        &app,
+        &token,
+        WEBHOOKS,
+        json!({"url": "ftp://example.org/hook"}),
+    )
+    .await;
+    common::assert_answer(&unroutable, StatusCode::BAD_REQUEST, "an ftp url");
+    assert_eq!(
+        unroutable.json_value(),
+        json!({"errors": {"url": ["invalid url"]}}),
+        "no web scheme is no delivery target"
+    );
+
+    let unknown_event = post_webhook(
+        &app,
+        &token,
+        WEBHOOKS,
+        json!({"url": "https://example.org/hook", "events": ["report.deleted"]}),
+    )
+    .await;
+    common::assert_answer(&unknown_event, StatusCode::BAD_REQUEST, "an unknown event");
+    assert_eq!(
+        unknown_event.json_value(),
+        json!({"errors": {"events": ["invalid event"]}}),
+        "the wording the ticket pins"
+    );
+
+    let bad_gate = post_webhook(
+        &app,
+        &token,
+        WEBHOOKS,
+        json!({"url": "https://example.org/hook", "enabled": "maybe"}),
+    )
+    .await;
+    common::assert_answer(
+        &bad_gate,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unreadable gate",
+    );
+
+    let listed = TestRequest::get(WEBHOOKS).bearer(&token).send(&app).await;
+    assert_eq!(
+        listed.json_value(),
+        json!([]),
+        "a refused body wrote nothing"
+    );
+}
+
+/// The `PATCH` screens its present fields exactly as the create does —
+/// the same 400 `{"errors": …}` bodies for an unknown event and a bad
+/// url — and leaves the row untouched on refusal.
+#[tokio::test]
+async fn webhook_patches_are_screened_too() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookscreener").await;
+
+    let created = post_webhook(
+        &app,
+        &token,
+        WEBHOOKS,
+        json!({"url": "https://example.org/hook", "events": ["report.created"]}),
+    )
+    .await;
+    common::assert_answer(&created, StatusCode::OK, "the control create");
+    let entity = created.json_value();
+    let id = entity["id"].as_str().expect("the id is text").to_owned();
+
+    let bad_events = TestRequest::patch(&format!("{WEBHOOKS}/{id}"))
+        .bearer(&token)
+        .json(&json!({"events": ["nonsense"]}))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &bad_events,
+        StatusCode::BAD_REQUEST,
+        "a patch with an unknown event",
+    );
+    assert_eq!(
+        bad_events.json_value(),
+        json!({"errors": {"events": ["invalid event"]}}),
+        "the same refusal on the patch"
+    );
+    let bad_url = TestRequest::patch(&format!("{WEBHOOKS}/{id}"))
+        .bearer(&token)
+        .json(&json!({"url": "mailto:hook@example.org"}))
+        .send(&app)
+        .await;
+    assert_eq!(
+        bad_url.json_value(),
+        json!({"errors": {"url": ["invalid url"]}}),
+        "and the same url screen"
+    );
+
+    let shown = TestRequest::get(&format!("{WEBHOOKS}/{id}"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        shown.json_value(),
+        entity,
+        "the refused patches changed nothing"
+    );
+}
+
+/// The action routes: `disable` and `enable` answer the entity with the
+/// gate set and leave the rest of the row standing; `rotate_secret` turns
+/// only the secret, in the minted shape, every time.
+#[tokio::test]
+async fn webhooks_enable_disable_and_rotate_their_secret() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookgater").await;
+
+    let (entity, id_text) = create_webhook(
+        &app,
+        &token,
+        json!({"url": "https://example.org/hook", "events": ["report.created"]}),
+    )
+    .await;
+    let id = Uuid::parse_str(&id_text).expect("the test id parses");
+
+    let disabled = act_on_webhook(&app, &token, &id_text, "/disable").await;
+    common::assert_answer(&disabled, StatusCode::OK, "the disable");
+    let off = disabled.json_value();
+    assert_eq!(off["enabled"], json!(false), "the gate closed");
+    assert_eq!(
+        off["secret"], entity["secret"],
+        "the disable leaves the secret"
+    );
+    let off_row = stored_webhook(&pool, id).await.expect("the row stands");
+    assert!(!off_row.3, "the table says disabled");
+
+    let enabled = act_on_webhook(&app, &token, &id_text, "/enable").await;
+    common::assert_answer(&enabled, StatusCode::OK, "the enable");
+    let on = enabled.json_value();
+    assert_eq!(on["enabled"], json!(true), "the gate opened again");
+    assert_eq!(
+        on["url"], entity["url"],
+        "and the rest of the entity stands"
+    );
+
+    let rotated = act_on_webhook(&app, &token, &id_text, "/rotate_secret").await;
+    common::assert_answer(&rotated, StatusCode::OK, "the rotation");
+    let after = rotated.json_value();
+    assert_ne!(
+        after["secret"], entity["secret"],
+        "rotate_secret answers a NEW secret"
+    );
+    assert_secret(&after);
+    assert_eq!(after["id"], entity["id"], "everything else stands");
+    assert_eq!(after["url"], entity["url"], "id, url");
+    assert_eq!(after["events"], entity["events"], "events");
+    assert_eq!(after["enabled"], entity["enabled"], "gate");
+    assert_eq!(after["internal"], entity["internal"], "flag");
+    let rotated_row = stored_webhook(&pool, id).await.expect("the row stands");
+    assert_eq!(
+        rotated_row.2,
+        after["secret"].as_str().expect("the secret is text"),
+        "the row carries the new secret"
+    );
+
+    let twice = act_on_webhook(&app, &token, &id_text, "/rotate_secret").await;
+    assert_ne!(
+        twice.json_value()["secret"],
+        after["secret"],
+        "and a second rotation mints again"
+    );
+}
+
+/// An instance-installed webhook is read like any other: the show answers
+/// its entity and the listing holds it beside the external rows.
+#[tokio::test]
+async fn internal_webhooks_are_read_like_any_other() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookreader").await;
+
+    let internal_id = seed_webhook(&pool, 7, "https://internal.example.org/hook", true).await;
+    let external_id = seed_webhook(&pool, 8, "https://external.example.org/hook", false).await;
+
+    let shown = TestRequest::get(&format!("{WEBHOOKS}/{internal_id}"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&shown, StatusCode::OK, "the internal show");
+    assert_eq!(
+        shown.json_value()["internal"],
+        json!(true),
+        "reads answer internal webhooks verbatim"
+    );
+
+    let listed = TestRequest::get(WEBHOOKS).bearer(&token).send(&app).await;
+    let entries = listed.json_value();
+    let rows = entries.as_array().expect("the array");
+    assert_eq!(rows.len(), 2, "the listing includes the internal webhook");
+    assert_eq!(
+        rows[0]["id"],
+        json!(internal_id.to_string()),
+        "it reads side by side with an external webhook, in id order"
+    );
+    assert_eq!(
+        rows[1]["id"],
+        json!(external_id.to_string()),
+        "the external neighbour follows"
+    );
+}
+
+/// The internal protection: the delete answers the ticket's 422 and the
+/// patch, the gate actions and the rotation answer Pleroma's 403 — with
+/// the row left standing on every refusal.
+#[tokio::test]
+async fn internal_webhooks_resist_the_admin_writes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookguard").await;
+
+    let internal_id = seed_webhook(&pool, 7, "https://internal.example.org/hook", true).await;
+    let internal_text = internal_id.to_string();
+
+    let deleted = TestRequest::delete(&format!("{WEBHOOKS}/{internal_text}"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[deleted],
+        StatusCode::UNPROCESSABLE_ENTITY,
+        CANNOT_DELETE_INTERNAL,
+        "the delete of an internal webhook",
+    );
+
+    let patched = TestRequest::patch(&format!("{WEBHOOKS}/{internal_text}"))
+        .bearer(&token)
+        .json(&json!({"enabled": false}))
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[patched],
+        StatusCode::FORBIDDEN,
+        FORBIDDEN,
+        "a patch onto an internal webhook",
+    );
+    let disabled = post_webhook(
+        &app,
+        &token,
+        &format!("{WEBHOOKS}/{internal_text}/disable"),
+        json!({}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[disabled],
+        StatusCode::FORBIDDEN,
+        FORBIDDEN,
+        "the disable of an internal webhook",
+    );
+    let rotated = post_webhook(
+        &app,
+        &token,
+        &format!("{WEBHOOKS}/{internal_text}/rotate_secret"),
+        json!({}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[rotated],
+        StatusCode::FORBIDDEN,
+        FORBIDDEN,
+        "the rotation of an internal webhook",
+    );
+
+    let row = stored_webhook(&pool, internal_id)
+        .await
+        .expect("the row survives every refused write");
+    assert_eq!(row.0, "https://internal.example.org/hook", "nothing moved");
+    assert_eq!(row.2, "s".repeat(64), "not even the secret");
+    assert!(row.3, "the gate stands");
+    assert!(row.4, "and the flag");
+}
+
+/// The listing order and window: seeded ids come back ascending (the v7
+/// text sorts as creation order, decision 4), `page` / `page_size` cut
+/// the window, unparsable or non-positive parameters fall to the defaults
+/// (page 1, 50 rows), and an API-created webhook — minted right now —
+/// lands after every seeded row.
+#[tokio::test]
+async fn the_webhook_listing_orders_by_id_and_pages() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = webhook_admin(&pool, "hookpager").await;
+
+    let first = seed_webhook(&pool, 1, "https://example.org/one", false).await;
+    let second = seed_webhook(&pool, 2, "https://example.org/two", false).await;
+    let third = seed_webhook(&pool, 3, "https://example.org/three", false).await;
+    let seeded = vec![first.to_string(), second.to_string(), third.to_string()];
+
+    let full = get_webhook(&app, &token, WEBHOOKS).await;
+    common::assert_answer(&full, StatusCode::OK, "the full listing");
+    assert_eq!(listed_ids(&full), seeded, "ordered by id");
+
+    let windowed = get_webhook(&app, &token, &format!("{WEBHOOKS}?page=2&page_size=2")).await;
+    let last = json!([{"id": third.to_string(), "url": "https://example.org/three",
+                       "events": ["report.created"], "secret": "s".repeat(64),
+                       "enabled": true, "internal": false}]);
+    assert_eq!(
+        windowed.json_value(),
+        last,
+        "the second window of two holds the last row"
+    );
+
+    let head = get_webhook(&app, &token, &format!("{WEBHOOKS}?page_size=2")).await;
+    let two = vec![first.to_string(), second.to_string()];
+    assert_eq!(listed_ids(&head), two, "the first window");
+
+    let past_end = get_webhook(&app, &token, &format!("{WEBHOOKS}?page=9&page_size=2")).await;
+    assert_eq!(
+        past_end.json_value(),
+        json!([]),
+        "a window past the table is empty"
+    );
+
+    let junk = get_webhook(&app, &token, &format!("{WEBHOOKS}?page=abc&page_size=0")).await;
+    assert_eq!(
+        listed_ids(&junk).len(),
+        3,
+        "unusable parameters fall to the 1 / 50 defaults"
+    );
+
+    let (_, newest) =
+        create_webhook(&app, &token, json!({"url": "https://example.org/created"})).await;
+    let full_again = get_webhook(&app, &token, WEBHOOKS).await;
+    let mut expected = seeded;
+    expected.push(newest);
+    assert_eq!(
+        listed_ids(&full_again),
+        expected,
+        "the freshly minted v7 id sorts last"
+    );
+}
+
+/// The four logged writes land in the moderation log — `webhook_create`,
+/// `webhook_update`, `webhook_rotate_secret` and `webhook_delete` — each
+/// sentence naming the webhook id with the id in the data map's
+/// `subject_id`, as the invite lines do. (The enable/disable actions are
+/// not among the ticket's logged verbs.)
+#[tokio::test]
+async fn webhook_writes_record_the_moderation_log() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, token) = admin(&pool, "hooklogger", "admin:read admin:write").await;
+
+    let created = post_webhook(
+        &app,
+        &token,
+        WEBHOOKS,
+        json!({"url": "https://example.org/hook", "events": ["report.created"]}),
+    )
+    .await;
+    let entity = created.json_value();
+    let id = entity["id"].as_str().expect("the id is text").to_owned();
+    let patched = TestRequest::patch(&format!("{WEBHOOKS}/{id}"))
+        .bearer(&token)
+        .json(&json!({"enabled": false}))
+        .send(&app)
+        .await;
+    common::assert_answer(&patched, StatusCode::OK, "the patch");
+    let rotated = post_webhook(
+        &app,
+        &token,
+        &format!("{WEBHOOKS}/{id}/rotate_secret"),
+        json!({}),
+    )
+    .await;
+    common::assert_answer(&rotated, StatusCode::OK, "the rotation");
+    // The unlogged actions must not add a fifth line under any search.
+    let gated = post_webhook(&app, &token, &format!("{WEBHOOKS}/{id}/enable"), json!({})).await;
+    common::assert_answer(&gated, StatusCode::OK, "the enable");
+    let deleted = TestRequest::delete(&format!("{WEBHOOKS}/{id}"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "the delete");
+
+    for (search, verb, action) in [
+        ("created+webhook", "created", "webhook_create"),
+        ("updated+webhook", "updated", "webhook_update"),
+        (
+            "rotated+secret+for+webhook",
+            "rotated secret for",
+            "webhook_rotate_secret",
+        ),
+        ("deleted+webhook", "deleted", "webhook_delete"),
+    ] {
+        let found = TestRequest::get(&format!("{LOG}?search={search}"))
+            .bearer(&token)
+            .send(&app)
+            .await;
+        let page = found.json_value();
+        assert_eq!(page["total"], json!(1), "one {action} line");
+        let entry = &page["items"][0];
+        assert_eq!(
+            entry["message"],
+            format!("@hooklogger {verb} webhook: {id}"),
+            "the sentence names the webhook id"
+        );
+        assert_eq!(entry["data"]["action"], action, "the action");
+        assert_eq!(
+            entry["data"]["subject_id"], id,
+            "and the webhook rides in subject_id"
+        );
+        assert_eq!(
+            entry["data"]["actor"]["nickname"], "hooklogger",
+            "beside the acting admin, as every entry carries it"
+        );
+    }
+}
+
+/// The webhook routes' scope half: the reads ask `admin:read:webhooks`
+/// and the writes `admin:write:webhooks`, each accepting its narrow alias
+/// and refusing the other class.
+#[tokio::test]
+async fn webhook_routes_answer_the_scope_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, read_only) = admin(&pool, "hookread", "admin:read:webhooks").await;
+    let (_, write_only) = admin(&pool, "hookwrite", "admin:write:webhooks").await;
+
+    let (_, id) = create_webhook(
+        &app,
+        &write_only,
+        json!({"url": "https://example.org/hook"}),
+    )
+    .await;
+
+    let listed = get_webhook(&app, &read_only, WEBHOOKS).await;
+    common::assert_answer(&listed, StatusCode::OK, "the narrow read scope lists");
+    let shown = get_webhook(&app, &read_only, &format!("{WEBHOOKS}/{id}")).await;
+    common::assert_answer(&shown, StatusCode::OK, "and shows");
+
+    let list_with_write = get_webhook(&app, &write_only, WEBHOOKS).await;
+    let show_with_write = get_webhook(&app, &write_only, &format!("{WEBHOOKS}/{id}")).await;
+    common::assert_all_refused(
+        &[list_with_write, show_with_write],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_READ,
+        "the write scope never reads",
+    );
+
+    let refusals = [
+        post_webhook(
+            &app,
+            &read_only,
+            WEBHOOKS,
+            json!({"url": "https://example.org/x"}),
+        )
+        .await,
+        patch_webhook(&app, &read_only, &id, json!({"enabled": false})).await,
+        delete_webhook(&app, &read_only, &id).await,
+        act_on_webhook(&app, &read_only, &id, "/disable").await,
+        act_on_webhook(&app, &read_only, &id, "/enable").await,
+        act_on_webhook(&app, &read_only, &id, "/rotate_secret").await,
+    ];
+    common::assert_all_refused(
+        &refusals,
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "the read scope never writes",
+    );
+
+    // Nothing the read scope tried actually changed: the webhook still
+    // stands as created, enabled and at its original url.
+    let standing = get_webhook(&app, &read_only, &format!("{WEBHOOKS}/{id}")).await;
+    let row = standing.json_value();
+    assert_eq!(row["url"], json!("https://example.org/hook"), "the url");
+    assert_eq!(row["enabled"], json!(true), "and the gate");
+}
+
+/// The same gate's two remaining halves: an admin whose token grants only
+/// ordinary scopes is refused both classes, each refusal naming its own
+/// class, while the broad `admin:read` / `admin:write` roots open every
+/// webhook route.
+#[tokio::test]
+async fn unscoped_and_broad_admins_answer_the_webhook_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, unscoped) = admin(&pool, "hookplain", "read write").await;
+
+    let refused_get = get_webhook(&app, &unscoped, WEBHOOKS).await;
+    common::assert_all_refused(
+        &[refused_get],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_READ,
+        "an admin with no admin grant",
+    );
+    let refused_post = post_webhook(
+        &app,
+        &unscoped,
+        WEBHOOKS,
+        json!({"url": "https://example.org/y"}),
+    )
+    .await;
+    common::assert_all_refused(
+        &[refused_post],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "and the POST refusal names the write class",
+    );
+
+    let (_, both) = admin(&pool, "hookbroad", "admin:read admin:write").await;
+    let (broad, _) = create_webhook(&app, &both, json!({"url": "https://example.org/broad"})).await;
+    assert_webhook_keys(&broad);
+    let listed = get_webhook(&app, &both, WEBHOOKS).await;
+    assert_eq!(
+        listed_ids(&listed).len(),
+        1,
+        "the broad roots grant both classes"
+    );
+}
+
+/// The webhook routes' role and credential half: a moderator or a regular
+/// user holding the webhook scopes is refused the role, an app-only token
+/// the user, and no token at all the credentials.
+#[tokio::test]
+async fn webhook_routes_answer_the_role_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let scopes = "admin:read:webhooks admin:write:webhooks";
+    let (_, mod_hooks) = moderator(&pool, "hookmod", scopes).await;
+    let (_, user_hooks) = regular(&pool, "hookuser", scopes).await;
+    let app_only = common::create_app_only_token(&pool, scopes).await;
+
+    for (token, who) in [(&mod_hooks, "a moderator"), (&user_hooks, "a regular user")] {
+        let refused = TestRequest::get(WEBHOOKS).bearer(token).send(&app).await;
+        common::assert_all_refused(&[refused], StatusCode::FORBIDDEN, NOT_ADMIN, who);
+        let posted = post_webhook(
+            &app,
+            token,
+            WEBHOOKS,
+            json!({"url": "https://example.org/hook"}),
+        )
+        .await;
+        common::assert_all_refused(&[posted], StatusCode::FORBIDDEN, NOT_ADMIN, who);
+    }
+
+    let app_only_refused = TestRequest::get(WEBHOOKS)
+        .bearer(&app_only)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[app_only_refused],
+        StatusCode::FORBIDDEN,
+        USER_REQUIRED,
+        "an app-only token",
+    );
+
+    let anonymous = TestRequest::get(WEBHOOKS).send(&app).await;
+    common::assert_all_refused(
+        &[anonymous],
+        StatusCode::UNAUTHORIZED,
+        NO_TOKEN,
+        "an anonymous GET",
+    );
+    let bogus = post_webhook(
+        &app,
+        "no-such-token",
+        WEBHOOKS,
+        json!({"url": "https://example.org/hook"}),
+    )
+    .await;
     common::assert_all_refused(
         &[bogus],
         StatusCode::UNAUTHORIZED,
