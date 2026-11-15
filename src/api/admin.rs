@@ -34,7 +34,9 @@
 //! Later admin tickets join this same file with more `.merge(...)` /
 //! `.route(...)` lines; the [module docs of `crate::api::v1`](crate::api::v1)
 //! hold the no-fallback rule that applies to every router merged there.
-//! The runtime config store (`GET`/`POST /config`, WBE-206) joins as the
+//! The runtime config store (`GET`/`POST /config`, its
+//! `GET /config/descriptions` payload and the `GET /need_reboot` /
+//! `GET /restart` pair, WBE-206 and WBE-207) joins as the
 //! [`config`] submodule, the registration invites (`users/invite_token`,
 //! `users/invites`, `users/revoke_invite`, `users/email_invite`, WBE-199)
 //! as the [`invites`] submodule — whose [`registration_router`]

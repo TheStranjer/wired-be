@@ -12,6 +12,11 @@
 //! pipeline through [`RuntimeConfig::mrf_document`] and the instance
 //! documents through [`RuntimeConfig::effective_config`].
 //!
+//! Beside the table the module also carries the two process-wide flags
+//! of the admin API's reboot pair: the [`RuntimeConfig::need_reboot`]
+//! `AtomicBool` a restart-requiring `POST /config` raises, and the
+//! graceful-restart request [`serve`] waits on beside ctrl-c.
+//!
 //! Two value forms live in this module. The **storage form** is what the
 //! jsonb column holds: keyword lists as JSON objects, everything else as
 //! plain JSON. The **wire form** is what the admin API exchanges: an
@@ -21,10 +26,15 @@
 //! the API can send.
 //!
 //! [`config_registry`]: super::config_registry
+//! [`serve`]: crate::serve
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use sqlx::PgPool;
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::{
@@ -49,6 +59,37 @@ const WRITE_SQL: &str = "INSERT INTO config_entries (group_name, key, value)
 
 /// [`remove`]: the whole row.
 const REMOVE_SQL: &str = "DELETE FROM config_entries WHERE group_name = $1 AND key = $2";
+
+/// The process-wide "a restart-requiring key changed since this boot"
+/// flag [`RuntimeConfig::need_reboot`] answers with, raised by
+/// [`RuntimeConfig::set_need_reboot`] — `POST /config` does that whenever
+/// a changed key's [`RegistryEntry::requires_restart`] says so. Pleroma's
+/// `Restarter.Pleroma.need_reboot?/0` reads the same fact off the config
+/// tracker; here it is one atomic set at change time and lowered only by
+/// the next boot, when everything takes effect anyway.
+///
+/// [`RegistryEntry::requires_restart`]: super::config_registry::RegistryEntry::requires_restart
+static NEED_REBOOT: AtomicBool = AtomicBool::new(false);
+
+/// The graceful-restart flag's channel: the sender that raises the flag
+/// beside a receiver every waiter clones to observe it.
+type RestartSignal = (watch::Sender<bool>, watch::Receiver<bool>);
+
+/// The process-wide graceful-restart request: the shutdown flag
+/// [`RuntimeConfig::request_restart`] raises and [`serve`] observes
+/// through [`RuntimeConfig::wait_for_restart`], beside the wakeup half
+/// that turns the flag into a future. The channel lives in a static
+/// because the requester is an HTTP handler and the waiter the boot
+/// path — no request state connects them.
+///
+/// [`serve`]: crate::serve
+static RESTART: OnceLock<RestartSignal> = OnceLock::new();
+
+/// The restart flag's channel, minted on first use; the static keeps the
+/// sender alive, so [`watch::Receiver::changed`] never loses a request.
+fn restart_channel() -> &'static RestartSignal {
+    RESTART.get_or_init(|| watch::channel(false))
+}
 
 /// One `config_entries` row: a whitelisted setting's DB-side value.
 #[derive(Clone, Debug, Eq, PartialEq, sqlx::FromRow)]
@@ -306,6 +347,75 @@ impl<'a> RuntimeConfig<'a> {
         Self { db, env }
     }
 
+    /// Whether a restart-requiring key changed since this process
+    /// started: the process-wide flag `GET /need_reboot` answers with,
+    /// raised by [`Self::set_need_reboot`] and lowered only by the next
+    /// boot (or, in tests, [`Self::reset_process_flags`]).
+    #[must_use]
+    pub fn need_reboot() -> bool {
+        NEED_REBOOT.load(Ordering::SeqCst)
+    }
+
+    /// Raises the process-wide [`Self::need_reboot`] flag: `POST /config`
+    /// calls this once any changed key waits for a restart.
+    pub fn set_need_reboot() {
+        NEED_REBOOT.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a graceful restart has been requested since this process
+    /// started — the flag [`Self::request_restart`] raises.
+    #[must_use]
+    pub fn restart_requested() -> bool {
+        let (_, receiver) = restart_channel();
+        *receiver.clone().borrow_and_update()
+    }
+
+    /// Requests the graceful restart: raises the shutdown flag
+    /// [`serve`] observes through [`Self::wait_for_restart`] and returns.
+    /// The answer to `GET /restart`, which is the admin's "let the
+    /// supervisor restart me" button — Pleroma's
+    /// `Restarter.Pleroma.restart/2`; here the request only flags, and
+    /// the process exiting with code `0` after draining is the restart.
+    ///
+    /// [`serve`]: crate::serve
+    pub fn request_restart() {
+        let (sender, _) = restart_channel();
+        let sent = sender.send(true);
+        debug_assert!(sent.is_ok(), "the static keeps a receiver alive");
+    }
+
+    /// Resolves once [`Self::request_restart`] has fired — the shutdown
+    /// flag's future half, which [`serve`] waits on beside ctrl-c. The
+    /// watch channel delivers the flag without a lost wakeup: a request
+    /// that lands before this starts waiting is already in its hand.
+    ///
+    /// [`serve`]: crate::serve
+    pub async fn wait_for_restart() {
+        let (_, receiver) = restart_channel();
+        let mut changes = receiver.clone();
+        loop {
+            if *changes.borrow_and_update() {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                // The sender lives in a static, so this only happens at
+                // process teardown: no restart can arrive any more.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Test support: lowers the two process-wide flags, so a test can
+    /// watch `need_reboot` toggle and assert on the restart request
+    /// without inheriting what an earlier test in the same binary set.
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub fn reset_process_flags() {
+        NEED_REBOOT.store(false, Ordering::SeqCst);
+        let (sender, _) = restart_channel();
+        let sent = sender.send(false);
+        debug_assert!(sent.is_ok(), "the static keeps a receiver alive");
+    }
+
     /// The effective value of `(group, key)`: the stored row merged over
     /// the registry's env-derived default — or, for a pair the registry
     /// does not list, the stored row alone. `None` when neither exists.
@@ -523,6 +633,65 @@ mod tests {
 
     use super::*;
     use crate::services::config_registry::KEY_MRF_SIMPLE;
+
+    /// Serializes the tests that read the process-wide flags: they are
+    /// one per process, so only one test may own them at a time. An
+    /// async lock because the flag tests await between the assertions.
+    static PROCESS_FLAGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The restart pair: `set_need_reboot` raises the flag `GET
+    /// /need_reboot` answers with, `request_restart` raises the shutdown
+    /// flag, resolves every waiter, and leaves `need_reboot` standing —
+    /// clearing it is the next boot's business, not this endpoint's.
+    #[tokio::test]
+    async fn the_process_flags_toggle_on_request() {
+        let _guard = PROCESS_FLAGS_LOCK.lock().await;
+        RuntimeConfig::reset_process_flags();
+        assert!(
+            !RuntimeConfig::need_reboot(),
+            "a fresh boot waits for nobody"
+        );
+        assert!(
+            !RuntimeConfig::restart_requested(),
+            "and nobody has asked it to restart"
+        );
+
+        RuntimeConfig::set_need_reboot();
+        assert!(
+            RuntimeConfig::need_reboot(),
+            "the POST /config raise sticks"
+        );
+
+        let waiter = tokio::spawn(RuntimeConfig::wait_for_restart());
+        RuntimeConfig::request_restart();
+        waiter.await.expect("the waiter finishes");
+        assert!(
+            RuntimeConfig::restart_requested(),
+            "the shutdown flag stands for serve() to observe"
+        );
+        assert!(
+            RuntimeConfig::need_reboot(),
+            "requesting the restart does NOT clear need_reboot"
+        );
+
+        RuntimeConfig::reset_process_flags();
+        assert!(
+            !RuntimeConfig::need_reboot() && !RuntimeConfig::restart_requested(),
+            "the reset is the test affordance it advertises"
+        );
+    }
+
+    /// The watch channel loses no wakeup: waiting after the request
+    /// already landed resolves on the spot.
+    #[tokio::test]
+    async fn a_late_waiter_sees_the_early_request() {
+        let _guard = PROCESS_FLAGS_LOCK.lock().await;
+        RuntimeConfig::reset_process_flags();
+        RuntimeConfig::request_restart();
+        RuntimeConfig::wait_for_restart().await;
+        assert!(RuntimeConfig::restart_requested(), "the flag is the state");
+        RuntimeConfig::reset_process_flags();
+    }
 
     /// The wire form spells stored objects as tuple arrays — and plain
     /// JSON data (arrays of strings, scalars, pair lists) as itself.

@@ -2,6 +2,11 @@
 //! /api/v1/pleroma/admin/config`, the HTTP face of
 //! [`crate::services::runtime_config`].
 //!
+//! Beside the store answer the documentation payload
+//! `GET /config/descriptions` and the restart pair `GET /need_reboot`
+//! and `GET /restart` (WBE-207), generated from the same registry and
+//! the same module's process-wide flags.
+//!
 //! The reference is Pleroma's
 //! `lib/pleroma/web/admin_api/controllers/config_controller.ex` with the
 //! value encoding of `lib/pleroma/config/transfer_task.ex`: only the
@@ -21,10 +26,23 @@
 //!   `ConfigDB.update_or_create`) or deletes entries / subkeys; the
 //!   answer is the GET shape for the changed entries, `need_reboot`
 //!   true when any changed key has [`RegistryEntry::requires_restart`],
-//!   and every changed request records one `config_change`
+//!   such a change also raising the process-wide flag `GET /need_reboot`
+//!   answers with, and every changed request records one `config_change`
 //!   [`moderation_log`] entry. A pair outside the whitelist is the 400
 //!   `{"error":"Config not allowed: <group>/<key>"}`; the whole request
 //!   is refused before anything is written.
+//! - `GET /config/descriptions` (`descriptions`) — one description
+//!   object per whitelist entry — `group`, `key`, `type`, `description`
+//!   and the `children` metadata (with their `suggestions`) the
+//!   [`config_registry`] carries (WBE-207).
+//! - `GET /need_reboot` (`need_reboot`) — `{"need_reboot": bool}`: the
+//!   process-wide "changed since this boot" flag, raised by `POST
+//!   /config` for a restart-requiring key and lowered only by the next
+//!   boot.
+//! - `GET /restart` (`restart`) — requests the graceful restart: raises
+//!   the shutdown flag [`serve`](crate::serve) waits on beside ctrl-c,
+//!   so the process drains and exits `0` for the supervisor; answers
+//!   `{}` and leaves `need_reboot` standing.
 //!
 //! Pleroma answers 400 "You must enable `configurable_from_database`" on
 //! both routes until the operator flips that setting; wired-be's store is
@@ -43,7 +61,7 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tracing::debug;
 
 use crate::{
@@ -53,7 +71,7 @@ use crate::{
     extract::{ApiBody, flex},
     models::moderation_log::{self, ConfigChange},
     services::{
-        config_registry::{self, GROUP_PLEROMA},
+        config_registry::{self, EntryDescription, GROUP_PLEROMA},
         runtime_config::{self, ConfigEntry, DeleteOutcome, RuntimeConfig},
     },
     state::AppState,
@@ -73,9 +91,22 @@ const ONLY_DB: &str = "only_db";
 /// (`:mrf_simple` and friends, beside the whole-`mrf`-doc `:mrf`).
 const MRF_PREFIX: &str = ":mrf";
 
-/// The `/config` routes of the admin API, merged into [`super`].
+/// The `/config`, `/config/descriptions`, `/need_reboot` and `/restart`
+/// routes of the admin API, merged into [`super`].
 pub fn router() -> Router<AppState> {
-    Router::new().route("/config", get(show).post(update))
+    Router::new()
+        .route("/config", get(show).post(update))
+        .route("/config/descriptions", get(descriptions))
+        .route("/need_reboot", get(need_reboot))
+        .route("/restart", get(restart))
+}
+
+/// The one-field body of `GET /need_reboot` (Pleroma's render).
+#[derive(Debug, Serialize)]
+struct NeedReboot {
+    /// Whether a restart-requiring key was changed since this process
+    /// started.
+    need_reboot: bool,
 }
 
 /// One config entry as the API renders it: the colon-spelled pair, the
@@ -223,6 +254,12 @@ async fn update(
     if applied.mrf_changed {
         state.mrf_config_cache.clear();
     }
+    if applied.need_reboot {
+        // The process-wide flag `GET /need_reboot` answers with: a
+        // restart-requiring key changed since this boot, and the next
+        // `GET /restart` (or a signal) is what takes effect.
+        RuntimeConfig::set_need_reboot();
+    }
     if !applied.changes.is_empty() {
         let logged = moderation_log::config_change(&state.db, &admin.0, &applied.changes).await?;
         debug!(
@@ -235,6 +272,57 @@ async fn update(
         configs: applied.configs,
         need_reboot: applied.need_reboot,
     }))
+}
+
+/// `GET /api/v1/pleroma/admin/config/descriptions` — Pleroma's
+/// `descriptions`: one documentation object per whitelist entry, in
+/// registry order, each with its `type`, `description` and `children`.
+/// The payload is the [`config_registry`] data itself, so every pair the
+/// store accepts is a pair the payload describes.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:read` gate.
+async fn descriptions(admin: AdminUser) -> AppResult<Json<Vec<EntryDescription>>> {
+    admin.require(CLASS_READ, AREA_CONFIG)?;
+    Ok(Json(config_registry::descriptions()))
+}
+
+/// `GET /api/v1/pleroma/admin/need_reboot` — Pleroma's `need_reboot`:
+/// whether a restart-requiring key changed since this process started,
+/// read off the process-wide flag `POST /config` raises. Beside it, the
+/// `need_reboot` field of the config pages answers what still *waits* in
+/// the store; this answers what *changed* since the boot — and only the
+/// next boot lowers it again.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:read` gate.
+async fn need_reboot(admin: AdminUser) -> AppResult<Json<NeedReboot>> {
+    admin.require(CLASS_READ, AREA_CONFIG)?;
+    Ok(Json(NeedReboot {
+        need_reboot: RuntimeConfig::need_reboot(),
+    }))
+}
+
+/// `GET /api/v1/pleroma/admin/restart` — Pleroma's `restart`: request
+/// the graceful restart. The answer is `{}` and the effect is the
+/// process-wide shutdown flag [`RuntimeConfig::wait_for_restart`] carries
+/// into [`serve`](crate::serve): the server drains, the process exits
+/// with code `0`, and the supervisor starts the boot every pending
+/// change needs. `need_reboot` is deliberately *not* cleared here — the
+/// running process did not apply anything, the next one will.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate.
+async fn restart(admin: AdminUser) -> AppResult<Json<Map<String, Value>>> {
+    admin.require(CLASS_WRITE, AREA_CONFIG)?;
+    RuntimeConfig::request_restart();
+    Ok(Json(Map::new()))
 }
 
 /// Every stored row against the registry: the whole-table answer of
@@ -603,6 +691,21 @@ mod tests {
             delete,
             subkeys: None,
         }
+    }
+
+    /// The reboot pair's bodies: `need_reboot` renders Pleroma's
+    /// one-field answer, and `restart` the empty object.
+    #[test]
+    fn the_reboot_pair_renders_the_ticket_bodies() {
+        let flag =
+            serde_json::to_value(NeedReboot { need_reboot: true }).expect("the view serializes");
+        assert_eq!(flag, json!({ "need_reboot": true }), "the flagged answer");
+        let lowered =
+            serde_json::to_value(NeedReboot { need_reboot: false }).expect("the view serializes");
+        assert_eq!(lowered, json!({ "need_reboot": false }), "and the calm one");
+        let ack =
+            serde_json::to_value(Map::<String, Value>::new()).expect("the empty object serializes");
+        assert_eq!(ack, json!({}), "and restart answers the empty object");
     }
 
     /// A stored row for the table-driven tests.

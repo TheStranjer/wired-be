@@ -5,7 +5,9 @@
 //! [`StaffUser`] gate, which guards no production route yet). The admin
 //! config store (WBE-206) — `GET`/`POST /config` over the whitelist
 //! registry, the `:mrf`/`:instance` consumers and the `config_change`
-//! log line — joins at the bottom of this file, and with it the admin
+//! log line, its `GET /config/descriptions` payload and the
+//! `GET /need_reboot` / `GET /restart` pair (WBE-207) — joins at the
+//! bottom of this file, and with it the admin
 //! invites (WBE-199): `users/invite_token`, `users/invites`,
 //! `users/revoke_invite` and `users/email_invite`, their `invite_create`
 //! and `invite_revoke` log lines, and the `GET /registration/{token}`
@@ -40,6 +42,7 @@ use wired_be::{
         status::{self, NewStatus, Visibility},
         user::{Flag, NewUser, User},
     },
+    services::runtime_config::RuntimeConfig,
     state::AppState,
 };
 
@@ -275,9 +278,10 @@ async fn staff_extractor_matrix_over_http() {
     );
 }
 
-/// The log listing, stats and config-store routes all demand an admin: a
-/// moderator is refused the role, an admin without `admin:read` the
-/// scope, and nobody without a token at all.
+/// The log listing, stats and config routes — store, descriptions and the
+/// reboot pair — all demand an admin: a moderator is refused the role, an
+/// admin without the route's scope class is refused the scope, and nobody
+/// without a token at all.
 #[tokio::test]
 async fn production_routes_demand_an_admin_token() {
     let db = common::test_db().await;
@@ -286,7 +290,14 @@ async fn production_routes_demand_an_admin_token() {
     let (_, mod_read) = moderator(&pool, "mod-no-admin", "admin:read").await;
     let (_, admin_no_scope) = admin(&pool, "admin-no-scope", "read").await;
 
-    for route in [LOG, STATS, CONFIG] {
+    for route in [
+        LOG,
+        STATS,
+        CONFIG,
+        CONFIG_DESCRIPTIONS,
+        NEED_REBOOT,
+        RESTART,
+    ] {
         let not_admin = TestRequest::get(route).bearer(&mod_read).send(&app).await;
         common::assert_all_refused(
             &[not_admin],
@@ -302,8 +313,14 @@ async fn production_routes_demand_an_admin_token() {
         common::assert_all_refused(
             &[no_scope],
             StatusCode::FORBIDDEN,
-            NO_ADMIN_READ,
-            "an admin without admin:read",
+            // every route above reads; only the restart request writes,
+            // and a bare `read` admin holds neither admin class.
+            if route == RESTART {
+                NO_ADMIN_WRITE
+            } else {
+                NO_ADMIN_READ
+            },
+            "an admin without the route's admin scope",
         );
 
         let anonymous = TestRequest::get(route).send(&app).await;
@@ -675,8 +692,19 @@ async fn seed_excluded(pool: &PgPool, alice: &User) {
 
 /// The config store route.
 const CONFIG: &str = "/api/v1/pleroma/admin/config";
+/// The config descriptions route (WBE-207).
+const CONFIG_DESCRIPTIONS: &str = "/api/v1/pleroma/admin/config/descriptions";
+/// The process-wide need-reboot read route (WBE-207).
+const NEED_REBOOT: &str = "/api/v1/pleroma/admin/need_reboot";
+/// The graceful-restart request route (WBE-207).
+const RESTART: &str = "/api/v1/pleroma/admin/restart";
 /// The 403 body of a missing `admin:write` grant on the POST route.
 const NO_ADMIN_WRITE: &str = "Insufficient permissions: admin:write.";
+/// Serializes the tests that read or reset the process-wide config
+/// flags: `need_reboot` and the restart request live one per process,
+/// so only one of them may own them at a time (WBE-207, decision 13).
+/// An async lock because the guarded tests await throughout.
+static PROCESS_FLAGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The `{"tuple": [key, value]}` array the API exchanges keyword lists
 /// as (Pleroma's `ConfigDB.to_json_types` shape).
@@ -1149,9 +1177,12 @@ fn media_proxy_entry(page: &Value) -> Value {
 
 /// The `need_reboot` flag follows the registry: a live key's write keeps
 /// it down and a restart-flagged key's write raises it — in the POST
-/// answer and in every later GET while the row stands.
+/// answer and in every later GET while the row stands. The flagged write
+/// also raises the process-wide flag the WBE-207 tests read, so this
+/// holds [`PROCESS_FLAGS_LOCK`] across it.
 #[tokio::test]
 async fn config_need_reboot_follows_the_changed_keys() {
+    let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -1206,9 +1237,11 @@ async fn config_need_reboot_follows_the_changed_keys() {
 /// The restart flag clears with the row: deleting the stored
 /// `:media_proxy` is itself still a restart-flagged change, and once it
 /// stands no more the GET answers the env default and `need_reboot` is
-/// down.
+/// down. The page flag is the store's answer; the process-wide flag the
+/// same writes raise belongs to [`PROCESS_FLAGS_LOCK`]'s readers.
 #[tokio::test]
 async fn deleting_a_restart_flagged_row_lets_the_flag_fall() {
+    let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -1357,10 +1390,13 @@ async fn unchanged_and_refused_batches_log_nothing() {
     );
 }
 
-/// The config routes' gate: the GET asks for `admin:read` and the POST
-/// for `admin:write`, each accepting its narrow `admin:*:config` alias;
-/// the write scope never grants the read and vice versa, a moderator is
-/// refused the role, and no token is 401.
+/// The config store's own gate, and the scope class every config route
+/// asks for: the reads (the store, its descriptions and `need_reboot`)
+/// for `admin:read`, the POST and the restart request for
+/// `admin:write`, each accepting its narrow `admin:*:config` alias; the
+/// write scope never grants the read and vice versa, a moderator is
+/// refused the role, and no token is 401. The reboot pair's own
+/// successful paths are the gate test below it.
 #[tokio::test]
 async fn config_routes_answer_the_admin_gate() {
     let db = common::test_db().await;
@@ -1371,9 +1407,12 @@ async fn config_routes_answer_the_admin_gate() {
     let (_, write_only) = admin(&pool, "configwrite", "admin:write:config").await;
     let (_, mod_write) = moderator(&pool, "configmod", "admin:write:config").await;
 
-    let refused = TestRequest::get(CONFIG).bearer(&no_scope).send(&app).await;
+    let mut refused = Vec::new();
+    for route in [CONFIG, CONFIG_DESCRIPTIONS, NEED_REBOOT] {
+        refused.push(TestRequest::get(route).bearer(&no_scope).send(&app).await);
+    }
     common::assert_all_refused(
-        &[refused],
+        &refused,
         StatusCode::FORBIDDEN,
         NO_ADMIN_READ,
         "an admin without any admin:read grant",
@@ -1391,16 +1430,19 @@ async fn config_routes_answer_the_admin_gate() {
     .await;
     common::assert_answer(&posted, StatusCode::OK, "the narrow write scope posts");
 
-    let read_with_write = TestRequest::get(CONFIG)
-        .bearer(&write_only)
-        .send(&app)
-        .await;
+    let mut read_with_write = Vec::new();
+    for route in [CONFIG, CONFIG_DESCRIPTIONS, NEED_REBOOT] {
+        read_with_write.push(TestRequest::get(route).bearer(&write_only).send(&app).await);
+    }
     common::assert_all_refused(
-        &[read_with_write],
+        &read_with_write,
         StatusCode::FORBIDDEN,
         NO_ADMIN_READ,
         "the write scope never grants the read",
     );
+
+    let read_ok = TestRequest::get(CONFIG).bearer(&read_only).send(&app).await;
+    common::assert_answer(&read_ok, StatusCode::OK, "the narrow read scope reads");
 
     let post_with_read = post_configs(
         &app,
@@ -1414,9 +1456,6 @@ async fn config_routes_answer_the_admin_gate() {
         NO_ADMIN_WRITE,
         "the read scope never grants the write",
     );
-
-    let read_ok = TestRequest::get(CONFIG).bearer(&read_only).send(&app).await;
-    common::assert_answer(&read_ok, StatusCode::OK, "the narrow read scope reads");
 
     let not_admin = post_configs(
         &app,
@@ -1445,6 +1484,485 @@ async fn config_routes_answer_the_admin_gate() {
         INVALID_TOKEN,
         "an unknown token on the POST",
     );
+}
+
+// ---------------------------------------------------------------------------
+// The admin config descriptions and the reboot pair (WBE-207): the
+// documentation payload `GET /config/descriptions` over the registry
+// metadata (Pleroma's `ConfigController.descriptions`), the process-wide
+// `GET /need_reboot` flag and the `GET /restart` request
+// (`AdminAPIController`'s pair).
+// ---------------------------------------------------------------------------
+
+/// The descriptions and reboot pair's gate: the reads take the narrow
+/// `admin:read:config`, the restart request takes `admin:write:config` —
+/// and refuses the read scope, a moderator and an anonymous request
+/// before it raises anything. The successful request answers `{}`.
+#[tokio::test]
+async fn the_reboot_pair_answers_the_admin_gate() {
+    let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, no_scope) = admin(&pool, "rebootplain", "read write").await;
+    let (_, read_only) = admin(&pool, "rebootread", "admin:read:config").await;
+    let (_, write_only) = admin(&pool, "rebootwrite", "admin:write:config").await;
+    let (_, mod_write) = moderator(&pool, "rebootmod", "admin:write:config").await;
+
+    let write_denied = TestRequest::get(RESTART).bearer(&no_scope).send(&app).await;
+    common::assert_all_refused(
+        &[write_denied],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "an admin without any admin:write grant on the restart route",
+    );
+
+    let mut reads = Vec::new();
+    for route in [CONFIG_DESCRIPTIONS, NEED_REBOOT] {
+        reads.push(TestRequest::get(route).bearer(&read_only).send(&app).await);
+    }
+    for read in &reads {
+        common::assert_answer(read, StatusCode::OK, "the narrow read scope reads");
+    }
+
+    let read_denied = TestRequest::get(RESTART)
+        .bearer(&read_only)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[read_denied],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "the read scope never grants the restart",
+    );
+    let mod_denied = TestRequest::get(RESTART)
+        .bearer(&mod_write)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[mod_denied],
+        StatusCode::FORBIDDEN,
+        NOT_ADMIN,
+        "a moderator asking for the restart",
+    );
+    let anonymous = TestRequest::get(RESTART).send(&app).await;
+    common::assert_all_refused(
+        &[anonymous],
+        StatusCode::UNAUTHORIZED,
+        NO_TOKEN,
+        "an anonymous restart request",
+    );
+
+    let restart_ok = TestRequest::get(RESTART)
+        .bearer(&write_only)
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &restart_ok,
+        StatusCode::OK,
+        "the narrow write scope restarts",
+    );
+    assert_eq!(
+        restart_ok.json_value(),
+        json!({}),
+        "Pleroma's empty answer, and the shutdown flag is what the request raises"
+    );
+    assert!(
+        RuntimeConfig::restart_requested(),
+        "the accepted request is the flag's only origin"
+    );
+    RuntimeConfig::reset_process_flags();
+}
+
+/// The ticket's type vocabulary, everywhere in the payload and at every
+/// nesting depth.
+const DESCRIPTION_TYPES: [&str; 7] = [
+    "string", "boolean", "integer", "[:atom]", "keyword", "map", "group",
+];
+
+/// Collects every `type` string of one `children` array, recursively.
+fn collect_types(children: &Value, seen: &mut Vec<String>) {
+    if let Some(items) = children.as_array() {
+        for child in items {
+            if let Some(name) = child["type"].as_str() {
+                seen.push(name.to_owned());
+            }
+            collect_types(&child["children"], seen);
+        }
+    }
+}
+
+/// `GET /config/descriptions` as the scoped admin answers it: the array
+/// of description objects, in registry order.
+async fn descriptions_json(app: &Router, token: &str) -> Vec<Value> {
+    let page = TestRequest::get(CONFIG_DESCRIPTIONS)
+        .bearer(token)
+        .send(app)
+        .await;
+    common::assert_answer(&page, StatusCode::OK, "the descriptions payload");
+    page.json_value()
+        .as_array()
+        .expect("an array of description objects")
+        .clone()
+}
+
+/// `GET /config/descriptions` answers the registry: one documented
+/// object per whitelisted key, in table order, and the `:instance`
+/// element spelled like the ticket's example — its children naming their
+/// types, the hinted leaves carrying `suggestions` and the plain
+/// booleans carrying none.
+#[tokio::test]
+async fn config_descriptions_answer_with_the_registry() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configdocs").await;
+
+    let objects = descriptions_json(&app, &token).await;
+    assert_eq!(objects.len(), 8, "one object per whitelist entry");
+    let keys: Vec<&str> = objects
+        .iter()
+        .map(|object| {
+            assert_eq!(
+                object["group"],
+                json!(":pleroma"),
+                "every entry is :pleroma"
+            );
+            assert!(
+                object["description"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
+                "no entry goes undocumented"
+            );
+            object["key"].as_str().expect("the key is a string")
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            ":instance",
+            ":mrf",
+            ":mrf_simple",
+            ":mrf_keyword",
+            ":mrf_hellthread",
+            ":mrf_object_age",
+            ":media_proxy",
+            ":restrict_unauthenticated",
+        ],
+        "the whitelist, in table order"
+    );
+
+    let instance = &objects[0];
+    assert_eq!(instance["type"], json!("group"), "a documented container");
+    assert_eq!(
+        instance["description"],
+        json!("Instance-related settings"),
+        "Pleroma's wording"
+    );
+    let children = instance["children"].as_array().expect("the children");
+    assert_eq!(children.len(), 9, "one child per whitelisted subkey");
+    assert_eq!(children[0]["key"], json!("name"), "the example child");
+    assert_eq!(children[0]["type"], json!("string"));
+    assert_eq!(children[0]["description"], json!("Name of the instance"));
+    assert_eq!(
+        children[0]["suggestions"],
+        json!(["Wired"]),
+        "the example value, as the ticket's example carries one"
+    );
+    let registrations = children
+        .iter()
+        .find(|child| child["key"] == json!("registrations_open"))
+        .expect("the subkey is documented");
+    assert_eq!(registrations["type"], json!("boolean"), "booleans type");
+    assert!(
+        registrations.get("suggestions").is_none(),
+        "a leaf without hints renders no suggestions field"
+    );
+}
+
+/// The payload's other child metadata: the `[:atom]` policy chain with
+/// its example names, the whole-value policy entries documented as
+/// keyword parameter objects, the media proxy's three reported subkeys,
+/// the nested restriction maps — and every `type`, at every depth,
+/// inside the ticket's vocabulary.
+#[tokio::test]
+async fn config_descriptions_document_the_registry_children() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configkids").await;
+
+    let objects = descriptions_json(&app, &token).await;
+    let mrf = &objects[1];
+    assert_eq!(
+        mrf["children"][0]["key"],
+        json!("policies"),
+        "the one subkey"
+    );
+    assert_eq!(
+        mrf["children"][0]["type"],
+        json!("[:atom]"),
+        "the list-of-names spelling"
+    );
+    let policies = mrf["children"][0]["suggestions"]
+        .as_array()
+        .expect("the chain has example values");
+    assert!(
+        policies.contains(&json!("simple")) && policies.contains(&json!("keyword")),
+        "the wired policy names are offered"
+    );
+
+    let simple = &objects[2];
+    assert_eq!(simple["type"], json!("keyword"), "a whole parameter object");
+    let lists = simple["children"].as_array().expect("the policy's lists");
+    assert_eq!(
+        lists[0]["key"],
+        json!("accept"),
+        "Pleroma's simple-policy docs"
+    );
+    assert_eq!(lists[0]["type"], json!("[:atom]"));
+
+    let proxy = &objects[6];
+    assert_eq!(proxy["type"], json!("group"));
+    let proxy_children = proxy["children"].as_array().expect("the reported subkeys");
+    let names: Vec<&str> = proxy_children
+        .iter()
+        .map(|child| child["key"].as_str().expect("a string key"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["enabled", "blacklist", "max_bytes"],
+        "the registry's three subkeys"
+    );
+
+    let restricted = &objects[7];
+    let halves = restricted["children"].as_array().expect("the three halves");
+    assert_eq!(halves.len(), 3, "timelines, profiles, activities");
+    assert_eq!(halves[0]["type"], json!("map"), "a map of booleans");
+    let fields = halves[0]["children"]
+        .as_array()
+        .expect("the map nests fields");
+    assert_eq!(fields[0]["type"], json!("boolean"), "and they are booleans");
+
+    let mut types = Vec::new();
+    for object in objects {
+        types.push(
+            object["type"]
+                .as_str()
+                .expect("every entry types")
+                .to_owned(),
+        );
+        collect_types(&object["children"], &mut types);
+    }
+    assert!(
+        types
+            .iter()
+            .all(|name| DESCRIPTION_TYPES.contains(&name.as_str())),
+        "the payload stays inside the ticket's vocabulary: {types:?}"
+    );
+}
+
+/// `GET /need_reboot` reads the process-wide flag, not the store: down
+/// for a fresh boot, still down after a live key's write, and raised by
+/// a restart-requiring change.
+#[tokio::test]
+async fn need_reboot_toggles_after_a_restart_requiring_change() {
+    let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
+    RuntimeConfig::reset_process_flags();
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configflag").await;
+
+    let quiet = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&quiet, StatusCode::OK, "the quiet GET");
+    assert_eq!(
+        quiet.json_value(),
+        json!({ "need_reboot": false }),
+        "a fresh boot waits for nobody"
+    );
+
+    let live = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("Live"))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&live, StatusCode::OK, "the live write");
+    let still = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        still.json_value(),
+        json!({ "need_reboot": false }),
+        ":instance takes effect live and raises nothing"
+    );
+
+    let rebooting = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":media_proxy",
+            "value": wire(&[("max_bytes", json!(2048))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&rebooting, StatusCode::OK, "the flagged write");
+    let raised = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        raised.json_value(),
+        json!({ "need_reboot": true }),
+        "the restart-requiring change raised the flag"
+    );
+}
+
+/// Once raised, `GET /need_reboot` keeps answering true: only the next
+/// boot lowers the flag. A later live write does not lower it, a refused
+/// batch changes nothing, and a delete that finds nothing to delete
+/// toggles nothing either.
+#[tokio::test]
+async fn need_reboot_stands_through_calm_and_refused_writes() {
+    let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
+    RuntimeConfig::reset_process_flags();
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "confighold").await;
+
+    let raising = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":media_proxy",
+            "value": wire(&[("max_bytes", json!(2048))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&raising, StatusCode::OK, "the flagged write");
+
+    let later = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("Calmer"))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&later, StatusCode::OK, "a later live write");
+    let holds = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        holds.json_value(),
+        json!({ "need_reboot": true }),
+        "live changes do not lower what a restart still owes"
+    );
+
+    let refused = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":nope", "value": json!([]) }]),
+    )
+    .await;
+    common::assert_answer(&refused, StatusCode::BAD_REQUEST, "the refused batch");
+    let unchanged = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "delete": true,
+            "subkeys": ["never-stored"],
+        }]),
+    )
+    .await;
+    common::assert_answer(&unchanged, StatusCode::OK, "the no-op delete");
+    let flag = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        flag.json_value(),
+        json!({ "need_reboot": true }),
+        "changes that are not changes toggle nothing"
+    );
+}
+
+/// `GET /restart` answers `{}` and raises the shutdown flag `serve()`
+/// observes beside ctrl-c — and it does NOT clear `need_reboot`: the
+/// running process applied nothing, the next boot will. Tests assert the
+/// flag; nothing here restarts a process.
+#[tokio::test]
+async fn restart_raises_the_shutdown_flag() {
+    let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
+    RuntimeConfig::reset_process_flags();
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configrestart").await;
+
+    assert!(
+        !RuntimeConfig::restart_requested(),
+        "nobody has asked this process to restart"
+    );
+
+    let ack = TestRequest::get(RESTART).bearer(&token).send(&app).await;
+    common::assert_answer(&ack, StatusCode::OK, "the restart request");
+    assert_eq!(ack.json_value(), json!({}), "Pleroma's empty answer");
+    assert!(
+        RuntimeConfig::restart_requested(),
+        "the shutdown flag stands for serve() to drain on"
+    );
+
+    let flagged = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":media_proxy",
+            "value": wire(&[("max_bytes", json!(4096))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&flagged, StatusCode::OK, "the flagged write");
+    let raised = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        raised.json_value(),
+        json!({ "need_reboot": true }),
+        "the flag was raised before the request"
+    );
+
+    let again = TestRequest::get(RESTART).bearer(&token).send(&app).await;
+    common::assert_answer(&again, StatusCode::OK, "a second request is answerable too");
+    let stands = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        stands.json_value(),
+        json!({ "need_reboot": true }),
+        "and clearing need_reboot is NOT the restart's business"
+    );
+    RuntimeConfig::reset_process_flags();
 }
 
 // ---------------------------------------------------------------------------
