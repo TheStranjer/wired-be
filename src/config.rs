@@ -1140,7 +1140,9 @@ pub struct Config {
     /// Origin the frontend pages are served from, from `FRONTEND_BASE_URL`;
     /// [`base_url`](Self::base_url) when unset or blank. A set value is
     /// trimmed and loses its trailing slashes, so a browser redirect such as
-    /// `/notice/{id}` (a later slice) can hang its path straight onto it.
+    /// `/notice/{id}` (a later slice) and the default-asset URLs
+    /// (`/images/…`, shipped by the frontend) can hang their paths straight
+    /// onto it.
     pub frontend_base_url: String,
     /// Display name of the instance.
     pub instance_name: String,

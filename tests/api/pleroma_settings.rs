@@ -340,7 +340,8 @@ async fn a_non_object_patch_body_is_unprocessable() {
 }
 
 /// Without a stored mascot the answer is the instance default: Wired's
-/// own mascot, under `BASE_URL`.
+/// own mascot. On the default config `FRONTEND_BASE_URL` is unset and so
+/// equals `BASE_URL`, which pins the URL where it has always been.
 #[tokio::test]
 async fn the_mascot_default_is_the_instance_mascot() {
     let db = common::test_db().await;
@@ -357,6 +358,31 @@ async fn the_mascot_default_is_the_instance_mascot() {
         response.json_value(),
         default_mascot(),
         "the instance's default mascot"
+    );
+}
+
+/// The default mascot hangs under `FRONTEND_BASE_URL`, where the frontend
+/// ships the file, when that origin differs from `BASE_URL`; the test
+/// above keeps the unchanged URL for the default config, where the
+/// variable is unset and the two origins are equal.
+#[tokio::test]
+async fn the_mascot_default_follows_the_frontend_origin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
+    let mut config = common::test_config();
+    config.frontend_base_url = "https://fe.example".to_owned();
+    let app = common::test_app_with_config(pool, config);
+
+    let response = common::TestRequest::get(MASCOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the default answers 200");
+    let url = response.json_value()["url"].as_str().unwrap().to_owned();
+    assert!(
+        url.starts_with("https://fe.example") && url.ends_with("/images/mascot.png"),
+        "the default mascot is served by the frontend, not the API: {url}"
     );
 }
 

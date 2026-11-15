@@ -308,12 +308,13 @@ async fn body_text(
 
 /// The delivered `icon`: the actor's avatar URL, or the same instance
 /// default the [`Account`](crate::entities::account::Account) entity
-/// renders when the actor has none.
+/// renders when the actor has none — under the frontend origin, where the
+/// file is actually served.
 fn icon_for(state: &AppState, actor: &User) -> String {
     actor
         .avatar_url
         .clone()
-        .unwrap_or_else(|| format!("{}{DEFAULT_AVATAR_PATH}", state.config.base_url))
+        .unwrap_or_else(|| format!("{}{DEFAULT_AVATAR_PATH}", state.config.frontend_base_url))
 }
 
 /// The title's first half: the actor's display name, its nickname when the
@@ -396,7 +397,13 @@ mod tests {
     /// reaches the loopback mocks the tests bind (decision 13's fixture is
     /// what the database-backed tests lease from).
     fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
+        app_state_with(pool, Config::for_tests())
+    }
+
+    /// [`app_state`] built on `config`, for the tests that read a setting
+    /// away from its test default.
+    fn app_state_with(pool: &PgPool, config: Config) -> AppState {
+        let config = Arc::new(config);
         AppState {
             db: pool.clone(),
             hub: Hub::new(pool),
@@ -815,6 +822,28 @@ mod tests {
         );
         assert_eq!(payload["body"], "", "a status-less telling carries no text");
         assert_eq!(s.actor.name, "Alice", "the fixture actor's name");
+    }
+
+    /// The fallback icon for an avatar-less actor hangs under
+    /// `FRONTEND_BASE_URL`, where the frontend ships the file, not under
+    /// the API's own origin; [`a_follow_wakes_the_subscription_with_a_signed_encrypted_payload`]
+    /// above keeps the unchanged URL pinned for the default config, where
+    /// the variable is unset and the origins are equal.
+    #[tokio::test]
+    async fn the_default_icon_hangs_off_the_frontend_origin() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        let state = app_state_with(&pool, config);
+        let actor = local(&pool, "iconalice", "Alice").await;
+
+        let icon = icon_for(&state, &actor);
+
+        assert!(
+            icon.starts_with("https://fe.example") && icon.ends_with(DEFAULT_AVATAR_PATH),
+            "the fallback icon is the default avatar on the frontend origin: {icon}"
+        );
     }
 
     #[tokio::test]

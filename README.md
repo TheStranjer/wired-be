@@ -17,7 +17,7 @@ All configuration comes from environment variables. For local development, copy 
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
 | `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
-| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` (no trailing slash) |
+| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and of the default-asset URLs (see "Default assets" below; no trailing slash) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
 | `INSTANCE_DESCRIPTION` | no | `A Wired instance, compatible with Pleroma clients` | Short instance description |
@@ -106,6 +106,21 @@ All configuration comes from environment variables. For local development, copy 
 | `RATE_LIMITS_ENABLED` | no | `true` | Whether routes that mount a rate-limit bucket throttle their requests; while off they answer uncounted and without `x-ratelimit-*` headers (`true`/`false`, or `1`/`0`) |
 | `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60`; a bucket off the table is unlimited |
 | `TRUST_PROXY_HEADERS` | no | `false` | Let the leftmost `X-Forwarded-For` entry name the client a rate-limit window counts against; while off the socket peer always does (`true`/`false`, or `1`/`0`) |
+
+### Default assets
+
+wired-be serves API only and ships no files: the four default assets are
+served by the frontend, so their URLs are built from `FRONTEND_BASE_URL`
+(unset or blank, that is `BASE_URL` — a same-origin deployment whose
+reverse proxy routes `/images/*` to the frontend keeps the URLs it has
+now). The frontend must ship exactly these paths under that origin:
+
+| Path | Advertised as |
+|---|---|
+| `/images/avi.png` | Default avatar: the `avatar`/`avatar_static` fallback on accounts, and the `icon` fallback of a Web Push notification |
+| `/images/banner.png` | Default banner: the `header`/`header_static` fallback on accounts |
+| `/images/thumbnail.jpg` | Instance thumbnail on `GET /api/v1/instance` and `GET /api/v2/instance` |
+| `/images/mascot.png` | Default mascot on `GET /api/v1/pleroma/mascot` |
 
 ## Moderation filters (MRF)
 
