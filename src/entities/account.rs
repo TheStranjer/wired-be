@@ -693,7 +693,12 @@ pub fn local_url(config: &Config, nickname: &str) -> String {
 /// user's images pass through untouched. The default assets are shipped by
 /// the frontend, so the fallback hangs off [`Config::frontend_base_url`],
 /// not the API's own origin.
-fn profile_image(
+///
+/// Crate-visible because the admin API's account entity renders the same
+/// `avatar` Pleroma's `AdminAPI.AccountView` puts through
+/// `User.avatar_url/1 |> MediaProxy.url/1` (see
+/// [`AdminAccount`](super::admin_account::AdminAccount)).
+pub(crate) fn profile_image(
     user: &User,
     config: &Config,
     stored_url: Option<&str>,

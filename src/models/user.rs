@@ -18,7 +18,8 @@
 //!
 //! Registration and password login live in [`register`]; the MFA column's
 //! shape and updates live in [`mfa`]; the email-confirmation token, its
-//! letter and its two writers live in [`confirmation`].
+//! letter and its two writers live in [`confirmation`]; and the admin API's
+//! filtered listing and nickname-or-id lookup live in [`admin`].
 
 use std::fmt;
 
@@ -29,6 +30,7 @@ use uuid::Uuid;
 
 use crate::{config::Config, error::AppResult, pagination::PageParams, util::id::new_id};
 
+pub mod admin;
 pub mod confirmation;
 pub mod mfa;
 pub mod notification_settings;
