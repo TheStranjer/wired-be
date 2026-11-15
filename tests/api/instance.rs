@@ -959,13 +959,13 @@ async fn the_rules_endpoint_serves_the_instance_rules() {
     );
 }
 
-/// Writes the `mrf` instance setting the endpoints and the pipeline both
+/// Writes the `:mrf` config entry the endpoints and the pipeline both
 /// read: the tests configure policy chains through the same row the admin
-/// tickets will own.
+/// config store owns (WBE-206).
 async fn set_mrf(pool: &PgPool, setting: &Value) {
-    wired_be::models::instance_setting::set(pool, "mrf", setting)
+    wired_be::services::runtime_config::write(pool, ":pleroma", ":mrf", setting)
         .await
-        .expect("the mrf setting writes");
+        .expect("the mrf entry writes");
 }
 
 /// The `simple` lists the moderation tests configure: one host per
@@ -1237,9 +1237,14 @@ async fn the_sub_resources_are_v1_only() {
 async fn federation_reports_the_enabled_mrf_policies() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    wired_be::models::instance_setting::set(&pool, "mrf", &json!({"policies": ["ghost", "noop"]}))
-        .await
-        .expect("the setting writes");
+    wired_be::services::runtime_config::write(
+        &pool,
+        ":pleroma",
+        ":mrf",
+        &json!({"policies": ["ghost", "noop"]}),
+    )
+    .await
+    .expect("the mrf entry writes");
     let app = common::test_app(pool);
     for path in ["/api/v1/instance", "/api/v2/instance"] {
         let response = common::TestRequest::get(path).send(&app).await;

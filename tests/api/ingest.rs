@@ -38,10 +38,11 @@ use wired_be::{
     config::Config,
     federation::dispatch::handle_incoming,
     models::{
-        follow, instance_setting,
+        follow,
         status::{self, Status},
         user::User,
     },
+    services::runtime_config,
     state::AppState,
 };
 
@@ -561,13 +562,14 @@ async fn media_count(pool: &PgPool, status_id: Uuid) -> i64 {
 
 /// Enables the `simple` policy with the domain lists `lists` configures.
 async fn set_simple(pool: &PgPool, lists: &Value) {
-    instance_setting::set(
+    runtime_config::write(
         pool,
-        "mrf",
+        ":pleroma",
+        ":mrf",
         &json!({"policies": ["simple"], "simple": lists}),
     )
     .await
-    .expect("the mrf setting writes");
+    .expect("the mrf entry writes");
 }
 
 /// Two `direct` statuses answering the same unstored parent under one

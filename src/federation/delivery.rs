@@ -516,10 +516,10 @@ mod tests {
         },
         http_client::HttpClient,
         models::{
-            instance_setting,
             job::Job,
             user::{NewUser, insert, local_ap_id},
         },
+        services::runtime_config,
         uploads::UploaderBackend,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
@@ -1476,9 +1476,10 @@ mod tests {
     async fn a_domain_the_mrf_lists_reject_is_refused_without_a_job() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(
+        runtime_config::write(
             &pool,
-            "mrf",
+            ":pleroma",
+            ":mrf",
             &json!({
                 "policies": ["simple"],
                 "simple": {"reject": ["*.evil.example"], "accept": [["peer.example", "our peer"]]},

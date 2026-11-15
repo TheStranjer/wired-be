@@ -301,10 +301,10 @@ mod tests {
         jobs::AttemptInfo,
         models::{
             follow::{self, Follow},
-            instance_setting,
             status::{self, NewStatus, Status},
             user::{Flag, NewUser, insert},
         },
+        services::runtime_config,
         uploads::UploaderBackend,
     };
 
@@ -577,16 +577,17 @@ mod tests {
     async fn an_update_lands_stripped_by_the_mrf_actor_lists() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(
+        runtime_config::write(
             &pool,
-            "mrf",
+            ":pleroma",
+            ":mrf",
             &json!({
                 "policies": ["simple"],
                 "simple": {"avatar_removal": ["peer.example"], "banner_removal": ["*.example"]},
             }),
         )
         .await
-        .expect("the setting writes");
+        .expect("the mrf entry writes");
         let state = app_state(&pool);
         let alice = mirror(&pool).await;
         let alice_id = alice.id;

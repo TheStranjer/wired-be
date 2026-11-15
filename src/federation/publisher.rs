@@ -505,12 +505,11 @@ mod tests {
         http_client::HttpClient,
         models::{
             follow::FollowState,
-            instance_setting,
             job::Job,
             relay,
             user::{NewUser, insert, local_ap_id},
         },
-        services::instance_actor::ensure_instance_actor,
+        services::{instance_actor::ensure_instance_actor, runtime_config},
         uploads::UploaderBackend,
     };
 
@@ -1064,9 +1063,10 @@ mod tests {
     async fn a_domain_the_mrf_lists_reject_is_excluded() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        instance_setting::set(
+        runtime_config::write(
             &pool,
-            "mrf",
+            ":pleroma",
+            ":mrf",
             &json!({
                 "policies": ["simple"],
                 "simple": {"accept": [["other.example", "the one we talk to"]]},

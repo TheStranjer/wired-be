@@ -65,6 +65,7 @@ use crate::{
     },
     services::{
         instance_meta,
+        runtime_config::RuntimeConfig,
         translate::{Translator, languages_matrix},
         vapid,
     },
@@ -266,6 +267,7 @@ pub fn v2_router() -> Router<AppState> {
 /// [`AppError::Database`](crate::error::AppError).
 async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance>> {
     let now = Utc::now();
+    let config = effective_instance_config(&state).await?;
     let counters = if let Some(cached) = state.instance_stats_cache.get(now) {
         cached
     } else {
@@ -276,9 +278,9 @@ async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
     let vapid_key = vapid::vapid_public_key(&state.db).await?;
-    let pleroma = PleromaBlock::build(&state.config, &vapid_key, federation_block(&state).await);
+    let pleroma = PleromaBlock::build(&config, &vapid_key, federation_block(&state).await);
     Ok(Json(Instance::build(
-        &state.config,
+        &config,
         &counters,
         &rules,
         contact.as_ref(),
@@ -334,17 +336,36 @@ async fn read_first_admin(pool: &PgPool) -> AppResult<Option<User>> {
 /// Any database failure arrives through `?` as
 /// [`AppError::Database`](crate::error::AppError).
 async fn show_instance_v2(State(state): State<AppState>) -> AppResult<Json<InstanceV2>> {
+    let config = effective_instance_config(&state).await?;
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
     let vapid_key = vapid::vapid_public_key(&state.db).await?;
-    let pleroma = PleromaBlock::build(&state.config, &vapid_key, federation_block(&state).await);
+    let pleroma = PleromaBlock::build(&config, &vapid_key, federation_block(&state).await);
     Ok(Json(InstanceV2::build(
-        &state.config,
+        &config,
         &rules,
         contact.as_ref(),
         &vapid_key,
         pleroma,
     )))
+}
+
+/// The [`Config`] the instance documents answer with: the environment-
+/// derived one with the admin config store's stored `:instance` overrides
+/// applied (WBE-206) — the name, description, email, registration flags,
+/// `limit` and `max_media_attachments` an operator set through
+/// `POST /api/v1/pleroma/admin/config`, which [`RuntimeConfig::effective_config`]
+/// resolves. Every other setting stays exactly as `Config` carries it.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+///
+/// [`RuntimeConfig::effective_config`]: crate::services::runtime_config::RuntimeConfig::effective_config
+async fn effective_instance_config(state: &AppState) -> AppResult<Config> {
+    RuntimeConfig::new(&state.db, &state.config)
+        .effective_config()
+        .await
 }
 
 /// [`show_peers`]: the peer list — distinct `users.domain`,

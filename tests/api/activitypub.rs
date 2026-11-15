@@ -47,12 +47,11 @@ use wired_be::{
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
     models::{
-        instance_setting,
         job::Job,
         status::{self, NewStatus, Status as StoredStatus, Visibility},
         user::{Flag, NewUser, User, followers},
     },
-    services::instance_actor::ensure_instance_actor,
+    services::{instance_actor::ensure_instance_actor, runtime_config},
     util::time::mastodon_time,
 };
 
@@ -979,12 +978,12 @@ async fn a_delivery_from_an_mrf_rejected_host_is_refused() {
     assert_eq!(incoming_jobs(&pool).await.len(), 1, "and the job is queued");
 }
 
-/// Writes the `mrf` instance setting: the pipeline reads it (uncached: each
+/// Writes the `:mrf` config entry: the pipeline reads it (uncached: each
 /// phase of the test builds a fresh state) as its policy chain.
 async fn set_mrf(pool: &PgPool, setting: &Value) {
-    instance_setting::set(pool, "mrf", setting)
+    runtime_config::write(pool, ":pleroma", ":mrf", setting)
         .await
-        .expect("the mrf setting writes");
+        .expect("the mrf entry writes");
 }
 
 // ---------------------------------------------------------------------------

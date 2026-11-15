@@ -2,7 +2,10 @@
 //! [`AdminUser`] and [`StaffUser`] extractors, the moderation-log listing
 //! and its filters and pagination, and the visibility `stats`, all against
 //! the real router (plus a two-route test router that exercises the
-//! [`StaffUser`] gate, which guards no production route yet).
+//! [`StaffUser`] gate, which guards no production route yet). The admin
+//! config store (WBE-206) — `GET`/`POST /config` over the whitelist
+//! registry, the `:mrf`/`:instance` consumers and the `config_change`
+//! log line — joins at the bottom of this file.
 //!
 //! The extractor matrix follows Pleroma's `UserIsAdminPlug` /
 //! `UserIsStaffPlug` order — a missing token is 401, an unusable one
@@ -264,9 +267,9 @@ async fn staff_extractor_matrix_over_http() {
     );
 }
 
-/// The log listing and stats routes both demand an admin: a moderator is
-/// refused the role, an admin without `admin:read` the scope, and nobody
-/// without a token at all.
+/// The log listing, stats and config-store routes all demand an admin: a
+/// moderator is refused the role, an admin without `admin:read` the
+/// scope, and nobody without a token at all.
 #[tokio::test]
 async fn production_routes_demand_an_admin_token() {
     let db = common::test_db().await;
@@ -275,7 +278,7 @@ async fn production_routes_demand_an_admin_token() {
     let (_, mod_read) = moderator(&pool, "mod-no-admin", "admin:read").await;
     let (_, admin_no_scope) = admin(&pool, "admin-no-scope", "read").await;
 
-    for route in [LOG, STATS] {
+    for route in [LOG, STATS, CONFIG] {
         let not_admin = TestRequest::get(route).bearer(&mod_read).send(&app).await;
         common::assert_all_refused(
             &[not_admin],
@@ -652,4 +655,786 @@ async fn seed_excluded(pool: &PgPool, alice: &User) {
     let _tombstone = status::soft_delete(pool, doomed.id)
         .await
         .expect("the soft delete runs");
+}
+
+// ---------------------------------------------------------------------------
+// The admin config store (WBE-206): `GET`/`POST /config` over the
+// whitelist registry — set/merge/delete round-trips, the wire's tuple
+// form, the `:mrf*` chain the MRF loader reads, the `:instance` overrides
+// the instance documents show, the `need_reboot` flag and the
+// `config_change` log line.
+// ---------------------------------------------------------------------------
+
+/// The config store route.
+const CONFIG: &str = "/api/v1/pleroma/admin/config";
+/// The 403 body of a missing `admin:write` grant on the POST route.
+const NO_ADMIN_WRITE: &str = "Insufficient permissions: admin:write.";
+
+/// The `{"tuple": [key, value]}` array the API exchanges keyword lists
+/// as (Pleroma's `ConfigDB.to_json_types` shape).
+fn wire(pairs: &[(&str, Value)]) -> Vec<Value> {
+    pairs
+        .iter()
+        .map(|(key, value)| json!({"tuple": [key, value]}))
+        .collect()
+}
+
+/// The stored value `value` carries under wire-form `key`, `None` when no
+/// such tuple entry stands in the array.
+fn tuple_value<'v>(value: &'v Value, key: &str) -> Option<&'v Value> {
+    value.as_array()?.iter().find_map(|entry| {
+        let pair = entry.get("tuple").and_then(Value::as_array)?;
+        if pair.first() == Some(&json!(key)) {
+            pair.get(1)
+        } else {
+            None
+        }
+    })
+}
+
+/// `POST /config` with one `configs` batch.
+async fn post_configs(app: &Router, token: &str, items: Value) -> common::TestResponse {
+    TestRequest::post(CONFIG)
+        .bearer(token)
+        .json(&json!({ "configs": items }))
+        .send(app)
+        .await
+}
+
+/// An admin holding both config scopes: the round-trip tests GET what
+/// they POST.
+async fn config_admin(pool: &PgPool, nickname: &str) -> String {
+    admin(pool, nickname, "admin:read:config admin:write:config")
+        .await
+        .1
+}
+
+/// A set renders the wire tuple form, names its `db` subkeys, and the
+/// effective GET merges the row over the env defaults — every whitelisted
+/// key answers, and `need_reboot` stays down for the live keys.
+#[tokio::test]
+async fn config_set_renders_the_wire_shape_and_the_effective_view() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configroot").await;
+
+    let first = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("Renamed")), ("email", json!("staff@example.test"))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&first, StatusCode::OK, "the first write");
+    let body = first.json_value();
+    assert_eq!(body["configs"][0]["group"], ":pleroma", "the group");
+    assert_eq!(body["configs"][0]["key"], ":instance", "the key");
+    assert_eq!(
+        body["configs"][0]["value"],
+        json!(wire(&[
+            ("email", json!("staff@example.test")),
+            ("name", json!("Renamed"))
+        ])),
+        "the stored row renders as its tuple array"
+    );
+    assert_eq!(
+        body["configs"][0]["db"],
+        json!(["email", "name"]),
+        "db names the stored subkeys"
+    );
+    assert_eq!(body["need_reboot"], json!(false), ":instance changes live");
+
+    let merged = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
+    common::assert_answer(&merged, StatusCode::OK, "the effective GET");
+    let view = merged.json_value();
+    assert_eq!(
+        view["configs"].as_array().map(Vec::len),
+        Some(8),
+        "every whitelisted key answers without only_db"
+    );
+    let instance = &view["configs"][0];
+    assert_eq!(
+        tuple_value(&instance["value"], "name"),
+        Some(&json!("Renamed")),
+        "the row's name is the effective one"
+    );
+    assert_eq!(
+        tuple_value(&instance["value"], "description"),
+        Some(&json!("A Wired instance, compatible with Pleroma clients")),
+        "the untouched sibling keeps the env default"
+    );
+    assert_eq!(instance["db"], json!(["email", "name"]), "and db stays");
+    assert_eq!(
+        view["configs"][1].get("db"),
+        None,
+        "an entry with no row renders no db"
+    );
+}
+
+/// A second set merges into the stored row: the new subkey writes
+/// through, the first batch's subkey survives, and `only_db` answers the
+/// stored rows alone.
+#[tokio::test]
+async fn config_second_write_merges_into_the_stored_row() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configmerge").await;
+
+    let opening = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("Renamed")), ("email", json!("staff@example.test"))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&opening, StatusCode::OK, "the first write");
+
+    let second = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("Again"))]),
+        }]),
+    )
+    .await;
+    let body = second.json_value();
+    assert_eq!(
+        tuple_value(&body["configs"][0]["value"], "name"),
+        Some(&json!("Again")),
+        "the re-set writes through"
+    );
+    assert_eq!(
+        tuple_value(&body["configs"][0]["value"], "email"),
+        Some(&json!("staff@example.test")),
+        "and the earlier subkey survives the merge"
+    );
+    assert_eq!(
+        body["configs"][0]["db"],
+        json!(["email", "name"]),
+        "both subkeys are stored now"
+    );
+
+    let only_db = TestRequest::get(&format!("{CONFIG}?only_db=true"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&only_db, StatusCode::OK, "the only_db GET");
+    let rows = only_db.json_value();
+    assert_eq!(
+        rows["configs"].as_array().map(Vec::len),
+        Some(1),
+        "only_db answers the stored rows alone"
+    );
+    assert_eq!(rows["configs"][0]["key"], ":instance", "the one row");
+}
+
+/// The deletes: the subkey delete leaves the rest of the row standing,
+/// the whole delete takes the row out of the store, and the effective GET
+/// falls back to the env values once nothing stands.
+#[tokio::test]
+async fn config_delete_takes_subkeys_then_the_whole_row() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configdel").await;
+
+    let opening = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("Renamed")), ("email", json!("staff@example.test"))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&opening, StatusCode::OK, "the seeded write");
+
+    let subkey_delete = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "delete": true,
+            "subkeys": ["name"],
+        }]),
+    )
+    .await;
+    let left = subkey_delete.json_value();
+    assert_eq!(
+        left["configs"][0]["value"],
+        json!(wire(&[("email", json!("staff@example.test"))])),
+        "the deleted subkey is out and the row keeps the rest"
+    );
+    assert_eq!(left["configs"][0]["db"], json!(["email"]), "db shrank too");
+
+    let whole_delete = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":instance", "delete": true }]),
+    )
+    .await;
+    let gone = whole_delete.json_value();
+    assert_eq!(
+        gone["configs"],
+        json!([]),
+        "a whole delete leaves nothing to render"
+    );
+    let only_db = TestRequest::get(&format!("{CONFIG}?only_db=true"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        only_db.json_value()["configs"],
+        json!([]),
+        "and the row is gone from the store"
+    );
+    let effective = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
+    let fallback = &effective.json_value()["configs"][0];
+    assert_eq!(
+        tuple_value(&fallback["value"], "name"),
+        Some(&json!("Wired")),
+        "the effective name fell back to the env default"
+    );
+    assert_eq!(fallback.get("db"), None, "with no row there is no db");
+}
+
+/// The whitelist is the write gate: an unknown key or group is the 400
+/// naming the pair, the whole batch is refused before any of it writes,
+/// and an upsert without a value is refused too.
+#[tokio::test]
+async fn config_whitelist_refuses_unknown_pairs() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configgate").await;
+
+    let mixed = post_configs(
+        &app,
+        &token,
+        json!([
+            { "group": ":pleroma", "key": ":instance", "value": wire(&[("name", json!("Sneaky"))]) },
+            { "group": ":pleroma", "key": ":database_config", "value": json!([]) },
+        ]),
+    )
+    .await;
+    common::assert_answer(&mixed, StatusCode::BAD_REQUEST, "the mixed batch");
+    common::assert_error(
+        &mixed,
+        "Config not allowed: :pleroma/:database_config",
+        "an unknown key in a batch that leads with a valid pair",
+    );
+    let only_db = TestRequest::get(&format!("{CONFIG}?only_db=true"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        only_db.json_value()["configs"],
+        json!([]),
+        "the refused batch wrote nothing, not even its valid first item"
+    );
+
+    let wrong_group = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":wired", "key": ":instance", "value": json!([]) }]),
+    )
+    .await;
+    common::assert_error(
+        &wrong_group,
+        "Config not allowed: :wired/:instance",
+        "a real key in an unregistered group",
+    );
+
+    let valueless = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":mrf" }]),
+    )
+    .await;
+    common::assert_answer(
+        &valueless,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an upsert without a value",
+    );
+}
+
+/// The MRF chain is a live consumer of the store: after a first read has
+/// filled the pipeline's cache, a `POST /config` setting `:mrf` policies
+/// and `:mrf_simple` lists takes effect at once — the instance document's
+/// federation block names `SimplePolicy` and publishes the stored list.
+#[tokio::test]
+async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configmrf").await;
+
+    let before = TestRequest::get("/api/v1/instance").send(&app).await;
+    assert_eq!(
+        before.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
+        json!([]),
+        "the fresh instance runs no policy, and this read fills the cache"
+    );
+
+    let written = post_configs(
+        &app,
+        &token,
+        json!([
+            {
+                "group": ":pleroma",
+                "key": ":mrf",
+                "value": wire(&[("policies", json!(["simple"]))]),
+            },
+            {
+                "group": ":pleroma",
+                "key": ":mrf_simple",
+                "value": wire(&[("reject", json!([["evil.example", "bots"]]))]),
+            },
+        ]),
+    )
+    .await;
+    common::assert_answer(&written, StatusCode::OK, "the :mrf batch");
+    assert_eq!(
+        written.json_value()["need_reboot"],
+        json!(false),
+        "the chain reloads without a restart"
+    );
+
+    let after = TestRequest::get("/api/v1/instance").send(&app).await;
+    let federation = after.json_value()["pleroma"]["metadata"]["federation"].clone();
+    assert_eq!(
+        federation["mrf_policies"],
+        json!(["SimplePolicy"]),
+        "the POST cleared the cache and the new chain answers"
+    );
+    assert_eq!(
+        federation["mrf_simple"]["reject"],
+        json!(["evil.example"]),
+        "the :mrf_simple entry is the policy's own lists"
+    );
+
+    let deleted = post_configs(
+        &app,
+        &token,
+        json!([
+            { "group": ":pleroma", "key": ":mrf", "delete": true },
+            { "group": ":pleroma", "key": ":mrf_simple", "delete": true },
+        ]),
+    )
+    .await;
+    common::assert_answer(&deleted, StatusCode::OK, "the delete batch");
+    let reverted = TestRequest::get("/api/v1/instance").send(&app).await;
+    assert_eq!(
+        reverted.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
+        json!([]),
+        "and with the rows gone the env fallback runs the empty chain again"
+    );
+}
+
+/// The `:instance` overrides ride the public documents: the v1 and v2
+/// instance titles, the v1 contact email and registration flags, and the
+/// `NodeInfo` name and `openRegistrations` all answer from the stored
+/// row until it is deleted.
+#[tokio::test]
+async fn instance_overrides_show_in_the_public_documents() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configname").await;
+
+    let written = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[
+                ("name", json!("Renamed Radio")),
+                ("email", json!("desk@example.test")),
+                ("registrations_open", json!(false)),
+                ("account_approval_required", json!(true)),
+            ]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&written, StatusCode::OK, "the :instance write");
+
+    let v1 = TestRequest::get("/api/v1/instance").send(&app).await;
+    let document = v1.json_value();
+    assert_eq!(document["title"], "Renamed Radio", "the v1 title");
+    assert_eq!(document["email"], "desk@example.test", "the v1 email");
+    assert_eq!(document["registrations"], json!(false), "the v1 flag");
+    assert_eq!(
+        document["approval_required"],
+        json!(true),
+        "account_approval_required rides the approval gate"
+    );
+
+    let v2 = TestRequest::get("/api/v2/instance").send(&app).await;
+    assert_eq!(v2.json_value()["title"], "Renamed Radio", "the v2 title");
+    assert_eq!(
+        v2.json_value()["registrations"]["enabled"],
+        json!(false),
+        "and the v2 registration block"
+    );
+
+    let nodeinfo = TestRequest::get("/nodeinfo/2.0").send(&app).await;
+    let summary = nodeinfo.json_value();
+    assert_eq!(
+        summary["metadata"]["nodeName"], "Renamed Radio",
+        "the NodeInfo name"
+    );
+    assert_eq!(
+        summary["openRegistrations"],
+        json!(false),
+        "and its registration answer"
+    );
+
+    let deleted = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":instance", "delete": true }]),
+    )
+    .await;
+    common::assert_answer(&deleted, StatusCode::OK, "the delete");
+    let back = TestRequest::get("/api/v1/instance").send(&app).await;
+    assert_eq!(
+        back.json_value()["title"],
+        "Wired",
+        "the env name is back once the row is gone"
+    );
+    assert_eq!(
+        back.json_value()["registrations"],
+        json!(true),
+        "and so is the env's open door"
+    );
+}
+
+/// The `:media_proxy` entry of a GET `/config` answer.
+fn media_proxy_entry(page: &Value) -> Value {
+    page["configs"]
+        .as_array()
+        .and_then(|configs| {
+            configs
+                .iter()
+                .find(|entry| {
+                    entry["key"]
+                        .as_str()
+                        .is_some_and(|key| key == ":media_proxy")
+                })
+                .cloned()
+        })
+        .expect("the media proxy entry answers")
+}
+
+/// The `need_reboot` flag follows the registry: a live key's write keeps
+/// it down and a restart-flagged key's write raises it — in the POST
+/// answer and in every later GET while the row stands.
+#[tokio::test]
+async fn config_need_reboot_follows_the_changed_keys() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configboot").await;
+
+    let instance_write = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("description", json!("Live change"))]),
+        }]),
+    )
+    .await;
+    assert_eq!(
+        instance_write.json_value()["need_reboot"],
+        json!(false),
+        ":instance takes effect without a restart"
+    );
+
+    let proxy_write = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":media_proxy",
+            "value": wire(&[("max_bytes", json!(1024))]),
+        }]),
+    )
+    .await;
+    assert_eq!(
+        proxy_write.json_value()["need_reboot"],
+        json!(true),
+        "the media proxy waits for the restart"
+    );
+
+    let standing = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
+    assert_eq!(
+        standing.json_value()["need_reboot"],
+        json!(true),
+        "and the flag holds while the stored row stands"
+    );
+    let page = standing.json_value();
+    assert_eq!(
+        tuple_value(&media_proxy_entry(&page)["value"], "max_bytes"),
+        Some(&json!(1024)),
+        "the stored value is the effective one"
+    );
+}
+
+/// The restart flag clears with the row: deleting the stored
+/// `:media_proxy` is itself still a restart-flagged change, and once it
+/// stands no more the GET answers the env default and `need_reboot` is
+/// down.
+#[tokio::test]
+async fn deleting_a_restart_flagged_row_lets_the_flag_fall() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configreboot").await;
+
+    let opening = post_configs(
+        &app,
+        &token,
+        json!([{
+            "group": ":pleroma",
+            "key": ":media_proxy",
+            "value": wire(&[("max_bytes", json!(1024))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&opening, StatusCode::OK, "the seeded write");
+
+    let deleted = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":media_proxy", "delete": true }]),
+    )
+    .await;
+    assert_eq!(
+        deleted.json_value()["need_reboot"],
+        json!(true),
+        "deleting a restart key is still a change waiting for the restart"
+    );
+
+    let after = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
+    assert_eq!(
+        after.json_value()["need_reboot"],
+        json!(false),
+        "with the row gone nothing waits any more"
+    );
+    let page = after.json_value();
+    assert_eq!(
+        tuple_value(&media_proxy_entry(&page)["value"], "max_bytes"),
+        Some(&json!(50_000_000)),
+        "and the env default is back"
+    );
+}
+
+/// The `config_change` entry of the moderation log: one row per changed
+/// batch, its sentence naming the pairs in order and its data carrying
+/// every pair with its write-or-delete flag — findable by the listing's
+/// search filter like every other entry.
+#[tokio::test]
+async fn config_changes_record_the_moderation_log() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, token) = admin(&pool, "configlogger", "admin:read admin:write").await;
+
+    let written = post_configs(
+        &app,
+        &token,
+        json!([
+            {
+                "group": ":pleroma",
+                "key": ":instance",
+                "value": wire(&[("name", json!("Logged"))]),
+            },
+            {
+                "group": ":pleroma",
+                "key": ":mrf",
+                "value": wire(&[("policies", json!(["noop"]))]),
+            },
+        ]),
+    )
+    .await;
+    common::assert_answer(&written, StatusCode::OK, "the two-entry batch");
+
+    let log_page = TestRequest::get(LOG).bearer(&token).send(&app).await;
+    let page = log_page.json_value();
+    assert_eq!(page["total"], json!(1), "one entry for the batch");
+    let entry = &page["items"][0];
+    assert_eq!(
+        entry["message"], "@configlogger changed config: :pleroma/:instance, :pleroma/:mrf",
+        "the sentence names every changed pair, in order"
+    );
+    assert_eq!(
+        entry["data"]["action"], "config_change",
+        "the stored data map carries the action"
+    );
+    assert_eq!(
+        entry["data"]["configs"],
+        json!([
+            {"group": ":pleroma", "key": ":instance", "delete": false},
+            {"group": ":pleroma", "key": ":mrf", "delete": false},
+        ]),
+        "with every pair's write-or-delete flag"
+    );
+    assert_eq!(
+        entry["data"]["actor"]["nickname"], "configlogger",
+        "and the acting admin, as every entry's data carries it"
+    );
+
+    let search = TestRequest::get(&format!("{LOG}?search=changed+config"))
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        search.json_value()["total"],
+        json!(1),
+        "the entry is findable"
+    );
+}
+
+/// Nothing that changed nothing gets logged: the delete of an absent row
+/// answers empty and writes no line, and a batch the whitelist refused
+/// wrote neither store nor log.
+#[tokio::test]
+async fn unchanged_and_refused_batches_log_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, token) = admin(&pool, "configquiet", "admin:read admin:write").await;
+
+    let quiet = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":mrf_keyword", "delete": true }]),
+    )
+    .await;
+    common::assert_answer(&quiet, StatusCode::OK, "the delete of an absent entry");
+    let empty_log = TestRequest::get(LOG).bearer(&token).send(&app).await;
+    assert_eq!(
+        empty_log.json_value()["total"],
+        json!(0),
+        "nothing changed, nothing logged"
+    );
+
+    let refused = post_configs(
+        &app,
+        &token,
+        json!([{ "group": ":pleroma", "key": ":nope", "value": json!([]) }]),
+    )
+    .await;
+    common::assert_answer(&refused, StatusCode::BAD_REQUEST, "the refused batch");
+    let after_refusal = TestRequest::get(LOG).bearer(&token).send(&app).await;
+    assert_eq!(
+        after_refusal.json_value()["total"],
+        json!(0),
+        "the refused batch added no log line either"
+    );
+}
+
+/// The config routes' gate: the GET asks for `admin:read` and the POST
+/// for `admin:write`, each accepting its narrow `admin:*:config` alias;
+/// the write scope never grants the read and vice versa, a moderator is
+/// refused the role, and no token is 401.
+#[tokio::test]
+async fn config_routes_answer_the_admin_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_, no_scope) = admin(&pool, "plainadmin", "read write").await;
+    let (_, read_only) = admin(&pool, "configread", "admin:read:config").await;
+    let (_, write_only) = admin(&pool, "configwrite", "admin:write:config").await;
+    let (_, mod_write) = moderator(&pool, "configmod", "admin:write:config").await;
+
+    let refused = TestRequest::get(CONFIG).bearer(&no_scope).send(&app).await;
+    common::assert_all_refused(
+        &[refused],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_READ,
+        "an admin without any admin:read grant",
+    );
+
+    let posted = post_configs(
+        &app,
+        &write_only,
+        json!([{
+            "group": ":pleroma",
+            "key": ":instance",
+            "value": wire(&[("name", json!("WriteOnly Works"))]),
+        }]),
+    )
+    .await;
+    common::assert_answer(&posted, StatusCode::OK, "the narrow write scope posts");
+
+    let read_with_write = TestRequest::get(CONFIG)
+        .bearer(&write_only)
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[read_with_write],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_READ,
+        "the write scope never grants the read",
+    );
+
+    let post_with_read = post_configs(
+        &app,
+        &read_only,
+        json!([{ "group": ":pleroma", "key": ":instance", "delete": true }]),
+    )
+    .await;
+    common::assert_all_refused(
+        &[post_with_read],
+        StatusCode::FORBIDDEN,
+        NO_ADMIN_WRITE,
+        "the read scope never grants the write",
+    );
+
+    let read_ok = TestRequest::get(CONFIG).bearer(&read_only).send(&app).await;
+    common::assert_answer(&read_ok, StatusCode::OK, "the narrow read scope reads");
+
+    let not_admin = post_configs(
+        &app,
+        &mod_write,
+        json!([{ "group": ":pleroma", "key": ":instance", "delete": true }]),
+    )
+    .await;
+    common::assert_all_refused(
+        &[not_admin],
+        StatusCode::FORBIDDEN,
+        NOT_ADMIN,
+        "a moderator with the write scope",
+    );
+
+    let anonymous = TestRequest::get(CONFIG).send(&app).await;
+    common::assert_all_refused(
+        &[anonymous],
+        StatusCode::UNAUTHORIZED,
+        NO_TOKEN,
+        "an anonymous GET",
+    );
+    let anonymous_post = post_configs(&app, "no-such-token", json!([])).await;
+    common::assert_all_refused(
+        &[anonymous_post],
+        StatusCode::UNAUTHORIZED,
+        INVALID_TOKEN,
+        "an unknown token on the POST",
+    );
 }

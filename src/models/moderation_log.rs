@@ -21,12 +21,13 @@
 //! [`deactivate`], [`activate`], [`delete`], [`approve`], [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`report_update`], [`report_note`], [`status_update`],
-//! [`status_delete`], [`relay_follow`] and [`relay_unfollow`] — compose the
-//! sentence word for word as Pleroma's `get_log_entry_message` clauses
-//! spell it, so later admin tickets call `moderation_log::deactivate(pool,
-//! &admin, &users)` and never hand-assemble a message. Actions without a
-//! helper here (`config_change`, the `announcement_*` family, …) join the
-//! set with the tickets that log them.
+//! [`status_delete`], [`relay_follow`], [`relay_unfollow`] and
+//! [`config_change`] — compose the sentence word for word as Pleroma's
+//! `get_log_entry_message` clauses spell it, so later admin tickets call
+//! `moderation_log::deactivate(pool, &admin, &users)` and never
+//! hand-assemble a message. Actions without a helper here (the
+//! `announcement_*` family, …) join the set with the tickets that log
+//! them.
 //!
 //! [`list`] is the read behind the endpoint: the newest-first `page` /
 //! `page_size` window over the [`LogListParams`] filters, beside the total
@@ -246,6 +247,19 @@ fn push_filters(builder: &mut QueryBuilder<Postgres>, params: &LogListParams) {
     if let Some(end) = params.end_date {
         let _to: &mut _ = builder.push(" AND inserted_at <= ").push_bind(end);
     }
+}
+
+/// One changed entry of a [`config_change`] record: the whitelisted pair
+/// the admin API wrote, and whether the write deleted it rather than
+/// upserting it.
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigChange<'a> {
+    /// The configuration group, colon-spelled (`:pleroma`).
+    pub group: &'a str,
+    /// The configuration key, colon-spelled (`:instance`, `:mrf`, …).
+    pub key: &'a str,
+    /// Whether the entry was deleted rather than written.
+    pub delete: bool,
 }
 
 /// Records `action` over `subjects` with the sentence `"{actor} {verb}
@@ -635,6 +649,57 @@ async fn relay_action(
         },
     )
     .await
+}
+
+/// Records a `config_change`: `@admin changed config: :pleroma/:instance,
+/// :pleroma/:mrf`.
+///
+/// One row per `POST /api/v1/pleroma/admin/config` that changed
+/// something, its `configs` data array naming every pair and whether it
+/// was written or deleted. The subject columns stay empty: the change is
+/// the instance's own state, not a user's, so the pairs live in `data`
+/// the way a report's or a relay target's does.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn config_change(
+    pool: &PgPool,
+    actor: &User,
+    changes: &[ConfigChange<'_>],
+) -> AppResult<ModerationLog> {
+    let names: Vec<String> = changes
+        .iter()
+        .map(|change| format!("{}/{}", change.group, change.key))
+        .collect();
+    let message = format!("@{} changed config: {}", actor.nickname, names.join(", "));
+    let mut data = Map::new();
+    let configs = changes
+        .iter()
+        .map(config_change_map)
+        .collect::<Vec<Value>>();
+    put(&mut data, "configs", Value::Array(configs));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "config_change".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// One `configs` entry of the [`config_change`] data map.
+fn config_change_map(change: &ConfigChange<'_>) -> Value {
+    let mut entry = Map::new();
+    put(&mut entry, "group", Value::String(change.group.to_owned()));
+    put(&mut entry, "key", Value::String(change.key.to_owned()));
+    put(&mut entry, "delete", Value::Bool(change.delete));
+    Value::Object(entry)
 }
 
 /// The `@alice, @bob` list Pleroma's `users_to_nicknames_string` and
@@ -1260,6 +1325,57 @@ mod tests {
             unfollowed.data.get("target").and_then(Value::as_str),
             Some("https://relay.example"),
             "the relay target rides in the data map"
+        );
+    }
+
+    /// The `config_change` entry: the sentence names every changed pair
+    /// in order, the `configs` data array spells each as
+    /// `{group, key, delete}`, and the subject columns stay empty — the
+    /// instance itself is what changed.
+    #[tokio::test]
+    async fn config_change_lists_the_changed_pairs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+        let entry = config_change(
+            &pool,
+            &actor,
+            &[
+                ConfigChange {
+                    group: ":pleroma",
+                    key: ":instance",
+                    delete: false,
+                },
+                ConfigChange {
+                    group: ":pleroma",
+                    key: ":mrf",
+                    delete: true,
+                },
+            ],
+        )
+        .await
+        .expect("config_change records");
+        assert_eq!(
+            entry.message, "@mod changed config: :pleroma/:instance, :pleroma/:mrf",
+            "the sentence names the pairs, in request order"
+        );
+        assert_eq!(entry.action, "config_change", "the action column");
+        assert!(
+            entry.subject_ids.is_empty() && entry.subject_nicknames.is_empty(),
+            "no user is the subject of a config change"
+        );
+        let configs = entry
+            .data
+            .get("configs")
+            .and_then(Value::as_array)
+            .expect("the data names its configs");
+        assert_eq!(
+            configs,
+            &vec![
+                serde_json::json!({"group": ":pleroma", "key": ":instance", "delete": false}),
+                serde_json::json!({"group": ":pleroma", "key": ":mrf", "delete": true}),
+            ],
+            "each pair with its write-or-delete flag"
         );
     }
 

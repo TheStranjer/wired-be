@@ -11,7 +11,14 @@ its goal is to first replicate, and later expand upon, Pleroma's backend.
 
 ## Configuration
 
-All configuration comes from environment variables. For local development, copy `.env.example` to `.env` and edit it; `.env` is gitignored.
+Baseline configuration comes from environment variables. For local development, copy `.env.example` to `.env` and edit it; `.env` is gitignored.
+
+A whitelisted subset of these settings can be overridden at runtime through
+the admin config store (`GET`/`POST /api/v1/pleroma/admin/config`, backed by
+the `config_entries` table); a stored override wins over its environment
+value, and the instance identity, registration flags and the MRF chain read
+through it live. See [Moderation filters (MRF)](#moderation-filters-mrf)
+below.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -125,9 +132,12 @@ now). The frontend must ship exactly these paths under that origin:
 ## Moderation filters (MRF)
 
 Every activity this instance receives or is about to send runs the policy
-chain configured by the `mrf` row of the `instance_settings` table — written
-directly until the admin-API ticket owns it, read cached for 30 s — with
-`MRF_POLICIES` as the fallback list of names:
+chain configured by the admin config store — the `:mrf` entry's fields plus
+the dedicated `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread` and
+`:mrf_object_age` entries, all in group `:pleroma`, read cached for 30 s and
+editable at runtime through `POST /api/v1/pleroma/admin/config` — with
+`MRF_POLICIES` as the fallback list of names. Stored as one document, the
+chain looks like this:
 
 ```json
 {
