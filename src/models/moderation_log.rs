@@ -21,7 +21,7 @@
 //! [`deactivate`], [`activate`], [`delete`], [`approve`], [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`report_update`], [`report_note`], [`status_update`],
-//! [`status_delete`], [`relay_follow`], [`relay_unfollow`],
+//! [`status_delete`], [`chat_message_delete`], [`relay_follow`], [`relay_unfollow`],
 //! [`delete_instance`], [`reload_emoji`],
 //! [`invite_create`], [`invite_revoke`], [`config_change`],
 //! [`webhook_create`], [`webhook_update`], [`webhook_delete`],
@@ -608,6 +608,42 @@ pub async fn status_delete(
         actor,
         ModAction {
             action: "status_delete".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records a `chat_message_delete`: `@admin deleted chat message ##{message_id}`.
+///
+/// A withdrawn chat message leaves no live row to name, so its id rides in
+/// `subject_id` as text — the same shape [`status_delete`] gives a deleted
+/// post, with the chat-message wording Pleroma's `get_log_entry_message`
+/// clause spells.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn chat_message_delete(
+    pool: &PgPool,
+    actor: &User,
+    message_id: Uuid,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} deleted chat message ##{message_id}", actor.nickname);
+    let mut data = Map::new();
+    put(
+        &mut data,
+        "subject_id",
+        Value::String(message_id.to_string()),
+    );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "chat_message_delete".to_owned(),
             subjects: Vec::new(),
             message,
             data,
@@ -1634,6 +1670,37 @@ mod tests {
             unfollowed.data.get("target").and_then(Value::as_str),
             Some("https://relay.example"),
             "the relay target rides in the data map"
+        );
+    }
+
+    /// `chat_message_delete` stores Pleroma's chat-message sentence with the
+    /// withdrawn message's id in `subject_id` — the shape the admin chat
+    /// endpoint logs on every delete.
+    #[tokio::test]
+    async fn the_chat_message_delete_entry_states_its_subject() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+        let message = new_id();
+
+        let deleted = chat_message_delete(&pool, &actor, message)
+            .await
+            .expect("chat_message_delete records");
+
+        assert_eq!(deleted.action, "chat_message_delete", "the action column");
+        assert_eq!(
+            deleted.message,
+            format!("@mod deleted chat message ##{message}"),
+            "Pleroma's chat_message_delete sentence"
+        );
+        assert_eq!(
+            deleted.data.get("subject_id").and_then(Value::as_str),
+            Some(message.to_string().as_str()),
+            "the withdrawn message rides in subject_id"
+        );
+        assert!(
+            deleted.subject_ids.is_empty(),
+            "a chat message is no user subject: the columns stay empty"
         );
     }
 

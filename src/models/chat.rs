@@ -19,7 +19,8 @@
 //! [`add_message`] writes read for the sender and unread for the recipient. A
 //! chat belongs to the account it is stored under, so ids are never shared
 //! between participants and [`get_owned`] is the gate in front of every
-//! per-chat operation.
+//! per-chat operation — except the admin reads, which name a chat by its id
+//! alone through [`get_by_id`] and check nothing.
 //!
 //! Message text is never markdown: [`render_chat_content`] escapes plain text
 //! and linkifies URLs with [`text_to_html`], and [`add_message`] refuses
@@ -104,6 +105,11 @@ ON CONFLICT (user_id, recipient_id) DO UPDATE SET updated_at = now()
 /// one conversation have different ids, so a chat somebody else owns simply is
 /// not there.
 const OWNED_CHAT_SQL: &str = "SELECT * FROM chats WHERE id = $1 AND user_id = $2";
+
+/// [`get_by_id`]: the chat row `id` names, whoever owns it — the admin read,
+/// which names a chat by its id alone and so runs [`OWNED_CHAT_SQL`] without
+/// its second condition.
+const CHAT_BY_ID_SQL: &str = "SELECT * FROM chats WHERE id = $1";
 
 /// [`set_pinned`]: pinning is the chat owner's own ordering choice, and like
 /// every update here it refreshes `updated_at` — Pleroma's `Chat.pin` and
@@ -424,6 +430,24 @@ pub async fn get_owned(pool: &PgPool, user_id: Uuid, id: Uuid) -> AppResult<Opti
     let chat = sqlx::query_as::<_, Chat>(OWNED_CHAT_SQL)
         .bind(id)
         .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(chat)
+}
+
+/// The chat row with primary key `id`, whatever owner it has.
+///
+/// This is the admin read behind the `/api/v1/pleroma/admin/chats` routes,
+/// which name a chat by its id alone and skip [`get_owned`]'s ownership
+/// condition. `None` when no chat has that id.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<Chat>> {
+    let chat = sqlx::query_as::<_, Chat>(CHAT_BY_ID_SQL)
+        .bind(id)
         .fetch_optional(pool)
         .await?;
     Ok(chat)
@@ -1225,6 +1249,33 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "an unknown chat is nothing to pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_id_ignores_ownership() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let alice_chat = get_or_create(&pool, &alice, &bob).await.unwrap();
+
+        assert_eq!(
+            get_by_id(&pool, alice_chat.id).await.unwrap(),
+            Some(alice_chat.clone()),
+            "get_by_id finds a chat by its id alone"
+        );
+        assert_eq!(
+            get_by_id(&pool, alice_chat.id)
+                .await
+                .unwrap()
+                .map(|c| c.user_id),
+            Some(alice.id),
+            "the row is alice's, and the read does not care who asks"
+        );
+        assert!(
+            get_by_id(&pool, new_id()).await.unwrap().is_none(),
+            "an unknown id is no chat"
         );
     }
 

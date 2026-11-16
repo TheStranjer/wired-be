@@ -350,20 +350,22 @@ async fn list_page(
 /// The `Link` header value for a fetched chat page: Pleroma's
 /// `add_link_headers` over the first and last row's chat id — the page's
 /// activity order stands, so the cursors name those two rows' ids — and
-/// `None` for an empty page.
-fn page_link(base_url: &str, path: &str, rows: &[chat::Chat]) -> Option<String> {
+/// `None` for an empty page. [`crate::api::admin::chats`] links its paged
+/// admin lists through the same rule.
+pub(crate) fn page_link(base_url: &str, path: &str, rows: &[chat::Chat]) -> Option<String> {
     let newest = rows.first()?.id.to_string();
     let oldest = rows.last()?.id.to_string();
     link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The [`Chat`] entities for `rows`, each rendered the way [`chat_json`]
-/// renders one.
+/// renders one. The admin chat listing (WBE-202) builds its pages through
+/// this same fan-out.
 ///
 /// # Errors
 ///
 /// As [`chat_entity`]'s.
-async fn chat_entities(state: &AppState, rows: &[chat::Chat]) -> AppResult<Vec<Chat>> {
+pub(crate) async fn chat_entities(state: &AppState, rows: &[chat::Chat]) -> AppResult<Vec<Chat>> {
     let mut entities = Vec::with_capacity(rows.len());
     for row in rows {
         entities.push(chat_entity(state, row).await?);
@@ -433,7 +435,12 @@ async fn list_messages(
 /// The `Link` header value for a fetched message page: [`page_link`] for
 /// references instead of chats — the cursors are the first and last row's
 /// reference id, which is what [`chat::messages_page`] keys its pages on.
-fn message_page_link(base_url: &str, path: &str, rows: &[ChatMessageReference]) -> Option<String> {
+/// [`crate::api::admin::chats`] links its admin message list the same way.
+pub(crate) fn message_page_link(
+    base_url: &str,
+    path: &str,
+    rows: &[ChatMessageReference],
+) -> Option<String> {
     let newest = rows.first()?.id.to_string();
     let oldest = rows.last()?.id.to_string();
     link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
@@ -972,10 +979,17 @@ async fn newest_message(state: &AppState, chat_id: Uuid) -> AppResult<Option<Cha
 /// The [`ChatMessage`] entity for `reference`, with its attachment row read
 /// when it carries one.
 ///
+/// `crate::api::admin::chats` renders a foreign chat's messages through this
+/// same builder, so a moderator sees exactly the entity the owner's client
+/// does.
+///
 /// # Errors
 ///
 /// As [`chat_json`]'s.
-async fn message_of(state: &AppState, reference: &ChatMessageReference) -> AppResult<ChatMessage> {
+pub(crate) async fn message_of(
+    state: &AppState,
+    reference: &ChatMessageReference,
+) -> AppResult<ChatMessage> {
     let attachment = match reference.attachment_media_id {
         Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await?,
         None => None,
