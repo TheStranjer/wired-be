@@ -94,7 +94,7 @@ use crate::{
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{PageParams, link_header, set_link_header},
-    services::render_status::render_statuses,
+    services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
 };
@@ -590,7 +590,7 @@ async fn expand_statuses(
             visible.push(row);
         }
     }
-    render_statuses(state, viewer, &visible).await
+    render_statuses(state, ViewerMode::User(viewer), &visible).await
 }
 
 #[cfg(test)]

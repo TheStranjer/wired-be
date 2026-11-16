@@ -151,7 +151,11 @@ use crate::{
         user::User,
     },
     services::{
-        federation_out, mentions::resolve_mentions, notify, render_status::render_status, streaming,
+        federation_out,
+        mentions::resolve_mentions,
+        notify,
+        render_status::{ViewerMode, render_status},
+        streaming,
     },
     state::AppState,
     util::{
@@ -1006,7 +1010,7 @@ async fn created_entity(state: &AppState, user: &User, row: status::Status) -> A
         "status created"
     );
     crate::jobs::statuses::schedule_expiration(state, &row).await;
-    let entity = render_status(state, Some(user), &row)
+    let entity = render_status(state, ViewerMode::user(user), &row)
         .await?
         // Unreachable for what was written a moment ago — live, local and no
         // reblog, so the renderer has nothing to drop it for — and a 500
@@ -1168,7 +1172,7 @@ async fn discard(tx: sqlx::Transaction<'_, sqlx::Postgres>) {
 /// [`AppError::NotFound`] for a row the renderer cannot answer; any
 /// database failure arrives through `?` as [`AppError::Database`].
 async fn replayed_entity(state: &AppState, user: &User, row: &status::Status) -> AppResult<Status> {
-    render_status(state, Some(user), row)
+    render_status(state, ViewerMode::user(user), row)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -1893,7 +1897,7 @@ pub async fn edit_status(
         edited = updated.edited_at.is_some(),
         "status edited"
     );
-    render_status(state, Some(user), &updated).await
+    render_status(state, ViewerMode::user(user), &updated).await
 }
 
 #[cfg(test)]

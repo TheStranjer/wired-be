@@ -109,7 +109,10 @@ use crate::{
         status,
         user::{self, User},
     },
-    services::{render_status::render_statuses, webhooks},
+    services::{
+        render_status::{ViewerMode, render_statuses},
+        webhooks,
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -678,7 +681,7 @@ async fn entities(
             .filter_map(|id| by_id.get(id).copied())
             .cloned()
             .collect();
-        let statuses = render_statuses(state, Some(viewer), &owned).await?;
+        let statuses = render_statuses(state, ViewerMode::user(viewer), &owned).await?;
         entities.push(AdminReport::from_parts(
             AdminReportParts {
                 row,

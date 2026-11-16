@@ -108,7 +108,7 @@ use crate::{
     },
     oauth::scopes::READ_ACCOUNTS,
     pagination::PageParams,
-    services::render_status::render_statuses,
+    services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
 };
@@ -550,7 +550,7 @@ async fn find_statuses(
         page.push(top);
     }
     page.append(&mut rows);
-    let rendered = render_statuses(state, viewer, &page).await?;
+    let rendered = render_statuses(state, ViewerMode::User(viewer), &page).await?;
     debug!(
         count = rendered.len(),
         author_filtered = params.account_id.is_some(),

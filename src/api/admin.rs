@@ -69,7 +69,12 @@
 //! [`reports::legacy_router`], and the admin's read of
 //! any account's chats beside the moderation withdrawal of a single chat
 //! message (the `users/…/chats`, `chats/…` and message-delete routes,
-//! WBE-202) as the [`chats`] submodule.
+//! WBE-202) as the [`chats`] submodule, and the admin status surface — the
+//! whole network's ledger, one account's page, one domain's page, and the
+//! re-scope and delete of a single post, all rendered through
+//! [`ViewerMode::Admin`](crate::services::render_status::ViewerMode::Admin),
+//! for staff, admins *and* moderators on Pleroma's
+//! `UserIsStaffPlug` gate (WBE-201) — as the [`statuses`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -103,6 +108,7 @@ pub mod federation;
 pub mod invites;
 pub mod ops;
 pub mod reports;
+pub mod statuses;
 pub mod users;
 pub mod webhooks;
 
@@ -142,6 +148,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(invites::router())
         .merge(ops::router(config))
         .merge(reports::router())
+        .merge(statuses::router())
         .merge(users::router())
         .merge(webhooks::router())
 }

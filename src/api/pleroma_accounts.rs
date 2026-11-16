@@ -97,7 +97,7 @@ use crate::{
     },
     oauth::scopes::{FOLLOW, READ_FAVOURITES, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{PageParams, link_header, set_link_header},
-    services::render_status::render_statuses,
+    services::render_status::{ViewerMode, render_statuses},
     state::AppState,
 };
 
@@ -423,7 +423,7 @@ async fn favourites(
     )?;
     Ok((
         headers,
-        Json(render_statuses(&state, viewer, &visible).await?),
+        Json(render_statuses(&state, ViewerMode::User(viewer), &visible).await?),
     ))
 }
 
