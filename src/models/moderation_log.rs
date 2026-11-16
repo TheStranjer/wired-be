@@ -20,6 +20,8 @@
 //! beyond actor/action/message. The small per-action helpers built on it —
 //! [`deactivate`], [`activate`], [`delete`], [`approve`], [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
+//! [`updated_users`], [`confirm_email`], [`resend_confirmation_email`],
+//! [`disable_mfa`], [`follow`], [`unfollow`],
 //! [`report_update`], [`report_note`], [`status_update`],
 //! [`status_delete`], [`chat_message_delete`], [`relay_follow`], [`relay_unfollow`],
 //! [`delete_instance`], [`reload_emoji`],
@@ -360,6 +362,150 @@ pub async fn force_password_reset(
         subjects,
         "force_password_reset",
         "forced password reset for",
+    )
+    .await
+}
+
+/// Records an `updated_users`: `@admin updated users: @alice, @bob` — the
+/// entry the admin credentials write leaves behind (Pleroma's
+/// `AdminAPIController.update_user_credentials`).
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn updated_users(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    users_action(pool, actor, subjects, "updated_users", "updated").await
+}
+
+/// Records a `confirm_email`: `@admin confirmed email for users: @alice,
+/// @bob` — Pleroma's `confirm_email` clause of `get_log_entry_message`.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn confirm_email(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    users_action(
+        pool,
+        actor,
+        subjects,
+        "confirm_email",
+        "confirmed email for",
+    )
+    .await
+}
+
+/// Records a `resend_confirmation_email`: `@admin re-sent confirmation
+/// email for users: @alice, @bob` — Pleroma's clause of the same name.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn resend_confirmation_email(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    users_action(
+        pool,
+        actor,
+        subjects,
+        "resend_confirmation_email",
+        "re-sent confirmation email for",
+    )
+    .await
+}
+
+/// Records a `disable_mfa`: `@admin disabled MFA for users: @alice, @bob`.
+///
+/// Pleroma's `disable_mfa` endpoint logs nothing at all; the ticket asks
+/// every admin write to leave an entry, so this sentence joins the
+/// user-list family with the verb the action states, following the shape
+/// of the five clauses above.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn disable_mfa(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    users_action(pool, actor, subjects, "disable_mfa", "disabled MFA for").await
+}
+
+/// Records a `follow`: `@admin made @alice follow @bob`, the admin's
+/// forced follow (Pleroma's `UserController.follow`, whose log entry names
+/// both accounts as user maps and no subject list).
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn follow(
+    pool: &PgPool,
+    actor: &User,
+    follower: &User,
+    target: &User,
+) -> AppResult<ModerationLog> {
+    follow_action(pool, actor, follower, target, "follow").await
+}
+
+/// Records an `unfollow`: `@admin made @alice unfollow @bob`, the pair of
+/// [`follow`].
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn unfollow(
+    pool: &PgPool,
+    actor: &User,
+    follower: &User,
+    target: &User,
+) -> AppResult<ModerationLog> {
+    follow_action(pool, actor, follower, target, "unfollow").await
+}
+
+/// The one writer of the two follow sentences: Pleroma's `follow` /
+/// `unfollow` `insert_log` clause puts the pair into `data` under
+/// `follower` and `followed` (each a [`user_map`]) and spells the message
+/// `"@actor made @follower {action} @followed"`; the subject columns carry
+/// both accounts, which is what the pair is about.
+async fn follow_action(
+    pool: &PgPool,
+    actor: &User,
+    follower: &User,
+    target: &User,
+    action: &str,
+) -> AppResult<ModerationLog> {
+    let mut data = Map::new();
+    put(&mut data, "follower", Value::Object(user_map(follower)));
+    put(&mut data, "followed", Value::Object(user_map(target)));
+    let message = format!(
+        "@{} made @{} {action} @{}",
+        actor.nickname, follower.nickname, target.nickname
+    );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: vec![follower, target],
+            message,
+            data,
+        },
     )
     .await
 }
@@ -1310,6 +1456,26 @@ mod tests {
             "the force_password_reset clause"
         );
         assert_eq!(
+            users_sentence("admin", "updated", &subjects),
+            "@admin updated users: @alice, @bob",
+            "the updated_users clause"
+        );
+        assert_eq!(
+            users_sentence("admin", "confirmed email for", &subjects),
+            "@admin confirmed email for users: @alice, @bob",
+            "the confirm_email clause"
+        );
+        assert_eq!(
+            users_sentence("admin", "re-sent confirmation email for", &subjects),
+            "@admin re-sent confirmation email for users: @alice, @bob",
+            "the resend_confirmation_email clause"
+        );
+        assert_eq!(
+            users_sentence("admin", "disabled MFA for", &subjects),
+            "@admin disabled MFA for users: @alice, @bob",
+            "the disable_mfa clause the ticket adds"
+        );
+        assert_eq!(
             users_sentence("admin", "deactivated", &names(&["solo"])),
             "@admin deactivated users: @solo",
             "a lone subject carries no comma"
@@ -1456,7 +1622,7 @@ mod tests {
         );
     }
 
-    /// The five user-list helpers store their action, sentence and subject
+    /// The user-list helpers store their action, sentence and subject
     /// columns.
     #[tokio::test]
     async fn user_list_helpers_record_their_sentences() {
@@ -1475,6 +1641,18 @@ mod tests {
             force_password_reset(&pool, &actor, &subjects)
                 .await
                 .expect("records"),
+            updated_users(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
+            confirm_email(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
+            resend_confirmation_email(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
+            disable_mfa(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
         ];
         let actions = [
             "deactivate",
@@ -1482,6 +1660,10 @@ mod tests {
             "delete",
             "approve",
             "force_password_reset",
+            "updated_users",
+            "confirm_email",
+            "resend_confirmation_email",
+            "disable_mfa",
         ];
         for (row, action) in iter::zip(cases, actions) {
             assert_eq!(row.action, action, "the action column");
@@ -1497,6 +1679,56 @@ mod tests {
                 row.message
             );
         }
+    }
+
+    /// The follow pair stores Pleroma's `made … follow` sentence, the two
+    /// user maps in `data` and both accounts in the subject columns.
+    #[tokio::test]
+    async fn follow_helpers_record_their_entries() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+        let alice = stored(&pool, "alice").await;
+        let bob = stored(&pool, "bob").await;
+        let followed = follow(&pool, &actor, &alice, &bob)
+            .await
+            .expect("follow records");
+        assert_eq!(followed.action, "follow", "the action column");
+        assert_eq!(
+            followed.message, "@mod made @alice follow @bob",
+            "Pleroma's follow sentence"
+        );
+        assert_eq!(
+            followed.subject_ids,
+            vec![alice.id, bob.id],
+            "both accounts are the subjects"
+        );
+        assert_eq!(
+            followed
+                .data
+                .get("follower")
+                .and_then(|map| map.get("nickname"))
+                .and_then(Value::as_str),
+            Some("alice"),
+            "the follower map rides in the data"
+        );
+        assert_eq!(
+            followed
+                .data
+                .get("followed")
+                .and_then(|map| map.get("type"))
+                .and_then(Value::as_str),
+            Some("user"),
+            "and so does the followed one, in user_to_map shape"
+        );
+        let withdrawn = unfollow(&pool, &actor, &alice, &bob)
+            .await
+            .expect("unfollow records");
+        assert_eq!(withdrawn.action, "unfollow", "the pair's other action");
+        assert_eq!(
+            withdrawn.message, "@mod made @alice unfollow @bob",
+            "Pleroma's unfollow sentence"
+        );
     }
 
     /// `tag`, `untag`, `grant` and `revoke` store their sentences and the

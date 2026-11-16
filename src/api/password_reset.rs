@@ -62,8 +62,10 @@ use crate::{
 };
 
 /// The path the emailed link names and the reset form posts to, under the
-/// `/api/v1` nest [`crate::api::v1`] mounts it on.
-const RESET_PATH: &str = "/api/v1/pleroma/password_reset";
+/// `/api/v1` nest [`crate::api::v1`] mounts it on. Crate-visible because
+/// the admin's reset endpoint hands out the same link (WBE-198): the token
+/// it mints must complete through this flow unchanged.
+pub(crate) const RESET_PATH: &str = "/api/v1/pleroma/password_reset";
 /// The heading and page of a token that names no live reset.
 const INVALID_TOKEN: &str = "Invalid Token";
 /// The message of a submitted password under `MIN_PASSWORD_LENGTH`.

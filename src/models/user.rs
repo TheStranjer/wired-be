@@ -1445,6 +1445,39 @@ where
     Ok(())
 }
 
+/// The `UPDATE` behind [`set_password_reset_pending`]: raises the flag and
+/// refreshes `updated_at`.
+const SET_PASSWORD_RESET_PENDING_SQL: &str =
+    "UPDATE users SET password_reset_pending = true, updated_at = now() WHERE id = $1";
+
+/// Raises [`password_reset_pending`](User::password_reset_pending) on user
+/// `id`: the write the admin's forced reset performs.
+///
+/// Its counterpart [`set_password`] clears the flag again once a new hash
+/// lands. The endpoint pairs the raise with the revocation of the
+/// account's tokens, and [`crate::api::oauth`] refuses the password grant
+/// while it is raised.
+///
+/// Runs on the caller's executor (or any transaction), so one account's
+/// force-reset can write the flag and revoke its tokens as one statement
+/// pair.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_password_reset_pending<'e, E>(executor: E, id: Uuid) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(SET_PASSWORD_RESET_PENDING_SQL)
+        .bind(id)
+        .execute(executor)
+        .await
+        .map(drop)?;
+    Ok(())
+}
+
 /// The `UPDATE` behind [`set_email`]: writes the new address and the
 /// confirmed flag together and refreshes `updated_at`.
 const SET_EMAIL_SQL: &str =
@@ -2955,6 +2988,40 @@ mod tests {
         set_email_notifications(&pool, new_id(), false)
             .await
             .unwrap();
+    }
+
+    /// The force-reset write raises the flag on its own and leaves every
+    /// other column alone; [`set_password`] is the pair that clears it
+    /// again, so the two writes round-trip the flag.
+    #[tokio::test]
+    async fn set_password_reset_pending_raises_the_flag_and_set_password_clears_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        assert!(
+            !alice.password_reset_pending.get(),
+            "a fresh account is not pending a reset"
+        );
+
+        set_password_reset_pending(&pool, alice.id).await.unwrap();
+        let pending = fetch(&pool, alice.id).await;
+        assert!(
+            pending.password_reset_pending.get(),
+            "the force-reset write raises the flag"
+        );
+        assert_eq!(pending.nickname, "alice", "and writes nothing else");
+
+        // The flag survives an ordinary profile write untouched; only a new
+        // password clears it (the completed-reset rule already tested for
+        // set_password).
+        set_password(&pool, alice.id, SECRET_HASH).await.unwrap();
+        assert!(
+            !fetch(&pool, alice.id).await.password_reset_pending.get(),
+            "a new hash clears the pending flag"
+        );
+
+        // An unknown id matches no row and is not an error.
+        set_password_reset_pending(&pool, new_id()).await.unwrap();
     }
 
     /// A [`ProfileFields`] that sets every profile column to something

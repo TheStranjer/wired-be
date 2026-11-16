@@ -2,9 +2,10 @@
 //! `GET /api/v1/pleroma/admin/users` and the nickname-or-id lookup behind
 //! `GET /api/v1/pleroma/admin/users/{nickname}` (WBE-195).
 //!
-//! [`staff_with_email`] is the third read: the active local admins and
+//! [`staff_with_email`] is a third read: the active local admins and
 //! moderators that hold an address, which is who the report letter goes to
-//! (WBE-212).
+//! (WBE-212). [`resolve_nicknames`] is the fourth: the batch nickname
+//! lookup the list-taking admin account endpoints act on (WBE-198).
 //!
 //! The reference is `Pleroma.Web.AdminAPI.Search.user`
 //! (`lib/pleroma/web/admin_api/search.ex`) over `Pleroma.User.Query.build`
@@ -198,6 +199,30 @@ pub async fn get_by_nickname_or_id(pool: &PgPool, raw: &str) -> AppResult<Option
         Some(id) => super::get_by_id(pool, id).await,
         None => Ok(None),
     }
+}
+
+/// The accounts one admin body's `nicknames` list names, in the order the
+/// list spells them: [`get_by_nickname`](super::get_by_nickname) per
+/// entry, and a name no account carries is quietly dropped.
+///
+/// That dropping is Pleroma's admin behavior, not an error: its
+/// `force_password_reset`, `confirm_email` and `resend_confirmation_email`
+/// map every submitted nickname through `get_cached_by_nickname` and act
+/// on the list as it comes, an unknown name having no user to act on. The
+/// answered list is what those endpoints write to and what their
+/// moderation-log entries name as subjects.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn resolve_nicknames(pool: &PgPool, nicknames: &[String]) -> AppResult<Vec<User>> {
+    let mut found = Vec::with_capacity(nicknames.len());
+    for nickname in nicknames {
+        if let Some(user) = super::get_by_nickname(pool, nickname).await? {
+            found.push(user);
+        }
+    }
+    Ok(found)
 }
 
 /// The number of rows `params`' criteria select, whatever page they land
@@ -827,6 +852,47 @@ mod tests {
                 .expect("a miss reads")
                 .is_none(),
             "and unroutable text is no id either"
+        );
+    }
+
+    /// The batch lookup keeps the submitted order, folds case through the
+    /// citext column, and drops the names nobody answers to — Pleroma's
+    /// admin list actions act on what was found and ignore the rest.
+    #[tokio::test]
+    async fn resolve_nicknames_keeps_order_and_skips_the_misses() {
+        let (_db, pool) = fixture().await;
+        let submitted = ["root", "ghost", "PLAIN", "faraway@remote.example"]
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<String>>();
+        let found = resolve_nicknames(&pool, &submitted)
+            .await
+            .expect("the batch read runs");
+        assert_eq!(
+            found
+                .iter()
+                .map(|user| user.nickname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "plain", "faraway@remote.example"],
+            "three accounts in the submitted order, the unknown name gone"
+        );
+        let misses = ["nobody", "ghost"]
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<String>>();
+        assert!(
+            resolve_nicknames(&pool, &misses)
+                .await
+                .expect("a list of misses reads")
+                .is_empty(),
+            "nothing found is the empty list, not an error"
+        );
+        assert!(
+            resolve_nicknames(&pool, &[])
+                .await
+                .expect("the empty list reads")
+                .is_empty(),
+            "and an empty list is empty"
         );
     }
 

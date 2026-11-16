@@ -1,11 +1,15 @@
-//! The admin API's account entity: what an admin sees of one account in
-//! the users listing and the users show endpoint (WBE-195).
+//! The admin API's account entities: what an admin sees of one account in
+//! the listing, the show and the credentials form (WBE-195, WBE-198).
 //!
 //! The reference is `Pleroma.Web.AdminAPI.AccountView`
 //! (`lib/pleroma/web/admin_api/views/account_view.ex`), whose `"show.json"`
-//! renders the fifteen keys the ticket pins and whose `"index.json"` wraps
-//! the entity list in `{users, count, page_size}`. It is a deliberately
-//! different shape from the Mastodon [`Account`](super::account::Account)
+//! renders the fifteen keys the ticket pins, whose `"index.json"` wraps
+//! the entity list in `{users, count, page_size}`, and whose
+//! `"credentials.json"` renders the twenty-four keys of
+//! [`AdminCredentials`] — the moderation form's fields, with `avatar`,
+//! `banner` and `background` through `MediaProxy.url` like the listing's
+//! avatar. It is a deliberately different shape from the Mastodon
+//! [`Account`](super::account::Account)
 //! entity: a moderation console's row, so the private columns an admin is
 //! owed — `email`, `registration_reason`, the two approval flags — are in,
 //! while the counters, note and `pleroma` block are not.
@@ -29,10 +33,11 @@
 //! timestamp of [`mastodon_time`] (decision 5).
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::{
     config::Config,
-    entities::account::{DEFAULT_AVATAR_PATH, JsonBool, profile_image},
+    entities::account::{DEFAULT_AVATAR_PATH, DEFAULT_BANNER_PATH, JsonBool, profile_image},
     models::user::{User, admin},
     util::{sanitize::sanitize_display_name, time::mastodon_time},
 };
@@ -133,6 +138,116 @@ impl AdminAccount {
     }
 }
 
+/// One account's editable credentials as the admin API renders them:
+/// Pleroma's `AdminAPI.AccountView` `"credentials.json"`, the answer of
+/// `GET /api/v1/pleroma/admin/users/{nickname}/credentials` (WBE-198).
+///
+/// The shape is the moderation form's own: the twenty-four keys Pleroma's
+/// `Map.take` lists in the view's order, the twelve flags as [`JsonBool`]s
+/// (again only to keep the serializer's struct under Clippy's
+/// `struct_excessive_bools`), `avatar` and `banner` through the same
+/// `profile_image` defaulting and proxying [`AdminAccount`] applies, and
+/// `background` the stored url alone — Pleroma's `image_url(user.background)`
+/// has no default asset, so an account without one answers `null`.
+/// `pleroma_settings_store` is the raw client settings blob, `fields` and
+/// `raw_fields` the stored pair, and `bio` the rendered note — the values
+/// the matching `PATCH` writes, read back as the row holds them.
+#[derive(Debug, Serialize)]
+pub struct AdminCredentials {
+    /// The row's `UUIDv7` as lowercase hyphenated text (decision 4).
+    pub id: String,
+    /// The profile note as stored rendered html.
+    pub bio: String,
+    /// The account's email, `None` rendered as `null`.
+    pub email: Option<String>,
+    /// The profile metadata as stored: a JSON array of rendered entries.
+    pub fields: Value,
+    /// The display name as stored.
+    pub name: String,
+    /// The full handle (decision 7).
+    pub nickname: String,
+    /// Whether follow requests need manual approval.
+    pub is_locked: JsonBool,
+    /// Whether clients should render this account's content as plain text.
+    pub no_rich_text: JsonBool,
+    /// The visibility new statuses default to.
+    pub default_scope: String,
+    /// Whether the follow collection is hidden from other accounts.
+    pub hide_follows: JsonBool,
+    /// Whether the follower count renders as zero for others.
+    pub hide_followers_count: JsonBool,
+    /// Whether the follow count renders as zero for others.
+    pub hide_follows_count: JsonBool,
+    /// Whether the follower collection is hidden from other accounts.
+    pub hide_followers: JsonBool,
+    /// Whether the favourites list is private to the account.
+    pub hide_favorites: JsonBool,
+    /// Whether a `Move` of the account may take the following list with it.
+    pub allow_following_move: JsonBool,
+    /// Whether the staff flags may be shown to other accounts.
+    pub show_role: JsonBool,
+    /// Whether this account's statuses skip thread containment.
+    pub skip_thread_containment: JsonBool,
+    /// The client settings blob, stored as received.
+    pub pleroma_settings_store: Value,
+    /// The profile metadata as typed, beside its rendered twin.
+    pub raw_fields: Value,
+    /// Whether the account opted into discovery.
+    pub is_discoverable: JsonBool,
+    /// The `ActivityPub` actor type.
+    pub actor_type: String,
+    /// The avatar, defaulted and media-proxied as in [`AdminAccount`].
+    pub avatar: String,
+    /// The banner, defaulted to `DEFAULT_BANNER_PATH` and proxied.
+    pub banner: String,
+    /// The background image url as stored, with no default — `null` for an
+    /// account that never set one.
+    pub background: Option<String>,
+}
+
+impl AdminCredentials {
+    /// Renders one `users` row in Pleroma's credentials shape.
+    #[must_use]
+    pub fn from_user(user: &User, config: &Config) -> Self {
+        Self {
+            id: user.id.to_string(),
+            bio: user.bio.clone(),
+            email: user.email.clone(),
+            fields: user.fields.clone(),
+            name: user.name.clone(),
+            nickname: user.nickname.clone(),
+            is_locked: JsonBool(user.locked.get()),
+            no_rich_text: JsonBool(user.no_rich_text.get()),
+            default_scope: user.default_scope.clone(),
+            hide_follows: JsonBool(user.hide_follows.get()),
+            hide_followers_count: JsonBool(user.hide_followers_count.get()),
+            hide_follows_count: JsonBool(user.hide_follows_count.get()),
+            hide_followers: JsonBool(user.hide_followers.get()),
+            hide_favorites: JsonBool(user.hide_favorites.get()),
+            allow_following_move: JsonBool(user.allow_following_move.get()),
+            show_role: JsonBool(user.show_role.get()),
+            skip_thread_containment: JsonBool(user.skip_thread_containment.get()),
+            pleroma_settings_store: user.settings_store.clone(),
+            raw_fields: user.raw_fields.clone(),
+            is_discoverable: JsonBool(user.discoverable.get()),
+            actor_type: user.actor_type.clone(),
+            avatar: profile_image(
+                user,
+                config,
+                user.avatar_url.as_deref(),
+                DEFAULT_AVATAR_PATH,
+            ),
+            banner: profile_image(
+                user,
+                config,
+                user.banner_url.as_deref(),
+                DEFAULT_BANNER_PATH,
+            ),
+            background: user.background_image_url.clone(),
+        }
+    }
+}
+
 /// The whole `GET /api/v1/pleroma/admin/users` answer: Pleroma's
 /// `AccountView` `"index.json"`, with all three of its keys.
 ///
@@ -180,6 +295,8 @@ fn display_name(user: &User) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use chrono::{DateTime, Utc};
     use serde_json::json;
     use uuid::Uuid;
@@ -488,6 +605,149 @@ mod tests {
             rendered["page_size"],
             json!(200),
             "the cap the request asked for"
+        );
+    }
+
+    /// The ticket's twenty-four credentials keys, in the view's order:
+    /// Pleroma's `Map.take` list with the three images appended.
+    const CREDENTIAL_KEYS: [&str; 24] = [
+        "id",
+        "bio",
+        "email",
+        "fields",
+        "name",
+        "nickname",
+        "is_locked",
+        "no_rich_text",
+        "default_scope",
+        "hide_follows",
+        "hide_followers_count",
+        "hide_follows_count",
+        "hide_followers",
+        "hide_favorites",
+        "allow_following_move",
+        "show_role",
+        "skip_thread_containment",
+        "pleroma_settings_store",
+        "raw_fields",
+        "is_discoverable",
+        "actor_type",
+        "avatar",
+        "banner",
+        "background",
+    ];
+
+    /// A default account renders the full credentials form: the stored
+    /// flags as plain booleans, the defaults for the two images, `null`
+    /// for email and background, and nothing beyond the pinned keys. (The
+    /// ticket's KEY ORDER is the struct's declaration order: a parsed JSON
+    /// value's map sorts, so only the exact key SET is assertable here,
+    /// and the wire order is the handler's `Json` serializer's.)
+    #[test]
+    fn the_credentials_entity_pins_the_twenty_four_keys() {
+        let rendered = serde_json::to_value(AdminCredentials::from_user(
+            &base_user("alice"),
+            &Config::for_tests(),
+        ))
+        .expect("the entity serializes");
+        let keys = rendered
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<&str>>();
+        assert_eq!(
+            keys,
+            CREDENTIAL_KEYS.iter().copied().collect::<BTreeSet<&str>>(),
+            "exactly the twenty-four pinned keys"
+        );
+        assert_eq!(
+            rendered,
+            json!({
+                "id": ACCOUNT_ID,
+                "bio": "",
+                "email": null,
+                "fields": [],
+                "name": "",
+                "nickname": "alice",
+                "is_locked": false,
+                "no_rich_text": false,
+                "default_scope": "public",
+                "hide_follows": false,
+                "hide_followers_count": false,
+                "hide_follows_count": false,
+                "hide_followers": false,
+                "hide_favorites": true,
+                "allow_following_move": true,
+                "show_role": true,
+                "skip_thread_containment": false,
+                "pleroma_settings_store": {},
+                "raw_fields": [],
+                "is_discoverable": false,
+                "actor_type": "Person",
+                "avatar": format!("{TEST_BASE_URL}/images/avi.png"),
+                "banner": format!("{TEST_BASE_URL}/images/banner.png"),
+                "background": null,
+            }),
+            "the column defaults, spelled out"
+        );
+    }
+
+    /// The writable columns come through as stored — the email, the note,
+    /// the settings blob, the metadata pair — while the images keep the
+    /// entity's own defaulting: a stated background is the stored url, and
+    /// there is no default for it.
+    #[test]
+    fn the_credentials_answer_the_written_columns() {
+        let written = User {
+            email: Some("alice@example.org".to_owned()),
+            bio: "<p>hello</p>".to_owned(),
+            name: "Alice".to_owned(),
+            locked: Flag::new(true),
+            discoverable: Flag::new(true),
+            default_scope: "private".to_owned(),
+            fields: json!([{"name": "web", "value": "<a href=\"x\">x</a>"}]),
+            raw_fields: json!([{"name": "web", "value": "x"}]),
+            settings_store: json!({"config": {"fe": "mochi-pub"}}),
+            actor_type: "Service".to_owned(),
+            banner_url: Some(format!("{TEST_BASE_URL}/uploads/banner.png")),
+            background_image_url: Some(format!("{TEST_BASE_URL}/uploads/bg.png")),
+            ..base_user("alice")
+        };
+        let rendered =
+            serde_json::to_value(AdminCredentials::from_user(&written, &Config::for_tests()))
+                .expect("the entity serializes");
+        assert_eq!(rendered["email"], json!("alice@example.org"));
+        assert_eq!(rendered["bio"], json!("<p>hello</p>"));
+        assert_eq!(rendered["name"], json!("Alice"));
+        assert_eq!(rendered["is_locked"], json!(true));
+        assert_eq!(rendered["is_discoverable"], json!(true));
+        assert_eq!(rendered["default_scope"], json!("private"));
+        assert_eq!(rendered["actor_type"], json!("Service"));
+        assert_eq!(
+            rendered["pleroma_settings_store"],
+            json!({"config": {"fe": "mochi-pub"}}),
+            "the blob is answered as stored"
+        );
+        assert_eq!(
+            rendered["fields"],
+            json!([{"name": "web", "value": "<a href=\"x\">x</a>"}]),
+            "the rendered pair"
+        );
+        assert_eq!(
+            rendered["raw_fields"],
+            json!([{"name": "web", "value": "x"}]),
+            "and the raw one"
+        );
+        assert_eq!(
+            rendered["banner"],
+            json!(format!("{TEST_BASE_URL}/uploads/banner.png")),
+            "a stored banner is the plain url"
+        );
+        assert_eq!(
+            rendered["background"],
+            json!(format!("{TEST_BASE_URL}/uploads/bg.png")),
+            "and the stored background"
         );
     }
 }
