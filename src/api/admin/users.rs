@@ -1,5 +1,9 @@
-//! The admin user endpoints under `/api/v1/pleroma/admin/users`, both the
-//! WBE-195 account reads and the WBE-198 credential and security writes.
+//! The admin user endpoints under `/api/v1/pleroma/admin/users`.
+//!
+//! WBE-195 adds the account reads, WBE-198 the credential and security
+//! writes, WBE-197 the tags, staff groups and suggestion pool, and WBE-196
+//! the account lifecycle: create, delete, activate, deactivate, toggle and
+//! approve.
 //!
 //! The reference is Pleroma's `AdminAPI.UserController`
 //! (`lib/pleroma/web/admin_api/controllers/user_controller.ex`), `index`
@@ -118,14 +122,72 @@
 //!   accounts as `{"users": [admin entity…]}` and logged as an
 //!   `add_suggestion` / `remove_suggestion` entry.
 //!
+//! WBE-196 adds the account lifecycle: creation, deletion, activation and
+//! approval.
+//!
+//! - `POST /users` — `{"users": [{"nickname", "email", "password"}…]}`,
+//!   at most 50 of them (more is refused whole, nothing
+//!   created). Each item goes through [`create_local_user`] with the
+//!   confirmation requirement bypassed — the admin set the password and
+//!   vouches for the address, so no letter is queued (Pleroma's
+//!   `confirmed: true`) — and the approval gate lifted off the row when
+//!   `REGISTRATIONS_APPROVAL_REQUIRED` set it: every created account is
+//!   active, confirmed and approved whatever the instance's modes. The
+//!   answer is always 200 with one entry per item: Pleroma's
+//!   `"created.json"` map (`code` 200, `type` `"success"`, `data`
+//!   `{email, nickname}`) for a stored account, or its
+//!   `"create_error.json"` shape with the ticket's `code` 400, the
+//!   refused field map as the `error` text and the submitted handle and
+//!   address as `data`. Where Pleroma rolls the whole batch back into one
+//!   409, the ticket pins per-item results, so one refused item leaves
+//!   its siblings stored; the accounts that were created log one
+//!   `create` entry.
+//! - `DELETE /users` — `nicknames[]` in the body or the query: every
+//!   named account that exists starts its deletion the way the
+//!   user-facing `POST /api/pleroma/delete_account` does — `deleted_at`
+//!   stamped, every token revoked, the `users.delete` sweep queued on
+//!   the `background` queue (the sweep's first act is the `Delete`
+//!   announcement to the peers) — except the caller's own row, which is
+//!   ignored. The answer is the JSON array of the nicknames started,
+//!   Pleroma's `json(conn, nicknames)` narrowed to what was found and
+//!   not the caller, and one `delete` entry names them.
+//! - `PATCH /users/activate` and `PATCH /users/deactivate` —
+//!   `nicknames[]`: the `is_active` flag moves on every named account
+//!   that exists — the acting admin's own excepted from the
+//!   DEACTIVATION (Pleroma's `UserController.activate` / `deactivate`,
+//!   with the self-protection the ticket pins). A deactivation is the
+//!   flag alone: tokens keep existing (the bearer gate answers their
+//!   owner's requests a 403, the login gate refuses the password grant)
+//!   and nothing federates — the actor document must stay resolvable.
+//!   The answer is the moved accounts as admin entities under `users`,
+//!   logged one `activate` / `deactivate` entry.
+//! - `PATCH /users/{nickname}/toggle_activation` — Pleroma's
+//!   `toggle_activation`: flips one account's flag, answers its single
+//!   admin entity and logs the move it made under the other pair's
+//!   actions. Unlike the bulk pair it does not protect the caller: the
+//!   segment that names an account names it.
+//! - `PATCH /users/approve` — `nicknames[]`: every named account still
+//!   awaiting staff clears `approval_pending` and gets the
+//!   `account_approved` letter; an already-approved one answers unchanged
+//!   and is mailed nothing (Pleroma's `approve` clause for
+//!   `is_approved: true`), and no credential is minted — the approved
+//!   account signs in with its own password. The answer is the named
+//!   accounts as admin entities under `users`, one `approve` entry
+//!   naming them. `POST /api/v1/admin/accounts/{id}/approve` is the
+//!   separate Mastodon-admin ticket's own route.
+//!
 //! Two of Pleroma's parameters are read wider here than its
 //! `CastAndValidate` declares them: an array key arrives in both the
 //! bracketed spelling `pleroma-fe` sends (`tags[]`) and the bare one
-//! (`tags`), the way the timeline routes read their hashtag lists.
+//! (`tags`), the way the timeline routes read their hashtag lists. The
+//! lifecycle `nicknames[]` of WBE-196 reads both spellings from the body
+//! OR the query string, the way the tag pair does, because its `DELETE
+//! /users` is specified as "body or query".
 //!
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
 //! [`AdminAccount`]: crate::entities::admin_account::AdminAccount
 //! [AdminCredentials]: crate::entities::admin_account::AdminCredentials
+//! [`create_local_user`]: crate::models::user::register::create_local_user
 //! [`follow`]: crate::models::follow
 
 use std::{fmt, slice};
@@ -158,8 +220,11 @@ use crate::{
     },
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
+    jobs::{QUEUE_BACKGROUND, deletion},
+    mailer::{self, templates},
     models::{
         follow::{self, FollowState},
+        job::{NewJob, enqueue},
         moderation_log, oauth_token, password_reset,
         user::{self, Flag, PleromaPrefs, ProfileFields, User, admin, confirmation, mfa, register},
     },
@@ -211,6 +276,9 @@ const REMOTE_ROLE: &str = "Can't set role for a remote user";
 /// 403 body of the admin who revokes a role from their own account:
 /// Pleroma's `right_delete` self clause.
 const SELF_REVOKE: &str = "You can't revoke your own admin status.";
+/// The largest batch `POST /users` may create in one request, the cap the
+/// ticket pins; a bigger one is refused whole, before anything is created.
+const MAX_CREATE_USERS: usize = 50;
 
 /// The user routes of the admin API, merged into [`super`].
 ///
@@ -221,9 +289,11 @@ const SELF_REVOKE: &str = "You can't revoke your own admin status.";
 /// (`/users/password_reset`, `/users/confirm_email`,
 /// `/users/resend_confirmation_email`, `/users/disable_mfa`,
 /// `/users/follow` and `/users/unfollow`) beside the two `{nickname}`
-/// routes the credentials read and the issued reset token hang on, and of
+/// routes the credentials read and the issued reset token hang on, of
 /// this ticket's static `/users/tag`, `/users/suggest` and
-/// `/users/unsuggest`.
+/// `/users/unsuggest`, and of WBE-196's `/users/activate`,
+/// `/users/deactivate` and `/users/approve` beside the single account's
+/// `/users/{nickname}/toggle_activation`.
 ///
 /// The two `permission_group` shapes coexist the same way: the bulk pair
 /// `/users/permission_group/{group}` hangs off the static
@@ -232,7 +302,10 @@ const SELF_REVOKE: &str = "You can't revoke your own admin status.";
 /// parameter, and the static one wins the exact-match contest.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/users", get(list_users))
+        .route(
+            "/users",
+            get(list_users).post(create_users).delete(delete_users),
+        )
         .route("/users/{nickname}", get(show_user))
         .route(
             "/users/{nickname}/credentials",
@@ -265,6 +338,13 @@ pub fn router() -> Router<AppState> {
         )
         .route("/users/suggest", patch(suggest_users))
         .route("/users/unsuggest", patch(unsuggest_users))
+        .route("/users/activate", patch(activate_users))
+        .route("/users/deactivate", patch(deactivate_users))
+        .route("/users/approve", patch(approve_users))
+        .route(
+            "/users/{nickname}/toggle_activation",
+            patch(toggle_activation),
+        )
 }
 
 /// `GET /api/v1/pleroma/admin/users` — Pleroma's `index`: the criteria of
@@ -1804,6 +1884,457 @@ async fn unsuggest_users(
     write_suggestions(&state, &admin.0, &body.0.nicknames, false).await
 }
 
+/// The body of `POST /api/v1/pleroma/admin/users`: the batch of accounts
+/// the admin creates, at most [`MAX_CREATE_USERS`] of them.
+#[derive(Debug, Deserialize)]
+struct CreateUsersBody {
+    /// The accounts to create, in the order the request states them.
+    users: Vec<CreateUserItem>,
+}
+
+/// One `users` entry: the three keys the ticket pins, all required —
+/// Pleroma's passwordless variant (a random password behind a minted
+/// reset link) is not part of this endpoint's pinned shape.
+#[derive(Deserialize)]
+struct CreateUserItem {
+    /// The handle to register, validated by
+    /// [`create_local_user`](crate::models::user::register::create_local_user)'s
+    /// registration rules.
+    nickname: String,
+    /// The address to store, format- and uniqueness-checked by the same.
+    email: String,
+    /// The password in plain text — only its hash ever reaches a row, and
+    /// it never lives past this request.
+    password: String,
+}
+
+/// The password is secret material and renders as `<redacted>`; everything
+/// else shows.
+impl fmt::Debug for CreateUserItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateUserItem")
+            .field("nickname", &self.nickname)
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What one create item came to: the stored account, or the refusal the
+/// registration changeset reported for it. The row rides boxed so the
+/// refusal's text does not pay for the [`User`]'s size in every variant.
+#[derive(Debug)]
+enum Creation {
+    /// The account the creation stored, active, confirmed and approved.
+    Created(Box<User>),
+    /// The refusal's message: the field map as JSON text, the encoding the
+    /// user-facing registration's own 422 body carries.
+    Refused(String),
+}
+
+/// `POST /api/v1/pleroma/admin/users` — Pleroma's `create`: a batch of
+/// local accounts, each answered for itself. Where Pleroma wraps the batch
+/// in one `Multi` transaction that rolls every account back on the first
+/// conflict and answers 409, the ticket pins an always-200 per-item answer:
+/// each entry is the stored account's `"created.json"` map or the 400
+/// `"create_error.json"` one, and the accounts that passed stay created.
+/// The created ones log one `create` entry, whatever the batch also
+/// refused.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::Unprocessable`] for a batch over
+/// [`MAX_CREATE_USERS`]; [`AppError::Internal`] or [`AppError::Database`]
+/// from the shared registration path's server-side failures (a hashing,
+/// key-generation or database fault is nobody's validation error and
+/// aborts the request) and from the log.
+async fn create_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    body: ApiBody<CreateUsersBody>,
+) -> AppResult<Json<Vec<Value>>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    if body.0.users.len() > MAX_CREATE_USERS {
+        return Err(AppError::Unprocessable(format!(
+            "Cannot create more than {MAX_CREATE_USERS} users in one request"
+        )));
+    }
+    let mut results = Vec::with_capacity(body.0.users.len());
+    let mut created = Vec::new();
+    let mut refused = 0;
+    for item in &body.0.users {
+        match create_one(&state, item).await? {
+            Creation::Created(user) => {
+                let user = *user;
+                results.push(created_item(&user));
+                created.push(user);
+            }
+            Creation::Refused(message) => {
+                results.push(refused_item(item, &message));
+                refused += 1;
+            }
+        }
+    }
+    let logged = moderation_log::create_users(&state.db, &admin.0, &created).await?;
+    debug!(
+        log = %logged.id,
+        created = created.len(),
+        refused, "admin created users"
+    );
+    Ok(Json(results))
+}
+
+/// One create item through the shared registration path, with the three
+/// gates the admin creation bypasses: the display name and the profile
+/// note stay the registration's own defaults (the handle, an empty note —
+/// Pleroma's admin create likewise puts the nickname in `name`), and
+/// [`provider_email_verified`](crate::models::user::register::RegisterParams::provider_email_verified)
+/// stands for the confirmation bypass — the admin who set the password
+/// vouches for the address, so `ACCOUNT_ACTIVATION_REQUIRED` leaves the
+/// row confirmed and queues no letter (Pleroma's
+/// `register_changeset(…, confirmed: true)`).
+/// The approval flag, which the registration stores from the instance
+/// mode whatever the caller says, is lifted afterwards by
+/// [`creation_bypasses_approval`].
+///
+/// # Errors
+///
+/// As [`create_users`]'s for a server-side [`register::RegisterError`];
+/// validation refusals come back as [`Creation::Refused`].
+async fn create_one(state: &AppState, item: &CreateUserItem) -> AppResult<Creation> {
+    let params = register::RegisterParams {
+        nickname: item.nickname.clone(),
+        email: Some(item.email.clone()),
+        password: item.password.clone(),
+        name: None,
+        bio: None,
+        reason: None,
+        provider_email_verified: true,
+    };
+    match register::create_local_user(state, params, None).await {
+        Ok(stored) => Ok(Creation::Created(Box::new(
+            creation_bypasses_approval(state, stored).await?,
+        ))),
+        Err(register::RegisterError::Invalid(errors)) => {
+            Ok(Creation::Refused(field_errors_message(&errors)))
+        }
+        Err(register::RegisterError::Failed(err)) => Err(err),
+    }
+}
+
+/// The approval half of the bypass: with `REGISTRATIONS_APPROVAL_REQUIRED`
+/// the freshly stored row awaits staff, and an admin-created account must
+/// not — [`set_approved`] lifts the flag and hands the finished row back
+/// for the answer. A row that went away mid-request keeps the copy the
+/// insert returned.
+///
+/// [`set_approved`]: crate::models::user::admin::set_approved
+async fn creation_bypasses_approval(state: &AppState, stored: User) -> AppResult<User> {
+    if !stored.approval_pending.get() {
+        return Ok(stored);
+    }
+    Ok(admin::set_approved(&state.db, stored.id)
+        .await?
+        .unwrap_or(stored))
+}
+
+/// The per-item `error` message: the refused field map as JSON text, the
+/// same encoding [`RegisterError`] carries into the user-facing
+/// registration's 422 body. The fallback fold is for a map serde could
+/// never encode anyway; it reads like [`RegisterError`]'s own `Display`.
+///
+/// [`RegisterError`]: crate::models::user::register::RegisterError
+fn field_errors_message(errors: &register::FieldErrors) -> String {
+    serde_json::to_string(errors).unwrap_or_else(|_| {
+        errors
+            .iter()
+            .map(|(field, messages)| format!("{field}: {}", messages.join(", ")))
+            .collect::<Vec<String>>()
+            .join("; ")
+    })
+}
+
+/// The per-item success entry: Pleroma's `"created.json"` — code 200, type
+/// `"success"`, the stored address and handle as `data` (the
+/// `password_reset_link` Pleroma adds to its passwordless items has no
+/// place in this endpoint's pinned shape).
+fn created_item(user: &User) -> Value {
+    json!({
+        "code": 200,
+        "type": "success",
+        "data": { "email": user.email, "nickname": user.nickname },
+    })
+}
+
+/// The per-item failure entry: Pleroma's `"create_error.json"` with the
+/// ticket's 400 — code, type `"error"`, the refusal's message, and the
+/// handle and address as the request submitted them.
+fn refused_item(item: &CreateUserItem, message: &str) -> Value {
+    json!({
+        "code": 400,
+        "type": "error",
+        "error": message,
+        "data": { "nickname": item.nickname, "email": item.email },
+    })
+}
+
+/// `DELETE /api/v1/pleroma/admin/users` — Pleroma's `delete`: every named
+/// account that exists starts its deletion, and the answer is the JSON
+/// array of the nicknames started. Two divergences from Pleroma's
+/// `do_deletes`, both the ticket's: unknown handles are skipped inside the
+/// same success (where a Pleroma miss dies on the nil user's `ap_id`), and
+/// the caller's own account is ignored — an admin cannot delete themselves
+/// out of the instance through their own console.
+///
+/// The `nicknames[]` arrives in the body or the query string, bracketed or
+/// bare, through [`ApiParams`].
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::Unprocessable`] from the
+/// extractor for a request that names nothing; [`AppError::Database`] from
+/// the lookups, the writes, the queueing and the log.
+async fn delete_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    params: ApiParams<NicknamesBody>,
+) -> AppResult<Json<Vec<String>>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let found = admin::resolve_nicknames(&state.db, &params.0.nicknames).await?;
+    let subjects: Vec<User> = found
+        .into_iter()
+        .filter(|account| account.id != admin.0.id)
+        .collect();
+    for account in &subjects {
+        start_deletion(&state, account).await?;
+    }
+    let nicknames: Vec<String> = subjects
+        .iter()
+        .map(|account| account.nickname.clone())
+        .collect();
+    let logged = moderation_log::delete(&state.db, &admin.0, &subjects).await?;
+    debug!(
+        log = %logged.id,
+        deleted = nicknames.len(),
+        "admin deleted users"
+    );
+    Ok(Json(nicknames))
+}
+
+/// The admin deletion's start, the same write the user-facing
+/// `POST /api/pleroma/delete_account` performs: [`mark_deleted`] stamps
+/// `deleted_at` and deactivates beside [`delete_all_for_user`]'s revocation
+/// of every token, in one transaction, and the
+/// [`users.delete`](deletion::KIND_DELETE) sweep goes onto
+/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
+/// sweep's own first act, not this endpoint's — a client that gets this
+/// 200 must not wait on federation.
+///
+/// [`mark_deleted`]: crate::models::user::mark_deleted
+/// [`delete_all_for_user`]: crate::models::oauth_token::delete_all_for_user
+async fn start_deletion(state: &AppState, account: &User) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    user::mark_deleted(&mut *tx, account.id).await?;
+    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
+    tx.commit().await?;
+    let queued = enqueue(
+        &state.db,
+        NewJob {
+            queue: QUEUE_BACKGROUND,
+            kind: deletion::KIND_DELETE,
+            args: deletion::job_args(account.id),
+            run_at: None,
+            max_attempts: None,
+            unique_key: None,
+        },
+    )
+    .await?;
+    debug!(
+        account = %account.nickname,
+        revoked,
+        queued = queued.is_some(),
+        "admin started a user deletion"
+    );
+    Ok(())
+}
+
+/// The activation write the activate/deactivate pair shares: `is_active`
+/// lands on every named account that answers — the acting admin's own row
+/// excepted when the request deactivates, the self-protection the ticket
+/// pins (Pleroma protects nobody here) — and the answer is the moved
+/// accounts as admin entities, in the order the request stated them.
+///
+/// A deactivation is the flag alone: no token is revoked (the bearer gate
+/// answers a deactivated owner's requests with its own 403 for as long as
+/// the rows live), no deletion is stamped and nothing federates, exactly
+/// as `POST /api/pleroma/disable_account`'s note about the actor document
+/// staying resolvable.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the lookups, the writes and the log.
+async fn write_activation(
+    state: &AppState,
+    actor: &User,
+    nicknames: &[String],
+    active: bool,
+) -> AppResult<Json<AdminAccounts>> {
+    let found = admin::resolve_nicknames(&state.db, nicknames).await?;
+    let mut moved = Vec::with_capacity(found.len());
+    for account in &found {
+        if !active && account.id == actor.id {
+            continue;
+        }
+        if let Some(updated) = admin::set_active(&state.db, account.id, active).await? {
+            moved.push(updated);
+        }
+    }
+    let logged = if active {
+        moderation_log::activate(&state.db, actor, &moved).await?
+    } else {
+        moderation_log::deactivate(&state.db, actor, &moved).await?
+    };
+    debug!(
+        log = %logged.id,
+        moved = moved.len(),
+        active, "admin changed account activations"
+    );
+    Ok(Json(AdminAccounts::from_users(&moved, &state.config)))
+}
+
+/// `PATCH /api/v1/pleroma/admin/users/activate` — Pleroma's `activate`:
+/// [`write_activation`] with the flag set.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::Unprocessable`] from the
+/// extractor for a body with no `nicknames`; [`AppError::Database`] from
+/// [`write_activation`].
+async fn activate_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    body: ApiBody<NicknamesBody>,
+) -> AppResult<Json<AdminAccounts>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    write_activation(&state, &admin.0, &body.0.nicknames, true).await
+}
+
+/// `PATCH /api/v1/pleroma/admin/users/deactivate` — Pleroma's
+/// `deactivate`: [`write_activation`] with the flag cleared, and the
+/// caller's own account skipped rather than locked out.
+///
+/// # Errors
+///
+/// As [`activate_users`].
+async fn deactivate_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    body: ApiBody<NicknamesBody>,
+) -> AppResult<Json<AdminAccounts>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    write_activation(&state, &admin.0, &body.0.nicknames, false).await
+}
+
+/// `PATCH /api/v1/pleroma/admin/users/{nickname}/toggle_activation` —
+/// Pleroma's `toggle_activation`: flip the flag of the one account the
+/// segment names (nickname or id, the show's lookup, mirror included),
+/// answer its single admin entity and log the move that was made — an
+/// activation logged `activate`, a deactivation `deactivate`, Pleroma's
+/// own choice of action for the entry. Unlike the bulk pair, no account is
+/// protected: the admin who toggles their own console off gets the entity
+/// of a deactivated self, the state Pleroma's route answers too.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::RouteNotFound`] from
+/// [`named_account`] or from the write matching no row;
+/// [`AppError::Database`] from the write and the log.
+async fn toggle_activation(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(raw): Path<String>,
+) -> AppResult<Json<AdminAccount>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let found = named_account(&state, &raw).await?;
+    let activate = !found.is_active.get();
+    let updated = admin::set_active(&state.db, found.id, activate)
+        .await?
+        .ok_or(AppError::RouteNotFound)?;
+    let subjects = slice::from_ref(&found);
+    let logged = if activate {
+        moderation_log::activate(&state.db, &admin.0, subjects).await?
+    } else {
+        moderation_log::deactivate(&state.db, &admin.0, subjects).await?
+    };
+    debug!(
+        log = %logged.id,
+        id = %found.id,
+        nickname = %found.nickname,
+        activated = activate,
+        "admin toggled an account's activation"
+    );
+    Ok(Json(AdminAccount::from_user(&updated, &state.config)))
+}
+
+/// `PATCH /api/v1/pleroma/admin/users/approve` — Pleroma's `approve`:
+/// every named account that answers is among the answered `users`, in the
+/// order the request stated them, and the ones still awaiting staff get
+/// their `approval_pending` cleared and the `account_approved` letter —
+/// an already-approved account is content to be handed back unchanged,
+/// Pleroma's `approve(%User{is_approved: true})` clause, mailed nothing
+/// and written nothing. No token is created: approval opens the door, the
+/// account still signs in with its own password. One `approve` entry names
+/// every resolved subject, moved or not.
+///
+/// # Errors
+///
+/// As [`activate_users`].
+async fn approve_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    body: ApiBody<NicknamesBody>,
+) -> AppResult<Json<AdminAccounts>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let found = admin::resolve_nicknames(&state.db, &body.0.nicknames).await?;
+    let mut answered = Vec::with_capacity(found.len());
+    for account in found {
+        if account.approval_pending.get() {
+            answered.push(approve_one(&state, account).await?);
+        } else {
+            answered.push(account);
+        }
+    }
+    let logged = moderation_log::approve(&state.db, &admin.0, &answered).await?;
+    debug!(
+        log = %logged.id,
+        resolved = answered.len(),
+        "admin approved users"
+    );
+    Ok(Json(AdminAccounts::from_users(&answered, &state.config)))
+}
+
+/// The write behind one approval: [`set_approved`] clears the gate and
+/// hands the fresh row back (a row that went away mid-request keeps the
+/// stored copy as the answer), and the newly-approved account gets its
+/// letter through the mailer queue when it gave an address at all —
+/// Pleroma's `send_user_approval_email` has the same guard on its
+/// `is_binary(email)` clause.
+///
+/// [`set_approved`]: crate::models::user::admin::set_approved
+async fn approve_one(state: &AppState, pending: User) -> AppResult<User> {
+    let Some(updated) = admin::set_approved(&state.db, pending.id).await? else {
+        return Ok(pending);
+    };
+    if let Some(email) = updated.email.as_deref() {
+        mailer::deliver_later(state, templates::account_approved(&state.config, email)).await?;
+    }
+    Ok(updated)
+}
+
 /// The listing criteria one request states: the five named criteria, the
 /// comma list of `filters` and the page window, read off the raw query
 /// string `Uri::query` returns (percent-decoding and all).
@@ -2350,5 +2881,86 @@ mod tests {
             let err = group_of(text).expect_err("no such group name");
             assert_eq!(err.to_string(), NO_SUCH_GROUP, "Pleroma's wording");
         }
+    }
+
+    /// The create body reads its list of three-key items and nothing
+    /// looser: every key of every item is required, and an item that
+    /// states two of them is the parse error the extractor turns into
+    /// its 422 — the same for a body with no list at all.
+    #[test]
+    fn the_create_body_requires_every_key_of_every_item() {
+        let batch: CreateUsersBody = serde_json::from_value(json!({
+            "users": [
+                {"nickname": "alice", "email": "alice@example.org", "password": "long enough"},
+                {"nickname": "bob", "email": "bob@example.org", "password": "another pass"},
+            ],
+        }))
+        .expect("the create body");
+        assert_eq!(batch.users.len(), 2, "both items");
+        assert_eq!(batch.users[0].nickname, "alice", "each with");
+        assert_eq!(batch.users[1].password, "another pass", "all three keys");
+        for broken in [
+            json!({"users": [{"nickname": "a", "email": "a@b.cx"}]}),
+            json!({"users": [{"nickname": "a", "password": "p"}]}),
+            json!({"users": [{"email": "a@b.cx", "password": "p"}]}),
+            json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<CreateUsersBody>(broken.clone()).is_err(),
+                "an incomplete request does not parse: {broken}"
+            );
+        }
+    }
+
+    /// The submitted password never renders, and the per-item answers keep
+    /// Pleroma's two shapes: the success entry the ticket pins its data
+    /// keys to, and the refusal carrying the message and the submitted
+    /// handle and address.
+    #[test]
+    fn the_create_items_redact_and_render_the_pinned_shapes() {
+        let item: CreateUserItem = serde_json::from_value(json!({
+            "nickname": "alice",
+            "email": "alice@example.org",
+            "password": "hunter2 password",
+        }))
+        .expect("one item");
+        let shown = format!("{item:?}");
+        assert!(
+            !shown.contains("hunter2"),
+            "the plaintext never reaches a log line: {shown}"
+        );
+        assert_eq!(
+            refused_item(&item, "nope"),
+            json!({
+                "code": 400,
+                "type": "error",
+                "error": "nope",
+                "data": {"nickname": "alice", "email": "alice@example.org"},
+            }),
+            "the refusal, with what the request submitted"
+        );
+    }
+
+    /// The per-item `error` text is the field map as JSON, every refusal
+    /// of every field inside it — the encoding the user-facing
+    /// registration's own 422 body carries.
+    #[test]
+    fn the_create_refusal_encodes_the_whole_field_map() {
+        let mut errors = register::FieldErrors::new();
+        let first: Option<Vec<String>> =
+            errors.insert("nickname", vec!["has already been taken".to_owned()]);
+        let second: Option<Vec<String>> =
+            errors.insert("email", vec!["has invalid format".to_owned()]);
+        drop((first, second));
+        assert_eq!(
+            field_errors_message(&errors),
+            "{\"email\":[\"has invalid format\"],\"nickname\":[\"has already been taken\"]}",
+            "the map's own JSON text, keys sorted"
+        );
+        assert_eq!(
+            field_errors_message(&register::FieldErrors::new()),
+            "{}",
+            "and an empty map is no special case"
+        );
     }
 }

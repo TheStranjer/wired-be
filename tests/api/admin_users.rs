@@ -3169,3 +3169,820 @@ async fn account_named(pool: &PgPool, nickname: &str) -> User {
         .expect("the account reads back")
         .expect("the fixture seeded it")
 }
+
+// ===== WBE-196: the account lifecycle — create, delete, activation, approval =====
+
+/// The bulk activation PATCH route.
+const ACTIVATE: &str = "/api/v1/pleroma/admin/users/activate";
+/// The bulk deactivation PATCH route.
+const DEACTIVATE: &str = "/api/v1/pleroma/admin/users/deactivate";
+/// The bulk approval PATCH route.
+const APPROVE: &str = "/api/v1/pleroma/admin/users/approve";
+/// A password every lifecycle fixture and created account uses, over the
+/// test config's minimum length.
+const PASSWORD: &str = "a long enough pass";
+/// The 403 body of every bearer request a deactivated account makes.
+const DISABLED: &str = "Your account is currently disabled";
+
+/// The toggle route of one account.
+fn toggle_path(nickname: &str) -> String {
+    format!("{USERS}/{nickname}/toggle_activation")
+}
+
+/// A `users` body creating one account per `(nickname, email, password)`
+/// triple, in the order stated.
+fn create_body(items: &[(&str, &str, &str)]) -> Value {
+    json!({
+        "users": items
+            .iter()
+            .map(|(nickname, email, password)| json!({
+                "nickname": nickname,
+                "email": email,
+                "password": password,
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
+/// The OAuth `password` grant body for `username`, over the app's
+/// credentials.
+fn grant_body(client_id: &str, client_secret: &str, username: &str) -> Value {
+    json!({
+        "grant_type": "password",
+        "username": username,
+        "password": PASSWORD,
+        "scope": "read",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+}
+
+/// The three lifecycle flags one account carries: activation, confirmation
+/// and the staff gate.
+async fn lifecycle_flags(pool: &PgPool, nickname: &str) -> (bool, bool, bool) {
+    sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT is_active, email_confirmed, approval_pending FROM users WHERE nickname = $1",
+    )
+    .bind(nickname)
+    .fetch_one(pool)
+    .await
+    .expect("the flags read back")
+}
+
+/// Whether any account answers to `nickname`.
+async fn exists(pool: &PgPool, nickname: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM users WHERE nickname = $1)")
+        .bind(nickname)
+        .fetch_one(pool)
+        .await
+        .expect("the existence read runs")
+}
+
+/// The arguments of every job on `queue` of `kind`, oldest first.
+async fn jobs_of(pool: &PgPool, queue: &str, kind: &str) -> Vec<Value> {
+    sqlx::query_as::<_, (Value,)>(
+        "SELECT args FROM jobs WHERE queue = $1 AND kind = $2 ORDER BY inserted_at",
+    )
+    .bind(queue)
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .expect("the queue reads back")
+    .into_iter()
+    .map(|(args,)| args)
+    .collect()
+}
+
+/// How many live bearer tokens `account` holds.
+async fn token_count(pool: &PgPool, account: &User) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM oauth_tokens WHERE user_id = $1")
+        .bind(account.id)
+        .fetch_one(pool)
+        .await
+        .expect("the token count reads back")
+}
+
+/// Whether `account` carries a deletion stamp.
+async fn deletion_stamped(pool: &PgPool, account: &User) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT deleted_at IS NOT NULL FROM users WHERE id = $1")
+        .bind(account.id)
+        .fetch_one(pool)
+        .await
+        .expect("the stamp reads back")
+}
+
+/// The admin-created account is active, confirmed and approved on an
+/// instance that demands confirmation AND approval: the registration
+/// queues no letter for it, its row clears the staff gate the mode sets,
+/// it signs in at once, and the batch logs Pleroma's one `create` entry
+/// with its plural `subjects` key.
+#[tokio::test]
+async fn admin_created_accounts_bypass_every_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let mut config = mail_config();
+    config.registrations_approval_required = wired_be::config::Toggle::new(true);
+    config.account_activation_required = wired_be::config::Toggle::new(true);
+    let app = common::test_app_with_config(pool.clone(), config);
+    let root = common::create_local_user_with(&pool, "root", |user| NewUser {
+        is_admin: Flag::new(true),
+        email: Some("root@example.org".to_owned()),
+        ..user
+    })
+    .await;
+    let token = mint(&pool, &root, "admin:write:accounts").await;
+
+    let response = post_json(
+        &app,
+        &token,
+        USERS,
+        Some(&create_body(&[
+            ("fresh", "fresh@example.org", PASSWORD),
+            ("other", "other@example.org", PASSWORD),
+        ])),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the bulk create");
+    assert_eq!(
+        response.json_value(),
+        json!([
+            {"code": 200, "type": "success",
+             "data": {"email": "fresh@example.org", "nickname": "fresh"}},
+            {"code": 200, "type": "success",
+             "data": {"email": "other@example.org", "nickname": "other"}},
+        ]),
+        "one success entry per item, in the order the request stated them"
+    );
+
+    for nickname in ["fresh", "other"] {
+        let (active, confirmed, pending) = lifecycle_flags(&pool, nickname).await;
+        assert!(
+            active && confirmed && !pending,
+            "{nickname} is active, confirmed and approved whatever the modes: {active} {confirmed} {pending}"
+        );
+    }
+    assert!(
+        jobs_of(&pool, "mailer", "mailer.send").await.is_empty(),
+        "activation mode queued no confirmation letter for an admin-created account"
+    );
+
+    let client = common::create_app(&pool, "read").await;
+    let login = TestRequest::post("/oauth/token")
+        .json(&grant_body(
+            &client.client_id,
+            &client.client_secret,
+            "fresh",
+        ))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &login,
+        StatusCode::OK,
+        "the created account signs straight in",
+    );
+    assert!(
+        !login.json_value()["access_token"].is_null(),
+        "and the grant hands out its credential"
+    );
+
+    let entries = logged(&pool, "create").await;
+    assert_eq!(entries.len(), 1, "one create entry for the whole batch");
+    assert_eq!(
+        entries[0].0, "@root created users: @fresh, @other",
+        "Pleroma's create sentence"
+    );
+    let named: Vec<&str> = entries[0].1["subjects"]
+        .as_array()
+        .expect("the plural subjects key Pleroma's clause reads")
+        .iter()
+        .filter_map(|found| found["nickname"].as_str())
+        .collect();
+    assert_eq!(named, vec!["fresh", "other"], "both created accounts");
+    assert!(
+        entries[0].1.get("subject").is_none(),
+        "and the entry keeps Pleroma's spelling of the key"
+    );
+}
+
+/// A mixed batch answers per item, and stays per item: the one valid
+/// account is stored and logged while the duplicate, the malformed
+/// address and the short password each report their own 400 refusal —
+/// where Pleroma rolls the whole batch back into one 409, the ticket pins
+/// the always-200 per-item answer.
+#[tokio::test]
+async fn the_create_answers_every_item_for_itself() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+
+    let response = post_json(
+        &seeded.app,
+        &token,
+        USERS,
+        Some(&create_body(&[
+            ("goodone", "goodone@example.org", PASSWORD),
+            ("plain", "dup@example.org", PASSWORD),
+            ("wrong", "not-an-email", PASSWORD),
+            ("shorty", "shorty@example.org", "pw"),
+        ])),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the mixed batch");
+    let items = response.json_value();
+    let items = items.as_array().expect("four items");
+    assert_eq!(items.len(), 4, "one entry per submitted item");
+
+    assert_eq!(items[0]["code"], 200, "the valid item stored");
+    assert_eq!(items[0]["type"], "success");
+    for (index, needle, who) in [
+        (1, "has already been taken", "the duplicate handle"),
+        (2, "has invalid format", "the malformed address"),
+        (3, "should be at least", "the too-short password"),
+    ] {
+        assert_eq!(items[index]["code"], 400, "{who} reports the pinned code");
+        assert_eq!(items[index]["type"], "error", "{who} is an error item");
+        assert!(
+            items[index]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(needle),
+            "{who} says why: {}",
+            items[index]["error"]
+        );
+    }
+    assert_eq!(
+        items[1]["data"]["nickname"], "plain",
+        "the refusal names what was submitted"
+    );
+    assert_eq!(
+        items[2]["data"]["email"], "not-an-email",
+        "handle and address alike"
+    );
+
+    assert!(
+        exists(&seeded.pool, "goodone").await,
+        "the good item is stored"
+    );
+    let (active, confirmed, pending) = lifecycle_flags(&seeded.pool, "goodone").await;
+    assert!(
+        active && confirmed && !pending,
+        "on the default open instance the bypass is the registration's own plain state"
+    );
+    assert!(
+        !exists(&seeded.pool, "wrong").await,
+        "the refused items created nothing"
+    );
+    assert!(!exists(&seeded.pool, "shorty").await, "every one of them");
+
+    let entries = logged(&seeded.pool, "create").await;
+    assert_eq!(entries.len(), 1, "one entry for the batch");
+    assert_eq!(
+        entries[0].0, "@root created users: @goodone",
+        "naming only the created"
+    );
+}
+
+/// The fifty-account cap refuses the oversized batch whole, before any
+/// item is created and with no entry logged.
+#[tokio::test]
+async fn the_create_caps_the_batch_at_fifty() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let before = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
+        .fetch_one(&seeded.pool)
+        .await
+        .expect("the count reads");
+
+    let users: Vec<Value> = (0..51)
+        .map(|index| {
+            json!({
+                "nickname": format!("batch{index}"),
+                "email": format!("batch{index}@example.org"),
+                "password": PASSWORD,
+            })
+        })
+        .collect();
+    let response = post_json(&seeded.app, &token, USERS, Some(&json!({ "users": users }))).await;
+    common::assert_answer(&response, StatusCode::UNPROCESSABLE_ENTITY, "a batch of 51");
+    assert!(
+        response.text().contains("50"),
+        "and the 422 states the cap: {}",
+        response.text()
+    );
+
+    let after = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
+        .fetch_one(&seeded.pool)
+        .await
+        .expect("the count reads");
+    assert_eq!(after, before, "nothing was created");
+    assert!(
+        logged(&seeded.pool, "create").await.is_empty(),
+        "and the refused batch left no entry"
+    );
+}
+
+/// The admin's delete starts each named account's own deletion exactly as
+/// `POST /api/pleroma/delete_account` starts it — marked, revoked, swept
+/// on the `background` queue — answers the started nicknames, ignores the
+/// caller's own account and the misses, and the `nicknames[]` arrives in
+/// the body OR the query string.
+#[tokio::test]
+async fn admin_delete_starts_the_sweep_of_every_other_account() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = account_named(&seeded.pool, "plain").await;
+    let _plain_token = mint(&seeded.pool, &plain, "read").await;
+
+    let response = TestRequest::delete(USERS)
+        .bearer(&token)
+        .json(&json!({"nicknames": ["plain", "ghost", "root"]}))
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "the delete");
+    assert_eq!(
+        response.json_value(),
+        json!(["plain"]),
+        "the started nicknames: the miss skipped, the caller ignored"
+    );
+
+    let sweeps = jobs_of(&seeded.pool, "background", "users.delete").await;
+    assert_eq!(sweeps.len(), 1, "one sweep queued");
+    assert_eq!(
+        sweeps[0]["user_id"],
+        plain.id.to_string(),
+        "and it names plain's row, on the queue account deletion uses"
+    );
+    assert!(
+        deletion_stamped(&seeded.pool, &plain).await,
+        "the account carries its deletion stamp"
+    );
+    let (active, _, _) = lifecycle_flags(&seeded.pool, "plain").await;
+    assert!(!active, "and it is inactive");
+    assert_eq!(
+        token_count(&seeded.pool, &plain).await,
+        0,
+        "every token went"
+    );
+    let root = account_named(&seeded.pool, "root").await;
+    assert!(
+        !deletion_stamped(&seeded.pool, &root).await && token_count(&seeded.pool, &root).await > 0,
+        "the caller's own account stands untouched, tokens included"
+    );
+
+    // The same call through the query string, bracketed.
+    let again = TestRequest::delete(&format!("{USERS}?nicknames[]=beeper&nicknames[]=ghost"))
+        .bearer(&token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&again, StatusCode::OK, "the query-string delete");
+    assert_eq!(again.json_value(), json!(["beeper"]), "one started name");
+    assert_eq!(
+        jobs_of(&seeded.pool, "background", "users.delete")
+            .await
+            .len(),
+        2,
+        "and its own sweep job"
+    );
+
+    let entries = logged(&seeded.pool, "delete").await;
+    let messages: Vec<&str> = entries
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "@root deleted users: @plain",
+            "@root deleted users: @beeper"
+        ],
+        "Pleroma's delete sentence, once per request"
+    );
+}
+
+/// The `password` grant for `username`, sent.
+async fn login(
+    app: &Router,
+    client_id: &str,
+    client_secret: &str,
+    username: &str,
+) -> common::TestResponse {
+    TestRequest::post("/oauth/token")
+        .json(&grant_body(client_id, client_secret, username))
+        .send(app)
+        .await
+}
+
+/// Deactivation blocks the account — its bearer requests with the auth
+/// gate's own 403, its login with the password grant's disabled refusal —
+/// while revoking no token; the caller's own row and the unknown handle
+/// are skipped inside the same success, and the moved account answers as
+/// the admin entity with Pleroma's `deactivate` entry behind it.
+#[tokio::test]
+async fn deactivation_blocks_the_account_and_skips_the_caller() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let root = common::create_local_user_with(&pool, "root", |user| NewUser {
+        is_admin: Flag::new(true),
+        ..user
+    })
+    .await;
+    let sleepy = common::create_user_with_password(&pool, "sleepy", PASSWORD).await;
+    let sleepy_token = mint(&pool, &sleepy, "read").await;
+    let client = common::create_app(&pool, "read").await;
+    let token = mint(&pool, &root, "admin:write:accounts").await;
+
+    let off = patch_json(
+        &app,
+        &token,
+        DEACTIVATE,
+        &json!({"nicknames": ["sleepy", "root", "ghost"]}),
+    )
+    .await;
+    common::assert_answer(&off, StatusCode::OK, "the deactivation");
+    let body = off.json_value();
+    assert_eq!(
+        answered_users(&body),
+        vec!["sleepy"],
+        "the moved account only: the ghost is skipped inside the same 200"
+    );
+    assert_eq!(
+        body["users"][0]["is_active"], false,
+        "answered as deactivated"
+    );
+    let (sleeping, _, _) = lifecycle_flags(&pool, "sleepy").await;
+    assert!(!sleeping, "the flag moved");
+    let (root_active, _, _) = lifecycle_flags(&pool, "root").await;
+    assert!(
+        root_active,
+        "the caller cannot deactivate itself, even by name"
+    );
+    assert_eq!(
+        token_count(&pool, &sleepy).await,
+        1,
+        "deactivation revokes no token"
+    );
+
+    let denied = TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(&sleepy_token)
+        .send(&app)
+        .await;
+    common::assert_answer(&denied, StatusCode::FORBIDDEN, "the bearer gate's own 403");
+    common::assert_error(&denied, DISABLED, "in the auth gate's words");
+
+    let refused = login(&app, &client.client_id, &client.client_secret, "sleepy").await;
+    common::assert_answer(&refused, StatusCode::FORBIDDEN, "the deactivated login");
+    assert_eq!(
+        refused.json_value()["identifier"],
+        "account_is_disabled",
+        "with the password grant's own reason code"
+    );
+
+    let (message, subjects) = one_entry(&pool, "deactivate").await;
+    assert_eq!(
+        message, "@root deactivated users: @sleepy",
+        "Pleroma's sentence"
+    );
+    assert_eq!(
+        subjects,
+        vec!["sleepy"],
+        "the caller's own name left the subject list"
+    );
+}
+
+/// Activation is the same write with the flag set: it answers the entity
+/// active, logs the `activate` entry, and the account that was blocked
+/// signs in and calls the API again — the deactivation's un-revoked token
+/// works once more, the flag being the whole gate.
+#[tokio::test]
+async fn activation_frees_the_account_it_releases() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let root = common::create_local_user_with(&pool, "root", |user| NewUser {
+        is_admin: Flag::new(true),
+        ..user
+    })
+    .await;
+    let sleepy = common::create_user_with_password(&pool, "sleepy", PASSWORD).await;
+    let sleepy_token = mint(&pool, &sleepy, "read").await;
+    let client = common::create_app(&pool, "read").await;
+    let token = mint(&pool, &root, "admin:write:accounts").await;
+    let _off = patch_json(&app, &token, DEACTIVATE, &json!({"nicknames": ["sleepy"]})).await;
+
+    let on = patch_json(&app, &token, ACTIVATE, &json!({"nicknames": ["sleepy"]})).await;
+    common::assert_answer(&on, StatusCode::OK, "the activation");
+    assert_eq!(
+        on.json_value()["users"][0]["is_active"],
+        true,
+        "answered as active"
+    );
+    let granted = login(&app, &client.client_id, &client.client_secret, "sleepy").await;
+    common::assert_answer(&granted, StatusCode::OK, "the freed account signs in again");
+
+    let verify = TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(&sleepy_token)
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &verify,
+        StatusCode::OK,
+        "and the token the deactivation left behind works again",
+    );
+
+    let (message, subjects) = one_entry(&pool, "activate").await;
+    assert_eq!(
+        message, "@root activated users: @sleepy",
+        "Pleroma's sentence"
+    );
+    assert_eq!(subjects, vec!["sleepy"]);
+}
+
+/// The single-account toggle flips the flag both ways — by nickname and,
+/// like the show route, by id — answers that account's own admin entity
+/// carrying the new state, logs the move under the bulk pair's actions,
+/// and sends the miss and the wrong-scoped token to 404 and 403 without
+/// touching the row.
+#[tokio::test]
+async fn toggle_flips_one_account_and_logs_the_move() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let suspended = account_named(&seeded.pool, "suspended").await;
+
+    let on = TestRequest::patch(&toggle_path("suspended"))
+        .bearer(&token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&on, StatusCode::OK, "the wake-up");
+    let entity = on.json_value();
+    assert_eq!(
+        entity["id"],
+        suspended.id.to_string(),
+        "the one account's entity"
+    );
+    assert_eq!(entity["nickname"], "suspended");
+    assert_eq!(entity["is_active"], true, "carrying the state it moved to");
+
+    let off = TestRequest::patch(&toggle_path(&suspended.id.to_string()))
+        .bearer(&token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&off, StatusCode::OK, "the toggle by id, back to sleep");
+    assert_eq!(
+        off.json_value()["is_active"],
+        false,
+        "the id reaches the same row"
+    );
+
+    let (on_message, on_subjects) = one_entry(&seeded.pool, "activate").await;
+    assert_eq!(
+        on_message, "@root activated users: @suspended",
+        "Pleroma logs the toggle's activation as an activate"
+    );
+    assert_eq!(on_subjects, vec!["suspended"]);
+    let (off_message, off_subjects) = one_entry(&seeded.pool, "deactivate").await;
+    assert_eq!(
+        off_message, "@root deactivated users: @suspended",
+        "and the deactivation likewise"
+    );
+    assert_eq!(off_subjects, vec!["suspended"]);
+
+    let miss = TestRequest::patch(&toggle_path("ghost"))
+        .bearer(&token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&miss, StatusCode::NOT_FOUND, "no account named ghost");
+    common::assert_error(&miss, NOT_FOUND, "the module's 404");
+
+    let wrong_scope = TestRequest::patch(&toggle_path("plain"))
+        .bearer(&seeded.token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(
+        &wrong_scope,
+        StatusCode::FORBIDDEN,
+        "the read scope must not write",
+    );
+    common::assert_error(&wrong_scope, NO_ADMIN_WRITE, "in the write class's words");
+    let (still_active, _, _) = lifecycle_flags(&seeded.pool, "plain").await;
+    assert!(still_active, "and the refused toggle wrote nothing");
+}
+
+/// Approval clears the staff gate for the pending accounts, mails each
+/// one that holds an address the approval letter, mints nothing, answers
+/// every named account that exists — and leaves the already-approved one
+/// unwritten and unmailed when the request runs a second time.
+#[tokio::test]
+async fn approve_opens_the_pending_accounts_and_mails_them() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let app = common::test_app_with_config(seeded.pool.clone(), mail_config());
+    let token = write_token(&seeded).await;
+    let _waiting = common::create_local_user_with(&seeded.pool, "waiting", |user| NewUser {
+        approval_pending: Flag::new(true),
+        email: Some("waiting@example.org".to_owned()),
+        ..user
+    })
+    .await;
+
+    let response = patch_json(
+        &app,
+        &token,
+        APPROVE,
+        &json!({"nicknames": ["waiting", "newbie", "plain", "ghost"]}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the approval");
+    let body = response.json_value();
+    assert_eq!(
+        answered_users(&body),
+        vec!["waiting", "newbie", "plain"],
+        "every named account that exists, in order, the miss skipped"
+    );
+    for index in 0..3 {
+        assert_eq!(
+            body["users"][index]["is_approved"], true,
+            "answered as approved, moved now or before"
+        );
+    }
+
+    for nickname in ["waiting", "newbie"] {
+        let (_, _, pending) = lifecycle_flags(&seeded.pool, nickname).await;
+        assert!(!pending, "{nickname} is off the approval list");
+    }
+    let waiting = account_named(&seeded.pool, "waiting").await;
+    assert_eq!(
+        token_count(&seeded.pool, &waiting).await,
+        0,
+        "and the approval minted no credential"
+    );
+
+    let letters = jobs_of(&seeded.pool, "mailer", "mailer.send").await;
+    assert_eq!(
+        letters.len(),
+        1,
+        "one letter: plain was not approved now, and newbie has no address"
+    );
+    assert_eq!(
+        letters[0]["to"],
+        json!("waiting@example.org"),
+        "to the newly approved"
+    );
+    assert!(
+        letters[0]["subject"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("approved"),
+        "the approval letter: {}",
+        letters[0]["subject"]
+    );
+
+    let (message, subjects) = one_entry(&seeded.pool, "approve").await;
+    assert_eq!(
+        message, "@root approved users: @waiting, @newbie, @plain",
+        "Pleroma's approve sentence, naming every resolved subject"
+    );
+    assert_eq!(subjects, vec!["waiting", "newbie", "plain"], "moved or not");
+}
+
+/// Approving an already-approved account changes nothing and mails
+/// nothing — Pleroma's `approve(%User{is_approved: true})` clause hands
+/// the user back untouched — yet the answer still carries its entity and
+/// the write still logs its entry.
+#[tokio::test]
+async fn approving_an_already_approved_account_sends_no_letter() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let app = common::test_app_with_config(seeded.pool.clone(), mail_config());
+    let token = write_token(&seeded).await;
+
+    let again = patch_json(&app, &token, APPROVE, &json!({"nicknames": ["plain"]})).await;
+    common::assert_answer(&again, StatusCode::OK, "approval of the already approved");
+    assert_eq!(
+        answered_users(&again.json_value()),
+        vec!["plain"],
+        "it answers unchanged"
+    );
+    assert!(
+        jobs_of(&seeded.pool, "mailer", "mailer.send")
+            .await
+            .is_empty(),
+        "no letter for an account nobody just approved"
+    );
+    let (message, subjects) = one_entry(&seeded.pool, "approve").await;
+    assert_eq!(
+        message, "@root approved users: @plain",
+        "and still the entry"
+    );
+    assert_eq!(subjects, vec!["plain"]);
+}
+
+/// One gated lifecycle route: its name for the assertions, the HTTP verb,
+/// the path, and the JSON body it needs (`None` for the body-less toggle).
+type LifecycleRoute<'a> = (&'a str, &'a str, &'a str, Option<&'a Value>);
+
+/// One expected refusal: who presents which credential (no bearer at all
+/// for `None`) and the status and message the gate answers.
+type Refusal<'a> = (&'a str, Option<&'a str>, StatusCode, &'a str);
+
+/// Sends one lifecycle request, asserting the gate refused it with the
+/// pinned status and message before anything ran.
+async fn refuse(app: &Router, route: LifecycleRoute<'_>, refusal: Refusal<'_>) {
+    let (what, verb, path, body) = route;
+    let (who, token, status, message) = refusal;
+    let base = match verb {
+        "POST" => TestRequest::post(path),
+        "DELETE" => TestRequest::delete(path),
+        _ => TestRequest::patch(path),
+    };
+    let with_body = match body {
+        Some(value) => base.json(value),
+        None => base,
+    };
+    let with_auth = match token {
+        Some(bearer) => with_body.bearer(bearer),
+        None => with_body,
+    };
+    let response = with_auth.send(app).await;
+    common::assert_answer(&response, status, &format!("{what} from {who}"));
+    common::assert_error(&response, message, &format!("{what} from {who}"));
+}
+
+/// Every lifecycle route stands behind the same gate as the rest of the
+/// module: no token is the 401, a NON-admin holding `admin:write:accounts`
+/// is the 403 "User is not an admin.", and an admin token of the wrong
+/// scope or the wrong area is the 403 naming `admin:write` — nobody
+/// outside the accounts gate moves an account, and nothing lands while
+/// the gate is closed.
+#[tokio::test]
+async fn the_lifecycle_writes_guard_their_gate() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let member = common::create_local_user_with(&seeded.pool, "member", |user| user).await;
+    let member_token = mint(&seeded.pool, &member, "admin:write:accounts").await;
+    let other_area = mint(&seeded.pool, &seeded.root, "admin:write:reports").await;
+    let names = json!({"nicknames": ["plain"]});
+    let gate_body = create_body(&[("gate1", "gate1@example.org", PASSWORD)]);
+    let toggle = toggle_path("plain");
+
+    let routes: [LifecycleRoute<'_>; 6] = [
+        ("POST create", "POST", USERS, Some(&gate_body)),
+        ("DELETE users", "DELETE", USERS, Some(&names)),
+        ("PATCH activate", "PATCH", ACTIVATE, Some(&names)),
+        ("PATCH deactivate", "PATCH", DEACTIVATE, Some(&names)),
+        ("PATCH approve", "PATCH", APPROVE, Some(&names)),
+        ("PATCH toggle", "PATCH", &toggle, None),
+    ];
+    let refusals: [Refusal<'_>; 4] = [
+        ("no token at all", None, StatusCode::UNAUTHORIZED, NO_TOKEN),
+        (
+            "a NON-admin holding the exact scope",
+            Some(member_token.as_str()),
+            StatusCode::FORBIDDEN,
+            NOT_ADMIN,
+        ),
+        (
+            "the admin's read scope",
+            Some(seeded.token.as_str()),
+            StatusCode::FORBIDDEN,
+            NO_ADMIN_WRITE,
+        ),
+        (
+            "the admin's other write area",
+            Some(other_area.as_str()),
+            StatusCode::FORBIDDEN,
+            NO_ADMIN_WRITE,
+        ),
+    ];
+
+    for route in routes {
+        for refusal in refusals {
+            refuse(&seeded.app, route, refusal).await;
+        }
+    }
+
+    assert!(
+        !exists(&seeded.pool, "gate1").await,
+        "and every refused request wrote nothing"
+    );
+    let (plain_active, _, plain_pending) = lifecycle_flags(&seeded.pool, "plain").await;
+    assert!(
+        plain_active && !plain_pending,
+        "plain's row stands as the fixture left it"
+    );
+    for action in ["create", "delete", "activate", "deactivate", "approve"] {
+        assert!(
+            logged(&seeded.pool, action).await.is_empty(),
+            "the closed gate logged no {action} entry"
+        );
+    }
+    assert!(
+        jobs_of(&seeded.pool, "background", "users.delete")
+            .await
+            .is_empty(),
+        "and queued no sweep"
+    );
+}

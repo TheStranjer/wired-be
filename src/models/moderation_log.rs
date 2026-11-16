@@ -18,7 +18,8 @@
 //! the affected users (into the `subject_ids` / `subject_nicknames`
 //! columns) and the sentence, and its `data` map is what the action adds
 //! beyond actor/action/message. The small per-action helpers built on it —
-//! [`deactivate`], [`activate`], [`delete`], [`approve`], [`tag`],
+//! [`deactivate`], [`activate`], [`delete`], [`approve`], [`create_users`],
+//! [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`updated_users`], [`confirm_email`], [`resend_confirmation_email`],
 //! [`disable_mfa`], [`add_suggestion`], [`remove_suggestion`],
@@ -343,6 +344,40 @@ pub async fn delete(pool: &PgPool, actor: &User, subjects: &[User]) -> AppResult
 /// [`AppError::Database`](crate::error::AppError); see [`record`].
 pub async fn approve(pool: &PgPool, actor: &User, subjects: &[User]) -> AppResult<ModerationLog> {
     users_action(pool, actor, subjects, "approve", "approved").await
+}
+
+/// Records a `create`: `@admin created users: @alice, @bob` — the
+/// `create` clause of Pleroma's `get_log_entry_message`, the entry the
+/// admin `POST /users` leaves behind (WBE-196).
+///
+/// The one departure from the sentence family of [`deactivate`] and its
+/// siblings is where the entry puts the array: Pleroma's `create` clause
+/// matches the PLURAL `"subjects"` key (its `insert_log` takes the map's
+/// `subjects:` field verbatim into `data`), so this records the same user
+/// maps there and the moderation-log read hands that spelling back
+/// unchanged.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn create_users(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    let message = users_sentence(&actor.nickname, "created", &nicknames_of(subjects));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "create".to_owned(),
+            subjects: subjects.iter().collect(),
+            message,
+            data: subjects_data(subjects),
+        },
+    )
+    .await
 }
 
 /// Records a `force_password_reset`: `@admin forced password reset for
@@ -1347,12 +1382,24 @@ fn user_map(user: &User) -> Map<String, Value> {
 /// The `subject` entry for the user-list actions: an array of
 /// [`user_map`]s, Pleroma's `user_to_map` over the list.
 fn subject_data(users: &[User]) -> Map<String, Value> {
+    subjects_under("subject", users)
+}
+
+/// The same array under Pleroma's plural `subjects` key, which only the
+/// `create` clause of `get_log_entry_message` matches on.
+fn subjects_data(users: &[User]) -> Map<String, Value> {
+    subjects_under("subjects", users)
+}
+
+/// A user array under `key`: the one shape the singular and plural
+/// subject entries share.
+fn subjects_under(key: &str, users: &[User]) -> Map<String, Value> {
     let mut data = Map::new();
     let subjects = users
         .iter()
         .map(|user| Value::Object(user_map(user)))
         .collect::<Vec<Value>>();
-    put(&mut data, "subject", Value::Array(subjects));
+    put(&mut data, key, Value::Array(subjects));
     data
 }
 
@@ -1489,6 +1536,11 @@ mod tests {
             users_sentence("admin", "approved", &subjects),
             "@admin approved users: @alice, @bob",
             "the approve clause"
+        );
+        assert_eq!(
+            users_sentence("admin", "created", &subjects),
+            "@admin created users: @alice, @bob",
+            "the create clause"
         );
         assert_eq!(
             users_sentence("admin", "forced password reset for", &subjects),
@@ -1688,6 +1740,9 @@ mod tests {
             activate(&pool, &actor, &subjects).await.expect("records"),
             delete(&pool, &actor, &subjects).await.expect("records"),
             approve(&pool, &actor, &subjects).await.expect("records"),
+            create_users(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
             force_password_reset(&pool, &actor, &subjects)
                 .await
                 .expect("records"),
@@ -1710,26 +1765,35 @@ mod tests {
                 .await
                 .expect("records"),
         ];
-        let actions = [
-            "deactivate",
-            "activate",
-            "delete",
-            "approve",
-            "force_password_reset",
-            "updated_users",
-            "confirm_email",
-            "resend_confirmation_email",
-            "disable_mfa",
-            "add_suggestion",
-            "remove_suggestion",
+        let expectations = [
+            ("deactivate", "subject"),
+            ("activate", "subject"),
+            ("delete", "subject"),
+            ("approve", "subject"),
+            ("create", "subjects"),
+            ("force_password_reset", "subject"),
+            ("updated_users", "subject"),
+            ("confirm_email", "subject"),
+            ("resend_confirmation_email", "subject"),
+            ("disable_mfa", "subject"),
+            ("add_suggestion", "subject"),
+            ("remove_suggestion", "subject"),
         ];
-        for (row, action) in iter::zip(cases, actions) {
+        for (row, (action, subject_key)) in iter::zip(cases, expectations) {
             assert_eq!(row.action, action, "the action column");
             assert_eq!(row.subject_ids, vec![alice_id, bob_id], "{action} subjects");
             assert_eq!(
                 row.subject_nicknames,
                 names(&["alice", "bob"]),
                 "{action} nicknames"
+            );
+            assert_eq!(
+                row.data
+                    .get(subject_key)
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+                Some(2),
+                "{action} carries its user array under {subject_key}"
             );
             assert!(
                 row.message.starts_with("@mod ") && row.message.ends_with(" users: @alice, @bob"),
