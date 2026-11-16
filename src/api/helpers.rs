@@ -160,6 +160,59 @@ pub async fn status_for_viewer_or_404(
     }
 }
 
+/// The decoded pairs of one query string, read the way Pleroma's
+/// `conn.query_params` hands them to its controller.
+///
+/// The pairs are kept in order, so a repeated array key can be read as the
+/// list it is while a repeated scalar folds to its last value — how a
+/// query-parameter map reads either way.
+///
+/// Every listing that filters on more than the cursors reads its parameters
+/// through it rather than through `Query<HashMap<…>>`: a map refuses the
+/// bracketed array spelling a client sends (`tags[]=a`) outright, and the
+/// admin listings are exactly where clients send both shapes.
+#[derive(Debug)]
+pub struct QueryPairs(Vec<(String, String)>);
+
+impl QueryPairs {
+    /// Decodes `query` (an absent query string is no pairs at all).
+    #[must_use]
+    pub fn parse(query: Option<&str>) -> Self {
+        let pairs = query.map_or_else(Vec::default, |raw| {
+            form_urlencoded::parse(raw.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect()
+        });
+        Self(pairs)
+    }
+
+    /// The value of the last occurrence of `key`, `None` when it is absent
+    /// or empty — an empty parameter is nothing to filter on (Pleroma's
+    /// `not_empty_string` guard).
+    #[must_use]
+    pub fn value(&self, key: &str) -> Option<String> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(found, _)| found == key)
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Every value of `key` in occurrence order, in both the bracketed
+    /// spelling a client sends (`key[]`) and the bare one, empty values
+    /// dropped; neither spelling present is the empty list.
+    #[must_use]
+    pub fn values(&self, key: &str) -> Vec<String> {
+        let bracketed = format!("{key}[]");
+        self.0
+            .iter()
+            .filter(|(found, value)| !value.is_empty() && (found == key || found == &bracketed))
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+}
+
 /// The pagination keys the `Link` header replaces with its own cursors: the
 /// three id cursors and `offset`, the cursors [`PageParams`] reads
 /// (`limit` is a page size, not a cursor, and stays).
@@ -238,14 +291,17 @@ fn page_link(state: &AppState, uri: &Uri, rows: &[Status]) -> Option<String> {
 }
 
 /// The query parameters a page's `Link` targets repeat: the request's own
-/// pairs with the four cursors [`PageParams`] reads ([`CURSOR_KEYS`])
-/// dropped — each link carries its own, and the next page starts where this
-/// one ended. Every other parameter, `limit` included, rides on both links
-/// exactly as it arrived, so a followed link re-asks the same filtered
-/// timeline.
+/// pairs with the four cursors [`PageParams`] reads (`CURSOR_KEYS`) dropped.
+///
+/// Each link carries its own cursor, and the next page starts where this one
+/// ended. Every other parameter, `limit` included, rides on both links exactly
+/// as it arrived, so a followed link re-asks the same filtered listing: the
+/// timelines share it with the admin account listings, whose filters mean as
+/// much to a second page as a `tag` does.
 ///
 /// [`PageParams`]: crate::pagination::PageParams
-fn link_query(query: Option<&str>) -> Vec<(String, String)> {
+#[must_use]
+pub fn link_query(query: Option<&str>) -> Vec<(String, String)> {
     form_urlencoded::parse(query.unwrap_or_default().as_bytes())
         .filter(|(key, _value)| !CURSOR_KEYS.contains(&key.as_ref()))
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -436,6 +492,39 @@ mod tests {
             "filters and `limit` ride on, the cursors and `offset` do not"
         );
         assert!(link_query(None).is_empty(), "no query repeats nothing");
+    }
+
+    /// The pair reader's own rules: an absent key, an empty value, the order
+    /// of a list and the percent-decoding both listings rely on.
+    #[test]
+    fn the_pair_reader_folds_duplicates_and_drops_empties() {
+        let pairs = QueryPairs::parse(Some("a=1&a=&b=2&c[]=x&a[]=y&empty=&empty[]=&d=a%20b"));
+        assert_eq!(pairs.value("a").as_deref(), None, "the empty last value");
+        assert_eq!(pairs.value("b").as_deref(), Some("2"), "an ordinary value");
+        assert_eq!(pairs.value("d").as_deref(), Some("a b"), "a decoded value");
+        assert_eq!(pairs.value("missing"), None, "and an absent key");
+        assert_eq!(
+            pairs.values("empty"),
+            Vec::<String>::new(),
+            "a key whose every value is empty lists nothing"
+        );
+        assert_eq!(
+            pairs.values("a"),
+            vec!["1", "y"],
+            "a key with values in both spellings lists them in order"
+        );
+        assert_eq!(pairs.values("c"), vec!["x"], "the bracketed spelling");
+        assert_eq!(
+            pairs.values("missing"),
+            Vec::<String>::new(),
+            "an absent key is the empty list"
+        );
+        let none = QueryPairs::parse(None);
+        assert_eq!(
+            none.value("anything"),
+            None,
+            "no query string holds no pairs"
+        );
     }
 
     #[test]

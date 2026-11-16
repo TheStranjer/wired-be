@@ -202,7 +202,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::debug;
-use url::form_urlencoded;
 
 use crate::{
     api::{
@@ -210,6 +209,7 @@ use crate::{
             ACTOR_TYPES, SCOPES, SERVICE_ACTOR_TYPE, after_follow_changed, after_profile_updated,
             render_note, sanitized_name, stored_fields,
         },
+        helpers::QueryPairs,
         password_reset::RESET_PATH,
         pleroma_settings::{check_store_size, shallow_merge},
     },
@@ -2357,49 +2357,6 @@ fn list_params(query: Option<&str>) -> admin::ListParams {
     }
 }
 
-/// The decoded pairs of one query string, kept in order so a repeated array
-/// key can be read as the list it is while a repeated scalar folds to its
-/// last value — how a query-parameter map reads either way, and what
-/// Pleroma's `conn.query_params` hands its controller.
-#[derive(Debug)]
-struct QueryPairs(Vec<(String, String)>);
-
-impl QueryPairs {
-    /// Decodes `query` (an absent query string is no pairs at all).
-    fn parse(query: Option<&str>) -> Self {
-        let pairs = query.map_or_else(Vec::default, |raw| {
-            form_urlencoded::parse(raw.as_bytes())
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect()
-        });
-        Self(pairs)
-    }
-
-    /// The value of the last occurrence of `key`, `None` when it is absent
-    /// or empty — an empty parameter is nothing to filter on (Pleroma's
-    /// `not_empty_string` guard).
-    fn value(&self, key: &str) -> Option<String> {
-        self.0
-            .iter()
-            .rev()
-            .find(|(found, _)| found == key)
-            .map(|(_, value)| value.clone())
-            .filter(|value| !value.is_empty())
-    }
-
-    /// Every value of `key` in occurrence order, in both the bracketed
-    /// spelling a client sends (`key[]`) and the bare one, empty values
-    /// dropped; neither spelling present is the empty list.
-    fn values(&self, key: &str) -> Vec<String> {
-        let bracketed = format!("{key}[]");
-        self.0
-            .iter()
-            .filter(|(found, value)| !value.is_empty() && (found == key || found == &bracketed))
-            .map(|(_, value)| value.clone())
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2499,38 +2456,6 @@ mod tests {
             params.query.as_deref(),
             Some("second"),
             "the last occurrence wins"
-        );
-    }
-
-    /// The pair reader's own rules: an absent key, an empty value and the
-    /// order of a list.
-    #[test]
-    fn the_pair_reader_folds_duplicates_and_drops_empties() {
-        let pairs = QueryPairs::parse(Some("a=1&a=&b=2&c[]=x&a[]=y&empty=&empty[]="));
-        assert_eq!(pairs.value("a").as_deref(), None, "the empty last value");
-        assert_eq!(pairs.value("b").as_deref(), Some("2"), "an ordinary value");
-        assert_eq!(pairs.value("missing"), None, "and an absent key");
-        assert_eq!(
-            pairs.values("empty"),
-            Vec::<String>::new(),
-            "a key whose every value is empty lists nothing"
-        );
-        assert_eq!(
-            pairs.values("a"),
-            vec!["1", "y"],
-            "a key with values in both spellings lists them in order"
-        );
-        assert_eq!(pairs.values("c"), vec!["x"], "the bracketed spelling");
-        assert_eq!(
-            pairs.values("missing"),
-            Vec::<String>::new(),
-            "an absent key is the empty list"
-        );
-        let none = QueryPairs::parse(None);
-        assert_eq!(
-            none.value("anything"),
-            None,
-            "no query string holds no pairs"
         );
     }
 
