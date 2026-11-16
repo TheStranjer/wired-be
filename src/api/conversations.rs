@@ -95,7 +95,7 @@ use crate::{
     },
     oauth::scopes::{READ_STATUSES, WRITE_CONVERSATIONS},
     pagination::{PageParams, link_header, set_link_header},
-    services::render_status::render_statuses,
+    services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
 };
@@ -325,7 +325,7 @@ async fn list_statuses(
         user = %auth.0.id,
         "conversation statuses listed"
     );
-    let entities = render_statuses(&state, Some(&auth.0), &visible).await?;
+    let entities = render_statuses(&state, ViewerMode::user(&auth.0), &visible).await?;
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
@@ -585,7 +585,7 @@ async fn visible_statuses(
             visible.push(row);
         }
     }
-    let rendered = render_statuses(state, viewer, &visible).await?;
+    let rendered = render_statuses(state, ViewerMode::User(viewer), &visible).await?;
     let mut statuses = HashMap::new();
     for entity in rendered {
         let Some(id) = parse_id(&entity.id) else {

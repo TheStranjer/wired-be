@@ -1,9 +1,10 @@
 //! The admin API's JSON shapes (WBE-199, WBE-209, WBE-208, WBE-205,
-//! WBE-203).
+//! WBE-203, WBE-201).
 //!
 //! They cover the moderation-log page, the stats counters, the invite,
 //! webhook and ops entities, the OAuth-app and instance-document
-//! answers, and the relay ledger.
+//! answers, the relay ledger and the `{total, activities}` envelope of the
+//! two narrower admin status listings.
 //!
 //! Pleroma renders all of them through
 //! `Pleroma.Web.AdminAPI.ModerationLogView`
@@ -28,6 +29,7 @@ use serde_json::Value;
 
 use crate::{
     config::FrontendConfig,
+    entities::status::Status,
     models::{
         invite_token::InviteToken, moderation_log, oauth_app::OauthApp, relay::RelayListing,
         status::StatusVisibilityCounts, webhook::Webhook,
@@ -82,6 +84,24 @@ pub struct StatusVisibility {
 pub struct AdminStats {
     /// The live-status counters of the selected audience.
     pub status_visibility: StatusVisibility,
+}
+
+/// The `{total, activities}` answer of the two narrower admin status
+/// listings.
+///
+/// `GET /api/v1/pleroma/admin/users/{nickname}/statuses` and
+/// `GET …/instances/{instance}/statuses` render Pleroma's
+/// `AdminAPI.StatusView` `"index.json"` clause that carries a total,
+/// `%{total: total, activities: activities}`
+/// (`lib/pleroma/web/admin_api/views/status_view.ex`), the `activities`
+/// being the very [`Status`] entities of the client API. The whole-network
+/// `GET /statuses` answer is the bare array and has no page of its own.
+#[derive(Debug, Serialize)]
+pub struct AdminStatusPage {
+    /// How many statuses the listing's filters select, pages included.
+    pub total: i64,
+    /// The page, newest post first.
+    pub activities: Vec<Status>,
 }
 
 impl ModerationLogEntry {

@@ -523,7 +523,7 @@ use crate::{
         federation_out,
         filter::{self, FilterContext},
         notify,
-        render_status::{render_status, render_statuses},
+        render_status::{ViewerMode, render_status, render_statuses},
         rich_media::stored_card_json,
         schedule_status, streaming,
         translate::Translator,
@@ -893,7 +893,7 @@ async fn show_status(
     auth.require_user_scope(READ_STATUSES)?;
     let viewer = auth.0.as_ref();
     let row = status_for_viewer_or_404(&state, viewer, &id).await?;
-    let rendered = render_status(&state, viewer, &row).await?;
+    let rendered = render_status(&state, ViewerMode::User(viewer), &row).await?;
     Ok(Json(rendered.ok_or(AppError::NotFound)?))
 }
 
@@ -981,7 +981,7 @@ async fn delete_status(
     if !may_delete(&auth.0, &row) {
         return Err(AppError::Forbidden(RECORD_NOT_FOUND.to_owned()));
     }
-    let entity = render_status(&state, Some(&auth.0), &row)
+    let entity = render_status(&state, ViewerMode::user(&auth.0), &row)
         .await?
         .ok_or(AppError::NotFound)?;
     if !crate::services::delete_status::delete_status(&state, &row).await? {
@@ -1284,7 +1284,9 @@ async fn list_statuses(
     let live = status::get_many(&state.db, &requested).await?;
     let visible = status_visibility::filter_visible(&state.db, live, viewer).await?;
     let rows = in_requested_order(&requested, visible);
-    Ok(Json(render_statuses(&state, viewer, &rows).await?))
+    Ok(Json(
+        render_statuses(&state, ViewerMode::User(viewer), &rows).await?,
+    ))
 }
 
 /// `GET /api/v1/statuses/{id}/context` — the thread around the status `id`:
@@ -1333,8 +1335,10 @@ async fn get_status_context(
     let row = status_for_viewer_or_404(&state, viewer, &id).await?;
     let ancestor_rows = visible_ancestors(&state, viewer, row.id).await?;
     let descendant_rows = visible_descendants(&state, viewer, row.id).await?;
-    let rendered_ancestors = render_statuses(&state, viewer, &ancestor_rows).await?;
-    let rendered_descendants = render_statuses(&state, viewer, &descendant_rows).await?;
+    let rendered_ancestors =
+        render_statuses(&state, ViewerMode::User(viewer), &ancestor_rows).await?;
+    let rendered_descendants =
+        render_statuses(&state, ViewerMode::User(viewer), &descendant_rows).await?;
     let ancestors =
         filter::apply_active(&state, viewer, rendered_ancestors, FilterContext::Thread).await?;
     let mut descendants =
@@ -1640,7 +1644,7 @@ async fn list_favourites(
     )?;
     Ok((
         headers,
-        Json(render_statuses(&state, Some(&auth.0), &visible).await?),
+        Json(render_statuses(&state, ViewerMode::user(&auth.0), &visible).await?),
     ))
 }
 
@@ -1848,7 +1852,7 @@ async fn list_quotes(
     )?;
     Ok((
         headers,
-        Json(render_statuses(&state, viewer, &visible).await?),
+        Json(render_statuses(&state, ViewerMode::User(viewer), &visible).await?),
     ))
 }
 
@@ -2121,7 +2125,7 @@ async fn list_bookmarks(
     )?;
     Ok((
         headers,
-        Json(render_statuses(&state, Some(&auth.0), &visible).await?),
+        Json(render_statuses(&state, ViewerMode::user(&auth.0), &visible).await?),
     ))
 }
 
@@ -2435,7 +2439,7 @@ async fn current_entity(state: &AppState, viewer: &User, id: Uuid) -> AppResult<
     let row = status::get_by_id(&state.db, id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let entity = render_status(state, Some(viewer), &row)
+    let entity = render_status(state, ViewerMode::user(viewer), &row)
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(entity))

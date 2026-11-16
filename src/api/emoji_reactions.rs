@@ -118,7 +118,10 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    services::{federation_out, notify, render_status::render_status},
+    services::{
+        federation_out, notify,
+        render_status::{ViewerMode, render_status},
+    },
     state::AppState,
     util::emoji::Emoji,
 };
@@ -446,7 +449,7 @@ async fn rendered_status(
     viewer: &User,
     row: &StatusRow,
 ) -> AppResult<Json<Status>> {
-    let entity = render_status(state, Some(viewer), row)
+    let entity = render_status(state, ViewerMode::user(viewer), row)
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(entity))

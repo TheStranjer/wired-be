@@ -174,8 +174,9 @@ use crate::{
     state::AppState,
 };
 
-/// Renders `statuses` as the [`Status`] entity for `viewer` (`None`: an
-/// anonymous request), in the input order.
+/// Renders `statuses` as the [`Status`] entity for `viewer` (see
+/// [`ViewerMode`]: whose account the per-viewer flags render from, and
+/// whether the visibility rules apply), in the input order.
 ///
 /// The rows arrive as the caller paged and narrowed them — per-status
 /// visibility is the caller's [`filter_visible`] step — and this renderer
@@ -201,7 +202,7 @@ use crate::{
 /// [`filter_visible`]: crate::models::status_visibility::filter_visible
 pub async fn render_statuses(
     state: &AppState,
-    viewer: Option<&User>,
+    viewer: ViewerMode<'_>,
     statuses: &[StatusRow],
 ) -> AppResult<Vec<Status>> {
     let rows: Vec<&StatusRow> = statuses
@@ -215,6 +216,81 @@ pub async fn render_statuses(
     Ok(batch.render_all(&rows))
 }
 
+/// Who a page of [`Status`] entities renders for, and how much of the
+/// post network that render may see: the second argument of
+/// [`render_statuses`] and [`render_status`].
+///
+/// The two modes differ in exactly one thing — whether the visibility
+/// rules of [`crate::models::status_visibility`] are in force inside the
+/// render — and agree in the rest: both name the account whose own flags
+/// (`favourited`, `reblogged`, `bookmarked`, `pinned`, `muted`,
+/// `pleroma.relationship`, the poll's `voted`) the entity carries.
+///
+/// - [`ViewerMode::User`] is every ordinary surface: the viewer's own
+///   account, or `None` for an anonymous request. The rules are in force,
+///   so a quoted original the viewer may not reach renders `quote: null`
+///   with `pleroma.quote_visible` false (the module docs' step 3 read).
+/// - [`ViewerMode::Admin`] is the staff surface of
+///   [`crate::api::admin::statuses`] (WBE-201): Pleroma's
+///   `AdminAPI.StatusController` and its `AdminAPI.StatusView`, which
+///   render an activity's JSON with the reading admin as viewer and run no
+///   visibility filter at all. The staff member's own flags still render
+///   off their own account; what the mode grants is that every quoted
+///   original on the page is admitted, private or direct included.
+///
+/// The mode is the renderer's half of the bypass only. Which *rows* a
+/// staff listing carries is the caller's filter — the admin listing's
+/// `godmode` parameter and the absence of any [`filter_visible`] step are
+/// what decide that; this type decides nothing about the rows it is handed.
+///
+/// [`filter_visible`]: crate::models::status_visibility::filter_visible
+#[derive(Clone, Copy, Debug)]
+pub enum ViewerMode<'a> {
+    /// The ordinary view of `viewer` — `None` for an anonymous request —
+    /// with the visibility rules in force.
+    User(Option<&'a User>),
+    /// The staff view of an admin or moderator, with the visibility rules
+    /// bypassed.
+    Admin(&'a User),
+}
+
+impl<'a> ViewerMode<'a> {
+    /// The anonymous view: the `User` arm holding `None`, the spelling the
+    /// unauthenticated callers read better than the nested option.
+    pub const ANONYMOUS: Self = Self::User(None);
+
+    /// The ordinary view of `viewer`, the flags of their account and no
+    /// other, with the visibility rules in force.
+    #[must_use]
+    pub const fn user(viewer: &'a User) -> Self {
+        Self::User(Some(viewer))
+    }
+
+    /// The staff view of `admin`: their own flags, the visibility rules
+    /// bypassed.
+    #[must_use]
+    pub const fn admin(admin: &'a User) -> Self {
+        Self::Admin(admin)
+    }
+
+    /// The account whose own flags render, `None` for an anonymous view.
+    #[must_use]
+    pub const fn viewer(self) -> Option<&'a User> {
+        match self {
+            Self::User(viewer) => viewer,
+            Self::Admin(admin) => Some(admin),
+        }
+    }
+
+    /// Whether the visibility rules of [`crate::models::status_visibility`]
+    /// are bypassed for this view: [`ViewerMode::Admin`] is, and
+    /// [`ViewerMode::User`] never is.
+    #[must_use]
+    pub const fn bypasses_visibility(self) -> bool {
+        matches!(self, Self::Admin(_))
+    }
+}
+
 /// Renders the single `status`, delegating to [`render_statuses`]: `None`
 /// when the row is a tombstone, or a reblog whose original is gone. One
 /// row costs the same fixed query set, no more.
@@ -224,7 +300,7 @@ pub async fn render_statuses(
 /// As [`render_statuses`].
 pub async fn render_status(
     state: &AppState,
-    viewer: Option<&User>,
+    viewer: ViewerMode<'_>,
     status: &StatusRow,
 ) -> AppResult<Option<Status>> {
     let mut rendered = render_statuses(state, viewer, std::slice::from_ref(status)).await?;
@@ -343,58 +419,19 @@ impl<'a> Batch<'a> {
     /// empty.
     async fn load(
         state: &'a AppState,
-        viewer: Option<&'a User>,
+        mode: ViewerMode<'a>,
         rows: &[&'a StatusRow],
     ) -> AppResult<Self> {
         let pool = &state.db;
+        let viewer = mode.viewer();
         let reblog_ids = distinct(rows.iter().copied().filter_map(|row| row.reblog_of_id));
         let originals = load_statuses_by_id(pool, &reblog_ids).await?;
         let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
-        let quoted = load_statuses_by_id(pool, &quote_ids).await?;
-        let visible_quotes = load_visible_quotes(pool, &quoted, viewer).await?;
-        debug!(
-            quotes = quoted.len(),
-            visible = visible_quotes.len(),
-            "quoted originals batch-loaded; the visible ones render nested, one level deep"
-        );
-        let rendered_ids = distinct(
-            rows.iter()
-                .copied()
-                .map(|row| row.id)
-                .chain(originals.keys().copied())
-                .chain(quoted.keys().copied()),
-        );
-        let account_ids = distinct(
-            rows.iter()
-                .copied()
-                .chain(originals.values())
-                .chain(quoted.values())
-                .flat_map(|row| [Some(row.user_id), row.in_reply_to_account_id])
-                .flatten(),
-        );
-        let author_ids = distinct(
-            rows.iter()
-                .copied()
-                .map(|row| row.user_id)
-                .chain(originals.values().map(|row| row.user_id))
-                .chain(quoted.values().map(|row| row.user_id)),
-        );
-        let conversation_ids = distinct(
-            rows.iter()
-                .copied()
-                .chain(originals.values())
-                .chain(quoted.values())
-                .map(|row| row.conversation_id),
-        );
-        let direct_ids = distinct(
-            rows.iter()
-                .copied()
-                .chain(originals.values())
-                .filter_map(|row| row.direct_conversation_id),
-        );
-        let polls = load_polls(pool, &rendered_ids).await?;
-        let poll_options = load_poll_options(pool, &rendered_ids).await?;
-        let poll_votes = load_poll_votes(pool, &rendered_ids, viewer).await?;
+        let (quoted, visible_quotes) = load_quotes(pool, &quote_ids, mode).await?;
+        let ids = PageIds::of(rows, &originals, &quoted);
+        let polls = load_polls(pool, &ids.rendered).await?;
+        let poll_options = load_poll_options(pool, &ids.rendered).await?;
+        let poll_votes = load_poll_votes(pool, &ids.rendered, viewer).await?;
         debug!(
             polls = polls.len(),
             options = poll_options.len(),
@@ -404,25 +441,25 @@ impl<'a> Batch<'a> {
         Ok(Self {
             config: state.config.as_ref(),
             viewer,
-            users: load_users(pool, &account_ids).await?,
+            users: load_users(pool, &ids.accounts).await?,
             originals,
             quoted,
             visible_quotes,
-            media: load_media(pool, &rendered_ids).await?,
-            mentions: load_mentions(pool, &rendered_ids).await?,
-            tags: load_tags(pool, &rendered_ids).await?,
-            reactions: load_reactions(pool, &rendered_ids, viewer).await?,
-            favourites: load_favourites(pool, &rendered_ids, viewer).await?,
-            reblogs: load_reblogs(pool, &rendered_ids, viewer).await?,
-            bookmarks: load_bookmarks(pool, &rendered_ids, viewer).await?,
-            pins: load_pins(pool, &rendered_ids, viewer).await?,
-            thread_mutes: load_thread_mutes(pool, &conversation_ids, viewer).await?,
-            direct_participations: load_direct_participations(pool, &direct_ids, viewer).await?,
+            media: load_media(pool, &ids.rendered).await?,
+            mentions: load_mentions(pool, &ids.rendered).await?,
+            tags: load_tags(pool, &ids.rendered).await?,
+            reactions: load_reactions(pool, &ids.rendered, viewer).await?,
+            favourites: load_favourites(pool, &ids.rendered, viewer).await?,
+            reblogs: load_reblogs(pool, &ids.rendered, viewer).await?,
+            bookmarks: load_bookmarks(pool, &ids.rendered, viewer).await?,
+            pins: load_pins(pool, &ids.rendered, viewer).await?,
+            thread_mutes: load_thread_mutes(pool, &ids.conversations, viewer).await?,
+            direct_participations: load_direct_participations(pool, &ids.directs, viewer).await?,
             polls,
             poll_options,
             poll_votes,
-            relationships: load_relationships(pool, viewer, &author_ids).await?,
-            cards: load_cards(pool, &rendered_ids).await?,
+            relationships: load_relationships(pool, viewer, &ids.authors).await?,
+            cards: load_cards(pool, &ids.rendered).await?,
         })
     }
 
@@ -611,14 +648,112 @@ async fn load_statuses_by_id(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<U
 /// (its `quote_id` still names the target). The quoted rows' authors are
 /// the page's strangers' by nature, so the filter's follow/mention/
 /// block `EXISTS` arms run for real here.
+///
+/// [`ViewerMode::Admin`] runs no filter at all — Pleroma's
+/// `AdminAPI.StatusView` asks the visibility question of nobody — so every
+/// quoted row on the page is in the set and the database is not asked, and
+/// [`ViewerMode::User`] is the ordinary read.
 async fn load_visible_quotes(
     pool: &PgPool,
     quoted: &HashMap<Uuid, StatusRow>,
-    viewer: Option<&User>,
+    mode: ViewerMode<'_>,
 ) -> AppResult<HashSet<Uuid>> {
     let candidates: Vec<StatusRow> = quoted.values().cloned().collect();
-    let visible = status_visibility::filter_visible(pool, candidates, viewer).await?;
+    if mode.bypasses_visibility() {
+        return Ok(candidates.iter().map(|row| row.id).collect());
+    }
+    let visible = status_visibility::filter_visible(pool, candidates, mode.viewer()).await?;
     Ok(visible.into_iter().map(|row| row.id).collect())
+}
+
+/// The [module docs]' steps 2 and 3 as one question — what does this view
+/// see of what these posts quote? — answered as the two maps the batch
+/// keeps: every quoted original the page names, and the subset admitted to
+/// nest. Split out of [`Batch::load`] because the pair always travels
+/// together.
+async fn load_quotes(
+    pool: &PgPool,
+    quote_ids: &[Uuid],
+    mode: ViewerMode<'_>,
+) -> AppResult<(HashMap<Uuid, StatusRow>, HashSet<Uuid>)> {
+    let quoted = load_statuses_by_id(pool, quote_ids).await?;
+    let visible_quotes = load_visible_quotes(pool, &quoted, mode).await?;
+    debug!(
+        quotes = quoted.len(),
+        visible = visible_quotes.len(),
+        "quoted originals batch-loaded; the visible ones render nested, one level deep"
+    );
+    Ok((quoted, visible_quotes))
+}
+
+/// The id sets [`Batch::load`] asks its keyed loaders about, walked once
+/// from the page and the two nested-row maps: the same five `distinct`
+/// collections for every render, named instead of spelled out inline.
+#[derive(Debug)]
+struct PageIds {
+    /// Every row this render emits an entity for — the page's own ids with
+    /// the reblogged originals and quoted originals beside them. The key of
+    /// every status-keyed loader.
+    rendered: Vec<Uuid>,
+    /// Every author and replied-to author the page and its nested rows
+    /// name.
+    accounts: Vec<Uuid>,
+    /// The authors whose relationship to the viewer renders: the `user_id`
+    /// of every emitted row, nested ones included.
+    authors: Vec<Uuid>,
+    /// The threads the page touches, for the viewer's muted-thread read.
+    conversations: Vec<Uuid>,
+    /// The direct-message threads the page touches, for the viewer's
+    /// participation read.
+    directs: Vec<Uuid>,
+}
+
+impl PageIds {
+    /// Collects the five sets in first-seen order over `rows`, the
+    /// `originals` they reblog and the `quoted` they quote.
+    fn of(
+        rows: &[&StatusRow],
+        originals: &HashMap<Uuid, StatusRow>,
+        quoted: &HashMap<Uuid, StatusRow>,
+    ) -> Self {
+        Self {
+            rendered: distinct(
+                rows.iter()
+                    .copied()
+                    .map(|row| row.id)
+                    .chain(originals.keys().copied())
+                    .chain(quoted.keys().copied()),
+            ),
+            accounts: distinct(
+                rows.iter()
+                    .copied()
+                    .chain(originals.values())
+                    .chain(quoted.values())
+                    .flat_map(|row| [Some(row.user_id), row.in_reply_to_account_id])
+                    .flatten(),
+            ),
+            authors: distinct(
+                rows.iter()
+                    .copied()
+                    .map(|row| row.user_id)
+                    .chain(originals.values().map(|row| row.user_id))
+                    .chain(quoted.values().map(|row| row.user_id)),
+            ),
+            conversations: distinct(
+                rows.iter()
+                    .copied()
+                    .chain(originals.values())
+                    .chain(quoted.values())
+                    .map(|row| row.conversation_id),
+            ),
+            directs: distinct(
+                rows.iter()
+                    .copied()
+                    .chain(originals.values())
+                    .filter_map(|row| row.direct_conversation_id),
+            ),
+        }
+    }
 }
 
 /// [`user::get_many`] keyed by id — one query for every author and
@@ -942,7 +1077,9 @@ mod tests {
 
     /// Renders `statuses` anonymously and returns the first entity's JSON.
     async fn render_first(state: &AppState, statuses: &[StatusRow]) -> Value {
-        let rendered = render_statuses(state, None, statuses).await.unwrap();
+        let rendered = render_statuses(state, ViewerMode::ANONYMOUS, statuses)
+            .await
+            .unwrap();
         serde_json::to_value(&rendered[0]).unwrap()
     }
 
@@ -966,7 +1103,9 @@ mod tests {
         .await
         .unwrap();
 
-        let rendered = render_status(&state, None, &status).await.unwrap();
+        let rendered = render_status(&state, ViewerMode::ANONYMOUS, &status)
+            .await
+            .unwrap();
         let entity = rendered.expect("a live status renders");
         let value = serde_json::to_value(&entity).unwrap();
         assert_eq!(value["id"], status.id.to_string());
@@ -1056,7 +1195,9 @@ mod tests {
         .unwrap();
 
         let page = [reply.clone(), media.clone()];
-        let rendered = render_statuses(&state, None, &page).await.unwrap();
+        let rendered = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
+            .await
+            .unwrap();
         assert_eq!(
             rendered_ids(&rendered),
             id_strings(&page),
@@ -1181,7 +1322,7 @@ mod tests {
         react(&pool, &bob, &second, THUMB, None).await;
 
         let page = [first.clone(), reblog.clone()];
-        let for_bob = render_statuses(&state, Some(&bob), &page)
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), &page)
             .await
             .expect("the page renders for bob");
         let reblog_json = serde_json::to_value(&for_bob[1]).expect("the reblog serializes");
@@ -1219,9 +1360,10 @@ mod tests {
              who reacted with one of them"
         );
 
-        let anonymous = render_statuses(&state, None, std::slice::from_ref(&first))
-            .await
-            .expect("the post renders anonymously");
+        let anonymous =
+            render_statuses(&state, ViewerMode::ANONYMOUS, std::slice::from_ref(&first))
+                .await
+                .expect("the post renders anonymously");
         assert_eq!(
             serde_json::to_value(&anonymous[0]).expect("it serializes")["pleroma"]
                 ["emoji_reactions"]
@@ -1264,7 +1406,7 @@ mod tests {
                 .clone()
         };
         let page = [liked.clone(), ignored.clone(), reblog.clone()];
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(flag(&for_alice[0]), json!(true), "alice's own like shows");
@@ -1286,7 +1428,7 @@ mod tests {
             "and the nested original carries its own flag"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&liked))
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), std::slice::from_ref(&liked))
             .await
             .expect("the post renders for bob");
         assert_eq!(
@@ -1294,7 +1436,7 @@ mod tests {
             json!(false),
             "alice's like is nobody else's flag"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1328,7 +1470,7 @@ mod tests {
             serde_json::to_value(entity).expect("a rendered status serializes")["reblogged"].clone()
         };
         let page = [boosted.clone(), ignored.clone(), reblog.clone()];
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(
@@ -1354,15 +1496,19 @@ mod tests {
             "and the nested original carries its own flag"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&boosted))
-            .await
-            .expect("the post renders for bob");
+        let for_bob = render_statuses(
+            &state,
+            ViewerMode::user(&bob),
+            std::slice::from_ref(&boosted),
+        )
+        .await
+        .expect("the post renders for bob");
         assert_eq!(
             flag(&for_bob[0]),
             json!(false),
             "alice's boost is nobody else's flag"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1405,7 +1551,7 @@ mod tests {
                 .clone()
         };
         let page = [saved.clone(), ignored.clone(), reblog.clone()];
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(flag(&for_alice[0]), json!(true), "alice's bookmark shows");
@@ -1427,7 +1573,7 @@ mod tests {
             "and the nested original, never bookmarked, is not"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&saved))
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), std::slice::from_ref(&saved))
             .await
             .expect("the post renders for bob");
         assert_eq!(
@@ -1435,7 +1581,7 @@ mod tests {
             json!(false),
             "alice's bookmark is nobody else's flag"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1471,7 +1617,7 @@ mod tests {
                 .clone()
         };
         let page = [filed.clone(), unfiled.clone()];
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(
@@ -1490,7 +1636,7 @@ mod tests {
             "and the flag and the folder come from the one read"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&filed))
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), std::slice::from_ref(&filed))
             .await
             .expect("the post renders for bob");
         assert_eq!(
@@ -1498,7 +1644,7 @@ mod tests {
             Value::Null,
             "alice's folder is nobody else's key"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1559,7 +1705,7 @@ mod tests {
             )
         };
         let page = [own.clone(), second.clone(), reblog.clone()];
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(
@@ -1590,7 +1736,7 @@ mod tests {
             "with its stamp"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&own))
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), std::slice::from_ref(&own))
             .await
             .expect("the post renders for bob");
         assert_eq!(
@@ -1598,7 +1744,7 @@ mod tests {
             (json!(false), json!(null)),
             "alice's pin is nobody else's flag"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1639,7 +1785,7 @@ mod tests {
             )
         };
         let page = [muted.clone(), open.clone(), boost.clone()];
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(
@@ -1665,7 +1811,7 @@ mod tests {
             "and the nested original carries the same pair"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&muted))
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), std::slice::from_ref(&muted))
             .await
             .expect("the post renders for bob");
         assert_eq!(
@@ -1673,7 +1819,7 @@ mod tests {
             (json!(false), json!(false)),
             "alice's mute is nobody else's flag"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1732,7 +1878,7 @@ mod tests {
         let bob_expected = the_participation(&pool, &bob, thread).await;
         let page = [dm.clone(), quiet.clone()];
 
-        let for_alice = render_statuses(&state, Some(&alice), &page)
+        let for_alice = render_statuses(&state, ViewerMode::user(&alice), &page)
             .await
             .expect("the page renders for alice");
         assert_eq!(
@@ -1746,7 +1892,7 @@ mod tests {
             "and the public row on the same page stays unkeyed"
         );
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&dm))
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), std::slice::from_ref(&dm))
             .await
             .expect("the post renders for bob");
         assert_eq!(
@@ -1755,15 +1901,16 @@ mod tests {
             "bob's view of the same DM names his participation, not alice's"
         );
 
-        let for_carol = render_statuses(&state, Some(&carol), std::slice::from_ref(&dm))
-            .await
-            .expect("the post renders for carol");
+        let for_carol =
+            render_statuses(&state, ViewerMode::user(&carol), std::slice::from_ref(&dm))
+                .await
+                .expect("the post renders for carol");
         assert_eq!(
             field(&for_carol[0]),
             Value::Null,
             "a stranger to the thread renders null"
         );
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert!(
@@ -1913,7 +2060,7 @@ mod tests {
         let expected = expected_open_poll(&open, true, &[1]);
 
         let page = [polled.clone(), plain.clone(), reblog.clone()];
-        let for_bob = render_statuses(&state, Some(&bob), &page)
+        let for_bob = render_statuses(&state, ViewerMode::user(&bob), &page)
             .await
             .expect("the page renders for bob");
         assert_eq!(
@@ -1949,9 +2096,10 @@ mod tests {
         let state = test_state(&pool);
         let (_alice, _bob, polled, open) = open_poll_fixture(&pool).await;
 
-        let anonymous = render_statuses(&state, None, std::slice::from_ref(&polled))
-            .await
-            .expect("the poll renders anonymously");
+        let anonymous =
+            render_statuses(&state, ViewerMode::ANONYMOUS, std::slice::from_ref(&polled))
+                .await
+                .expect("the poll renders anonymously");
         let value = serde_json::to_value(&anonymous[0]).expect("it serializes");
         assert_eq!(
             value["poll"],
@@ -1980,9 +2128,13 @@ mod tests {
         let yes = choices.first().expect("the fixture poll has an option");
         vote(&pool, hidden.id, yes.id, bob.id).await;
 
-        let for_bob = render_statuses(&state, Some(&bob), std::slice::from_ref(&secret))
-            .await
-            .expect("the hidden-totals poll renders for bob");
+        let for_bob = render_statuses(
+            &state,
+            ViewerMode::user(&bob),
+            std::slice::from_ref(&secret),
+        )
+        .await
+        .expect("the hidden-totals poll renders for bob");
         let value = serde_json::to_value(&for_bob[0]).expect("it serializes");
         assert_eq!(
             value["poll"]["options"],
@@ -2064,7 +2216,7 @@ mod tests {
             serde_json::to_value(entity).expect("a rendered status serializes")["card"].clone()
         };
         let page = [original.clone(), dead.clone(), boost.clone()];
-        let anonymous = render_statuses(&state, None, &page)
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &page)
             .await
             .expect("the page renders anonymously");
         assert_eq!(
@@ -2088,9 +2240,13 @@ mod tests {
             "and the nested original its own, from the same batch"
         );
 
-        let for_alice = render_statuses(&state, Some(&alice), std::slice::from_ref(&original))
-            .await
-            .expect("the post renders for alice");
+        let for_alice = render_statuses(
+            &state,
+            ViewerMode::user(&alice),
+            std::slice::from_ref(&original),
+        )
+        .await
+        .expect("the post renders for alice");
         assert_eq!(
             card_of(&for_alice[0]),
             card,
@@ -2149,7 +2305,7 @@ mod tests {
         let deep = quote(&pool, &alice, &secret, Visibility::Private).await;
         let chain = quote(&pool, &carol, &deep, Visibility::Public).await;
 
-        let anonymous = render_status(&state, None, &public_quote)
+        let anonymous = render_status(&state, ViewerMode::ANONYMOUS, &public_quote)
             .await
             .expect("the public quote renders")
             .expect("a live public row renders");
@@ -2174,7 +2330,7 @@ mod tests {
         );
         assert_eq!(open["pleroma"]["quote_visible"], json!(true));
 
-        let for_owner = render_status(&state, Some(&alice), &chain)
+        let for_owner = render_status(&state, ViewerMode::user(&alice), &chain)
             .await
             .expect("the chain renders for alice")
             .expect("and answers");
@@ -2192,7 +2348,7 @@ mod tests {
         assert_eq!(owned["quote"]["quote_id"], secret.id.to_string());
         assert_eq!(owned["quote"]["pleroma"]["quote_visible"], json!(false));
 
-        let anonymous_chain = render_status(&state, None, &chain)
+        let anonymous_chain = render_status(&state, ViewerMode::ANONYMOUS, &chain)
             .await
             .expect("the chain renders anonymously")
             .expect("and answers");
@@ -2209,6 +2365,60 @@ mod tests {
         );
         assert_eq!(quiet["pleroma"]["quote"], Value::Null);
         assert_eq!(quiet["pleroma"]["quote_visible"], json!(false));
+    }
+
+    /// The one lift [`ViewerMode::Admin`] buys, on the renderer's own
+    /// surface: a quoted original its viewer cannot reach still nests for
+    /// staff, where the anonymous view — and any [`ViewerMode::User`] —
+    /// leaves it null with `quote_visible` false. The post's own render is
+    /// the standard entity either way: the mode adds no admin key, exactly
+    /// as Pleroma's `AdminAPI.StatusView` delegates to `MastodonAPI.StatusView`.
+    #[tokio::test]
+    async fn the_admin_view_nests_a_quote_its_viewer_cannot_reach() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let root = user(&pool, "root").await;
+        let secret = insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                visibility: Visibility::Private,
+                ..NewStatus::local(&alice, "followers only")
+            },
+        )
+        .await
+        .expect("a private post inserts");
+        let quoting = quote(&pool, &alice, &secret, Visibility::Public).await;
+
+        let anonymous_row = render_status(&state, ViewerMode::ANONYMOUS, &quoting)
+            .await
+            .expect("the quoting row renders")
+            .expect("a live public row renders");
+        let anonymous = serde_json::to_value(&anonymous_row).expect("it serializes");
+        assert_eq!(
+            anonymous["quote"],
+            Value::Null,
+            "an anonymous viewer may not reach alice's private quote"
+        );
+        assert_eq!(anonymous["pleroma"]["quote_visible"], json!(false));
+
+        let staff_row = render_status(&state, ViewerMode::admin(&root), &quoting)
+            .await
+            .expect("the same row renders for staff")
+            .expect("and answers");
+        let seen = serde_json::to_value(&staff_row).expect("it serializes");
+        assert_eq!(
+            seen["quote"]["id"],
+            secret.id.to_string(),
+            "the admin view admits the private quote and nests it"
+        );
+        assert_eq!(seen["pleroma"]["quote_visible"], json!(true));
+        assert_eq!(
+            seen["visibility"], anonymous["visibility"],
+            "the outer entity is the same standard Status in both views"
+        );
     }
 
     #[tokio::test]
@@ -2229,7 +2439,9 @@ mod tests {
         // renders all twenty rows, anonymous and authenticated alike. A
         // per-row loader would show up as twenty times the queries, and
         // this call makes exactly the fixed set of the module docs.
-        let anonymous = render_statuses(&state, None, &all).await.unwrap();
+        let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, &all)
+            .await
+            .unwrap();
         assert_eq!(
             rendered_ids(&anonymous),
             want,
@@ -2237,7 +2449,9 @@ mod tests {
         );
 
         let viewer = &authors[0];
-        let for_viewer = render_statuses(&state, Some(viewer), &all).await.unwrap();
+        let for_viewer = render_statuses(&state, ViewerMode::user(viewer), &all)
+            .await
+            .unwrap();
         assert_eq!(for_viewer.len(), 20, "a viewer renders the same page");
         let value = serde_json::to_value(&for_viewer[0]).unwrap();
         assert_eq!(
@@ -2323,13 +2537,13 @@ mod tests {
         let state = test_state(&pool);
         let (alice, page) = mixed_page(&pool).await;
 
-        assert_page_equals_rows(&state, None, &page).await;
-        assert_page_equals_rows(&state, Some(&alice), &page).await;
+        assert_page_equals_rows(&state, ViewerMode::ANONYMOUS, &page).await;
+        assert_page_equals_rows(&state, ViewerMode::user(&alice), &page).await;
     }
 
     /// Batch-render `page` for `viewer` and compare entry for entry with
     /// the same rows rendered one at a time: the two paths must agree.
-    async fn assert_page_equals_rows(state: &AppState, viewer: Option<&User>, page: &[StatusRow]) {
+    async fn assert_page_equals_rows(state: &AppState, viewer: ViewerMode<'_>, page: &[StatusRow]) {
         let batched = render_statuses(state, viewer, page).await.unwrap();
         assert_eq!(batched.len(), 4, "every live row of the page renders");
         for (entry, row) in batched.iter().zip(page) {
@@ -2385,7 +2599,7 @@ mod tests {
         .await
         .unwrap();
 
-        let entity = render_status(&state, None, &reblog)
+        let entity = render_status(&state, ViewerMode::ANONYMOUS, &reblog)
             .await
             .unwrap()
             .expect("a reblog of a live original renders");
@@ -2452,9 +2666,13 @@ mod tests {
         assert!(tombstone.deleted_at.is_some(), "the row is a tombstone");
 
         let keep_id = keep.id.to_string();
-        let rendered = render_statuses(&state, None, &[keep, tombstone.clone(), orphan_reblog])
-            .await
-            .unwrap();
+        let rendered = render_statuses(
+            &state,
+            ViewerMode::ANONYMOUS,
+            &[keep, tombstone.clone(), orphan_reblog],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             rendered_ids(&rendered),
             [keep_id],
@@ -2462,7 +2680,7 @@ mod tests {
              skipped; whatever survives keeps its place"
         );
         assert!(
-            render_status(&state, None, &tombstone)
+            render_status(&state, ViewerMode::ANONYMOUS, &tombstone)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2494,7 +2712,7 @@ mod tests {
             "the anonymous viewer embeds Pleroma's empty relationship"
         );
 
-        let for_bob = render_status(&state, Some(&bob), &status)
+        let for_bob = render_status(&state, ViewerMode::user(&bob), &status)
             .await
             .unwrap()
             .expect("it renders for bob too");
@@ -2504,7 +2722,7 @@ mod tests {
             "the batched relationship preload reaches the account entity"
         );
 
-        let for_alice = render_status(&state, Some(&alice), &status)
+        let for_alice = render_status(&state, ViewerMode::user(&alice), &status)
             .await
             .unwrap()
             .expect("and for the author");
@@ -2545,7 +2763,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rendered = render_status(&state, None, &status)
+        let rendered = render_status(&state, ViewerMode::ANONYMOUS, &status)
             .await
             .unwrap()
             .expect("a mirror renders");
@@ -2580,11 +2798,17 @@ mod tests {
             .unwrap()
             .expect("the post was live");
 
-        let rendered = render_statuses(&state, None, &[]).await.unwrap();
-        assert!(rendered.is_empty(), "nothing in answers nothing out");
-        let tombstoned = render_statuses(&state, None, std::slice::from_ref(&tombstone))
+        let rendered = render_statuses(&state, ViewerMode::ANONYMOUS, &[])
             .await
             .unwrap();
+        assert!(rendered.is_empty(), "nothing in answers nothing out");
+        let tombstoned = render_statuses(
+            &state,
+            ViewerMode::ANONYMOUS,
+            std::slice::from_ref(&tombstone),
+        )
+        .await
+        .unwrap();
         assert!(
             tombstoned.is_empty(),
             "a page of tombstones renders empty without loading anything"

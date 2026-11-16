@@ -87,7 +87,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ, READ_LISTS, READ_NOTIFICATIONS, READ_STATUSES, Scopes},
-    services::render_status::render_status,
+    services::render_status::{ViewerMode, render_status},
     state::AppState,
     streaming::hub::{Audience, RenderSpec, StreamEvent, stream_matches},
 };
@@ -649,7 +649,7 @@ impl Connection {
             return None;
         }
         let viewer = self.viewer();
-        match render_status(&self.state, viewer, &row).await {
+        match render_status(&self.state, ViewerMode::User(viewer), &row).await {
             Ok(Some(entity)) => entity_json(&entity, id),
             Ok(None) => {
                 debug!(%id, "a streaming render hint has no renderable view");

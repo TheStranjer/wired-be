@@ -85,6 +85,15 @@ mod admin_ops;
 /// moderation-log entries, and the staff-and-scope gate on every route.
 mod admin_reports;
 
+/// The admin statuses surface over HTTP (`/api/v1/pleroma/admin/statuses…`,
+/// WBE-201): the network ledger with its `godmode` / `local_only` /
+/// `with_reblogs` filters and its `page` / `page_size` window, the
+/// visibility-free show, the scope write with its moderation entry and
+/// federated `Update`, the shared deletion service behind `DELETE` with its
+/// `{}` answer, the two `{total, activities}` envelopes of one account and
+/// one domain, and the staff-and-scope gate on all six routes.
+mod admin_statuses;
+
 /// The admin users endpoints over HTTP (`GET /api/v1/pleroma/admin/users`
 /// and `GET …/users/{nickname}`, WBE-195): the eight filters and their
 /// combinations, the query and the named criteria, the page window beside

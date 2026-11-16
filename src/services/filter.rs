@@ -225,7 +225,7 @@ mod tests {
             status::{self, NewStatus, Status as StatusRow, Visibility},
             user::{self, NewUser, local_ap_id},
         },
-        services::render_status::render_statuses,
+        services::render_status::{ViewerMode, render_statuses},
         uploads::UploaderBackend,
     };
 
@@ -329,7 +329,7 @@ mod tests {
         filters: &[Filter],
         context: FilterContext,
     ) -> Vec<StatusEntity> {
-        let page = render_statuses(test_state, viewer, rows)
+        let page = render_statuses(test_state, ViewerMode::User(viewer), rows)
             .await
             .expect("the fixture page renders");
         apply_filters(page, filters, context, viewer.map(|user| user.id))
@@ -946,9 +946,13 @@ mod tests {
         .await
         .expect("the fixture filter creates");
 
-        let page = render_statuses(&test_state, Some(&alice), std::slice::from_ref(&doomed))
-            .await
-            .expect("the fixture page renders");
+        let page = render_statuses(
+            &test_state,
+            ViewerMode::user(&alice),
+            std::slice::from_ref(&doomed),
+        )
+        .await
+        .expect("the fixture page renders");
         let kept = apply_active(&test_state, Some(&alice), page, FilterContext::Home)
             .await
             .expect("the active read succeeds");
@@ -957,9 +961,13 @@ mod tests {
             "alice's active irreversible filter removes the stranger's post"
         );
 
-        let anon_page = render_statuses(&test_state, Some(&alice), std::slice::from_ref(&doomed))
-            .await
-            .expect("the fixture page renders");
+        let anon_page = render_statuses(
+            &test_state,
+            ViewerMode::user(&alice),
+            std::slice::from_ref(&doomed),
+        )
+        .await
+        .expect("the fixture page renders");
         let anonymous = apply_active(&test_state, None, anon_page, FilterContext::Home)
             .await
             .expect("the anonymous pass runs no query");

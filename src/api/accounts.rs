@@ -397,7 +397,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         federation_out, notify,
-        render_status::render_statuses,
+        render_status::{ViewerMode, render_statuses},
         timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     },
     state::AppState,
@@ -2850,7 +2850,7 @@ async fn pinned_response(
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     let rows = query.fetch(&state.db).await?;
     let rows = ordered_by_pin(state, user_id, rows).await?;
-    let statuses = render_statuses(state, query.viewer.as_ref(), &rows).await?;
+    let statuses = render_statuses(state, ViewerMode::User(query.viewer.as_ref()), &rows).await?;
     Ok((HeaderMap::new(), Json(statuses)))
 }
 

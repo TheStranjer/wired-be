@@ -107,7 +107,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         filter::{FilterContext, apply_filters},
-        render_status::render_statuses,
+        render_status::{ViewerMode, render_statuses},
     },
     state::AppState,
     util::id::parse_id,
@@ -809,7 +809,7 @@ async fn visible_statuses(
             visible.push(row);
         }
     }
-    let page = render_statuses(state, viewer, &visible).await?;
+    let page = render_statuses(state, ViewerMode::User(viewer), &visible).await?;
     let mut all_ids: Vec<Uuid> = page
         .iter()
         .filter_map(|entity| parse_id(&entity.id))

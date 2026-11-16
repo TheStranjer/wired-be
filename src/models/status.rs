@@ -74,6 +74,8 @@ use crate::{
     util::{entities::extract_hashtags, format::text_to_html, id::new_id},
 };
 
+pub mod admin;
+
 /// The `text/plain` value of [`content_type`](NewStatus::content_type), which
 /// is also the column default.
 pub const DEFAULT_CONTENT_TYPE: &str = "text/plain";

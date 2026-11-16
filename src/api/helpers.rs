@@ -26,7 +26,11 @@ use crate::{
         user::{self, User},
     },
     pagination::{link_header, set_link_header},
-    services::{filter, render_status::render_statuses, timeline::TimelineQuery},
+    services::{
+        filter,
+        render_status::{ViewerMode, render_statuses},
+        timeline::TimelineQuery,
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -261,7 +265,7 @@ pub async fn timeline_response(
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     let rows = query.fetch(&state.db).await?;
     let link = page_link(state, uri, &rows);
-    let rendered = render_statuses(state, query.viewer.as_ref(), &rows).await?;
+    let rendered = render_statuses(state, ViewerMode::User(query.viewer.as_ref()), &rows).await?;
     let statuses = match query.source.filter_context() {
         Some(context) => {
             filter::apply_active(state, query.viewer.as_ref(), rendered, context).await?
