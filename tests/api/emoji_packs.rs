@@ -6,33 +6,40 @@
 //! admin write routes of WBE-211: create, metadata patch and delete
 //! under `admin:write`, their validation refusals, the `custom_emojis`
 //! resync they trigger and the `emoji_pack_*` moderation entries they
-//! leave behind, and the emoji-file routes of WBE-215 under
-//! `/packs/files`: add (uploaded part and fetched URL), rename with
-//! `force`, and delete — each answering the pack's full `files` object,
-//! resyncing the custom emojis, and refusing an unknown pack with the
-//! 400 `{"error":"Pack <name> does not exist"}`. The reads answer
-//! without authentication and unknown or unsafe pack names answer the
-//! reads' shared 404; every write demands an admin bearer token.
+//! leave behind, the emoji-file routes of WBE-215 under `/packs/files`:
+//! add (uploaded part and fetched URL), rename with `force`, and delete
+//! — each answering the pack's full `files` object, resyncing the custom
+//! emojis, and refusing an unknown pack with the 400 `{"error":"Pack
+//! <name> does not exist"}` — and the install routes of WBE-216: the
+//! remote listing relay, the pack download from a mock remote instance
+//! (shared, fallback and refused), the uploaded-zip install and the
+//! filesystem import, under `admin:read` for the GETs and `admin:write`
+//! for the POSTs. The reads answer without authentication and unknown
+//! or unsafe pack names answer the reads' shared 404; every write
+//! demands an admin bearer token.
 
 #![cfg(test)]
 
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Read as _},
+    io::{Cursor, Read as _, Write as _},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
     body::{Body, Bytes},
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, Uri, header},
     response::Response,
     routing::get,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use wired_be::{
     config::TEST_BASE_URL,
     models::{
@@ -2143,4 +2150,1163 @@ async fn file_writes_demand_an_admin_with_admin_write() {
     let removed = gated_file_write(&app, "delete", Some(&narrow)).await;
     common::assert_answer(&removed, StatusCode::OK, "the narrow alias deletes");
     assert_eq!(removed.json_value(), json!({}));
+}
+
+// --- WBE-216: the remote relay, the pack download, the zip upload and
+// --- the filesystem import.
+
+/// Magic bytes the emoji-file detection names as `image/webp`.
+const WEBP_BYTES: &[u8] = b"RIFF\x00\x00\x00\x00WEBPVP8 ";
+/// The pinned 500 body of the remote-fetch routes.
+const COULD_NOT_FETCH: &str = "Could not fetch the pack list";
+/// The pinned 400 body of an unshared, fallback-less remote pack.
+const NOT_SHAREABLE: &str =
+    "The pack was not set as shared and there is no fallback src to download from";
+/// The pinned 400 of the traversal refusal.
+const UNSAFE_PATH: &str = "Pack archive contains an unsafe path";
+/// The pinned 400 of the unreadable-archive refusal.
+const UNREADABLE: &str = "Could not read the pack archive";
+
+/// The manifest the fixture archives ship.
+const ARCHIVE_MANIFEST: &str = concat!(
+    r#"{"pack": {"license": "MIT", "share-files": true}, "#,
+    r#""files": {"cat": "cat.png", "kitten": "sub/kitten.gif", "ghost": "gone.png"}}"#,
+);
+
+/// The bytes of a zip holding `entries` (name, payload).
+fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, payload) in entries {
+        writer
+            .start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(payload).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// The shared pack's archive: two images (one nested), the manifest, and
+/// a text and a hidden file the safe extraction must skip.
+fn good_archive() -> Vec<u8> {
+    build_zip(&[
+        ("pack.json", ARCHIVE_MANIFEST.as_bytes()),
+        ("cat.png", PNG_BYTES),
+        ("sub/kitten.gif", GIF_BYTES),
+        ("notes.txt", b"prose, not an emoji".as_slice()),
+        (".hidden.png", PNG_BYTES),
+    ])
+}
+
+/// The scripted answer of a mock remote instance.
+#[derive(Debug)]
+struct MockRemote {
+    /// The body of `GET /api/v1/pleroma/emoji/packs` (the relay's source).
+    packs: Value,
+    /// The body of `GET /api/v1/pleroma/emoji/pack` for the first
+    /// (`page_size=0`) read.
+    pack_first: Value,
+    /// The body of the same route when the caller re-reads with a real
+    /// `page_size` (Pleroma's `files_count` second pass); `None` serves
+    /// the first body again.
+    pack_full: Option<Value>,
+    /// The bytes of `GET /api/v1/pleroma/emoji/packs/archive`.
+    archive: Vec<u8>,
+    /// The status both listing routes answer with.
+    list_status: StatusCode,
+    /// The status the archive route answers with.
+    archive_status: StatusCode,
+    /// Whether the packs route serves non-JSON junk.
+    packs_as_junk: bool,
+    /// The queries the one-pack listing route saw, in order.
+    seen_pack: Mutex<Vec<String>>,
+    /// How often the archive route was called.
+    archive_hits: AtomicUsize,
+}
+
+impl Default for MockRemote {
+    fn default() -> Self {
+        Self {
+            packs: json!({"count": 0, "packs": {}}),
+            pack_first: json!({
+                "pack": {"share-files": true},
+                "files": {"cat": "cat.png", "kitten": "sub/kitten.gif"},
+                "files_count": 2,
+            }),
+            pack_full: None,
+            archive: good_archive(),
+            list_status: StatusCode::OK,
+            archive_status: StatusCode::OK,
+            packs_as_junk: false,
+            seen_pack: Mutex::new(Vec::new()),
+            archive_hits: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// A JSON response of the mock remote.
+fn mock_json(status: StatusCode, body: &Value) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Serves the all-packs listing, echoing the query it was asked with,
+/// so the relay test proves exactly what this instance forwarded.
+async fn serve_packs_list(State(remote): State<Arc<MockRemote>>, uri: Uri) -> Response {
+    if remote.packs_as_junk {
+        return Response::builder()
+            .status(remote.list_status)
+            .body(Body::from("not json at all"))
+            .unwrap();
+    }
+    let mut body = remote.packs.clone();
+    if let Some(fields) = body.as_object_mut() {
+        let _seen: Option<Value> = fields.insert(
+            "seen_query".to_owned(),
+            json!(uri.query().unwrap_or_default()),
+        );
+    }
+    mock_json(remote.list_status, &body)
+}
+
+/// Serves one pack's listing, recording the query and answering the
+/// full body once the caller asks beyond the first `page_size=0` read.
+async fn serve_pack_show(State(remote): State<Arc<MockRemote>>, uri: Uri) -> Response {
+    let query = uri.query().unwrap_or_default().to_owned();
+    remote.seen_pack.lock().await.push(query.clone());
+    let body = match (&remote.pack_full, query.contains("page_size=0")) {
+        (Some(full), false) => full,
+        _ => &remote.pack_first,
+    };
+    mock_json(remote.list_status, body)
+}
+
+/// Serves the pack archive and counts the hit.
+async fn serve_pack_archive(State(remote): State<Arc<MockRemote>>) -> Response {
+    let _hits = remote.archive_hits.fetch_add(1, Ordering::SeqCst);
+    Response::builder()
+        .status(remote.archive_status)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .body(Body::from(remote.archive.clone()))
+        .unwrap()
+}
+
+/// Serves a mock remote instance on loopback (reachable because the test
+/// config allows private hosts exactly as `HTTP_ALLOW_PRIVATE_HOSTS`
+/// does), built from its own base URL: returns that URL, the shared
+/// script for assertions, and the server task.
+async fn spawn_pack_server<F>(build: F) -> (String, Arc<MockRemote>, JoinHandle<()>)
+where
+    F: FnOnce(String) -> MockRemote,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let state = Arc::new(build(base.clone()));
+    let app = axum::Router::new()
+        .route("/api/v1/pleroma/emoji/packs", get(serve_packs_list))
+        .route("/api/v1/pleroma/emoji/pack", get(serve_pack_show))
+        .route(
+            "/api/v1/pleroma/emoji/packs/archive",
+            get(serve_pack_archive),
+        )
+        .with_state(Arc::clone(&state));
+    let server = tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::debug!("mock emoji-pack remote stopped: {err}");
+        }
+    });
+    (base, state, server)
+}
+
+/// The manifest of the pack installed under `name`, as stored on disk.
+async fn installed_manifest(dir: &Path, name: &str) -> Pack {
+    emoji_packs::load_pack(dir, name)
+        .await
+        .unwrap_or_else(|err| panic!("the installed pack parses: {err}"))
+}
+
+/// The `(shortcode, file)` pairs of a pack manifest, ordered.
+fn manifest_files(pack: &Pack) -> Vec<(&str, &str)> {
+    pack.files
+        .iter()
+        .map(|(code, file)| (code.as_str(), file.as_str()))
+        .collect()
+}
+
+/// `GET /packs/remote` reads `{url}/api/v1/pleroma/emoji/packs` through
+/// the guarded client and relays it verbatim, forwarding the requested
+/// `page` and this module's capped `page_size`.
+#[tokio::test]
+async fn remote_relays_the_packs_listing_of_an_instance() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "remotereader", "admin:read").await;
+
+    let listing = json!({
+        "count": 1,
+        "packs": {
+            "cats": {"pack": {"share-files": true}, "files": {"cat": "cat.png"}, "files_count": 1},
+        },
+    });
+    let (base, _script, server) = spawn_pack_server(|_| MockRemote {
+        packs: listing.clone(),
+        ..MockRemote::default()
+    })
+    .await;
+
+    let response = common::TestRequest::get(&format!(
+        "/api/v1/pleroma/emoji/packs/remote?url={base}&page=2&page_size=500"
+    ))
+    .bearer(&token)
+    .send(&app)
+    .await;
+    server.abort();
+    common::assert_answer(&response, StatusCode::OK, "remote relay");
+    let mut expected = listing;
+    let _seen: Option<Value> = expected
+        .as_object_mut()
+        .unwrap()
+        .insert("seen_query".to_owned(), json!("page=2&page_size=100"));
+    assert_eq!(
+        response.json_value(),
+        expected,
+        "the remote body as it answered, with the forwarded page and the clamped size"
+    );
+}
+
+/// The relay's refusals: an absent or unusable `url` is the 400, and a
+/// remote that is down, answers an error status or talks non-JSON is the
+/// 500 `{"error":"Could not fetch the pack list"}` — and nothing of any
+/// of them touches the local packs.
+#[tokio::test]
+async fn remote_refuses_bad_urls_and_broken_remotes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "remotescreener", "admin:read").await;
+
+    for query in [
+        "",
+        "?url=",
+        "?url=%20%20",
+        "?url=not-a-url",
+        "?url=ftp://x.test/packs",
+    ] {
+        let refused =
+            common::TestRequest::get(&format!("/api/v1/pleroma/emoji/packs/remote{query}"))
+                .bearer(&token)
+                .send(&app)
+                .await;
+        common::assert_answer(&refused, StatusCode::BAD_REQUEST, &format!("url {query:?}"));
+        common::assert_error(
+            &refused,
+            "url must be a valid http(s) URL",
+            &format!("url {query:?}"),
+        );
+    }
+
+    // A port nothing listens on any more: the connect failure is the 500.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dead = common::TestRequest::get(&format!(
+        "/api/v1/pleroma/emoji/packs/remote?url=http://127.0.0.1:{dead_port}"
+    ))
+    .bearer(&token)
+    .send(&app)
+    .await;
+    common::assert_answer(&dead, StatusCode::INTERNAL_SERVER_ERROR, "a dead remote");
+    common::assert_error(&dead, COULD_NOT_FETCH, "a dead remote");
+
+    // An error status and a non-JSON body answer the same.
+    let (failing_base, _failing, failing_server) = spawn_pack_server(|_| MockRemote {
+        list_status: StatusCode::INTERNAL_SERVER_ERROR,
+        ..MockRemote::default()
+    })
+    .await;
+    let failing = common::TestRequest::get(&format!(
+        "/api/v1/pleroma/emoji/packs/remote?url={failing_base}"
+    ))
+    .bearer(&token)
+    .send(&app)
+    .await;
+    failing_server.abort();
+    common::assert_answer(&failing, StatusCode::INTERNAL_SERVER_ERROR, "a 500 remote");
+    common::assert_error(&failing, COULD_NOT_FETCH, "a 500 remote");
+
+    let (junk_base, _junk, junk_server) = spawn_pack_server(|_| MockRemote {
+        packs_as_junk: true,
+        ..MockRemote::default()
+    })
+    .await;
+    let junk = common::TestRequest::get(&format!(
+        "/api/v1/pleroma/emoji/packs/remote?url={junk_base}"
+    ))
+    .bearer(&token)
+    .send(&app)
+    .await;
+    junk_server.abort();
+    common::assert_answer(
+        &junk,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a non-JSON remote",
+    );
+    common::assert_error(&junk, COULD_NOT_FETCH, "a non-JSON remote");
+
+    assert!(
+        std::fs::read_dir(dir.path()).is_ok_and(|entries| entries.count() == 0),
+        "a relay never reads or writes local packs"
+    );
+}
+
+/// `POST /packs/download` of a shared pack: the listing is re-read with
+/// its `files_count` (Pleroma's two-pass read), the archive lands under
+/// the `as` name, the shipped manifest survives reduced to the files
+/// that actually arrived, non-images and hidden entries are skipped,
+/// the custom emojis resync and the answer is the JSON string `"ok"`.
+#[tokio::test]
+async fn download_installs_a_shared_remote_pack() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packpuller", "admin:write").await;
+
+    let remote = MockRemote {
+        pack_first: json!({
+            "pack": {"license": "CC0-1.0", "share-files": true},
+            "files": {"cat": "cat.png"},
+            "files_count": 3,
+        }),
+        pack_full: Some(json!({
+            "pack": {"license": "CC0-1.0", "share-files": true},
+            "files": {"cat": "cat.png", "kitten": "sub/kitten.gif", "ghost": "gone.png"},
+            "files_count": 3,
+        })),
+        ..MockRemote::default()
+    };
+    let (base, script, server) = spawn_pack_server(|_| remote).await;
+
+    let response = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": base, "name": "cats", "as": "imported-cats"}))
+        .send(&app)
+        .await;
+    server.abort();
+    common::assert_answer(&response, StatusCode::OK, "shared pack download");
+    assert_eq!(response.json_value(), json!("ok"), "Pleroma's `ok` body");
+
+    let seen = script.seen_pack.lock().await;
+    assert_eq!(seen.len(), 2, "the two-pass listing read: {seen:?}");
+    assert!(
+        seen[0].contains("page_size=0") && seen[1].contains("page_size=3"),
+        "the truncated first page is re-read with the announced files_count: {seen:?}"
+    );
+    drop(seen);
+
+    let installed = installed_manifest(dir.path(), "imported-cats").await;
+    assert_eq!(
+        manifest_files(&installed),
+        [("cat", "cat.png"), ("kitten", "sub/kitten.gif")],
+        "the archive manifest, reduced to the files that landed"
+    );
+    assert_eq!(
+        installed.pack.license.as_deref(),
+        Some("MIT"),
+        "the shipped metadata came with the pack"
+    );
+    assert!(installed.pack.share_files, "and its share flag too");
+    assert_eq!(
+        pack_entries(dir.path(), "imported-cats"),
+        ["cat.png", "pack.json", "sub"],
+        "the text and hidden entries wrote nothing"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("imported-cats/sub/kitten.gif")).unwrap(),
+        GIF_BYTES,
+        "nested files keep their path"
+    );
+    assert_eq!(
+        served_emojis(&app).await,
+        [
+            ("imported-cats".to_owned(), "cat".to_owned()),
+            ("imported-cats".to_owned(), "kitten".to_owned()),
+        ],
+        "the resync served the installed pack"
+    );
+}
+
+/// An unshared pack with a `fallback-src` downloads from it; that
+/// archive ships no manifest, so the listing's files map and metadata
+/// become the pack's, and an absent `as` installs under the remote name.
+#[tokio::test]
+async fn download_follows_a_fallback_src_and_keeps_the_listing_map() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packfaller", "admin:write").await;
+
+    let (base, script, server) = spawn_pack_server(|base| MockRemote {
+        pack_first: json!({
+            "pack": {
+                "description": "from the listing",
+                "share-files": false,
+                "fallback-src": format!("{base}/api/v1/pleroma/emoji/packs/archive"),
+            },
+            "files": {"cat": "cat.png", "ghost": "gone.png"},
+            "files_count": 2,
+        }),
+        archive: build_zip(&[("cat.png", PNG_BYTES)]),
+        ..MockRemote::default()
+    })
+    .await;
+
+    let response = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": base, "name": "cats"}))
+        .send(&app)
+        .await;
+    server.abort();
+    common::assert_answer(&response, StatusCode::OK, "fallback download");
+    assert_eq!(
+        script.archive_hits.load(Ordering::SeqCst),
+        1,
+        "the fallback archive was fetched once"
+    );
+
+    let installed = installed_manifest(dir.path(), "cats").await;
+    assert_eq!(
+        manifest_files(&installed),
+        [("cat", "cat.png")],
+        "the listing's map, minus the file that never arrived"
+    );
+    assert_eq!(
+        installed.pack.description.as_deref(),
+        Some("from the listing"),
+        "the listing's metadata came with the pack"
+    );
+    assert!(!installed.pack.share_files, "and it stayed unshared");
+    assert_eq!(
+        served_emojis(&app).await,
+        [("cats".to_owned(), "cat".to_owned())],
+        "the resync served the installed pack"
+    );
+}
+
+/// A remote pack that shares nothing and names no fallback is the 400
+/// `{"error":"The pack was not set as shared and there is no fallback
+/// src to download from"}`; no archive is ever asked for and no
+/// directory is left behind.
+#[tokio::test]
+async fn download_refuses_an_unshared_pack_without_a_fallback_src() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packbeggar", "admin:write").await;
+
+    let (base, script, server) = spawn_pack_server(|_| MockRemote {
+        pack_first: json!({"pack": {"share-files": false}, "files": {}, "files_count": 0}),
+        ..MockRemote::default()
+    })
+    .await;
+    let response = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": base, "name": "cats"}))
+        .send(&app)
+        .await;
+    server.abort();
+    common::assert_answer(&response, StatusCode::BAD_REQUEST, "unshared pack");
+    common::assert_error(&response, NOT_SHAREABLE, "unshared pack");
+    assert_eq!(
+        script.archive_hits.load(Ordering::SeqCst),
+        0,
+        "an unshared pack never asks for an archive"
+    );
+    assert!(
+        !dir.path().join("cats").exists(),
+        "the refused download created no pack"
+    );
+}
+
+/// A download that cannot finish — a remote listing that errors, or an
+/// archive that is not a zip — answers the 500 "Could not fetch the pack
+/// list" / 400 "Could not read the pack archive", and the half-created
+/// pack directory of the extraction failure is removed again.
+#[tokio::test]
+async fn download_refuses_broken_remotes_and_archives() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packchecker", "admin:write").await;
+
+    let (failing_base, _failing, failing_server) = spawn_pack_server(|_| MockRemote {
+        list_status: StatusCode::NOT_FOUND,
+        ..MockRemote::default()
+    })
+    .await;
+    let failing = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": failing_base, "name": "cats"}))
+        .send(&app)
+        .await;
+    failing_server.abort();
+    common::assert_answer(
+        &failing,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failing listing",
+    );
+    common::assert_error(&failing, COULD_NOT_FETCH, "a failing listing");
+
+    let (junk_base, _junk, junk_server) = spawn_pack_server(|_| MockRemote {
+        archive: b"this is not a zip".to_vec(),
+        ..MockRemote::default()
+    })
+    .await;
+    let junk = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": junk_base, "name": "cats"}))
+        .send(&app)
+        .await;
+    junk_server.abort();
+    common::assert_answer(&junk, StatusCode::BAD_REQUEST, "a broken archive");
+    common::assert_error(&junk, UNREADABLE, "a broken archive");
+    assert!(
+        !dir.path().join("cats").exists(),
+        "the failed install removed its half-written pack"
+    );
+    assert!(
+        std::fs::read_dir(dir.path()).is_ok_and(|entries| entries.count() == 0),
+        "and left no other trace"
+    );
+}
+
+/// An archive whose entries climb out of the pack directory is the 400
+/// `{"error":"Pack archive contains an unsafe path"}`: nothing outside
+/// the pack is written and the half-created pack is removed.
+#[tokio::test]
+async fn download_refuses_a_traversal_archive() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packescaper", "admin:write").await;
+
+    for (bad, outside) in [
+        ("../../escape.png", "escape.png"),
+        ("/abs.png", "abs.png"),
+        ("ok/../../up.png", "up.png"),
+    ] {
+        let (base, _script, server) = spawn_pack_server(move |_| MockRemote {
+            archive: build_zip(&[("cat.png", PNG_BYTES), (bad, PNG_BYTES)]),
+            ..MockRemote::default()
+        })
+        .await;
+        let refused = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+            .bearer(&token)
+            .json(&json!({"url": base, "name": "cats"}))
+            .send(&app)
+            .await;
+        server.abort();
+        common::assert_answer(&refused, StatusCode::BAD_REQUEST, &format!("entry {bad}"));
+        common::assert_error(&refused, UNSAFE_PATH, &format!("entry {bad}"));
+        assert!(
+            !dir.path().join(outside).exists(),
+            "the {bad} entry wrote nothing outside the pack"
+        );
+        assert!(
+            !dir.path().join("cats").exists(),
+            "and its pack was removed as the install failed"
+        );
+    }
+}
+
+/// An archive past the 20 MiB cap is refused mid-stream with the 500
+/// "Could not download the pack archive", and an occupied local name —
+/// checked after the remote work — answers the pinned 400 "Pack already
+/// exists" without disturbing the pack that stands there.
+#[tokio::test]
+async fn download_respects_the_size_cap_and_the_existing_pack() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packhoarder", "admin:write").await;
+
+    let oversized = vec![b'x'; emoji_packs::MAX_PACK_ARCHIVE_BYTES + 1];
+    let (base, _script, server) = spawn_pack_server(move |_| MockRemote {
+        archive: oversized,
+        ..MockRemote::default()
+    })
+    .await;
+    let big = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": base, "name": "not-here"}))
+        .send(&app)
+        .await;
+    server.abort();
+    common::assert_answer(
+        &big,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a 20 MiB plus one archive",
+    );
+    common::assert_error(
+        &big,
+        "Could not download the pack archive",
+        "an oversize archive",
+    );
+    assert!(
+        !dir.path().join("not-here").exists(),
+        "the oversize fetch created no pack"
+    );
+
+    let (occupied_base, _occupied, occupied_server) =
+        spawn_pack_server(|_| MockRemote::default()).await;
+    let occupied = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": occupied_base, "name": "cats", "as": "  "}))
+        .send(&app)
+        .await;
+    occupied_server.abort();
+    common::assert_answer(&occupied, StatusCode::BAD_REQUEST, "an occupied name");
+    common::assert_error(&occupied, "Pack already exists", "an occupied name");
+    let kept = installed_manifest(dir.path(), "cats").await;
+    assert_eq!(
+        manifest_files(&kept),
+        [("cat", "cat.png")],
+        "the standing pack was neither overwritten nor emptied"
+    );
+}
+
+/// `POST /packs/download_zip` installs an uploaded archive without a
+/// manifest: every image becomes an emoji named after its file stem,
+/// nested paths are kept, texts, hidden names and a shipped manifest
+/// play no naming role, and the custom emojis resync.
+#[tokio::test]
+async fn download_zip_names_emojis_after_the_file_stems() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "ziplifter", "admin:write").await;
+
+    let archive = build_zip(&[
+        ("cat.png", PNG_BYTES),
+        ("cat.webp", WEBP_BYTES),
+        ("sub/kitten.gif", GIF_BYTES),
+        ("notes.txt", b"prose".as_slice()),
+        (".hidden.png", PNG_BYTES),
+        ("two words.png", PNG_BYTES),
+    ]);
+    let response = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download_zip")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &[
+                common::MultipartPart::text("name", "packzip"),
+                common::MultipartPart::file(
+                    "file",
+                    "whatever.zip",
+                    "application/zip",
+                    Bytes::from(archive),
+                ),
+            ],
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "uploaded pack");
+    assert_eq!(response.json_value(), json!("ok"), "Pleroma's `ok` body");
+
+    let installed = installed_manifest(dir.path(), "packzip").await;
+    assert_eq!(
+        manifest_files(&installed),
+        [("cat", "cat.webp"), ("kitten", "sub/kitten.gif")],
+        "one emoji per stem, the last extracted name wins, junk and hidden names skipped"
+    );
+    assert!(
+        !installed.pack.share_files,
+        "a stem-built pack starts unshared"
+    );
+    assert_eq!(
+        pack_entries(dir.path(), "packzip"),
+        ["cat.png", "cat.webp", "pack.json", "sub"],
+        "only the kept files and the manifest stand in the pack"
+    );
+    assert_eq!(
+        served_emojis(&app).await,
+        [
+            ("packzip".to_owned(), "cat".to_owned()),
+            ("packzip".to_owned(), "kitten".to_owned()),
+        ],
+        "the resync served the uploaded pack"
+    );
+    let served = common::TestRequest::get("/emoji/packzip/cat.webp")
+        .send(&app)
+        .await;
+    common::assert_answer(&served, StatusCode::OK, "an uploaded image serves");
+    assert_eq!(served.body.as_ref(), WEBP_BYTES, "byte for byte");
+}
+
+/// `download_zip` of an archive that ships its own `pack.json` keeps it,
+/// reduced to the files that landed — the manifest on disk is what the
+/// listing, the static route and the archive endpoint will read.
+#[tokio::test]
+async fn download_zip_keeps_the_shipped_manifest_reduced() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "zipkeeper", "admin:write").await;
+
+    let archive = build_zip(&[
+        ("pack.json", ARCHIVE_MANIFEST.as_bytes()),
+        ("cat.png", PNG_BYTES),
+    ]);
+    let response =
+        common::TestRequest::post("/api/v1/pleroma/emoji/packs/download_zip?name=shipped")
+            .bearer(&token)
+            .multipart(
+                BOUNDARY,
+                &[common::MultipartPart::file(
+                    "file",
+                    "shipped.zip",
+                    "application/zip",
+                    Bytes::from(archive),
+                )],
+            )
+            .send(&app)
+            .await;
+    common::assert_answer(&response, StatusCode::OK, "manifest-carrying upload");
+
+    let installed = installed_manifest(dir.path(), "shipped").await;
+    assert_eq!(
+        manifest_files(&installed),
+        [("cat", "cat.png")],
+        "only the entry whose file landed stands"
+    );
+    assert_eq!(
+        installed.pack.license.as_deref(),
+        Some("MIT"),
+        "the shipped metadata survived the rewrite"
+    );
+}
+
+/// `POST /api/v1/pleroma/emoji/packs/download_zip` with `name` and the
+/// archive bytes as the `file` part.
+async fn upload_pack(
+    app: &axum::Router,
+    token: &str,
+    name: &'static str,
+    archive: Vec<u8>,
+) -> common::TestResponse {
+    common::TestRequest::post("/api/v1/pleroma/emoji/packs/download_zip")
+        .bearer(token)
+        .multipart(
+            BOUNDARY,
+            &[
+                common::MultipartPart::text("name", name),
+                common::MultipartPart::file(
+                    "file",
+                    "pack.zip",
+                    "application/zip",
+                    Bytes::from(archive),
+                ),
+            ],
+        )
+        .send(app)
+        .await
+}
+
+/// The upload route's parameter refusals: a body without a `file` part
+/// is the 422 `{"error":"Missing parameter: file"}`, a blank name the
+/// shared empty-name 400.
+#[tokio::test]
+async fn download_zip_refuses_bodies_without_file_or_name() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "zipbeggar", "admin:write").await;
+
+    let no_file = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download_zip")
+        .bearer(&token)
+        .json(&json!({"name": "nothing"}))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &no_file,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a body without a file",
+    );
+    common::assert_error(&no_file, "Missing parameter: file", "a body without a file");
+
+    let no_name = upload_pack(&app, &token, "   ", good_archive()).await;
+    common::assert_answer(&no_name, StatusCode::BAD_REQUEST, "a blank name");
+    common::assert_error(&no_name, "pack name cannot be empty", "a blank name");
+    assert!(
+        std::fs::read_dir(dir.path()).is_ok_and(|entries| entries.count() == 0),
+        "the parameter refusals created nothing"
+    );
+}
+
+/// The upload route's archive refusals: bytes that are no zip and an
+/// archive that traverses answer the extraction's 400s with nothing
+/// left behind, an occupied name the pinned 400 "Pack already exists"
+/// without disturbing the standing pack, and a part past the configured
+/// upload limit the 413 that names it.
+#[tokio::test]
+async fn download_zip_refuses_bad_archives_and_sizes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "taken", &pack(false, &[("cat", "cat.png")])).await;
+    let mut config = common::test_config_with_emoji_dir(dir.path());
+    config.upload_limits.max_file_bytes = 4096;
+    let app = common::test_app_with_config(pool.clone(), config);
+    let token = admin_token(&pool, "zipfilter", "admin:write").await;
+
+    let junk = upload_pack(&app, &token, "junk", b"PK but not a zip".to_vec()).await;
+    common::assert_answer(&junk, StatusCode::BAD_REQUEST, "no zip");
+    common::assert_error(&junk, UNREADABLE, "no zip");
+
+    let escaping = upload_pack(
+        &app,
+        &token,
+        "escapes",
+        build_zip(&[("../../outside.png", PNG_BYTES)]),
+    )
+    .await;
+    common::assert_answer(&escaping, StatusCode::BAD_REQUEST, "a traversal");
+    common::assert_error(&escaping, UNSAFE_PATH, "a traversal");
+    assert!(
+        !dir.path().join("escapes").exists() && !dir.path().join("outside.png").exists(),
+        "the traversing upload installed nothing"
+    );
+
+    let occupied = upload_pack(&app, &token, "taken", good_archive()).await;
+    common::assert_answer(&occupied, StatusCode::BAD_REQUEST, "an occupied name");
+    common::assert_error(&occupied, "Pack already exists", "an occupied name");
+    let kept = installed_manifest(dir.path(), "taken").await;
+    assert_eq!(
+        manifest_files(&kept),
+        [("cat", "cat.png")],
+        "the standing pack was neither overwritten nor emptied"
+    );
+
+    let mut oversize = good_archive();
+    oversize.resize(5000, b'0');
+    let big = upload_pack(&app, &token, "big", oversize).await;
+    common::assert_answer(
+        &big,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a part past the upload limit",
+    );
+    assert!(
+        error_message(&big).is_some_and(|message| message.contains("4096")),
+        "the 413 names the limit: {}",
+        big.text()
+    );
+    let standing: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(standing, ["taken"], "none of the refusals created a pack");
+}
+
+/// `GET /packs/import` writes a `pack.json` for every pack directory of
+/// `EMOJI_DIR` that lacks a valid one — loose images and a broken
+/// manifest alike — names the imported packs, leaves the valid packs and
+/// hidden directories alone, resyncs the custom emojis, and finds
+/// nothing the second time.
+#[tokio::test]
+async fn import_writes_manifests_for_loose_pack_directories() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    let cats_manifest = std::fs::read(dir.path().join("cats").join("pack.json")).unwrap();
+    std::fs::create_dir_all(dir.path().join("dogs").join("sub")).unwrap();
+    std::fs::write(dir.path().join("dogs").join("dog.png"), PNG_BYTES).unwrap();
+    std::fs::write(dir.path().join("dogs/sub/puppy.gif"), GIF_BYTES).unwrap();
+    std::fs::write(
+        dir.path().join("dogs").join("notes.txt"),
+        b"prose".as_slice(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("broken")).unwrap();
+    std::fs::write(dir.path().join("broken").join("pack.json"), b"{ not json").unwrap();
+    std::fs::write(dir.path().join("broken").join("a.jpg"), PNG_BYTES).unwrap();
+    std::fs::create_dir_all(dir.path().join(".secret")).unwrap();
+    std::fs::write(dir.path().join(".secret/x.png"), PNG_BYTES).unwrap();
+    std::fs::write(dir.path().join("stray.png"), PNG_BYTES).unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packimporter", "admin:read").await;
+
+    let response = common::TestRequest::get("/api/v1/pleroma/emoji/packs/import")
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "filesystem import");
+    assert_eq!(
+        response.json_value(),
+        json!(["broken", "dogs"]),
+        "the two directories without a usable manifest, sorted"
+    );
+
+    let dogs = installed_manifest(dir.path(), "dogs").await;
+    assert_eq!(
+        manifest_files(&dogs),
+        [("dog", "dog.png"), ("puppy", "sub/puppy.gif")],
+        "stems key the images, nested paths kept, texts ignored"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("cats").join("pack.json")).unwrap(),
+        cats_manifest,
+        "the valid pack's manifest was not rewritten"
+    );
+    assert!(
+        !dir.path().join(".secret").join("pack.json").exists(),
+        "a hidden directory is not a pack name and gets nothing"
+    );
+
+    let again = common::TestRequest::get("/api/v1/pleroma/emoji/packs/import")
+        .bearer(&token)
+        .send(&app)
+        .await;
+    common::assert_answer(&again, StatusCode::OK, "the second import");
+    assert_eq!(
+        again.json_value(),
+        json!([]),
+        "everything now has a manifest"
+    );
+
+    assert_eq!(
+        served_emojis(&app).await,
+        [
+            ("broken".to_owned(), "a".to_owned()),
+            ("cats".to_owned(), "cat".to_owned()),
+            ("dogs".to_owned(), "dog".to_owned()),
+            ("dogs".to_owned(), "puppy".to_owned()),
+        ],
+        "the resync served the imported packs"
+    );
+}
+
+/// `POST /packs/download` with a body missing its `url` or `name` is the
+/// extractor's 422, a blank `name` the shared 400 — and the request
+/// reaches no remote at all.
+#[tokio::test]
+async fn download_demands_its_url_and_name() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "packhalfbody", "admin:write").await;
+
+    for body in [
+        json!({"name": "cats"}),
+        json!({"url": "https://remote.invalid"}),
+    ] {
+        let refused = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+            .bearer(&token)
+            .json(&body)
+            .send(&app)
+            .await;
+        common::assert_answer(
+            &refused,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a body missing a required key",
+        );
+    }
+
+    let blank = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&token)
+        .json(&json!({"url": "https://remote.invalid", "name": "   "}))
+        .send(&app)
+        .await;
+    common::assert_answer(&blank, StatusCode::BAD_REQUEST, "a blank name");
+    common::assert_error(&blank, "pack name cannot be empty", "a blank name");
+    assert!(
+        std::fs::read_dir(dir.path()).is_ok_and(|entries| entries.count() == 0),
+        "a malformed download created nothing"
+    );
+}
+
+/// The install routes' two GETs, with the query the remote one demands.
+const INSTALL_GETS: [&str; 2] = [
+    "/api/v1/pleroma/emoji/packs/remote?url=https://remote.invalid",
+    "/api/v1/pleroma/emoji/packs/import",
+];
+
+/// The install routes' two POSTs and a body each; the auth extractor
+/// rejects them before any of these bodies is parsed.
+fn install_posts() -> [(&'static str, Value); 2] {
+    [
+        (
+            "/api/v1/pleroma/emoji/packs/download",
+            json!({"url": "https://remote.invalid", "name": "ghost"}),
+        ),
+        (
+            "/api/v1/pleroma/emoji/packs/download_zip",
+            json!({"name": "ghost"}),
+        ),
+    ]
+}
+
+/// The install routes answer the shared admin gate: no bearer, a bogus
+/// token, an app-only token and a non-admin are refused alike on all
+/// four, in the words the gate itself words them.
+#[tokio::test]
+async fn install_routes_refuse_weaker_credentials() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let app_only = common::create_app_only_token(&pool, "admin:read admin:write").await;
+    let plain = plain_token(&pool, "installpleb", "admin:read admin:write").await;
+
+    let refusals: &[Refusal<'_>] = &[
+        (
+            "no bearer token",
+            None,
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials",
+        ),
+        (
+            "a bogus token",
+            Some("not-a-real-token"),
+            StatusCode::UNAUTHORIZED,
+            "The access token is invalid",
+        ),
+        (
+            "an app-only token",
+            Some(&app_only),
+            StatusCode::FORBIDDEN,
+            "This API requires an authenticated user",
+        ),
+        (
+            "a non-admin user",
+            Some(&plain),
+            StatusCode::FORBIDDEN,
+            "User is not an admin.",
+        ),
+    ];
+    for path in &INSTALL_GETS {
+        for (who, token, status, message) in refusals {
+            let request = common::TestRequest::get(path);
+            let response = match token {
+                Some(bearer) => request.bearer(bearer).send(&app).await,
+                None => request.send(&app).await,
+            };
+            common::assert_answer(&response, *status, &format!("get {path} as {who}"));
+            common::assert_error(&response, message, &format!("get {path} as {who}"));
+        }
+    }
+    for (path, body) in &install_posts() {
+        for (who, token, status, message) in refusals {
+            let request = common::TestRequest::post(path).json(body);
+            let response = match token {
+                Some(bearer) => request.bearer(bearer).send(&app).await,
+                None => request.send(&app).await,
+            };
+            common::assert_answer(&response, *status, &format!("post {path} as {who}"));
+            common::assert_error(&response, message, &format!("post {path} as {who}"));
+        }
+    }
+}
+
+/// The class the ticket pins per route: `admin:write` never grants the
+/// GETs and `admin:read` never grants the POSTs, each refusal naming the
+/// root it lacks; the narrow `admin:read:emoji` and `admin:write:emoji`
+/// aliases pass the gate and reach the endpoints' own work — an answer
+/// from past the gate on every one of them.
+#[tokio::test]
+async fn install_routes_enforce_their_admin_class() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let reader = admin_token(&pool, "installreader", "admin:read").await;
+    let writer = admin_token(&pool, "installwriter", "admin:write").await;
+
+    for path in &INSTALL_GETS {
+        let refused = common::TestRequest::get(path)
+            .bearer(&writer)
+            .send(&app)
+            .await;
+        common::assert_answer(&refused, StatusCode::FORBIDDEN, "a writer on a reader");
+        common::assert_error(
+            &refused,
+            "Insufficient permissions: admin:read.",
+            "a writer on a reader",
+        );
+    }
+    for (path, body) in &install_posts() {
+        let refused = common::TestRequest::post(path)
+            .bearer(&reader)
+            .json(body)
+            .send(&app)
+            .await;
+        common::assert_answer(&refused, StatusCode::FORBIDDEN, "a reader on a writer");
+        common::assert_error(
+            &refused,
+            "Insufficient permissions: admin:write.",
+            "a reader on a writer",
+        );
+    }
+
+    let narrow_read = admin_token(&pool, "installnarrowr", "admin:read:emoji").await;
+    let imported = common::TestRequest::get("/api/v1/pleroma/emoji/packs/import")
+        .bearer(&narrow_read)
+        .send(&app)
+        .await;
+    common::assert_answer(&imported, StatusCode::OK, "the narrow read alias imports");
+    assert_eq!(
+        imported.json_value(),
+        json!([]),
+        "the empty directory imports nothing"
+    );
+    let relayed =
+        common::TestRequest::get("/api/v1/pleroma/emoji/packs/remote?url=https://remote.invalid")
+            .bearer(&narrow_read)
+            .send(&app)
+            .await;
+    common::assert_answer(
+        &relayed,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the narrow read relay",
+    );
+    common::assert_error(&relayed, COULD_NOT_FETCH, "the narrow read relay");
+
+    let narrow_write = admin_token(&pool, "installnarroww", "admin:write:emoji").await;
+    let pulled = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
+        .bearer(&narrow_write)
+        .json(&json!({"url": "https://remote.invalid", "name": "ghost"}))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &pulled,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the narrow write download",
+    );
+    let uploaded = upload_pack(&app, &narrow_write, "narrowzip", b"not a zip".to_vec()).await;
+    common::assert_answer(
+        &uploaded,
+        StatusCode::BAD_REQUEST,
+        "the narrow write upload",
+    );
+    common::assert_error(&uploaded, UNREADABLE, "the narrow write upload");
+
+    assert!(
+        !dir.path().join("narrowzip").exists() && !dir.path().join("ghost").exists(),
+        "the post-gate failures left no packs behind"
+    );
 }

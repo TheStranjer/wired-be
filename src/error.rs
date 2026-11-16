@@ -117,6 +117,14 @@ pub enum AppError {
     BadGateway(String),
     /// A server-side failure; its detail is logged, never sent (500).
     Internal(String),
+    /// A server-side failure whose detail is the fixed client-safe
+    /// message the endpoint owes (500): Pleroma's remote emoji-pack
+    /// actions answer a failed remote fetch with a 500 naming exactly
+    /// what could not be fetched (`emoji_pack_controller.ex`), which the
+    /// generic [`Self::Internal`] body cannot carry. Like
+    /// [`Self::UpstreamFailure`], its detail is a fixed message, sent
+    /// as-is.
+    InternalMessage(String),
     /// A PostgreSQL failure; its detail is logged, never sent (500).
     Database(SqlxError),
 }
@@ -160,7 +168,9 @@ impl AppError {
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::UpstreamFailure(_) | Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
-            Self::Internal(_) | Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal(_) | Self::InternalMessage(_) | Self::Database(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 
@@ -179,6 +189,7 @@ impl AppError {
             | Self::UpstreamFailure(detail)
             | Self::ServiceUnavailable(detail)
             | Self::Unprocessable(detail)
+            | Self::InternalMessage(detail)
             | Self::NotFoundMessage(detail) => detail,
             Self::NotFound => NOT_FOUND_MESSAGE,
             Self::NotImplemented => NOT_IMPLEMENTED_MESSAGE,
@@ -220,6 +231,7 @@ impl fmt::Display for AppError {
             | Self::UpstreamFailure(detail)
             | Self::ServiceUnavailable(detail)
             | Self::Unprocessable(detail)
+            | Self::InternalMessage(detail)
             | Self::Internal(detail)
             | Self::BadGateway(detail)
             | Self::NotFoundMessage(detail) => f.write_str(detail),
@@ -255,6 +267,7 @@ impl Error for AppError {
             | Self::Unprocessable(_)
             | Self::RateLimited
             | Self::BadGateway(_)
+            | Self::InternalMessage(_)
             | Self::Internal(_) => None,
         }
     }
@@ -382,6 +395,10 @@ mod tests {
             (AppError::RateLimited, RATE_LIMITED_MESSAGE),
             (AppError::BadGateway(SECRET.to_owned()), INTERNAL_MESSAGE),
             (AppError::Internal(SECRET.to_owned()), INTERNAL_MESSAGE),
+            (
+                AppError::InternalMessage("Could not fetch the pack list".to_owned()),
+                "Could not fetch the pack list",
+            ),
             (
                 AppError::Database(SqlxError::Protocol(SECRET.to_owned())),
                 INTERNAL_MESSAGE,
