@@ -36,9 +36,17 @@
 //! [`crate::api::emoji_packs`] serves), and local emojis under that prefix
 //! that no pack names any more are deleted. Call it at startup and after
 //! any change to the packs directory.
+//!
+//! The install side of the admin API lives here too:
+//! [`extract_pack_archive`] unpacks a pack zip (remote download or upload)
+//! into a fresh pack directory under the same name rules — traversal is
+//! refused, only images and the manifest are written — and
+//! [`import_packs`] writes `pack.json` for pack directories that lack a
+//! valid one, from the image files they hold.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
     io::{self, Cursor, Write as _},
     path::{Path, PathBuf},
 };
@@ -66,6 +74,40 @@ pub const PACK_EXISTS: &str = "Pack already exists";
 /// The manifest [`create_pack`] writes: empty metadata and no files —
 /// Pleroma's `save_pack(%Pack{})` of a freshly `mkdir`ed directory.
 pub const NEW_PACK_MANIFEST: &str = r#"{"pack": {}, "files": {}}"#;
+/// Largest pack archive [`extract_pack_archive`] installs, fetched or
+/// uploaded.
+///
+/// The ticket's 20 MiB. One fetched entry is capped at the same size,
+/// so no single file can inflate out of the archive's own budget.
+pub const MAX_PACK_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
+/// Largest number of entries a pack archive may hold (the ticket's
+/// 2000); one more refuses the whole archive.
+pub const MAX_PACK_ARCHIVE_ENTRIES: usize = 2000;
+/// 400 body for an archive entry that climbs out of the pack directory
+/// (absolute paths and `..` segments, what Pleroma's `SafeZip` refuses
+/// through `Path.safe_relative`).
+pub const ARCHIVE_UNSAFE_PATH: &str = "Pack archive contains an unsafe path";
+/// 400 body for an archive over [`MAX_PACK_ARCHIVE_ENTRIES`] entries.
+pub const ARCHIVE_TOO_MANY_FILES: &str = "Pack archive contains too many files";
+/// 400 body for bytes that are no readable zip archive — or an entry
+/// whose stored bytes corrupt the read.
+pub const ARCHIVE_UNREADABLE: &str = "Could not read the pack archive";
+/// 400 body for one entry whose unpacked bytes pass
+/// [`MAX_PACK_ARCHIVE_BYTES`] — the archive bomb this cap defuses.
+pub const ARCHIVE_ENTRY_TOO_LARGE: &str = "Pack archive contains an oversized file";
+/// The image media types an emoji file may be, read from the bytes
+/// themselves.
+///
+/// The magic-byte allowlist of [`crate::api::emoji_packs`] and
+/// [`extract_pack_archive`]. SVG is deliberately absent: it has no magic
+/// bytes to read, and the static pack route refuses to serve it, so
+/// accepting it could only store a file that never renders.
+pub const ACCEPTED_EMOJI_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+/// The file extensions [`import_packs`] treats as emoji images — the
+/// loose-file counterpart of [`ACCEPTED_EMOJI_TYPES`], Pleroma's
+/// `[:emoji, :pack_extensions]` widened to the formats this instance
+/// serves.
+pub const PACK_IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
 /// The metadata block of a `pack.json`: all of it optional on read (an
 /// empty manifest `{"files": {}}` is what Pleroma's `create` writes), with
@@ -139,6 +181,20 @@ pub fn pack_name_valid(name: &str) -> bool {
 #[must_use]
 pub fn file_name_valid(file: &str) -> bool {
     !file.is_empty() && file.split('/').all(segment_valid)
+}
+
+/// Whether `code` may be an emoji shortcode.
+///
+/// A non-empty run of `[A-Za-z0-9_-]`, deliberately stricter than a pack
+/// name — no dots, no separators — so a shortcode can neither hide an
+/// extension nor name a path. The pattern the file routes pin and
+/// [`import_packs`] applies to the file stems it turns into shortcodes.
+#[must_use]
+pub fn shortcode_valid(code: &str) -> bool {
+    !code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Rejects a pack name that [`pack_name_valid`] would refuse, for the
@@ -529,6 +585,239 @@ fn zip_write<W: io::Write + io::Seek>(
     Ok(())
 }
 
+/// The 400 a refused pack archive is answered with.
+fn archive_refused(message: &str) -> AppError {
+    AppError::BadRequest(message.to_owned())
+}
+
+/// Whether `file` names a zip entry that would escape the pack
+/// directory: an absolute path or a `..` segment. These refuse the
+/// whole archive (the ticket's reject-traversal rule); other unusable
+/// names are merely skipped, since they can neither traverse nor hide
+/// once [`file_name_valid`] has had them.
+fn path_traversal(file: &str) -> bool {
+    file.starts_with('/') || file.split('/').any(|segment| segment == "..")
+}
+
+/// Whether `bytes` are an accepted emoji image, read from the magic
+/// bytes like the file routes do — never from the name or a
+/// `content-type` the archive's author claimed.
+fn is_emoji_image(bytes: &[u8]) -> bool {
+    infer::get(bytes).is_some_and(|kind| ACCEPTED_EMOJI_TYPES.contains(&kind.mime_type()))
+}
+
+/// Installs a pack archive the way Pleroma's `SafeZip.unzip_data` must:
+/// the zip `bytes` are unpacked into the pack directory `name` under
+/// the packs root `dir`, entry by entry and safely.
+///
+/// An entry name that traverses out of the pack (absolute, or with a
+/// `..` segment) refuses the whole archive with [`ARCHIVE_UNSAFE_PATH`],
+/// as do more than [`MAX_PACK_ARCHIVE_ENTRIES`] entries
+/// ([`ARCHIVE_TOO_MANY_FILES`]) and one entry inflating past
+/// [`MAX_PACK_ARCHIVE_BYTES`] ([`ARCHIVE_ENTRY_TOO_LARGE`]); bytes that
+/// are no readable zip fail with [`ARCHIVE_UNREADABLE`]. Beyond those
+/// rules only [`PACK_FILE`] and files whose magic bytes name an accepted
+/// image type are written — every other entry is skipped without
+/// touching the disk. Directory entries name nothing to write.
+///
+/// Returns the relative names of the entries it wrote.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] per the rules above and for a pack name
+/// [`pack_name_valid`] rejects; [`AppError::Internal`] for a filesystem
+/// failure.
+pub async fn extract_pack_archive(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> AppResult<BTreeSet<String>> {
+    let pack_root = pack_dir(dir, name)?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+        .map_err(|_err| archive_refused(ARCHIVE_UNREADABLE))?;
+    if archive.len() > MAX_PACK_ARCHIVE_ENTRIES {
+        return Err(archive_refused(ARCHIVE_TOO_MANY_FILES));
+    }
+    let mut extracted = BTreeSet::new();
+    for index in 0..archive.len() {
+        if let Some(file) = extract_archive_entry(&mut archive, &pack_root, index).await? {
+            let _fresh: bool = extracted.insert(file);
+        }
+    }
+    debug!(
+        pack = name,
+        files = extracted.len(),
+        "extracted emoji pack archive"
+    );
+    Ok(extracted)
+}
+
+/// Unpacks entry `index` of `archive` into `pack_root`. `Ok(None)` is
+/// an entry there is nothing to write: a directory, a name
+/// [`file_name_valid`] refuses, or bytes no accepted image type names.
+async fn extract_archive_entry(
+    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
+    pack_root: &Path,
+    index: usize,
+) -> AppResult<Option<String>> {
+    let entry = archive
+        .by_index(index)
+        .map_err(|_err| archive_refused(ARCHIVE_UNREADABLE))?;
+    if entry.is_dir() {
+        return Ok(None);
+    }
+    let file = entry
+        .name()
+        .map_err(|_err| archive_refused(ARCHIVE_UNREADABLE))?
+        .into_owned();
+    if path_traversal(&file) {
+        return Err(archive_refused(ARCHIVE_UNSAFE_PATH));
+    }
+    if !file_name_valid(&file) {
+        return Ok(None);
+    }
+    let bytes = read_archive_entry_bytes(entry)?;
+    if file != PACK_FILE && !is_emoji_image(&bytes) {
+        return Ok(None);
+    }
+    let path = pack_root.join(&file);
+    create_parent(&path).await?;
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|err| io_error("write emoji pack file", &path, &err))?;
+    Ok(Some(file))
+}
+
+/// The unpacked bytes of one entry, reading at most one byte past
+/// [`MAX_PACK_ARCHIVE_BYTES`] so an oversized entry fails without being
+/// given the whole budget; a read that breaks midway (a corrupt entry)
+/// is the unreadable archive it came from.
+fn read_archive_entry_bytes<R: io::Read>(entry: zip::read::ZipFile<'_, R>) -> AppResult<Vec<u8>> {
+    let limit = u64::try_from(MAX_PACK_ARCHIVE_BYTES).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    let mut capped = io::Read::take(entry, limit.saturating_add(1));
+    let _read: usize = io::Read::read_to_end(&mut capped, &mut bytes)
+        .map_err(|_err| archive_refused(ARCHIVE_UNREADABLE))?;
+    if bytes.len() > MAX_PACK_ARCHIVE_BYTES {
+        return Err(archive_refused(ARCHIVE_ENTRY_TOO_LARGE));
+    }
+    Ok(bytes)
+}
+
+/// Pleroma's `import_from_filesystem`: write the missing pack manifests.
+///
+/// Every pack directory under the packs root `dir` that lacks a valid
+/// `pack.json` — a loose pile of images a manual install left behind, or
+/// a directory whose manifest cannot be parsed — gets one written from
+/// the image files it holds, and its name is reported.
+///
+/// Directories with a valid manifest are left exactly as they are; so
+/// are hidden or otherwise unusable names (their manifests could not be
+/// [saved](save_pack) safely anyway) and plain files under the root. A
+/// missing root imports nothing. The files themselves are never moved
+/// or renamed — only `pack.json` is written.
+///
+/// Returns the imported pack names, sorted.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] for a filesystem failure; the walk only ever
+/// touches names it can store.
+pub async fn import_packs(dir: &Path) -> AppResult<Vec<String>> {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Ok(Vec::new());
+    };
+    let mut imported = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|err| io_error("list emoji packs", dir, &err))?
+    {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !pack_name_valid(&name) || !entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        match load_pack(dir, &name).await {
+            Ok(_) => {}
+            Err(AppError::NotFound | AppError::Internal(_)) => {
+                let files = collect_pack_images(&dir.join(&name)).await?;
+                let pack = Pack {
+                    pack: PackMeta::default(),
+                    files,
+                };
+                save_pack(dir, &name, &pack).await?;
+                imported.push(name);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    imported.sort_unstable();
+    debug!(packs = imported.len(), "imported emoji pack manifests");
+    Ok(imported)
+}
+
+/// The `files` map [`import_packs`] writes for a pack directory: every
+/// accepted image under it, recursively, keyed by the stem of its file
+/// name — Pleroma's `files_from_path` without the `emoji.txt` spelling
+/// the file routes do not speak. The walk is a work stack, not
+/// recursion; names that could not be stored, and stems that could not
+/// be shortcodes, are skipped.
+async fn collect_pack_images(root: &Path) -> AppResult<BTreeMap<String, String>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let mut entries = tokio::fs::read_dir(&current)
+            .await
+            .map_err(|err| io_error("list emoji pack", &current, &err))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|err| io_error("list emoji pack", &current, &err))?
+        {
+            let path = entry.path();
+            if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+                continue;
+            }
+            let Some(relative) = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some(shortcode) = stem_shortcode(&relative) else {
+                continue;
+            };
+            let _entry: Option<String> = files.insert(shortcode, relative);
+        }
+    }
+    Ok(files)
+}
+
+/// The shortcode a loose pack file gets: its extension must be one of
+/// [`PACK_IMAGE_EXTENSIONS`] and its file stem a valid shortcode, or
+/// there is none.
+fn stem_shortcode(file: &str) -> Option<String> {
+    let path = Path::new(file);
+    if !pack_image_extension(path) {
+        return None;
+    }
+    let stem = path.file_stem().and_then(OsStr::to_str)?;
+    shortcode_valid(stem).then(|| stem.to_owned())
+}
+
+/// Whether `path` ends in one of [`PACK_IMAGE_EXTENSIONS`], case
+/// insensitively like Pleroma's `Path.extname` comparison.
+fn pack_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| PACK_IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Reconciles the `custom_emojis` table with the packs under `dir`.
 ///
 /// Every pack file is upserted as a local emoji (`category` and sole tag =
@@ -582,6 +871,10 @@ mod tests {
     const BASE: &str = "https://test.example";
     /// Bytes for a fake image file.
     const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+    /// Magic bytes the [`infer`] match names as `image/gif`.
+    const GIF_BYTES: &[u8] = b"GIF89a....";
+    /// Magic bytes the [`infer`] match names as `image/jpeg`.
+    const JPEG_BYTES: &[u8] = b"\xFF\xD8\xFF\xE0rest";
 
     /// A throwaway packs root; removed when the guard drops.
     fn temp_dir() -> TempDir {
@@ -1308,5 +1601,261 @@ mod tests {
             custom_emoji::list_local(&pool).await.unwrap().is_empty(),
             "and stores no rows"
         );
+    }
+
+    /// The bytes of a zip holding `entries` (name, payload) as written.
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, payload) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(payload).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// A manifest naming the two images of the fixture archives.
+    const ARCHIVE_MANIFEST: &[u8] =
+        br#"{"pack": {"share-files": true}, "files": {"cat": "cat.png"}}"#;
+
+    /// The 400 a refused archive is answered with, checking the pinned
+    /// wording.
+    fn archive_error(err: &AppError, message: &str) -> bool {
+        matches!(err, AppError::BadRequest(_)) && err.to_string() == message
+    }
+
+    #[tokio::test]
+    async fn extraction_lands_images_and_the_manifest_and_skips_the_rest() {
+        let dir = temp_dir();
+        let archive = zip_of(&[
+            (PACK_FILE, ARCHIVE_MANIFEST),
+            ("cat.png", PNG_BYTES),
+            ("sub/kitten.gif", GIF_BYTES),
+            ("notes.txt", b"not an image".as_slice()),
+            (".hidden.png", PNG_BYTES),
+            ("two words.png", PNG_BYTES),
+            ("sub/", b"".as_slice()),
+        ]);
+        let extracted = extract_pack_archive(dir.path(), "fresh", &archive)
+            .await
+            .unwrap();
+        let names: Vec<&str> = extracted.iter().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["cat.png", "pack.json", "sub/kitten.gif"],
+            "only the manifest and the images are written, nested paths included"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("fresh").join("sub/kitten.gif")).unwrap(),
+            GIF_BYTES,
+            "the nested bytes landed"
+        );
+        assert!(
+            !dir.path().join("fresh/notes.txt").exists()
+                && !dir.path().join("fresh/.hidden.png").exists()
+                && !dir.path().join("fresh/two words.png").exists(),
+            "the skipped entries wrote nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_refuses_traversal_and_keeps_the_outside_untouched() {
+        let dir = temp_dir();
+        write_file(&dir.path().join("outside.txt"), b"secret");
+        for bad in ["../../escape.png", "/abs.png", "ok/../../../up.png"] {
+            let archive = zip_of(&[("cat.png", PNG_BYTES), (bad, PNG_BYTES)]);
+            let err = extract_pack_archive(dir.path(), "fresh", &archive)
+                .await
+                .unwrap_err();
+            assert!(
+                archive_error(&err, ARCHIVE_UNSAFE_PATH),
+                "{bad} refuses the archive: {err}"
+            );
+        }
+        assert!(
+            !dir.path().join("escape.png").exists()
+                && !dir.path().join("abs.png").exists()
+                && !dir.path().join("up.png").exists(),
+            "nothing escaped the pack directory"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("outside.txt")).unwrap(),
+            b"secret",
+            "and the file outside is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_caps_the_entry_count_and_one_entries_size() {
+        let dir = temp_dir();
+        let many: Vec<(String, &[u8])> = (0..=MAX_PACK_ARCHIVE_ENTRIES)
+            .map(|index| (format!("e{index}.png"), PNG_BYTES))
+            .collect();
+        let many_refs: Vec<(&str, &[u8])> = many
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), *bytes))
+            .collect();
+        let err = extract_pack_archive(dir.path(), "many", &zip_of(&many_refs))
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&err, ARCHIVE_TOO_MANY_FILES),
+            "2001 entries refuse the archive: {err}"
+        );
+
+        // One deflate-compressed entry of one byte past the cap: the
+        // archive itself is tiny, only the unpacked bytes are big.
+        let bomb = vec![0_u8; MAX_PACK_ARCHIVE_BYTES + 1];
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "bomb.png",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(&bomb).unwrap();
+        let archive = writer.finish().unwrap().into_inner();
+        assert!(
+            archive.len() < 1024 * 1024,
+            "the bomb is small compressed: {} bytes",
+            archive.len()
+        );
+        let bomb_err = extract_pack_archive(dir.path(), "bomb", &archive)
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&bomb_err, ARCHIVE_ENTRY_TOO_LARGE),
+            "a 20 MiB plus one entry refuses: {bomb_err}"
+        );
+        assert!(
+            !dir.path().join("many").exists() && !dir.path().join("bomb").exists(),
+            "the refused archives installed nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_refuses_non_archives_and_unusable_pack_names() {
+        let dir = temp_dir();
+        let junk_err = extract_pack_archive(dir.path(), "fresh", b"PK not really a zip")
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&junk_err, ARCHIVE_UNREADABLE),
+            "bytes no zip parser reads are refused: {junk_err}"
+        );
+        let archive = zip_of(&[("cat.png", PNG_BYTES)]);
+        for name in ["../escape", ".hidden", ""] {
+            let name_err = extract_pack_archive(dir.path(), name, &archive)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(name_err, AppError::BadRequest(_)),
+                "no unusable pack name reaches the filesystem: {name_err}"
+            );
+        }
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort_unstable();
+        assert!(
+            left.is_empty(),
+            "the refused archives created nothing: {left:?}"
+        );
+    }
+
+    /// Seeds the fixture for [`import_packs`]: a valid pack, a loose
+    /// image directory, a directory with a broken manifest, a hidden
+    /// directory and a stray file under the root.
+    async fn seed_import_fixture(dir: &Path) {
+        save_pack(dir, "cats", &pack_with(true, &[("cat", "cat.png")]))
+            .await
+            .unwrap();
+        write_file(&dir.join("cats").join("cat.png"), PNG_BYTES);
+        write_file(&dir.join("dogs").join("dog.png"), PNG_BYTES);
+        write_file(&dir.join("dogs").join("sub/puppy.gif"), GIF_BYTES);
+        write_file(&dir.join("dogs").join("notes.txt"), b"prose".as_slice());
+        write_file(
+            &dir.join("dogs").join("emoji.txt"),
+            b"dog, dog.png\n".as_slice(),
+        );
+        write_file(
+            &dir.join("broken").join(PACK_FILE),
+            b"{ not json".as_slice(),
+        );
+        write_file(&dir.join("broken").join("a.jpg"), JPEG_BYTES);
+        write_file(&dir.join(".secret").join("x.png"), PNG_BYTES);
+        write_file(&dir.join("stray.png"), PNG_BYTES);
+    }
+
+    #[tokio::test]
+    async fn import_writes_manifests_for_loose_directories_only() {
+        let dir = temp_dir();
+        seed_import_fixture(dir.path()).await;
+        let cats_before = std::fs::read_to_string(dir.path().join("cats").join(PACK_FILE)).unwrap();
+
+        let names = import_packs(dir.path()).await.unwrap();
+        assert_eq!(
+            names,
+            ["broken", "dogs"],
+            "the valid pack, the hidden name and the stray file stand aside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cats").join(PACK_FILE)).unwrap(),
+            cats_before,
+            "the valid manifest was not rewritten"
+        );
+        assert_eq!(
+            import_packs(dir.path()).await.unwrap(),
+            Vec::<String>::new(),
+            "a second import finds nothing left to write"
+        );
+
+        let dogs = load_pack(dir.path(), "dogs").await.unwrap();
+        assert_eq!(
+            dogs.files
+                .iter()
+                .map(|(code, file)| (code.as_str(), file.as_str()))
+                .collect::<Vec<_>>(),
+            [("dog", "dog.png"), ("puppy", "sub/puppy.gif")],
+            "stems key the images, nested paths kept, texts ignored"
+        );
+        assert!(!dogs.pack.share_files, "imported packs start unshared");
+        let broken = load_pack(dir.path(), "broken").await.unwrap();
+        assert_eq!(
+            broken.files.get("a").map(String::as_str),
+            Some("a.jpg"),
+            "the broken manifest was replaced from the images"
+        );
+        assert!(
+            !dir.path().join(".secret").join(PACK_FILE).exists(),
+            "the hidden directory keeps no manifest it could not be read by"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_of_a_missing_or_empty_root_imports_nothing() {
+        let dir = temp_dir();
+        assert_eq!(
+            import_packs(&dir.path().join("nowhere")).await.unwrap(),
+            Vec::<String>::new(),
+            "a missing root imports nothing"
+        );
+        assert_eq!(
+            import_packs(dir.path()).await.unwrap(),
+            Vec::<String>::new(),
+            "an empty root imports nothing"
+        );
+    }
+
+    #[test]
+    fn shortcodes_follow_the_pinned_pattern_in_the_service_too() {
+        for code in ["cat", "a", "0", "dog_1", "well-known", "MiXeD42"] {
+            assert!(shortcode_valid(code), "{code} is a shortcode");
+        }
+        for code in ["", "cat.png", "two words", "a/b", ".hidden", "é"] {
+            assert!(!shortcode_valid(code), "{code} is not a shortcode");
+        }
     }
 }

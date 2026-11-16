@@ -77,11 +77,41 @@
 //! - `DELETE /packs/files` — remove an entry and its file, the same 400
 //!   for an unknown shortcode.
 //!
+//! The four install routes (WBE-216) are the controller's `remote`,
+//! `download`, `download_zip` and `import_from_filesystem` actions.
+//! [`AdminUser`] gates them all; the ticket grants the two GETs the
+//! `admin:read` class and the two POSTs `admin:write` (Pleroma itself
+//! demands `admin:write` for all four).
+//!
+//! - `GET /packs/remote?url=…&page=…&page_size=…` — relay another
+//!   instance's `{"count","packs"}` listing, fetched from
+//!   `{url}/api/v1/pleroma/emoji/packs` through the SSRF-guarded
+//!   [`HttpClient`](crate::http_client::HttpClient) at a 5 MiB cap.
+//!   A `url` no client may call is the 400, any remote failure the 500
+//!   `{"error":"Could not fetch the pack list"}`.
+//! - `POST /packs/download` — body `url`, `name` and the optional local
+//!   name `as`: the remote pack listing decides the source (a shared
+//!   pack downloads from its `packs/archive` endpoint, an unshared one
+//!   only through a `fallback-src`, else the 400 `{"error":"The pack
+//!   was not set as shared and there is no fallback src to download
+//!   from"}`); the zip — at most 20 MiB — is extracted safely into a
+//!   fresh pack directory, and an occupied local name is the 400
+//!   `{"error":"Pack already exists"}`. Then the emojis resync and the
+//!   answer is `"ok"`.
+//! - `POST /packs/download_zip` — the same install from an uploaded zip
+//!   under `file`; with no `pack.json` inside, every image becomes an
+//!   emoji named after its file stem.
+//! - `GET /packs/import` — write `pack.json` for every pack directory of
+//!   `EMOJI_DIR` that lacks a valid one
+//!   ([`import_packs`](crate::services::emoji_packs::import_packs)) and
+//!   answer the imported names as a JSON array.
+//!
 //! [`moderation_log`]: crate::models::moderation_log
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    ffi::OsStr,
     future::{self, Future},
 };
 
@@ -100,7 +130,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
-use url::form_urlencoded;
+use url::{Url, form_urlencoded};
 
 use crate::{
     auth::admin::AdminUser,
@@ -110,7 +140,7 @@ use crate::{
         ApiParams, flex,
         multipart::{MultipartForm, UploadedFile, UploadedFiles as _, upload_body_limit},
     },
-    http_client::HttpError,
+    http_client::{HttpError, HttpResponse},
     models::{custom_emoji, moderation_log},
     services::emoji_packs,
     state::AppState,
@@ -150,11 +180,13 @@ const INLINE: &str = "inline";
 /// Largest emoji file the `/packs/files` create route accepts, uploaded
 /// or fetched: the ticket's 2 MiB.
 const MAX_EMOJI_FILE_BYTES: usize = 2 * 1024 * 1024;
-/// The image types magic bytes can name for an emoji file. SVG is
-/// deliberately absent: it has no magic bytes to read, and the static
-/// pack route of this module refuses to serve it either, so accepting it
-/// here could only store a file that never renders.
-const ACCEPTED_EMOJI_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+/// The image types magic bytes can name for an emoji file: the service's
+/// allowlist, shared with the pack-archive extraction of
+/// [`emoji_packs::extract_pack_archive`]. SVG is deliberately absent: it
+/// has no magic bytes to read, and the static pack route refuses to
+/// serve it either, so accepting it here could only store a file that
+/// never renders.
+const ACCEPTED_EMOJI_TYPES: [&str; 4] = emoji_packs::ACCEPTED_EMOJI_TYPES;
 /// 422 body for bytes [`detect_emoji_type`] cannot name an accepted image
 /// type for (the wording the media and profile uploads use alike).
 const UNSUPPORTED_FILE_TYPE: &str = "Unsupported file type";
@@ -174,12 +206,41 @@ const MIN_FETCH_STATUS: u16 = 200;
 /// with.
 const MAX_FETCH_STATUS: u16 = 300;
 
+/// The read class of [`AdminUser::require`]: the ticket grants the two
+/// GET install routes `admin:read` (and its narrow `admin:read:emoji`
+/// alias), where Pleroma demands `admin:write`.
+const CLASS_READ: &str = "read";
+/// Largest remote listing response the install routes read: the
+/// ticket's 5 MiB.
+const MAX_REMOTE_LIST_BYTES: usize = 5 * 1024 * 1024;
+/// 400 body for a `url` this instance's client could never call.
+const INVALID_URL: &str = "url must be a valid http(s) URL";
+/// 500 body when the remote pack listing could not be fetched or read —
+/// the ticket's pinned wording for the relay route, kept for the
+/// download's own listing fetch.
+const COULD_NOT_FETCH: &str = "Could not fetch the pack list";
+/// 500 body when the pack archive (shared or `fallback-src`) could not
+/// be fetched, read or extracted within
+/// [`MAX_PACK_ARCHIVE_BYTES`](emoji_packs::MAX_PACK_ARCHIVE_BYTES).
+const COULD_NOT_DOWNLOAD: &str = "Could not download the pack archive";
+/// 400 body for a remote pack that shares no files and names no
+/// fallback archive (Pleroma's `fetch_pack_info` refusal, the ticket's
+/// exact wording).
+const PACK_NOT_SHAREABLE: &str =
+    "The pack was not set as shared and there is no fallback src to download from";
+/// The remote path of an instance's pack listing.
+const REMOTE_PACKS_PATH: &str = "/api/v1/pleroma/emoji/packs";
+/// The remote path of one pack's listing.
+const REMOTE_PACK_PATH: &str = "/api/v1/pleroma/emoji/pack";
+/// The remote path of one pack's zip archive.
+const REMOTE_ARCHIVE_PATH: &str = "/api/v1/pleroma/emoji/packs/archive";
+
 /// The `/api/v1/pleroma/emoji` router, nested by [`crate::api::v1`].
 ///
 /// `config` is what [`upload_body_limit`] sizes the `/packs/files` create
-/// route's body limit from: axum's multipart extractor refuses bodies
-/// over 2 MiB unless the route raises that first, and the endpoint takes
-/// uploaded image files.
+/// and `/packs/download_zip` routes' body limits from: axum's multipart
+/// extractor refuses bodies over 2 MiB unless the route raises that
+/// first, and both endpoints take uploaded files.
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/", get(emoji_map))
@@ -189,6 +250,13 @@ pub fn router(config: &Config) -> Router<AppState> {
         )
         .route("/packs", get(index))
         .route("/packs/archive", get(archive))
+        .route("/packs/download", post(download))
+        .route(
+            "/packs/download_zip",
+            post(download_zip).layer(upload_body_limit(config)),
+        )
+        .route("/packs/import", get(import))
+        .route("/packs/remote", get(remote))
         .route(
             "/packs/files",
             post(create_file)
@@ -204,9 +272,10 @@ pub fn files_router() -> Router<AppState> {
     Router::new().route("/emoji/{pack}/{file}", get(serve_emoji_file))
 }
 
-/// The `name`, `page` and `page_size` query parameters, parsed the way
-/// [`crate::pagination::PageParams`] parses its keys: `name` is kept raw
-/// for the endpoints to trim and validate, numbers that are absent or not
+/// The `name`, `url`, `page` and `page_size` query parameters, parsed the
+/// way [`crate::pagination::PageParams`] parses its keys: `name` and `url`
+/// are kept raw for the endpoints to trim and validate (`url` is the
+/// remote instance of the relay route), numbers that are absent or not
 /// positive whole numbers fall back to the defaults, `page_size` is capped
 /// at [`MAX_PAGE_SIZE`], the last occurrence of a repeated key wins and
 /// unrelated keys are ignored.
@@ -214,6 +283,8 @@ pub fn files_router() -> Router<AppState> {
 struct PackParams {
     /// Raw `name` value, if present.
     name: Option<String>,
+    /// Raw `url` value, if present (the remote routes).
+    url: Option<String>,
     /// 1-based page number, defaulted.
     page: usize,
     /// Page size, defaulted and capped at [`MAX_PAGE_SIZE`].
@@ -250,12 +321,14 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let mut name = None;
+        let mut url = None;
         let mut page = None;
         let mut page_size = None;
         for (key, value) in form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
         {
             match key.as_ref() {
                 "name" => name = Some(value.into_owned()),
+                "url" => url = Some(value.into_owned()),
                 "page" => page = number(&value),
                 "page_size" => page_size = number(&value),
                 _ => {}
@@ -263,6 +336,7 @@ where
         }
         future::ready(Ok(Self {
             name,
+            url,
             page: page.unwrap_or(DEFAULT_PAGE),
             page_size: page_size.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE),
         }))
@@ -759,14 +833,12 @@ struct Rename<'a> {
 }
 
 /// Whether `code` may be an emoji shortcode: a non-empty run of
-/// `[A-Za-z0-9_-]`, the pattern the ticket pins. It is deliberately
-/// stricter than a pack name — no dots, no separators — so a shortcode
-/// can neither hide an extension nor name a path.
+/// `[A-Za-z0-9_-]`, the pattern the ticket pins — the service's rule
+/// [`emoji_packs::shortcode_valid`], shared with the manifests
+/// [`import_packs`](emoji_packs::import_packs) and
+/// [`manifest_from_images`] write.
 fn shortcode_valid(code: &str) -> bool {
-    !code.is_empty()
-        && code
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    emoji_packs::shortcode_valid(code)
 }
 
 /// The 400 the file routes owe a pack that is not there to write, the
@@ -1183,6 +1255,472 @@ async fn delete_file(
     Ok(Json(pack.files))
 }
 
+/// The `url`, `name` and optional `as` body of `POST /packs/download`:
+/// the remote instance to install from, the pack on it, and the local
+/// name to install it under (Pleroma's `as`, defaulted to `name`).
+#[derive(Debug, Deserialize)]
+struct DownloadParams {
+    /// The remote instance's base URL.
+    url: String,
+    /// The pack's name on the remote.
+    name: String,
+    /// The local pack name, absent for the remote one.
+    #[serde(default, rename = "as")]
+    as_name: Option<String>,
+}
+
+/// One validated install request, ready to build remote URLs from.
+#[derive(Debug)]
+struct DownloadRequest<'a> {
+    /// The remote instance's base URL, trimmed.
+    base: &'a str,
+    /// The pack's name on the remote, trimmed.
+    remote_name: &'a str,
+    /// The local pack name: `as` when non-blank, else the remote name.
+    local_name: &'a str,
+}
+
+impl<'a> DownloadRequest<'a> {
+    /// Validates `params` the way the module's other writes validate a
+    /// name: a blank remote name is the shared empty-name 400, and the
+    /// local name must be one this instance may create a directory for.
+    /// The base URL is checked where it becomes a fetch target
+    /// ([`instance_api_url`]).
+    fn from_params(params: &'a DownloadParams) -> AppResult<Self> {
+        let remote_name = params.name.trim();
+        if remote_name.is_empty() {
+            return Err(AppError::BadRequest(NAME_EMPTY.to_owned()));
+        }
+        let local_name = params.as_name.as_deref().unwrap_or_default().trim();
+        let local_name = if local_name.is_empty() {
+            remote_name
+        } else {
+            local_name
+        };
+        if !emoji_packs::pack_name_valid(local_name) {
+            return Err(AppError::BadRequest(format!(
+                "invalid pack name: {local_name}"
+            )));
+        }
+        Ok(Self {
+            base: params.url.trim(),
+            remote_name,
+            local_name,
+        })
+    }
+}
+
+/// The `name` parameter of `POST /packs/download_zip` (query or body,
+/// [`create_file`] reads the pair alike); the archive itself rides in
+/// the multipart `file` part.
+#[derive(Debug, Deserialize)]
+struct DownloadZipParams {
+    /// Raw pack `name` value, if present.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// One pack as a remote instance's `/api/v1/pleroma/emoji/pack` answers
+/// it: the same triple [`PackView`] serializes, read back from a peer.
+/// Unknown keys (Pleroma's `files_extra`) are ignored.
+#[derive(Debug, Deserialize)]
+struct RemotePackListing {
+    /// The manifest metadata block: its `share-files` flag and
+    /// `fallback-src` decide where the archive comes from.
+    #[serde(default)]
+    pack: emoji_packs::PackMeta,
+    /// Shortcode to file name, as the remote paginated them.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+    /// Total files on the remote, before pagination.
+    #[serde(default)]
+    files_count: usize,
+}
+
+/// The 400 for a `url` this instance's client could never call.
+fn bad_url() -> AppError {
+    AppError::BadRequest(INVALID_URL.to_owned())
+}
+
+/// The URL of the instance `base` answers `path` at, with `query`
+/// percent-encoded onto it — Pleroma's `URI.merge` of the instance URL
+/// with the fixed API path. A `base` that parses to no http(s) address
+/// is [`bad_url`]'s 400; whether the SSRF guard lets the host through is
+/// the fetch's answer, not this function's.
+fn instance_api_url(base: &str, path: &str, query: &[(&str, &str)]) -> AppResult<String> {
+    let parsed = Url::parse(base.trim()).map_err(|_err| bad_url())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(bad_url());
+    }
+    let mut target = parsed.join(path).map_err(|_err| bad_url())?;
+    let query_text = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(query.iter().copied())
+        .finish();
+    target.set_query(Some(&query_text));
+    Ok(target.into())
+}
+
+/// The 500 for a failed remote fetch: the fixed client-safe `message`
+/// on the wire, the cause in the log — Pleroma answers its remote
+/// actions' fetch failures with a 500 whose body names what failed
+/// (`emoji_pack_controller.ex`), which [`AppError::Internal`]'s generic
+/// message could not.
+fn remote_failure(message: &str, cause: &str) -> AppError {
+    debug!(cause, "emoji pack remote fetch failed");
+    AppError::InternalMessage(message.to_owned())
+}
+
+/// Fetches `url` with the state's guarded client, reading at most
+/// `max_bytes`, and insists on a 2xx answer; every failure — transport,
+/// guard, size cap, status — arrives as the 500 that `message` words.
+async fn fetch_remote(
+    state: &AppState,
+    url: &str,
+    max_bytes: usize,
+    message: &str,
+) -> AppResult<HttpResponse> {
+    let response = state
+        .http_client
+        .get_limited(url, &[], max_bytes)
+        .await
+        .map_err(|err| remote_failure(message, &err.to_string()))?;
+    if !(MIN_FETCH_STATUS..MAX_FETCH_STATUS).contains(&response.status) {
+        return Err(remote_failure(
+            message,
+            &format!("the peer answered {}", response.status),
+        ));
+    }
+    Ok(response)
+}
+
+/// Fetches `url` under the listing cap ([`MAX_REMOTE_LIST_BYTES`]) and
+/// requires a JSON body; bytes that parse to no JSON are as good as no
+/// answer.
+async fn fetch_remote_json(state: &AppState, url: &str) -> AppResult<Value> {
+    let response = fetch_remote(state, url, MAX_REMOTE_LIST_BYTES, COULD_NOT_FETCH).await?;
+    serde_json::from_slice(&response.body)
+        .map_err(|err| remote_failure(COULD_NOT_FETCH, &err.to_string()))
+}
+
+/// Fetches the listing of the pack `request` names on its instance,
+/// asking for `page_size` files; Pleroma's `download` reads
+/// `files_count` from a first page and refetches with it as the size,
+/// and this keeps that shape.
+async fn fetch_pack_listing(
+    state: &AppState,
+    request: &DownloadRequest<'_>,
+    page_size: &str,
+) -> AppResult<RemotePackListing> {
+    let url = instance_api_url(
+        request.base,
+        REMOTE_PACK_PATH,
+        &[
+            ("name", request.remote_name),
+            ("page", "1"),
+            ("page_size", page_size),
+        ],
+    )?;
+    let body = fetch_remote_json(state, &url).await?;
+    serde_json::from_value(body).map_err(|err| remote_failure(COULD_NOT_FETCH, &err.to_string()))
+}
+
+/// Where the archive of `request`'s remote pack comes from, Pleroma's
+/// `fetch_pack_info` decision: a pack that shares its files downloads
+/// from its instance's archive endpoint; an unshared one only through a
+/// `fallback-src` it names; a pack with neither is refused with the
+/// ticket's pinned 400.
+fn archive_source(request: &DownloadRequest<'_>, listing: &RemotePackListing) -> AppResult<String> {
+    if listing.pack.share_files {
+        return instance_api_url(
+            request.base,
+            REMOTE_ARCHIVE_PATH,
+            &[("name", request.remote_name)],
+        );
+    }
+    listing
+        .pack
+        .fallback_src
+        .as_deref()
+        .map(str::trim)
+        .filter(|src| !src.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppError::BadRequest(PACK_NOT_SHAREABLE.to_owned()))
+}
+
+/// Extracts a pack archive into the freshly created pack `name` and
+/// writes the manifest that stands: the one the archive carries itself
+/// when it parses and names files that landed, else `listing`'s map (a
+/// remote pack's own shortcode map) or the stems of the extracted
+/// images (an upload without a manifest). Every entry of the stored
+/// manifest names a file that actually arrived, so an installed pack
+/// always lists, serves and archives. Returns the stored entry count.
+///
+/// # Errors
+///
+/// [`emoji_packs::extract_pack_archive`]'s refusals
+/// ([`emoji_packs::ARCHIVE_UNSAFE_PATH`] and friends), whatever
+/// [`emoji_packs::save_pack`] fails with; a directory the failed install
+/// leaves behind is the caller's to [`remove_half_pack`].
+async fn install_pack_archive(
+    state: &AppState,
+    name: &str,
+    archive: &[u8],
+    listing: Option<RemotePackListing>,
+) -> AppResult<usize> {
+    let extracted =
+        emoji_packs::extract_pack_archive(&state.config.emoji_dir, name, archive).await?;
+    let manifest = stored_manifest(state, name, &extracted)
+        .await
+        .unwrap_or_else(|| {
+            listing.map_or_else(
+                || manifest_from_images(&extracted),
+                |listing| manifest_from_listing(&listing, &extracted),
+            )
+        });
+    emoji_packs::save_pack(&state.config.emoji_dir, name, &manifest).await?;
+    Ok(manifest.files.len())
+}
+
+/// The manifest the extracted archive brought with it: its `pack.json`,
+/// loaded from the pack directory where the extraction wrote it and
+/// reduced to the entries that are a valid shortcode naming a file that
+/// landed. `None` when the archive shipped no manifest, none that
+/// parses, or none that names a single installed file.
+async fn stored_manifest(
+    state: &AppState,
+    name: &str,
+    extracted: &BTreeSet<String>,
+) -> Option<emoji_packs::Pack> {
+    if !extracted.contains(emoji_packs::PACK_FILE) {
+        return None;
+    }
+    let stored = emoji_packs::load_pack(&state.config.emoji_dir, name)
+        .await
+        .ok()?;
+    let files: BTreeMap<String, String> = stored
+        .files
+        .into_iter()
+        .filter(|(code, file)| emoji_packs::shortcode_valid(code) && extracted.contains(file))
+        .collect();
+    (!files.is_empty()).then_some(emoji_packs::Pack {
+        pack: stored.pack,
+        files,
+    })
+}
+
+/// The manifest a remote pack gets from its listing: the metadata block
+/// as the peer describes it, keeping only the files the extraction
+/// landed (an archive may carry less than the listing claims, and never
+/// more than this instance stores).
+fn manifest_from_listing(
+    listing: &RemotePackListing,
+    extracted: &BTreeSet<String>,
+) -> emoji_packs::Pack {
+    emoji_packs::Pack {
+        pack: listing.pack.clone(),
+        files: listing
+            .files
+            .iter()
+            .filter(|(_, file)| extracted.contains(*file))
+            .map(|(code, file)| (code.clone(), file.clone()))
+            .collect(),
+    }
+}
+
+/// The manifest an upload without one gets: every extracted image is an
+/// emoji named after its file stem, nested names keeping their relative
+/// path — Pleroma's `make_shortcode_to_file_map`.
+fn manifest_from_images(extracted: &BTreeSet<String>) -> emoji_packs::Pack {
+    let mut pack = emoji_packs::Pack::default();
+    for file in extracted {
+        if file == emoji_packs::PACK_FILE {
+            continue;
+        }
+        let Some(stem) = std::path::Path::new(file)
+            .file_stem()
+            .and_then(OsStr::to_str)
+        else {
+            continue;
+        };
+        if emoji_packs::shortcode_valid(stem) {
+            let _entry: Option<String> = pack.files.insert(stem.to_owned(), file.clone());
+        }
+    }
+    pack
+}
+
+/// Removes a pack directory an install left half-written, so a refused
+/// download or upload stores nothing that cannot be served; a directory
+/// that resists removal is logged — the install failure is the answer.
+async fn remove_half_pack(state: &AppState, name: &str) {
+    if let Err(err) = emoji_packs::delete_pack(&state.config.emoji_dir, name).await {
+        debug!(
+            pack = name,
+            %err,
+            "could not remove the half-installed emoji pack"
+        );
+    }
+}
+
+/// `GET /api/v1/pleroma/emoji/packs/remote?url=…` — Pleroma's `remote`:
+/// another instance's pack listing, its `{"count","packs"}` object
+/// fetched from `{url}/api/v1/pleroma/emoji/packs` (paginated by the
+/// `page` and `page_size` of the request, this module's defaults and
+/// cap included) through the SSRF-guarded client at the 5 MiB cap, and
+/// relayed as it answered. A `url` that is no http(s) address is the
+/// 400; a remote that is down, answers a non-2xx or talks non-JSON is
+/// the 500 `{"error":"Could not fetch the pack list"}`. An admin with
+/// `admin:read` (the ticket's grant for the GETs; Pleroma itself asks
+/// `admin:write`).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:read` gate; [`AppError::BadRequest`] for a `url` no
+/// client may call ([`INVALID_URL`]); [`AppError::InternalMessage`] for
+/// every remote failure; other read failures arrive unchanged.
+async fn remote(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    params: PackParams,
+) -> AppResult<Json<Value>> {
+    admin.require(CLASS_READ, AREA_EMOJI)?;
+    let page = params.page.to_string();
+    let page_size = params.page_size.to_string();
+    let url = instance_api_url(
+        params.url.as_deref().unwrap_or_default(),
+        REMOTE_PACKS_PATH,
+        &[("page", &page), ("page_size", &page_size)],
+    )?;
+    let body = fetch_remote_json(&state, &url).await?;
+    debug!("emoji pack remote listing relayed");
+    Ok(Json(body))
+}
+
+/// `POST /api/v1/pleroma/emoji/packs/download` — Pleroma's `download`:
+/// install the pack `name` of the instance `url` under `as` (or the
+/// remote name). The remote pack listing decides the source, per
+/// [`archive_source`]: a shared pack downloads from its instance's
+/// `packs/archive` endpoint, an unshared one only through a
+/// `fallback-src`, and a pack with neither is the 400
+/// `{"error":"The pack was not set as shared and there is no fallback
+/// src to download from"}`. The zip — at most
+/// [`MAX_PACK_ARCHIVE_BYTES`](emoji_packs::MAX_PACK_ARCHIVE_BYTES) —
+/// is extracted safely into a fresh pack directory, so an occupied
+/// local name is the 400 `{"error":"Pack already exists"}` and a
+/// traversal or over-cap archive is refused with nothing left behind.
+/// On success the custom emojis resync and the answer is the JSON
+/// string `"ok"`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::BadRequest`] from the name
+/// and `url` checks, the pack-exists refusal and the extraction rules
+/// ([`emoji_packs::ARCHIVE_UNSAFE_PATH`] and friends);
+/// [`AppError::Unprocessable`] for a body without `url` or `name`;
+/// [`AppError::InternalMessage`] for a failed remote fetch;
+/// [`AppError::Internal`] for a filesystem failure; [`AppError::Database`]
+/// from the resync.
+async fn download(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    ApiParams(params): ApiParams<DownloadParams>,
+) -> AppResult<Json<&'static str>> {
+    admin.require(CLASS_WRITE, AREA_EMOJI)?;
+    let request = DownloadRequest::from_params(&params)?;
+    let mut listing = fetch_pack_listing(&state, &request, "0").await?;
+    if listing.files.len() < listing.files_count {
+        let full = listing.files_count.to_string();
+        listing = fetch_pack_listing(&state, &request, &full).await?;
+    }
+    let source = archive_source(&request, &listing)?;
+    let archive = fetch_remote(
+        &state,
+        &source,
+        emoji_packs::MAX_PACK_ARCHIVE_BYTES,
+        COULD_NOT_DOWNLOAD,
+    )
+    .await?;
+    emoji_packs::create_pack(&state.config.emoji_dir, request.local_name).await?;
+    let installed =
+        install_pack_archive(&state, request.local_name, &archive.body, Some(listing)).await;
+    if let Err(err) = installed {
+        remove_half_pack(&state, request.local_name).await;
+        return Err(err);
+    }
+    resync(&state).await?;
+    debug!(
+        pack = request.local_name,
+        "emoji pack downloaded from a remote instance"
+    );
+    Ok(Json(OK_BODY))
+}
+
+/// `POST /api/v1/pleroma/emoji/packs/download_zip` — Pleroma's
+/// `download_zip`: create the pack `name` from an uploaded zip. The
+/// same safe extraction as [`download`]; a `pack.json` inside the
+/// archive is the manifest, and without one every extracted image
+/// becomes an emoji named after its file stem. An occupied name is the
+/// 400 `{"error":"Pack already exists"}`, a body without a `file` part
+/// the 422, unusable archive contents the 400 of
+/// [`emoji_packs::ARCHIVE_UNSAFE_PATH`] and friends. On success the
+/// custom emojis resync and the answer is the JSON string `"ok"`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::BadRequest`] for a blank or
+/// unusable `name` and the extraction refusals;
+/// [`AppError::Unprocessable`] for a body without any `file` part;
+/// [`AppError::PayloadTooLarge`] for an upload past the configured
+/// limits; [`AppError::Internal`] for a filesystem failure;
+/// [`AppError::Database`] from the resync.
+async fn download_zip(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    params: PackParams,
+    form: MultipartForm<DownloadZipParams>,
+) -> AppResult<Json<&'static str>> {
+    admin.require(CLASS_WRITE, AREA_EMOJI)?;
+    let MultipartForm { fields, mut files } = form;
+    let name = trimmed_name(fields.name.as_deref().or(params.name.as_deref()))?;
+    let Some(upload) = files.take(FILE_FIELD) else {
+        return Err(AppError::Unprocessable(MISSING_FILE.to_owned()));
+    };
+    emoji_packs::create_pack(&state.config.emoji_dir, name).await?;
+    let installed = install_pack_archive(&state, name, &upload.bytes, None).await;
+    if let Err(err) = installed {
+        remove_half_pack(&state, name).await;
+        return Err(err);
+    }
+    resync(&state).await?;
+    debug!(pack = name, "emoji pack installed from an uploaded archive");
+    Ok(Json(OK_BODY))
+}
+
+/// `GET /api/v1/pleroma/emoji/packs/import` — Pleroma's
+/// `import_from_filesystem`: every pack directory of `EMOJI_DIR` that
+/// lacks a valid `pack.json` gets one written from the image files it
+/// holds ([`import_packs`](emoji_packs::import_packs)), and the names
+/// imported answer as a JSON array; already-valid packs, hidden names
+/// and loose files under the root are left alone. The custom emojis
+/// resync afterwards, so an imported pack serves at once. An admin with
+/// `admin:read` (the ticket's grant; Pleroma asks `admin:write`).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:read` gate; [`AppError::Internal`] for a filesystem
+/// failure; [`AppError::Database`] from the resync.
+async fn import(State(state): State<AppState>, admin: AdminUser) -> AppResult<Json<Vec<String>>> {
+    admin.require(CLASS_READ, AREA_EMOJI)?;
+    let names = emoji_packs::import_packs(&state.config.emoji_dir).await?;
+    resync(&state).await?;
+    debug!(packs = names.len(), "emoji pack manifests imported");
+    Ok(Json(names))
+}
+
 /// `GET /emoji/{pack}/{file}` — one image file of a pack, served with the
 /// media safety headers. No authentication: the address is what
 /// `custom_emojis.image_url` carries into client HTML.
@@ -1291,6 +1829,7 @@ mod tests {
             "absent parameters take the defaults"
         );
         assert_eq!(plain.name, None, "no name by default");
+        assert_eq!(plain.url, None, "no url by default");
 
         let big = params_for("/p?page=0&page_size=500&name=x").await;
         assert_eq!(big.page, 1, "a page below 1 reads as the first");
@@ -1924,6 +2463,250 @@ mod tests {
         assert!(
             matches!(err, AppError::PayloadTooLarge(_)),
             "2 MiB and one byte is too large: {err}"
+        );
+    }
+
+    #[test]
+    fn the_remote_urls_are_built_on_the_instances_api_paths() {
+        let packs = instance_api_url(
+            " https://remote.example/ ",
+            REMOTE_PACKS_PATH,
+            &[("page", "2"), ("page_size", "7")],
+        )
+        .unwrap_or_else(|err| panic!("a good base parses: {err}"));
+        assert_eq!(
+            packs, "https://remote.example/api/v1/pleroma/emoji/packs?page=2&page_size=7",
+            "the base is trimmed and the API path and query appended"
+        );
+        let named = instance_api_url(
+            "https://remote.example",
+            REMOTE_PACK_PATH,
+            &[("name", "two words"), ("page", "1"), ("page_size", "3")],
+        )
+        .unwrap();
+        assert_eq!(
+            named,
+            "https://remote.example/api/v1/pleroma/emoji/pack?name=two+words&page=1&page_size=3",
+            "the pack name rides percent-encoded like every query value"
+        );
+        let hosted = instance_api_url(
+            "https://remote.example/pleroma",
+            REMOTE_ARCHIVE_PATH,
+            &[("name", "cats")],
+        )
+        .unwrap();
+        assert_eq!(
+            hosted, "https://remote.example/api/v1/pleroma/emoji/packs/archive?name=cats",
+            "an absolute API path replaces the base path, Pleroma's URI.merge"
+        );
+    }
+
+    #[test]
+    fn a_url_no_client_could_ever_call_is_the_400() {
+        for base in ["", "   ", "not a url", "ftp://remote.example", "https://"] {
+            let err = instance_api_url(base, REMOTE_PACKS_PATH, &[]).unwrap_err();
+            assert!(
+                matches!(err, AppError::BadRequest(_)),
+                "{base:?} is a 400, not {err}"
+            );
+            assert_eq!(err.to_string(), INVALID_URL, "the message is pinned");
+        }
+    }
+
+    /// A download body for the request-shape tests.
+    fn download_body(url: &str, name: &str, as_name: Option<&str>) -> DownloadParams {
+        DownloadParams {
+            url: url.to_owned(),
+            name: name.to_owned(),
+            as_name: as_name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_download_body_takes_url_name_and_an_as_override() {
+        let full: DownloadParams = serde_json::from_value(json!({
+            "url": "https://remote.example",
+            "name": "cats",
+            "as": "local-cats",
+        }))
+        .unwrap();
+        let request = DownloadRequest::from_params(&full).unwrap();
+        assert_eq!(
+            (request.base, request.remote_name, request.local_name),
+            ("https://remote.example", "cats", "local-cats"),
+            "the dashed body key renames into `as_name`"
+        );
+
+        let trimmed_body = download_body(" https://remote.example ", "  cats  ", Some("   "));
+        let trimmed = DownloadRequest::from_params(&trimmed_body).unwrap();
+        assert_eq!(
+            (trimmed.base, trimmed.remote_name, trimmed.local_name),
+            ("https://remote.example", "cats", "cats"),
+            "everything is trimmed and a blank `as` stands aside for the remote name"
+        );
+
+        let blank = download_body("https://x.test", "  ", None);
+        let empty_name_err = DownloadRequest::from_params(&blank).unwrap_err();
+        assert_eq!(
+            empty_name_err.to_string(),
+            NAME_EMPTY,
+            "a blank pack name is the 400"
+        );
+
+        let escaping = download_body("https://x.test", "cats", Some("../evil"));
+        let escape_err = DownloadRequest::from_params(&escaping).unwrap_err();
+        assert_eq!(
+            escape_err.to_string(),
+            "invalid pack name: ../evil",
+            "no local name can name an escaping directory"
+        );
+    }
+
+    #[test]
+    fn the_remote_listing_reads_pleromas_pack_triple() {
+        let listing: RemotePackListing = serde_json::from_value(json!({
+            "files": {"cat": "cat.png"},
+            "files_count": 1,
+            "files_extra": {"cat": {"tags": ["pack:cats"]}},
+            "pack": {
+                "license": "MIT",
+                "share-files": true,
+                "can-download": true,
+                "download-sha256": "beef",
+            },
+        }))
+        .unwrap();
+        assert!(listing.pack.share_files, "the share flag parsed");
+        assert_eq!(
+            listing.files.get("cat").map(String::as_str),
+            Some("cat.png"),
+            "the shortcode map parsed"
+        );
+        assert_eq!(listing.files_count, 1, "and the total count");
+
+        let empty: RemotePackListing = serde_json::from_value(json!({})).unwrap();
+        assert!(
+            !empty.pack.share_files && empty.files.is_empty() && empty.files_count == 0,
+            "every key is optional on read"
+        );
+        let err = serde_json::from_value::<RemotePackListing>(json!("just a string"))
+            .expect_err("a non-object body is no listing");
+        assert!(!err.to_string().is_empty(), "and says why: {err}");
+    }
+
+    /// A shared listing for the source-decision tests.
+    fn listing_with(meta: emoji_packs::PackMeta) -> RemotePackListing {
+        RemotePackListing {
+            pack: meta,
+            files: BTreeMap::new(),
+            files_count: 0,
+        }
+    }
+
+    #[test]
+    fn a_shared_pack_downloads_from_its_archive_endpoint() {
+        let body = download_body(
+            "https://remote.example",
+            "cats and dogs",
+            Some("packed-cats"),
+        );
+        let request = DownloadRequest::from_params(&body).unwrap();
+        assert_eq!(request.local_name, "packed-cats");
+        let shared = listing_with(emoji_packs::PackMeta {
+            share_files: true,
+            ..emoji_packs::PackMeta::default()
+        });
+        assert_eq!(
+            archive_source(&request, &shared).unwrap(),
+            "https://remote.example/api/v1/pleroma/emoji/packs/archive?name=cats+and+dogs",
+            "the instance's own archive endpoint, name encoded"
+        );
+    }
+
+    #[test]
+    fn an_unshared_pack_follows_only_its_fallback_src() {
+        let body = download_body("https://x.test", "cats", None);
+        let request = DownloadRequest::from_params(&body).unwrap();
+        let with_src = listing_with(emoji_packs::PackMeta {
+            fallback_src: Some("  https://files.example/cats.zip  ".to_owned()),
+            ..emoji_packs::PackMeta::default()
+        });
+        assert_eq!(
+            archive_source(&request, &with_src).unwrap(),
+            "https://files.example/cats.zip",
+            "the declared archive, as given"
+        );
+        for meta in [
+            emoji_packs::PackMeta::default(),
+            emoji_packs::PackMeta {
+                fallback_src: Some("   ".to_owned()),
+                ..emoji_packs::PackMeta::default()
+            },
+        ] {
+            let err = archive_source(&request, &listing_with(meta)).unwrap_err();
+            assert!(
+                matches!(err, AppError::BadRequest(_)),
+                "nothing to download from is a 400, not {err}"
+            );
+            assert_eq!(err.to_string(), PACK_NOT_SHAREABLE, "the pinned wording");
+        }
+    }
+
+    #[test]
+    fn the_listing_manifest_keeps_only_files_that_landed() {
+        let listing = RemotePackListing {
+            pack: emoji_packs::PackMeta {
+                license: Some("MIT".to_owned()),
+                share_files: true,
+                ..emoji_packs::PackMeta::default()
+            },
+            files: BTreeMap::from([
+                ("cat".to_owned(), "cat.png".to_owned()),
+                ("gone".to_owned(), "gone.png".to_owned()),
+                ("nested".to_owned(), "sub/nested.gif".to_owned()),
+            ]),
+            files_count: 3,
+        };
+        let extracted = BTreeSet::from(["cat.png".to_owned(), "sub/nested.gif".to_owned()]);
+        let pack = manifest_from_listing(&listing, &extracted);
+        assert_eq!(
+            pack.pack.license.as_deref(),
+            Some("MIT"),
+            "the remote metadata rides into the stored manifest"
+        );
+        assert!(pack.pack.share_files, "including its share flag");
+        assert_eq!(
+            pack.files
+                .iter()
+                .map(|(code, file)| (code.as_str(), file.as_str()))
+                .collect::<Vec<_>>(),
+            [("cat", "cat.png"), ("nested", "sub/nested.gif")],
+            "the announced file that never landed is not entered"
+        );
+    }
+
+    #[test]
+    fn an_upload_manifest_names_emojis_after_the_file_stems() {
+        let extracted = BTreeSet::from([
+            emoji_packs::PACK_FILE.to_owned(),
+            "cat.png".to_owned(),
+            "cat.webp".to_owned(),
+            "sub/kitten.gif".to_owned(),
+            "sub/kitten.jpg".to_owned(),
+            "no stem.png".to_owned(),
+        ]);
+        let pack = manifest_from_images(&extracted);
+        assert_eq!(
+            pack.files
+                .iter()
+                .map(|(code, file)| (code.as_str(), file.as_str()))
+                .collect::<Vec<_>>(),
+            [("cat", "cat.webp"), ("kitten", "sub/kitten.jpg")],
+            "one emoji per stem, the last extracted name wins, the manifest itself is no emoji, and a stem the pattern refuses is skipped"
+        );
+        assert!(
+            !pack.pack.share_files,
+            "a stem-built pack starts unshared, its provenance unknown"
         );
     }
 }
