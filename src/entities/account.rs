@@ -59,7 +59,7 @@ pub(crate) const DEFAULT_AVATAR_PATH: &str = "/images/avi.png";
 
 /// Path appended to [`Config::frontend_base_url`] for the default banner,
 /// matching Pleroma's `banner_url/2` fallback.
-const DEFAULT_BANNER_PATH: &str = "/images/banner.png";
+pub(crate) const DEFAULT_BANNER_PATH: &str = "/images/banner.png";
 
 /// Format of `last_status_at`: a bare `YYYY-MM-DD` date, the counterpart
 /// of Pleroma's `NaiveDateTime.to_date() |> Date.to_iso8601()`.

@@ -22,6 +22,9 @@
 //!   clearing the token as it goes.
 //! * [`unconfirmed_by_email`] is the lookup `POST
 //!   /api/v1/pleroma/accounts/confirmation_resend` runs.
+//! * [`set_confirmed`] is the admin's override of the whole dance: Pleroma's
+//!   `User.confirm/1` over the `PATCH /users/confirm_email` list, which
+//!   activates the address without ever asking its owner for the token.
 //!
 //! Registration decides *whether* an account needs this at all from
 //! `ACCOUNT_ACTIVATION_REQUIRED` (see
@@ -131,6 +134,38 @@ pub async fn confirm(pool: &PgPool, user_id: Uuid, token: &str) -> AppResult<boo
         .execute(pool)
         .await?;
     Ok(outcome.rows_affected() > 0)
+}
+
+/// [`set_confirmed`]: the admin's tokenless confirmation — Pleroma's
+/// `User.confirm/1`, which just flips the flag and retires any token. The
+/// `WHERE` asks nothing of the account: an already-confirmed row keeps its
+/// `updated_at` write and changes no fact.
+const SET_CONFIRMED_SQL: &str = "UPDATE users
+      SET email_confirmed = true, confirmation_token = NULL,
+          confirmation_sent_at = NULL, updated_at = now()
+    WHERE id = $1";
+
+/// Confirms the address of user `id` without its token: Pleroma's
+/// `User.confirm`, the admin's `PATCH /users/confirm_email` override.
+///
+/// The pending [`confirmation_token`] dies with the flag, so a letter
+/// already in someone's inbox confirms nothing afterwards. An id no
+/// account carries matches nothing and is nobody's error — the caller
+/// resolved the nickname moments ago, and Pleroma's `confirm` is content
+/// with a list that holds no such user.
+///
+/// [`confirmation_token`]: User::confirmation_token
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn set_confirmed(pool: &PgPool, user_id: Uuid) -> AppResult<()> {
+    sqlx::query(SET_CONFIRMED_SQL)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map(drop)?;
+    Ok(())
 }
 
 /// The local account whose email is `email` and whose address is still
@@ -448,5 +483,46 @@ mod tests {
             "an account that never went through the flow has no token"
         );
         assert!(user.confirmation_sent_at.is_none(), "and no send stamp");
+    }
+
+    /// The admin override confirms without the token and retires a pending
+    /// one; an already-confirmed account keeps its fact and an unknown id
+    /// changes nothing.
+    #[tokio::test]
+    async fn set_confirmed_overrides_the_token_check() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let pending = account(pool, "admin-confirmed", false).await;
+        let _tokened = sqlx::query(
+            "UPDATE users SET confirmation_token = $2, confirmation_sent_at = now() WHERE id = $1",
+        )
+        .bind(pending.id)
+        .bind("a-letter-in-the-wild")
+        .execute(pool)
+        .await
+        .expect("the token fixture writes");
+
+        set_confirmed(pool, pending.id)
+            .await
+            .expect("the admin override runs");
+        let row = stored(pool, pending.id).await;
+        assert!(row.email_confirmed.get(), "the address is confirmed");
+        assert!(
+            row.confirmation_token.is_none(),
+            "the outstanding letter confirms nothing any more"
+        );
+        assert!(row.confirmation_sent_at.is_none(), "and so is its stamp");
+
+        // The write is idempotent and safe on rows that are not there.
+        set_confirmed(pool, pending.id)
+            .await
+            .expect("the second override runs");
+        assert!(
+            stored(pool, pending.id).await.email_confirmed.get(),
+            "a confirmed account stays confirmed"
+        );
+        set_confirmed(pool, Uuid::now_v7())
+            .await
+            .expect("an unknown id matches no row and is nobody's error");
     }
 }

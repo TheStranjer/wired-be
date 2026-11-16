@@ -441,7 +441,7 @@ const TOO_MANY_FIELDS: &str = "Too many fields";
 /// The four `default_scope` values `source[privacy]` accepts: the
 /// visibilities new statuses may default to (the same list a scrobble's
 /// `visibility` picks from).
-const SCOPES: [&str; 4] = ["public", "unlisted", "private", "direct"];
+pub(crate) const SCOPES: [&str; 4] = ["public", "unlisted", "private", "direct"];
 
 /// The 422 body for a `source[privacy]` (or the flat `default_scope` of the
 /// same parameter) outside [`SCOPES`], in the wording the scrobble endpoint
@@ -454,14 +454,14 @@ const MAX_LANGUAGE_CHARS: usize = 10;
 
 /// The two `actor_type` values `update_credentials` accepts: a human actor
 /// and an automated one (`Service` is what Pleroma stores for `bot=true`).
-const ACTOR_TYPES: [&str; 2] = [PERSON_ACTOR_TYPE, SERVICE_ACTOR_TYPE];
+pub(crate) const ACTOR_TYPES: [&str; 2] = [PERSON_ACTOR_TYPE, SERVICE_ACTOR_TYPE];
 
 /// The [`ACTOR_TYPES`] entry of a human actor: the column default, which is
 /// what `bot=false` stores.
 const PERSON_ACTOR_TYPE: &str = DEFAULT_ACTOR_TYPE;
 
 /// The [`ACTOR_TYPES`] entry of an automated account.
-const SERVICE_ACTOR_TYPE: &str = "Service";
+pub(crate) const SERVICE_ACTOR_TYPE: &str = "Service";
 
 /// The 422 body for an `actor_type` outside [`ACTOR_TYPES`].
 const ACTOR_TYPE_INVALID: &str = "actor_type: is not included in the list";
@@ -1876,7 +1876,7 @@ fn own_media_key(config: &Config, stored_url: &str) -> Option<String> {
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] for the count and both length limits.
-fn stored_fields(submitted: Value, max_fields: usize) -> AppResult<(Value, Value)> {
+pub(crate) fn stored_fields(submitted: Value, max_fields: usize) -> AppResult<(Value, Value)> {
     let mut entries = Vec::new();
     for entry in index_map_to_vec(submitted) {
         let name = field_text(&entry, "name");
@@ -1932,7 +1932,7 @@ fn check_field_len(what: &str, text: &str, max_chars: usize) -> AppResult<()> {
 /// before sanitizing, like Pleroma's changeset checks the parameter —
 /// and then [`sanitize_display_name`]'s one line of plain text. An empty
 /// string survives as empty.
-fn sanitized_name(raw: &str, max_chars: usize) -> AppResult<String> {
+pub(crate) fn sanitized_name(raw: &str, max_chars: usize) -> AppResult<String> {
     if raw.chars().count() > max_chars {
         return Err(AppError::Unprocessable(format!(
             "Name is too long (maximum is {max_chars} characters)"
@@ -1947,7 +1947,7 @@ fn sanitized_name(raw: &str, max_chars: usize) -> AppResult<String> {
 /// mentions naming a local user of this instance become their `h-card`
 /// anchors — unknown and remote mentions stay the plain text they were
 /// written as.
-async fn render_note(state: &AppState, raw: &str) -> AppResult<String> {
+pub(crate) async fn render_note(state: &AppState, raw: &str) -> AppResult<String> {
     let html = text_to_html(raw);
     let urls = local_mention_urls(&state.db, &state.config, &html).await?;
     let resolver = |mention: &MentionRef| urls.get(&mention_key(mention)).cloned();

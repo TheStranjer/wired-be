@@ -26,8 +26,12 @@
 //!   ([`status_visibility_counts`](crate::models::status::status_visibility_counts)).
 //!
 //! The account reads the [`users`] submodule serves — `GET /users` and
-//! `GET /users/{nickname}` — are listed there, along with the invite
-//! actions of [`invites`] and the webhook routes of [`webhooks`]. The
+//! `GET /users/{nickname}` — are listed there, along with the credentials,
+//! security and follow maintenance of one account that joins them with
+//! WBE-198 (the `users/…/credentials` pair, the issued and forced password
+//! resets, `users/confirm_email`, `users/resend_confirmation_email`,
+//! `users/disable_mfa` and the `users/follow` pair), the invite actions of
+//! [`invites`] and the webhook routes of [`webhooks`]. The
 //! media-proxy cache ledger, the frontend installer and the admin's backup
 //! trigger (WBE-208) are the [`ops`] submodule.
 //!
