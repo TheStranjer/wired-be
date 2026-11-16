@@ -4,7 +4,7 @@
 use axum::Router;
 
 use crate::{
-    api::{account_lists, chats, instance, media, notifications_v2, search},
+    api::{account_lists, chats, instance, mastodon_admin, media, notifications_v2, search},
     state::AppState,
 };
 
@@ -22,7 +22,10 @@ use crate::{
 /// arm renders tag entities where v1 spells plain names.
 /// [`notifications_v2::router`] contributes the grouped notification API:
 /// `GET /api/v2/notifications` with its `unread_count`, `{group_key}`,
-/// `{group_key}/accounts` and `{group_key}/dismiss` companions. Do not call
+/// `{group_key}/accounts` and `{group_key}/dismiss` companions.
+/// [`mastodon_admin::v2_router`] is nested at `/admin`, the prefix Mastodon's
+/// admin API rides on: `GET /api/v2/admin/accounts` is the word-spelled twin
+/// of that area's v1 listing, same entities, same page. Do not call
 /// [`Router::fallback`] here (or on
 /// anything merged here): unmatched paths must reach the app-wide JSON
 /// fallback in [`crate::app`], which answers them with Pleroma's
@@ -41,5 +44,6 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(media::router(&state.config))
         .merge(notifications_v2::router())
         .merge(search::v2_router(state))
+        .nest("/admin", mastodon_admin::v2_router())
         .nest("/pleroma/chats", chats::v2_router())
 }

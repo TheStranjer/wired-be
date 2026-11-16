@@ -9,7 +9,10 @@
 //! alone. [`account`] renders the Mastodon `Account` entity,
 //! [`admin_account`] the admin API's account entity — the moderation
 //! console's row behind `GET /api/v1/pleroma/admin/users` and its show
-//! endpoint — [`admin_report`] the admin API's report entity — the
+//! endpoint — [`mastodon_admin`] the Mastodon admin API's account entity,
+//! the profile-plus-private-columns row behind
+//! `GET /api/v{1,2}/admin/accounts` —
+//! [`admin_report`] the admin API's report entity — the
 //! moderation console's view of a filed report behind
 //! `GET /api/v1/pleroma/admin/reports` —
 //! [`announcement`] the Mastodon `Announcement` entity,
@@ -63,6 +66,7 @@ pub mod emoji_reaction;
 pub mod filter;
 pub mod list;
 pub mod marker;
+pub mod mastodon_admin;
 pub mod media_attachment;
 pub mod mention;
 pub mod notification;

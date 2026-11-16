@@ -8,10 +8,10 @@ use crate::{
     api::{
         account_lists, accounts, admin, announcements, apps, backups, blocks, chats, conversations,
         custom_emojis, domain_blocks, emoji_packs, emoji_reactions, endorsements,
-        federation_status, filters, follow_requests, instance, lists, markers, media, misc, mutes,
-        notifications, oauth_tokens, password_reset, pleroma_accounts, pleroma_bookmark_folders,
-        pleroma_settings, polls, push, remote_interaction, reports, scheduled_statuses, scrobbles,
-        search, statuses, streaming, tags, timelines,
+        federation_status, filters, follow_requests, instance, lists, markers, mastodon_admin,
+        media, misc, mutes, notifications, oauth_tokens, password_reset, pleroma_accounts,
+        pleroma_bookmark_folders, pleroma_settings, polls, push, remote_interaction, reports,
+        scheduled_statuses, scrobbles, search, statuses, streaming, tags, timelines,
     },
     state::AppState,
 };
@@ -19,11 +19,14 @@ use crate::{
 /// The `/api/v1` router.
 ///
 /// Area routers live as `src/api/<area>.rs` and are merged here; future
-/// endpoints join them the same way. Do not call [`Router::fallback`]
-/// here (or on anything merged here): unmatched paths must reach the
-/// app-wide JSON fallback in [`crate::app`], which answers them with
-/// Pleroma's `api_not_implemented`, and merging two routers that each set
-/// a fallback panics.
+/// endpoints join them the same way. One of them is nested rather than
+/// merged: [`mastodon_admin::v1_router`] rides on `/admin`, the prefix
+/// Mastodon's admin API is routed under (its staff account reads are
+/// `GET /api/v1/admin/accounts` and `…/accounts/{id}`). Do not call
+/// [`Router::fallback`] here (or on anything merged here): unmatched paths
+/// must reach the app-wide JSON fallback in [`crate::app`], which answers
+/// them with Pleroma's `api_not_implemented`, and merging two routers that
+/// each set a fallback panics.
 ///
 /// `state` reaches [`accounts::router`], [`apps::router`],
 /// [`polls::router`], [`reports::router`], [`search::router`] and
@@ -86,4 +89,5 @@ pub fn router(state: &AppState) -> Router<AppState> {
             emoji_reactions::router().merge(statuses::pleroma_router()),
         )
         .merge(federation_status::router())
+        .nest("/admin", mastodon_admin::v1_router())
 }

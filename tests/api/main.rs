@@ -268,6 +268,14 @@ mod lists;
 /// Read markers (`/api/v1/markers`).
 mod markers;
 
+/// The Mastodon admin account reads over HTTP (`GET /api/v1/admin/accounts`,
+/// its `{id}` twin and `GET /api/v2/admin/accounts`, WBE-210): the sixteen-key
+/// entity with its role object, the v1 boolean and v2 word spellings of the
+/// same criteria, the criteria this schema cannot weigh and accepts anyway,
+/// the page under a `Link` header keyed on the account ids, the show route's
+/// two misses, and the staff-and-`admin:read:accounts` gate.
+mod mastodon_admin;
+
 /// The media route (`src/api/media_files.rs`) and the local uploader.
 mod media;
 
