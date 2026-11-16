@@ -53,7 +53,10 @@
 //! `DELETE /instances/{instance}` and `POST /reload_emoji`, WBE-203) as
 //! the [`federation`] submodule, and the moderation move of a filed report
 //! (`PATCH /reports`, whose state change is the `report.updated` webhook
-//! event, WBE-212) as the [`reports`] submodule.
+//! event, WBE-212) as the [`reports`] submodule, and the admin's read of
+//! any account's chats beside the moderation withdrawal of a single chat
+//! message (the `users/…/chats`, `chats/…` and message-delete routes,
+//! WBE-202) as the [`chats`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -79,6 +82,7 @@ use crate::{
 };
 
 pub mod apps_docs;
+pub mod chats;
 pub mod config;
 pub mod federation;
 pub mod invites;
@@ -117,6 +121,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .route("/moderation_log", get(list_moderation_log))
         .route("/stats", get(stats))
         .merge(apps_docs::router(config))
+        .merge(chats::router())
         .merge(config::router())
         .merge(federation::router())
         .merge(invites::router())

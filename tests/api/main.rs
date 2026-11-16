@@ -59,6 +59,13 @@ mod admin;
 /// refusals, and both areas' scope gates.
 mod admin_apps_docs;
 
+/// The admin chat endpoints over HTTP: the user chat listing, the chat
+/// show, the message listing and the moderation withdrawal of a single
+/// message (WBE-202), all on the ordinary entities without ownership
+/// checks, with their pages and `Link` headers, their moderation entry
+/// and the chats-area scope gate.
+mod admin_chats;
+
 /// The admin federation endpoints over HTTP (WBE-203): the `/relay`
 /// follow / unfollow lifecycle against a mock relay and its
 /// `{actor, followed_back}` ledger, `DELETE /instances/{instance}`
