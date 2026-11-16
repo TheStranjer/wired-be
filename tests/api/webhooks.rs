@@ -16,8 +16,9 @@
 //! when all of them moved and Pleroma's 400 `{"id": …, "error": …}` list for
 //! the elements that moved nothing — a state off `open`/`closed`/`resolved` or
 //! an unknown report — while the reports that did move stay moved. Being the
-//! admin API, no token is 401, a moderator is 403 "User is not an admin." and
-//! an admin without the write scope is 403 on insufficient permissions. And a
+//! admin API, no token is 401, a moderator passes the staff gate the route
+//! runs on, and an admin without the write scope is 403 on insufficient
+//! permissions. And a
 //! queued job really delivers: the mock endpoint sees the four-key envelope,
 //! the three `X-Wired-*` headers, and an HMAC-SHA256 over
 //! `"{timestamp}.{body}"` that its own recomputation from the stored secret
@@ -533,11 +534,12 @@ async fn an_empty_request_moves_and_announces_nothing() {
     );
 }
 
-/// The gate: no token is 401 "Invalid credentials", a moderator is 403 "User
-/// is not an admin.", an admin holding only the read scope is 403 on
-/// insufficient permissions, and no refusal moved or queued anything.
+/// The gate: no token is 401 "Invalid credentials", a moderator passes the
+/// staff gate and answers Pleroma's `204`, an admin holding only the read
+/// scope is 403 on insufficient permissions, and the read refusal moved
+/// nothing beyond what the moderator had already moved.
 #[tokio::test]
-async fn the_admin_state_change_demands_an_admin_write_token() {
+async fn the_admin_state_change_demands_a_staff_write_token() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -557,17 +559,15 @@ async fn the_admin_state_change_demands_an_admin_write_token() {
 
     common::assert_error(&anonymous, "Invalid credentials", "no token");
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "401");
-    common::assert_answer(&as_moderator, StatusCode::FORBIDDEN, "a moderator");
-    assert_eq!(
-        as_moderator.json_value()["error"],
-        "User is not an admin.",
-        "Pleroma's admin-plug wording: {}",
-        as_moderator.json_value()
+    common::assert_answer(
+        &as_moderator,
+        StatusCode::NO_CONTENT,
+        "a moderator with the write scope",
     );
     common::assert_answer(&as_reader, StatusCode::FORBIDDEN, "a read-only admin");
     assert!(
         deliveries(&pool).await.is_empty(),
-        "a refused state change queues nothing"
+        "no subscribed webhook, so nothing was queued for the move"
     );
     let stored = report::get(&pool, report_id(&entity))
         .await
@@ -575,8 +575,8 @@ async fn the_admin_state_change_demands_an_admin_write_token() {
         .expect("the report exists");
     assert_eq!(
         stored.state,
-        report::ReportState::Open,
-        "and nothing moved: {who:?} filed it"
+        report::ReportState::Closed,
+        "the moderator moved it: {who:?} filed it"
     );
 }
 

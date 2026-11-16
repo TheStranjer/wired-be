@@ -24,7 +24,7 @@
 //! [`updated_users`], [`confirm_email`], [`resend_confirmation_email`],
 //! [`disable_mfa`], [`add_suggestion`], [`remove_suggestion`],
 //! [`follow`], [`unfollow`],
-//! [`report_update`], [`report_note`], [`status_update`],
+//! [`report_update`], [`report_note`], [`report_note_delete`], [`status_update`],
 //! [`status_delete`], [`chat_message_delete`], [`relay_follow`], [`relay_unfollow`],
 //! [`delete_instance`], [`reload_emoji`],
 //! [`invite_create`], [`invite_revoke`], [`config_change`],
@@ -771,6 +771,46 @@ pub async fn report_note(
     .await
 }
 
+/// Records a `report_note_delete`: `@admin deleted note 'text' from report
+/// ##{report_id}` plus ` on user @target` when the report names one —
+/// Pleroma's `report_note_delete` clause of `get_log_entry_message`.
+///
+/// The entry the admin note removal leaves behind. The note is gone when
+/// this records, which is exactly why its text is kept: the log line is
+/// the surviving trace of the deleted note.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn report_note_delete(
+    pool: &PgPool,
+    actor: &User,
+    report_id: Uuid,
+    text: &str,
+    subject_actor: Option<&User>,
+) -> AppResult<ModerationLog> {
+    let message = report_note_delete_sentence(
+        &actor.nickname,
+        report_id,
+        text,
+        subject_actor.map(|target| target.nickname.as_str()),
+    );
+    let mut data = report_data(report_id, None, subject_actor);
+    put(&mut data, "text", Value::String(text.to_owned()));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "report_note_delete".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
 /// Records a `status_update` of `status_id`, naming only the parts that
 /// changed: `@admin updated status ##{id}, set sensitive: 'true',
 /// visibility: 'private'`.
@@ -1348,6 +1388,22 @@ fn report_note_sentence(
     )
 }
 
+/// `"{actor} deleted note '{text}' from report ##{report_id}"` with the
+/// same ` on user @{subject}` tail [`report_note_sentence`] gives —
+/// Pleroma's `report_note_delete` clause reads the pair with
+/// `subject_actor_nickname/2` too.
+fn report_note_delete_sentence(
+    actor: &str,
+    report_id: Uuid,
+    text: &str,
+    subject_nickname: Option<&str>,
+) -> String {
+    format!(
+        "@{actor} deleted note '{text}' from report ##{report_id}{}",
+        subject_nickname.map_or_else(String::new, |target| format!(" on user @{target}"))
+    )
+}
+
 /// `"{actor} updated status ##{status_id}"` with the changed parts after
 /// a comma, in Pleroma's clause order: sensitive, then visibility; when
 /// neither is named, Pleroma's sensitive-`nil` clause still renders the
@@ -1632,6 +1688,16 @@ mod tests {
             report_note_sentence("admin", id, "noted", Some("target")),
             format!("@admin added note 'noted' to report ##{id} on user @target"),
             "the report_note clause with the bare tail"
+        );
+        assert_eq!(
+            report_note_delete_sentence("admin", id, "noted", None),
+            format!("@admin deleted note 'noted' from report ##{id}"),
+            "the report_note_delete clause without a subject actor"
+        );
+        assert_eq!(
+            report_note_delete_sentence("admin", id, "noted", Some("target")),
+            format!("@admin deleted note 'noted' from report ##{id} on user @target"),
+            "the report_note_delete clause with the bare tail"
         );
         assert_eq!(
             status_update_sentence("admin", id, Some(true), Some("private")),

@@ -78,6 +78,13 @@ mod admin_federation;
 /// frontend catalogue and installer, and the admin backup trigger.
 mod admin_ops;
 
+/// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`
+/// and the legacy `/api/v0/pleroma/reports`, WBE-200): the filtered,
+/// paged entity list, the entity show with its visibility-free statuses
+/// and notes, the bulk assignment, the note lifecycle with its
+/// moderation-log entries, and the staff-and-scope gate on every route.
+mod admin_reports;
+
 /// The admin users endpoints over HTTP (`GET /api/v1/pleroma/admin/users`
 /// and `GET …/users/{nickname}`, WBE-195): the eight filters and their
 /// combinations, the query and the named criteria, the page window beside
