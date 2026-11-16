@@ -9,12 +9,14 @@
 //! (WBE-212). [`resolve_nicknames`] is the fourth: the batch nickname
 //! lookup the list-taking admin account endpoints act on (WBE-198).
 //!
-//! The three writers belong to the maintenance the admin API does to one
+//! The five writers belong to the maintenance the admin API does to one
 //! account rather than to the profile the account edits itself, so they
 //! sit here beside the lookups that name the row: [`set_tags`] replaces the
 //! profile-tag array (WBE-197), [`set_role`] moves one of the two staff
-//! flags [`Role`] names, and [`set_suggested`] the suggestion-pool flag the
-//! `GET /api/v{1,2}/suggestions` listings read back. Like
+//! flags [`Role`] names, [`set_suggested`] the suggestion-pool flag the
+//! `GET /api/v{1,2}/suggestions` listings read back, [`set_active`] the
+//! activation flag the admin lifecycle pair flips (WBE-196) and
+//! [`set_approved`] the staff gate on a pending registration. Like
 //! [`set_also_known_as`](super::set_also_known_as) and
 //! [`set_settings_store`](super::set_settings_store) above them, each
 //! writes exactly the whole value the endpoint computed — the merge,
@@ -561,6 +563,74 @@ pub async fn set_suggested(pool: &PgPool, id: Uuid, suggested: bool) -> AppResul
     let updated = sqlx::query_as::<_, User>(SET_SUGGESTED_SQL)
         .bind(id)
         .bind(Flag::new(suggested))
+        .fetch_optional(pool)
+        .await?;
+    Ok(updated)
+}
+
+/// The `UPDATE` behind [`set_active`]: writes the activation flag,
+/// refreshes `updated_at` and returns the stored row.
+const SET_ACTIVE_SQL: &str =
+    "UPDATE users SET is_active = $2, updated_at = now() WHERE id = $1 RETURNING *";
+
+/// Stores `active` as user `id`'s [`is_active`](User::is_active) flag and
+/// returns the updated row (WBE-196).
+///
+/// The write of the admin `PATCH /users/activate`, `PATCH /users/deactivate`
+/// and `PATCH /users/{nickname}/toggle_activation` trio, whose answers carry
+/// the moved accounts as admin entities — so the fresh row comes back for
+/// the endpoint to render, the shape [`set_suggested`] keeps.
+///
+/// The flag alone: unlike [`super::set_activation`], the user-facing write
+/// of `POST /api/pleroma/disable_account` (which answers `()` and runs on
+/// any executor), this one writes no other column — a deactivation started
+/// here revokes no token, stamps no deletion and publishes nothing. It is
+/// the flag the login gate and the bearer-token gate read.
+///
+/// `None` when `id` names no row: the account went away between the
+/// endpoint's lookup and this write, and it is simply not among the
+/// answered users.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn set_active(pool: &PgPool, id: Uuid, active: bool) -> AppResult<Option<User>> {
+    let updated = sqlx::query_as::<_, User>(SET_ACTIVE_SQL)
+        .bind(id)
+        .bind(Flag::new(active))
+        .fetch_optional(pool)
+        .await?;
+    Ok(updated)
+}
+
+/// The `UPDATE` behind [`set_approved`]: clears the staff gate, refreshes
+/// `updated_at` and returns the stored row.
+const SET_APPROVED_SQL: &str = "UPDATE users SET approval_pending = false, updated_at = now() \
+                                WHERE id = $1 RETURNING *";
+
+/// Clears user `id`'s [`approval_pending`](User::approval_pending) flag and
+/// returns the updated row (WBE-196).
+///
+/// The write of the admin `PATCH /users/approve` — Pleroma's
+/// `User.approve` setting `is_approved: true`, this schema's opposite
+/// column being cleared (see the module docs' criteria note) — and of the
+/// admin `POST /users` bypass, which creates the account through the
+/// registration path and lifts the flag off the row that path stored while
+/// `REGISTRATIONS_APPROVAL_REQUIRED` is on. No other column moves: the
+/// approval is a staff decision about the account, not about its address
+/// ([`super::confirmation::set_confirmed`] is that write) and it mints no
+/// credential — the approved account signs in with its own password.
+///
+/// `None` when `id` names no row.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+///
+/// [`super::confirmation::set_confirmed`]: super::confirmation::set_confirmed
+pub async fn set_approved(pool: &PgPool, id: Uuid) -> AppResult<Option<User>> {
+    let updated = sqlx::query_as::<_, User>(SET_APPROVED_SQL)
+        .bind(id)
         .fetch_optional(pool)
         .await?;
     Ok(updated)
@@ -1331,6 +1401,69 @@ mod tests {
                 .expect("a miss writes nothing")
                 .is_none(),
             "an unknown id matches no row"
+        );
+    }
+
+    /// The lifecycle pair each move their own flag and hand the fresh row
+    /// back: `set_active` touches nothing a deactivation must not touch
+    /// (the address, the approval gate, the deletion stamp), and
+    /// `set_approved` clears only the staff gate. Unknown ids answer
+    /// `None`, the way [`set_suggested`] does.
+    #[tokio::test]
+    async fn the_activation_and_approval_writes_move_their_own_flag() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(
+            &pool,
+            &NewUser {
+                is_active: Flag::new(false),
+                approval_pending: Flag::new(true),
+                ..NewUser::local("alice", "https://test.example/users/alice")
+            },
+        )
+        .await
+        .expect("the fixture inserts");
+
+        let woken = set_active(&pool, alice.id, true)
+            .await
+            .expect("the activation runs")
+            .expect("the row comes back");
+        assert!(woken.is_active.get(), "the flag moved");
+        assert!(
+            woken.approval_pending.get(),
+            "the approval gate stayed shut — activation is not approval"
+        );
+        assert!(woken.deleted_at.is_none(), "and no deletion was stamped");
+
+        let cleared = set_approved(&pool, alice.id)
+            .await
+            .expect("the approval runs")
+            .expect("the row comes back");
+        assert!(
+            !cleared.approval_pending.get(),
+            "the pending flag is cleared for good"
+        );
+        assert!(cleared.is_active.get(), "the activation stayed");
+
+        let asleep = set_active(&pool, alice.id, false)
+            .await
+            .expect("the deactivation runs")
+            .expect("the row comes back");
+        assert!(!asleep.is_active.get(), "and the flag moves back");
+
+        assert!(
+            set_active(&pool, Uuid::now_v7(), true)
+                .await
+                .expect("a miss writes nothing")
+                .is_none(),
+            "an unknown id matches no row"
+        );
+        assert!(
+            set_approved(&pool, Uuid::now_v7())
+                .await
+                .expect("a miss writes nothing")
+                .is_none(),
+            "and neither does it for the approval write"
         );
     }
 }
