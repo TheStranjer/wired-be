@@ -85,13 +85,17 @@
 //! The read handlers finish with `after_chat_read`, the documented empty
 //! hook where Pleroma pushes its `chat_read` socket event; the pin routes
 //! broadcast nothing there and so call nothing here. The message routes
-//! finish with their own documented empty hooks, `after_chat_message_created`
-//! and `after_chat_message_deleted`: Pleroma's chat sockets, recipient
-//! notifications and federation hang off the created and deleted message,
-//! and the streaming, notification and federation tickets attach them
-//! there.
+//! finish with their federation hooks, `after_chat_message_created` and
+//! `after_chat_message_deleted`: a message posted to a REMOTE counterpart
+//! is announced to them as a `Create{ChatMessage}`, and the sender's delete
+//! of it as a `Delete` of that object
+//! ([`federation_out`]'s chat arms — Pleroma's `post_chat_message` and
+//! `delete_message` pipelines); a local counterpart is told by their rows
+//! alone, never over HTTP. The chat sockets' events stay the streaming
+//! ticket's own, as does the recipient's notification.
 //!
 //! [`max_chat_message_chars`]: crate::config::Config::max_chat_message_chars
+//! [`federation_out`]: crate::services::federation_out
 
 use axum::{
     Json, Router,
@@ -117,6 +121,7 @@ use crate::{
     },
     oauth::scopes::{READ_CHATS, WRITE_CHATS},
     pagination::{MAX_LIMIT, PageParams, link_header, set_link_header},
+    services::federation_out,
     state::AppState,
     util::id::parse_id,
 };
@@ -554,8 +559,8 @@ async fn post_message(
         user = %auth.0.id,
         "chat message posted"
     );
+    after_chat_message_created(&state, &reference, &auth.0, &recipient).await;
     let entity = message_of(&state, &reference).await?;
-    after_chat_message_created(&state, &entity, &auth.0, &recipient);
     Ok(Json(entity))
 }
 
@@ -594,9 +599,10 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
 }
 
 /// [`chat::add_message`] on a transaction of its own: the message and both
-/// sides' chat rows and references commit together. The federation ticket
-/// that wraps this write and its delivery in one transaction replaces this
-/// helper; until then posting is this one write.
+/// sides' chat rows and references commit together. The delivery of a
+/// message to a remote counterpart is the hook the caller fires after this
+/// returns: a queued `federator.publish` job, not a second write, so the
+/// posting stands on its own while the wire stays the worker's work.
 ///
 /// # Errors
 ///
@@ -609,8 +615,14 @@ async fn send_message(
     new_message: &NewChatMessage,
 ) -> AppResult<ChatMessageReference> {
     let mut tx = state.db.begin().await?;
-    let (_, sender_reference, _) =
-        chat::add_message(&mut tx, sender, recipient, new_message).await?;
+    let (_, sender_reference, _) = chat::add_message(
+        &mut tx,
+        &state.config.base_url,
+        sender,
+        recipient,
+        new_message,
+    )
+    .await?;
     tx.commit().await?;
     Ok(sender_reference)
 }
@@ -656,7 +668,7 @@ async fn delete_message(
         sender = %reference.sender_id,
         "chat message deleted"
     );
-    after_chat_message_deleted(&state, &entity, &auth.0, &recipient);
+    after_chat_message_deleted(&state, &reference, &auth.0, &recipient).await;
     Ok(Json(entity))
 }
 
@@ -675,42 +687,52 @@ async fn chat_recipient(state: &AppState, row: &chat::Chat) -> AppResult<User> {
         .ok_or(AppError::NotFound)
 }
 
-/// The side effect Pleroma attaches to a created chat message, here
-/// documented and empty.
+/// The side effect Pleroma attaches to a created chat message: the telling
+/// of a REMOTE counterpart — Pleroma's `post_chat_message` runs the message
+/// through `Pipeline.common_pipeline`, and the `Create` activity that comes
+/// out the other end is what carries the message to the recipient's inbox
+/// (beside the chat sockets and notifications, which render from the rows
+/// this endpoint already wrote).
 ///
-/// Pleroma's `post_chat_message` runs the message through
-/// `Pipeline.common_pipeline`, and the `Create` activity that comes out the
-/// other end is what fans the message into the pair's chat sockets (the
-/// `chat_message_created` event), into the recipient's notifications, and
-/// out to the recipient's inbox. None of those transports exists here yet —
-/// the streaming and federation tickets own them — so this hook takes the
-/// created [`ChatMessage`] entity as the recipient's side sees it (the
-/// posting endpoint passes the sender's own view; the federation chat
-/// handler, [`crate::federation::handlers::chat`], passes the recipient's),
-/// the `sender`, and the local-or-remote `recipient` the message is
-/// addressed to, and does nothing until those tickets fill in exactly this
-/// one function.
-pub(crate) const fn after_chat_message_created(
-    _state: &AppState,
-    _message: &ChatMessage,
-    _sender: &User,
-    _recipient: &User,
+/// `message` is the sender's reference to the stored message, `sender` the
+/// local account that posted it and `recipient` the account it is addressed
+/// to, local or remote. A local recipient is told by their timeline alone —
+/// chat messages to local accounts never travel over HTTP — and everything
+/// else, including the remote pair's gates, is
+/// [`federation_out::after_chat_message_created`]'s.
+///
+/// [`federation_out::after_chat_message_created`]: crate::services::federation_out::after_chat_message_created
+pub(crate) async fn after_chat_message_created(
+    state: &AppState,
+    message: &ChatMessageReference,
+    sender: &User,
+    recipient: &User,
 ) {
+    federation_out::after_chat_message_created(state, message, sender, recipient).await;
 }
 
-/// The side effect Pleroma attaches to a deleted chat message, here
-/// documented and empty — the delete counterpart of
-/// [`after_chat_message_created`]: Pleroma's `delete_message` ends with the
-/// `chat_message_deleted` socket push for the viewer's chat and, when the
-/// sender withdrew the message, an `Undo` of its `Create` for federation;
-/// `user` is the caller who deleted, `other` the chat's recipient, and
-/// `message` the entity as the caller saw it before the delete.
-const fn after_chat_message_deleted(
-    _state: &AppState,
-    _message: &ChatMessage,
-    _user: &User,
-    _other: &User,
+/// The side effect Pleroma attaches to a deleted chat message: the
+/// [`after_chat_message_created`] counterpart — Pleroma's `delete_message`
+/// ends with an `Undo` of the message's `Create` for federation when the
+/// sender withdrew it; this instance federates the withdrawal as a
+/// `Delete` of the message's reserved object id (decision 6's tombstone
+/// convention, [`crate::federation::note`]'s status `Delete` beside it).
+///
+/// `user` is the caller who deleted, `other` the chat's counterpart and
+/// `message` the caller's reference as it stood before the delete. Only the
+/// sender's delete announces anything — a participant who merely took the
+/// message out of their own list withdraws nobody's copy — and a local
+/// counterpart never hears over HTTP; the gates are
+/// [`federation_out::after_chat_message_deleted`]'s.
+///
+/// [`federation_out::after_chat_message_deleted`]: crate::services::federation_out::after_chat_message_deleted
+async fn after_chat_message_deleted(
+    state: &AppState,
+    message: &ChatMessageReference,
+    user: &User,
+    other: &User,
 ) {
+    federation_out::after_chat_message_deleted(state, message, user, other).await;
 }
 
 /// The `with_muted` and `pinned` query parameters of both chat lists

@@ -82,6 +82,13 @@ mod bookmarks;
 /// that refuse it.
 mod chat_federation;
 
+/// The outbound federation of chat messages over HTTP (WBE-181): the
+/// `Create{ChatMessage}` a message posted to a remote counterpart publishes
+/// and the `Delete` of its reserved object id when the sender withdraws it,
+/// and the local pairs that deliver nothing
+/// (`src/services/federation_out.rs`).
+mod chat_federation_out;
+
 /// The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 twin).
 mod chats;
 
@@ -306,6 +313,12 @@ mod polls;
 /// own poll — counts, dedupe, refusals, the author's telling — and the
 /// fall-through that leaves an ordinary note reply to the create path.
 mod poll_votes;
+
+/// The outbound federation of poll votes over HTTP (WBE-181): the answer
+/// `Create`s one ballot on a remote question publishes to the poll author's
+/// inbox, its exact document for a single- and a multiple-choice mark, and
+/// the local votes that send nothing (`src/services/federation_out.rs`).
+mod poll_federation_out;
 
 /// Web Push subscriptions (`/api/v1/push/subscription`) and the VAPID key
 /// the app and instance responses advertise.

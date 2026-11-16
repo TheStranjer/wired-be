@@ -20,6 +20,7 @@
 //!
 //! [`polls`]: crate::models::poll
 //! [`require_user_scope`]: crate::auth::MaybeAuthUser::require_user_scope
+//! [`federation_out::after_poll_vote`]: crate::services::federation_out::after_poll_vote
 //!
 //! Both routes resolve the poll through the same gate: the id must parse
 //! and name a stored poll whose *status* the viewer may see — Pleroma's
@@ -69,9 +70,11 @@
 //! The telling of the poll's author is landed: the vote runs
 //! [`on_poll_vote`](crate::services::notify::on_poll_vote) through this
 //! module's `after_vote_cast` hook, one `poll` notification per voter and
-//! poll. The federation of the answer activities the ballot becomes is a
-//! later ticket, landing at the same hook the way [`crate::api::reports`]
-//! leaves `after_report_created`.
+//! poll. The same hook federates the answer activities the ballot becomes:
+//! a vote on a REMOTE status's poll sends one `Create` per chosen option to
+//! the poll author's inbox ([`federation_out::after_poll_vote`], the way
+//! [`crate::api::reports`] lands `after_report_created`), and a vote on a
+//! local poll sends nothing.
 
 use axum::{
     Json, Router,
@@ -96,7 +99,7 @@ use crate::{
         user::User,
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    services::notify,
+    services::{federation_out, notify},
     state::AppState,
     util::id::parse_id,
 };
@@ -174,6 +177,13 @@ async fn show_poll(
 /// to order the refusals, and again under the poll's row lock inside the
 /// transaction, so two racing requests from one account leave one
 /// ballot and one 422, never two.
+///
+/// A poll standing on a REMOTE status is voted exactly as a local one:
+/// the shared [`status_visibility`] gate is all that decides whether the
+/// question may be marked, the author rule refuses the mirrored author's
+/// own ballot, and the counting is the same transaction. What a remote
+/// question additionally gets is the answer federation
+/// [`after_vote_cast`] lands — a local poll's ballot announces nothing.
 ///
 /// # Errors
 ///
@@ -410,25 +420,31 @@ fn choice_index(value: &Value) -> Option<i32> {
 /// each `Answer` through `Pipeline.common_pipeline`, which lands the
 /// notification — is landed here from [`notify::on_poll_vote`], deduplicated
 /// per voter and poll. The federation of the answer activities the ballot
-/// becomes (decision 6's `ap_id`-bearing activities, queued through the job
-/// table, decision 11) wires itself in here when that ticket lands, reading
-/// the moved poll from `state` and naming `option_ids` as the answers'
-/// `inReplyTo` choices.
+/// becomes is landed here too, from
+/// [`federation_out::after_poll_vote`]: when the poll stands on a REMOTE
+/// status one `Create` per chosen option travels to the poll author's inbox
+/// (Pleroma's pipeline delivers the same answers through the ordinary
+/// fan-out); a local poll's ballot is this instance's own fact and sends
+/// nothing.
 ///
 /// `poll` is the row as the transaction left it, `voter` the account
 /// that cast the ballot, and `option_ids` the options it marked — the
 /// same ids [`poll::cast_vote`] wrote. The federated ballot
 /// ([`crate::federation::handlers::vote`]) calls the same hook, so an
-/// author is told about a remote vote exactly as about a local one.
+/// author is told about a remote vote exactly as about a local one — and
+/// nothing more federates out of that door: the fold only ever marks
+/// questions this instance owns, and their answers stay local.
 ///
 /// [`notify::on_poll_vote`]: crate::services::notify::on_poll_vote
+/// [`federation_out::after_poll_vote`]: crate::services::federation_out::after_poll_vote
 pub(crate) async fn after_vote_cast(
     state: &AppState,
     poll: &PollRow,
     voter: &User,
-    _option_ids: &[Uuid],
+    option_ids: &[Uuid],
 ) {
     notify::on_poll_vote(state, poll, voter).await;
+    federation_out::after_poll_vote(state, poll, voter, option_ids).await;
 }
 
 #[cfg(test)]

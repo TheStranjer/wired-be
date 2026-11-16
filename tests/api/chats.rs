@@ -47,6 +47,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
+    config::TEST_BASE_URL,
     models::{
         chat::{self, ChatFilter, ChatMessageReference, NewChatMessage},
         status::Visibility,
@@ -143,9 +144,15 @@ async fn send(
     ChatMessageReference,
 ) {
     let mut conn = pool.begin().await.expect("a transaction begins");
-    let sent = chat::add_message(&mut conn, sender, recipient, &NewChatMessage::text(text))
-        .await
-        .expect("a plain chat message is written");
+    let sent = chat::add_message(
+        &mut conn,
+        TEST_BASE_URL,
+        sender,
+        recipient,
+        &NewChatMessage::text(text),
+    )
+    .await
+    .expect("a plain chat message is written");
     conn.commit().await.expect("the transaction commits");
     (sent.0, sent.1, sent.2.expect("the recipient is local"))
 }
@@ -582,6 +589,7 @@ async fn a_marked_message_carries_its_attachment() {
     let mut conn = pool.begin().await.expect("a transaction begins");
     let sent = chat::add_message(
         &mut conn,
+        TEST_BASE_URL,
         &alice,
         &bob,
         &NewChatMessage {

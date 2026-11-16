@@ -2500,6 +2500,7 @@ mod tests {
         let mut conn = pool.begin().await.expect("a transaction begins");
         let (message, _, _) = chat::add_message(
             &mut conn,
+            TEST_BASE_URL,
             &sender,
             &recipient,
             &NewChatMessage::text("a delivered chat message"),

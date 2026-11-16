@@ -27,7 +27,11 @@
 //! carry the `Idempotency-Key` its creator sent ([`NewChatMessage`]'s field of
 //! that name): [`sender_reference_for_key`] replays a key written within the
 //! last hour, which is what makes a retried `POST` answer its first message
-//! instead of a duplicate. Withdrawing a message is a soft delete
+//! instead of a duplicate. A message written without an
+//! [`ap_id`](ChatMessage::ap_id) gets this instance's own
+//! `{base_url}/objects/{uuid}` id from [`add_message`] — the address its
+//! federated `Create` and `Delete` name it by (decision 6). Withdrawing a
+//! message is a soft delete
 //! ([`delete_message_for`]) that leaves the row as a tombstone, while a
 //! participant who merely wants a message out of *their* list drops only their
 //! own reference and leaves the other side untouched.
@@ -323,9 +327,9 @@ pub struct NewChatMessage {
     pub raw_text: String,
     /// The attachment to carry, if any.
     pub attachment_media_id: Option<Uuid>,
-    /// `ActivityPub` object id: the remote id a mirrored message arrived with.
-    /// A local caller leaves `None` until the federation ticket mints
-    /// `{BASE_URL}/objects/{uuid}` ids for chat messages.
+    /// `ActivityPub` object id: the remote id a mirrored message arrived
+    /// with. A local caller leaves `None`, and [`add_message`] mints
+    /// `{base_url}/objects/{uuid}` for the row it writes.
     pub ap_id: Option<String>,
     /// The `Idempotency-Key` of the request that creates this message, kept
     /// for [`sender_reference_for_key`]'s replay; `None` posts as usual.
@@ -510,9 +514,11 @@ pub async fn unread_count(pool: &PgPool, chat_id: Uuid) -> AppResult<i64> {
 /// The answer is the message, the sender's reference and — when the recipient
 /// is a local account — the recipient's.
 ///
-/// `conn` is the caller's transaction, on purpose: sending a chat message means
-/// federating it too, so the ticket that delivers messages wraps this write and
-/// its delivery job in one transaction and rolls both back together.
+/// `conn` is the caller's transaction, on purpose: sending a chat message
+/// means federating it too, so a caller that wants the write and its
+/// delivery job to stand or fall together holds both on one transaction
+/// (the `federator.publish` queue keeps the wire off the request either
+/// way).
 ///
 /// What it writes, in order:
 ///
@@ -522,7 +528,9 @@ pub async fn unread_count(pool: &PgPool, chat_id: Uuid) -> AppResult<i64> {
 ///   `recipient` is remote**, whose chat rows live on their own instance; then
 ///   nothing at all is stored for them and the third half of the answer is
 ///   `None`;
-/// - the [`ChatMessage`] row, from `new_message`;
+/// - the [`ChatMessage`] row, from `new_message` — its `ActivityPub` object
+///   id is the one the message arrived with, or `{base_url}/objects/{uuid}`
+///   of the minted row id when `new_message` carries none (decision 6);
 /// - the sender's reference, already read: you have read what you wrote;
 /// - the recipient's reference, unread.
 ///
@@ -537,6 +545,7 @@ pub async fn unread_count(pool: &PgPool, chat_id: Uuid) -> AppResult<i64> {
 /// unique violation on `chat_messages.ap_id`.
 pub async fn add_message(
     conn: &mut PgConnection,
+    base_url: &str,
     sender: &User,
     recipient: &User,
     new_message: &NewChatMessage,
@@ -548,7 +557,7 @@ pub async fn add_message(
     check_length(&new_message.raw_text)?;
     let sender_chat = bump_or_create(conn, sender.id, recipient.id).await?;
     let recipient_chat = local_recipient_chat(conn, sender, recipient).await?;
-    let message = write_message(conn, sender.id, new_message).await?;
+    let message = write_message(conn, base_url, sender.id, new_message).await?;
     let sender_reference = reference_in_chat(conn, sender_chat.id, &message, false).await?;
     let recipient_reference = match recipient_chat {
         Some(chat) => Some(reference_in_chat(conn, chat.id, &message, true).await?),
@@ -853,19 +862,28 @@ async fn bump_or_create(
     Ok(chat)
 }
 
-/// Writes the message row of [`add_message`] and returns it.
+/// [`INSERT_MESSAGE_SQL`]'s write: the id this module mints and the object id
+/// that names the row — the one the mirrored message arrived with, or the
+/// instance's own `{base_url}/objects/{id}` minted beside the row id when it
+/// carried none.
 async fn write_message(
     conn: &mut PgConnection,
+    base_url: &str,
     sender_id: Uuid,
     new_message: &NewChatMessage,
 ) -> AppResult<ChatMessage> {
+    let id = new_id();
+    let ap_id = new_message
+        .ap_id
+        .clone()
+        .unwrap_or_else(|| format!("{base_url}/objects/{id}"));
     let message = sqlx::query_as::<_, ChatMessage>(INSERT_MESSAGE_SQL)
-        .bind(new_id())
+        .bind(id)
         .bind(sender_id)
         .bind(new_message.content.as_str())
         .bind(new_message.raw_text.as_str())
         .bind(new_message.attachment_media_id)
-        .bind(new_message.ap_id.as_deref())
+        .bind(&ap_id)
         .bind(new_message.idempotency_key.as_deref())
         .bind(new_message.inserted_at)
         .fetch_one(conn)
@@ -1036,7 +1054,7 @@ mod tests {
         Option<ChatMessageReference>,
     ) {
         let mut conn = pool.begin().await.expect("a transaction begins");
-        let sent = add_message(&mut conn, sender, recipient, new_message)
+        let sent = add_message(&mut conn, TEST_BASE_URL, sender, recipient, new_message)
             .await
             .expect("the fixture chat message is written");
         conn.commit().await.expect("the transaction commits");
@@ -1320,7 +1338,11 @@ mod tests {
         assert_eq!(message.raw_text, "hi bob", "the source text is stored");
         assert_eq!(message.content, "<p>hi bob</p>", "and the rendered HTML");
         assert!(message.attachment_media_id.is_none(), "no attachment");
-        assert!(message.ap_id.is_none(), "no ActivityPub id yet");
+        assert_eq!(
+            message.ap_id.as_deref(),
+            Some(format!("{TEST_BASE_URL}/objects/{}", message.id).as_str()),
+            "a message posted here owns this instance's object id"
+        );
         assert!(message.deleted_at.is_none(), "the message is live");
 
         let alice_chat = stored_chat(&pool, alice_ref.chat_id).await;
@@ -1485,9 +1507,15 @@ mod tests {
         let too_long = "x".repeat(MAX_CHAT_MESSAGE_CHARS + 1);
         let mut conn = pool.begin().await.unwrap();
 
-        let err = add_message(&mut conn, &alice, &bob, &NewChatMessage::text(&too_long))
-            .await
-            .expect_err("one character over the limit is refused");
+        let err = add_message(
+            &mut conn,
+            TEST_BASE_URL,
+            &alice,
+            &bob,
+            &NewChatMessage::text(&too_long),
+        )
+        .await
+        .expect_err("one character over the limit is refused");
 
         assert_eq!(
             err.to_string(),
@@ -2177,6 +2205,7 @@ mod tests {
             let mut conn = pool.begin().await.unwrap();
             let written = add_message(
                 &mut conn,
+                TEST_BASE_URL,
                 &alice,
                 &bob,
                 &with_extras("look at this", attachment, &ap_id),
@@ -2221,6 +2250,7 @@ mod tests {
 
         let (message, alice_ref, _) = add_message(
             &mut conn,
+            TEST_BASE_URL,
             &alice,
             &bob,
             &NewChatMessage {
@@ -2266,6 +2296,7 @@ mod tests {
         let mut first = pool.begin().await.unwrap();
         let stored = add_message(
             &mut first,
+            TEST_BASE_URL,
             &alice,
             &bob,
             &with_extras("first use", attachment, &ap_id),
@@ -2282,6 +2313,7 @@ mod tests {
         let mut retry = pool.begin().await.unwrap();
         let duplicate = add_message(
             &mut retry,
+            TEST_BASE_URL,
             &alice,
             &bob,
             &with_extras("again", attachment, &ap_id),
@@ -2306,6 +2338,7 @@ mod tests {
         let mut conn = pool.begin().await.unwrap();
         let foreign = add_message(
             &mut conn,
+            TEST_BASE_URL,
             &alice,
             &bob,
             &NewChatMessage {
@@ -2414,6 +2447,7 @@ mod tests {
             let mut conn = pool.begin().await.unwrap();
             let written = add_message(
                 &mut conn,
+                TEST_BASE_URL,
                 &alice,
                 &bob,
                 &with_extras("look at this", attachment, "https://remote.example/cm/1"),
