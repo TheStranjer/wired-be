@@ -122,8 +122,9 @@ use crate::state::AppState;
 /// `/api/oauth_tokens` ([`oauth_tokens`]) Pleroma's token-management
 /// endpoints and `/api/account` ([`accounts::email_confirmation_router`])
 /// the email-confirmation link Pleroma serves outside its versioned API;
-/// later tickets add the remaining `/api` areas (admin) here the same way.
-/// [`media_files`] and [`activitypub`] are the exceptions:
+/// `/api/v0/pleroma` carries Pleroma's legacy admin report ledger
+/// ([`admin::reports::legacy_router`]), the historical mount of the two
+/// admin report reads. [`media_files`] and [`activitypub`] are the exceptions:
 /// they serve `/media` and `/users`, addresses that go out in
 /// `ActivityPub` documents, and [`crate::app`] merges them directly.
 ///
@@ -140,4 +141,5 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .nest("/api/pleroma", pleroma::router())
         .nest("/api/oauth_tokens", oauth_tokens::router())
         .nest("/api/account", accounts::email_confirmation_router())
+        .nest("/api/v0/pleroma", admin::reports::legacy_router())
 }

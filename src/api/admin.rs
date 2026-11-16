@@ -11,7 +11,10 @@
 //! `:moderation_log_read` and `:statistics_read` to admins only, which is
 //! why both routes here take the [`AdminUser`] extractor. The scope plugs
 //! of the same pipelines (`admin:read:reports` and friends) are the
-//! [`AdminUser::require`] call each handler makes first.
+//! [`AdminUser::require`] call each handler makes first — or its
+//! [`StaffUser::require`] twin, the gate of the submodules Pleroma hands
+//! to the `UserIsStaffPlug` pipeline and its moderator-granted roles,
+//! [`reports`] being one of them.
 //!
 //! - `GET /api/v1/pleroma/admin/moderation_log` (`list_log`) — the
 //!   [`crate::models::moderation_log`] entries, newest first, in Pleroma's
@@ -55,15 +58,23 @@
 //! `GET /instance/{name}.html`, WBE-205) as the [`apps_docs`] submodule,
 //! and the federation maintenance routes (the `/relay` ledger trio,
 //! `DELETE /instances/{instance}` and `POST /reload_emoji`, WBE-203) as
-//! the [`federation`] submodule, and the moderation move of a filed report
-//! (`PATCH /reports`, whose state change is the `report.updated` webhook
-//! event, WBE-212) as the [`reports`] submodule, and the admin's read of
+//! the [`federation`] submodule, and the admin reports surface — the
+//! `index`/`show` ledger, the state change `PATCH /reports` whose event
+//! is the `report.updated` webhook (WBE-212), the `assign_account` pair
+//! and the report notes (WBE-200), all gated for staff, admins *and*
+//! moderators, Pleroma's `reports_manage_reports` privilege — as the
+//! [`reports`] submodule, with the two legacy reads (`GET
+//! /api/v0/pleroma/reports` and its `{id}` twin, the same entities
+//! through the same gate) mounted at the root by [`crate::api`] as
+//! [`reports::legacy_router`], and the admin's read of
 //! any account's chats beside the moderation withdrawal of a single chat
 //! message (the `users/…/chats`, `chats/…` and message-delete routes,
 //! WBE-202) as the [`chats`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
+//! [`StaffUser`]: crate::auth::admin::StaffUser
+//! [`StaffUser::require`]: crate::auth::admin::StaffUser::require
 //! [`registration_router`]: invites::registration_router
 
 use std::collections::HashMap;

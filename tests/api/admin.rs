@@ -2,7 +2,8 @@
 //! [`AdminUser`] and [`StaffUser`] extractors, the moderation-log listing
 //! and its filters and pagination, and the visibility `stats`, all against
 //! the real router (plus a two-route test router that exercises the
-//! [`StaffUser`] gate, which guards no production route yet). The admin
+//! [`StaffUser`] gate in isolation; its production routes joined with the
+//! admin reports surface, WBE-200). The admin
 //! config store (WBE-206) — `GET`/`POST /config` over the whitelist
 //! registry, the `:mrf`/`:instance` consumers and the `config_change`
 //! log line, its `GET /config/descriptions` payload and the
@@ -104,8 +105,9 @@ async fn regular(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) 
 
 /// A two-route test router guarding each extractor in turn: `AdminUser`
 /// then its `admin:read` gate on `/admin`, and `StaffUser` then the same
-/// gate on `/staff`. `StaffUser` guards no production route yet, so this is
-/// the matrix harness, mirroring `auth.rs`.
+/// gate on `/staff`. This is the extractor matrix in isolation — the
+/// staff routes the admin reports surface serves are gated and tested on
+/// the real router in `admin_reports.rs`.
 fn extractor_app(pool: PgPool) -> Router {
     Router::new()
         .route("/admin", get(admin_view))
