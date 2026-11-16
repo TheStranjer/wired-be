@@ -2,13 +2,17 @@
 //! `src/api/emoji_packs.rs`: the pack listing and its pagination, the
 //! single-pack view, the zip archive download and its sharing gate, the
 //! util emoji map over synced `custom_emojis` rows, the static
-//! `GET /emoji/{pack}/{file}` route with its media safety headers, and
-//! the admin write routes of WBE-211: create, metadata patch and delete
+//! `GET /emoji/{pack}/{file}` route with its media safety headers, the
+//! admin write routes of WBE-211: create, metadata patch and delete
 //! under `admin:write`, their validation refusals, the `custom_emojis`
 //! resync they trigger and the `emoji_pack_*` moderation entries they
-//! leave behind. The reads answer without authentication and unknown or
-//! unsafe pack names answer one shared 404; the writes demand an admin
-//! bearer token and answer the named `"Pack <name> does not exist"` 404.
+//! leave behind, and the emoji-file routes of WBE-215 under
+//! `/packs/files`: add (uploaded part and fetched URL), rename with
+//! `force`, and delete — each answering the pack's full `files` object,
+//! resyncing the custom emojis, and refusing an unknown pack with the
+//! 400 `{"error":"Pack <name> does not exist"}`. The reads answer
+//! without authentication and unknown or unsafe pack names answer the
+//! reads' shared 404; every write demands an admin bearer token.
 
 #![cfg(test)]
 
@@ -16,11 +20,19 @@ use std::{
     collections::BTreeMap,
     io::{Cursor, Read as _},
     path::Path,
+    sync::Arc,
 };
 
-use axum::http::StatusCode;
+use axum::{
+    body::{Body, Bytes},
+    extract::State,
+    http::StatusCode,
+    response::Response,
+    routing::get,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::{net::TcpListener, task::JoinHandle};
 use wired_be::{
     config::TEST_BASE_URL,
     models::{
@@ -34,6 +46,12 @@ use crate::common;
 
 /// Bytes for every fixture image file.
 const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+/// Magic bytes the emoji-file detection names as `image/gif`.
+const GIF_BYTES: &[u8] = b"GIF89a....";
+/// Bytes no accepted image matcher names.
+const NOT_AN_IMAGE: &[u8] = b"print(1); // definitely no image";
+/// Boundary the multipart file-route bodies are written with.
+const BOUNDARY: &str = "wired-test-boundary";
 
 /// A manifest naming `files` (shortcode, file name) pairs, sharing its
 /// files when `shared`.
@@ -1166,4 +1184,963 @@ async fn pack_writes_demand_an_admin_with_admin_write() {
     common::assert_answer(&patched, StatusCode::OK, "the narrow alias patches");
     let deleted = gated_write(&app, "delete", Some(&narrow), "gated").await;
     common::assert_answer(&deleted, StatusCode::OK, "the narrow alias deletes");
+}
+
+/// The add route's per-file byte cap, mirrored for the test body.
+const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
+/// `multipart/form-data` parts: text `fields` plus, when `file` is given,
+/// a `file` part uploaded under that name.
+fn upload_parts(
+    fields: &[(&'static str, &'static str)],
+    file: Option<(&'static str, &'static [u8])>,
+) -> Vec<common::MultipartPart> {
+    let mut parts: Vec<common::MultipartPart> = fields
+        .iter()
+        .map(|(name, value)| common::MultipartPart::text(name, value))
+        .collect();
+    if let Some((filename, bytes)) = file {
+        parts.push(common::MultipartPart::file(
+            "file",
+            filename,
+            "image/png",
+            Bytes::from_static(bytes),
+        ));
+    }
+    parts
+}
+
+/// The sorted names inside pack `name`'s directory, for "nothing else
+/// landed" assertions.
+fn pack_entries(dir: &Path, name: &str) -> Vec<String> {
+    let mut entries: Vec<String> = std::fs::read_dir(dir.join(name))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort_unstable();
+    entries
+}
+
+/// The scripted answer of the emoji-file mock origin.
+#[derive(Debug)]
+struct MockFile {
+    /// The body to serve.
+    bytes: Vec<u8>,
+    /// The status to serve it with.
+    status: StatusCode,
+}
+
+/// Answers with the script's status and bytes.
+async fn serve_mock(State(mock): State<Arc<MockFile>>) -> Response {
+    Response::builder()
+        .status(mock.status)
+        .body(Body::from(mock.bytes.clone()))
+        .unwrap()
+}
+
+/// Serves `bytes` at `/file` on loopback with `status`, returning the
+/// URL and the server task: the mock origin the URL-file tests fetch
+/// from, reachable because the test config turns the SSRF guard off for
+/// private hosts exactly as `HTTP_ALLOW_PRIVATE_HOSTS` does.
+async fn spawn_file_server(bytes: &[u8], status: StatusCode) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .route("/file", get(serve_mock))
+        .with_state(Arc::new(MockFile {
+            bytes: bytes.to_vec(),
+            status,
+        }));
+    let server = tokio::spawn(async move {
+        if let Err(err) = axum::serve(listener, app).await {
+            tracing::debug!("mock emoji-file server stopped: {err}");
+        }
+    });
+    (format!("http://{addr}/file"), server)
+}
+
+/// `POST /packs/files` lands an uploaded image in the pack directory
+/// under `<shortcode>.<ext>` — the part's own client name ignored —
+/// records the entry in `pack.json`, resyncs the custom emojis and
+/// answers the full `files` object; an explicit `filename` (even a
+/// nested one, and one whose extension differs from the magic bytes)
+/// stands, and the new file serves from the static emoji route.
+#[tokio::test]
+async fn upload_adds_the_file_to_the_pack() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filemaker", "admin:write").await;
+
+    let added = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &upload_parts(
+                &[("shortcode", "dog")],
+                Some(("whatever name.png", PNG_BYTES)),
+            ),
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(&added, StatusCode::OK, "upload add");
+    assert_eq!(
+        added.json_value(),
+        json!({"cat": "cat.png", "dog": "dog.png"}),
+        "the full files object; the default name is shortcode plus extension"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("cats").join("dog.png")).unwrap(),
+        PNG_BYTES,
+        "the bytes landed in the pack directory"
+    );
+
+    let nested = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &[
+                common::MultipartPart::text("shortcode", "kitten"),
+                common::MultipartPart::text("filename", "sub/kitten.gif"),
+                common::MultipartPart::file(
+                    "file",
+                    "kitten.png",
+                    "image/png",
+                    Bytes::from_static(GIF_BYTES),
+                ),
+            ],
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(&nested, StatusCode::OK, "named nested upload");
+    assert_eq!(
+        nested.json_value(),
+        json!({"cat": "cat.png", "dog": "dog.png", "kitten": "sub/kitten.gif"}),
+        "the requested file name stands"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("cats").join("sub/kitten.gif")).unwrap(),
+        GIF_BYTES,
+        "the directories a nested name needs are created for it"
+    );
+
+    let served = common::TestRequest::get("/emoji/cats/dog.png")
+        .send(&app)
+        .await;
+    common::assert_answer(&served, StatusCode::OK, "the new file serves");
+    assert_eq!(served.body.as_ref(), PNG_BYTES, "byte for byte");
+
+    assert_eq!(
+        served_emojis(&app).await,
+        [
+            ("cats".to_owned(), "cat".to_owned()),
+            ("cats".to_owned(), "dog".to_owned()),
+            ("cats".to_owned(), "kitten".to_owned()),
+        ],
+        "the custom emoji list picked the new files up on the resync"
+    );
+}
+
+/// A `file` parameter that is a URL is fetched with the instance's
+/// guarded client and stored under the magic bytes' default name; a
+/// remote that answers non-image bytes or a 404 is refused with a 422,
+/// and nothing of a refused fetch lands.
+#[tokio::test]
+async fn a_url_file_is_fetched_and_stored() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filefetcher", "admin:write").await;
+
+    let (url, server) = spawn_file_server(GIF_BYTES, StatusCode::OK).await;
+    let added = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({"shortcode": "fox", "file": url}))
+        .send(&app)
+        .await;
+    server.abort();
+    common::assert_answer(&added, StatusCode::OK, "url add");
+    assert_eq!(
+        added.json_value(),
+        json!({"cat": "cat.png", "fox": "fox.gif"}),
+        "the default extension comes from the magic bytes, not the URL"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("cats").join("fox.gif")).unwrap(),
+        GIF_BYTES,
+        "the fetched bytes landed"
+    );
+
+    // The urlencoded spelling, with an explicit filename, and a body
+    // that also carries the pack name (the query has none here).
+    let (named_url, named_server) = spawn_file_server(PNG_BYTES, StatusCode::OK).await;
+    let renamed = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files")
+        .bearer(&token)
+        .form(&[
+            ("name", "cats"),
+            ("shortcode", "lynx"),
+            ("filename", "lynx.png"),
+            ("file", named_url.as_str()),
+        ])
+        .send(&app)
+        .await;
+    named_server.abort();
+    common::assert_answer(&renamed, StatusCode::OK, "form url add");
+    assert_eq!(
+        renamed.json_value()["lynx"],
+        json!("lynx.png"),
+        "the requested name stands for the fetched bytes"
+    );
+
+    let (junk_url, junk_server) = spawn_file_server(NOT_AN_IMAGE, StatusCode::OK).await;
+    let junk = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({"shortcode": "junk", "file": junk_url}))
+        .send(&app)
+        .await;
+    junk_server.abort();
+    common::assert_answer(&junk, StatusCode::UNPROCESSABLE_ENTITY, "non-image URL");
+    common::assert_error(&junk, "Unsupported file type", "non-image URL");
+
+    let (missing_url, missing_server) = spawn_file_server(b"", StatusCode::NOT_FOUND).await;
+    let gone = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({"shortcode": "gone", "file": missing_url}))
+        .send(&app)
+        .await;
+    missing_server.abort();
+    common::assert_answer(&gone, StatusCode::UNPROCESSABLE_ENTITY, "404 URL");
+    assert!(
+        gone.json_value()["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("404")),
+        "the refusal names the remote status: {}",
+        gone.text()
+    );
+
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["cat.png", "fox.gif", "lynx.png", "pack.json"],
+        "the refused fetches stored nothing"
+    );
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("cats").join("pack.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["files"],
+        json!({"cat": "cat.png", "fox": "fox.gif", "lynx": "lynx.png"}),
+        "and recorded no entries"
+    );
+}
+
+/// A duplicate shortcode is the 409 `{"error":"An emoji with the
+/// \"<shortcode>\" shortcode already exists"}`, and none of the add
+/// route's refusals — this one or the byte- and name-level ones tested
+/// next — ever lands a file, an entry, an emoji row or a log row.
+#[tokio::test]
+async fn add_refuses_the_duplicate_shortcode() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    let synced: usize = emoji_packs::sync_custom_emojis(&pool, TEST_BASE_URL, dir.path())
+        .await
+        .expect("the fixture pack syncs");
+    assert_eq!(synced, 1, "the seeded cat is the one stored emoji");
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filetester", "admin:write").await;
+
+    let duplicate = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &upload_parts(&[("shortcode", "cat")], Some(("cat.png", PNG_BYTES))),
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(&duplicate, StatusCode::CONFLICT, "duplicate shortcode");
+    common::assert_error(
+        &duplicate,
+        "An emoji with the \"cat\" shortcode already exists",
+        "duplicate shortcode",
+    );
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["cat.png", "pack.json"],
+        "the refused duplicate landed no file"
+    );
+    assert_eq!(
+        served_emojis(&app).await,
+        [("cats".to_owned(), "cat".to_owned())],
+        "the emoji list never saw a refused add"
+    );
+    assert!(log_rows(&pool).await.is_empty(), "file writes log nothing");
+}
+
+/// The add route's file refusals: non-image bytes are the 422
+/// `{"error":"Unsupported file type"}`, a body without any `file` the
+/// 422 `{"error":"Missing parameter: file"}`, and an upload past 2 MiB
+/// the 413 that names the cap.
+#[tokio::test]
+async fn add_refuses_bad_files() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filescreener", "admin:write").await;
+
+    let junk = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &upload_parts(&[("shortcode", "junk")], Some(("junk.png", NOT_AN_IMAGE))),
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(&junk, StatusCode::UNPROCESSABLE_ENTITY, "non-image upload");
+    common::assert_error(&junk, "Unsupported file type", "non-image upload");
+
+    let no_file = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({"shortcode": "nothing"}))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &no_file,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "body without a file",
+    );
+    common::assert_error(&no_file, "Missing parameter: file", "body without a file");
+
+    let mut oversize = PNG_BYTES.to_vec();
+    oversize.resize(MAX_FILE_BYTES + 1, b'0');
+    let big_file =
+        common::MultipartPart::file("file", "big.png", "image/png", Bytes::from(oversize));
+    let big = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &[common::MultipartPart::text("shortcode", "big"), big_file],
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &big,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "a 2 MiB plus one upload",
+    );
+    assert!(
+        big.json_value()["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("2097152")),
+        "the 413 names the cap: {}",
+        big.text()
+    );
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["cat.png", "pack.json"],
+        "nothing of a refused file landed in the pack"
+    );
+}
+
+/// The add route's name refusals: a shortcode outside
+/// `[A-Za-z0-9_-]+` and a file name that could traverse out of the pack
+/// are 400s, a body without `shortcode` is the extractor's 422 — and no
+/// refused name writes, moves or touches anything.
+#[tokio::test]
+async fn add_refuses_unsafe_names() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    std::fs::write(dir.path().join("outside.txt"), b"do not write me").unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filenamer", "admin:write").await;
+
+    for code in ["bad code", "a.b", "a/b", "", ".hidden"] {
+        let refused = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+            .bearer(&token)
+            .json(&json!({"shortcode": code, "file": "https://unreachable.invalid/x.png"}))
+            .send(&app)
+            .await;
+        common::assert_answer(&refused, StatusCode::BAD_REQUEST, "the refused shortcode");
+        common::assert_error(
+            &refused,
+            &format!("invalid emoji shortcode: {code}"),
+            "the refused shortcode",
+        );
+    }
+
+    let escaping = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .multipart(
+            BOUNDARY,
+            &[
+                common::MultipartPart::text("shortcode", "sneaky"),
+                common::MultipartPart::text("filename", "../escape.png"),
+                common::MultipartPart::file(
+                    "file",
+                    "sneaky.png",
+                    "image/png",
+                    Bytes::from_static(PNG_BYTES),
+                ),
+            ],
+        )
+        .send(&app)
+        .await;
+    common::assert_answer(&escaping, StatusCode::BAD_REQUEST, "the traversal filename");
+    common::assert_error(
+        &escaping,
+        "invalid emoji file name: ../escape.png",
+        "the traversal filename",
+    );
+
+    let no_shortcode = common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({"file": "https://unreachable.invalid/x.png"}))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &no_shortcode,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "no shortcode",
+    );
+    assert!(
+        no_shortcode.json_value()["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("Invalid parameters")),
+        "the 422 names the shape: {}",
+        no_shortcode.text()
+    );
+
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["cat.png", "pack.json"],
+        "nothing of a refused name landed in the pack"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("outside.txt")).unwrap(),
+        b"do not write me",
+        "and the file outside the pack is untouched"
+    );
+}
+
+/// `PATCH /packs/files` renames the shortcode, the file, or both: the
+/// file on disk follows the entry (emptying subdirectories are pruned),
+/// parameters ride the query, the body or both, and every success
+/// answers the pack's full `files` object and moves the custom emoji
+/// with it.
+#[tokio::test]
+async fn rename_moves_the_shortcode_and_the_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(
+        dir.path(),
+        "cats",
+        &pack(true, &[("cat", "sub/cat.png"), ("dog", "dog.png")]),
+    )
+    .await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filerenamer", "admin:write").await;
+
+    let both = common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({
+            "shortcode": "cat",
+            "new_shortcode": "kitty",
+            "new_filename": "kitty.png",
+        }))
+        .send(&app)
+        .await;
+    common::assert_answer(&both, StatusCode::OK, "rename both");
+    assert_eq!(
+        both.json_value(),
+        json!({"dog": "dog.png", "kitty": "kitty.png"}),
+        "the full files object after the rename"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("cats").join("kitty.png")).unwrap(),
+        PNG_BYTES,
+        "the file moved with the entry"
+    );
+    assert!(
+        !dir.path().join("cats").join("sub").exists(),
+        "the emptied subdirectory is pruned"
+    );
+    assert_eq!(
+        served_emojis(&app).await,
+        [
+            ("cats".to_owned(), "dog".to_owned()),
+            ("cats".to_owned(), "kitty".to_owned()),
+        ],
+        "the custom emoji list followed the rename"
+    );
+
+    // Shortcode only: the file stays where it is.
+    let code = common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .form(&[("shortcode", "kitty"), ("new_shortcode", "cat")])
+        .send(&app)
+        .await;
+    common::assert_answer(&code, StatusCode::OK, "rename the shortcode alone");
+    assert_eq!(
+        code.json_value(),
+        json!({"cat": "kitty.png", "dog": "dog.png"}),
+        "the stored file name kept"
+    );
+
+    // File only, and everything from the query string, no body at all.
+    let file = common::TestRequest::patch(
+        "/api/v1/pleroma/emoji/packs/files?name=cats&shortcode=cat&new_filename=c.png",
+    )
+    .bearer(&token)
+    .send(&app)
+    .await;
+    common::assert_answer(&file, StatusCode::OK, "rename the file from the query");
+    assert_eq!(
+        file.json_value(),
+        json!({"cat": "c.png", "dog": "dog.png"}),
+        "query-only parameters work"
+    );
+    assert!(
+        dir.path().join("cats").join("c.png").exists(),
+        "and the file moved again"
+    );
+}
+
+/// A rename into an occupied new shortcode is the 409
+/// `{"error":"New shortcode \"<new>\" is already used. If you want to
+/// override emoji use 'force' option"}` until `force` overwrites the
+/// other entry — the custom emoji list follows the map.
+#[tokio::test]
+async fn rename_conflicts_unless_forced() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(
+        dir.path(),
+        "cats",
+        &pack(true, &[("cat", "c.png"), ("dog", "dog.png")]),
+    )
+    .await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "fileclasher", "admin:write").await;
+
+    let clash = common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({"shortcode": "cat", "new_shortcode": "dog"}))
+        .send(&app)
+        .await;
+    common::assert_answer(&clash, StatusCode::CONFLICT, "the occupied new shortcode");
+    common::assert_error(
+        &clash,
+        "New shortcode \"dog\" is already used. If you want to override emoji use 'force' option",
+        "the occupied new shortcode",
+    );
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["c.png", "dog.png", "pack.json"],
+        "the refused rename moved nothing"
+    );
+
+    let forced = common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .json(&json!({
+            "shortcode": "cat",
+            "new_shortcode": "dog",
+            "new_filename": "c.png",
+            "force": true,
+        }))
+        .send(&app)
+        .await;
+    common::assert_answer(&forced, StatusCode::OK, "the forced rename");
+    assert_eq!(
+        forced.json_value(),
+        json!({"dog": "c.png"}),
+        "force replaces the other entry with this one"
+    );
+    assert_eq!(
+        served_emojis(&app).await,
+        [("cats".to_owned(), "dog".to_owned())],
+        "the overwritten shortcode left the emoji list"
+    );
+}
+
+/// One refused rename: the pack, the body, the owed status and the
+/// pinned error wording.
+type RenameCase<'a> = (&'a str, Value, StatusCode, &'a str);
+
+/// The rename's refusals: an unknown shortcode and an entry whose file
+/// vanished off disk are the 400 `{"error":"Emoji \"<shortcode>\" does
+/// not exist"}`, an empty `new_shortcode` or `new_filename` the 422, a
+/// new shortcode that breaks the pattern and a new file name that could
+/// traverse the 400s — and none of them moves anything.
+#[tokio::test]
+async fn rename_refuses_unknown_empty_and_unsafe() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &pack(true, &[("cat", "cat.png")])).await;
+    emoji_packs::save_pack(dir.path(), "haunt", &pack(true, &[("ghost", "ghost.png")]))
+        .await
+        .expect("the manifest-only pack saves");
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filescreener", "admin:write").await;
+
+    let cases: [RenameCase<'_>; 6] = [
+        (
+            "haunt",
+            json!({"shortcode": "ghost", "new_filename": "here.png"}),
+            StatusCode::BAD_REQUEST,
+            "Emoji \"ghost\" does not exist",
+        ),
+        (
+            "cats",
+            json!({"shortcode": "nope", "new_shortcode": "x"}),
+            StatusCode::BAD_REQUEST,
+            "Emoji \"nope\" does not exist",
+        ),
+        (
+            "cats",
+            json!({"shortcode": "cat", "new_shortcode": ""}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "new_shortcode or new_filename cannot be empty",
+        ),
+        (
+            "cats",
+            json!({"shortcode": "cat", "new_filename": "", "new_shortcode": "ok"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "new_shortcode or new_filename cannot be empty",
+        ),
+        (
+            "cats",
+            json!({"shortcode": "cat", "new_shortcode": "bad code"}),
+            StatusCode::BAD_REQUEST,
+            "invalid emoji shortcode: bad code",
+        ),
+        (
+            "cats",
+            json!({"shortcode": "cat", "new_filename": "../escape.png"}),
+            StatusCode::BAD_REQUEST,
+            "invalid emoji file name: ../escape.png",
+        ),
+    ];
+    for (pack_name, body, status, message) in cases {
+        let refused = common::TestRequest::patch(&format!(
+            "/api/v1/pleroma/emoji/packs/files?name={pack_name}"
+        ))
+        .bearer(&token)
+        .json(&body)
+        .send(&app)
+        .await;
+        common::assert_answer(&refused, status, "the refused rename");
+        common::assert_error(&refused, message, "the refused rename");
+    }
+
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["cat.png", "pack.json"],
+        "no refused rename touched a file"
+    );
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join("cats").join("pack.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["files"],
+        json!({"cat": "cat.png"}),
+        "and none touched the manifest"
+    );
+}
+
+/// `DELETE /packs/files` drops the entry from `pack.json` and the file
+/// from the pack directory — pruning the subdirectory a nested name
+/// emptied — accepts the `shortcode` (and the `name`) from the query or
+/// the body, answers the pack's full `files` object, and the resync
+/// forgets the custom emoji with it.
+#[tokio::test]
+async fn delete_removes_the_entry_and_the_file() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(
+        dir.path(),
+        "cats",
+        &pack(
+            true,
+            &[
+                ("cat", "cat.png"),
+                ("kitten", "sub/kitten.png"),
+                ("lone", "lone.gif"),
+            ],
+        ),
+    )
+    .await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "filereaper", "admin:write").await;
+
+    let via_query =
+        common::TestRequest::delete("/api/v1/pleroma/emoji/packs/files?name=cats&shortcode=cat")
+            .bearer(&token)
+            .send(&app)
+            .await;
+    common::assert_answer(&via_query, StatusCode::OK, "delete from the query");
+    assert_eq!(
+        via_query.json_value(),
+        json!({"kitten": "sub/kitten.png", "lone": "lone.gif"}),
+        "the entry is gone from the files object"
+    );
+    assert!(
+        !dir.path().join("cats").join("cat.png").exists(),
+        "and its file with it"
+    );
+
+    let via_body = common::TestRequest::delete("/api/v1/pleroma/emoji/packs/files?name=cats")
+        .bearer(&token)
+        .form(&[("shortcode", "kitten")])
+        .send(&app)
+        .await;
+    common::assert_answer(&via_body, StatusCode::OK, "delete from the body");
+    assert_eq!(
+        via_body.json_value(),
+        json!({"lone": "lone.gif"}),
+        "the nested entry left"
+    );
+    assert!(
+        !dir.path().join("cats").join("sub").exists(),
+        "the emptied subdirectory is pruned"
+    );
+
+    let last = common::TestRequest::delete("/api/v1/pleroma/emoji/packs/files")
+        .bearer(&token)
+        .json(&json!({"name": "cats", "shortcode": "lone"}))
+        .send(&app)
+        .await;
+    common::assert_answer(&last, StatusCode::OK, "delete with the name in the body");
+    assert_eq!(last.json_value(), json!({}), "the pack is empty now");
+    assert_eq!(
+        pack_entries(dir.path(), "cats"),
+        ["pack.json"],
+        "every file left with its entry"
+    );
+    assert!(
+        served_emojis(&app).await.is_empty(),
+        "and the custom emoji list followed the deletes"
+    );
+}
+
+/// A delete of a shortcode the pack does not name is the 400
+/// `{"error":"Emoji \"<shortcode>\" does not exist"}` — the same refusal
+/// twice-deleted entries and never-there ones — while an entry whose
+/// file already vanished off disk is still deletable: the manifest is
+/// what must stop naming it.
+#[tokio::test]
+async fn delete_refuses_unknown_shortcodes_and_tolerates_off_disk_entries() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    emoji_packs::save_pack(dir.path(), "haunt", &pack(true, &[("ghost", "ghost.png")]))
+        .await
+        .expect("the manifest-only pack saves");
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "fileghoster", "admin:write").await;
+
+    let ghost = common::TestRequest::delete("/api/v1/pleroma/emoji/packs/files?name=haunt")
+        .bearer(&token)
+        .json(&json!({"shortcode": "ghost"}))
+        .send(&app)
+        .await;
+    common::assert_answer(&ghost, StatusCode::OK, "delete an off-disk entry");
+    assert_eq!(ghost.json_value(), json!({}), "the entry left the manifest");
+
+    for shortcode in ["ghost", "never-was"] {
+        let again = common::TestRequest::delete(&format!(
+            "/api/v1/pleroma/emoji/packs/files?name=haunt&shortcode={shortcode}"
+        ))
+        .bearer(&token)
+        .send(&app)
+        .await;
+        common::assert_answer(&again, StatusCode::BAD_REQUEST, "delete twice");
+        common::assert_error(
+            &again,
+            &format!("Emoji \"{shortcode}\" does not exist"),
+            "delete twice",
+        );
+    }
+}
+
+/// All three file routes answer an unknown pack with the ticket's 400
+/// `{"error":"Pack <name> does not exist"}`, fold a name that could
+/// traverse into the same refusal (the routes cannot be used to probe
+/// the filesystem), and demand the `name`: absent or blank is the
+/// shared empty-value 400.
+#[tokio::test]
+async fn file_routes_refuse_unknown_and_unnamed_packs() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("outside.txt"), b"do not touch me").unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let token = admin_token(&pool, "fileguesser", "admin:write").await;
+
+    for (request, message) in [
+        (
+            common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=nope")
+                .json(&json!({"shortcode": "cat", "file": "https://unreachable.invalid/c.png"})),
+            "Pack nope does not exist",
+        ),
+        (
+            common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=nope")
+                .json(&json!({"shortcode": "cat", "new_shortcode": "dog"})),
+            "Pack nope does not exist",
+        ),
+        (
+            common::TestRequest::delete(
+                "/api/v1/pleroma/emoji/packs/files?name=nope&shortcode=cat",
+            ),
+            "Pack nope does not exist",
+        ),
+        (
+            common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=%2e%2e%2fsecret")
+                .json(&json!({"shortcode": "cat", "file": "https://unreachable.invalid/c.png"})),
+            "Pack ../secret does not exist",
+        ),
+        (
+            common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=%2fetc%2fpasswd")
+                .json(&json!({"shortcode": "cat"})),
+            "Pack /etc/passwd does not exist",
+        ),
+        (
+            common::TestRequest::delete("/api/v1/pleroma/emoji/packs/files?name=&shortcode=cat"),
+            "pack name cannot be empty",
+        ),
+        (
+            common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files")
+                .json(&json!({"shortcode": "cat"})),
+            "pack name cannot be empty",
+        ),
+    ] {
+        let refused = request.bearer(&token).send(&app).await;
+        common::assert_answer(&refused, StatusCode::BAD_REQUEST, "the refused file write");
+        common::assert_error(&refused, message, "the refused file write");
+    }
+
+    let siblings: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        siblings,
+        ["outside.txt"],
+        "no refused file write created or touched anything"
+    );
+    assert!(log_rows(&pool).await.is_empty(), "refusals log nothing");
+}
+
+/// One file-route `verb` against `/packs/files?name=gated` as `token`
+/// (`None` for no bearer header), always with a body that would pass if
+/// the caller were allowed: the gate refuses before anything else reads
+/// it, and only the scope refusal needs the parseable body — the
+/// extractor's role gate runs first.
+async fn gated_file_write(
+    app: &axum::Router,
+    verb: &str,
+    token: Option<&str>,
+) -> common::TestResponse {
+    let request = match verb {
+        "post" => common::TestRequest::post("/api/v1/pleroma/emoji/packs/files?name=gated")
+            .multipart(
+                BOUNDARY,
+                &upload_parts(&[("shortcode", "gated")], Some(("g.png", PNG_BYTES))),
+            ),
+        "patch" => common::TestRequest::patch("/api/v1/pleroma/emoji/packs/files?name=gated")
+            .json(&json!({"shortcode": "gated", "new_shortcode": "renamed"})),
+        _ => common::TestRequest::delete(
+            "/api/v1/pleroma/emoji/packs/files?name=gated&shortcode=renamed",
+        ),
+    };
+    match token {
+        Some(bearer) => request.bearer(bearer).send(app).await,
+        None => request.send(app).await,
+    }
+}
+
+/// Every file write refuses weaker credentials the way the shared admin
+/// gate words them, on all three verbs, and none of them touches the
+/// pack on disk or the moderation log; the narrow `admin:write:emoji`
+/// alias grants all three.
+#[tokio::test]
+async fn file_writes_demand_an_admin_with_admin_write() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "gated", &pack(false, &[])).await;
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let app_only = common::create_app_only_token(&pool, "admin:write").await;
+    let plain = plain_token(&pool, "filepleb", "admin:write").await;
+    let rootless = admin_token(&pool, "filerootless", "read write").await;
+
+    let refusals: &[Refusal<'_>] = &[
+        (
+            "no bearer token",
+            None,
+            StatusCode::UNAUTHORIZED,
+            "Invalid credentials",
+        ),
+        (
+            "a bogus token",
+            Some("not-a-real-token"),
+            StatusCode::UNAUTHORIZED,
+            "The access token is invalid",
+        ),
+        (
+            "an app-only token",
+            Some(&app_only),
+            StatusCode::FORBIDDEN,
+            "This API requires an authenticated user",
+        ),
+        (
+            "a non-admin user",
+            Some(&plain),
+            StatusCode::FORBIDDEN,
+            "User is not an admin.",
+        ),
+        (
+            "an admin without admin:write",
+            Some(&rootless),
+            StatusCode::FORBIDDEN,
+            "Insufficient permissions: admin:write.",
+        ),
+    ];
+    for verb in ["post", "patch", "delete"] {
+        for (who, token, status, message) in refusals {
+            let response = gated_file_write(&app, verb, *token).await;
+            common::assert_answer(&response, *status, &format!("{verb} as {who}"));
+            common::assert_error(&response, message, &format!("{verb} as {who}"));
+        }
+    }
+    assert_eq!(
+        pack_entries(dir.path(), "gated"),
+        ["pack.json"],
+        "no refused file write touched the pack"
+    );
+    assert!(log_rows(&pool).await.is_empty(), "refusals log nothing");
+
+    let narrow = admin_token(&pool, "filenarrow", "admin:write:emoji").await;
+    let added = gated_file_write(&app, "post", Some(&narrow)).await;
+    common::assert_answer(&added, StatusCode::OK, "the narrow alias adds");
+    assert_eq!(added.json_value(), json!({"gated": "gated.png"}));
+    let renamed = gated_file_write(&app, "patch", Some(&narrow)).await;
+    common::assert_answer(&renamed, StatusCode::OK, "the narrow alias renames");
+    assert_eq!(renamed.json_value(), json!({"renamed": "gated.png"}));
+    let removed = gated_file_write(&app, "delete", Some(&narrow)).await;
+    common::assert_answer(&removed, StatusCode::OK, "the narrow alias deletes");
+    assert_eq!(removed.json_value(), json!({}));
 }

@@ -29,9 +29,10 @@ use crate::{
 /// [`polls::router`], [`reports::router`], [`search::router`] and
 /// [`statuses::router`], the merged routers whose routes mount the rate
 /// limiter, and — as
-/// [`state.config`] — [`media::router`], [`pleroma_settings::router`] and
-/// [`admin::router`], whose upload/install routes carry their own body
-/// limit (see [`crate::extract::multipart::upload_body_limit`]), which
+/// [`state.config`] — [`media::router`], [`pleroma_settings::router`],
+/// [`admin::router`] and [`emoji_packs::router`], whose upload/install
+/// routes carry their own body limit (see
+/// [`crate::extract::multipart::upload_body_limit`]), which
 /// axum's multipart extractor cannot read from the state on its own.
 ///
 /// [`state.config`]: AppState::config
@@ -79,7 +80,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         )
         .nest("/pleroma/chats", chats::router())
         .nest("/pleroma/conversations", conversations::pleroma_router())
-        .nest("/pleroma/emoji", emoji_packs::router())
+        .nest("/pleroma/emoji", emoji_packs::router(&state.config))
         .nest(
             "/pleroma/statuses",
             emoji_reactions::router().merge(statuses::pleroma_router()),
