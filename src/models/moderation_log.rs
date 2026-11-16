@@ -21,7 +21,8 @@
 //! [`deactivate`], [`activate`], [`delete`], [`approve`], [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`updated_users`], [`confirm_email`], [`resend_confirmation_email`],
-//! [`disable_mfa`], [`follow`], [`unfollow`],
+//! [`disable_mfa`], [`add_suggestion`], [`remove_suggestion`],
+//! [`follow`], [`unfollow`],
 //! [`report_update`], [`report_note`], [`status_update`],
 //! [`status_delete`], [`chat_message_delete`], [`relay_follow`], [`relay_unfollow`],
 //! [`delete_instance`], [`reload_emoji`],
@@ -443,6 +444,45 @@ pub async fn disable_mfa(
     subjects: &[User],
 ) -> AppResult<ModerationLog> {
     users_action(pool, actor, subjects, "disable_mfa", "disabled MFA for").await
+}
+
+/// Records an `add_suggestion`: `@admin added suggested users: @alice,
+/// @bob` — Pleroma's `add_suggestion` clause of `get_log_entry_message`,
+/// the entry the admin `PATCH /users/suggest` leaves behind.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn add_suggestion(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    users_action(pool, actor, subjects, "add_suggestion", "added suggested").await
+}
+
+/// Records a `remove_suggestion`: `@admin removed suggested users: @alice,
+/// @bob` — [`add_suggestion`]'s twin, the entry the admin
+/// `PATCH /users/unsuggest` leaves behind.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn remove_suggestion(
+    pool: &PgPool,
+    actor: &User,
+    subjects: &[User],
+) -> AppResult<ModerationLog> {
+    users_action(
+        pool,
+        actor,
+        subjects,
+        "remove_suggestion",
+        "removed suggested",
+    )
+    .await
 }
 
 /// Records a `follow`: `@admin made @alice follow @bob`, the admin's
@@ -1476,6 +1516,16 @@ mod tests {
             "the disable_mfa clause the ticket adds"
         );
         assert_eq!(
+            users_sentence("admin", "added suggested", &subjects),
+            "@admin added suggested users: @alice, @bob",
+            "the add_suggestion clause"
+        );
+        assert_eq!(
+            users_sentence("admin", "removed suggested", &subjects),
+            "@admin removed suggested users: @alice, @bob",
+            "the remove_suggestion clause"
+        );
+        assert_eq!(
             users_sentence("admin", "deactivated", &names(&["solo"])),
             "@admin deactivated users: @solo",
             "a lone subject carries no comma"
@@ -1653,6 +1703,12 @@ mod tests {
             disable_mfa(&pool, &actor, &subjects)
                 .await
                 .expect("records"),
+            add_suggestion(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
+            remove_suggestion(&pool, &actor, &subjects)
+                .await
+                .expect("records"),
         ];
         let actions = [
             "deactivate",
@@ -1664,6 +1720,8 @@ mod tests {
             "confirm_email",
             "resend_confirmation_email",
             "disable_mfa",
+            "add_suggestion",
+            "remove_suggestion",
         ];
         for (row, action) in iter::zip(cases, actions) {
             assert_eq!(row.action, action, "the action column");
