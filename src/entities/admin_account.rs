@@ -1,5 +1,5 @@
-//! The admin API's account entities: what an admin sees of one account in
-//! the listing, the show and the credentials form (WBE-195, WBE-198).
+//! The admin API's account entities: what an admin sees of one account
+//! (WBE-195, WBE-198, WBE-197).
 //!
 //! The reference is `Pleroma.Web.AdminAPI.AccountView`
 //! (`lib/pleroma/web/admin_api/views/account_view.ex`), whose `"show.json"`
@@ -276,6 +276,63 @@ impl AdminAccountList {
                 .collect(),
             count: page.count,
             page_size,
+        }
+    }
+}
+
+/// One account's two staff groups as the admin API's permission-group
+/// reads answer them.
+///
+/// The shape is Pleroma's `right_get` map, `is_moderator` first and
+/// `is_admin` beside it, the column names rather than the `roles` object
+/// [`AdminAccount`] nests them in.
+///
+/// Both flags come back whichever group the request named — Pleroma's
+/// `GET /users/:nickname/permission_group/:permission_group` route runs the
+/// very same `right_get` as its group-less twin — and the write pair answers
+/// only the one key it moved, which
+/// [`crate::api::admin::users`] builds from
+/// [`crate::models::user::admin::Role::column`] instead of from this type.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct AdminPermissionGroup {
+    /// Whether the account is a moderator (`is_moderator`).
+    pub is_moderator: bool,
+    /// Whether the account is an admin (`is_admin`).
+    pub is_admin: bool,
+}
+
+impl AdminPermissionGroup {
+    /// The two staff flags of one `users` row.
+    #[must_use]
+    pub const fn from_user(user: &User) -> Self {
+        Self {
+            is_moderator: user.is_moderator.get(),
+            is_admin: user.is_admin.get(),
+        }
+    }
+}
+
+/// The whole `{"users": […]}` answer of the admin suggest pair
+/// (WBE-197).
+///
+/// This is Pleroma's `AccountView` `"index.json"` clause that takes the
+/// list alone, without [`AdminAccountList`]'s `count` and `page_size`,
+/// because a write answers its subjects and not a page.
+#[derive(Debug, Serialize)]
+pub struct AdminAccounts {
+    /// The accounts, in the order the request named them.
+    pub users: Vec<AdminAccount>,
+}
+
+impl AdminAccounts {
+    /// Renders `users` as admin entities under the one `users` key.
+    #[must_use]
+    pub fn from_users(users: &[User], config: &Config) -> Self {
+        Self {
+            users: users
+                .iter()
+                .map(|found| AdminAccount::from_user(found, config))
+                .collect(),
         }
     }
 }
@@ -690,6 +747,73 @@ mod tests {
                 "background": null,
             }),
             "the column defaults, spelled out"
+        );
+    }
+
+    /// The permission-group read answers exactly Pleroma's `right_get` map:
+    /// both flags, always, under their column names — the group the route
+    /// segment named is not a filter on the answer. A mirror's row answers
+    /// the same shape with both flags false.
+    #[test]
+    fn the_permission_group_answers_both_flags() {
+        let plain = serde_json::to_value(AdminPermissionGroup::from_user(&base_user("alice")))
+            .expect("the group serializes");
+        assert_eq!(
+            plain,
+            json!({ "is_moderator": false, "is_admin": false }),
+            "an ordinary account holds neither group"
+        );
+        let staff = User {
+            is_admin: Flag::new(true),
+            is_moderator: Flag::new(true),
+            ..base_user("root")
+        };
+        assert_eq!(
+            serde_json::to_value(AdminPermissionGroup::from_user(&staff))
+                .expect("the group serializes"),
+            json!({ "is_moderator": true, "is_admin": true }),
+            "and both flags come back at once"
+        );
+    }
+
+    /// The suggest pair's answer is Pleroma's `index.json` clause that
+    /// carries the list alone: one `users` key, no `count`, no `page_size`,
+    /// the entries the same admin entities the show renders.
+    #[test]
+    fn the_suggestion_answer_wraps_the_list_alone() {
+        let moved = vec![base_user("alice"), base_user("bob")];
+        let rendered =
+            serde_json::to_value(AdminAccounts::from_users(&moved, &Config::for_tests()))
+                .expect("the answer serializes");
+        assert_eq!(
+            rendered
+                .as_object()
+                .expect("an object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["users"],
+            "exactly the one key"
+        );
+        let entries = rendered["users"].as_array().expect("the users array");
+        assert_eq!(entries.len(), 2, "both moved accounts");
+        assert_eq!(
+            entries
+                .iter()
+                .filter_map(|found| found["nickname"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice", "bob"],
+            "in the order the request named them"
+        );
+        assert_eq!(
+            rendered["users"][0]["is_suggested"],
+            json!(false),
+            "the flag the write just set rides in the entity"
+        );
+        assert_eq!(
+            serde_json::to_value(AdminAccounts::from_users(&[], &Config::for_tests()))
+                .expect("the empty answer serializes"),
+            json!({ "users": [] }),
+            "and a write that moved nobody answers the empty list"
         );
     }
 

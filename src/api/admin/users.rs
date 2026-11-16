@@ -81,6 +81,43 @@
 //!   `"@admin made @follower follow|unfollow @followed"` entry and answers
 //!   the JSON string `"ok"`.
 //!
+//! WBE-197 adds the profile tags, the staff groups and the suggestion pool.
+//!
+//! - `PUT /users/tag` and `DELETE /users/tag` — the request's `nicknames[]`
+//!   and `tags[]`, in the body or the query string: every account the
+//!   request names gains — or loses — those profile tags, deduped and
+//!   lowercased into the spelling the [`crate::federation::mrf::tag`]
+//!   switches match by (Pleroma's `User.tag` / `User.untag`, both
+//!   idempotent: tagging a held tag and untagging an absent one change
+//!   nothing and stay 204). Unknown handles are skipped and mirrors are
+//!   taggable — the `mrf_tag:` tags exist to be put on remote accounts.
+//!   Each writes a `tag` / `untag` entry naming the accounts and the tags
+//!   and answers 204. Pleroma's `GET /users/tag` tag listing is not part of
+//!   this router, per the ticket.
+//! - `GET /users/{nickname}/permission_group` and its
+//!   `/{group}` twin — Pleroma's `right_get`: the account's two flags as
+//!   `{"is_moderator": …, "is_admin": …}`, mirror included, the group
+//!   segment read as nothing but validated (an unknown one is the 404).
+//! - `POST` and `DELETE /users/{nickname}/permission_group/{group}` —
+//!   `right_add` and `right_delete`: one LOCAL account joins or leaves one
+//!   group, the answer naming the one column that moved
+//!   (`{"is_admin": true}`, `{"is_moderator": false}`, …) and one `grant` /
+//!   `revoke` entry logged. A mirror is the 400 `{"error":"Can't set role
+//!   for a remote user"}` and the admin who names their own account in the
+//!   revoke is the 403 `{"error":"You can't revoke your own admin status."}`,
+//!   for either group.
+//! - `POST` and `DELETE /users/permission_group/{group}` — the same write
+//!   over a `nicknames[]` list: everyone but the caller and the mirrors
+//!   moves (`right_delete_multiple`'s self-refusal is the ticket's
+//!   self-exclusion here), one entry names them, and the answer is the
+//!   group's column carrying the state it was written to.
+//! - `PATCH /users/suggest` and `PATCH /users/unsuggest` — a `nicknames[]`
+//!   list in or out of the suggestion pool the
+//!   `GET /api/v{1,2}/suggestions` listings answer from (Pleroma's
+//!   `UserController.suggest` / `unsuggest`), answered with the moved
+//!   accounts as `{"users": [admin entity…]}` and logged as an
+//!   `add_suggestion` / `remove_suggestion` entry.
+//!
 //! Two of Pleroma's parameters are read wider here than its
 //! `CastAndValidate` declares them: an array key arrives in both the
 //! bracketed spelling `pleroma-fe` sends (`tags[]`) and the bare one
@@ -116,9 +153,11 @@ use crate::{
     },
     auth::admin::AdminUser,
     config::Config,
-    entities::admin_account::{AdminAccount, AdminAccountList, AdminCredentials},
+    entities::admin_account::{
+        AdminAccount, AdminAccountList, AdminAccounts, AdminCredentials, AdminPermissionGroup,
+    },
     error::{AppError, AppResult},
-    extract::{ApiBody, flex},
+    extract::{ApiBody, ApiParams, flex},
     models::{
         follow::{self, FollowState},
         moderation_log, oauth_token, password_reset,
@@ -158,17 +197,39 @@ const SUCCESS: &str = "success";
 /// The follow pair's answer: the ticket pins the bare JSON string `"ok"`
 /// where Pleroma renders its own success map.
 const OK: &str = "ok";
+/// 404 body of a `permission_group` segment that names neither `admin` nor
+/// `moderator`: Pleroma's `right_add`, `right_delete` and their bulk twins
+/// all answer an unknown group with `render_error(conn, :not_found, "No
+/// such permission_group")`. The ticket pins the status; the wording is the
+/// reference's, and the module's generic `RouteNotFound` "Not found" stays
+/// for the misses that name an account.
+const NO_SUCH_GROUP: &str = "No such permission_group";
+/// 400 body of a role write aimed at a remote mirror: a role is this
+/// instance's own to give, and the ticket pins this wording for both the
+/// grant and the revoke.
+const REMOTE_ROLE: &str = "Can't set role for a remote user";
+/// 403 body of the admin who revokes a role from their own account:
+/// Pleroma's `right_delete` self clause.
+const SELF_REVOKE: &str = "You can't revoke your own admin status.";
 
 /// The user routes of the admin API, merged into [`super`].
 ///
 /// `/users/{nickname}` is the show route of the same prefix the invite
 /// actions (`/users/invites` and friends, [`super::invites`]) live under;
 /// the router prefers a static segment over a parameter, so both are
-/// reachable. The same is true of the maintenance actions this ticket adds
+/// reachable. The same is true of the maintenance actions of WBE-198
 /// (`/users/password_reset`, `/users/confirm_email`,
 /// `/users/resend_confirmation_email`, `/users/disable_mfa`,
 /// `/users/follow` and `/users/unfollow`) beside the two `{nickname}`
-/// routes the credentials read and the issued reset token hang on.
+/// routes the credentials read and the issued reset token hang on, and of
+/// this ticket's static `/users/tag`, `/users/suggest` and
+/// `/users/unsuggest`.
+///
+/// The two `permission_group` shapes coexist the same way: the bulk pair
+/// `/users/permission_group/{group}` hangs off the static
+/// `permission_group` segment the single account's
+/// `/users/{nickname}/permission_group[/{group}]` reads occupy as a
+/// parameter, and the static one wins the exact-match contest.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/users", get(list_users))
@@ -187,6 +248,23 @@ pub fn router() -> Router<AppState> {
         .route("/users/disable_mfa", put(disable_mfa))
         .route("/users/follow", post(follow_users))
         .route("/users/unfollow", post(unfollow_users))
+        .route("/users/tag", put(tag_users).delete(untag_users))
+        .route(
+            "/users/{nickname}/permission_group",
+            get(show_permission_group),
+        )
+        .route(
+            "/users/{nickname}/permission_group/{group}",
+            get(show_permission_group_of)
+                .post(grant_role)
+                .delete(revoke_role),
+        )
+        .route(
+            "/users/permission_group/{group}",
+            post(grant_role_bulk).delete(revoke_role_bulk),
+        )
+        .route("/users/suggest", patch(suggest_users))
+        .route("/users/unsuggest", patch(unsuggest_users))
 }
 
 /// `GET /api/v1/pleroma/admin/users` — Pleroma's `index`: the criteria of
@@ -1053,6 +1131,18 @@ struct NicknameBody {
     nickname: String,
 }
 
+/// The parameters of the tag pair: Pleroma's `tag_users` and `untag_users`
+/// both require `nicknames` AND `tags`, each arriving from JSON as the
+/// array and from a form or the query string as the repeated bracketed key
+/// the [`ApiParams`] extractor nests.
+#[derive(Debug, Deserialize)]
+struct TagsBody {
+    /// The accounts whose profile tags change, unknown ones skipped.
+    nicknames: Vec<String>,
+    /// The tags to add to — or remove from — every one of them.
+    tags: Vec<String>,
+}
+
 /// The body of the follow pair: both ends of the relationship, named by
 /// nickname and both required (Pleroma's `open_api_spex` body params).
 #[derive(Debug, Deserialize)]
@@ -1305,6 +1395,413 @@ async fn unfollow_users(
         "admin forced an unfollow"
     );
     Ok(Json(OK))
+}
+
+/// The normalized spelling of one submitted tag list: Pleroma's
+/// `normalize_tags` (`lib/pleroma/user.ex`), which folds every tag the
+/// admin submits to lowercase. The fold is what makes the `mrf_tag:`
+/// switches forgiving — [`crate::federation::mrf::tag::Tag`] matches the
+/// stored spelling exactly, and its six keys are spelled in lowercase.
+fn normalized(tags: &[String]) -> Vec<String> {
+    tags.iter().map(|tag| tag.to_lowercase()).collect()
+}
+
+/// Pleroma's `Enum.uniq((user.tags || []) ++ normalize_tags(tags))`, the
+/// `User.tag` write: the stored tags keep their order and their spelling,
+/// and every submitted tag the account does not already carry is appended
+/// once, in the order it was stated. Adding a tag twice is therefore one
+/// entry, which is the pair's idempotence.
+fn merged_tags(stored: &[String], submitted: &[String]) -> Vec<String> {
+    let mut merged = stored.to_vec();
+    for tag in normalized(submitted) {
+        if !merged.contains(&tag) {
+            merged.push(tag);
+        }
+    }
+    merged
+}
+
+/// Pleroma's `(user.tags || []) -- normalize_tags(tags)`, the `User.untag`
+/// write: the stored tags that the submission does not name, order kept.
+/// The comparison is exact, so a tag stored in some other spelling by a
+/// hand-written row survives a lowercase removal — and no tag that is not
+/// named goes anywhere, which is the pair's other idempotence.
+fn kept_tags(stored: &[String], submitted: &[String]) -> Vec<String> {
+    let gone = normalized(submitted);
+    stored
+        .iter()
+        .filter(|tag| !gone.contains(*tag))
+        .cloned()
+        .collect()
+}
+
+/// The accounts a staff write may move: [`local_only`]'s filter over what
+/// one request named, applied to the nickname-list routes (see
+/// [`grant_role`]'s refusal of the same account in the singular).
+fn local_only(found: Vec<User>) -> Vec<User> {
+    found
+        .into_iter()
+        .filter(|account| account.local.get())
+        .collect()
+}
+
+/// The staff group one `permission_group` segment names, and Pleroma's
+/// `No such permission_group` 404 for any other text (its `right_add`,
+/// `right_delete` and bulk twins all end in that fallback clause).
+///
+/// # Errors
+///
+/// [`AppError::NotFoundMessage`] with [`NO_SUCH_GROUP`].
+fn group_of(text: &str) -> AppResult<admin::Role> {
+    admin::Role::parse(text).ok_or_else(|| AppError::NotFoundMessage(NO_SUCH_GROUP.to_owned()))
+}
+
+/// The account one `permission_group` route names: the show's
+/// nickname-or-id lookup, remote mirrors included. The read answers a
+/// mirror's two flags (both false, and Pleroma's `right_get` looks no
+/// further than the row), and the write looks one up precisely so that it
+/// can refuse it with its own 400.
+///
+/// # Errors
+///
+/// [`AppError::RouteNotFound`] for text that names neither;
+/// [`AppError::Database`] from the read.
+async fn named_account(state: &AppState, raw: &str) -> AppResult<User> {
+    admin::get_by_nickname_or_id(&state.db, raw)
+        .await?
+        .ok_or(AppError::RouteNotFound)
+}
+
+/// The role write the four permission-group routes share: the flag lands on
+/// every account in `subjects`, one `grant` or `revoke` entry names them,
+/// and the answer is Pleroma's `json(conn, update)` — the group's own
+/// column, carrying the state it was written to.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the writes and the log.
+async fn write_role(
+    state: &AppState,
+    actor: &User,
+    subjects: &[User],
+    role: admin::Role,
+    granted: bool,
+) -> AppResult<Json<Value>> {
+    for found in subjects {
+        admin::set_role(&state.db, found.id, role, granted).await?;
+    }
+    let logged = if granted {
+        moderation_log::grant(&state.db, actor, subjects, role.as_str()).await?
+    } else {
+        moderation_log::revoke(&state.db, actor, subjects, role.as_str()).await?
+    };
+    debug!(
+        log = %logged.id,
+        group = role.as_str(),
+        moved = subjects.len(),
+        granted,
+        "admin changed a staff group"
+    );
+    Ok(Json(json!({ role.column(): granted })))
+}
+
+/// The pool write both suggest routes share: `is_suggested` lands on every
+/// named account that answers, one entry names the moved subjects, and the
+/// answer is the moved accounts as admin entities, in the order the request
+/// stated them.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the lookups, the writes and the log.
+async fn write_suggestions(
+    state: &AppState,
+    actor: &User,
+    nicknames: &[String],
+    suggested: bool,
+) -> AppResult<Json<AdminAccounts>> {
+    let found = admin::resolve_nicknames(&state.db, nicknames).await?;
+    let mut moved = Vec::with_capacity(found.len());
+    for account in &found {
+        if let Some(updated) = admin::set_suggested(&state.db, account.id, suggested).await? {
+            moved.push(updated);
+        }
+    }
+    let logged = if suggested {
+        moderation_log::add_suggestion(&state.db, actor, &moved).await?
+    } else {
+        moderation_log::remove_suggestion(&state.db, actor, &moved).await?
+    };
+    debug!(
+        log = %logged.id,
+        moved = moved.len(),
+        suggested, "admin changed the suggestion pool"
+    );
+    Ok(Json(AdminAccounts::from_users(&moved, &state.config)))
+}
+
+/// `PUT /api/v1/pleroma/admin/users/tag` — Pleroma's `tag_users`: every
+/// account the request names gets the submitted tags appended, deduped and
+/// lowercased by [`merged_tags`], and the write logs a `tag` entry naming
+/// the accounts it found and the tags as they were spelled.
+///
+/// A remote mirror is taggable — the `mrf_tag:` switches exist to be put on
+/// mirrors — and a handle nobody answers to is skipped as the other list
+/// actions skip it, inside the same 204. A tag list that adds nothing still
+/// leaves the row alone (no empty write, no `updated_at` churn) and still
+/// logs.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::Unprocessable`] from the
+/// extractor for a request that states no `nicknames` or no `tags`;
+/// [`AppError::Database`] from the reads, the writes and the log.
+async fn tag_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    params: ApiParams<TagsBody>,
+) -> AppResult<StatusCode> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let subjects = admin::resolve_nicknames(&state.db, &params.0.nicknames).await?;
+    for found in &subjects {
+        let merged = merged_tags(&found.tags, &params.0.tags);
+        if merged != found.tags {
+            admin::set_tags(&state.db, found.id, &merged).await?;
+        }
+    }
+    let logged = moderation_log::tag(&state.db, &admin.0, &subjects, &params.0.tags).await?;
+    debug!(
+        log = %logged.id,
+        tagged = subjects.len(),
+        "admin tagged users"
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/v1/pleroma/admin/users/tag` — Pleroma's `untag_users`:
+/// [`tag_users`]'s twin, with [`kept_tags`] doing the subtracting and the
+/// entry logged as an `untag`.
+///
+/// # Errors
+///
+/// As [`tag_users`].
+async fn untag_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    params: ApiParams<TagsBody>,
+) -> AppResult<StatusCode> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let subjects = admin::resolve_nicknames(&state.db, &params.0.nicknames).await?;
+    for found in &subjects {
+        let kept = kept_tags(&found.tags, &params.0.tags);
+        if kept != found.tags {
+            admin::set_tags(&state.db, found.id, &kept).await?;
+        }
+    }
+    let logged = moderation_log::untag(&state.db, &admin.0, &subjects, &params.0.tags).await?;
+    debug!(
+        log = %logged.id,
+        untagged = subjects.len(),
+        "admin untagged users"
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/pleroma/admin/users/{nickname}/permission_group` — Pleroma's
+/// `right_get`: the account's two staff flags, `is_moderator` and `is_admin`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:read` gate; [`AppError::RouteNotFound`] from
+/// [`named_account`]; [`AppError::Database`] from the read.
+async fn show_permission_group(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(raw): Path<String>,
+) -> AppResult<Json<AdminPermissionGroup>> {
+    admin.require(CLASS_READ, AREA_ACCOUNTS)?;
+    let found = named_account(&state, &raw).await?;
+    debug!(
+        id = %found.id,
+        nickname = %found.nickname,
+        "admin permission group read"
+    );
+    Ok(Json(AdminPermissionGroup::from_user(&found)))
+}
+
+/// `GET /api/v1/pleroma/admin/users/{nickname}/permission_group/{group}` —
+/// the very same object: Pleroma routes both spellings onto `right_get`,
+/// which never reads the group. The segment is validated anyway, as the
+/// ticket pins its 404.
+///
+/// # Errors
+///
+/// As [`show_permission_group`], plus [`group_of`]'s 404.
+async fn show_permission_group_of(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path((raw, group)): Path<(String, String)>,
+) -> AppResult<Json<AdminPermissionGroup>> {
+    admin.require(CLASS_READ, AREA_ACCOUNTS)?;
+    let role = group_of(&group)?;
+    let found = named_account(&state, &raw).await?;
+    debug!(
+        id = %found.id,
+        group = role.as_str(),
+        "admin permission group read"
+    );
+    Ok(Json(AdminPermissionGroup::from_user(&found)))
+}
+
+/// `POST /api/v1/pleroma/admin/users/{nickname}/permission_group/{group}` —
+/// Pleroma's `right_add`: the account joins the group, and the answer names
+/// the one column that moved.
+///
+/// The write is the ticket's, and narrower than Pleroma's: an account this
+/// instance does not own is the 400 [`REMOTE_ROLE`], because a staff role
+/// here is a local row's flag and nothing else. The group is checked first,
+/// so a bogus group is [`group_of`]'s 404 whatever the handle says — where
+/// Pleroma's guard clause fails on the group before it ever looks the
+/// account up.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::NotFoundMessage`] for a group off
+/// the two, [`AppError::RouteNotFound`] for an account nobody answers to;
+/// [`AppError::BadRequest`] for a mirror; [`AppError::Database`] from the
+/// read, the write and the log.
+async fn grant_role(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path((raw, group)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let role = group_of(&group)?;
+    let found = named_account(&state, &raw).await?;
+    if !found.local.get() {
+        return Err(AppError::BadRequest(REMOTE_ROLE.to_owned()));
+    }
+    write_role(&state, &admin.0, slice::from_ref(&found), role, true).await
+}
+
+/// `DELETE /api/v1/pleroma/admin/users/{nickname}/permission_group/{group}`
+/// — Pleroma's `right_delete`: the account leaves the group.
+///
+/// The account's own row comes first among the refusals, as it does in
+/// Pleroma — and, like its `right_delete` clause that matches the acting
+/// admin's nickname without reading the group, for either group: an admin
+/// who could revoke their own `moderator` flag could still revoke
+/// themselves out of staff. A mirror is the same 400 [`grant_role`] answers
+/// it, and the bulk twin excludes the caller rather than refusing.
+///
+/// # Errors
+///
+/// As [`grant_role`], with [`AppError::Forbidden`] and [`SELF_REVOKE`] for
+/// the admin who names their own account.
+async fn revoke_role(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path((raw, group)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let role = group_of(&group)?;
+    let found = named_account(&state, &raw).await?;
+    if found.id == admin.0.id {
+        return Err(AppError::Forbidden(SELF_REVOKE.to_owned()));
+    }
+    if !found.local.get() {
+        return Err(AppError::BadRequest(REMOTE_ROLE.to_owned()));
+    }
+    write_role(&state, &admin.0, slice::from_ref(&found), role, false).await
+}
+
+/// `POST /api/v1/pleroma/admin/users/permission_group/{group}` — Pleroma's
+/// `right_add_multiple`: every named LOCAL account joins the group, unknown
+/// handles and mirrors skipped inside the same success, one `grant` entry
+/// naming who moved, and the same one-column answer as the singular write.
+///
+/// # Errors
+///
+/// As [`grant_role`], plus the extractor's 422 for a request with no
+/// `nicknames`.
+async fn grant_role_bulk(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(group): Path<String>,
+    params: ApiParams<NicknamesBody>,
+) -> AppResult<Json<Value>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let role = group_of(&group)?;
+    let found = admin::resolve_nicknames(&state.db, &params.0.nicknames).await?;
+    write_role(&state, &admin.0, &local_only(found), role, true).await
+}
+
+/// `DELETE /api/v1/pleroma/admin/users/permission_group/{group}` — Pleroma's
+/// `right_delete_multiple`, and the divergence the ticket pins: where
+/// Pleroma refuses the whole request with its `admin/moderator` 403 once
+/// the acting admin's own handle is on the list, this revokes from
+/// everybody ELSE and leaves the caller's own group untouched. The answer is
+/// the same one-column map, and the `revoke` entry names the accounts that
+/// moved — the caller's row not among them.
+///
+/// # Errors
+///
+/// As [`grant_role_bulk`].
+async fn revoke_role_bulk(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(group): Path<String>,
+    params: ApiParams<NicknamesBody>,
+) -> AppResult<Json<Value>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let role = group_of(&group)?;
+    let found = admin::resolve_nicknames(&state.db, &params.0.nicknames).await?;
+    let mut subjects = local_only(found);
+    subjects.retain(|account| account.id != admin.0.id);
+    write_role(&state, &admin.0, &subjects, role, false).await
+}
+
+/// `PATCH /api/v1/pleroma/admin/users/suggest` — Pleroma's
+/// `UserController.suggest`: the named accounts join the pool the
+/// `GET /api/v{1,2}/suggestions` listings answer from, and every one of
+/// them comes back as an admin entity under `users`.
+///
+/// Pleroma flags whatever the handle names, mirror included; a mirror keeps
+/// its flag out of those listings because the pool itself is local accounts
+/// only (see [`crate::models::suggestion`]), not because this write refused
+/// it.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// and its `admin:write` gate; [`AppError::Unprocessable`] from the
+/// extractor for a body with no `nicknames`; [`AppError::Database`] from the
+/// lookups, the writes and the log.
+async fn suggest_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    body: ApiParams<NicknamesBody>,
+) -> AppResult<Json<AdminAccounts>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    write_suggestions(&state, &admin.0, &body.0.nicknames, true).await
+}
+
+/// `PATCH /api/v1/pleroma/admin/users/unsuggest` — Pleroma's
+/// `unsuggest`: [`suggest_users`] with the flag cleared and the entry
+/// logged as a `remove_suggestion`.
+///
+/// # Errors
+///
+/// As [`suggest_users`].
+async fn unsuggest_users(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    body: ApiParams<NicknamesBody>,
+) -> AppResult<Json<AdminAccounts>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    write_suggestions(&state, &admin.0, &body.0.nicknames, false).await
 }
 
 /// The listing criteria one request states: the five named criteria, the
@@ -1766,5 +2263,92 @@ mod tests {
                 .contains("nicknames"),
             "and says so"
         );
+    }
+
+    /// The tag pair's body reads both lists, and a request that states only
+    /// one of them is the extractor's 422 (Pleroma's clause requires both).
+    #[test]
+    fn the_tag_body_requires_both_lists() {
+        let both: TagsBody = serde_json::from_value(json!({
+            "nicknames": ["alice", "bob"],
+            "tags": ["staff", "mrf_tag:sandbox"],
+        }))
+        .expect("the tag body");
+        assert_eq!(both.nicknames, vec!["alice", "bob"], "both handles");
+        assert_eq!(
+            both.tags,
+            vec!["staff", "mrf_tag:sandbox"],
+            "an MRF tag is an ordinary string here, and is allowed"
+        );
+        for missing in [json!({"nicknames": ["alice"]}), json!({"tags": ["x"]})] {
+            assert!(
+                serde_json::from_value::<TagsBody>(missing.clone()).is_err(),
+                "half a request does not parse: {missing}"
+            );
+        }
+    }
+
+    /// One `Vec<String>` from bare text, for the tag tests.
+    fn texts(items: &[&str]) -> Vec<String> {
+        items.iter().map(|text| (*text).to_owned()).collect()
+    }
+
+    /// The tag fold, order and all: the append is Pleroma's
+    /// `Enum.uniq(stored ++ normalize_tags(tags))` and the removal its
+    /// `stored -- normalize_tags(tags)`, each over the LOWERCASED
+    /// submission — which is what makes a tag the `mrf_tag:` switches
+    /// actually match, and what makes both writes idempotent.
+    #[test]
+    fn the_tag_lists_merge_and_subtract_over_the_lowercase_submission() {
+        let stored = texts(&["bots", "staff", "MANTAINED"]);
+        assert_eq!(
+            merged_tags(&stored, &texts(&["vip", "staff"])),
+            texts(&["bots", "staff", "MANTAINED", "vip"]),
+            "the stored list leads in its own spelling, the new tag follows, the held one is dropped"
+        );
+        assert_eq!(
+            merged_tags(&stored, &texts(&["STAFF", "Staff"])),
+            stored,
+            "tagging a held tag — twice, in any case — changes nothing"
+        );
+        assert_eq!(
+            merged_tags(&[], &texts(&["MRF_Tag:Sandbox"])),
+            texts(&["mrf_tag:sandbox"]),
+            "the switch's own spelling, whatever case the admin typed"
+        );
+        assert_eq!(
+            kept_tags(&stored, &texts(&["maintained"])),
+            stored,
+            "the removal compares the stored spelling exactly, so a tag kept in caps since before this
+             writer existed survives a lowercase untag — Pleroma's subtraction, quirk included"
+        );
+        assert_eq!(
+            kept_tags(&stored, &texts(&["bots", "STAFF"])),
+            texts(&["MANTAINED"]),
+            "every named tag goes, the rest stays in order"
+        );
+        assert_eq!(
+            kept_tags(&stored, &texts(&["nobody"])),
+            stored,
+            "an unheld tag is subtracted in peace"
+        );
+        assert_eq!(
+            merged_tags(&stored, &[]).len() + kept_tags(&stored, &[]).len(),
+            6,
+            "an empty tag list writes nothing either way"
+        );
+    }
+
+    /// The bulk write's subject filter is exercised end to end (a mirror in
+    /// a nickname list is skipped); the group segment is the pure part:
+    /// Pleroma's two names, and no other text.
+    #[test]
+    fn only_the_two_group_names_are_a_group() {
+        assert_eq!(group_of("admin").ok(), Some(admin::Role::Admin));
+        assert_eq!(group_of("moderator").ok(), Some(admin::Role::Moderator));
+        for text in ["Admin", "owner", "", "is_admin"] {
+            let err = group_of(text).expect_err("no such group name");
+            assert_eq!(err.to_string(), NO_SUCH_GROUP, "Pleroma's wording");
+        }
     }
 }

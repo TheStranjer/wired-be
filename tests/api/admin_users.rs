@@ -744,6 +744,21 @@ fn credentials(nickname: &str) -> String {
     format!("{USERS}/{nickname}/credentials")
 }
 
+/// The permission-group read of one account.
+fn group(nickname: &str) -> String {
+    format!("{USERS}/{nickname}/permission_group")
+}
+
+/// The permission-group read of one account, naming one group.
+fn group_of(nickname: &str, name: &str) -> String {
+    format!("{}/{name}", group(nickname))
+}
+
+/// The nickname-list permission-group route for one group.
+fn group_bulk(name: &str) -> String {
+    format!("{USERS}/permission_group/{name}")
+}
+
 /// The reset-token route of one account.
 fn issued_reset(nickname: &str) -> String {
     format!("{USERS}/{nickname}/password_reset")
@@ -761,6 +776,12 @@ const DISABLE_MFA: &str = "/api/v1/pleroma/admin/users/disable_mfa";
 const FOLLOW: &str = "/api/v1/pleroma/admin/users/follow";
 /// The forced-unfollow POST route.
 const UNFOLLOW: &str = "/api/v1/pleroma/admin/users/unfollow";
+/// The tag pair's route, `PUT` and `DELETE` on one path (WBE-197).
+const TAG: &str = "/api/v1/pleroma/admin/users/tag";
+/// The suggestion-pool add route.
+const SUGGEST: &str = "/api/v1/pleroma/admin/users/suggest";
+/// The suggestion-pool remove route.
+const UNSUGGEST: &str = "/api/v1/pleroma/admin/users/unsuggest";
 /// The completion form the issued link points at.
 const RESET_FORM: &str = "/api/v1/pleroma/password_reset";
 /// The 403 body of a token that grants neither `admin:write` nor
@@ -768,6 +789,12 @@ const RESET_FORM: &str = "/api/v1/pleroma/password_reset";
 const NO_ADMIN_WRITE: &str = "Insufficient permissions: admin:write.";
 /// The 403 `error` of the password grant refused to a forced-reset account.
 const RESET_REQUIRED: &str = "Password reset is required";
+/// The 404 body of a `permission_group` segment that names no group.
+const NO_SUCH_GROUP: &str = "No such permission_group";
+/// The 400 body of a role write aimed at a remote mirror.
+const REMOTE_ROLE: &str = "Can't set role for a remote user";
+/// The 403 body of the admin who revokes a group from their own account.
+const SELF_REVOKE: &str = "You can't revoke your own admin status.";
 
 /// A config with `SMTP_HOST` set, so `confirmation::send` really queues
 /// the letters the resend tests count (the suite default configures no
@@ -1934,11 +1961,75 @@ fn maintenance_routes() -> Vec<Route> {
             body: Some(json!({"follower": "plain", "followed": "root"})),
             status: StatusCode::OK,
         },
+        Route {
+            verb: "PUT",
+            path: TAG.to_owned(),
+            body: Some(json!({"nicknames": [], "tags": []})),
+            status: StatusCode::NO_CONTENT,
+        },
+        Route {
+            verb: "DELETE",
+            path: TAG.to_owned(),
+            body: Some(json!({"nicknames": [], "tags": []})),
+            status: StatusCode::NO_CONTENT,
+        },
     ]
 }
 
+/// The routes of the profile-tag pair, the permission-group writes and the
+/// suggest pair, each answered the way the seeded fixture allows. They ride
+/// the same gate as the maintenance routes: a write scope, then a write.
+fn role_routes() -> Vec<Route> {
+    vec![
+        Route {
+            verb: "POST",
+            path: group_of("plain", "moderator"),
+            body: None,
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "DELETE",
+            path: group_of("plain", "moderator"),
+            body: None,
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "POST",
+            path: group_bulk("admin"),
+            body: Some(json!({"nicknames": []})),
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "DELETE",
+            path: group_bulk("admin"),
+            body: Some(json!({"nicknames": []})),
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "PATCH",
+            path: SUGGEST.to_owned(),
+            body: Some(json!({"nicknames": []})),
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "PATCH",
+            path: UNSUGGEST.to_owned(),
+            body: Some(json!({"nicknames": []})),
+            status: StatusCode::OK,
+        },
+    ]
+}
+
+/// Everything in `maintenance_routes` plus this ticket's write routes.
+fn write_routes() -> Vec<Route> {
+    let mut routes = maintenance_routes();
+    routes.extend(role_routes());
+    routes
+}
+
 /// The credentials pair joins the set for the ROLE gate: both endpoints
-/// answer 401/403 by role and scope before anything else.
+/// answer 401/403 by role and scope before anything else. So do the two
+/// permission-group reads, which are this ticket's only GETs.
 fn credentials_routes() -> Vec<Route> {
     vec![
         Route {
@@ -1951,6 +2042,18 @@ fn credentials_routes() -> Vec<Route> {
             verb: "PATCH",
             path: credentials("plain"),
             body: Some(json!({})),
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "GET",
+            path: group("plain"),
+            body: None,
+            status: StatusCode::OK,
+        },
+        Route {
+            verb: "GET",
+            path: group_of("plain", "moderator"),
+            body: None,
             status: StatusCode::OK,
         },
     ]
@@ -1974,6 +2077,7 @@ fn request(route: &Route, token: Option<&str>) -> TestRequest {
         "GET" => TestRequest::get(&route.path),
         "PUT" => TestRequest::put(&route.path),
         "POST" => TestRequest::post(&route.path),
+        "DELETE" => TestRequest::delete(&route.path),
         _ => TestRequest::patch(&route.path),
     };
     let with_body = match route.body.as_ref() {
@@ -2005,7 +2109,7 @@ async fn only_admins_reach_the_maintenance_routes() {
     let regular = mint(&seeded.pool, &outsider, "admin:write").await;
     let app_only = common::create_app_only_token(&seeded.pool, "admin:write:accounts").await;
 
-    for route in maintenance_routes().into_iter().chain(credentials_routes()) {
+    for route in write_routes().into_iter().chain(credentials_routes()) {
         let anonymous = request(&route, None).send(&seeded.app).await;
         common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "no token");
         common::assert_error(&anonymous, NO_TOKEN, "no token");
@@ -2041,10 +2145,7 @@ async fn the_scope_class_sorts_the_maintenance_from_the_reads() {
     let seeded = seed(&db).await;
     for scopes in ["admin:write:accounts", "admin:write"] {
         let token = mint(&seeded.pool, &seeded.root, scopes).await;
-        for route in maintenance_routes()
-            .into_iter()
-            .chain([credentials_patch()])
-        {
+        for route in write_routes().into_iter().chain([credentials_patch()]) {
             let response = request(&route, Some(&token)).send(&seeded.app).await;
             common::assert_answer(
                 &response,
@@ -2066,7 +2167,7 @@ async fn the_scope_class_sorts_the_maintenance_from_the_reads() {
     );
     common::assert_error(&wrong_way, NO_ADMIN_READ, "in the read class's words");
 
-    for route in maintenance_routes() {
+    for route in write_routes() {
         let refused = request(&route, Some(&seeded.token)).send(&seeded.app).await;
         common::assert_answer(
             &refused,
@@ -2075,4 +2176,996 @@ async fn the_scope_class_sorts_the_maintenance_from_the_reads() {
         );
         common::assert_error(&refused, NO_ADMIN_WRITE, "in the write class's words");
     }
+}
+
+// ===== WBE-197: the profile tags, the permission groups, the pool =====
+
+/// The stored `tags` array of one account.
+async fn tags_of(pool: &PgPool, account: &User) -> Vec<String> {
+    sqlx::query_scalar::<_, Vec<String>>("SELECT tags FROM users WHERE id = $1")
+        .bind(account.id)
+        .fetch_one(pool)
+        .await
+        .expect("the tags read back")
+}
+
+/// A `PUT` of `path` as `token`, with the JSON `body` when one is given.
+async fn put_json(
+    app: &Router,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> common::TestResponse {
+    let base = TestRequest::put(path);
+    let with_body = match body {
+        Some(value) => base.json(value),
+        None => base,
+    };
+    with_body.bearer(token).send(app).await
+}
+
+/// A `DELETE` of `path` as `token`, with the JSON `body` when one is given.
+async fn delete_json(
+    app: &Router,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> common::TestResponse {
+    let base = TestRequest::delete(path);
+    let with_body = match body {
+        Some(value) => base.json(value),
+        None => base,
+    };
+    with_body.bearer(token).send(app).await
+}
+
+/// A `POST` of `path` as `token`, with the JSON `body` when one is given.
+async fn post_json(
+    app: &Router,
+    token: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> common::TestResponse {
+    let base = TestRequest::post(path);
+    let with_body = match body {
+        Some(value) => base.json(value),
+        None => base,
+    };
+    with_body.bearer(token).send(app).await
+}
+
+/// The nicknames one answer's `users` array carries, in order.
+fn answered_users(body: &Value) -> Vec<&str> {
+    body["users"]
+        .as_array()
+        .expect("the users array")
+        .iter()
+        .filter_map(|found| found["nickname"].as_str())
+        .collect()
+}
+
+/// The ids one `/api/v1/suggestions` answer carries, in order.
+fn suggested_ids(body: &Value) -> Vec<String> {
+    body.as_array()
+        .expect("the suggestion array")
+        .iter()
+        .filter_map(|found| found["id"].as_str())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `PUT /users/tag` appends the submitted tags to every named account —
+/// lowercased and deduped Pleroma-style, stored tags and their order kept —
+/// and the write is logged whether or not it changed anything.
+#[tokio::test]
+async fn the_tag_write_adds_the_submitted_tags() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+    let beeper = account_named(&seeded.pool, "beeper").await;
+    let body = json!({"nicknames": ["plain", "beeper"], "tags": ["staff", "VIP", "staff"]});
+
+    let added = put_json(&seeded.app, &token, TAG, Some(&body)).await;
+    assert_no_content(&added, "the tag write");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["staff", "vip"],
+        "the submission is lowercased, its duplicate dropped, the order kept"
+    );
+    assert_eq!(
+        tags_of(&seeded.pool, &beeper).await,
+        vec!["bots", "staff", "vip"],
+        "the stored tag leads and the new ones follow"
+    );
+
+    let again = put_json(&seeded.app, &token, TAG, Some(&body)).await;
+    assert_no_content(&again, "the repeated tag write");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["staff", "vip"],
+        "tagging the held tags again changes nothing"
+    );
+
+    let shown = read(&seeded.app, &seeded.token, &show("plain")).await;
+    assert_eq!(
+        shown["tags"],
+        json!(["staff", "vip"]),
+        "and the admin entity reads the new list back"
+    );
+
+    let entries = logged(&seeded.pool, "tag").await;
+    assert_eq!(
+        entries.len(),
+        2,
+        "one entry per tag write, even the one that changed nothing"
+    );
+    assert_eq!(
+        entries[0].0, "@root added tags: staff, VIP, staff to users: @plain, @beeper",
+        "the sentence names the accounts found and the tags as they were spelled"
+    );
+    assert_eq!(
+        entries[0].1["tags"],
+        json!(["staff", "VIP", "staff"]),
+        "the data map carries the raw submission, Pleroma-style"
+    );
+}
+
+/// `DELETE /users/tag` takes exactly the named tags back out of the named
+/// accounts, leaves every other tag and account alone, is idempotent, and
+/// lands its own sentence.
+#[tokio::test]
+async fn the_untag_write_takes_only_the_named_tags() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+    let beeper = account_named(&seeded.pool, "beeper").await;
+    let setup = put_json(
+        &seeded.app,
+        &token,
+        TAG,
+        Some(&json!({"nicknames": ["plain", "beeper"], "tags": ["staff", "vip"]})),
+    )
+    .await;
+    assert_no_content(&setup, "the write this test undoes");
+
+    let held = json!({"nicknames": ["plain"], "tags": ["staff"]});
+    let removed = delete_json(&seeded.app, &token, TAG, Some(&held)).await;
+    assert_no_content(&removed, "the untag write");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["vip"],
+        "only the named tag went"
+    );
+    assert_eq!(
+        tags_of(&seeded.pool, &beeper).await,
+        vec!["bots", "staff", "vip"],
+        "and the account nobody named kept every tag"
+    );
+
+    let again = delete_json(&seeded.app, &token, TAG, Some(&held)).await;
+    assert_no_content(&again, "the repeated untag");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["vip"],
+        "removing an absent tag is no error and no change"
+    );
+
+    let entries = logged(&seeded.pool, "untag").await;
+    assert_eq!(
+        entries[0].0, "@root removed tags: staff from users: @plain",
+        "and the pair's own sentence"
+    );
+}
+
+/// Both tag routes read their parameters from the query string and from a
+/// form body as well as from JSON, an MRF tag is an ordinary accepted tag,
+/// and a request that states only one of the two lists is the 422.
+#[tokio::test]
+async fn the_tag_routes_read_their_parameters_from_every_spelling() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+
+    let via_query = put_json(
+        &seeded.app,
+        &token,
+        &format!("{TAG}?nicknames[]=plain&tags[]=mrf_tag%3Asandbox&tags[]=ops"),
+        None,
+    )
+    .await;
+    assert_no_content(&via_query, "the query-string tag write");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["mrf_tag:sandbox", "ops"],
+        "a known MRF tag lands as the switch spells it, and the list came from the query"
+    );
+
+    let missing_tags = delete_json(
+        &seeded.app,
+        &token,
+        TAG,
+        Some(&json!({"nicknames": ["plain"]})),
+    )
+    .await;
+    common::assert_answer(&missing_tags, StatusCode::UNPROCESSABLE_ENTITY, "no `tags`");
+    let via_form = TestRequest::put(TAG)
+        .bearer(&token)
+        .form(&[("nicknames[]", "plain"), ("tags[]", "OPS")])
+        .send(&seeded.app)
+        .await;
+    assert_no_content(&via_form, "the form-body tag write");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["mrf_tag:sandbox", "ops"],
+        "the bracketed form key nests, and the fold leaves `ops` as it already stood"
+    );
+
+    let half = put_json(&seeded.app, &token, TAG, Some(&json!({"tags": ["x"]}))).await;
+    common::assert_answer(
+        &half,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a tag write with no nicknames",
+    );
+    assert!(
+        half.text().contains("missing field `nicknames`"),
+        "and the 422 names the key it needs: {}",
+        half.text()
+    );
+    let bare = put_json(&seeded.app, &token, TAG, Some(&json!({}))).await;
+    common::assert_answer(
+        &bare,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a tag write with neither list",
+    );
+    let bare_delete = delete_json(&seeded.app, &token, TAG, Some(&json!({"nicknames": []}))).await;
+    common::assert_answer(
+        &bare_delete,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an untag with no tags",
+    );
+    assert_eq!(
+        logged(&seeded.pool, "tag").await.len(),
+        2,
+        "the two accepted writes above logged, and the three refusals logged nothing"
+    );
+    assert!(
+        logged(&seeded.pool, "untag").await.is_empty(),
+        "and no refused request left an entry behind"
+    );
+}
+
+/// The tag routes skip the handles nobody answers to — inside the same 204
+/// — and a tag list naming nothing writes nothing while the entry still
+/// names every account that was found.
+#[tokio::test]
+async fn the_tag_routes_skip_what_they_cannot_resolve() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+
+    let ghosted = put_json(
+        &seeded.app,
+        &token,
+        TAG,
+        Some(&json!({"nicknames": ["ghost", "plain"], "tags": ["staff"]})),
+    )
+    .await;
+    assert_no_content(&ghosted, "a list with one unknown handle");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["staff"],
+        "the known one was written"
+    );
+
+    let empty = delete_json(
+        &seeded.app,
+        &token,
+        TAG,
+        Some(&json!({"nicknames": ["plain", "ghost"], "tags": []})),
+    )
+    .await;
+    assert_no_content(&empty, "a tag list with nothing in it");
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        vec!["staff"],
+        "and nothing was subtracted"
+    );
+    let entries = logged(&seeded.pool, "untag").await;
+    assert_eq!(entries.len(), 1, "the write logged all the same");
+    assert_eq!(
+        entries[0].0, "@root removed tags:  from users: @plain",
+        "Pleroma's clause spells the empty tag list as it reads it"
+    );
+    assert_eq!(
+        entries[0].1["nicknames"],
+        json!(["plain"]),
+        "the unknown handle is no subject"
+    );
+}
+
+/// Both permission-group reads answer the same two-key object for any
+/// account — an admin, a moderator, a plain member, a remote mirror, a row
+/// named by its id — and refuse a group off the two and a name nobody
+/// answers to with their 404s.
+#[tokio::test]
+async fn the_permission_group_reads_answer_both_flags() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let cases: &[(&str, Value)] = &[
+        ("root", json!({ "is_moderator": false, "is_admin": true })),
+        ("moddy", json!({ "is_moderator": true, "is_admin": false })),
+        ("plain", json!({ "is_moderator": false, "is_admin": false })),
+        (
+            "faraway@remote.example",
+            json!({ "is_moderator": false, "is_admin": false }),
+        ),
+    ];
+    for (nickname, expected) in cases {
+        let bare = read(&seeded.app, &seeded.token, &group(nickname)).await;
+        assert_eq!(&bare, expected, "the group-less read of {nickname}");
+        assert_eq!(
+            bare.as_object().expect("an object").len(),
+            2,
+            "exactly the two flags"
+        );
+        let named = read(&seeded.app, &seeded.token, &group_of(nickname, "moderator")).await;
+        assert_eq!(&named, expected, "and the named group answers the same");
+        let admin = read(&seeded.app, &seeded.token, &group_of(nickname, "admin")).await;
+        assert_eq!(&admin, expected, "for either group");
+    }
+
+    let by_id = read(
+        &seeded.app,
+        &seeded.token,
+        &group(&seeded.root.id.to_string()),
+    )
+    .await;
+    assert_eq!(
+        by_id["is_admin"],
+        json!(true),
+        "the segment resolves as an id like the show's"
+    );
+
+    for verb in ["GET", "POST", "DELETE"] {
+        let path = group_of("plain", "owner");
+        let bearer = if verb == "GET" {
+            seeded.token.clone()
+        } else {
+            write_token(&seeded).await
+        };
+        let bogus = match verb {
+            "GET" => {
+                TestRequest::get(&path)
+                    .bearer(&bearer)
+                    .send(&seeded.app)
+                    .await
+            }
+            "POST" => post_json(&seeded.app, &bearer, &path, None).await,
+            _ => delete_json(&seeded.app, &bearer, &path, None).await,
+        };
+        common::assert_answer(
+            &bogus,
+            StatusCode::NOT_FOUND,
+            &format!("a group off the two, over {verb}"),
+        );
+        common::assert_error(&bogus, NO_SUCH_GROUP, "Pleroma's wording");
+    }
+    let miss = TestRequest::get(&group("ghost"))
+        .bearer(&seeded.token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&miss, StatusCode::NOT_FOUND, "a name nobody answers to");
+    common::assert_error(&miss, NOT_FOUND, "the module's 404");
+
+    let write_only = write_token(&seeded).await;
+    let refused = TestRequest::get(&group("plain"))
+        .bearer(&write_only)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(
+        &refused,
+        StatusCode::FORBIDDEN,
+        "the write class must not read",
+    );
+    common::assert_error(&refused, NO_ADMIN_READ, "in the read class's words");
+}
+
+/// The single account's grant and revoke: the one-key answer of the group
+/// that moved, the flag in storage, the roles in the entity, the granted
+/// account reading the admin API it could not reach before, and one
+/// `grant` / `revoke` entry per write.
+#[tokio::test]
+async fn a_group_grant_lands_and_a_revoke_takes_it_back() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+
+    let before = TestRequest::get(USERS)
+        .bearer(&mint(&seeded.pool, &plain, "admin:read:accounts").await)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(
+        &before,
+        StatusCode::FORBIDDEN,
+        "the account is no admin yet",
+    );
+
+    let granted = post_json(&seeded.app, &token, &group_of("plain", "admin"), None).await;
+    common::assert_answer(&granted, StatusCode::OK, "the grant");
+    assert_eq!(
+        granted.json_value(),
+        json!({ "is_admin": true }),
+        "one key, the group that moved"
+    );
+    assert!(
+        flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &plain
+        )
+        .await,
+        "the column moved"
+    );
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_moderator FROM users WHERE id = $1",
+            &plain
+        )
+        .await,
+        "and the other group stayed"
+    );
+
+    let now_admin = TestRequest::get(USERS)
+        .bearer(&mint(&seeded.pool, &plain, "admin:read:accounts").await)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&now_admin, StatusCode::OK, "the grant took effect at once");
+
+    let shown = read(&seeded.app, &seeded.token, &show("plain")).await;
+    assert_eq!(
+        shown["roles"],
+        json!({ "admin": true, "moderator": false }),
+        "and the admin entity says so"
+    );
+
+    let revoked = delete_json(&seeded.app, &token, &group_of("plain", "admin"), None).await;
+    common::assert_answer(&revoked, StatusCode::OK, "the revoke");
+    assert_eq!(
+        revoked.json_value(),
+        json!({ "is_admin": false }),
+        "the same one key, cleared"
+    );
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &plain
+        )
+        .await,
+        "and the column went back"
+    );
+
+    let (grant, _) = one_entry(&seeded.pool, "grant").await;
+    assert_eq!(
+        grant, "@root made @plain admin",
+        "one entry per write, Pleroma's sentence with the group it named"
+    );
+    let (revoke, _) = one_entry(&seeded.pool, "revoke").await;
+    assert_eq!(
+        revoke, "@root revoked admin role from @plain",
+        "and the revoke's own wording"
+    );
+}
+
+/// The other group of the pair writes under its own key, touches nothing
+/// else on the row, and names its permission in the logged data map; a
+/// handle nobody answers to is the same 404 the rest of the module gives.
+#[tokio::test]
+async fn the_moderator_group_writes_under_its_own_key() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+
+    let modded = post_json(&seeded.app, &token, &group_of("plain", "moderator"), None).await;
+    assert_eq!(
+        modded.json_value(),
+        json!({ "is_moderator": true }),
+        "the other group answers under its own key"
+    );
+
+    let revoked = delete_json(&seeded.app, &token, &group_of("plain", "moderator"), None).await;
+    assert_eq!(
+        revoked.json_value(),
+        json!({ "is_moderator": false }),
+        "the same one key, cleared"
+    );
+    assert_eq!(
+        tags_of(&seeded.pool, &plain).await,
+        Vec::<String>::new(),
+        "a role write touches no other column"
+    );
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &plain
+        )
+        .await,
+        "and the group it was not asked for stays where it stood"
+    );
+
+    let grants = logged(&seeded.pool, "grant").await;
+    assert_eq!(
+        grants
+            .iter()
+            .map(|(message, _)| message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["@root made @plain moderator"],
+        "the entry names the group that moved"
+    );
+    assert_eq!(
+        grants[0].1["permission"],
+        json!("moderator"),
+        "the data map carries the permission"
+    );
+    assert_eq!(
+        grants[0].1["subject"]
+            .as_array()
+            .expect("the subject list")
+            .iter()
+            .filter_map(|found| found["nickname"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["plain"],
+        "and the subject map names the account"
+    );
+
+    for path in [group_of("ghost", "admin"), group_of("ghost", "moderator")] {
+        let miss = if path.ends_with("admin") {
+            post_json(&seeded.app, &token, &path, None).await
+        } else {
+            delete_json(&seeded.app, &token, &path, None).await
+        };
+        common::assert_answer(&miss, StatusCode::NOT_FOUND, "a name nobody answers to");
+        common::assert_error(&miss, NOT_FOUND, "the module's 404");
+    }
+}
+
+/// A role is this instance's own to give: a remote mirror is the 400 both
+/// the grant and the revoke answer, on its handle and on its id, and
+/// nothing is written or logged.
+#[tokio::test]
+async fn no_group_is_set_for_a_remote_account() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+
+    for path in [
+        group_of("faraway@remote.example", "admin"),
+        group_of(&seeded.mirror.id.to_string(), "moderator"),
+    ] {
+        let granted = post_json(&seeded.app, &token, &path, None).await;
+        common::assert_answer(&granted, StatusCode::BAD_REQUEST, "a mirror grant");
+        common::assert_error(&granted, REMOTE_ROLE, "the pinned wording");
+        let revoked = delete_json(&seeded.app, &token, &path, None).await;
+        common::assert_answer(&revoked, StatusCode::BAD_REQUEST, "a mirror revoke");
+        common::assert_error(&revoked, REMOTE_ROLE, "the same words");
+    }
+    assert!(
+        logged(&seeded.pool, "grant").await.is_empty()
+            && logged(&seeded.pool, "revoke").await.is_empty(),
+        "and no refusal logged anything"
+    );
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &seeded.mirror
+        )
+        .await,
+        "the mirror holds nothing"
+    );
+
+    let bulk = post_json(
+        &seeded.app,
+        &token,
+        &group_bulk("admin"),
+        Some(&json!({"nicknames": ["faraway@remote.example", "plain"]})),
+    )
+    .await;
+    common::assert_answer(
+        &bulk,
+        StatusCode::OK,
+        "a bulk grant with a mirror on the list",
+    );
+    assert_eq!(
+        bulk.json_value(),
+        json!({ "is_admin": true }),
+        "the list write answers the group either way"
+    );
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &seeded.mirror
+        )
+        .await,
+        "the mirror was skipped, not written"
+    );
+    let plain = plain(&seeded.pool).await;
+    assert!(
+        flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &plain
+        )
+        .await,
+        "and the local account was written"
+    );
+    let (grant, subjects) = one_entry(&seeded.pool, "grant").await;
+    assert_eq!(
+        grant, "@root made @plain admin",
+        "the entry names only who moved"
+    );
+    assert_eq!(subjects, vec!["plain"], "and its subject map says so");
+}
+
+/// The self-protection: neither group can be revoked from the acting admin,
+/// and the bulk revoke leaves the caller's row alone instead of refusing
+/// the whole list — which is the divergence from Pleroma the ticket pins.
+#[tokio::test]
+async fn an_admin_cannot_revoke_their_own_group() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+
+    for name in ["admin", "moderator"] {
+        let refused = delete_json(&seeded.app, &token, &group_of("root", name), None).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            &format!("the self-revoke of {name}"),
+        );
+        common::assert_error(&refused, SELF_REVOKE, "Pleroma's wording");
+    }
+    let plain = plain(&seeded.pool).await;
+    let _granted = post_json(&seeded.app, &token, &group_of("plain", "admin"), None).await;
+    let mixed = delete_json(
+        &seeded.app,
+        &token,
+        &group_bulk("admin"),
+        Some(&json!({"nicknames": ["root", "plain"]})),
+    )
+    .await;
+    common::assert_answer(
+        &mixed,
+        StatusCode::OK,
+        "the bulk revoke that names the caller",
+    );
+    assert_eq!(
+        mixed.json_value(),
+        json!({ "is_admin": false }),
+        "Pleroma's update map, as the ticket pins it"
+    );
+    assert!(
+        flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &seeded.root
+        )
+        .await,
+        "the caller's own grant stands"
+    );
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &plain
+        )
+        .await,
+        "and everybody else named lost it"
+    );
+    let (revoke, subjects) = one_entry(&seeded.pool, "revoke").await;
+    assert_eq!(
+        revoke, "@root revoked admin role from @plain",
+        "one entry, naming only the account that moved"
+    );
+    assert_eq!(subjects, vec!["plain"], "the caller is no subject");
+    assert_eq!(
+        logged(&seeded.pool, "revoke").await.len(),
+        1,
+        "and the two refused self-revokes logged nothing"
+    );
+}
+
+/// The nickname-list grant: everyone named and local joins the group, the
+/// unknown handles are skipped inside the same success, and one entry names
+/// the whole moved list in the submitted order.
+#[tokio::test]
+async fn the_bulk_group_grant_writes_to_everyone_named() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+    let moddy = account_named(&seeded.pool, "moddy").await;
+    let names = json!({"nicknames": ["plain", "moddy", "ghost"]});
+
+    let granted = post_json(&seeded.app, &token, &group_bulk("moderator"), Some(&names)).await;
+    common::assert_answer(&granted, StatusCode::OK, "the bulk grant");
+    assert_eq!(
+        granted.json_value(),
+        json!({ "is_moderator": true }),
+        "the group's key, the state it was written to"
+    );
+    for account in [&plain, &moddy] {
+        assert!(
+            flag_of(
+                &seeded.pool,
+                "SELECT is_moderator FROM users WHERE id = $1",
+                account
+            )
+            .await,
+            "{} joined the group",
+            account.nickname
+        );
+    }
+    let (grant, subjects) = one_entry(&seeded.pool, "grant").await;
+    assert_eq!(
+        grant, "@root made @plain, @moddy moderator",
+        "one entry for the whole list, in the submitted order"
+    );
+    assert_eq!(
+        subjects,
+        vec!["plain", "moddy"],
+        "the unknown name is not a subject"
+    );
+}
+
+/// The revoke half of the pair takes the group back the same way — the list
+/// may come over the query string too — and a route that states no list or a
+/// group off the two writes nothing at all.
+#[tokio::test]
+async fn the_bulk_group_revoke_takes_the_group_back() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let plain = plain(&seeded.pool).await;
+    let moddy = account_named(&seeded.pool, "moddy").await;
+    let names = json!({"nicknames": ["plain", "moddy"]});
+    let setup = post_json(&seeded.app, &token, &group_bulk("moderator"), Some(&names)).await;
+    common::assert_answer(&setup, StatusCode::OK, "the grant this test undoes");
+
+    let revoked = delete_json(
+        &seeded.app,
+        &token,
+        &format!(
+            "{}?nicknames[]=plain&nicknames[]=moddy",
+            group_bulk("moderator")
+        ),
+        None,
+    )
+    .await;
+    common::assert_answer(
+        &revoked,
+        StatusCode::OK,
+        "the bulk revoke over the query string",
+    );
+    assert_eq!(
+        revoked.json_value(),
+        json!({ "is_moderator": false }),
+        "the same answer, cleared"
+    );
+    for account in [&plain, &moddy] {
+        assert!(
+            !flag_of(
+                &seeded.pool,
+                "SELECT is_moderator FROM users WHERE id = $1",
+                account
+            )
+            .await,
+            "{} left the group",
+            account.nickname
+        );
+    }
+    let (revoke, _) = one_entry(&seeded.pool, "revoke").await;
+    assert_eq!(
+        revoke, "@root revoked moderator role from @plain, @moddy",
+        "and the revoke names both"
+    );
+
+    let bare = post_json(&seeded.app, &token, &group_bulk("admin"), None).await;
+    common::assert_answer(
+        &bare,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "no nicknames at all",
+    );
+    let bogus = post_json(
+        &seeded.app,
+        &token,
+        &group_bulk("owner"),
+        Some(&json!({"nicknames": []})),
+    )
+    .await;
+    common::assert_answer(&bogus, StatusCode::NOT_FOUND, "a group off the two");
+    common::assert_error(&bogus, NO_SUCH_GROUP, "Pleroma's wording");
+    assert!(
+        !flag_of(
+            &seeded.pool,
+            "SELECT is_admin FROM users WHERE id = $1",
+            &seeded.actor
+        )
+        .await,
+        "and the refused writes granted nobody — the instance actor included"
+    );
+}
+
+/// `PATCH /users/suggest` sets the flag on every account it resolved and
+/// answers the moved rows as admin entities under the one `users` key — the
+/// order the request named, the miss gone — and lands Pleroma's
+/// `add_suggestion` sentence.
+#[tokio::test]
+async fn suggesting_users_answers_the_moved_accounts() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let body = json!({"nicknames": ["plain", "suspended", "ghost", "beeper"]});
+
+    let suggested = patch_json(&seeded.app, &token, SUGGEST, &body).await;
+    common::assert_answer(&suggested, StatusCode::OK, "the suggest write");
+    let answered = suggested.json_value();
+    assert_eq!(
+        answered
+            .as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["users"],
+        "the one key Pleroma's index.json clause renders"
+    );
+    assert_eq!(
+        answered_users(&answered),
+        vec!["plain", "suspended", "beeper"],
+        "the accounts that were found, in the order the request named them, the miss gone"
+    );
+    for entry in answered["users"].as_array().expect("the users array") {
+        assert_eq!(
+            entry["is_suggested"],
+            json!(true),
+            "each answer carries the flag the write set: {entry}"
+        );
+        assert!(
+            entry["roles"].is_object() && entry["created_at"].is_string(),
+            "and the answer is the admin entity, not a bare account: {entry}"
+        );
+    }
+
+    let (added, added_subjects) = one_entry(&seeded.pool, "add_suggestion").await;
+    assert_eq!(
+        added, "@root added suggested users: @plain, @suspended, @beeper",
+        "Pleroma's add_suggestion sentence"
+    );
+    assert_eq!(
+        added_subjects,
+        vec!["plain", "suspended", "beeper"],
+        "and its subject list"
+    );
+}
+
+/// The listings follow the flag both ways: `PATCH /users/suggest` puts the
+/// live local picks into `/api/v1/suggestions` and leaves the deactivated
+/// one out of it though its row is set, and `PATCH /users/unsuggest` empties
+/// the pool again while answering the rows as they now stand.
+#[tokio::test]
+async fn the_suggestion_pool_follows_the_flag_both_ways() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let viewer = common::create_local_user(&seeded.pool, "watcher").await;
+    let watching = mint(&seeded.pool, &viewer, "read").await;
+    let names = json!({"nicknames": ["plain", "suspended", "beeper"]});
+    let suggested = patch_json(&seeded.app, &token, SUGGEST, &names).await;
+    common::assert_answer(&suggested, StatusCode::OK, "the suggest write");
+
+    let pool = suggested_ids(&read(&seeded.app, &watching, "/api/v1/suggestions").await);
+    let plain = plain(&seeded.pool).await;
+    let beeper = account_named(&seeded.pool, "beeper").await;
+    let suspended = account_named(&seeded.pool, "suspended").await;
+    assert!(
+        pool.contains(&plain.id.to_string()) && pool.contains(&beeper.id.to_string()),
+        "both live local picks are in the listing the pool answers: {pool:?}"
+    );
+    assert!(
+        !pool.contains(&suspended.id.to_string()),
+        "the flagged-but-deactivated account is not, even though its flag is set"
+    );
+    assert!(
+        flag_of(
+            &seeded.pool,
+            "SELECT is_suggested FROM users WHERE id = $1",
+            &suspended
+        )
+        .await,
+        "and the write did reach its row"
+    );
+
+    let unsuggested = patch_json(
+        &seeded.app,
+        &token,
+        UNSUGGEST,
+        &json!({"nicknames": ["plain", "beeper"]}),
+    )
+    .await;
+    common::assert_answer(&unsuggested, StatusCode::OK, "the unsuggest write");
+    assert_eq!(
+        answered_users(&unsuggested.json_value()),
+        vec!["plain", "beeper"],
+        "the same pair of accounts, now leaving"
+    );
+    assert_eq!(
+        unsuggested.json_value()["users"][0]["is_suggested"],
+        json!(false),
+        "answered as the row stands after the write"
+    );
+    let emptied = suggested_ids(&read(&seeded.app, &watching, "/api/v1/suggestions").await);
+    assert_eq!(
+        emptied,
+        Vec::<String>::new(),
+        "the pool the viewer sees is empty again"
+    );
+
+    let (removed, _) = one_entry(&seeded.pool, "remove_suggestion").await;
+    assert_eq!(
+        removed, "@root removed suggested users: @plain, @beeper",
+        "and the pair's other sentence"
+    );
+}
+
+/// The suggest pair writes nothing it was not asked to: a body that states no
+/// list is the 422, the read scope is the write class's 403, and neither
+/// leaves an entry behind.
+#[tokio::test]
+async fn a_suggest_write_refuses_what_it_cannot_write() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let body = json!({"nicknames": ["plain"]});
+
+    let bare = patch_json(&seeded.app, &token, SUGGEST, &json!({})).await;
+    common::assert_answer(
+        &bare,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a body with no list",
+    );
+    assert!(
+        bare.text().contains("nicknames"),
+        "and the 422 names the key it needs: {}",
+        bare.text()
+    );
+
+    let refused = patch_json(&seeded.app, &seeded.token, UNSUGGEST, &body).await;
+    common::assert_answer(
+        &refused,
+        StatusCode::FORBIDDEN,
+        "the read scope must not write",
+    );
+    common::assert_error(&refused, NO_ADMIN_WRITE, "in the write class's words");
+    assert!(
+        logged(&seeded.pool, "add_suggestion").await.is_empty()
+            && logged(&seeded.pool, "remove_suggestion").await.is_empty(),
+        "and the refused writes left no entry behind"
+    );
+}
+
+/// The account the shared fixture seeded, re-read from behind the row.
+async fn account_named(pool: &PgPool, nickname: &str) -> User {
+    wired_be::models::user::get_by_nickname(pool, nickname)
+        .await
+        .expect("the account reads back")
+        .expect("the fixture seeded it")
 }
