@@ -44,7 +44,9 @@
 //! are, not here.
 //!
 //! The outgoing side — delivering a local user's own chat messages and
-//! `Delete`s — is a separate ticket; nothing here sends anything anywhere.
+//! their sender's `Delete`s — is the chat federation hooks' other half,
+//! [`crate::services::federation_out`]'s chat arms; nothing here sends
+//! anything anywhere.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
@@ -56,8 +58,7 @@ use uuid::Uuid;
 
 use crate::{
     api::chats::after_chat_message_created,
-    entities::chat::ChatMessage as ChatMessageEntity,
-    error::{AppError, AppResult},
+    error::AppError,
     federation::{
         dispatch::{ActivityView, FederationError, Handlers, Outcome},
         json,
@@ -420,13 +421,10 @@ const fn recipient_refusal(recipient: &User) -> Option<&'static str> {
     None
 }
 
-/// The accepted delivery: the write ([`store`]), then the created-message
-/// view and the chat API's documented hook.
-///
-/// The entity the hook gets is the recipient's own view of the message: the
-/// local side of an inbound pair is the recipient, and Pleroma's
-/// `handle_object_creation` streamables likewise render each side's view for
-/// that account's clients.
+/// The accepted delivery: the write ([`store`]), then the chat API's
+/// documented hook over the recipient's own reference — the local side of
+/// an inbound pair is the recipient, and the hook federates nothing for a
+/// local one (it is the outbound chat ticket's counterpart).
 async fn deliver(
     state: &AppState,
     incoming: &IncomingChat<'_>,
@@ -443,34 +441,17 @@ async fn deliver(
         }
     };
     let written = store(state, incoming, sender, &recipient).await?;
-    let attachment = read_attachment(state, &written.message)
-        .await
-        .map_err(|err| transient("the attachment read", &err))?;
     let view = written
         .recipient_reference
         .as_ref()
         .unwrap_or(&written.sender_reference);
-    let entity = ChatMessageEntity::from_reference(view, attachment.as_ref(), &state.config);
-    after_chat_message_created(state, &entity, sender, &recipient);
+    after_chat_message_created(state, view, sender, &recipient).await;
     debug!(
         message = %written.message.id,
         recipient = %recipient.id,
         "a delivered chat message became a chat"
     );
     Ok(Outcome::Handled)
-}
-
-/// The delivered message's attachment row, re-read after the commit for the
-/// entity render — the same read the chat endpoints make of a stored
-/// attachment, answered `None` when the message carries none.
-async fn read_attachment(
-    state: &AppState,
-    message: &chat::ChatMessage,
-) -> AppResult<Option<media_attachment::MediaAttachment>> {
-    match message.attachment_media_id {
-        Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await,
-        None => Ok(None),
-    }
 }
 
 /// What one folded delivery left behind: the shared message row and the two
@@ -515,10 +496,15 @@ async fn store(
         idempotency_key: None,
         inserted_at: Some(incoming.published),
     };
-    let (message, sender_reference, recipient_reference) =
-        chat::add_message(&mut tx, sender, recipient, &new_message)
-            .await
-            .map_err(|err| delivery_refusal(&err))?;
+    let (message, sender_reference, recipient_reference) = chat::add_message(
+        &mut tx,
+        &state.config.base_url,
+        sender,
+        recipient,
+        &new_message,
+    )
+    .await
+    .map_err(|err| delivery_refusal(&err))?;
     let _told = notification::create(&mut *tx, &chat_mention(sender, recipient, message.id))
         .await
         .map_err(|err| transient("the chat mention notification", &err))?;

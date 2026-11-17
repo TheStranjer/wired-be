@@ -2996,6 +2996,7 @@ mod tests {
             .expect("the message fixture takes a transaction");
         let _sent = chat::add_message(
             &mut tx,
+            &state.config.base_url,
             &sender,
             &reader,
             &chat::NewChatMessage::text("hello in here"),

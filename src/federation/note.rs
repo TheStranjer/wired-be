@@ -382,7 +382,7 @@ fn attachments_json(attachments: &[MediaAttachment]) -> Vec<Value> {
 }
 
 /// One media row as its attachment object.
-fn attachment_json(media: &MediaAttachment) -> Value {
+pub(crate) fn attachment_json(media: &MediaAttachment) -> Value {
     let class = if media.content_type.starts_with("image/") {
         TYPE_IMAGE
     } else {

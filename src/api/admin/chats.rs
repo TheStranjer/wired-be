@@ -39,7 +39,7 @@
 //!   rather than the owner-side route's self-service delete:
 //!   [`chat::withdraw`] tombstones the message for **both** participants
 //!   whoever wrote it (the user-side delete only hides the caller's own
-//!   copy), [`federation_out::after_chat_message_deleted`] announces the
+//!   copy), [`federation_out::after_chat_message_deleted_by_admin`] announces the
 //!   withdrawal to the network when the message was this instance's to
 //!   announce, and [`moderation_log::chat_message_delete`] records the
 //!   staff action. `message_id` is the reference id inside the named chat,
@@ -231,7 +231,7 @@ async fn delete_message(
     if !chat::withdraw(&state.db, reference.message_id).await? {
         return Err(AppError::NotFound);
     }
-    federation_out::after_chat_message_deleted(&state, &row, &reference).await;
+    federation_out::after_chat_message_deleted_by_admin(&state, &row, &reference).await;
     let logged = moderation_log::chat_message_delete(&state.db, &admin.0, reference.id).await?;
     debug!(
         log = %logged.id,

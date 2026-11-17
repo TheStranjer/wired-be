@@ -117,7 +117,7 @@ async fn send_as(
     Option<ChatMessageReference>,
 ) {
     let mut tx = pool.begin().await.expect("a transaction begins");
-    let sent = chat::add_message(&mut tx, sender, recipient, new_message)
+    let sent = chat::add_message(&mut tx, TEST_BASE_URL, sender, recipient, new_message)
         .await
         .expect("the fixture chat message is written");
     tx.commit().await.expect("the transaction commits");
