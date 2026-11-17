@@ -1,7 +1,7 @@
 //! Integration tests for the `/oauth` endpoints: the `POST /oauth/token`
-//! `password`, `client_credentials` and `refresh_token` grants, the
-//! `POST /oauth/revoke` token revocation, and the `GET`/`POST
-//! /oauth/authorize` authorization-code flow.
+//! `password`, `client_credentials`, `refresh_token` and
+//! `authorization_code` grants, the `POST /oauth/revoke` token revocation,
+//! and the `GET`/`POST /oauth/authorize` authorization-code flow.
 //!
 //! Success over JSON, form and HTTP Basic bodies; the 400 "Invalid
 //! credentials" shared by wrong secrets, wrong passwords and unknown
@@ -555,11 +555,7 @@ async fn an_unknown_grant_type_is_unsupported() {
     let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "luna", "read").await;
     let http = common::test_app(pool.clone());
-    for grant in [
-        "authorization_code",
-        "urn:ietf:params:oauth:grant-type:device_code",
-        "bogus",
-    ] {
+    for grant in ["urn:ietf:params:oauth:grant-type:device_code", "bogus"] {
         let mut body = grant_body(&app, "luna", "read");
         body["grant_type"] = json!(grant);
         let response = post_json(&http, &body).await;

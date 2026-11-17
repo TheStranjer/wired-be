@@ -165,6 +165,13 @@ mod custom_emojis;
 /// Domain blocks (`/api/v1/domain_blocks`).
 mod domain_blocks;
 
+/// The end-to-end account, auth and social-graph scenarios (WBE-222):
+/// onboarding from an app registration to a new password, the OAuth code
+/// flow, the MFA gate, the relationship walk over follows, blocks, mutes,
+/// a domain block, endorsements, notes, lists and paged listings, the
+/// registration modes, admin user management and the CSV imports.
+mod e2e_accounts;
+
 /// The end-to-end discovery and federation scenarios (WBE-223): the
 /// search trio over the visibility matrix, the v1 phrase filters applied
 /// to the timelines, the Atom/RSS feeds and the link card through the job
