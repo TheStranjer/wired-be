@@ -166,6 +166,7 @@ mod tests {
             state: ReportState::Open,
             assigned_to: None,
             action_taken_at: None,
+            action_taken_by: None,
             rule_ids: vec![id(RULE_ID)],
             ap_id: Some(format!("{TEST_BASE_URL}/activities/filing")),
             inserted_at: stamped(),

@@ -25,7 +25,8 @@
 //! [`updated_users`], [`confirm_email`], [`resend_confirmation_email`],
 //! [`disable_mfa`], [`add_suggestion`], [`remove_suggestion`],
 //! [`follow`], [`unfollow`],
-//! [`report_update`], [`report_note`], [`report_note_delete`], [`status_update`],
+//! [`report_update`], [`report_assigned`], [`report_unassigned`],
+//! [`report_note`], [`report_note_delete`], [`status_update`],
 //! [`status_delete`], [`chat_message_delete`], [`relay_follow`], [`relay_unfollow`],
 //! [`delete_instance`], [`reload_emoji`],
 //! [`invite_create`], [`invite_revoke`], [`config_change`],
@@ -792,6 +793,88 @@ pub async fn report_update(
     .await
 }
 
+/// Records a `report_assigned`: `@admin assigned report ##{report_id}`
+/// plus ` ( on user @target)` when the report names one, plus
+/// ` to user {assignee}`.
+///
+/// That is Pleroma's `report_assigned` clause of `get_log_entry_message`,
+/// whose controller writes it from
+/// `POST /api/v1/admin/reports/{id}/assign_to_self` with the acting
+/// moderator's own nickname as the assignee. The subject map is the one of
+/// [`report_update`] without a state, plus the `assigned_account` text
+/// Pleroma's `insert_log` carries beside it.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn report_assigned(
+    pool: &PgPool,
+    actor: &User,
+    report_id: Uuid,
+    assignee: &str,
+    subject_actor: Option<&User>,
+) -> AppResult<ModerationLog> {
+    let message = report_assigned_sentence(
+        &actor.nickname,
+        report_id,
+        assignee,
+        subject_actor.map(|target| target.nickname.as_str()),
+    );
+    let mut data = report_data(report_id, None, subject_actor);
+    put(
+        &mut data,
+        "assigned_account",
+        Value::String(assignee.to_owned()),
+    );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "report_assigned".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records a `report_unassigned`: `@admin unassigned report ##{report_id}`
+/// plus ` ( on user @target)` when the report names one, plus
+/// ` from a user`.
+///
+/// That is Pleroma's `report_unassigned` clause, written by
+/// `POST /api/v1/admin/reports/{id}/unassign`.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn report_unassigned(
+    pool: &PgPool,
+    actor: &User,
+    report_id: Uuid,
+    subject_actor: Option<&User>,
+) -> AppResult<ModerationLog> {
+    let message = report_unassigned_sentence(
+        &actor.nickname,
+        report_id,
+        subject_actor.map(|target| target.nickname.as_str()),
+    );
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "report_unassigned".to_owned(),
+            subjects: Vec::new(),
+            message,
+            data: report_data(report_id, None, subject_actor),
+        },
+    )
+    .await
+}
+
 /// Records a `report_note`: `@admin added note 'text' to report
 /// ##{report_id}` plus ` on user @target` when the report names one.
 ///
@@ -1433,6 +1516,37 @@ fn report_update_sentence(
     )
 }
 
+/// `"{actor} assigned report ##{report_id}"`, the ` ( on user @{subject})`
+/// Pleroma's `subject_actor_nickname/3` splices in when the report names
+/// its target, and the ` to user {assignee}` close — Pleroma's
+/// `report_assigned` clause, whose assignee is a bare nickname, not a
+/// mention.
+fn report_assigned_sentence(
+    actor: &str,
+    report_id: Uuid,
+    assignee: &str,
+    subject_nickname: Option<&str>,
+) -> String {
+    format!(
+        "@{actor} assigned report ##{report_id}{} to user {assignee}",
+        subject_nickname.map_or_else(String::new, |target| format!(" ( on user @{target})"))
+    )
+}
+
+/// `"{actor} unassigned report ##{report_id}"` with the same spliced
+/// ` ( on user @{subject})` and the ` from a user` close — Pleroma's
+/// `report_unassigned` clause.
+fn report_unassigned_sentence(
+    actor: &str,
+    report_id: Uuid,
+    subject_nickname: Option<&str>,
+) -> String {
+    format!(
+        "@{actor} unassigned report ##{report_id}{} from a user",
+        subject_nickname.map_or_else(String::new, |target| format!(" ( on user @{target})"))
+    )
+}
+
 /// `"{actor} added note '{text}' to report ##{report_id}"` with Pleroma's
 /// ` on user @{subject}` tail (`subject_actor_nickname/2`, no paren).
 fn report_note_sentence(
@@ -1742,6 +1856,26 @@ mod tests {
             report_update_sentence("admin", id, "resolved", Some("target")),
             format!("@admin updated report ##{id} ( on user @target) with 'resolved' state"),
             "the report_update clause with the parenthesised target"
+        );
+        assert_eq!(
+            report_assigned_sentence("admin", id, "moddy", None),
+            format!("@admin assigned report ##{id} to user moddy"),
+            "the report_assigned clause without a subject actor"
+        );
+        assert_eq!(
+            report_assigned_sentence("admin", id, "moddy", Some("target")),
+            format!("@admin assigned report ##{id} ( on user @target) to user moddy"),
+            "the report_assigned clause with the parenthesised target"
+        );
+        assert_eq!(
+            report_unassigned_sentence("admin", id, None),
+            format!("@admin unassigned report ##{id} from a user"),
+            "the report_unassigned clause without a subject actor"
+        );
+        assert_eq!(
+            report_unassigned_sentence("admin", id, Some("target")),
+            format!("@admin unassigned report ##{id} ( on user @target) from a user"),
+            "the report_unassigned clause with the parenthesised target"
         );
         assert_eq!(
             report_note_sentence("admin", id, "noted", None),
@@ -2074,7 +2208,8 @@ mod tests {
     }
 
     /// `report_update` and `report_note` store their sentences, subject
-    /// maps, and optional target user.
+    /// maps, and optional target user; `report_assigned` adds its
+    /// `assigned_account` key.
     #[tokio::test]
     async fn report_helpers_record_their_entries() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -2110,6 +2245,26 @@ mod tests {
             Some("target"),
             "and the target user map rides beside it"
         );
+        let assigned = report_assigned(&pool, &actor, report, "mod", Some(&target))
+            .await
+            .expect("report_assigned records");
+        assert_eq!(
+            assigned.message,
+            format!("@mod assigned report ##{report} ( on user @target) to user mod"),
+            "the report_assigned entry"
+        );
+        assert_eq!(
+            assigned
+                .data
+                .get("assigned_account")
+                .and_then(Value::as_str),
+            Some("mod"),
+            "the new owner rides in the data map, Pleroma's extra key"
+        );
+        assert_eq!(
+            assigned.action, "report_assigned",
+            "and the action column names the clause"
+        );
         let noted = report_note(&pool, &actor, report, "looked", None)
             .await
             .expect("report_note records");
@@ -2126,6 +2281,41 @@ mod tests {
             noted.data.get("text").and_then(Value::as_str),
             Some("looked"),
             "the note rides in the data map"
+        );
+    }
+
+    /// `report_unassigned` stores its sentence with the named target and
+    /// without one, and the action column carries the clause name.
+    #[tokio::test]
+    async fn report_unassigned_records_its_entry() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+        let target = stored(&pool, "target").await;
+        let report = new_id();
+        let unassigned = report_unassigned(&pool, &actor, report, Some(&target))
+            .await
+            .expect("report_unassigned records");
+        assert_eq!(
+            unassigned.action, "report_unassigned",
+            "the action names the clause"
+        );
+        assert_eq!(
+            unassigned.message,
+            format!("@mod unassigned report ##{report} ( on user @target) from a user"),
+            "the target rides in the sentence"
+        );
+        let bare = report_unassigned(&pool, &actor, report, None)
+            .await
+            .expect("the unnamed target records too");
+        assert_eq!(
+            bare.message,
+            format!("@mod unassigned report ##{report} from a user"),
+            "no target is the bare sentence"
+        );
+        assert!(
+            bare.data.get("subject_actor").is_none(),
+            "no target means no subject_actor key"
         );
     }
 

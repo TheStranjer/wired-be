@@ -1167,6 +1167,7 @@ mod tests {
             state: report::ReportState::Open,
             assigned_to: None,
             action_taken_at: None,
+            action_taken_by: None,
             rule_ids: vec![],
             ap_id: None,
             inserted_at: Utc::now(),

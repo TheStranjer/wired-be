@@ -207,6 +207,7 @@ mod tests {
             state: ReportState::Open,
             assigned_to,
             action_taken_at: None,
+            action_taken_by: None,
             rule_ids: Vec::new(),
             ap_id: None,
             inserted_at: stamped(),

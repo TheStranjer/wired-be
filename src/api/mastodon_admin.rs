@@ -626,7 +626,7 @@ async fn resolve_report(
     if filed.target_id != account.id {
         return Err(AppError::BadRequest(WRONG_TARGET.to_owned()));
     }
-    let resolved = report::set_state(&state.db, id, ReportState::Resolved)
+    let resolved = report::set_state(&state.db, id, ReportState::Resolved, Some(actor.id))
         .await?
         .ok_or(AppError::NotFound)?;
     let logged =
