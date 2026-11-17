@@ -1,0 +1,17 @@
+-- The acting moderator of a resolved report (WBE-214): the Mastodon admin
+-- API's report entity names the account that took action on a report under
+-- `action_taken_by_account`, and `POST /api/v1/admin/reports/{id}/resolve`
+-- states that `resolve` "sets `action_taken_at` and the acting admin". The
+-- date half of that promise is the existing `action_taken_at` column; this
+-- is its actor half. Reference: Mastodon's `reports.action_taken_by_user_id`
+-- (`app/models/report.rb`, written by `resolve!`), and Pleroma's admin-side
+-- `report_update` moderation-log entry, which names the acting staff account
+-- there in the log while this column names it on the row.
+--
+-- Like `assigned_to` above, deliberately no `ON DELETE` rule: an account
+-- that acted on a report cannot be deleted out from under the record of it.
+-- `src/models/report.rs`'s `set_state` is the only writer: it stamps the
+-- acting admin on a `resolved` move (keeping the first one, exactly like
+-- `action_taken_at`), clears both together on a reopening, and leaves both
+-- alone on a `closed` move, which takes no action.
+ALTER TABLE reports ADD COLUMN action_taken_by uuid REFERENCES users(id);

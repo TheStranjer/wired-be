@@ -78,6 +78,7 @@ pub mod instance;
 pub mod lists;
 pub mod markers;
 pub mod mastodon_admin;
+pub mod mastodon_admin_reports;
 pub mod media;
 pub mod media_files;
 pub mod mfa;

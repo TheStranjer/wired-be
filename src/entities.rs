@@ -14,7 +14,12 @@
 //! `GET /api/v{1,2}/admin/accounts` —
 //! [`admin_report`] the admin API's report entity — the
 //! moderation console's view of a filed report behind
-//! `GET /api/v1/pleroma/admin/reports` —
+//! `GET /api/v1/pleroma/admin/reports` — [`mastodon_admin_report`] the
+//! Mastodon admin API's report entity, the action-taking console's view
+//! of a filed report behind `GET /api/v1/admin/reports` —
+//! [`mastodon_admin_report`] the Mastodon admin API's report entity, the
+//! action-taking console's view of a filed report behind
+//! `GET /api/v1/admin/reports` —
 //! [`announcement`] the Mastodon `Announcement` entity,
 //! [`application`] the Mastodon `Application` entity,
 //! [`media_attachment`] the Mastodon `Attachment` entity,
@@ -67,6 +72,7 @@ pub mod filter;
 pub mod list;
 pub mod marker;
 pub mod mastodon_admin;
+pub mod mastodon_admin_report;
 pub mod media_attachment;
 pub mod mention;
 pub mod notification;

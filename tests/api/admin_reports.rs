@@ -283,7 +283,7 @@ async fn the_list_filters_by_state() {
         (&closed, ReportState::Closed),
         (&resolved, ReportState::Resolved),
     ] {
-        let _moved = report::set_state(&pool, row.id, state)
+        let _moved = report::set_state(&pool, row.id, state, None)
             .await
             .expect("the fixture moves")
             .expect("the report exists");
@@ -850,7 +850,7 @@ async fn the_legacy_v0_pair_serves_the_same_entities_behind_the_same_gate() {
     let bob = common::create_local_user(&pool, "ar_v0_bob").await;
     let kept = file(&pool, &alice, &bob, &filing("kept")).await;
     let dropped = file(&pool, &alice, &bob, &filing("dropped")).await;
-    let _closed = report::set_state(&pool, dropped.id, ReportState::Closed)
+    let _closed = report::set_state(&pool, dropped.id, ReportState::Closed, None)
         .await
         .expect("the fixture closes")
         .expect("the report exists");

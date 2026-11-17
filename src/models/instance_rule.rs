@@ -18,6 +18,11 @@ use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::new_id};
 
+/// [`get_many`]: every rule whose id the array names; an id that names no
+/// rule — one deleted after a report cited it — is simply absent from the
+/// answer.
+const GET_MANY_SQL: &str = "SELECT * FROM instance_rules WHERE id = ANY($1) ORDER BY id";
+
 /// [`create`]: the id this module mints (decision 4) plus the three columns
 /// the caller decides on, with `inserted_at` and `updated_at` left to the
 /// column defaults. `RETURNING *` brings the row back with those stamps.
@@ -66,6 +71,29 @@ pub struct InstanceRule {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn list(pool: &PgPool) -> AppResult<Vec<InstanceRule>> {
     let rules = sqlx::query_as::<_, InstanceRule>(LIST_SQL)
+        .fetch_all(pool)
+        .await?;
+    Ok(rules)
+}
+
+/// Fetches every rule whose id is in `ids`, in `id` order (creation order,
+/// decision 4).
+///
+/// This is the batched read behind a report entity's `rules` array, which
+/// reorders the answer into the reporter's own citation order. Ids that
+/// name no rule — one deleted after it was cited — are absent from the
+/// answer, and an empty `ids` reads nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<InstanceRule>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rules = sqlx::query_as::<_, InstanceRule>(GET_MANY_SQL)
+        .bind(ids)
         .fetch_all(pool)
         .await?;
     Ok(rules)
@@ -250,6 +278,49 @@ mod tests {
             .await
             .expect("the miss still runs");
         assert_eq!(miss, None, "an unknown id updates nothing");
+    }
+
+    /// [`get_many`] answers the named rules in id order, skips the ids that
+    /// name no rule, and reads nothing for an empty list.
+    #[tokio::test]
+    async fn get_many_reads_the_named_rules_and_skips_the_gaps() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let first = create(&pool, "first", "", 1)
+            .await
+            .expect("the first rule inserts");
+        let second = create(&pool, "second", "", 2)
+            .await
+            .expect("the second rule inserts");
+
+        let found = get_many(&pool, &[second.id, first.id])
+            .await
+            .expect("the batched read runs");
+        assert_eq!(
+            ids(&found),
+            vec![first.id, second.id],
+            "id order, not request order"
+        );
+        assert_eq!(found[1].text, "second", "the rows come back whole");
+
+        let gap = get_many(&pool, &[first.id, Uuid::now_v7()])
+            .await
+            .expect("an unknown id is no failure");
+        assert_eq!(ids(&gap), vec![first.id], "the unknown id is simply absent");
+
+        let _gone = delete(&pool, second.id).await.expect("the rule deletes");
+        let after = get_many(&pool, &[first.id, second.id])
+            .await
+            .expect("the deleted id is no failure either");
+        assert_eq!(ids(&after), vec![first.id], "a deleted rule reads as a gap");
+
+        assert!(
+            get_many(&pool, &[])
+                .await
+                .expect("the empty list runs")
+                .is_empty(),
+            "no ids read nothing"
+        );
     }
 
     /// [`delete`] removes exactly the named rule and reports the second

@@ -336,7 +336,7 @@ async fn move_all(
 ) -> AppResult<Vec<Value>> {
     let mut failures: Vec<Value> = Vec::with_capacity(changes.len());
     for change in changes {
-        match move_one(&state.db, change).await? {
+        match move_one(&state.db, Some(actor.id), change).await? {
             Moved::Row(row) => follow_up(state, actor, &row).await?,
             Moved::Refused(reason) => failures.push(refusal(change, reason)),
         }
@@ -344,21 +344,28 @@ async fn move_all(
     Ok(failures)
 }
 
-/// One report's move: the state check, the id check and the write.
+/// One report's move: the state check, the id check and the write. A move
+/// to `resolved` names `acted_by` as the moderator who took the action
+/// ([`report::set_state`] keeps the first name it was given); the other
+/// two states decide the action columns on their own.
 ///
 /// # Errors
 ///
 /// [`AppError::Database`] when the write itself failed; a state off the
 /// three or an id that names no report is [`Moved::Refused`], not an
 /// error — the other elements of the request are still applied.
-async fn move_one(pool: &PgPool, change: &ReportChange) -> AppResult<Moved> {
+async fn move_one(
+    pool: &PgPool,
+    acted_by: Option<Uuid>,
+    change: &ReportChange,
+) -> AppResult<Moved> {
     let Ok(state_name) = change.state.parse::<ReportState>() else {
         return Ok(Moved::Refused(UNSUPPORTED_STATE));
     };
     let Some(id) = parse_id(&change.id) else {
         return Ok(Moved::Refused(NOT_FOUND));
     };
-    let row = report::set_state(pool, id, state_name).await?;
+    let row = report::set_state(pool, id, state_name, acted_by).await?;
     Ok(row.map_or(Moved::Refused(NOT_FOUND), Moved::Row))
 }
 
@@ -832,7 +839,7 @@ mod tests {
                 id: sent.to_owned(),
                 state: wanted.to_owned(),
             };
-            let outcome = move_one(&pool, &change).await.expect("no write runs");
+            let outcome = move_one(&pool, None, &change).await.expect("no write runs");
             match outcome {
                 Moved::Refused(got) => assert_eq!(got, reason, "the refusal for {sent}"),
                 Moved::Row(row) => panic!("nothing was written for {sent}, got {}", row.id),

@@ -292,6 +292,15 @@ mod markers;
 /// two misses, and the staff-and-`admin:read:accounts` gate.
 mod mastodon_admin;
 
+/// The Mastodon admin reports surface over HTTP (`/api/v1/admin/reports` and
+/// its four moderation writes, WBE-214): the filtered, cursor-paged open
+/// queue under its report-id-keyed `Link` header, the fourteen-key entity
+/// with its four admin accounts, rendered statuses and cited rules, the
+/// action-stamping resolve and its clearing reopen, the assign-to-self and
+/// unassign pair with their moderation-log entries, the one 404, and the
+/// staff-and-scope gate on every route.
+mod mastodon_admin_reports;
+
 /// The media route (`src/api/media_files.rs`) and the local uploader.
 mod media;
 
