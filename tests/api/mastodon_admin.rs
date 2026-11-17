@@ -21,11 +21,14 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
-    config::TEST_BASE_URL,
-    models::user::{Flag, NewUser, User},
+    config::{Config, TEST_BASE_URL},
+    models::{
+        report::{self, Category, NewReport},
+        user::{Flag, NewUser, User},
+    },
     services::instance_actor::ensure_instance_actor,
     test_db::TestDb,
-    util::time::mastodon_time,
+    util::{password::hash_password, time::mastodon_time},
 };
 
 use crate::common::{self, TestRequest};
@@ -855,6 +858,1398 @@ async fn the_gate_demands_the_accounts_read_scope() {
                 .send(&seeded.app)
                 .await;
             common::assert_error(&response, NO_ADMIN_READ, &format!("{why} on {route}"));
+        }
+    }
+}
+
+// ===== WBE-213: the account writes — delete, enable, approve, reject, action =====
+
+/// The 403 body of the two refusals the writes answer alike: the admin who
+/// names their own account in a deletion, and the rejection of an account
+/// nobody had left pending.
+const NOT_ALLOWED: &str = "This action is not allowed";
+/// The 422 body of a `type` word off the five the umbrella knows.
+const INVALID_TYPE: &str = "Validation failed: Type is invalid";
+/// The 422 body of a request that states no `type` at all.
+const MISSING_TYPE: &str = "Validation failed: Type is required";
+/// The 400 body of a `report_id` whose report is about another account.
+const WRONG_TARGET: &str = "Report does not target this account";
+/// The 403 body for a valid user token whose account is not an admin: the
+/// writes are the admin's, where the reads are staff's.
+const NOT_ADMIN: &str = "User is not an admin.";
+/// The 403 body of a token that grants neither `admin:write` nor
+/// `admin:write:accounts`.
+const NO_ADMIN_WRITE: &str = "Insufficient permissions: admin:write.";
+/// The password every write fixture signs in with.
+const PASSWORD: &str = "a long enough pass";
+/// The 403 the bearer gate answers a deactivated account's request with.
+const DISABLED: &str = "Your account is currently disabled";
+/// The queue the `users.delete` sweep rides on.
+const BACKGROUND: &str = "background";
+/// The job kind of an account's deletion sweep.
+const DELETE_KIND: &str = "users.delete";
+/// The subject of the letter a newly approved account is posted.
+const APPROVED_MAIL: &str = "Your account on Wired is approved";
+/// The subject of the letter a rejected account is posted.
+const REJECTED_MAIL: &str = "Your account on Wired has been rejected";
+
+/// What the write tests leave behind: the admin, one account per state a
+/// write weighs, and the `admin:write:accounts` token the writes are signed
+/// with.
+///
+/// The app is built on a config with `SMTP_HOST` set, because the two
+/// letters the approval and the rejection post are what those tests count;
+/// the suite default configures no relay and every send would drop.
+struct Writes {
+    /// The pool every row was inserted into.
+    pool: PgPool,
+    /// The router built on that pool.
+    app: Router,
+    /// The admin who signs every request.
+    root: User,
+    /// An ordinary active, approved, confirmed account, with a password.
+    plain: User,
+    /// A deactivated account, with a password.
+    asleep: User,
+    /// A registration awaiting staff, with an address.
+    newbie: User,
+    /// A registration awaiting staff that gave no address at all.
+    quiet: User,
+    /// The reporter whose reports the umbrella resolves.
+    beeper: User,
+    /// A remote mirror, which moderation reaches by id like any other row.
+    mirror: User,
+    /// `root`'s `admin:write:accounts` bearer token.
+    token: String,
+}
+
+/// Seeds the accounts the writes act on: one per state a write weighs, plus
+/// a reporter and a mirror, beside the admin who acts on them.
+async fn seed_writes(db: &TestDb) -> Writes {
+    let pool = db.pool().clone();
+    let root = create(&pool, "root", |user| NewUser {
+        is_admin: Flag::new(true),
+        ..user
+    })
+    .await;
+    let plain = common::create_user_with_password(&pool, "plain", PASSWORD).await;
+    let asleep = common::create_deactivated_user_with_password(&pool, "asleep", PASSWORD).await;
+    let newbie = create(&pool, "newbie", |user| NewUser {
+        approval_pending: Flag::new(true),
+        email: Some("newbie@example.org".to_owned()),
+        password_hash: Some(hash_password(PASSWORD).expect("the fixture password hashes")),
+        ..user
+    })
+    .await;
+    let quiet = create(&pool, "quiet", |user| NewUser {
+        approval_pending: Flag::new(true),
+        password_hash: Some(hash_password(PASSWORD).expect("the fixture password hashes")),
+        ..user
+    })
+    .await;
+    let beeper = create(&pool, "beeper", |user| NewUser {
+        actor_type: "Service".to_owned(),
+        ..user
+    })
+    .await;
+    let mirror = common::create_remote_user(&pool, "faraway", "remote.example").await;
+    let token = common::create_app_and_token(&pool, &root, "admin:write:accounts").await;
+    Writes {
+        app: common::test_app_with_config(pool.clone(), mail_config()),
+        pool,
+        root,
+        plain,
+        asleep,
+        newbie,
+        quiet,
+        beeper,
+        mirror,
+        token,
+    }
+}
+
+/// A config with `SMTP_HOST` set, so the letters the approval and the
+/// rejection post really reach the mailer queue.
+fn mail_config() -> Config {
+    let mut config = common::test_config();
+    config.smtp_host = Some("smtp.example.org".to_owned());
+    config
+}
+
+/// The `{id}` route of one account.
+fn account_path(id: Uuid) -> String {
+    format!("{V1}/{id}")
+}
+
+/// The `{id}/{suffix}` route of one account.
+fn account_action_path(id: Uuid, suffix: &str) -> String {
+    format!("{V1}/{id}/{suffix}")
+}
+
+/// `DELETE`s `path` as `token`.
+async fn delete_as(app: &Router, token: &str, path: &str) -> common::TestResponse {
+    TestRequest::delete(path).bearer(token).send(app).await
+}
+
+/// `POST`s the JSON `body` to `path` as `token`.
+async fn post_json(app: &Router, token: &str, path: &str, body: &Value) -> common::TestResponse {
+    TestRequest::post(path)
+        .bearer(token)
+        .json(body)
+        .send(app)
+        .await
+}
+
+/// The umbrella request for `id`, asserted to answer the empty object under
+/// a 200 — the pinned shape of every accepted action.
+async fn act(app: &Router, token: &str, id: Uuid, body: &Value) {
+    let response = post_json(app, token, &account_action_path(id, "action"), body).await;
+    common::assert_answer(&response, StatusCode::OK, "the account action");
+    assert_eq!(
+        response.json_value(),
+        json!({}),
+        "the umbrella answers the empty object, not Pleroma's 204"
+    );
+}
+
+/// The three state flags of one row, or `None` once the row is gone:
+/// activation, the staff gate and whether a deletion was stamped.
+async fn row_state(pool: &PgPool, id: Uuid) -> Option<(bool, bool, bool)> {
+    sqlx::query_as::<_, (bool, bool, bool)>(
+        "SELECT is_active, approval_pending, deleted_at IS NOT NULL FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .expect("the row reads back")
+}
+
+/// How many live bearer tokens `account` holds.
+async fn token_count(pool: &PgPool, account: &User) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM oauth_tokens WHERE user_id = $1")
+        .bind(account.id)
+        .fetch_one(pool)
+        .await
+        .expect("the token count reads back")
+}
+
+/// The moderation-log entries of one action, oldest first: sentence and data.
+async fn logged(pool: &PgPool, action: &str) -> Vec<(String, Value)> {
+    sqlx::query_as::<_, (String, Value)>(
+        "SELECT message, data FROM moderation_log WHERE action = $1 ORDER BY id",
+    )
+    .bind(action)
+    .fetch_all(pool)
+    .await
+    .expect("the log reads back")
+}
+
+/// The single entry one write must have left: its sentence and the nicknames
+/// its `subject` data map names.
+async fn one_entry(pool: &PgPool, action: &str) -> (String, Vec<String>) {
+    let entries = logged(pool, action).await;
+    let (message, data) = entries
+        .first()
+        .unwrap_or_else(|| panic!("one {action} entry was expected"));
+    assert_eq!(
+        entries.len(),
+        1,
+        "exactly one {action} entry, got {entries:?}"
+    );
+    let subjects = data["subject"]
+        .as_array()
+        .expect("the subject list")
+        .iter()
+        .filter_map(|found| found["nickname"].as_str())
+        .map(str::to_owned)
+        .collect();
+    (message.clone(), subjects)
+}
+
+/// The arguments of every job on `queue` of `kind`, oldest first.
+async fn jobs_of(pool: &PgPool, queue: &str, kind: &str) -> Vec<Value> {
+    sqlx::query_as::<_, (Value,)>(
+        "SELECT args FROM jobs WHERE queue = $1 AND kind = $2 ORDER BY id",
+    )
+    .bind(queue)
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .expect("the queue reads back")
+    .into_iter()
+    .map(|(args,)| args)
+    .collect()
+}
+
+/// The sweeps queued for one account.
+async fn sweeps_for(pool: &PgPool, account: &User) -> Vec<Value> {
+    jobs_of(pool, BACKGROUND, DELETE_KIND)
+        .await
+        .into_iter()
+        .filter(|args| args["user_id"] == json!(account.id.to_string()))
+        .collect()
+}
+
+/// The letters the mailer queue holds, in the order they were posted.
+async fn letters(pool: &PgPool) -> Vec<Value> {
+    jobs_of(pool, "mailer", "mailer.send").await
+}
+
+/// The stored state of one report, beside whether its action stamp is set.
+async fn report_state(pool: &PgPool, id: Uuid) -> (String, bool) {
+    sqlx::query_as::<_, (String, bool)>(
+        "SELECT state, action_taken_at IS NOT NULL FROM reports WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the report reads back")
+}
+
+/// Files `beeper`'s report about `target` through the model.
+async fn file_against(pool: &PgPool, beeper: &User, target: &User) -> Uuid {
+    let filed = report::create(
+        pool,
+        BASE,
+        beeper,
+        target,
+        &NewReport {
+            comment: "they did the thing".to_owned(),
+            category: Category::Other,
+            forwarded: false,
+            rule_ids: Vec::new(),
+            status_ids: Vec::new(),
+        },
+    )
+    .await
+    .expect("the fixture report files");
+    filed.id
+}
+
+/// The 403 body the login gate and the bearer gate answer an
+/// approval-pending account with, and its machine-readable reason.
+const AWAITING: &str = "Your account is awaiting approval.";
+
+/// The OAuth `password` grant body for `username`, over the app's credentials.
+fn grant_body(client_id: &str, client_secret: &str, username: &str) -> Value {
+    json!({
+        "grant_type": "password",
+        "username": username,
+        "password": PASSWORD,
+        "scope": "read",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+}
+
+/// The `password` grant for `username`.
+async fn login(
+    app: &Router,
+    client_id: &str,
+    client_secret: &str,
+    username: &str,
+) -> common::TestResponse {
+    TestRequest::post("/oauth/token")
+        .json(&grant_body(client_id, client_secret, username))
+        .send(app)
+        .await
+}
+
+/// An ordinary request to the account's own credentials endpoint, the one
+/// call the bearer gate answers with its role-and-flag refusals.
+async fn verify(app: &Router, token: &str) -> common::TestResponse {
+    TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(token)
+        .send(app)
+        .await
+}
+
+/// `DELETE /api/v1/admin/accounts/{id}` starts the same sweep the Pleroma
+/// console's `DELETE /users` starts — `deleted_at` stamped, every token
+/// revoked, `users.delete` queued — and answers the entity as the row stood,
+/// which is the state the client asked to see deleted.
+#[tokio::test]
+async fn deleting_an_account_starts_its_sweep_and_answers_the_row_as_it_was() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let mine = seeded.token.clone();
+    let victim_token = common::create_app_and_token(&seeded.pool, &seeded.plain, "read").await;
+    let client = common::create_app(&seeded.pool, "read").await;
+    assert_eq!(token_count(&seeded.pool, &seeded.plain).await, 1);
+
+    let response = delete_as(&seeded.app, &mine, &account_path(seeded.plain.id)).await;
+    common::assert_answer(&response, StatusCode::OK, "the deletion");
+    let body = response.json_value();
+    assert_eq!(body["id"], json!(seeded.plain.id.to_string()), "the row");
+    assert_eq!(body["username"], json!("plain"), "as the request named it");
+    assert_eq!(
+        body["disabled"],
+        json!(false),
+        "as it was: the answer is the pre-deletion snapshot"
+    );
+    assert_eq!(
+        body["approved"],
+        json!(true),
+        "and not the state it is now in"
+    );
+
+    let (active, pending, doomed) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row survives its sweep's start");
+    assert!(!active, "deleted_at implies the deactivation");
+    assert!(!pending, "the approval gate was never the point");
+    assert!(doomed, "and the deletion is stamped");
+    assert_eq!(
+        token_count(&seeded.pool, &seeded.plain).await,
+        0,
+        "every token went with the start of the deletion"
+    );
+    assert_eq!(
+        sweeps_for(&seeded.pool, &seeded.plain).await.len(),
+        1,
+        "one sweep queued for the account"
+    );
+
+    let denied = verify(&seeded.app, &victim_token).await;
+    common::assert_answer(&denied, StatusCode::UNAUTHORIZED, "the revoked credential");
+    common::assert_error(&denied, INVALID_TOKEN, "is no credential at all");
+    let refused = login(
+        &seeded.app,
+        &client.client_id,
+        &client.client_secret,
+        "plain",
+    )
+    .await;
+    common::assert_answer(
+        &refused,
+        StatusCode::FORBIDDEN,
+        "the sign-in of a doomed account",
+    );
+
+    let (message, subjects) = one_entry(&seeded.pool, "delete").await;
+    assert_eq!(message, "@root deleted users: @plain", "Pleroma's delete");
+    assert_eq!(subjects, vec!["plain"], "naming the account");
+}
+
+/// The admin's own row is off limits: naming yourself is the 403 this surface
+/// answers its refusals with, and nothing is stamped, queued or logged.
+#[tokio::test]
+async fn deleting_refuses_the_admins_own_account() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+
+    let response = delete_as(&seeded.app, &seeded.token, &account_path(seeded.root.id)).await;
+    common::assert_answer(&response, StatusCode::FORBIDDEN, "self-deletion");
+    common::assert_error(&response, NOT_ALLOWED, "in the pinned words");
+
+    let (active, _, doomed) = row_state(&seeded.pool, seeded.root.id)
+        .await
+        .expect("the admin is still here");
+    assert!(active, "and the refusal is real: the flag did not move");
+    assert!(!doomed, "nor was a deletion stamped");
+    assert!(
+        sweeps_for(&seeded.pool, &seeded.root).await.is_empty(),
+        "and no sweep was queued"
+    );
+    assert!(
+        logged(&seeded.pool, "delete").await.is_empty(),
+        "and the refused request left no entry behind"
+    );
+}
+
+/// The 404 of an id that names no account is the reads' own wording, and it
+/// answers before any body is read or any state moves.
+#[tokio::test]
+async fn the_writes_404_for_an_id_that_names_no_account() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let missing = Uuid::now_v7();
+    let token = seeded.token.clone();
+
+    let gone = delete_as(&seeded.app, &token, &account_path(missing)).await;
+    common::assert_error(&gone, NOT_FOUND, "the deletion of nothing");
+    for suffix in ["enable", "approve", "reject"] {
+        let response = post_json(
+            &seeded.app,
+            &token,
+            &account_action_path(missing, suffix),
+            &json!({}),
+        )
+        .await;
+        common::assert_answer(
+            &response,
+            StatusCode::NOT_FOUND,
+            &format!("the {suffix} of nothing"),
+        );
+        common::assert_error(&response, NOT_FOUND, "is the shared body");
+    }
+    let response = post_json(
+        &seeded.app,
+        &token,
+        &account_action_path(missing, "action"),
+        &json!({"type": "disable"}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::NOT_FOUND, "the action on nothing");
+    common::assert_error(
+        &response,
+        NOT_FOUND,
+        "and the account half is checked first",
+    );
+
+    let text = TestRequest::delete(&format!("{V1}/not-an-id"))
+        .bearer(&token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&text, StatusCode::NOT_FOUND, "text that is no id");
+    let enabled = post_json(
+        &seeded.app,
+        &token,
+        &format!("{V1}/not-an-id/enable"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(
+        &enabled,
+        StatusCode::NOT_FOUND,
+        "on the action suffixes too",
+    );
+    assert!(
+        logged(&seeded.pool, "delete").await.is_empty(),
+        "and the misses wrote nothing"
+    );
+}
+
+/// Enabling is the flag alone: the deactivated account answers active, its
+/// untouched credential works again, its password signs in once more, and the
+/// `activate` entry Pleroma's `enable` writes names it.
+#[tokio::test]
+async fn enabling_a_disabled_account_frees_it_again() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let client = common::create_app(&seeded.pool, "read").await;
+    let asleep_token = common::create_app_and_token(&seeded.pool, &seeded.asleep, "read").await;
+    let blocked = verify(&seeded.app, &asleep_token).await;
+    common::assert_answer(&blocked, StatusCode::FORBIDDEN, "the gate before the write");
+    common::assert_error(&blocked, DISABLED, "names the flag as the reason");
+
+    let response = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.asleep.id, "enable"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the enable");
+    let body = response.json_value();
+    assert_eq!(
+        body["id"],
+        json!(seeded.asleep.id.to_string()),
+        "its entity"
+    );
+    assert_eq!(body["disabled"], json!(false), "answered active");
+
+    let (active, _, _) = row_state(&seeded.pool, seeded.asleep.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "and the flag moved in the row");
+    assert_eq!(
+        token_count(&seeded.pool, &seeded.asleep).await,
+        1,
+        "the credential the deactivation left behind is the whole gate"
+    );
+    let freed = login(
+        &seeded.app,
+        &client.client_id,
+        &client.client_secret,
+        "asleep",
+    )
+    .await;
+    common::assert_answer(&freed, StatusCode::OK, "and the account signs in again");
+    let allowed = verify(&seeded.app, &asleep_token).await;
+    common::assert_answer(&allowed, StatusCode::OK, "with the token it already had");
+
+    let (message, subjects) = one_entry(&seeded.pool, "activate").await;
+    assert_eq!(
+        message, "@root activated users: @asleep",
+        "Pleroma's activate"
+    );
+    assert_eq!(subjects, vec!["asleep"], "naming the account");
+}
+
+/// Enabling an account that was never disabled is not an error: the same
+/// `true` is written, the same entity answers and the same entry is logged.
+#[tokio::test]
+async fn enabling_an_active_account_answers_it_unchanged() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+
+    let response = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.plain.id, "enable"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the enable of an active account");
+    assert_eq!(
+        response.json_value()["disabled"],
+        json!(false),
+        "answered as it was"
+    );
+    let (active, _, _) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "and it stayed active");
+
+    let (message, subjects) = one_entry(&seeded.pool, "activate").await;
+    assert_eq!(message, "@root activated users: @plain", "still the entry");
+    assert_eq!(subjects, vec!["plain"]);
+}
+
+/// A mirror is a row like any other: the admin who names its id can enable it,
+/// because this schema's activation flag is the one column both kinds share.
+#[tokio::test]
+async fn the_writes_reach_a_remote_mirror_by_id() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+
+    let response = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.mirror.id, "enable"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the enable of a mirror");
+    assert_eq!(
+        response.json_value()["domain"],
+        json!("remote.example"),
+        "whose entity answers as the reads answer it"
+    );
+    let (active, _, _) = row_state(&seeded.pool, seeded.mirror.id)
+        .await
+        .expect("the mirror is still a row");
+    assert!(active, "and its flag is written like a local one's");
+
+    let (message, subjects) = one_entry(&seeded.pool, "activate").await;
+    assert_eq!(message, "@root activated users: @faraway@remote.example");
+    assert_eq!(
+        subjects,
+        vec!["faraway@remote.example"],
+        "by its full handle"
+    );
+}
+
+/// Approving a pending registration clears the gate, posts its letter and
+/// answers the fresh entity — and the account, which the login gate refused
+/// as awaiting approval, signs in on the strength of the flag alone: the
+/// approval mints nothing.
+#[tokio::test]
+async fn approving_a_pending_account_letters_it() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let client = common::create_app(&seeded.pool, "read").await;
+    let waiting = login(
+        &seeded.app,
+        &client.client_id,
+        &client.client_secret,
+        "newbie",
+    )
+    .await;
+    common::assert_answer(
+        &waiting,
+        StatusCode::FORBIDDEN,
+        "the pending account's sign-in",
+    );
+    common::assert_error(&waiting, AWAITING, "names the gate that holds it");
+
+    let response = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.newbie.id, "approve"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the approval");
+    let body = response.json_value();
+    assert_eq!(
+        body["id"],
+        json!(seeded.newbie.id.to_string()),
+        "the entity"
+    );
+    assert_eq!(body["approved"], json!(true), "answered approved");
+
+    let (active, pending, _) = row_state(&seeded.pool, seeded.newbie.id)
+        .await
+        .expect("the row is there");
+    assert!(!pending, "the staff gate is off the row");
+    assert!(active, "and the account was active all along");
+    assert_eq!(
+        token_count(&seeded.pool, &seeded.newbie).await,
+        0,
+        "approval mints no credential — Pleroma's approval is a flag, not a password"
+    );
+
+    let granted = login(
+        &seeded.app,
+        &client.client_id,
+        &client.client_secret,
+        "newbie",
+    )
+    .await;
+    common::assert_answer(
+        &granted,
+        StatusCode::OK,
+        "the approved account signs in at last",
+    );
+    assert!(
+        !granted.json_value()["access_token"].is_null(),
+        "with a credential of its own now"
+    );
+
+    let posted = letters(&seeded.pool).await;
+    assert_eq!(
+        posted.len(),
+        1,
+        "one letter, to the account that just passed"
+    );
+    assert_eq!(
+        posted[0]["to"],
+        json!("newbie@example.org"),
+        "its own address"
+    );
+    assert_eq!(
+        posted[0]["subject"],
+        json!(APPROVED_MAIL),
+        "the approval letter"
+    );
+
+    let (message, subjects) = one_entry(&seeded.pool, "approve").await;
+    assert_eq!(
+        message, "@root approved users: @newbie",
+        "Pleroma's approve"
+    );
+    assert_eq!(subjects, vec!["newbie"]);
+}
+
+/// An account nobody left pending is Pleroma's already-approved arm: the same
+/// entity back, no letter, no write — and still a log subject. So is a pending
+/// one that never gave an address: approved, and mailed nothing because there
+/// is nothing to mail.
+#[tokio::test]
+async fn approving_answers_an_approved_account_unchanged_and_letters_an_addressless_one() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+
+    let again = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.plain.id, "approve"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&again, StatusCode::OK, "approval of the already approved");
+    assert_eq!(
+        again.json_value()["approved"],
+        json!(true),
+        "answered unchanged"
+    );
+
+    let nameless = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.quiet.id, "approve"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&nameless, StatusCode::OK, "approval of the addressless one");
+    assert_eq!(
+        nameless.json_value()["email"],
+        json!(null),
+        "and its entity carries the absence it stored"
+    );
+    let (_, pending, _) = row_state(&seeded.pool, seeded.quiet.id)
+        .await
+        .expect("the row is there");
+    assert!(!pending, "the gate is off it");
+
+    assert!(
+        letters(&seeded.pool).await.is_empty(),
+        "no letter for an account that was not approved now, and none for one with no address"
+    );
+    let entries = logged(&seeded.pool, "approve").await;
+    let messages: Vec<&str> = entries
+        .iter()
+        .map(|(message, _)| message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "@root approved users: @plain",
+            "@root approved users: @quiet"
+        ],
+        "one entry per request, moved or not"
+    );
+}
+
+/// Rejecting a pending registration deletes the account outright — row and
+/// tokens gone — posts its rejection letter and answers the snapshot of the
+/// row that is no more.
+#[tokio::test]
+async fn rejecting_a_pending_account_deletes_it() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let their_token = common::create_app_and_token(&seeded.pool, &seeded.newbie, "read").await;
+
+    let response = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.newbie.id, "reject"),
+        &json!({}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the rejection");
+    let body = response.json_value();
+    assert_eq!(
+        body["id"],
+        json!(seeded.newbie.id.to_string()),
+        "the snapshot"
+    );
+    assert_eq!(
+        body["approved"],
+        json!(false),
+        "as it stood: pending, which is what was refused"
+    );
+    assert_eq!(
+        body["email"],
+        json!("newbie@example.org"),
+        "the address it gave"
+    );
+
+    assert!(
+        row_state(&seeded.pool, seeded.newbie.id).await.is_none(),
+        "the row is gone, not purged or deactivated"
+    );
+    assert_eq!(
+        token_count(&seeded.pool, &seeded.newbie).await,
+        0,
+        "and its credential left on the cascade"
+    );
+    let denied = verify(&seeded.app, &their_token).await;
+    common::assert_answer(
+        &denied,
+        StatusCode::UNAUTHORIZED,
+        "the credential of a deleted account",
+    );
+    assert!(
+        sweeps_for(&seeded.pool, &seeded.newbie).await.is_empty(),
+        "rejection deletes the row outright: there is no sweep to wait for"
+    );
+
+    let posted = letters(&seeded.pool).await;
+    assert_eq!(posted.len(), 1, "the rejected account is written to");
+    assert_eq!(
+        posted[0]["to"],
+        json!("newbie@example.org"),
+        "at its address"
+    );
+    assert_eq!(
+        posted[0]["subject"],
+        json!(REJECTED_MAIL),
+        "the rejection letter"
+    );
+
+    let (message, subjects) = one_entry(&seeded.pool, "reject").await;
+    assert_eq!(
+        message, "@root rejected users: @newbie",
+        "Pleroma's reject sentence"
+    );
+    assert_eq!(
+        subjects,
+        vec!["newbie"],
+        "naming the row the log can no longer join to"
+    );
+}
+
+/// Rejection is the pending account's refusal: an approved one — active,
+/// deactivated, a mirror — is the 403, and survives the request unchanged.
+#[tokio::test]
+async fn rejecting_an_account_that_was_never_pending_is_refused() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let token = seeded.token.clone();
+
+    for (who, label) in [
+        (seeded.plain.id, "an approved account"),
+        (seeded.asleep.id, "a deactivated one"),
+        (seeded.mirror.id, "a mirror"),
+    ] {
+        let response = post_json(
+            &seeded.app,
+            &token,
+            &account_action_path(who, "reject"),
+            &json!({}),
+        )
+        .await;
+        common::assert_answer(
+            &response,
+            StatusCode::FORBIDDEN,
+            &format!("rejecting {label}"),
+        );
+        common::assert_error(&response, NOT_ALLOWED, "in the pinned words");
+        assert!(
+            row_state(&seeded.pool, who).await.is_some(),
+            "{label} is still a row"
+        );
+    }
+    assert!(
+        letters(&seeded.pool).await.is_empty(),
+        "and no refusal posted a letter"
+    );
+    assert!(
+        logged(&seeded.pool, "reject").await.is_empty(),
+        "nor left an entry"
+    );
+}
+
+/// `disable` is the deactivation and nothing more: the flag moves, the row is
+/// not stamped for deletion, the credential survives (refused, but live), and
+/// the request leaves both the `deactivate` entry of the move and the `disable`
+/// entry of the ask.
+#[tokio::test]
+async fn the_action_disables_the_account_it_is_pointed_at() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let mine = common::create_app_and_token(&seeded.pool, &seeded.plain, "read").await;
+    let client = common::create_app(&seeded.pool, "read").await;
+
+    act(
+        &seeded.app,
+        &seeded.token,
+        seeded.plain.id,
+        &json!({"type": "disable"}),
+    )
+    .await;
+
+    let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is there");
+    assert!(!active, "the flag moved");
+    assert!(
+        !doomed,
+        "and no deletion was stamped — disable is not delete"
+    );
+    assert_eq!(
+        token_count(&seeded.pool, &seeded.plain).await,
+        1,
+        "the token is left in place, refused until the account comes back"
+    );
+    let denied = verify(&seeded.app, &mine).await;
+    common::assert_answer(&denied, StatusCode::FORBIDDEN, "its bearer's request");
+    common::assert_error(&denied, DISABLED, "is the disabled refusal");
+    let refused = login(
+        &seeded.app,
+        &client.client_id,
+        &client.client_secret,
+        "plain",
+    )
+    .await;
+    common::assert_answer(&refused, StatusCode::FORBIDDEN, "and its sign-in");
+    assert_eq!(
+        refused.json_value()["identifier"],
+        json!("account_is_disabled"),
+        "with the grant's own reason code"
+    );
+    assert!(
+        sweeps_for(&seeded.pool, &seeded.plain).await.is_empty(),
+        "and no content sweep was queued"
+    );
+
+    let (message, subjects) = one_entry(&seeded.pool, "deactivate").await;
+    assert_eq!(
+        message, "@root deactivated users: @plain",
+        "the move keeps the entry every other writer of the flag leaves"
+    );
+    assert_eq!(subjects, vec!["plain"]);
+    let (asked, asked_subjects) = one_entry(&seeded.pool, "disable").await;
+    assert_eq!(
+        asked, "@root performed action disable",
+        "and the request is recorded under the type it stated"
+    );
+    assert_eq!(asked_subjects, vec!["plain"], "naming its account");
+}
+
+/// `suspend` deactivates and queues the `users.delete` sweep, answering 200
+/// `{}`; the three warning parameters the client sent alongside are dropped
+/// without a trace, and the two entries name the move and the ask.
+#[tokio::test]
+async fn the_action_suspends_and_queues_the_content_sweep() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let mine = common::create_app_and_token(&seeded.pool, &seeded.plain, "read").await;
+
+    act(
+        &seeded.app,
+        &seeded.token,
+        seeded.plain.id,
+        &json!({
+            "type": "suspend",
+            "text": "read the rules",
+            "warning_preset_id": "7",
+            "send_email_notification": true,
+        }),
+    )
+    .await;
+
+    let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is still there for the sweep to work on");
+    assert!(!active, "suspension deactivates");
+    assert!(
+        !doomed,
+        "and queues the sweep instead of stamping the deletion itself"
+    );
+    let queued = sweeps_for(&seeded.pool, &seeded.plain).await;
+    assert_eq!(queued.len(), 1, "the content sweep is on the queue");
+    assert_eq!(
+        queued[0]["user_id"],
+        json!(seeded.plain.id.to_string()),
+        "and names the account it will clear"
+    );
+    let denied = verify(&seeded.app, &mine).await;
+    common::assert_answer(
+        &denied,
+        StatusCode::FORBIDDEN,
+        "the suspended account's own request",
+    );
+    common::assert_error(&denied, DISABLED, "is refused as disabled");
+    assert_eq!(
+        token_count(&seeded.pool, &seeded.plain).await,
+        1,
+        "the row's own credential is the sweep's business, not this request's"
+    );
+    assert!(
+        letters(&seeded.pool).await.is_empty(),
+        "`send_email_notification` is accepted and ignored: there is no warning letter to send"
+    );
+
+    let (message, subjects) = one_entry(&seeded.pool, "deactivate").await;
+    assert_eq!(
+        message, "@root deactivated users: @plain",
+        "the suspension's flag move is recorded as the deactivation it is"
+    );
+    assert_eq!(subjects, vec!["plain"]);
+    let (asked, asked_subjects) = one_entry(&seeded.pool, "suspend").await;
+    assert_eq!(asked, "@root performed action suspend");
+    assert_eq!(
+        asked_subjects,
+        vec!["plain"],
+        "and the ask is recorded by its type"
+    );
+}
+
+/// `none`, `sensitive` and `silence` are the types with nothing under them:
+/// this schema has no sensitive flag and no silence state, so each is the log
+/// entry alone, and the account is left exactly as it stood.
+#[tokio::test]
+async fn the_unmodelled_action_types_are_recorded_alone() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+
+    for kind in ["none", "sensitive", "silence"] {
+        act(
+            &seeded.app,
+            &seeded.token,
+            seeded.plain.id,
+            &json!({"type": kind}),
+        )
+        .await;
+        let (active, pending, doomed) = row_state(&seeded.pool, seeded.plain.id)
+            .await
+            .expect("the row is there");
+        assert!(
+            active && !pending && !doomed,
+            "`{kind}` changed nothing on the account"
+        );
+        let (message, subjects) = one_entry(&seeded.pool, kind).await;
+        assert_eq!(
+            message,
+            format!("@root performed action {kind}"),
+            "Pleroma's fall-through sentence"
+        );
+        assert_eq!(subjects, vec!["plain"], "and the account it names");
+    }
+
+    assert!(
+        logged(&seeded.pool, "deactivate").await.is_empty(),
+        "and no type that moves nothing left a deactivation entry"
+    );
+    assert_eq!(
+        logged(&seeded.pool, "none").await.len(),
+        1,
+        "one entry per request"
+    );
+}
+
+/// A `report_id` on an action request is resolved as part of it: the row moves
+/// to `resolved`, its action stamp lands, and the `report_update` entry and the
+/// `report.updated` event are the ones every other state change writes.
+#[tokio::test]
+async fn the_action_resolves_the_report_it_names() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let report = file_against(&seeded.pool, &seeded.beeper, &seeded.plain).await;
+    assert_eq!(
+        report_state(&seeded.pool, report).await,
+        ("open".to_owned(), false),
+        "the fixture report is filed open"
+    );
+
+    act(
+        &seeded.app,
+        &seeded.token,
+        seeded.plain.id,
+        &json!({"type": "disable", "report_id": report.to_string()}),
+    )
+    .await;
+
+    assert_eq!(
+        report_state(&seeded.pool, report).await,
+        ("resolved".to_owned(), true),
+        "resolved, with its action stamp"
+    );
+    let entries = logged(&seeded.pool, "report_update").await;
+    assert_eq!(entries.len(), 1, "one resolution entry for one report");
+    assert_eq!(
+        entries[0].0,
+        format!("@root updated report ##{report} ( on user @plain) with 'resolved' state"),
+        "the same sentence the console's state change writes, naming its target"
+    );
+    assert_eq!(
+        entries[0].1["subject"]["id"],
+        json!(report.to_string()),
+        "whose subject is the report itself, Pleroma's report map"
+    );
+    let (asked, _) = one_entry(&seeded.pool, "disable").await;
+    assert_eq!(
+        asked, "@root performed action disable",
+        "and the action itself is recorded beside the resolution"
+    );
+    let (moved, _) = one_entry(&seeded.pool, "deactivate").await;
+    assert_eq!(
+        moved, "@root deactivated users: @plain",
+        "with the flag move"
+    );
+}
+
+/// Pleroma's `associated_report` guard comes with the umbrella: an id that
+/// names no report is the 404 the account half gives, and a report about
+/// somebody else the 400 that says so — both before anything moves.
+#[tokio::test]
+async fn the_action_refuses_a_report_it_does_not_belong_to() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let theirs = file_against(&seeded.pool, &seeded.beeper, &seeded.asleep).await;
+    let token = seeded.token.clone();
+
+    let unknown = post_json(
+        &seeded.app,
+        &token,
+        &account_action_path(seeded.plain.id, "action"),
+        &json!({"type": "disable", "report_id": Uuid::now_v7().to_string()}),
+    )
+    .await;
+    common::assert_answer(
+        &unknown,
+        StatusCode::NOT_FOUND,
+        "a report that names nothing",
+    );
+    common::assert_error(&unknown, NOT_FOUND, "is the shared 404 body");
+
+    let malformed = post_json(
+        &seeded.app,
+        &token,
+        &account_action_path(seeded.plain.id, "action"),
+        &json!({"type": "disable", "report_id": "nope"}),
+    )
+    .await;
+    common::assert_answer(
+        &malformed,
+        StatusCode::NOT_FOUND,
+        "text that is no report id",
+    );
+
+    let stranger = post_json(
+        &seeded.app,
+        &token,
+        &account_action_path(seeded.plain.id, "action"),
+        &json!({"type": "disable", "report_id": theirs.to_string()}),
+    )
+    .await;
+    common::assert_answer(
+        &stranger,
+        StatusCode::BAD_REQUEST,
+        "a report about another account",
+    );
+    common::assert_error(&stranger, WRONG_TARGET, "says so in Pleroma's words");
+
+    let (active, _, _) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "and the refused request touched nothing");
+    assert_eq!(
+        report_state(&seeded.pool, theirs).await,
+        ("open".to_owned(), false),
+        "least of all somebody else's report"
+    );
+    assert!(
+        logged(&seeded.pool, "report_update").await.is_empty(),
+        "and no resolution was recorded"
+    );
+    assert!(
+        logged(&seeded.pool, "deactivate").await.is_empty()
+            && logged(&seeded.pool, "disable").await.is_empty(),
+        "nor the action's own entries"
+    );
+}
+
+/// A `type` off the five words, and no `type` at all, are the two 422s the
+/// endpoint answers a request it cannot name an action for — with the exact
+/// bodies the ticket pins, and no effect on the account.
+#[tokio::test]
+async fn the_action_refuses_an_unusable_type() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let token = seeded.token.clone();
+    let path = account_action_path(seeded.plain.id, "action");
+
+    let invalid = post_json(&seeded.app, &token, &path, &json!({"type": "freeze"})).await;
+    common::assert_answer(
+        &invalid,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unknown type",
+    );
+    common::assert_error(
+        &invalid,
+        INVALID_TYPE,
+        "Pleroma's enum refusal, spelled as it is",
+    );
+
+    let wrong_case = post_json(&seeded.app, &token, &path, &json!({"type": "Disable"})).await;
+    common::assert_answer(
+        &wrong_case,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the wrong case",
+    );
+    common::assert_error(&wrong_case, INVALID_TYPE, "is no more a type");
+
+    let absent = post_json(&seeded.app, &token, &path, &json!({})).await;
+    common::assert_answer(&absent, StatusCode::UNPROCESSABLE_ENTITY, "no type stated");
+    common::assert_error(&absent, MISSING_TYPE, "is the required-key refusal");
+
+    let number = post_json(&seeded.app, &token, &path, &json!({"type": 4})).await;
+    common::assert_answer(
+        &number,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a type that is no text",
+    );
+
+    let (active, _, _) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "and none of the four refusals moved anything");
+    for action in ["none", "disable", "suspend", "deactivate", "report_update"] {
+        assert!(
+            logged(&seeded.pool, action).await.is_empty(),
+            "nor left a {action} entry"
+        );
+    }
+}
+
+/// Decision 10: the same request arrives urlencoded, with the ignored keys
+/// beside the two that matter, and is answered the same — the umbrella's `type`
+/// reaching the endpoint as form text.
+#[tokio::test]
+async fn the_action_reads_a_form_body() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let fields = [
+        ("type", "silence"),
+        ("text", "shush"),
+        ("warning_preset_id", "3"),
+        ("send_email_notification", "true"),
+    ];
+
+    let response = TestRequest::post(&account_action_path(seeded.plain.id, "action"))
+        .bearer(&seeded.token)
+        .form(&fields)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "the form action");
+    assert_eq!(response.json_value(), json!({}), "the same empty object");
+
+    let (active, _, _) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "and `silence` silenced nothing but the request");
+    let (message, subjects) = one_entry(&seeded.pool, "silence").await;
+    assert_eq!(
+        message, "@root performed action silence",
+        "the form's type arrived as the umbrella's own word"
+    );
+    assert_eq!(subjects, vec!["plain"]);
+}
+
+/// Sends the write `suffix` names for account `id`: the `DELETE` of the
+/// account itself for the empty suffix, a body-less `POST` for the three
+/// state routes and the umbrella `POST` for `action`. `token` is `None` for
+/// the anonymous request.
+async fn write_request(
+    app: &Router,
+    token: Option<&str>,
+    id: Uuid,
+    suffix: &str,
+) -> common::TestResponse {
+    let path = if suffix.is_empty() {
+        account_path(id)
+    } else {
+        account_action_path(id, suffix)
+    };
+    let body = if suffix == "action" {
+        json!({"type": "none"})
+    } else {
+        json!({})
+    };
+    match (suffix.is_empty(), token) {
+        (true, None) => TestRequest::delete(&path).send(app).await,
+        (true, Some(text)) => TestRequest::delete(&path).bearer(text).send(app).await,
+        (false, None) => TestRequest::post(&path).json(&body).send(app).await,
+        (false, Some(text)) => {
+            TestRequest::post(&path)
+                .bearer(text)
+                .json(&body)
+                .send(app)
+                .await
+        }
+    }
+}
+
+/// The five writes are an admin's: no token, an unknown one and an app-only
+/// one are the shared refusals on every route, and a moderator — who reads
+/// this surface — is told they are not an admin, as is a plain account's
+/// token, however well scoped.
+#[tokio::test]
+async fn the_writes_demand_an_admin_user() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let pool = seeded.pool.clone();
+    let moddy = create(&pool, "moddy", |user| NewUser {
+        is_moderator: Flag::new(true),
+        ..user
+    })
+    .await;
+    let moderator = common::create_app_and_token(&pool, &moddy, "admin:write").await;
+    let stranger = common::create_app_and_token(&pool, &seeded.plain, "admin:write").await;
+    let app_only = common::create_app_only_token(&pool, "admin:write").await;
+    let id = seeded.plain.id;
+
+    for suffix in ["", "enable", "approve", "reject", "action"] {
+        let anonymous = write_request(&seeded.app, None, id, suffix).await;
+        common::assert_answer(&anonymous, StatusCode::UNAUTHORIZED, "no token at all");
+        common::assert_error(
+            &anonymous,
+            NO_TOKEN,
+            &format!("the route's suffix {suffix:?}"),
+        );
+
+        let bogus = write_request(&seeded.app, Some("nope"), id, suffix).await;
+        common::assert_answer(
+            &bogus,
+            StatusCode::UNAUTHORIZED,
+            "a token that resolves nowhere",
+        );
+
+        let unbound = write_request(&seeded.app, Some(&app_only), id, suffix).await;
+        common::assert_answer(&unbound, StatusCode::FORBIDDEN, "an app-only token");
+        common::assert_error(&unbound, USER_REQUIRED, "asks for a user");
+
+        for (credential, label) in [(&moderator, "a moderator"), (&stranger, "a plain account")] {
+            let outsider = write_request(&seeded.app, Some(credential), id, suffix).await;
+            common::assert_answer(
+                &outsider,
+                StatusCode::FORBIDDEN,
+                &format!("{label} on {suffix:?}"),
+            );
+            common::assert_error(&outsider, NOT_ADMIN, "is refused as not an admin");
+        }
+    }
+
+    let (active, _, _) = row_state(&pool, id).await.expect("the row is there");
+    assert!(active, "and every refusal left the flag alone");
+    let (_, pending, _) = row_state(&pool, seeded.newbie.id)
+        .await
+        .expect("the pending row is there");
+    assert!(pending, "nor did any of them approve or reject anything");
+    assert!(
+        logged(&pool, "delete").await.is_empty() && logged(&pool, "activate").await.is_empty(),
+        "and no refusal wrote the log"
+    );
+}
+
+/// The scope half of the gate is `admin:write:accounts`: the class root and
+/// the area scope both pass on all five routes, and another area, the read
+/// class, an ordinary `write` or no scope at all refuse with the class root
+/// named.
+#[tokio::test]
+async fn the_writes_demand_the_accounts_write_scope() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let pool = seeded.pool.clone();
+
+    let granted = common::create_app_and_token(&pool, &seeded.root, "admin:write").await;
+    for (suffix, target, label) in [
+        ("", seeded.plain.id, "the delete"),
+        ("enable", seeded.asleep.id, "the enable"),
+        ("approve", seeded.newbie.id, "the approve"),
+        ("reject", seeded.quiet.id, "the reject"),
+        ("action", seeded.asleep.id, "the umbrella"),
+    ] {
+        let answered = write_request(&seeded.app, Some(&granted), target, suffix).await;
+        common::assert_answer(
+            &answered,
+            StatusCode::OK,
+            &format!("the `admin:write` root on {label}"),
+        );
+    }
+    let scoped = common::create_app_and_token(&pool, &seeded.root, "admin:write:accounts").await;
+    let answered = write_request(&seeded.app, Some(&scoped), seeded.asleep.id, "enable").await;
+    common::assert_answer(
+        &answered,
+        StatusCode::OK,
+        "the area scope on the enable route",
+    );
+
+    for scopes in [
+        "admin:write:reports",
+        "admin:read:accounts",
+        "admin:read",
+        "write",
+        "",
+    ] {
+        let token = common::create_app_and_token(&pool, &seeded.root, scopes).await;
+        for suffix in ["", "enable", "approve", "reject", "action"] {
+            let refused = write_request(&seeded.app, Some(&token), seeded.asleep.id, suffix).await;
+            common::assert_answer(
+                &refused,
+                StatusCode::FORBIDDEN,
+                &format!("`{scopes}` on {suffix:?}"),
+            );
+            common::assert_error(
+                &refused,
+                NO_ADMIN_WRITE,
+                &format!("`{scopes}` names the class root"),
+            );
         }
     }
 }
