@@ -669,8 +669,9 @@ async fn a_bad_state_is_refused_on_both_legs() {
 /// is the app's redirect with a code, minted for the *original* application
 /// and scopes, redeemable by the owning application exactly once.
 ///
-/// `/oauth/token` does not speak the `authorization_code` grant yet (a later
-/// ticket), so the code's usability is proven through
+/// The redemption itself is the `authorization_code` grant, walked end to
+/// end over HTTP in `e2e_accounts.rs`; here the code's single-use
+/// semantics are proven on
 /// [`consume_authorization`](wired_be::models::oauth_token::consume_authorization)
 /// — the one-statement redemption that exchange runs.
 #[tokio::test]

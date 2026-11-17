@@ -1,6 +1,15 @@
-//! `POST /oauth/token`: the OAuth 2.0 `password`, `client_credentials` and
-//! `refresh_token` grants (Pleroma's `OAuthController.token_exchange`,
+//! `POST /oauth/token`: the OAuth 2.0 `password`, `client_credentials`,
+//! `refresh_token` and `authorization_code` grants (Pleroma's
+//! `OAuthController.token_exchange`,
 //! `lib/pleroma/web/o_auth/o_auth_controller.ex`).
+//!
+//! The `authorization_code` grant redeems the `?code=` a browser got from
+//! `POST /oauth/authorize`: the application authenticates as on every
+//! other grant, the code must name one of *its own* unused, unlapsed
+//! authorizations — the redemption is one statement, so a replay is
+//! refused and a foreign app cannot burn the code — and the pair it
+//! answers acts as the consenting account with exactly the scopes that
+//! authorization approved (Pleroma's `Token.exchange_token`).
 //!
 //! The `refresh_token` grant rotates a user-bound pair: it authenticates
 //! the application like `/oauth/revoke` does, looks the presented refresh
@@ -106,6 +115,10 @@ const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
 /// The refresh-token grant type: a live refresh token is exchanged for a
 /// fresh pair with the same user and scopes, the old row deleted.
 const GRANT_TYPE_REFRESH_TOKEN: &str = "refresh_token";
+/// The authorization-code grant type: the `?code=` of a completed
+/// `/oauth/authorize` consent is exchanged for a pair acting as the
+/// consenting account.
+const GRANT_TYPE_AUTHORIZATION_CODE: &str = "authorization_code";
 /// 400 body when the request omits `grant_type` entirely.
 const MISSING_GRANT_TYPE: &str = "Missing parameter: grant_type";
 /// 400 body when `grant_type` names a grant this endpoint does not speak.
@@ -116,6 +129,10 @@ const MISSING_TOKEN: &str = "Missing parameter: token";
 /// 400 body when the refresh-token grant omits the `refresh_token`
 /// parameter.
 const MISSING_REFRESH_TOKEN: &str = "Missing parameter: refresh_token";
+/// 400 body when the authorization-code grant omits the `code`
+/// parameter, spelled like the refresh grant's refusal of its own
+/// credential.
+const MISSING_CODE: &str = "Missing parameter: code";
 /// 400 body for every credential failure — unknown app, wrong client
 /// secret, unknown user, wrong password — which Pleroma deliberately does
 /// not tell apart (`render_invalid_credentials_error`).
@@ -186,6 +203,10 @@ enum Grant {
     /// `grant_type=refresh_token`: a live refresh token plus client
     /// credentials, answered with a rotated user-bound token pair.
     RefreshToken,
+    /// `grant_type=authorization_code`: an unused authorization code from
+    /// `/oauth/authorize` plus client credentials, answered with a pair
+    /// acting as the account that granted the code.
+    AuthorizationCode,
 }
 
 /// The token exchange, in order: the grant type, then per grant — the
@@ -202,6 +223,7 @@ async fn exchange(
         Grant::Password => password_grant(state, headers, &params).await,
         Grant::ClientCredentials => client_credentials_grant(state, headers, &params).await,
         Grant::RefreshToken => refresh_token_grant(state, headers, &params).await,
+        Grant::AuthorizationCode => authorization_code_grant(state, headers, &params).await,
     }
 }
 
@@ -270,9 +292,56 @@ async fn client_credentials_grant(
     Ok(TokenReply::Issued(Json(TokenResponse::new(token, None))))
 }
 
+/// The `authorization_code` grant: the code a completed
+/// `/oauth/authorize` consent handed the client (Pleroma's
+/// `token_exchange` clause for `grant_type=authorization_code`). The
+/// application authenticates exactly like on the other grants; the code
+/// is redeemed by [`consume_authorization`], whose one statement takes
+/// only an unused, unexpired row of *this* application and flips it used,
+/// so a replay, an expired code and another app's code all answer the
+/// shared 400 [`INVALID_CREDENTIALS`]. The pair carries the authorization's
+/// approved scopes — not a `scope` the client now asks for — and acts as
+/// the account that consented, which still has to exist and be ready to
+/// log in: staff can deactivate or hold an account between the consent
+/// and the exchange.
+///
+/// [`consume_authorization`]: oauth_token::consume_authorization
+///
+/// # Errors
+///
+/// 400 [`MISSING_CODE`] when the `code` field is absent, 400
+/// [`INVALID_CREDENTIALS`] for a failed app authentication, a spent,
+/// lapsed or foreign code, or a vanished owner, and
+/// [`check_account_ready`]'s 403 for an account that stopped being ready.
+/// Database failures arrive as [`AppError::Database`].
+async fn authorization_code_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: &TokenParams,
+) -> AppResult<TokenReply> {
+    let Some(code) = params.code.as_deref() else {
+        return Err(AppError::BadRequest(MISSING_CODE.to_owned()));
+    };
+    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let authorized = oauth_token::consume_authorization(&state.db, code, app.id)
+        .await?
+        .ok_or_else(invalid_credentials)?;
+    let owner = user::get_by_id(&state.db, authorized.user_id)
+        .await?
+        .ok_or_else(invalid_credentials)?;
+    check_account_ready(&owner)?;
+    let scopes = Scopes::parse(&authorized.scopes);
+    let token = issue_token(state, Some(&owner), &app, scopes).await?;
+    Ok(TokenReply::Issued(Json(TokenResponse::new(
+        token,
+        Some(&owner),
+    ))))
+}
+
 /// 403 body message when the password grant meets an MFA-enabled
 /// account (Pleroma's `mfa_response.json` `error` value).
 const MFA_REQUIRED: &str = "mfa_required";
+
 /// The challenge types the 403 above advertises, comma-joined as
 /// Pleroma's `MFA.supported_methods` renders them — `totp` is the only
 /// method this server speaks.
@@ -358,8 +427,8 @@ async fn active_owner(pool: &PgPool, token: &OauthToken) -> AppResult<Option<Use
 #[derive(Deserialize)]
 struct TokenParams {
     /// Which grant to run; [`GRANT_TYPE_PASSWORD`],
-    /// [`GRANT_TYPE_CLIENT_CREDENTIALS`] and [`GRANT_TYPE_REFRESH_TOKEN`]
-    /// are implemented.
+    /// [`GRANT_TYPE_CLIENT_CREDENTIALS`], [`GRANT_TYPE_REFRESH_TOKEN`] and
+    /// [`GRANT_TYPE_AUTHORIZATION_CODE`] are implemented.
     #[serde(default)]
     grant_type: Option<String>,
     /// The account's nickname or email. Required by the password grant.
@@ -384,11 +453,16 @@ struct TokenParams {
     /// grant. Renders as `<redacted>` in `Debug` output.
     #[serde(default)]
     refresh_token: Option<String>,
+    /// The authorization code to redeem. Required by the
+    /// `authorization_code` grant. Renders as `<redacted>` in `Debug`
+    /// output: it is a one-time credential.
+    #[serde(default)]
+    code: Option<String>,
 }
 
-/// [`password`](Self::password), [`client_secret`](Self::client_secret)
-/// and [`refresh_token`](Self::refresh_token) are secret material and
-/// render as `<redacted>`; everything else shows.
+/// [`password`](Self::password), [`client_secret`](Self::client_secret),
+/// [`refresh_token`](Self::refresh_token) and [`code`](Self::code) are
+/// secret material and render as `<redacted>`; everything else shows.
 impl fmt::Debug for TokenParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenParams")
@@ -399,6 +473,7 @@ impl fmt::Debug for TokenParams {
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
             .field("refresh_token", &"<redacted>")
+            .field("code", &"<redacted>")
             .finish()
     }
 }
@@ -412,16 +487,15 @@ impl TokenParams {
 }
 
 /// Checks the grant type and names the grant to run. The password,
-/// `client_credentials` and `refresh_token` grants are the ones
-/// implemented here; the authorization-code exchange joins in a later
-/// ticket.
+/// `client_credentials`, `refresh_token` and `authorization_code` grants
+/// are the ones implemented here.
 ///
 /// # Errors
 ///
 /// 400 [`MISSING_GRANT_TYPE`] when the field is absent, 400
 /// [`UNSUPPORTED_GRANT_TYPE`] for any value other than
-/// [`GRANT_TYPE_PASSWORD`], [`GRANT_TYPE_CLIENT_CREDENTIALS`] or
-/// [`GRANT_TYPE_REFRESH_TOKEN`].
+/// [`GRANT_TYPE_PASSWORD`], [`GRANT_TYPE_CLIENT_CREDENTIALS`],
+/// [`GRANT_TYPE_REFRESH_TOKEN`] or [`GRANT_TYPE_AUTHORIZATION_CODE`].
 fn require_grant(params: &TokenParams) -> AppResult<Grant> {
     let Some(grant_type) = params.grant_type.as_deref() else {
         return Err(AppError::BadRequest(MISSING_GRANT_TYPE.to_owned()));
@@ -430,6 +504,7 @@ fn require_grant(params: &TokenParams) -> AppResult<Grant> {
         GRANT_TYPE_PASSWORD => Ok(Grant::Password),
         GRANT_TYPE_CLIENT_CREDENTIALS => Ok(Grant::ClientCredentials),
         GRANT_TYPE_REFRESH_TOKEN => Ok(Grant::RefreshToken),
+        GRANT_TYPE_AUTHORIZATION_CODE => Ok(Grant::AuthorizationCode),
         _ => Err(AppError::BadRequest(UNSUPPORTED_GRANT_TYPE.to_owned())),
     }
 }
@@ -811,6 +886,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             refresh_token: None,
+            code: None,
         }
     }
 
@@ -952,11 +1028,7 @@ mod tests {
 
     #[test]
     fn an_unknown_grant_type_is_unsupported() {
-        for grant in [
-            "authorization_code",
-            "urn:ietf:params:oauth:grant-type:device_code",
-            "bogus",
-        ] {
+        for grant in ["urn:ietf:params:oauth:grant-type:device_code", "bogus"] {
             let err = require_grant(&params_with_grant(Some(grant))).unwrap_err();
             assert_eq!(
                 message_of(&err),
@@ -990,6 +1062,15 @@ mod tests {
             require_grant(&params_with_grant(Some(GRANT_TYPE_REFRESH_TOKEN))).unwrap(),
             Grant::RefreshToken,
             "refresh_token selects the rotation grant"
+        );
+    }
+
+    #[test]
+    fn the_authorization_code_grant_passes_the_gate() {
+        assert_eq!(
+            require_grant(&params_with_grant(Some(GRANT_TYPE_AUTHORIZATION_CODE))).unwrap(),
+            Grant::AuthorizationCode,
+            "authorization_code selects the code-redemption grant"
         );
     }
 
@@ -1288,17 +1369,20 @@ mod tests {
         params.client_id = Some("client-id".to_owned());
         params.client_secret = Some("client-secret".to_owned());
         params.refresh_token = Some("refresh-secret".to_owned());
+        params.code = Some("authorization-code".to_owned());
         let debug = format!("{params:?}");
         assert!(
             !debug.contains("correct horse battery staple")
                 && !debug.contains("client-secret")
-                && !debug.contains("refresh-secret"),
+                && !debug.contains("refresh-secret")
+                && !debug.contains("authorization-code"),
             "the secrets must not leak: {debug}"
         );
         assert!(
             debug.contains(r#"password: "<redacted>""#)
                 && debug.contains(r#"client_secret: "<redacted>""#)
-                && debug.contains(r#"refresh_token: "<redacted>""#),
+                && debug.contains(r#"refresh_token: "<redacted>""#)
+                && debug.contains(r#"code: "<redacted>""#),
             "the markers name their fields: {debug}"
         );
         assert!(
@@ -1377,6 +1461,24 @@ mod tests {
         assert_eq!(
             message_of(&err),
             MISSING_REFRESH_TOKEN,
+            "the refusal names the missing parameter even without credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_grant_without_the_code_parameter_is_refused_by_name() {
+        // Same order as the refresh grant: the parameter gate first, so
+        // the lazy pool of `test_state` is never consulted.
+        let err = authorization_code_grant(
+            &test_state(),
+            &HeaderMap::new(),
+            &params_with_grant(Some(GRANT_TYPE_AUTHORIZATION_CODE)),
+        )
+        .await
+        .expect_err("no code is no exchange");
+        assert_eq!(
+            message_of(&err),
+            MISSING_CODE,
             "the refusal names the missing parameter even without credentials"
         );
     }
