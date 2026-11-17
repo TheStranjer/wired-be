@@ -11,11 +11,20 @@
 //!   inbox in `endpoints`, so a delivery addressed to either lands in the
 //!   capture and an inbound signature verifies against the key the document
 //!   names ([`MockPeer::deliver`] signs with the matching private half);
+//! - `GET /users/{nick}/outbox` — the actor's `OrderedCollection` root and,
+//!   under `?page=true`, the pages of activity ids a test listed with
+//!   [`MockPeer::publish`], walked with `next` / `prev` cursors;
 //! - `GET /relay` — a `Service` actor (the shape relays are served as) whose
 //!   inbox *is* the shared one, which is what lets a test watch the
 //!   publisher's per-inbox deduplication;
 //! - `GET /objects/{name}` — a public `Note` authored by the peer's own
-//!   `author` account, the object a relay re-broadcasts;
+//!   `author` account, the object a relay re-broadcasts, or whatever shaped
+//!   document [`MockPeer::serve_note`] put at that name — the id this
+//!   instance dereferences when it backfills a thread or resolves a status
+//!   by `uri`;
+//! - `GET /key` — a standalone `Key` object carrying the same
+//!   `publicKeyPem` the actor documents embed: the mirror a fetcher reads
+//!   when a `keyId` names the key rather than an actor;
 //! - `GET /.well-known/webfinger` — a JRD echoing the asked `acct:` resource
 //!   and naming that nickname's actor, so `acct:` handles resolve here;
 //! - `POST /inbox` and `POST /users/{nick}/inbox` — both record the exact
@@ -33,7 +42,10 @@
 //! with [`wired_be::federation::signature::sign_request`] and rides any path
 //! the caller names through the test router in-process; [`MockPeer::activity`]
 //! builds the documents with ids on the peer's own host, which is what the
-//! dispatcher's containment check asks of them. Reading is
+//! dispatcher's containment check asks of them, and
+//! [`MockPeer::note_document`] shapes the `Note` they wrap — the addressing,
+//! `attachment`, `tag`, `sensitive` / `summary`, a `Question`'s `oneOf`.
+//! Reading is
 //! [`MockPeer::received`], [`MockPeer::delivered`] and
 //! [`MockPeer::delivery_count`], and a [`Delivery`] proves its own authenticity
 //! through [`Delivery::signature_verifies`] and [`Delivery::digest_matches`].
@@ -82,6 +94,21 @@ const AP_CONTENT_TYPE: &str = "application/activity+json";
 const JRD_CONTENT_TYPE: &str = "application/jrd+json";
 /// The `#main-key` fragment every actor's `keyId` ends with.
 const KEY_SUFFIX: &str = "#main-key";
+/// The `@context` every mock `ActivityPub` document names.
+const AS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
+/// The `@context` of the standalone [`Key`](MockPeer::key_url) document, the
+/// `security` vocabulary a `publicKeyPem` belongs to.
+const SECURITY_CONTEXT: &str = "https://w3id.org/security/v1";
+/// The actor that owns the `/key` mirror: a nickname the peer serves an actor
+/// document for, like every other mock account, so a `keyId` naming the key
+/// settles on a fetchable owner.
+pub const KEY_OWNER: &str = "alice";
+/// The activity ids one page of a mock outbox carries: small enough that a
+/// test with three published activities walks two pages.
+const OUTBOX_PAGE: usize = 2;
+/// The `published` of a mock note: a fixed past instant, so no clock-skew
+/// clamp ever moves it.
+const DEFAULT_PUBLISHED: &str = "2026-11-02T00:00:00Z";
 
 /// The mock peer's key pair, made once for the process.
 ///
@@ -278,8 +305,9 @@ struct Scripted {
 }
 
 /// The mock's shared half: its origin, the deliveries it recorded, the
-/// scripted answers its inboxes still owe and the key pair its documents
-/// currently publish.
+/// scripted answers its inboxes still owe, the key pair its documents
+/// currently publish, the notes it serves by name and the activity ids it
+/// has published to an actor's outbox.
 #[derive(Clone, Debug)]
 struct Peer {
     /// The `http://{addr}` origin this peer answers on.
@@ -291,6 +319,48 @@ struct Peer {
     /// The key pair actor documents name as their `publicKeyPem`, swappable
     /// under [`MockPeer::rotate_keys`] while the capture keeps recording.
     key: Arc<Mutex<Arc<KeyPair>>>,
+    /// The shaped documents `GET /objects/{name}` answers by `name`, in
+    /// place of the canned public note.
+    notes: NoteShelf,
+    /// The activity ids each actor's outbox lists, by nickname, oldest
+    /// first — paged by `GET /users/{nick}/outbox`.
+    outbox: OutboxIds,
+}
+
+/// The mock's outbox listings: actor nickname to the activity ids it publishes,
+/// behind the lock the handler and [`MockPeer::publish`] share.
+type OutboxIds = Arc<Mutex<HashMap<String, Vec<String>>>>;
+
+/// The shaped notes the mock serves by object name: `GET /objects/{name}`
+/// answers what a test put here, and its canned note otherwise.
+type NoteShelf = Arc<Mutex<HashMap<String, Value>>>;
+
+impl Peer {
+    /// The activity ids published to the actor `nick`'s outbox, oldest
+    /// first; empty when nothing was published there.
+    ///
+    /// # Panics
+    ///
+    /// If the outbox lock is poisoned, which only a panicking handler leaves
+    /// behind.
+    fn listed(&self, nick: &str) -> Vec<String> {
+        self.outbox
+            .lock()
+            .expect("the outbox lock")
+            .get(nick)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The `publicKeyPem` this peer's documents carry right now.
+    ///
+    /// # Panics
+    ///
+    /// If the key lock is poisoned, which only a panicking handler leaves
+    /// behind.
+    fn public_pem(&self) -> String {
+        self.key.lock().expect("the key lock").public_pem.clone()
+    }
 }
 
 /// The running mock peer; dropping it stops the server.
@@ -311,6 +381,13 @@ fn main_key(actor: &str) -> String {
 impl MockPeer {
     /// Binds a loopback port and serves the whole peer surface.
     ///
+    /// The returned peer is the test's handle on all of it — the
+    /// [`origin`](Self::origin) to point a handle at, the [`Delivery`]
+    /// capture to read the deliveries off, and the task serving both:
+    /// [`Drop`] aborts that task, so a test must hold the peer alive for as
+    /// long as the instance is expected to reach it (which is why no test
+    /// binds it to `_`).
+    ///
     /// # Panics
     ///
     /// If no loopback port can be bound, which tests never provoke.
@@ -324,12 +401,16 @@ impl MockPeer {
             posts: Arc::new(Mutex::new(Vec::new())),
             script: Arc::new(Mutex::new(VecDeque::new())),
             key: Arc::new(Mutex::new(Arc::new(peer_keys().clone()))),
+            notes: Arc::new(Mutex::new(HashMap::new())),
+            outbox: Arc::new(Mutex::new(HashMap::new())),
         };
         let app = Router::new()
             .route("/.well-known/webfinger", get(webfinger))
+            .route("/key", get(key_mirror))
             .route("/relay", get(relay_actor))
             .route("/objects/{name}", get(note))
             .route("/users/{nick}", get(person_actor))
+            .route("/users/{nick}/outbox", get(outbox))
             .route("/users/{nick}/inbox", post(capture))
             .route(INBOX, post(capture))
             .with_state(peer.clone());
@@ -428,6 +509,79 @@ impl MockPeer {
         self.activity("Follow", name, follower, &json!(target))
     }
 
+    /// The `OrderedCollection` address of the peer actor `nick`'s outbox, as
+    /// its actor document names it.
+    #[must_use]
+    pub fn outbox_url(&self, nick: &str) -> String {
+        format!("{}/outbox", self.actor(nick))
+    }
+
+    /// The address of the standalone `Key` mirror this peer serves — the
+    /// document a `keyId` that names the key, and not an actor, resolves to.
+    #[must_use]
+    pub fn key_url(&self) -> String {
+        format!("{}/key", self.peer.base)
+    }
+
+    /// Lists `activity_id` at the end of the outbox of the peer's actor
+    /// `nick`, which is how a test decides what `GET /users/{nick}/outbox`
+    /// pages through. The ids of the activities [`activity`] built with
+    /// [`activity_id`](Self::activity_id) are what belongs here: the outbox
+    /// carries activity *references*, not documents.
+    ///
+    /// [`activity`]: Self::activity
+    ///
+    /// # Panics
+    ///
+    /// If the outbox lock is poisoned, which only a panicking handler leaves
+    /// behind.
+    pub fn publish(&self, nick: &str, activity_id: &str) {
+        let mut listing = self.peer.outbox.lock().expect("the outbox lock");
+        listing
+            .entry(nick.to_owned())
+            .or_default()
+            .push(activity_id.to_owned());
+    }
+
+    /// A public `Note` on this peer's origin named `name` — id
+    /// [`note`](Self::note) — authored by `actor` and carrying `content`.
+    /// Every field of `extra` merges over those defaults, which is how a
+    /// scenario shapes one note: its `to` / `cc` addressing, `attachment`,
+    /// `tag` (mentions, hashtags, custom emojis), `sensitive` and `summary`
+    /// for a content warning, `inReplyTo`, or a `Question`'s `oneOf` and
+    /// `closed`.
+    ///
+    /// [`note`]: Self::note
+    #[must_use]
+    pub fn note_document(&self, name: &str, actor: &str, content: &str, extra: Value) -> Value {
+        let mut note = json!({
+            "@context": AS_CONTEXT,
+            "id": self.note(name),
+            "type": "Note",
+            "attributedTo": actor,
+            "to": [PUBLIC],
+            "cc": [],
+            "content": content,
+            "published": DEFAULT_PUBLISHED,
+        });
+        merge(&mut note, extra);
+        note
+    }
+
+    /// Asks `GET /objects/{name}` to answer `document` from now on — the
+    /// shaped note a remote reader dereferences when this instance fetches
+    /// the object by id (a thread backfill, a `resolve=true` status read).
+    /// A name nothing was served for keeps answering the canned public note.
+    ///
+    /// # Panics
+    ///
+    /// If the notes lock is poisoned, which only a panicking handler leaves
+    /// behind.
+    pub fn serve_note(&self, name: &str, document: Value) {
+        let mut served = self.peer.notes.lock().expect("the notes lock");
+        let _previous: Option<Value> = served.insert(name.to_owned(), document);
+    }
+
     /// Script the next `times` inbox `POST`s — on either endpoint, in
     /// arrival order — to be recorded as always but answered `status`
     /// instead of `202`, with a `Retry-After: {secs}` header when
@@ -460,11 +614,11 @@ impl MockPeer {
         self.script_inbox(status, retry_after, usize::MAX);
     }
 
-    /// Generate and serve a fresh key pair from every actor document now —
-    /// the peer mid-rotation. The pair [`deliver`] and the signing helpers
-    /// use does not change: what this instance already mirrored of a mock
-    /// actor still vouches for the old key, which is exactly the skew a
-    /// rotation scenario reads back.
+    /// Generate and serve a fresh key pair from every document the peer
+    /// publishes from now on — the peer mid-rotation. The pair [`deliver`]
+    /// and the signing helpers use does not change: what this instance
+    /// already mirrored of a mock actor still vouches for the old key, which
+    /// is exactly the skew a rotation scenario reads back.
     ///
     /// # Panics
     ///
@@ -488,12 +642,7 @@ impl MockPeer {
     /// behind.
     #[must_use]
     pub fn served_public_key(&self) -> String {
-        self.peer
-            .key
-            .lock()
-            .expect("the key lock")
-            .public_pem
-            .clone()
+        self.peer.public_pem()
     }
 
     /// The four auth headers of a signed `POST` of `body` to this instance at
@@ -629,9 +778,9 @@ impl Drop for MockPeer {
 ///
 /// [`rotate_keys`]: MockPeer::rotate_keys
 fn actor_doc(peer: &Peer, id: &str, kind: &str, preferred: &str) -> Value {
-    let public_pem = peer.key.lock().expect("the key lock").public_pem.clone();
+    let public_pem = peer.public_pem();
     json!({
-        "@context": "https://www.w3.org/ns/activitystreams",
+        "@context": AS_CONTEXT,
         "type": kind,
         "id": id,
         "preferredUsername": preferred,
@@ -675,21 +824,130 @@ async fn relay_actor(State(peer): State<Peer>) -> Response {
     document_response(&document, AP_CONTENT_TYPE)
 }
 
-/// `GET /objects/{name}`: a public `Note` by the peer's own `author`.
+/// `GET /objects/{name}`: whatever shaped document [`MockPeer::serve_note`]
+/// put at that name, and otherwise the peer's own public `Note` by `author`.
 async fn note(State(peer): State<Peer>, Path(name): Path<String>) -> Response {
-    let id = format!("{}/objects/{name}", peer.base);
+    let served = {
+        let shelf = peer.notes.lock().expect("the notes lock");
+        shelf
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| canned_note(&peer, &name))
+    };
+    document_response(&served, AP_CONTENT_TYPE)
+}
+
+/// The `Note` a name nothing was shaped for answers with: public, authored by
+/// the peer's own `author` account, naming `name` in its body so a test can
+/// tell two of them apart.
+fn canned_note(peer: &Peer, name: &str) -> Value {
+    json!({
+        "@context": AS_CONTEXT,
+        "id": format!("{}/objects/{name}", peer.base),
+        "type": "Note",
+        "attributedTo": format!("{}/users/author", peer.base),
+        "to": [PUBLIC],
+        "cc": [],
+        "content": format!("<p>a note relayed as {name}</p>"),
+        "published": DEFAULT_PUBLISHED,
+    })
+}
+
+/// `GET /key`: the peer's current public key as a standalone `Key` object —
+/// the `security` vocabulary's shape, `owner` naming an actor this peer also
+/// serves — the mirror a fetcher reads when a `keyId` names the key instead
+/// of dereferencing an actor document.
+async fn key_mirror(State(peer): State<Peer>) -> Response {
     document_response(
         &json!({
-            "@context": "https://www.w3.org/ns/activitystreams",
-            "id": id,
-            "type": "Note",
-            "attributedTo": format!("{}/users/author", peer.base),
-            "to": [PUBLIC],
-            "content": format!("<p>a note relayed as {name}</p>"),
-            "published": "2026-11-02T00:00:00Z",
+            "@context": SECURITY_CONTEXT,
+            "id": format!("{}/key", peer.base),
+            "type": "Key",
+            "owner": format!("{}/users/{KEY_OWNER}", peer.base),
+            "publicKeyPem": peer.public_pem(),
         }),
         AP_CONTENT_TYPE,
     )
+}
+
+/// `GET /users/{nick}/outbox`: the actor's `OrderedCollection` root, and —
+/// under `?page=true`, the query this instance's own collections are paged
+/// with — one [`OUTBOX_PAGE`]-sized page of the activity ids
+/// [`MockPeer::publish`] listed for that actor.
+async fn outbox(
+    State(peer): State<Peer>,
+    Path(nick): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let root = format!("{}/users/{nick}/outbox", peer.base);
+    let ids = peer.listed(&nick);
+    if !page_requested(&params) {
+        return document_response(
+            &json!({
+                "@context": AS_CONTEXT,
+                "id": root,
+                "type": "OrderedCollection",
+                "totalItems": ids.len(),
+                "first": format!("{root}?page=true"),
+            }),
+            AP_CONTENT_TYPE,
+        );
+    }
+    let offset = params
+        .get("offset")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    document_response(&outbox_page(&root, &ids, offset), AP_CONTENT_TYPE)
+}
+
+/// One page of a mock outbox: the activity ids `offset` windows onto, as
+/// `orderedItems` of an `OrderedCollectionPage`, with the `next` and `prev`
+/// links the window leaves standing on the peer's own `offset` cursor.
+fn outbox_page(root: &str, ids: &[String], offset: usize) -> Value {
+    let page: Vec<Value> = ids
+        .iter()
+        .skip(offset)
+        .take(OUTBOX_PAGE)
+        .map(|id| json!(id))
+        .collect();
+    let mut document = json!({
+        "@context": AS_CONTEXT,
+        "id": format!("{root}?page=true&offset={offset}"),
+        "type": "OrderedCollectionPage",
+        "partOf": root,
+        "orderedItems": page,
+    });
+    if offset + OUTBOX_PAGE < ids.len() {
+        let next = offset.saturating_add(OUTBOX_PAGE);
+        document["next"] = json!(format!("{root}?page=true&offset={next}"));
+    }
+    if offset > 0 {
+        let prev = offset.saturating_sub(OUTBOX_PAGE);
+        document["prev"] = json!(format!("{root}?page=true&offset={prev}"));
+    }
+    document
+}
+
+/// Whether `params` ask for a page of a collection rather than its root:
+/// `page=true`, the spelling this instance's own `OrderedCollection`s answer.
+fn page_requested(params: &HashMap<String, String>) -> bool {
+    params.get("page").is_some_and(|value| value == "true")
+}
+
+/// Merges `extra`'s fields over `target`, dropping what they displace: the
+/// shaping every mock document builder reads its caller's `extra` through.
+///
+/// # Panics
+///
+/// If either document is not a JSON `Object`, which only a caller that built
+/// the wrong shape does.
+fn merge(target: &mut Value, extra: Value) {
+    let (Some(map), Value::Object(additions)) = (target.as_object_mut(), extra) else {
+        panic!("both documents are JSON objects");
+    };
+    for (key, value) in additions {
+        let _previous = map.insert(key, value);
+    }
 }
 
 /// `GET /.well-known/webfinger`: a JRD echoing the asked `acct:` resource and

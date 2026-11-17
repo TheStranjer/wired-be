@@ -172,6 +172,12 @@ mod domain_blocks;
 /// mock peer.
 mod e2e_discovery;
 
+/// The `remote::MockPeer` harness smoke tests (WBE-224 slice 1): the mock
+/// account resolving to the mock origin through `GET /api/v1/accounts/lookup`,
+/// one local follow-and-post delivered signed and verified out of the mock's
+/// capture, and one mock-signed `Create` folding onto the public timeline.
+mod e2e_federation;
+
 /// The end-to-end federation discovery shapes and remote resolution
 /// (WBE-224 scenarios 1 and 5): the `WebFinger`/host-meta/`NodeInfo`/actor
 /// surface read by a remote's own HTTP client and off the JSON-LD keys,
@@ -464,9 +470,10 @@ mod relationships;
 
 /// The shared loopback mock federation peer the federation scenarios drive.
 ///
-/// Real actor documents under a real RSA key, capturing inboxes, a
-/// `WebFinger`, a `Service` relay and a public `Note`, plus the signed-`POST`
-/// half that lets a peer deliver to this instance's inbox.
+/// Real actor documents under a real RSA key, a paged outbox, capturing
+/// inboxes, a `WebFinger`, a `Service` relay, a shapeable public `Note` and a
+/// `Key` mirror, plus the signed-`POST` half that lets a peer deliver to this
+/// instance's inbox.
 pub mod remote;
 
 /// Remote interaction over HTTP (`src/api/remote_interaction.rs`): the
