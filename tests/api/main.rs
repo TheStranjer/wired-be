@@ -189,6 +189,17 @@ mod e2e_federation_discovery;
 /// accepted, fanned out to, announced by and withdrawn over real HTTP.
 mod e2e_federation_follow;
 
+/// The end-to-end federation of inbound content (WBE-224 scenario 3 and the
+/// chat half of scenario 7): a signed `Create Note` at each visibility and
+/// with rich content read back through the timelines, context, poll, reactions
+/// and chat endpoints; the `Update` edit history, the `Delete` tombstone and
+/// its swallowed late create; the `Like`, `EmojiReact` and `Announce` counters
+/// and tellings; the thread backfill over real HTTP and its 404 degradation;
+/// a remote ballot on a local poll; and the delivered `ChatMessage` and its
+/// sender's withdrawal — every fact reached by real signed HTTP and read
+/// through the public API, never a row dump.
+mod e2e_federation_inbound;
+
 /// The end-to-end federation of outbound content (WBE-224 scenario 4): the
 /// `Create`/`Update`/`Delete` of a status, the `Announce`, `Like` and
 /// `EmojiReact` writes and their `Undo`s delivered signed to the right
