@@ -13,14 +13,15 @@
 //! (WBE-212). [`resolve_nicknames`] is the fourth: the batch nickname
 //! lookup the list-taking admin account endpoints act on (WBE-198).
 //!
-//! The five writers belong to the maintenance the admin API does to one
+//! The writers here belong to the maintenance the admin API does to one
 //! account rather than to the profile the account edits itself, so they
-//! sit here beside the lookups that name the row: [`set_tags`] replaces the
+//! sit beside the lookups that name the row: [`set_tags`] replaces the
 //! profile-tag array (WBE-197), [`set_role`] moves one of the two staff
 //! flags [`Role`] names, [`set_suggested`] the suggestion-pool flag the
 //! `GET /api/v{1,2}/suggestions` listings read back, [`set_active`] the
-//! activation flag the admin lifecycle pair flips (WBE-196) and
-//! [`set_approved`] the staff gate on a pending registration. Like
+//! activation flag the admin lifecycle pair flips (WBE-196),
+//! [`set_approved`] the staff gate on a pending registration and
+//! [`delete_user`] the pending account an admin rejects (WBE-213). Like
 //! [`set_also_known_as`](super::set_also_known_as) and
 //! [`set_settings_store`](super::set_settings_store) above them, each
 //! writes exactly the whole value the endpoint computed — the merge,
@@ -857,12 +858,50 @@ pub async fn set_approved(pool: &PgPool, id: Uuid) -> AppResult<Option<User>> {
     Ok(updated)
 }
 
+/// The `DELETE` behind [`delete_user`]: takes the row itself, whose
+/// cascades go through every dependent row the schema hangs off it.
+const DELETE_SQL: &str = "DELETE FROM users WHERE id = $1";
+
+/// Removes user `id`'s row outright and reports whether one went (WBE-213).
+///
+/// The write behind the Mastodon admin API's
+/// `POST /api/v1/admin/accounts/{id}/reject`: Pleroma's `User.reject` runs
+/// `User.delete`, and its `maybe_delete_from_db` clause drops the row of a
+/// local account that was never confirmed or approved instead of only
+/// purging it — which is exactly the account this route refuses anything
+/// else than, so the row goes here too. The tokens, authorizations,
+/// follows, notifications and every other dependent row leave with it on
+/// their `ON DELETE CASCADE` keys; the `moderation_log` entry the endpoint
+/// writes names the account by nickname, its `actor_id` key being `SET
+/// NULL` and its subject arrays carrying no key at all.
+///
+/// Unlike [`super::mark_deleted`] — the self-service deletion's stamp, which
+/// keeps the row so its `ActivityPub` actor stays resolvable and lets the
+/// `users.delete` sweep purge it — this takes the row in one statement and
+/// queues nothing. An account that has content worth sweeping is the delete
+/// endpoint's subject, not this one's.
+///
+/// `false` when `id` names no row.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError):
+/// the one reachable here is a dependent row whose key does not cascade
+/// (a report assigned to this account), which refuses the delete.
+pub async fn delete_user(pool: &PgPool, id: Uuid) -> AppResult<bool> {
+    let deleted = sqlx::query(DELETE_SQL).bind(id).execute(pool).await?;
+    Ok(deleted.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::models::user::{NewUser, insert};
+    use crate::models::{
+        follow,
+        user::{NewUser, insert},
+    };
 
     /// The account the listing must never answer with, and the direct
     /// lookup may.
@@ -2053,6 +2092,70 @@ mod tests {
                 .expect("a miss writes nothing")
                 .is_none(),
             "and neither does it for the approval write"
+        );
+    }
+
+    /// The rejection's delete takes the row itself and everything the schema
+    /// hangs off it: the follow it held goes on the cascade, the account it
+    /// followed stays, and a second delete — like an id that never existed —
+    /// reports that no row matched.
+    #[tokio::test]
+    async fn delete_user_takes_the_row_and_its_cascades() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let follower = insert(
+            &pool,
+            &NewUser::local("alice", "https://test.example/users/alice"),
+        )
+        .await
+        .expect("the follower inserts");
+        let other = insert(
+            &pool,
+            &NewUser::local("bob", "https://test.example/users/bob"),
+        )
+        .await
+        .expect("the followed account inserts");
+        let _placed: follow::Follow =
+            follow::follow(&pool, "https://test.example", &follower, &other)
+                .await
+                .expect("the follow is placed");
+
+        assert!(
+            delete_user(&pool, follower.id)
+                .await
+                .expect("the delete runs"),
+            "the named row went"
+        );
+        assert!(
+            super::super::get_by_id(&pool, follower.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "and nothing answers to that id any more"
+        );
+        let held =
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM follows WHERE follower_id = $1")
+                .bind(follower.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the follow count reads");
+        assert_eq!(held, 0, "the follow left with the row");
+        assert!(
+            super::super::get_by_id(&pool, other.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "the account it followed is untouched"
+        );
+        assert!(
+            !delete_user(&pool, follower.id).await.expect("a miss runs"),
+            "the second delete matches no row"
+        );
+        assert!(
+            !delete_user(&pool, Uuid::now_v7())
+                .await
+                .expect("an unknown id runs"),
+            "and neither does an id that never existed"
         );
     }
 }

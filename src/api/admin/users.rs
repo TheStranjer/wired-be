@@ -148,9 +148,11 @@
 //!   stamped, every token revoked, the `users.delete` sweep queued on
 //!   the `background` queue (the sweep's first act is the `Delete`
 //!   announcement to the peers) — except the caller's own row, which is
-//!   ignored. The answer is the JSON array of the nicknames started,
-//!   Pleroma's `json(conn, nicknames)` narrowed to what was found and
-//!   not the caller, and one `delete` entry names them.
+//!   ignored. That start is [`helpers::start_deletion`], shared with the
+//!   Mastodon admin API's `DELETE /api/v1/admin/accounts/{id}`. The answer
+//!   is the JSON array of the nicknames started, Pleroma's
+//!   `json(conn, nicknames)` narrowed to what was found and not the
+//!   caller, and one `delete` entry names them.
 //! - `PATCH /users/activate` and `PATCH /users/deactivate` —
 //!   `nicknames[]`: the `is_active` flag moves on every named account
 //!   that exists — the acting admin's own excepted from the
@@ -171,10 +173,11 @@
 //!   `account_approved` letter; an already-approved one answers unchanged
 //!   and is mailed nothing (Pleroma's `approve` clause for
 //!   `is_approved: true`), and no credential is minted — the approved
-//!   account signs in with its own password. The answer is the named
-//!   accounts as admin entities under `users`, one `approve` entry
-//!   naming them. `POST /api/v1/admin/accounts/{id}/approve` is the
-//!   separate Mastodon-admin ticket's own route.
+//!   account signs in with its own password. The clearing write and its
+//!   letter are [`helpers::approve_account`], shared with the Mastodon
+//!   admin API's `POST /api/v1/admin/accounts/{id}/approve` (WBE-213). The
+//!   answer is the named accounts as admin entities under `users`, one
+//!   `approve` entry naming them.
 //!
 //! Two of Pleroma's parameters are read wider here than its
 //! `CastAndValidate` declares them: an array key arrives in both the
@@ -209,7 +212,7 @@ use crate::{
             ACTOR_TYPES, SCOPES, SERVICE_ACTOR_TYPE, after_follow_changed, after_profile_updated,
             render_note, sanitized_name, stored_fields,
         },
-        helpers::QueryPairs,
+        helpers::{self, QueryPairs},
         password_reset::RESET_PATH,
         pleroma_settings::{check_store_size, shallow_merge},
     },
@@ -220,11 +223,8 @@ use crate::{
     },
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
-    jobs::{QUEUE_BACKGROUND, deletion},
-    mailer::{self, templates},
     models::{
         follow::{self, FollowState},
-        job::{NewJob, enqueue},
         moderation_log, oauth_token, password_reset,
         user::{self, Flag, PleromaPrefs, ProfileFields, User, admin, confirmation, mfa, register},
     },
@@ -2108,7 +2108,7 @@ async fn delete_users(
         .filter(|account| account.id != admin.0.id)
         .collect();
     for account in &subjects {
-        start_deletion(&state, account).await?;
+        helpers::start_deletion(&state, account).await?;
     }
     let nicknames: Vec<String> = subjects
         .iter()
@@ -2121,43 +2121,6 @@ async fn delete_users(
         "admin deleted users"
     );
     Ok(Json(nicknames))
-}
-
-/// The admin deletion's start, the same write the user-facing
-/// `POST /api/pleroma/delete_account` performs: [`mark_deleted`] stamps
-/// `deleted_at` and deactivates beside [`delete_all_for_user`]'s revocation
-/// of every token, in one transaction, and the
-/// [`users.delete`](deletion::KIND_DELETE) sweep goes onto
-/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
-/// sweep's own first act, not this endpoint's — a client that gets this
-/// 200 must not wait on federation.
-///
-/// [`mark_deleted`]: crate::models::user::mark_deleted
-/// [`delete_all_for_user`]: crate::models::oauth_token::delete_all_for_user
-async fn start_deletion(state: &AppState, account: &User) -> AppResult<()> {
-    let mut tx = state.db.begin().await?;
-    user::mark_deleted(&mut *tx, account.id).await?;
-    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
-    tx.commit().await?;
-    let queued = enqueue(
-        &state.db,
-        NewJob {
-            queue: QUEUE_BACKGROUND,
-            kind: deletion::KIND_DELETE,
-            args: deletion::job_args(account.id),
-            run_at: None,
-            max_attempts: None,
-            unique_key: None,
-        },
-    )
-    .await?;
-    debug!(
-        account = %account.nickname,
-        revoked,
-        queued = queued.is_some(),
-        "admin started a user deletion"
-    );
-    Ok(())
 }
 
 /// The activation write the activate/deactivate pair shares: `is_active`
@@ -2303,7 +2266,7 @@ async fn approve_users(
     let mut answered = Vec::with_capacity(found.len());
     for account in found {
         if account.approval_pending.get() {
-            answered.push(approve_one(&state, account).await?);
+            answered.push(helpers::approve_account(&state, account).await?);
         } else {
             answered.push(account);
         }
@@ -2315,24 +2278,6 @@ async fn approve_users(
         "admin approved users"
     );
     Ok(Json(AdminAccounts::from_users(&answered, &state.config)))
-}
-
-/// The write behind one approval: [`set_approved`] clears the gate and
-/// hands the fresh row back (a row that went away mid-request keeps the
-/// stored copy as the answer), and the newly-approved account gets its
-/// letter through the mailer queue when it gave an address at all —
-/// Pleroma's `send_user_approval_email` has the same guard on its
-/// `is_binary(email)` clause.
-///
-/// [`set_approved`]: crate::models::user::admin::set_approved
-async fn approve_one(state: &AppState, pending: User) -> AppResult<User> {
-    let Some(updated) = admin::set_approved(&state.db, pending.id).await? else {
-        return Ok(pending);
-    };
-    if let Some(email) = updated.email.as_deref() {
-        mailer::deliver_later(state, templates::account_approved(&state.config, email)).await?;
-    }
-    Ok(updated)
 }
 
 /// The listing criteria one request states: the five named criteria, the

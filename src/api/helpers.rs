@@ -7,23 +7,30 @@
 //! endpoint owes the client, reading the `id[]` array a batch endpoint
 //! is keyed on, answering one [`TimelineQuery`] page as a status listing
 //! ([`timeline_response`], with the `Link` header and the filter-parameter
-//! readers the timeline routes and the account status listing share), and
-//! more as later tickets need it.
+//! readers the timeline routes and the account status listing share), the
+//! two account-lifecycle writes the two admin surfaces share
+//! ([`start_deletion`] and [`approve_account`]), and more as later tickets
+//! need it.
 
 use axum::{
     Json,
     http::{HeaderMap, Uri},
 };
+use tracing::debug;
 use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
+    jobs::{QUEUE_BACKGROUND, deletion},
+    mailer::{self, templates},
     models::{
+        job::{NewJob, enqueue},
+        oauth_token,
         status::{self, Status, Visibility},
         status_visibility,
-        user::{self, User},
+        user::{self, User, admin},
     },
     pagination::{link_header, set_link_header},
     services::{
@@ -352,6 +359,78 @@ pub fn push_visibility(list: &mut Vec<Visibility>, raw: &str) {
 pub fn is_true(text: &str) -> bool {
     let text = text.trim();
     text.eq_ignore_ascii_case("true") || text == "1"
+}
+
+/// Starts `account`'s deletion: the write the admin `DELETE
+/// /api/v1/pleroma/admin/users` and the Mastodon admin `DELETE
+/// /api/v1/admin/accounts/{id}` share.
+///
+/// It is the shape the user-facing `POST /api/pleroma/delete_account`
+/// performs: [`mark_deleted`] stamps `deleted_at` and deactivates beside
+/// [`delete_all_for_user`]'s revocation of every token, in one transaction,
+/// and the [`users.delete`](deletion::KIND_DELETE) sweep goes onto
+/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
+/// sweep's own first act, not the endpoint's — a client that gets this 200
+/// must not wait on federation.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the transaction or the queue write.
+///
+/// [`mark_deleted`]: crate::models::user::mark_deleted
+/// [`delete_all_for_user`]: crate::models::oauth_token::delete_all_for_user
+pub async fn start_deletion(state: &AppState, account: &User) -> AppResult<()> {
+    let mut tx = state.db.begin().await?;
+    user::mark_deleted(&mut *tx, account.id).await?;
+    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
+    tx.commit().await?;
+    let queued = enqueue(
+        &state.db,
+        NewJob {
+            queue: QUEUE_BACKGROUND,
+            kind: deletion::KIND_DELETE,
+            args: deletion::job_args(account.id),
+            run_at: None,
+            max_attempts: None,
+            unique_key: None,
+        },
+    )
+    .await?;
+    debug!(
+        account = %account.nickname,
+        revoked,
+        queued = queued.is_some(),
+        "started a user deletion"
+    );
+    Ok(())
+}
+
+/// Approves the pending registration `pending` and posts its
+/// `account_approved` letter.
+///
+/// [`set_approved`] clears the staff gate and hands the fresh row back (a
+/// row that went away mid-request keeps the stored copy as the answer), and
+/// the newly-approved account gets its letter through the mailer queue when
+/// it gave an address at all — Pleroma's `send_user_approval_email` has the
+/// same guard on its `is_binary(email)` clause.
+///
+/// The shared half of the admin `PATCH /api/v1/pleroma/admin/users/approve`
+/// batch and the Mastodon admin `POST /api/v1/admin/accounts/{id}/approve`:
+/// which account is a pending one at all is each endpoint's own check.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the write or the letter's queueing.
+///
+/// [`set_approved`]: crate::models::user::admin::set_approved
+pub async fn approve_account(state: &AppState, pending: User) -> AppResult<User> {
+    let Some(updated) = admin::set_approved(&state.db, pending.id).await? else {
+        return Ok(pending);
+    };
+    if let Some(email) = updated.email.as_deref() {
+        mailer::deliver_later(state, templates::account_approved(&state.config, email)).await?;
+    }
+    Ok(updated)
 }
 
 #[cfg(test)]

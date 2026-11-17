@@ -18,7 +18,8 @@
 //! the affected users (into the `subject_ids` / `subject_nicknames`
 //! columns) and the sentence, and its `data` map is what the action adds
 //! beyond actor/action/message. The small per-action helpers built on it —
-//! [`deactivate`], [`activate`], [`delete`], [`approve`], [`create_users`],
+//! [`deactivate`], [`activate`], [`delete`], [`approve`], [`reject`],
+//! [`account_action`], [`create_users`],
 //! [`tag`],
 //! [`untag`], [`grant`], [`revoke`], [`force_password_reset`],
 //! [`updated_users`], [`confirm_email`], [`resend_confirmation_email`],
@@ -46,6 +47,8 @@
 //! [`list`] is the read behind the endpoint: the newest-first `page` /
 //! `page_size` window over the [`LogListParams`] filters, beside the total
 //! count of rows the same filters select.
+
+use std::slice;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
@@ -277,9 +280,10 @@ pub struct ConfigChange<'a> {
 }
 
 /// Records `action` over `subjects` with the sentence `"{actor} {verb}
-/// users: …"`: the five user-list actions share Pleroma's exact wording
-/// (the `deactivate`/`activate`/`delete`/`approve`/`force_password_reset`
-/// clauses of `get_log_entry_message`) and its `subject` data map.
+/// users: …"`: the user-list actions share Pleroma's exact wording (the
+/// `deactivate`/`activate`/`delete`/`approve`/`reject`/
+/// `force_password_reset` clauses of `get_log_entry_message`) and its
+/// `subject` data map.
 async fn users_action(
     pool: &PgPool,
     actor: &User,
@@ -344,6 +348,61 @@ pub async fn delete(pool: &PgPool, actor: &User, subjects: &[User]) -> AppResult
 /// [`AppError::Database`](crate::error::AppError); see [`record`].
 pub async fn approve(pool: &PgPool, actor: &User, subjects: &[User]) -> AppResult<ModerationLog> {
     users_action(pool, actor, subjects, "approve", "approved").await
+}
+
+/// Records a `reject`: `@admin rejected users: @alice, @bob`.
+///
+/// The entry the Mastodon admin API's
+/// `POST /api/v1/admin/accounts/{id}/reject` leaves behind (WBE-213),
+/// Pleroma's `reject` clause of `get_log_entry_message`. The rejected
+/// account's row is gone when this records — rejection DELETES the account —
+/// and the entry is the surviving trace of it: the subject columns carry the
+/// nickname of a row nothing joins to any more.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn reject(pool: &PgPool, actor: &User, subjects: &[User]) -> AppResult<ModerationLog> {
+    users_action(pool, actor, subjects, "reject", "rejected").await
+}
+
+/// Records one account action the endpoint names by its submitted type and
+/// no dedicated clause spells out: `@admin performed action {action}`.
+///
+/// That is Pleroma's `get_log_entry_message` fall-through for an action it
+/// has no sentence of its own for, over the same `subject` user list its
+/// `insert_log` writes.
+///
+/// [`crate::api::mastodon_admin`] records every
+/// `POST /api/v1/admin/accounts/{id}/action` through here under the type the
+/// request stated (`none`, `sensitive`, `silence`, `disable`, `suspend`);
+/// the state changes those types make keep the dedicated entry of their own
+/// ([`deactivate`], [`report_update`], …), which is why the two families
+/// appear side by side in the log for one request.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn account_action(
+    pool: &PgPool,
+    actor: &User,
+    subject: &User,
+    action: &str,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} performed action {action}", actor.nickname);
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: vec![subject],
+            message,
+            data: subject_data(slice::from_ref(subject)),
+        },
+    )
+    .await
 }
 
 /// Records a `create`: `@admin created users: @alice, @bob` — the
@@ -1562,7 +1621,7 @@ mod tests {
     /// A one-user subject slice, for the helpers a test calls on a lone
     /// account.
     fn one(user: &User) -> &[User] {
-        std::slice::from_ref(user)
+        slice::from_ref(user)
     }
 
     /// The fixed report id the report and status sentence tests read.
@@ -1592,6 +1651,11 @@ mod tests {
             users_sentence("admin", "approved", &subjects),
             "@admin approved users: @alice, @bob",
             "the approve clause"
+        );
+        assert_eq!(
+            users_sentence("admin", "rejected", &subjects),
+            "@admin rejected users: @alice, @bob",
+            "the reject clause"
         );
         assert_eq!(
             users_sentence("admin", "created", &subjects),
@@ -1806,6 +1870,7 @@ mod tests {
             activate(&pool, &actor, &subjects).await.expect("records"),
             delete(&pool, &actor, &subjects).await.expect("records"),
             approve(&pool, &actor, &subjects).await.expect("records"),
+            reject(&pool, &actor, &subjects).await.expect("records"),
             create_users(&pool, &actor, &subjects)
                 .await
                 .expect("records"),
@@ -1836,6 +1901,7 @@ mod tests {
             ("activate", "subject"),
             ("delete", "subject"),
             ("approve", "subject"),
+            ("reject", "subject"),
             ("create", "subjects"),
             ("force_password_reset", "subject"),
             ("updated_users", "subject"),
@@ -1865,6 +1931,36 @@ mod tests {
                 row.message.starts_with("@mod ") && row.message.ends_with(" users: @alice, @bob"),
                 "{action} reads like Pleroma: {}",
                 row.message
+            );
+        }
+    }
+
+    /// The account-action helper stores Pleroma's fall-through sentence —
+    /// `@mod performed action {type}` — with the one account in the subject
+    /// columns and the same user array under `subject` the user-list
+    /// actions write.
+    #[tokio::test]
+    async fn account_action_entries_name_their_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "mod").await;
+        let alice = stored(&pool, "alice").await;
+        let alice_id = alice.id;
+        for kind in ["none", "sensitive", "silence", "disable", "suspend"] {
+            let row = account_action(&pool, &actor, &alice, kind)
+                .await
+                .expect("records");
+            assert_eq!(row.action, kind, "the entry is named by the type");
+            assert_eq!(row.subject_ids, vec![alice_id], "{kind} names its subject");
+            assert_eq!(
+                row.data["subject"].as_array().map_or(0, Vec::len),
+                1,
+                "{kind} carries the one user map"
+            );
+            assert_eq!(
+                row.message,
+                format!("@mod performed action {kind}"),
+                "Pleroma's fall-through sentence"
             );
         }
     }
