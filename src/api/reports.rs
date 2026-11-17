@@ -50,6 +50,17 @@
 //! is not deduplicated: the same account may report the same account again,
 //! and each filing is its own row with its own id.
 //!
+//! `POST /api/v1/accounts/{id}/flag` is the same filing keyed by the path:
+//! the target is the account the route names and the body carries everything
+//! else the `ReportParams` of `POST /api/v1/reports` does minus
+//! `account_id`. Its one deliberate
+//! difference is the default: `forward` is `true` unless the body says
+//! otherwise, because the point of flagging an account by id is that the
+//! target's own instance hears about it ([`federation_out::after_report_created`]
+//! then speaks the `Flag` as this instance's own actor, delivered to the
+//! target's inbox alone); `forward: false` keeps the flag with our own
+//! moderators exactly like an unforwarded `POST /api/v1/reports`.
+//!
 //! A fresh report is `open`, has nothing done about it, and names no
 //! moderator; moving it through moderation is the admin tickets' business,
 //! which is what [`report::set_state`] and [`report::assign`] are there for.
@@ -69,7 +80,11 @@
 //! [`report::assign`]: crate::models::report::assign
 //! [`status_visibility`]: crate::models::status_visibility
 
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    routing::post,
+};
 use serde::Deserialize;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -108,10 +123,15 @@ const CATEGORY_INVALID: &str = "Validation failed: Category is not included in t
 /// `state` is what lets the one route mount the `statuses_actions` rate
 /// limiter (see [`crate::rate_limit`]).
 pub fn router(state: &AppState) -> Router<AppState> {
-    Router::new().route(
-        "/reports",
-        post(create_report).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
-    )
+    Router::new()
+        .route(
+            "/reports",
+            post(create_report).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
+        )
+        .route(
+            "/accounts/{id}/flag",
+            post(flag_account).layer(crate::rate_limit::rate_limit(state, "statuses_actions")),
+        )
 }
 
 /// `POST /api/v1/reports` — file the report the body describes and answer the
@@ -139,20 +159,103 @@ async fn create_report(
     ApiBody(params): ApiBody<ReportParams>,
 ) -> AppResult<Json<Report>> {
     auth.require(WRITE_REPORTS)?;
-    let comment = validated_comment(state.config.max_report_comment, params.comment.as_deref())?;
-    let category = validated_category(params.category.as_deref())?;
-    let target = account_or_404(&state, &params.account_id).await?;
-    let status_ids = cited_status_ids(&state, &auth.0, &target, params.status_ids).await?;
-    let rule_ids = cited_rule_ids(&state, params.rule_ids).await?;
+    file(
+        &state,
+        &auth.0,
+        &params.account_id,
+        Filing {
+            comment: params.comment.as_deref(),
+            category: params.category.as_deref(),
+            forward: params.forward.unwrap_or_default(),
+            status_ids: params.status_ids,
+            rule_ids: params.rule_ids,
+        },
+    )
+    .await
+}
+
+/// `POST /api/v1/accounts/{id}/flag` — file a report against the account the
+/// path names, on the body of [`crate::api::reports::ReportParams`] minus
+/// `account_id`.
+///
+/// One deliberate difference from the collection-shaped route: `forward`
+/// defaults to `true` here, because the point of flagging an account by id
+/// is that the target's instance is told (see the [module docs]). Everything
+/// else — the scope, the checks and their order, the write, the post-write
+/// hook and the entity answer — is [`file`], shared with
+/// [`create_report`] line for line.
+///
+/// # Errors
+///
+/// Exactly [`create_report`]'s, with the path id standing in for
+/// `account_id`: a malformed or unknown one is the shared 404.
+async fn flag_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+    ApiBody(params): ApiBody<FlagParams>,
+) -> AppResult<Json<Report>> {
+    auth.require(WRITE_REPORTS)?;
+    file(
+        &state,
+        &auth.0,
+        &id,
+        Filing {
+            comment: params.comment.as_deref(),
+            category: params.category.as_deref(),
+            forward: params.forward.unwrap_or(true),
+            status_ids: params.status_ids,
+            rule_ids: params.rule_ids,
+        },
+    )
+    .await
+}
+
+/// The validated body of one filing, in the raw shape both report routes
+/// hand to [`file`]: what the client sent, before any of it is checked.
+#[derive(Debug)]
+struct Filing<'a> {
+    /// The reporter's own words, `None` for the empty comment.
+    comment: Option<&'a str>,
+    /// The claimed reason, `None` for the `other` default.
+    category: Option<&'a str>,
+    /// Whether the target's instance is asked to handle it; each route
+    /// applies its own default before handing this in.
+    forward: bool,
+    /// The statuses cited for context, as sent.
+    status_ids: Option<IdValues>,
+    /// The instance rules cited, as sent.
+    rule_ids: Option<IdValues>,
+}
+
+/// The whole life of one filing, shared by both report routes: body checks
+/// first, then the target, then the two id arrays, then the write, the
+/// post-write hook and the entity answer. Split from the handlers so the
+/// path-keyed flag cannot drift from the collection-keyed report.
+///
+/// # Errors
+///
+/// Every refusal [`create_report`] documents, in the same order.
+async fn file(
+    state: &AppState,
+    reporter: &User,
+    target_id: &str,
+    filing: Filing<'_>,
+) -> AppResult<Json<Report>> {
+    let comment = validated_comment(state.config.max_report_comment, filing.comment)?;
+    let category = validated_category(filing.category)?;
+    let target = account_or_404(state, target_id).await?;
+    let status_ids = cited_status_ids(state, reporter, &target, filing.status_ids).await?;
+    let rule_ids = cited_rule_ids(state, filing.rule_ids).await?;
     let row = report::create(
         &state.db,
         &state.config.base_url,
-        &auth.0,
+        reporter,
         &target,
         &report::NewReport {
             comment,
             category,
-            forwarded: params.forward.unwrap_or_default(),
+            forwarded: filing.forward,
             rule_ids,
             status_ids,
         },
@@ -160,12 +263,12 @@ async fn create_report(
     .await?;
     debug!(
         report = %row.id,
-        user = %auth.0.id,
+        user = %reporter.id,
         target = %target.id,
         "report filed"
     );
-    after_report_created(&state, &row).await;
-    filed_response(&state, &auth.0, &target, &row).await
+    after_report_created(state, &row).await;
+    filed_response(state, reporter, &target, &row).await
 }
 
 /// The entity response for a filed report: its cited statuses read back from
@@ -211,6 +314,32 @@ struct ReportParams {
     comment: Option<String>,
     /// Whether to forward the report to the target's instance; `false` when
     /// absent (Pleroma's `Map.get(data, :forward, false)`).
+    #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
+    forward: Option<bool>,
+    /// Why it is reporting; `other` when absent.
+    #[serde(default)]
+    category: Option<String>,
+    /// The instance rules it is citing.
+    #[serde(default)]
+    rule_ids: Option<IdValues>,
+}
+
+/// The request parameters of `POST /api/v1/accounts/{id}/flag`: everything
+/// [`ReportParams`] carries except the target, which rides in the path.
+///
+/// [`forward`](Self::forward) is read here but defaulted the other way
+/// round — the flag route assumes forwarding is why it was called — and
+/// every other default matches the collection-shaped filing.
+#[derive(Debug, Deserialize)]
+struct FlagParams {
+    /// The statuses to cite for context.
+    #[serde(default)]
+    status_ids: Option<IdValues>,
+    /// The reporter's own words; empty when it says none.
+    #[serde(default)]
+    comment: Option<String>,
+    /// Whether to forward the flag to the target's instance; `true` when
+    /// absent, the opposite of the `POST /api/v1/reports` default.
     #[serde(default, deserialize_with = "crate::extract::flex::opt_bool")]
     forward: Option<bool>,
     /// Why it is reporting; `other` when absent.

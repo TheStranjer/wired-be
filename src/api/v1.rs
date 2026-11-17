@@ -10,9 +10,9 @@ use crate::{
         custom_emojis, domain_blocks, emoji_packs, emoji_reactions, endorsements,
         federation_status, filters, follow_requests, instance, lists, markers, mastodon_admin,
         mastodon_admin_reports, media, misc, mutes, notifications, oauth_tokens, password_reset,
-        pleroma_accounts, pleroma_bookmark_folders, pleroma_settings, polls, push,
-        remote_interaction, reports, scheduled_statuses, scrobbles, search, statuses, streaming,
-        tags, timelines,
+        pleroma_account_settings, pleroma_accounts, pleroma_bookmark_folders, pleroma_settings,
+        polls, push, remote_interaction, reports, scheduled_statuses, scrobbles, search, statuses,
+        streaming, tags, timelines,
     },
     state::AppState,
 };
@@ -63,6 +63,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(mutes::router())
         .merge(notifications::router())
         .merge(password_reset::pleroma_router())
+        .merge(pleroma_account_settings::mastodon_router())
         .merge(pleroma_accounts::router(state))
         .merge(pleroma_settings::router(&state.config))
         .merge(polls::router(state))

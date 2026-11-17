@@ -41,8 +41,14 @@
 //! or [`HttpError::Timeout`] failure marks the host unreachable on any
 //! attempt, and so does a `5xx` answer once this attempt spends the
 //! [`MAX_ATTEMPTS`] budget (a `5xx` with retries still left says only *not
-//! now*). Everything else stays silent in the ledger: a permanent `4xx`
-//! refusal and an [`HttpError::InvalidUrl`] or [`HttpError::Blocked`]
+//! now*). A `410 Gone` marks it on its first answer too: unlike the other
+//! refusals it does not reject one activity, it declares the address itself
+//! gone for good, and a host that says so of its inbox has opted out of
+//! every later fan-out ([`crate::federation::publisher`] drops candidates
+//! whose host the ledger marks, so once a `410` lands no new delivery is
+//! even queued there). Everything else stays silent in the ledger: any
+//! other permanent
+//! `4xx` refusal and an [`HttpError::InvalidUrl`] or [`HttpError::Blocked`]
 //! guard rejection tell nothing about the host being down. The marking
 //! itself is bookkeeping: [`instance::set_unreachable`] keeps an earlier
 //! mark in place, and a ledger write that fails is logged and never changes
@@ -106,6 +112,14 @@ const MAX_RETRY_AFTER: Duration = Duration::from_hours(6);
 /// a key that has just rotated reads as a bad signature once, and a refusal
 /// that survives a refresh window is a real refusal.
 const FIRST_ATTEMPT: i32 = 1;
+
+/// The status an inbox answers with to say the address is gone for good.
+/// It discards its own delivery like every permanent refusal, and it is the
+/// one `4xx` the reachability ledger records: no other refusal indicts the
+/// whole host the way "this endpoint is gone forever" does, and the ledger
+/// is the mechanism that stops [`crate::federation::publisher`] from
+/// queueing later fan-outs against it.
+const STATUS_GONE: u16 = 410;
 
 /// The JSON arguments of a [`KIND_DELIVER`] job: the four fields
 /// [`enqueue_delivery`] writes and [`handle`] reads.
@@ -461,14 +475,18 @@ async fn note_transport_failure(state: &AppState, inbox: &str, err: &HttpError) 
 /// and [`instance::set_reachable`] clears any mark there; a `5xx` on the
 /// attempt that spends [`MAX_ATTEMPTS`] marks the host unreachable (a `5xx`
 /// with retries still left says only *not now*, and every other answer —
-/// the `4xx` refusals, `3xx`, `408`, `429` — says nothing). An inbox whose
-/// host no `http(s)` URL gives names is skipped, and a write that fails is
-/// logged, never the job's outcome, which [`delivery_outcome`] still
+/// the `4xx` refusals other than [`STATUS_GONE`], `3xx`, `408`, `429` —
+/// says nothing); and a [`STATUS_GONE`] marks it on any attempt, because a
+/// peer that answers 410 has declared the address gone for good and no
+/// retry or later activity will land there. An inbox whose host no
+/// `http(s)` URL gives names is skipped, and a write that fails is logged,
+/// never the job's outcome, which [`delivery_outcome`] still
 /// decides alone.
 async fn note_answer(state: &AppState, inbox: &str, status: u16, attempt: AttemptInfo) {
     let delivered = (200..=299).contains(&status);
     let spent_5xx = (500..=599).contains(&status) && attempt.attempts >= attempt.max_attempts;
-    if !delivered && !spent_5xx {
+    let gone = status == STATUS_GONE;
+    if !delivered && !spent_5xx && !gone {
         return;
     }
     let Some(host) = json::http_host(inbox) else {
@@ -1262,6 +1280,11 @@ mod tests {
                 outcome_text(&other)
             ),
         }
+        assert!(
+            mark_of(&pool, LOOPBACK_HOST).await.is_some(),
+            "the 410 also marks the host: an address gone for good closes \
+             the ledger entry against every later fan-out"
+        );
     }
 
     #[tokio::test]
@@ -1719,9 +1742,12 @@ mod tests {
         server.abort();
     }
 
-    /// A permanent `4xx` refusal — even the final attempt's — discards the
-    /// delivery and leaves the host untouched in the ledger: a refusal
-    /// answers for the inbox, not for the host being down.
+    /// A permanent `4xx` refusal that is not `410` — even the final
+    /// attempt's — discards the delivery and leaves the host untouched in
+    /// the ledger: a refusal answers for one inbox's mood about one
+    /// activity, not for the host being gone. (`410 Gone` is the exception
+    /// that speaks about the address itself; see
+    /// [`a_gone_inbox_discards_the_delivery`].)
     #[tokio::test]
     async fn a_permanent_refusal_leaves_the_host_unmarked() {
         let db = crate::test_db::test_db().await.expect("test database slot");

@@ -55,6 +55,11 @@
 //!   ([`ApiParams`], the spellings Pleroma accepts for this action) and
 //!   removes those members, answering `{}`; an id that is not a member of
 //!   that list — account or not — is ignored.
+//! - Both writes announce the REMOTE members they name: the owner's
+//!   instance publishes the `Add` / `Remove` addressed to the member
+//!   alone, `target` the list's curated inbox (see
+//!   [`crate::services::federation_out::after_list_member_changed`]). A
+//!   local member hears nothing: their timeline is the delivery.
 //!
 //! Every route of both groups requires a user token ([`AuthUser`]) and, per
 //! the ticket's scope pair, `read:lists` to look and `write:lists` to change.
@@ -69,7 +74,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -87,6 +92,7 @@ use crate::{
     },
     oauth::scopes::{READ_LISTS, WRITE_LISTS},
     pagination::{MAX_LIMIT, OrdinalPageParams, link_header, set_link_header},
+    services::federation_out,
     state::AppState,
     util::id::parse_id,
 };
@@ -363,6 +369,7 @@ async fn add_list_accounts(
         user = %auth.0.id,
         "list members added"
     );
+    announce_membership(&state, &auth.0, list_id, &members, true).await;
     Ok(empty_object())
 }
 
@@ -398,7 +405,39 @@ async fn remove_list_accounts(
         user = %auth.0.id,
         "list members removed"
     );
+    announce_membership(&state, &auth.0, list_id, &members, false).await;
     Ok(empty_object())
+}
+
+/// The federation half of a membership write: every REMOTE account the
+/// write names is told about it through
+/// [`federation_out::after_list_member_changed`], which addresses the
+/// `Add` / `Remove` to the member alone with this list's curated inbox as
+/// its `target`. Local members announce nothing (the hook's own gate), a
+/// read that fails names nobody and only costs this announcement — the
+/// membership write already stands — and an id with no row is simply not
+/// anybody to tell.
+async fn announce_membership(
+    state: &AppState,
+    owner: &user::User,
+    list_id: Uuid,
+    members: &[Uuid],
+    adding: bool,
+) {
+    let rows = match user::get_many(&state.db, members).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            warn!(
+                %err,
+                list = %list_id,
+                "list membership federation could not read the named accounts"
+            );
+            return;
+        }
+    };
+    for member in rows {
+        federation_out::after_list_member_changed(state, owner, list_id, &member, adding).await;
+    }
 }
 
 /// The `{id}` path segment of a list route, resolved to the caller's list:

@@ -19,7 +19,15 @@
 //! - `GET /.well-known/webfinger` — a JRD echoing the asked `acct:` resource
 //!   and naming that nickname's actor, so `acct:` handles resolve here;
 //! - `POST /inbox` and `POST /users/{nick}/inbox` — both record the exact
-//!   bytes, headers and path they were sent to and answer `202 Accepted`.
+//!   bytes, headers and path they were sent to and answer `202 Accepted`,
+//!   or the next answer the test scripted with [`MockPeer::script_inbox`]
+//!   / [`MockPeer::script_inbox_permanently`] (a `500`, a `503` with a
+//!   `Retry-After`, a `410` that never lifts — whatever the scenario is
+//!   making the delivery worker see);
+//! - [`MockPeer::rotate_keys`] swaps the key pair every actor document
+//!   publishes from then on, so a scenario can stand the peer in a key
+//!   rotation and compare what this instance still holds against what is
+//!   served now.
 //!
 //! Sending is [`MockPeer::deliver`], which signs as one of the peer's actors
 //! with [`wired_be::federation::signature::sign_request`] and rides any path
@@ -34,13 +42,16 @@
 
 #![cfg(test)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header::CONTENT_TYPE};
+use axum::http::{
+    HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, header::CONTENT_TYPE, header::RETRY_AFTER,
+};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
@@ -204,6 +215,13 @@ impl Delivery {
             .map(|parsed| parsed.key_id)
     }
 
+    /// The exact bytes the `POST` arrived with, before parsing. A retry
+    /// test compares two deliveries with these to prove the same signed
+    /// body went out again.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
     /// Whether the `Digest` header describes the bytes that arrived.
     pub fn digest_matches(&self) -> bool {
         verify_digest(&self.header_map(), &self.body).is_ok()
@@ -244,13 +262,35 @@ impl Delivery {
     }
 }
 
-/// The mock's shared half: its origin and the deliveries it recorded.
+/// One answer a test asked the inboxes to give before falling back to the
+/// plain `202`: the status, an optional `Retry-After` delta in seconds, and
+/// how many further `POST`s it still stands for.
+#[derive(Clone, Debug)]
+struct Scripted {
+    /// The status to answer with.
+    status: StatusCode,
+    /// Seconds to name in the `Retry-After` header, when the answer asks
+    /// for a scheduled retry.
+    retry_after: Option<u64>,
+    /// How many more `POST`s get this answer; the queue entry is spent
+    /// when it reaches zero.
+    remaining: usize,
+}
+
+/// The mock's shared half: its origin, the deliveries it recorded, the
+/// scripted answers its inboxes still owe and the key pair its documents
+/// currently publish.
 #[derive(Clone, Debug)]
 struct Peer {
     /// The `http://{addr}` origin this peer answers on.
     base: String,
     /// The inbox `POST`s it recorded, oldest first.
     posts: Arc<Mutex<Vec<Delivery>>>,
+    /// The scripted answers, oldest first; an empty queue means `202`.
+    script: Arc<Mutex<VecDeque<Scripted>>>,
+    /// The key pair actor documents name as their `publicKeyPem`, swappable
+    /// under [`MockPeer::rotate_keys`] while the capture keeps recording.
+    key: Arc<Mutex<Arc<KeyPair>>>,
 }
 
 /// The running mock peer; dropping it stops the server.
@@ -282,6 +322,8 @@ impl MockPeer {
         let peer = Peer {
             base: format!("http://{address}"),
             posts: Arc::new(Mutex::new(Vec::new())),
+            script: Arc::new(Mutex::new(VecDeque::new())),
+            key: Arc::new(Mutex::new(Arc::new(peer_keys().clone()))),
         };
         let app = Router::new()
             .route("/.well-known/webfinger", get(webfinger))
@@ -384,6 +426,74 @@ impl MockPeer {
     #[must_use]
     pub fn follow_of(&self, name: &str, follower: &str, target: &str) -> Value {
         self.activity("Follow", name, follower, &json!(target))
+    }
+
+    /// Script the next `times` inbox `POST`s — on either endpoint, in
+    /// arrival order — to be recorded as always but answered `status`
+    /// instead of `202`, with a `Retry-After: {secs}` header when
+    /// `retry_after` names a delay. This is how a scenario points the
+    /// mock's inbox at a `500` a delivery must ride out, a `503` whose
+    /// `Retry-After` the worker must honour, or a `401` that reads like a
+    /// signature the peer can no longer verify.
+    ///
+    /// # Panics
+    ///
+    /// If the script lock is poisoned, which only a panicking handler
+    /// leaves behind.
+    pub fn script_inbox(&self, status: StatusCode, retry_after: Option<Duration>, times: usize) {
+        let retry_after = retry_after.map(|delay| delay.as_secs());
+        self.peer
+            .script
+            .lock()
+            .expect("the script lock")
+            .push_back(Scripted {
+                status,
+                retry_after,
+                remaining: times,
+            });
+    }
+
+    /// Script every later inbox `POST` to answer `status` (with
+    /// `Retry-After` when asked): the closed address that never reopens,
+    /// the peer that stays convinced a signature is bad.
+    pub fn script_inbox_permanently(&self, status: StatusCode, retry_after: Option<Duration>) {
+        self.script_inbox(status, retry_after, usize::MAX);
+    }
+
+    /// Generate and serve a fresh key pair from every actor document now —
+    /// the peer mid-rotation. The pair [`deliver`] and the signing helpers
+    /// use does not change: what this instance already mirrored of a mock
+    /// actor still vouches for the old key, which is exactly the skew a
+    /// rotation scenario reads back.
+    ///
+    /// # Panics
+    ///
+    /// If the new key pair cannot be generated, which it always can here.
+    ///
+    /// [`deliver`]: Self::deliver
+    pub fn rotate_keys(&self) {
+        let next = Arc::new(generate_keypair().expect("the mock peer rotates its key pair"));
+        let mut served = self.peer.key.lock().expect("the key lock");
+        *served = next;
+    }
+
+    /// The `publicKeyPem` the peer's actor documents carry right now — the
+    /// rotated one after [`rotate_keys`](Self::rotate_keys), the process
+    /// peer key before it. A test compares this against what a stored
+    /// mirror still holds to show which side moved.
+    ///
+    /// # Panics
+    ///
+    /// If the key lock is poisoned, which only a panicking handler leaves
+    /// behind.
+    #[must_use]
+    pub fn served_public_key(&self) -> String {
+        self.peer
+            .key
+            .lock()
+            .expect("the key lock")
+            .public_pem
+            .clone()
     }
 
     /// The four auth headers of a signed `POST` of `body` to this instance at
@@ -514,8 +624,12 @@ impl Drop for MockPeer {
 
 /// The actor document every mock account wears: self-identifying, its inbox
 /// under its own id, the peer-wide inbox as its `endpoints.sharedInbox`, and
-/// the real public key its signatures verify against.
+/// the real public key its signatures verify against — the key pair
+/// [`rotate_keys`] has moved the peer to, whichever that is now.
+///
+/// [`rotate_keys`]: MockPeer::rotate_keys
 fn actor_doc(peer: &Peer, id: &str, kind: &str, preferred: &str) -> Value {
+    let public_pem = peer.key.lock().expect("the key lock").public_pem.clone();
     json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "type": kind,
@@ -533,7 +647,7 @@ fn actor_doc(peer: &Peer, id: &str, kind: &str, preferred: &str) -> Value {
         "publicKey": {
             "id": main_key(id),
             "owner": id,
-            "publicKeyPem": peer_keys().public_pem,
+            "publicKeyPem": public_pem,
         },
     })
 }
@@ -605,13 +719,10 @@ async fn webfinger(
 }
 
 /// Both inboxes: record the path, headers and bytes as they arrived, and
-/// accept the delivery.
-async fn capture(
-    State(peer): State<Peer>,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> StatusCode {
+/// answer the next scripted status when the test queued one (with its
+/// `Retry-After` when the script carries one), the plain `202 Accepted`
+/// when nothing was scripted.
+async fn capture(State(peer): State<Peer>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
     let delivery = Delivery {
         path: uri.path().to_owned(),
         activity: serde_json::from_slice(&body).unwrap_or(Value::Null),
@@ -627,5 +738,40 @@ async fn capture(
         body,
     };
     peer.posts.lock().expect("the capture lock").push(delivery);
-    StatusCode::ACCEPTED
+    next_scripted(&peer.script).map_or_else(
+        || StatusCode::ACCEPTED.into_response(),
+        |scripted| answer_with(scripted.status, scripted.retry_after),
+    )
+}
+
+/// The response for a scripted answer: its status, with a `Retry-After`
+/// delta-seconds header when the script carries one.
+fn answer_with(status: StatusCode, retry_after: Option<u64>) -> Response {
+    let header = retry_after.and_then(|seconds| HeaderValue::try_from(seconds.to_string()).ok());
+    header.map_or_else(
+        || status.into_response(),
+        |value| (status, [(RETRY_AFTER, value)]).into_response(),
+    )
+}
+
+/// The next scripted answer, spent down: the queue's head answers this
+/// `POST` and loses one of its remaining hits, and an exhausted entry is
+/// off the queue for the next one. `None` — the plain `202` — when nothing
+/// stands scripted.
+///
+/// # Panics
+///
+/// If the script lock is poisoned, which only a panicking handler leaves
+/// behind.
+fn next_scripted(script: &Arc<Mutex<VecDeque<Scripted>>>) -> Option<Scripted> {
+    let scripted = {
+        let mut queue = script.lock().expect("the script lock");
+        let mut next = queue.front().cloned()?;
+        next.remaining = next.remaining.saturating_sub(1);
+        if next.remaining == 0 {
+            let _spent: Option<Scripted> = queue.pop_front();
+        }
+        next
+    };
+    Some(scripted)
 }

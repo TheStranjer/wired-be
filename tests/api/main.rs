@@ -189,6 +189,16 @@ mod e2e_federation_discovery;
 /// accepted, fanned out to, announced by and withdrawn over real HTTP.
 mod e2e_federation_follow;
 
+/// The end-to-end federation of outbound content (WBE-224 scenario 4): the
+/// `Create`/`Update`/`Delete` of a status, the `Announce`, `Like` and
+/// `EmojiReact` writes and their `Undo`s delivered signed to the right
+/// inboxes across the visibility matrix, shared-inbox deduplication, the
+/// profile `Update`, `Move`, forwarded `Flag` and list `Add`/`Remove`, and
+/// the retry ladder — `500` on backoff, `503` at its `Retry-After`, `410`
+/// dropping the address for good, and a refused signature retried once —
+/// all read off a loopback mock peer's capture over real HTTP.
+mod e2e_federation_outbound;
+
 /// The end-to-end federation refusals (WBE-224 scenario 6): every way an
 /// inbox delivery is turned away — unsigned, unknown key, malformed
 /// signature, spoofed signer, tampered body or digest, ids off the signer's
