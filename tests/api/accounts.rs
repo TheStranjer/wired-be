@@ -11,8 +11,9 @@
 //! counters a posted status moves, an invalid token still a 401, every miss
 //! (garbage id, unknown id, deactivated account, unresolvable acct) the same
 //! 404 "Record not found", `acct` resolved case-insensitively with this
-//! instance's own domain stripped, and an absent `acct` a 400 "Missing
-//! parameter: acct".
+//! instance's own domain stripped, an absent `acct` a 400 "Missing
+//! parameter: acct", `q` that parameter's alias, and `resolve=true` a
+//! federation arm that only an authenticated caller may trigger.
 
 #![cfg(test)]
 
@@ -1066,6 +1067,91 @@ async fn lookup_a_deactivated_account_is_a_record_not_found() {
             ghost.nickname
         );
         assert_eq!(response.text(), NOT_FOUND, "like any other miss, {query}");
+    }
+}
+
+/// `q` is the same handle parameter under its newer spelling: it answers
+/// the stored rows exactly as `acct` does, and a blank `acct` beside a
+/// filled `q` still lets the alias speak — but a usable `acct` outranks it.
+#[tokio::test]
+async fn lookup_reads_q_as_the_acct_alias() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
+    let app = common::test_app(pool);
+
+    let by_q = lookup(&app, "?q=alice").await;
+    assert_eq!(by_q.status, StatusCode::OK, "q finds the local nickname");
+    assert_eq!(by_q.json_value()["id"], alice.id.to_string());
+
+    let remote_by_q = lookup(&app, "?q=bob@remote.example").await;
+    assert_eq!(
+        remote_by_q.status,
+        StatusCode::OK,
+        "q finds the mirrored handle"
+    );
+    assert_eq!(remote_by_q.json_value()["id"], bob.id.to_string());
+
+    let blank_acct = lookup(&app, "?acct=%20&q=alice").await;
+    assert_eq!(
+        blank_acct.status,
+        StatusCode::OK,
+        "a blank acct defers to the alias"
+    );
+    assert_eq!(blank_acct.json_value()["id"], alice.id.to_string());
+
+    let ranked = lookup(&app, "?acct=bob@remote.example&q=alice").await;
+    assert_eq!(
+        ranked.json_value()["id"],
+        bob.id.to_string(),
+        "a usable acct outranks the alias"
+    );
+
+    let neither = lookup(&app, "?acct=&q=").await;
+    assert_eq!(
+        neither.status,
+        StatusCode::BAD_REQUEST,
+        "no handle in either spelling is the 400"
+    );
+    assert_eq!(neither.text(), MISSING_ACCT, "naming acct, as before");
+}
+
+/// `resolve=true` turns a stored miss into a federation lookup, and that
+/// arm runs only for an authenticated caller with a flag that spells true:
+/// the anonymous request, the `resolve=false` request and the unflagged
+/// one all keep the plain 404 for a handle this instance has never seen.
+#[tokio::test]
+async fn lookup_resolve_refuses_anonymous_and_unflagged_calls() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "read").await;
+    let app = common::test_app(pool);
+
+    let anonymous = lookup(&app, "?q=nobody@other.example&resolve=true").await;
+    assert_eq!(
+        anonymous.status,
+        StatusCode::NOT_FOUND,
+        "an anonymous caller does not trigger a federation fetch"
+    );
+    assert_eq!(anonymous.text(), NOT_FOUND);
+
+    for query in [
+        "?q=nobody@other.example",
+        "?q=nobody@other.example&resolve=false",
+        "?q=nobody@other.example&resolve=",
+    ] {
+        let response = common::TestRequest::get(&format!("/api/v1/accounts/lookup{query}"))
+            .bearer(&token)
+            .send(&app)
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "`{query}` is not the resolving arm"
+        );
+        assert_eq!(response.text(), NOT_FOUND);
     }
 }
 

@@ -488,7 +488,10 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{requested_status_ids, status_for_viewer_or_404},
+    api::{
+        helpers::{QueryPairs, is_true, requested_status_ids, status_for_viewer_or_404},
+        pleroma_account_settings::looks_like_ap_id,
+    },
     auth::{AuthUser, MaybeAuthUser},
     config::Config,
     entities::{
@@ -501,6 +504,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams},
+    federation::fetch_object::resolve_status,
     models::{
         block, bookmark, bookmark_folder, conversation_mute,
         favourite::{self, Favourite as FavouriteRow},
@@ -876,11 +880,18 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
 /// [`status_for_viewer_or_404`] for what that admits) rendered as the
 /// [`Status`] entity.
 ///
+/// A `UUID` miss has one second life: with `resolve=true` and a
+/// [`looks_like_ap_id`] `{id}`, the segment is an object URI and
+/// [`status_by_uri_or_404`] resolves it over federation. Resolution needs
+/// a viewer (the search's rule — a federation fetch runs on somebody's
+/// behalf), and every miss in it is this route's one 404 too.
+///
 /// # Errors
 ///
 /// [`AppError::NotFound`] for a malformed, unknown, deleted or invisible
-/// id, and for the one row a render cannot answer (a reblog whose original
-/// went away between the visibility read and the batch load);
+/// id — including a `resolve=true` URI nothing resolves to — and for the
+/// one row a render cannot answer (a reblog whose original went away
+/// between the visibility read and the batch load);
 /// [`AppError::Forbidden`] when a presented user token lacks
 /// `read:statuses`; [`AppError::Unauthorized`] from the extractor for a
 /// token that does not resolve. Any database failure arrives through `?`
@@ -888,13 +899,62 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
 async fn show_status(
     State(state): State<AppState>,
     auth: MaybeAuthUser,
+    uri: Uri,
     Path(id): Path<String>,
 ) -> AppResult<Json<Status>> {
     auth.require_user_scope(READ_STATUSES)?;
     let viewer = auth.0.as_ref();
-    let row = status_for_viewer_or_404(&state, viewer, &id).await?;
+    let row = match status_for_viewer_or_404(&state, viewer, &id).await {
+        Ok(row) => row,
+        Err(AppError::NotFound)
+            if viewer.is_some() && wants_resolution(&uri) && looks_like_ap_id(&id) =>
+        {
+            status_by_uri_or_404(&state, viewer, &id).await?
+        }
+        Err(err) => return Err(err),
+    };
     let rendered = render_status(&state, ViewerMode::User(viewer), &row).await?;
     Ok(Json(rendered.ok_or(AppError::NotFound)?))
+}
+
+/// Whether this request asks for federation resolution: a `resolve`
+/// parameter spelling `true` (the [`crate::api::search`] routes' reading).
+fn wants_resolution(uri: &Uri) -> bool {
+    QueryPairs::parse(uri.query())
+        .value("resolve")
+        .is_some_and(|value| is_true(&value))
+}
+
+/// The `resolve=true` arm of [`show_status`]: `id` is an object URI,
+/// [`resolve_status`] dereferences and folds it (a stored row answers
+/// first, without the network), and what resolves must still pass the
+/// show route's own visibility test for this viewer. A resolution the
+/// federation cannot answer — refused, gone, no `Note` behind it — or a
+/// folded row the viewer may not see is the module's one 404; the
+/// resolver's reason is logged, never sent (decision 8).
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn status_by_uri_or_404(
+    state: &AppState,
+    viewer: Option<&User>,
+    id: &str,
+) -> AppResult<StatusRow> {
+    let found = match resolve_status(state, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(AppError::NotFound),
+        Err(err) => {
+            debug!(%err, uri = %id, "a status show could not resolve the requested uri");
+            return Err(AppError::NotFound);
+        }
+    };
+    if status_visibility::can_view(&state.db, &found, viewer).await? {
+        Ok(found)
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 /// `GET /api/v1/statuses/{id}/card` — the stored rich-media card of the

@@ -172,6 +172,14 @@ mod domain_blocks;
 /// mock peer.
 mod e2e_discovery;
 
+/// The end-to-end federation discovery shapes and remote resolution
+/// (WBE-224 scenarios 1 and 5): the `WebFinger`/host-meta/`NodeInfo`/actor
+/// surface read by a remote's own HTTP client and off the JSON-LD keys,
+/// the `AUTHORIZED_FETCH` gate on the actor, object and activity reads,
+/// and the `resolve=true` lookups plus the follow-by-uri write reaching the
+/// mock peer over real HTTP.
+mod e2e_federation_discovery;
+
 /// The end-to-end federation of relationships (WBE-224 scenario 2).
 ///
 /// A remote `Follow` of a local account granted and answered with a signed
@@ -180,6 +188,14 @@ mod e2e_discovery;
 /// block, blocks in both directions, and a relay subscription followed,
 /// accepted, fanned out to, announced by and withdrawn over real HTTP.
 mod e2e_federation_follow;
+
+/// The end-to-end federation refusals (WBE-224 scenario 6): every way an
+/// inbox delivery is turned away — unsigned, unknown key, malformed
+/// signature, spoofed signer, tampered body or digest, ids off the signer's
+/// origin, an over-cap body, a refused private-host resolution and an
+/// `MRF`-blocked domain — each answered with its documented status and
+/// re-read through the public API as nothing having happened.
+mod e2e_federation_safety;
 
 /// The end-to-end interaction scenarios (WBE-223): favourite, reblog,
 /// bookmark + folder, pin, thread mute, reaction, poll vote, edit, expiry

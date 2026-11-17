@@ -309,6 +309,14 @@ impl MockPeer {
             .map_or_else(String::new, |(_scheme, rest)| rest.to_owned())
     }
 
+    /// The peer's full `http://{addr}` origin: the base every id it serves
+    /// hangs off, which a test needs when it builds a URL the peer does
+    /// *not* serve — a key id whose actor no lookup can settle.
+    #[must_use]
+    pub fn origin(&self) -> String {
+        self.peer.base.clone()
+    }
+
     /// The actor id of this peer's account `nick`.
     #[must_use]
     pub fn actor(&self, nick: &str) -> String {
@@ -402,6 +410,40 @@ impl MockPeer {
             Utc::now(),
         )
         .expect("the mock peer signs its own delivery")
+    }
+
+    /// The four auth headers of a signed `GET` of this instance at `path`,
+    /// presented as the peer's actor `actor` under [`main_key`] — the
+    /// proof an `AUTHORIZED_FETCH` gate reads, over the same origin
+    /// [`signed_headers`] signs deliveries to.
+    ///
+    /// # Panics
+    ///
+    /// If the URL cannot be signed, which the test instance's own origin
+    /// never is.
+    #[must_use]
+    pub fn signed_get(actor: &str, path: &str) -> SignedHeaders {
+        let key_id = main_key(actor);
+        sign_request(
+            "GET",
+            &format!("{}{path}", common::test_config().base_url),
+            None,
+            &SigningKey {
+                key_id: &key_id,
+                private_pem: &peer_keys().private_pem,
+            },
+            Utc::now(),
+        )
+        .expect("the mock peer signs its own fetch")
+    }
+
+    /// The public half of the peer's key pair: the `publicKeyPem` every
+    /// mock actor publishes. A test that must let the peer deliver while
+    /// the instance may not fetch its origin — a seeded mirror behind a
+    /// closed SSRF guard — stores exactly this PEM.
+    #[must_use]
+    pub fn public_key_pem() -> &'static str {
+        &peer_keys().public_pem
     }
 
     /// `POST`s `activity` to `path` on this instance as the peer's actor
