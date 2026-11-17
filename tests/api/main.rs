@@ -172,6 +172,15 @@ mod domain_blocks;
 /// mock peer.
 mod e2e_discovery;
 
+/// The end-to-end federation of relationships (WBE-224 scenario 2).
+///
+/// A remote `Follow` of a local account granted and answered with a signed
+/// `Accept` at the peer's inbox, a locked account's own answer, a local follow
+/// of a remote account the peer accepts, the `Undo` of a follow and of a
+/// block, blocks in both directions, and a relay subscription followed,
+/// accepted, fanned out to, announced by and withdrawn over real HTTP.
+mod e2e_federation_follow;
+
 /// The end-to-end interaction scenarios (WBE-223): favourite, reblog,
 /// bookmark + folder, pin, thread mute, reaction, poll vote, edit, expiry
 /// through the job queue, and delete, each asserted across the direct
@@ -415,6 +424,13 @@ mod relays;
 
 /// `GET /api/v1/accounts/relationships`.
 mod relationships;
+
+/// The shared loopback mock federation peer the federation scenarios drive.
+///
+/// Real actor documents under a real RSA key, capturing inboxes, a
+/// `WebFinger`, a `Service` relay and a public `Note`, plus the signed-`POST`
+/// half that lets a peer deliver to this instance's inbox.
+pub mod remote;
 
 /// Remote interaction over HTTP (`src/api/remote_interaction.rs`): the
 /// `POST /api/v1/pleroma/remote_interaction` refusals, the
