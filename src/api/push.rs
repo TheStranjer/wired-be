@@ -16,12 +16,15 @@
 //! validation.
 //!
 //! - `POST /api/v1/push/subscription` registers `subscription[endpoint]`
-//!   (an HTTPS URL of at most 2048 characters) with
+//!   (an `http`/`https` URL of at most 2048 characters — Pleroma stores
+//!   the endpoint verbatim and demands only that it is there, and this
+//!   gate follows it: a push service's own address is whatever the browser
+//!   was configured with, loopback test services included) with
 //!   `subscription[keys][p256dh]` and `subscription[keys][auth]` (stored
 //!   base64url-normalised, Pleroma's `ensure_base64_urlsafe`), plus the
 //!   optional `data[alerts][…]` preferences and `data[policy]`. It
 //!   replaces any subscription the token already had; a missing endpoint
-//!   or key, a non-HTTPS or overlong endpoint and an unknown policy are
+//!   or key, an unusable or overlong endpoint and an unknown policy are
 //!   422 `{"error":"Validation failed: …"}`.
 //! - `GET /api/v1/push/subscription` answers the token's subscription or
 //!   404 `{"error":"Record not found"}`.
@@ -379,7 +382,12 @@ impl SubscriptionParams {
 }
 
 /// The validated `subscription[endpoint]`: required, at most
-/// [`MAX_ENDPOINT_CHARS`] characters and an `https` URL.
+/// [`MAX_ENDPOINT_CHARS`] characters and an `http` or `https` URL. Pleroma
+/// stores the endpoint verbatim (its `Subscription.create` validates only
+/// presence); the one rule the delivery pipeline cannot survive without
+/// is a scheme the outbound client can actually call, so `http`/`https`
+/// it is — including a plain-`http` loopback service, which is what a
+/// local push endpoint is.
 ///
 /// # Errors
 ///
@@ -399,9 +407,10 @@ fn valid_endpoint(params: &SubscriptionParams) -> AppResult<String> {
             "Endpoint is too long (maximum is {MAX_ENDPOINT_CHARS} characters)"
         )));
     }
-    let https = url::Url::parse(endpoint).is_ok_and(|url| url.scheme() == "https");
-    if !https {
-        return Err(validation_failed("Endpoint must be a valid HTTPS URL"));
+    let callable =
+        url::Url::parse(endpoint).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+    if !callable {
+        return Err(validation_failed("Endpoint must be a valid URL"));
     }
     Ok(endpoint.to_owned())
 }
@@ -555,11 +564,19 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_validation_demands_a_usable_https_url() {
+    fn endpoint_validation_demands_a_usable_url() {
         assert_eq!(
             valid_endpoint(&params(full_body())).unwrap(),
             "https://push.example/sub/1",
             "the good case passes through verbatim"
+        );
+        assert_eq!(
+            valid_endpoint(&params(
+                json!({"subscription": {"endpoint": "http://127.0.0.1:9/push"}})
+            ))
+            .unwrap(),
+            "http://127.0.0.1:9/push",
+            "a plain-http endpoint is stored verbatim, as Pleroma stores any"
         );
         for (body, message) in [
             (json!({}), "Validation failed: Endpoint can't be blank"),
@@ -568,12 +585,12 @@ mod tests {
                 "Validation failed: Endpoint can't be blank",
             ),
             (
-                json!({"subscription": {"endpoint": "http://push.example/1"}}),
-                "Validation failed: Endpoint must be a valid HTTPS URL",
+                json!({"subscription": {"endpoint": "push.example/1"}}),
+                "Validation failed: Endpoint must be a valid URL",
             ),
             (
-                json!({"subscription": {"endpoint": "push.example/1"}}),
-                "Validation failed: Endpoint must be a valid HTTPS URL",
+                json!({"subscription": {"endpoint": "ftp://push.example/1"}}),
+                "Validation failed: Endpoint must be a valid URL",
             ),
             (
                 json!({"subscription": {"endpoint": format!("https://p.example/{}", "x".repeat(MAX_ENDPOINT_CHARS))}}),

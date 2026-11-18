@@ -244,6 +244,20 @@ mod e2e_interactions;
 /// direct-message flow through conversations and chats.
 mod e2e_notifications;
 
+/// The end-to-end realtime scenarios (WBE-226): the streaming WebSocket
+/// driven over a real `axum::serve` listener with `tokio-tungstenite` and
+/// `reqwest` — create/edit/delete, notification, conversation, chat and
+/// filter frames across the public, local, hashtag, home, list, direct and
+/// chat streams with both token carriers and the audience and block/mute
+/// gates — Web Push delivered end to end against a mock push service with
+/// browser-key decryption, alert and policy gating and the 410 retirement,
+/// the client-to-server `ActivityPub` walk (`whoami`, `upload_media`, the
+/// outbox `Create` and the owner's inbox read), the `Link`-header
+/// conformance sweep over every shared-`PageParams` listing, and the
+/// emoji-pack lifecycles from pack creation through upload, archive,
+/// remote install and loose-file import.
+mod e2e_realtime;
+
 /// The end-to-end job harness (`common::run_all_jobs`) and the scheduling,
 /// idempotency and preview scenarios it proves.
 mod e2e_scheduled;
