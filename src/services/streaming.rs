@@ -399,6 +399,80 @@ pub fn conversation_updated(state: &AppState, user_id: Uuid, participation_id: U
     });
 }
 
+/// Publish Mastodon's `filters_changed` after `user_id`'s filter write.
+///
+/// The event rides the owner's one user stream — `user:{user_id}`, the hub
+/// name a client's `user` subscription expands to (see
+/// [`crate::api::streaming`]) — with the owner as the whole
+/// [`Audience::Users`]. It carries neither payload nor render hint: Mastodon
+/// sends `filters_changed` bare, and a client's whole reaction to it is to
+/// re-read its filters, so there is no entity to ship or to render. The
+/// socket path forwards such a bare event as it stands — the envelope
+/// simply has no `payload` key.
+///
+/// [`crate::api::filters`]' three write handlers are the callers: a created,
+/// replaced or deleted filter tells its owner, and only its owner.
+/// Best-effort like the other emitters — the filter row is already committed
+/// — and since nothing here reads the database, this call cannot fail and
+/// never refuses. It is synchronous, like [`chat_updated`] and
+/// [`Hub::publish`](crate::streaming::hub::Hub::publish) itself: handing the
+/// event to the hub is the whole emission, and the cross-instance bridge is
+/// the hub's spawned task.
+pub fn filters_changed(state: &AppState, user_id: Uuid) {
+    state.hub.publish(StreamEvent {
+        streams: vec![format!("user:{user_id}")],
+        event: "filters_changed".to_owned(),
+        payload: None,
+        audience: Audience::Users(vec![user_id]),
+        render: None,
+        local_only: false,
+    });
+}
+
+/// Publish Mastodon's `announcement` for the entity `announcement` to every
+/// active LOCAL user.
+///
+/// There is no shared hub name an announcement could ride: a client's bare
+/// `user` subscription only ever matches `user:{reader uuid}` at the socket
+/// (see [`crate::api::streaming`]), so a bare `user` stream would reach
+/// nobody. This therefore reads the roster of active local ids once
+/// ([`user::active_local_ids`]) and publishes a single [`StreamEvent`] over
+/// all of their `user:{id}` streams with [`Audience::Users`] set to exactly
+/// those ids — remote mirrors and deactivated accounts stand outside both
+/// gates by construction. The payload is the announcement entity as its JSON
+/// text: Mastodon ships the rendered entity here, not a render hint, so the
+/// socket writes the frame unchanged.
+///
+/// Nothing calls this yet: the admin announcements ticket (WBE-204) will
+/// publish through here when its routes make and pull announcements.
+///
+/// Best-effort like [`status_created`]: a failed roster read is a log line
+/// and nothing published. With no active local users there is nobody to name
+/// in either gate, so the roster's emptiness is the other silence.
+pub async fn announcement_published(state: &AppState, announcement: &serde_json::Value) {
+    let ids = match user::active_local_ids(&state.db).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            warn!(
+                %err,
+                "announcement stream event skipped: reading the active local users failed"
+            );
+            return;
+        }
+    };
+    if ids.is_empty() {
+        return;
+    }
+    state.hub.publish(StreamEvent {
+        streams: ids.iter().map(|id| format!("user:{id}")).collect(),
+        event: "announcement".to_owned(),
+        payload: Some(announcement.to_string()),
+        audience: Audience::Users(ids),
+        render: None,
+        local_only: false,
+    });
+}
+
 /// Whether `row` is a reblog whose original is gone: [`status::get_by_id`]
 /// hides tombstones, so its `None` is both the deleted and the never-there
 /// answer, and each of them leaves a boost with nothing to announce.
@@ -1903,5 +1977,96 @@ mod tests {
             !event.local_only,
             "a conversation update is not flagged local-only"
         );
+    }
+
+    #[tokio::test]
+    async fn filters_changed_pushes_the_bare_event_on_the_owners_user_stream() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let mut rx = state.hub.subscribe();
+
+        filters_changed(&state, alice.id);
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(
+            event.event, "filters_changed",
+            "Mastodon's filter-changed event"
+        );
+        assert_eq!(
+            event.streams,
+            vec![user_stream(alice.id)],
+            "the event rides exactly the owner's user stream"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(vec![alice.id]),
+            "the owner is the whole audience"
+        );
+        assert!(
+            event.payload.is_none(),
+            "Mastodon sends filters_changed with no payload"
+        );
+        assert!(event.render.is_none(), "and with nothing to render");
+        assert!(
+            !event.local_only,
+            "a filter change is not flagged local-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn announcement_published_pushes_the_entity_to_every_active_local() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let _inactive = inactive_user(&pool, "sleepy").await;
+        let _remote = remote_user(&pool, "carol").await;
+        let announcement = serde_json::json!({"id": "1", "content": "<p>Up!</p>"});
+        let mut rx = state.hub.subscribe();
+
+        announcement_published(&state, &announcement).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "announcement", "Mastodon's announcement event");
+        assert_eq!(
+            event.streams,
+            canonical(vec![user_stream(alice.id), user_stream(bob.id)]),
+            "one user stream per active local user, none for the deactivated or the mirror"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(sorted_ids(vec![alice.id, bob.id])),
+            "the same roster is the whole audience"
+        );
+        assert_eq!(
+            event.payload.as_deref(),
+            Some(announcement.to_string().as_str()),
+            "the entity ships as Mastodon's string-in-envelope"
+        );
+        assert!(
+            event.render.is_none(),
+            "the payload is the entity: no render hint rides"
+        );
+        assert!(
+            !event.local_only,
+            "the roster, not the flag, is what keeps it to the locals"
+        );
+    }
+
+    #[tokio::test]
+    async fn announcement_published_publishes_nothing_without_active_local_users() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let _inactive = inactive_user(&pool, "sleepy").await;
+        let _remote = remote_user(&pool, "carol").await;
+        let mut rx = state.hub.subscribe();
+
+        announcement_published(&state, &serde_json::json!({"id": "1"})).await;
+
+        assert_empty(&mut rx);
     }
 }

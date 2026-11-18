@@ -42,7 +42,7 @@ use wired_be::{
     },
     services::{
         create_status::{self, CreateStatusParams},
-        delete_status, notify,
+        delete_status, notify, streaming,
     },
     state::AppState,
     streaming::hub::{Audience, StreamEvent},
@@ -1230,4 +1230,100 @@ fn assert_update_carries(frame: &Value, id: &str) {
             .is_some_and(|content| content.contains(LIFECYCLE_TEXT)),
         "the content rides the entity: {entity}"
     );
+}
+
+/// `announcement_published` (WBE-191 slice 5), end to end: the emitter reads
+/// the active-local roster and rides every one of those users' own
+/// `user:<uuid>` stream, so each active local socket receives the
+/// announcement and no remote or anonymous socket does. The event is put on
+/// the bus by the real emitter, so streams, audience and the entity-as-string
+/// payload are its production shape. Each socket is then bounded by its own
+/// control event on its own subscription, published after the announcement:
+/// what the announcement could not have reached before the control, it never
+/// will.
+#[tokio::test]
+async fn announcement_published_reaches_every_active_local_socket() {
+    let server = Server::start().await;
+    let alice = account(server.pool(), "announce-alice").await;
+    let bob = account(server.pool(), "announce-bob").await;
+    let remote =
+        common::create_remote_user(server.pool(), "announce-remote", "remote.example").await;
+    let alice_stream = format!("user:{}", alice.id);
+    let bob_stream = format!("user:{}", bob.id);
+    let remote_stream = format!("user:{}", remote.id);
+    let mut alice_socket = open(&server.url(&format!(
+        "stream=user&access_token={}",
+        token(server.pool(), &alice, "read").await
+    )))
+    .await;
+    let mut bob_socket = open(&server.url(&format!(
+        "stream=user&access_token={}",
+        token(server.pool(), &bob, "read").await
+    )))
+    .await;
+    let mut remote_socket = open(&server.url(&format!(
+        "stream=user&access_token={}",
+        token(server.pool(), &remote, "read").await
+    )))
+    .await;
+    let mut anonymous = open(&server.url(PUBLIC)).await;
+
+    let entity = json!({"id": "announcement-1", "content": "<p>Up!</p>"});
+    streaming::announcement_published(&server.state, &entity).await;
+    server.publish(event_on(
+        &[alice_stream.as_str()],
+        "alice-control",
+        Audience::Users(vec![alice.id]),
+    ));
+    server.publish(event_on(
+        &[bob_stream.as_str()],
+        "bob-control",
+        Audience::Users(vec![bob.id]),
+    ));
+    server.publish(event_on(
+        &[remote_stream.as_str()],
+        "remote-control",
+        Audience::Users(vec![remote.id]),
+    ));
+    server.publish(public_update("anon-control"));
+
+    let alice_frames = read_until(&mut alice_socket, "alice-control").await;
+    let alice_announcement = parse_event(&alice_frames, "announcement");
+    assert_eq!(
+        alice_announcement["stream"],
+        json!([alice_stream, bob_stream]),
+        "the event rides exactly the roster's own streams, alice's first"
+    );
+    assert_eq!(
+        alice_announcement["payload"],
+        entity.to_string(),
+        "Mastodon ships the entity as its JSON string"
+    );
+
+    let bob_frames = read_until(&mut bob_socket, "bob-control").await;
+    let bob_announcement = parse_event(&bob_frames, "announcement");
+    assert_eq!(
+        bob_announcement["payload"],
+        entity.to_string(),
+        "every active local socket gets the same entity"
+    );
+
+    let remote_frames = read_until(&mut remote_socket, "remote-control").await;
+    assert_absent(&remote_frames, &["announcement-1"]);
+
+    let anonymous_frames = read_until(&mut anonymous, "anon-control").await;
+    assert_absent(&anonymous_frames, &["announcement-1"]);
+}
+
+/// The frame among `frames` whose envelope names event `name`, parsed.
+///
+/// # Panics
+///
+/// If no frame carries that event or its envelope is not JSON.
+fn parse_event(frames: &[String], name: &str) -> Value {
+    let frame = frames
+        .iter()
+        .find(|frame| frame.contains(&format!(r#""event":"{name}""#)))
+        .unwrap_or_else(|| panic!("no `{name}` frame among {frames:?}"));
+    serde_json::from_str(frame).expect("the frame is a JSON envelope")
 }

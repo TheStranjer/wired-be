@@ -34,7 +34,10 @@
 //!
 //! All five routes require a user token ([`AuthUser`]) and, per the
 //! ticket's scope pair, `read:filters` to look and `write:filters` to
-//! create, replace and delete.
+//! create, replace and delete. Each successful write then publishes
+//! Mastodon's `filters_changed` on the caller's own `user:` stream, so a
+//! client watching its timelines re-reads its filters
+//! ([`filters_changed`](crate::services::streaming::filters_changed)).
 
 use axum::{
     Json, Router,
@@ -53,6 +56,7 @@ use crate::{
     extract::ApiBody,
     models::filter,
     oauth::scopes::{READ_FILTERS, WRITE_FILTERS},
+    services::streaming,
     state::AppState,
     util::id::parse_id,
 };
@@ -123,6 +127,8 @@ async fn show_filter(
 }
 
 /// `POST /api/v1/filters` — create a filter for the caller and answer it.
+/// A successful create publishes Mastodon's `filters_changed` to the
+/// caller's own user stream, as the other two writes do.
 ///
 /// # Errors
 ///
@@ -143,11 +149,13 @@ async fn create_filter(
         user = %auth.0.id,
         "filter created"
     );
+    streaming::filters_changed(&state, auth.0.id);
     Ok(Json(Filter::from_row(&row)))
 }
 
 /// `PUT /api/v1/filters/{id}` — replace every mutable column of one owned
-/// filter and answer it. Parameters are those of `POST`, with the same
+/// filter and answer it, publishing Mastodon's `filters_changed` to the
+/// caller's own user stream. Parameters are those of `POST`, with the same
 /// defaults: an absent `expires_in` clears the old expiry, an absent flag
 /// takes its default rather than keeping the stored value.
 ///
@@ -174,10 +182,12 @@ async fn update_filter(
     let Some(row) = filter::update(&state.db, filter_id, auth.0.id, &new).await? else {
         return Err(AppError::NotFound);
     };
+    streaming::filters_changed(&state, auth.0.id);
     Ok(Json(Filter::from_row(&row)))
 }
 
-/// `DELETE /api/v1/filters/{id}` — remove one owned filter and answer `{}`.
+/// `DELETE /api/v1/filters/{id}` — remove one owned filter, publish Mastodon's
+/// `filters_changed` to the caller's own user stream, and answer `{}`.
 ///
 /// # Errors
 ///
@@ -197,6 +207,7 @@ async fn delete_filter(
     if !filter::delete(&state.db, filter_id, auth.0.id).await? {
         return Err(AppError::NotFound);
     }
+    streaming::filters_changed(&state, auth.0.id);
     Ok(Json(Value::Object(Map::new())))
 }
 

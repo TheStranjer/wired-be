@@ -1979,6 +1979,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_owner_socket_forwards_a_bare_filters_changed_frame() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "filters-changed-reader").await;
+        let stranger = account(&state, "filters-changed-stranger").await;
+        let own_stream = format!("{USER}:{}", reader.id);
+        let other_stream = format!("{USER}:{}", stranger.id);
+        let owner = for_reader(&state, &reader, &[own_stream.as_str()]).await;
+        let holding_stranger = for_reader(&state, &stranger, &[own_stream.as_str()]).await;
+        let anonymous = watching(&state, &[own_stream.as_str()]).await;
+        // The event `services::streaming::filters_changed` publishes.
+        let filters_changed = StreamEvent {
+            streams: vec![own_stream.clone()],
+            event: "filters_changed".to_owned(),
+            payload: None,
+            audience: Audience::Users(vec![reader.id]),
+            render: None,
+            local_only: false,
+        };
+
+        assert_eq!(
+            owner.frame_for(&filters_changed).await,
+            Some(format!(
+                r#"{{"stream":["{own_stream}"],"event":"filters_changed"}}"#
+            )),
+            "the owner's socket writes the bare envelope, no payload key"
+        );
+        assert!(
+            holding_stranger.frame_for(&filters_changed).await.is_none(),
+            "a reader holding the stream name but outside the audience never sees it: {other_stream}"
+        );
+        assert!(
+            anonymous.frame_for(&filters_changed).await.is_none(),
+            "and neither does an anonymous socket"
+        );
+    }
+
+    #[tokio::test]
     async fn audience_decides_who_sees_an_event() {
         let (_db, state) = state().await;
         let reader = account(&state, "stream-reader").await;

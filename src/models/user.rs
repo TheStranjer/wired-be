@@ -1078,6 +1078,32 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<User>> {
     Ok(users)
 }
 
+/// The `SELECT` behind [`active_local_ids`]: this instance's own active
+/// accounts by id, in `UUIDv7` text order (decision 4's sort, the settled
+/// order [`mark_deleted_by_domain`] also answers in).
+const ACTIVE_LOCAL_IDS_SQL: &str = "SELECT id FROM users WHERE local AND is_active ORDER BY id";
+
+/// The ids of every active LOCAL user, oldest account first.
+///
+/// The roster for an event that goes to every account this instance owns at
+/// once and has no shared hub name to ride: a client's `user` subscription
+/// only matches `user:<reader uuid>` at the socket, so the publisher needs
+/// the ids themselves to name one stream per reader and to gate the
+/// audience — which is [`crate::services::streaming::announcement_published`]'s
+/// shape. Remote mirrors and deactivated accounts are out of the read by
+/// construction.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn active_local_ids(pool: &PgPool) -> AppResult<Vec<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(ACTIVE_LOCAL_IDS_SQL)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
 /// The order the profile directory walks its accounts in
 /// (`GET /api/v1/directory`'s `order` parameter).
 ///
@@ -3314,6 +3340,36 @@ mod tests {
             "`local` true answers this instance's own accounts"
         );
         assert!(!ids_of(&local_only).contains(&mirror.id), "and no mirror");
+    }
+
+    #[tokio::test]
+    async fn active_local_ids_are_the_local_active_accounts_in_id_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        let bob = insert(&pool, &local_new("bob")).await.unwrap();
+        let gone = insert(&pool, &local_new("gone")).await.unwrap();
+        set_activation(&pool, gone.id, false).await.unwrap();
+        let mirror = insert(
+            &pool,
+            &NewUser {
+                nickname: "mirror@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/mirror".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+
+        let ids = active_local_ids(&pool).await.unwrap();
+        assert_eq!(
+            ids,
+            vec![alice.id, bob.id],
+            "the two active locals, in `UUIDv7` text order"
+        );
+        assert!(!ids.contains(&gone.id), "a deactivated account is out");
+        assert!(!ids.contains(&mirror.id), "and so is a remote mirror");
     }
 
     #[tokio::test]
