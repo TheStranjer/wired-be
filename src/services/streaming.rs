@@ -28,7 +28,12 @@
 //! as `pleroma.is_muted`. [`chat_updated`] is the third: Pleroma's
 //! `pleroma:chat_update` for one participant's chat row, riding only their
 //! `user:pleroma_chat:{id}` stream with a [`RenderSpec::Chat`] hint, fired
-//! from the chat hooks of [`crate::api::chats`].
+//! from the chat hooks of [`crate::api::chats`]. [`conversation_updated`] is
+//! the fourth: Mastodon's `conversation` for one local participant's side of
+//! a direct thread, riding only their `direct:{id}` stream with a
+//! [`RenderSpec::Conversation`] hint, fired from the create hook's
+//! [`crate::services::create_status`] conversation arm once a `direct` status
+//! lands.
 //!
 //! The rules, stated once here and split into one helper per component:
 //!
@@ -352,6 +357,44 @@ pub fn chat_updated(state: &AppState, owner_id: Uuid, chat_id: Uuid) {
         payload: None,
         audience: Audience::Users(vec![owner_id]),
         render: Some(RenderSpec::Chat(chat_id)),
+        local_only: false,
+    });
+}
+
+/// Publish Mastodon's `conversation` for `user_id`'s side of a direct thread.
+///
+/// The event rides the reader's one direct stream — `direct:{user_id}`, the
+/// hub name a client's `direct` subscription expands to (see
+/// [`crate::api::streaming`]) — with the reader as the whole
+/// [`Audience::Users`] and a [`RenderSpec::Conversation`] hint rather than a
+/// payload, so each socket renders the conversation entity for its own reader
+/// as the status, notification and chat emitters do. The hint must name the
+/// reader's OWN participation row: every local side of a thread owns its own
+/// row ([`conversation::participate`]) and one side's id means nothing to
+/// another, so each participant of a DM is published to separately, with their
+/// own id. [`conversation::participations_for_status`] is the roster that
+/// read answers, and [`create_status`]'s `participate_in_conversation` the
+/// caller: a fresh `direct` status tells every LOCAL participant of its thread,
+/// each with their own participation id — a remote account holds no
+/// participation row and so hears nothing.
+///
+/// Best-effort like the other emitters — the participation rows are already
+/// committed — and since nothing here reads the database, this call cannot
+/// fail and never refuses. It is synchronous, like [`chat_updated`] and
+/// [`Hub::publish`](crate::streaming::hub::Hub::publish) itself: handing the
+/// event to the hub is the whole emission, and the cross-instance bridge is
+/// the hub's spawned task.
+///
+/// [`conversation::participate`]: crate::models::conversation::participate
+/// [`conversation::participations_for_status`]: crate::models::conversation::participations_for_status
+/// [`create_status`]: crate::services::create_status
+pub fn conversation_updated(state: &AppState, user_id: Uuid, participation_id: Uuid) {
+    state.hub.publish(StreamEvent {
+        streams: vec![format!("direct:{user_id}")],
+        event: "conversation".to_owned(),
+        payload: None,
+        audience: Audience::Users(vec![user_id]),
+        render: Some(RenderSpec::Conversation(participation_id)),
         local_only: false,
     });
 }
@@ -1825,5 +1868,40 @@ mod tests {
         );
         assert!(event.payload.is_none(), "no body: the socket renders it");
         assert!(!event.local_only, "a chat update is not flagged local-only");
+    }
+
+    #[tokio::test]
+    async fn conversation_updated_pushes_the_readers_direct_stream_with_the_hint() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let participation_id = Uuid::now_v7();
+        let mut rx = state.hub.subscribe();
+
+        conversation_updated(&state, alice.id, participation_id);
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "conversation", "Mastodon's conversation event");
+        assert_eq!(
+            event.streams,
+            vec![direct_stream(alice.id)],
+            "the event rides exactly the reader's direct stream"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(vec![alice.id]),
+            "the reader is the whole audience"
+        );
+        assert_eq!(
+            event.render,
+            Some(RenderSpec::Conversation(participation_id)),
+            "the event carries the reader's own participation render hint"
+        );
+        assert!(event.payload.is_none(), "no body: the socket renders it");
+        assert!(
+            !event.local_only,
+            "a conversation update is not flagged local-only"
+        );
     }
 }
