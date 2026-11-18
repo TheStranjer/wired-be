@@ -1,10 +1,10 @@
 //! The admin API's JSON shapes (WBE-199, WBE-209, WBE-208, WBE-205,
-//! WBE-203, WBE-201).
+//! WBE-203, WBE-201, WBE-204).
 //!
 //! They cover the moderation-log page, the stats counters, the invite,
-//! webhook and ops entities, the OAuth-app and instance-document
-//! answers, the relay ledger and the `{total, activities}` envelope of the
-//! two narrower admin status listings.
+//! webhook, instance-rule and ops entities, the OAuth-app and
+//! instance-document answers, the relay ledger and the `{total,
+//! activities}` envelope of the two narrower admin status listings.
 //!
 //! Pleroma renders all of them through
 //! `Pleroma.Web.AdminAPI.ModerationLogView`
@@ -31,8 +31,8 @@ use crate::{
     config::FrontendConfig,
     entities::status::Status,
     models::{
-        invite_token::InviteToken, moderation_log, oauth_app::OauthApp, relay::RelayListing,
-        status::StatusVisibilityCounts, webhook::Webhook,
+        instance_rule::InstanceRule, invite_token::InviteToken, moderation_log,
+        oauth_app::OauthApp, relay::RelayListing, status::StatusVisibilityCounts, webhook::Webhook,
     },
 };
 
@@ -250,6 +250,46 @@ impl AdminWebhook {
     #[must_use]
     pub fn from_rows(webhooks: &[Webhook]) -> Vec<Self> {
         webhooks.iter().map(Self::from_webhook).collect()
+    }
+}
+
+/// One instance rule, the admin API's `show.json`.
+///
+/// Pleroma's `AdminAPI.RuleView`
+/// (`lib/pleroma/web/admin_api/views/rule_view.ex`) verbatim: the four
+/// keys it takes off the row. `id` is the `UUIDv7` as lowercase hyphenated
+/// text (decision 4), `hint` the stored guidance — empty when the instance
+/// gave none — and `priority` the integer the listing sorts by.
+#[derive(Debug, Serialize)]
+pub struct AdminRule {
+    /// The row's `UUIDv7` as text.
+    pub id: String,
+    /// The rule as clients display it.
+    pub text: String,
+    /// The guidance shown beside the rule.
+    pub hint: String,
+    /// The sort position: lower shows first.
+    pub priority: i32,
+}
+
+impl AdminRule {
+    /// Renders one [`InstanceRule`] row in the admin API's shape.
+    #[must_use]
+    pub fn from_rule(rule: &InstanceRule) -> Self {
+        Self {
+            id: rule.id.to_string(),
+            text: rule.text.clone(),
+            hint: rule.hint.clone(),
+            priority: rule.priority,
+        }
+    }
+
+    /// Renders a whole listing, in the row order the model read it — the
+    /// priority-then-id order [`list`](crate::models::instance_rule::list)
+    /// gives.
+    #[must_use]
+    pub fn from_rows(rules: &[InstanceRule]) -> Vec<Self> {
+        rules.iter().map(Self::from_rule).collect()
     }
 }
 
@@ -750,6 +790,59 @@ mod tests {
             single,
             json!({"actor": "https://relay.example/relay", "followed_back": true}),
             "the follow answer carries no wrapper"
+        );
+    }
+
+    /// A stored rule with the given position, for the render tests.
+    fn rule(priority: i32) -> InstanceRule {
+        InstanceRule {
+            id: Uuid::parse_str("0198fc3a-0000-7000-8000-000000000042").expect("test uuid"),
+            text: "No harassment".to_owned(),
+            hint: "including in replies".to_owned(),
+            priority,
+            inserted_at: Utc.with_ymd_and_hms(2026, 1, 31, 12, 34, 56).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 2, 1, 8, 0, 0).unwrap(),
+        }
+    }
+
+    /// The rule entity is Pleroma's four keys: the id as text, the two
+    /// texts and the integer position — and no timestamps.
+    #[test]
+    fn a_rule_renders_the_four_admin_keys() {
+        let rendered =
+            serde_json::to_value(AdminRule::from_rule(&rule(1))).expect("the entity serializes");
+        assert_eq!(
+            rendered,
+            json!({
+                "id": "0198fc3a-0000-7000-8000-000000000042",
+                "text": "No harassment",
+                "hint": "including in replies",
+                "priority": 1,
+            }),
+            "exactly the view's keys"
+        );
+    }
+
+    /// The listing render keeps the model's priority-then-id order, an
+    /// empty listing being an empty array.
+    #[test]
+    fn the_rule_listing_keeps_the_row_order() {
+        let rows = vec![rule(-5), rule(1), rule(1)];
+        let rendered = serde_json::to_value(AdminRule::from_rows(&rows)).expect("page serializes");
+        let entries = rendered.as_array().expect("a JSON array");
+        assert_eq!(entries.len(), 3, "one entry per row");
+        assert_eq!(
+            entries
+                .iter()
+                .filter_map(|e| e["priority"].as_i64())
+                .collect::<Vec<i64>>(),
+            vec![-5, 1, 1],
+            "the order the model read them in"
+        );
+        assert_eq!(
+            serde_json::to_value(AdminRule::from_rows(&[])).expect("the empty page serializes"),
+            json!([]),
+            "no rows, an empty array"
         );
     }
 }

@@ -443,8 +443,11 @@ pub fn filters_changed(state: &AppState, user_id: Uuid) {
 /// text: Mastodon ships the rendered entity here, not a render hint, so the
 /// socket writes the frame unchanged.
 ///
-/// Nothing calls this yet: the admin announcements ticket (WBE-204) will
-/// publish through here when its routes make and pull announcements.
+/// [`crate::api::admin::content`]'s `POST /announcements` is the caller: a
+/// notice the admin makes is published the moment its row stands, so a
+/// client's socket learns of it without a re-read. Updates and deletes are
+/// not published — Mastodon sends the `announcement` event for a new
+/// notice alone, and its clients re-read the list on the next poll.
 ///
 /// Best-effort like [`status_created`]: a failed roster read is a log line
 /// and nothing published. With no active local users there is nobody to name

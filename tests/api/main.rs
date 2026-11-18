@@ -66,6 +66,14 @@ mod admin_apps_docs;
 /// and the chats-area scope gate.
 mod admin_chats;
 
+/// The admin content endpoints over HTTP (WBE-204): the `/rules` quartet
+/// and the `/announcements` quintet — the four-key rule entity in its
+/// priority-then-creation order, the announcement entity with
+/// `pleroma.raw_content` over its `limit` / `offset` window, the
+/// `{"errors": …}` refusals, the moderation entries and the
+/// `announcement` stream event, and both areas' scope gates.
+mod admin_content;
+
 /// The admin federation endpoints over HTTP (WBE-203): the `/relay`
 /// follow / unfollow lifecycle against a mock relay and its
 /// `{actor, followed_back}` ledger, `DELETE /instances/{instance}`

@@ -74,7 +74,12 @@
 //! re-scope and delete of a single post, all rendered through
 //! [`ViewerMode::Admin`](crate::services::render_status::ViewerMode::Admin),
 //! for staff, admins *and* moderators on Pleroma's
-//! `UserIsStaffPlug` gate (WBE-201) — as the [`statuses`] submodule.
+//! `UserIsStaffPlug` gate (WBE-201) — as the [`statuses`] submodule, and
+//! the instance-content maintenance over the two lists the public API only
+//! ever reads — the `/rules` quartet and the `/announcements` quintet with
+//! their `rules` / `announcements` admin areas, each write logged and a
+//! created notice published to the sockets (WBE-204) — as the
+//! [`content`] submodule.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
@@ -104,6 +109,7 @@ use crate::{
 pub mod apps_docs;
 pub mod chats;
 pub mod config;
+pub mod content;
 pub mod federation;
 pub mod invites;
 pub mod ops;
@@ -144,6 +150,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(apps_docs::router(config))
         .merge(chats::router())
         .merge(config::router())
+        .merge(content::router())
         .merge(federation::router())
         .merge(invites::router())
         .merge(ops::router(config))
