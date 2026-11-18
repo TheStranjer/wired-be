@@ -436,9 +436,11 @@ enum Assigned {
 }
 
 /// `POST /api/v1/pleroma/admin/reports/assign_account` — Pleroma's
-/// `assign_account`: move each named report to its named moderator and
-/// answer the updated [`AdminReport`] entities, or the `400` list of what
-/// resolved to nothing.
+/// `assign_account`: move each named report to its named moderator, record
+/// one `report_assigned` / `report_unassigned` moderation-log entry per
+/// move (Pleroma's `do_assign_account` clauses write the same two actions
+/// its `ModerationLogView` renders), and answer the updated [`AdminReport`]
+/// entities, or the `400` list of what resolved to nothing.
 ///
 /// # Errors
 ///
@@ -451,7 +453,7 @@ async fn assign_account(
     ApiBody(body): ApiBody<AssignBody>,
 ) -> AppResult<Response> {
     staff.require(CLASS_WRITE, AREA_REPORTS)?;
-    let (moved, failures) = assign_all(&state.db, &body.reports).await?;
+    let (moved, failures) = assign_all(&state.db, &staff.0, &body.reports).await?;
     if !failures.is_empty() {
         debug!(
             refused = failures.len(),
@@ -464,19 +466,21 @@ async fn assign_account(
 }
 
 /// The request's elements, in order: the assigned rows the request
-/// resolved, beside the failure entries it produced.
+/// resolved, beside the failure entries it produced. Every resolved
+/// element records its moderation-log entry as it moves.
 ///
 /// # Errors
 ///
 /// [`AppError::Database`] from any read or write [`assign_one`] reaches.
 async fn assign_all(
     pool: &PgPool,
+    actor: &User,
     changes: &[ReportAssignment],
 ) -> AppResult<(Vec<ReportRow>, Vec<Value>)> {
     let mut moved: Vec<ReportRow> = Vec::with_capacity(changes.len());
     let mut failures: Vec<Value> = Vec::new();
     for change in changes {
-        match assign_one(pool, change).await? {
+        match assign_one(pool, actor, change).await? {
             Assigned::Row(row) => moved.push(row),
             Assigned::Refused(reason) => {
                 failures.push(json!({"id": change.id, "error": reason}));
@@ -486,8 +490,8 @@ async fn assign_all(
     Ok((moved, failures))
 }
 
-/// One report's assignment: the id check, the nickname lookup and the
-/// write.
+/// One report's assignment: the id check, the nickname lookup, the write
+/// and the `report_assigned` / `report_unassigned` entry the move owes.
 ///
 /// # Errors
 ///
@@ -495,7 +499,7 @@ async fn assign_all(
 /// is no id, a report that names nothing or a nickname no account carries
 /// is [`Assigned::Refused`] with Pleroma's `not_found`, not an error —
 /// the other elements of the request are still applied.
-async fn assign_one(pool: &PgPool, change: &ReportAssignment) -> AppResult<Assigned> {
+async fn assign_one(pool: &PgPool, actor: &User, change: &ReportAssignment) -> AppResult<Assigned> {
     let Some(id) = parse_id(&change.id) else {
         return Ok(Assigned::Refused(NOT_FOUND));
     };
@@ -504,12 +508,27 @@ async fn assign_one(pool: &PgPool, change: &ReportAssignment) -> AppResult<Assig
             let Some(found) = user::get_by_nickname(pool, nickname).await? else {
                 return Ok(Assigned::Refused(NOT_FOUND));
             };
-            Some(found.id)
+            Some((found.id, found.nickname))
         }
         None => None,
     };
-    let row = report::assign(pool, id, assignee).await?;
-    Ok(row.map_or(Assigned::Refused(NOT_FOUND), Assigned::Row))
+    let row = report::assign(pool, id, assignee.as_ref().map(|(found, _)| *found)).await?;
+    let Some(row) = row else {
+        return Ok(Assigned::Refused(NOT_FOUND));
+    };
+    let target = user::get_by_id(pool, row.target_id).await?;
+    let logged = match assignee.as_ref() {
+        Some((_id, nickname)) => {
+            moderation_log::report_assigned(pool, actor, row.id, nickname, target.as_ref()).await?
+        }
+        None => moderation_log::report_unassigned(pool, actor, row.id, target.as_ref()).await?,
+    };
+    debug!(
+        log = %logged.id,
+        report = %row.id,
+        "admin report assignment recorded"
+    );
+    Ok(Assigned::Row(row))
 }
 
 // ---------------------------------------------------------------------------

@@ -611,6 +611,31 @@ pub async fn create_admin_with_password(pool: &PgPool, nickname: &str, password:
 }
 
 /// Inserts a local [`User`] named `nickname` that can log in with
+/// `password` and holds the moderator role (`is_moderator = true`).
+///
+/// The [`create_admin_with_password`] twin for the staff-only surfaces:
+/// like the admin, no public endpoint mints a moderator, so the
+/// moderation scenarios plant one and then win its credential over HTTP.
+///
+/// # Panics
+///
+/// If hashing or the insert fails.
+pub async fn create_moderator_with_password(pool: &PgPool, nickname: &str, password: &str) -> User {
+    let config = test_config();
+    let new = NewUser {
+        email: Some(format!("{nickname}@example.org")),
+        password_hash: Some(
+            hash_password(password).expect("password hashing succeeds for fixtures"),
+        ),
+        is_moderator: Flag::new(true),
+        ..NewUser::local(nickname, &local_ap_id(&config.base_url, nickname))
+    };
+    insert(pool, &new)
+        .await
+        .expect("moderator user fixture inserts")
+}
+
+/// Inserts a local [`User`] named `nickname` that can log in with
 /// `password` but is deactivated (`is_active = false`): the shape a
 /// suspended account has.
 ///
