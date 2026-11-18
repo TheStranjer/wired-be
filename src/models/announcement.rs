@@ -58,6 +58,12 @@ const GET_SQL: &str = "SELECT * FROM announcements WHERE id = $1";
 /// the administration view, which sees no viewer and so computes no read flag.
 const LIST_ALL_SQL: &str = "SELECT * FROM announcements ORDER BY id DESC";
 
+/// [`list_page`]: the same administration view cut to a `LIMIT`/`OFFSET`
+/// window — the order the window needs to mean anything, so it is the same
+/// newest-first one, on the id whose text sorts in creation order
+/// (decision 4).
+const LIST_PAGE_SQL: &str = "SELECT * FROM announcements ORDER BY id DESC LIMIT $1 OFFSET $2";
+
 /// [`delete`]: one notice by id; its dismissals go with it by the foreign key's
 /// cascade.
 const DELETE_SQL: &str = "DELETE FROM announcements WHERE id = $1";
@@ -271,6 +277,23 @@ pub async fn list_all(pool: &PgPool) -> AppResult<Vec<Announcement>> {
     Ok(rows)
 }
 
+/// Fetches one `limit`-sized, `offset`-deep window of [`list_all`]'s
+/// newest-first ordering: the administration listing's page, which — like the
+/// whole view — sees notices outside their window too.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn list_page(pool: &PgPool, limit: i64, offset: i64) -> AppResult<Vec<Announcement>> {
+    let rows = sqlx::query_as::<_, Announcement>(LIST_PAGE_SQL)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
 /// Deletes the notice `id`, reporting whether one went. Its dismissals are
 /// deleted with it, so an id reused by [`create`] arrives unread.
 ///
@@ -418,6 +441,12 @@ mod tests {
         rows.iter()
             .map(|row| row.announcement.content.as_str())
             .collect()
+    }
+
+    /// The bodies of the administration view's `rows`, in row order — what a
+    /// [`list_page`] test compares against.
+    fn contents(rows: &[Announcement]) -> Vec<&str> {
+        rows.iter().map(|row| row.content.as_str()).collect()
     }
 
     #[tokio::test]
@@ -748,6 +777,30 @@ mod tests {
                 .len(),
             2,
             "afterwards one row less"
+        );
+    }
+
+    /// [`list_page`] cuts that same view — newest first, window aside — to
+    /// one `LIMIT`/`OFFSET` page, an `offset` past the last row answering
+    /// the empty list.
+    #[tokio::test]
+    async fn list_page_windows_the_admin_view_newest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        seed(&pool, "first", None, None).await;
+        seed(&pool, "second", Some(offset(2)), None).await;
+        seed(&pool, "third", None, Some(offset(-2))).await;
+
+        let head = list_page(&pool, 2, 0).await.expect("the first page reads");
+        assert_eq!(contents(&head), ["third", "second"], "newest first");
+        let tail = list_page(&pool, 2, 2).await.expect("the second page reads");
+        assert_eq!(contents(&tail), ["first"], "the window continues");
+        assert!(
+            list_page(&pool, 5, 9)
+                .await
+                .expect("a window past the rows reads")
+                .is_empty(),
+            "and past the last row there is nothing"
         );
     }
 

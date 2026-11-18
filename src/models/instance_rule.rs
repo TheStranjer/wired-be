@@ -4,9 +4,10 @@
 //! `rules` table — a rule is a piece of `text` plus an explanatory `hint`,
 //! sorted by an integer `priority`. Pleroma seeds the list from its
 //! configuration through the admin API; here the list only ever lives in
-//! the table, and the (later) admin tickets reuse [`create`], [`update`]
-//! and [`delete`] to maintain it. `GET /api/v1/instance` and
-//! `GET /api/v1/instance/rules` serve [`list`] as the `rules` block.
+//! the table, and the admin content API (WBE-204) maintains it through
+//! [`create`], [`get`], [`update`] and [`delete`]. `GET /api/v1/instance`
+//! and `GET /api/v1/instance/rules` serve [`list`] as the `rules` block,
+//! so the admin's writes are what the public document reads back.
 //!
 //! [`list`] orders by `priority` first and the `id` second: id text sorts
 //! in creation order (decision 4), so equally ranked rules keep the order
@@ -40,6 +41,10 @@ const UPDATE_SQL: &str = "UPDATE instance_rules
 /// [`list`]: every rule, lowest `priority` first and, within one priority,
 /// oldest first on the id whose text sorts in creation order (decision 4).
 const LIST_SQL: &str = "SELECT * FROM instance_rules ORDER BY priority, id";
+
+/// [`get`]: one rule by id — what a present-only admin write reads before
+/// it merges the fields its body did send.
+const GET_SQL: &str = "SELECT * FROM instance_rules WHERE id = $1";
 
 /// [`delete`]: one rule by id.
 const DELETE_SQL: &str = "DELETE FROM instance_rules WHERE id = $1";
@@ -97,6 +102,24 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<InstanceRule
         .fetch_all(pool)
         .await?;
     Ok(rules)
+}
+
+/// Fetches the rule `id`, `None` when no rule carries it.
+///
+/// This is the read a present-only admin write goes through first: the one
+/// row it merges into, and the answer that turns an unknown id into a
+/// miss (see [`update`]'s and [`delete`]'s reports).
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Option<InstanceRule>> {
+    let row = sqlx::query_as::<_, InstanceRule>(GET_SQL)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
 }
 
 /// Inserts a rule reading `text` with the explanatory `hint` (Pleroma's
@@ -278,6 +301,29 @@ mod tests {
             .await
             .expect("the miss still runs");
         assert_eq!(miss, None, "an unknown id updates nothing");
+    }
+
+    /// [`get`] reads one rule by id and answers `None` for an id no rule
+    /// carries — the read the admin's present-only write goes through.
+    #[tokio::test]
+    async fn get_reads_one_rule_or_misses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let kept = create(&pool, "kept", "here", 2)
+            .await
+            .expect("the kept rule inserts");
+        let _other = create(&pool, "other", "", 0)
+            .await
+            .expect("the other rule inserts");
+
+        let found = get(&pool, kept.id)
+            .await
+            .expect("the read runs")
+            .expect("the rule is there");
+        assert_eq!(found, kept, "the whole row, as stored");
+
+        let miss = get(&pool, Uuid::now_v7()).await.expect("the miss runs");
+        assert_eq!(miss, None, "an unknown id reads as nothing");
     }
 
     /// [`get_many`] answers the named rules in id order, skips the ids that

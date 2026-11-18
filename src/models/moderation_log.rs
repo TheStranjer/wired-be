@@ -32,18 +32,22 @@
 //! [`invite_create`], [`invite_revoke`], [`config_change`],
 //! [`webhook_create`], [`webhook_update`], [`webhook_delete`],
 //! [`webhook_rotate_secret`], [`emoji_pack_create`],
-//! [`emoji_pack_update`] and [`emoji_pack_delete`] — compose
+//! [`emoji_pack_update`], [`emoji_pack_delete`], [`rule_create`],
+//! [`rule_update`], [`rule_delete`], [`announcement_create`],
+//! [`announcement_update`] and [`announcement_delete`] — compose
 //! the sentence word for word as Pleroma's `get_log_entry_message` clauses
 //! spell it, so later admin tickets call
 //! `moderation_log::deactivate(pool, &admin, &users)` and never
-//! hand-assemble a message. Actions without a helper here (the
-//! `announcement_*` family, …) join the set with the tickets that log
-//! them. The webhook maintenance actions — [`webhook_create`],
-//! [`webhook_update`], [`webhook_delete`] and [`webhook_rotate_secret`] —
+//! hand-assemble a message. Actions still without a helper here join the
+//! set with the tickets that log them. The webhook maintenance actions —
+//! [`webhook_create`], [`webhook_update`], [`webhook_delete`] and
+//! [`webhook_rotate_secret`] —
 //! name their row by id the way the invite pair does; the emoji-pack
 //! administration actions — [`emoji_pack_create`], [`emoji_pack_update`]
 //! and [`emoji_pack_delete`] — name their subject by its directory name,
-//! since a pack has no id.
+//! since a pack has no id, and the content maintenance actions — the
+//! [`rule_create`] trio and the [`announcement_create`] trio — name their
+//! row by id as the webhook and invite families do.
 //!
 //! [`list`] is the read behind the endpoint: the newest-first `page` /
 //! `page_size` window over the [`LogListParams`] filters, beside the total
@@ -1437,6 +1441,174 @@ async fn emoji_pack_action(
     let message = format!("@{} {verb} emoji pack: {pack}", actor.nickname);
     let mut data = Map::new();
     put(&mut data, "subject_id", Value::String(pack.to_owned()));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records a `rule_create`: `@admin created rule: {rule_id}`.
+///
+/// The admin content API's `POST /rules` logs here. A rule is no user, so
+/// — like an invite, a webhook or a pack — its id rides in `subject_id` as
+/// text and the subject columns stay empty.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn rule_create(pool: &PgPool, actor: &User, rule_id: Uuid) -> AppResult<ModerationLog> {
+    rule_action(pool, actor, rule_id, "rule_create", "created").await
+}
+
+/// Records a `rule_update`: `@admin updated rule: {rule_id}`.
+///
+/// The admin content API's `PATCH /rules/{id}` logs here.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn rule_update(pool: &PgPool, actor: &User, rule_id: Uuid) -> AppResult<ModerationLog> {
+    rule_action(pool, actor, rule_id, "rule_update", "updated").await
+}
+
+/// Records a `rule_delete`: `@admin deleted rule: {rule_id}`.
+///
+/// The admin content API's `DELETE /rules/{id}` logs here. The row is gone
+/// when this records, which is exactly why the id is kept: the line is the
+/// surviving trace of the deleted rule.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn rule_delete(pool: &PgPool, actor: &User, rule_id: Uuid) -> AppResult<ModerationLog> {
+    rule_action(pool, actor, rule_id, "rule_delete", "deleted").await
+}
+
+/// The three rule clauses share their sentence shape and their
+/// `subject_id` key; only the action name and the verb differ.
+async fn rule_action(
+    pool: &PgPool,
+    actor: &User,
+    rule_id: Uuid,
+    action: &str,
+    verb: &str,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} {verb} rule: {rule_id}", actor.nickname);
+    let mut data = Map::new();
+    put(&mut data, "subject_id", Value::String(rule_id.to_string()));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: action.to_owned(),
+            subjects: Vec::new(),
+            message,
+            data,
+        },
+    )
+    .await
+}
+
+/// Records an `announcement_create`:
+/// `@admin created announcement: {announcement_id}`.
+///
+/// The admin content API's `POST /announcements` logs here, beside the
+/// stream event the route publishes.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn announcement_create(
+    pool: &PgPool,
+    actor: &User,
+    announcement_id: Uuid,
+) -> AppResult<ModerationLog> {
+    announcement_action(
+        pool,
+        actor,
+        announcement_id,
+        "announcement_create",
+        "created",
+    )
+    .await
+}
+
+/// Records an `announcement_update`:
+/// `@admin updated announcement: {announcement_id}`.
+///
+/// The admin content API's `PATCH /announcements/{id}` logs here.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn announcement_update(
+    pool: &PgPool,
+    actor: &User,
+    announcement_id: Uuid,
+) -> AppResult<ModerationLog> {
+    announcement_action(
+        pool,
+        actor,
+        announcement_id,
+        "announcement_update",
+        "updated",
+    )
+    .await
+}
+
+/// Records an `announcement_delete`:
+/// `@admin deleted announcement: {announcement_id}`.
+///
+/// The admin content API's `DELETE /announcements/{id}` logs here, the line
+/// being what survives the notice and its dismissal rows.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn announcement_delete(
+    pool: &PgPool,
+    actor: &User,
+    announcement_id: Uuid,
+) -> AppResult<ModerationLog> {
+    announcement_action(
+        pool,
+        actor,
+        announcement_id,
+        "announcement_delete",
+        "deleted",
+    )
+    .await
+}
+
+/// The three announcement clauses share their sentence shape and their
+/// `subject_id` key; only the action name and the verb differ.
+async fn announcement_action(
+    pool: &PgPool,
+    actor: &User,
+    announcement_id: Uuid,
+    action: &str,
+    verb: &str,
+) -> AppResult<ModerationLog> {
+    let message = format!("@{} {verb} announcement: {announcement_id}", actor.nickname);
+    let mut data = Map::new();
+    put(
+        &mut data,
+        "subject_id",
+        Value::String(announcement_id.to_string()),
+    );
     record(
         pool,
         actor,
