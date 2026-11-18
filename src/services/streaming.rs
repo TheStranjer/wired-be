@@ -20,6 +20,12 @@
 //! renders the entity for its own reader (the streaming endpoint of
 //! [`crate::api::streaming`] resolves the hint); a delete, whose row is a
 //! tombstone nothing can re-render, carries the deleted id itself.
+//! [`notification_created`] is the module's other producer: Mastodon's
+//! `notification` for a freshly created notification row, riding the
+//! recipient's own `user:{id}` and `user:notification:{id}` streams with a
+//! [`RenderSpec::Notification`] hint — and never published when the
+//! recipient mutes the actor, the same mute the rendered entity reports
+//! as `pleroma.is_muted`.
 //!
 //! The rules, stated once here and split into one helper per component:
 //!
@@ -91,7 +97,8 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::{
-        follow, hashtag, list, media_attachment, mention,
+        follow, hashtag, list, media_attachment, mention, mute,
+        notification::Notification,
         status::{self, Status, Visibility},
         user::{self, User},
     },
@@ -263,6 +270,52 @@ async fn publish_status(
         audience,
         render,
         local_only,
+    });
+}
+
+/// Publish Mastodon's `notification` for the freshly created notification `row`.
+///
+/// The event rides the recipient's two private streams — `user:{recipient}`
+/// and `user:notification:{recipient}`, the hub names a client's `user` and
+/// `user:notification` subscriptions expand to (see
+/// [`crate::api::streaming`]) — with the recipient as the whole
+/// [`Audience::Users`] and a [`RenderSpec::Notification`] hint and no
+/// payload, so each socket renders the entity for its own reader as the
+/// status emitters do.
+///
+/// A notification whose recipient mutes its actor publishes nothing: that
+/// mute is exactly what the rendered entity reports as `pleroma.is_muted`
+/// (the relationship's `muting` flag, [`mute::is_muting`] being its
+/// one-pair spelling), and a row hidden from the recipient's listing is
+/// hidden from their socket too.
+///
+/// Best-effort like [`status_created`]: the row is already committed, so a
+/// failed mute read is a log line and nothing published, never an error
+/// back to the caller.
+pub async fn notification_created(state: &AppState, row: &Notification) {
+    let recipient = row.user_id;
+    match mute::is_muting(&state.db, recipient, row.from_account_id).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                notification = %row.id,
+                %err,
+                "notification stream event skipped: reading the recipient's mute failed"
+            );
+            return;
+        }
+    }
+    state.hub.publish(StreamEvent {
+        streams: vec![
+            format!("user:{recipient}"),
+            format!("user:notification:{recipient}"),
+        ],
+        event: "notification".to_owned(),
+        payload: None,
+        audience: Audience::Users(vec![recipient]),
+        render: Some(RenderSpec::Notification(row.id)),
+        local_only: false,
     });
 }
 
@@ -565,6 +618,7 @@ mod tests {
             follow::FollowToggles,
             list::NewList,
             media_attachment::NewMediaAttachment,
+            notification::{self, NewNotification, TYPE_FAVOURITE},
             status::NewStatus,
             user::{Flag, NewUser, insert, local_ap_id},
         },
@@ -1618,6 +1672,81 @@ mod tests {
         let mut rx = state.hub.subscribe();
 
         status_created(&state, &row).await;
+
+        assert_empty(&mut rx);
+    }
+
+    /// A stored `favourite` telling: `actor` favourited, `recipient` is told.
+    async fn favourite_note(pool: &PgPool, recipient: &User, actor: &User) -> Notification {
+        notification::create(
+            pool,
+            &NewNotification {
+                user_id: recipient.id,
+                from_account_id: actor.id,
+                notification_type: TYPE_FAVOURITE,
+                status_id: None,
+                emoji: None,
+                report_id: None,
+                chat_message_id: None,
+            },
+        )
+        .await
+        .expect("the notification fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn notification_created_pushes_the_recipient_streams_with_the_hint() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let row = favourite_note(&pool, &alice, &bob).await;
+        let mut rx = state.hub.subscribe();
+
+        notification_created(&state, &row).await;
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(event.event, "notification", "Mastodon's notification event");
+        assert_eq!(
+            event.streams,
+            vec![
+                user_stream(alice.id),
+                format!("user:notification:{}", alice.id),
+            ],
+            "the event rides exactly the recipient's user and notification streams"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(vec![alice.id]),
+            "the recipient is the whole audience"
+        );
+        assert_eq!(
+            event.render,
+            Some(RenderSpec::Notification(row.id)),
+            "the event carries the notification render hint"
+        );
+        assert!(event.payload.is_none(), "no body: the socket renders it");
+        assert!(
+            !event.local_only,
+            "a notification is not flagged local-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_created_publishes_nothing_the_recipient_mutes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let _mute = mute::mute(&pool, &alice, &bob, mute::MuteOptions::default())
+            .await
+            .expect("the mute fixture writes");
+        let row = favourite_note(&pool, &alice, &bob).await;
+        let mut rx = state.hub.subscribe();
+
+        notification_created(&state, &row).await;
 
         assert_empty(&mut rx);
     }
