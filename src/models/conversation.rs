@@ -38,7 +38,9 @@
 //! performs, [`page_direct_statuses`] one thread's status listing, and
 //! [`participation_ids`] the one batched read
 //! [`crate::services::render_status`] runs per page to fill
-//! `pleroma.direct_conversation_id`.
+//! `pleroma.direct_conversation_id`, and [`participations_for_status`] the
+//! local roster one freshly threaded status is announced to, off the create
+//! hook's [`crate::services::streaming::conversation_updated`] push.
 //!
 //! [`repoint_after_delete`] is the delete side of `last_status_id`: a soft
 //! delete never fires the foreign key, so when the status one
@@ -157,6 +159,15 @@ const RECIPIENTS_SQL: &str = "SELECT user_id FROM conversation_participation_rec
 /// (decision 3's fixed query set).
 const PARTICIPATION_IDS_SQL: &str = "SELECT conversation_id, id FROM conversation_participations \
      WHERE user_id = $1 AND conversation_id = ANY($2)";
+
+/// [`participations_for_status`]: every local side of the thread one status
+/// was recorded into. The join runs through `statuses.direct_conversation_id`,
+/// so a status of any other visibility (threaded by nothing) and a thread
+/// whose only members are remote (a participation is a local account's row)
+/// both answer no rows; the roster is ordered by its owning account.
+const PARTICIPATIONS_FOR_STATUS_SQL: &str = "SELECT p.* FROM conversation_participations p \
+     JOIN statuses s ON s.direct_conversation_id = p.conversation_id \
+     WHERE s.id = $1 ORDER BY p.user_id";
 
 /// [`get_participation`]: the one row of `user_id` whose id is `id`. Both
 /// halves of the key are required — a participation somebody else owns
@@ -452,6 +463,37 @@ pub async fn participate_for_status(pool: &PgPool, status: &Status) -> AppResult
     participate(&mut tx, status, &everyone).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Every local side of the direct thread `status_id` was recorded into, each
+/// as its own [`Participation`] row, ordered by its owning account.
+///
+/// The row's `user_id` is the reader to tell and its `id` is the participation
+/// their socket renders — the id [`crate::streaming::hub::RenderSpec::Conversation`]
+/// names, which means nothing to any other side of the thread. The thread is
+/// found through the status's stored [`direct_conversation_id`](Status::direct_conversation_id),
+/// so the answer is exactly the [`participate`] roster the create hook just
+/// wrote: a status of any other visibility (threaded by nothing) and a thread
+/// whose only members are remote (a participation is a local account's row)
+/// both answer the empty `Vec`. [`participate_in_conversation`] is its only
+/// caller, publishing one conversation update per row it returns.
+///
+/// [`participate_in_conversation`]: crate::services::create_status
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+///
+/// [`AppError::Database`]: crate::error::AppError
+pub async fn participations_for_status(
+    pool: &PgPool,
+    status_id: Uuid,
+) -> AppResult<Vec<Participation>> {
+    let rows = sqlx::query_as::<_, Participation>(PARTICIPATIONS_FOR_STATUS_SQL)
+        .bind(status_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// The accounts `participation_id` addresses besides its owner, in the
@@ -1628,6 +1670,54 @@ mod tests {
                 .expect("the empty ask runs")
                 .is_empty(),
             "an empty ask is the empty map"
+        );
+    }
+
+    #[tokio::test]
+    async fn participations_for_status_reads_the_local_roster_of_the_status_thread() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = remote(&pool, "carol").await;
+        let post = direct(&pool, &alice, &[&bob, &carol], "@bob @carol psst").await;
+        bump(&pool, &post).await;
+        let thread = linked_thread(&pool, &post).await;
+        let alice_row = participation(&pool, alice.id, thread)
+            .await
+            .expect("the author participates");
+        let bob_row = participation(&pool, bob.id, thread)
+            .await
+            .expect("the local addressee participates");
+
+        let found = participations_for_status(&pool, post.id)
+            .await
+            .expect("the local roster reads");
+        let mut pairs: Vec<(Uuid, Uuid)> = found.iter().map(|row| (row.user_id, row.id)).collect();
+        pairs.sort();
+        let mut expected = vec![(alice.id, alice_row.id), (bob.id, bob_row.id)];
+        expected.sort();
+        assert_eq!(
+            pairs, expected,
+            "both local sides, each with their own participation id"
+        );
+        assert!(
+            !pairs.iter().any(|(user_id, _)| *user_id == carol.id),
+            "the remote addressee owns no participation and is absent"
+        );
+
+        let public = status::insert(
+            &pool,
+            TEST_BASE_URL,
+            &NewStatus::local(&alice, "a public post"),
+        )
+        .await
+        .expect("the public fixture inserts");
+        assert!(
+            participations_for_status(&pool, public.id)
+                .await
+                .expect("the read runs")
+                .is_empty(),
+            "a non-direct status is threaded by nothing, so it has no roster"
         );
     }
 

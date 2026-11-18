@@ -35,14 +35,14 @@ use wired_be::{
     api::streaming::MAX_SUBSCRIPTIONS,
     config::Config,
     models::{
-        block, conversation_mute, domain_block, follow, list,
+        block, conversation_mute, domain_block, favourite, follow, list,
         mute::{self, MuteOptions},
         status,
         user::{NewUser, User, insert},
     },
     services::{
         create_status::{self, CreateStatusParams},
-        delete_status,
+        delete_status, notify, streaming,
     },
     state::AppState,
     streaming::hub::{Audience, StreamEvent},
@@ -1097,6 +1097,90 @@ async fn a_created_status_renders_for_one_subscriber_and_skips_a_blocker() {
     );
 }
 
+/// The notification push end to end: B favourites A's status, and
+/// [`notify::on_favourite`] publishes Mastodon's `notification` for the
+/// recipient with a [`RenderSpec::Notification`] hint; A's socket,
+/// subscribed to `user:notification`, receives the frame with the like
+/// rendered as its entity. A third user's socket on the same client
+/// stream receives nothing of it: only its own control event arrives.
+#[tokio::test]
+async fn a_favourite_lands_a_notification_frame_on_the_recipient_socket() {
+    let server = Server::start().await;
+    let author = account(server.pool(), "notif-author").await;
+    let favouriter = account(server.pool(), "notif-favouriter").await;
+    let bystander = account(server.pool(), "notif-bystander").await;
+    let entity =
+        create_status::create_status(&server.state, &author, None, create_body(LIFECYCLE_TEXT))
+            .await
+            .expect("the create service runs");
+    let status_id = Uuid::parse_str(&entity.id).expect("the entity id is a uuid");
+    let notified_token = token(server.pool(), &author, "read").await;
+    let blind_token = token(server.pool(), &bystander, "read").await;
+    let mut notified = open(&server.url(&format!(
+        "stream=user:notification&access_token={notified_token}"
+    )))
+    .await;
+    let mut bystander_socket = open(&server.url(&format!(
+        "stream=user:notification&access_token={blind_token}"
+    )))
+    .await;
+    settled(&mut notified).await;
+    settled(&mut bystander_socket).await;
+
+    let like = favourite::favourite(
+        server.pool(),
+        &server.state.config.base_url,
+        favouriter.id,
+        status_id,
+    )
+    .await
+    .expect("the favourite fixture writes")
+    .expect("the pair was fresh");
+    notify::on_favourite(&server.state, &like, true).await;
+
+    let frame = next_json(&mut notified).await;
+    assert_eq!(
+        frame["event"], "notification",
+        "the recipient sees the event"
+    );
+    let recipient_stream = format!("user:notification:{}", author.id);
+    assert!(
+        streams_of(&frame).contains(&recipient_stream.as_str()),
+        "it rides the recipient's notification stream: {frame}"
+    );
+    let payload: Value = serde_json::from_str(
+        frame["payload"]
+            .as_str()
+            .expect("the notification carries a payload string"),
+    )
+    .expect("the payload is the entity JSON");
+    assert_eq!(payload["type"], "favourite", "the entity is the like");
+    assert_eq!(
+        payload["account"]["id"],
+        json!(favouriter.id.to_string()),
+        "the entity names the favouriter as its actor"
+    );
+    assert_eq!(
+        payload["status"]["id"],
+        json!(entity.id),
+        "and the liked status"
+    );
+    assert_eq!(payload["pleroma"]["is_muted"], false, "A does not mute B");
+
+    let own_stream = format!("user:notification:{}", bystander.id);
+    server.publish(event_on(
+        &[own_stream.as_str()],
+        "notif-control",
+        Audience::Users(vec![bystander.id]),
+    ));
+    let frames = read_until(&mut bystander_socket, "notif-control").await;
+    assert_absent(&frames, &[r#""event":"notification""#, &entity.id]);
+    assert!(
+        frames.iter().any(|line| line.contains("notif-control")),
+        "the bystander's socket is open and streaming, just not this: {frames:?}"
+    );
+}
+
 /// The next text frame, parsed as Mastodon's JSON envelope.
 async fn next_json(client: &mut Client) -> Value {
     serde_json::from_str(&next_text(client).await).expect("every streaming frame is JSON")
@@ -1146,4 +1230,100 @@ fn assert_update_carries(frame: &Value, id: &str) {
             .is_some_and(|content| content.contains(LIFECYCLE_TEXT)),
         "the content rides the entity: {entity}"
     );
+}
+
+/// `announcement_published` (WBE-191 slice 5), end to end: the emitter reads
+/// the active-local roster and rides every one of those users' own
+/// `user:<uuid>` stream, so each active local socket receives the
+/// announcement and no remote or anonymous socket does. The event is put on
+/// the bus by the real emitter, so streams, audience and the entity-as-string
+/// payload are its production shape. Each socket is then bounded by its own
+/// control event on its own subscription, published after the announcement:
+/// what the announcement could not have reached before the control, it never
+/// will.
+#[tokio::test]
+async fn announcement_published_reaches_every_active_local_socket() {
+    let server = Server::start().await;
+    let alice = account(server.pool(), "announce-alice").await;
+    let bob = account(server.pool(), "announce-bob").await;
+    let remote =
+        common::create_remote_user(server.pool(), "announce-remote", "remote.example").await;
+    let alice_stream = format!("user:{}", alice.id);
+    let bob_stream = format!("user:{}", bob.id);
+    let remote_stream = format!("user:{}", remote.id);
+    let mut alice_socket = open(&server.url(&format!(
+        "stream=user&access_token={}",
+        token(server.pool(), &alice, "read").await
+    )))
+    .await;
+    let mut bob_socket = open(&server.url(&format!(
+        "stream=user&access_token={}",
+        token(server.pool(), &bob, "read").await
+    )))
+    .await;
+    let mut remote_socket = open(&server.url(&format!(
+        "stream=user&access_token={}",
+        token(server.pool(), &remote, "read").await
+    )))
+    .await;
+    let mut anonymous = open(&server.url(PUBLIC)).await;
+
+    let entity = json!({"id": "announcement-1", "content": "<p>Up!</p>"});
+    streaming::announcement_published(&server.state, &entity).await;
+    server.publish(event_on(
+        &[alice_stream.as_str()],
+        "alice-control",
+        Audience::Users(vec![alice.id]),
+    ));
+    server.publish(event_on(
+        &[bob_stream.as_str()],
+        "bob-control",
+        Audience::Users(vec![bob.id]),
+    ));
+    server.publish(event_on(
+        &[remote_stream.as_str()],
+        "remote-control",
+        Audience::Users(vec![remote.id]),
+    ));
+    server.publish(public_update("anon-control"));
+
+    let alice_frames = read_until(&mut alice_socket, "alice-control").await;
+    let alice_announcement = parse_event(&alice_frames, "announcement");
+    assert_eq!(
+        alice_announcement["stream"],
+        json!([alice_stream, bob_stream]),
+        "the event rides exactly the roster's own streams, alice's first"
+    );
+    assert_eq!(
+        alice_announcement["payload"],
+        entity.to_string(),
+        "Mastodon ships the entity as its JSON string"
+    );
+
+    let bob_frames = read_until(&mut bob_socket, "bob-control").await;
+    let bob_announcement = parse_event(&bob_frames, "announcement");
+    assert_eq!(
+        bob_announcement["payload"],
+        entity.to_string(),
+        "every active local socket gets the same entity"
+    );
+
+    let remote_frames = read_until(&mut remote_socket, "remote-control").await;
+    assert_absent(&remote_frames, &["announcement-1"]);
+
+    let anonymous_frames = read_until(&mut anonymous, "anon-control").await;
+    assert_absent(&anonymous_frames, &["announcement-1"]);
+}
+
+/// The frame among `frames` whose envelope names event `name`, parsed.
+///
+/// # Panics
+///
+/// If no frame carries that event or its envelope is not JSON.
+fn parse_event(frames: &[String], name: &str) -> Value {
+    let frame = frames
+        .iter()
+        .find(|frame| frame.contains(&format!(r#""event":"{name}""#)))
+        .unwrap_or_else(|| panic!("no `{name}` frame among {frames:?}"));
+    serde_json::from_str(frame).expect("the frame is a JSON envelope")
 }

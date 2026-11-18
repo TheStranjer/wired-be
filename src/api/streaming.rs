@@ -23,7 +23,8 @@
 //!   send time — one hub event, each socket its own view, the way Pleroma's
 //!   `Streamer` renders in the socket process: a hinted status through
 //!   [`render_status`], a hinted notification through the notifications
-//!   endpoint's builder, a hinted chat through the chats endpoint's builder.
+//!   endpoint's builder, a hinted chat through the chats endpoint's builder
+//!   and a hinted conversation through the conversations endpoint's one.
 //!   A hint the socket cannot answer for its reader — no row, not visible,
 //!   a deactivated actor, or text one of the reader's irreversible word
 //!   filters matches — drops the event rather than sending an
@@ -78,12 +79,12 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    api::{chats, notifications},
+    api::{chats, conversations, notifications},
     auth,
     error::{AppError, AppResult},
     models::{
-        block, chat, conversation_mute, domain_block, filter, hashtag, list, mute, notification,
-        status, status_visibility,
+        block, chat, conversation, conversation_mute, domain_block, filter, hashtag, list, mute,
+        notification, status, status_visibility,
         user::{self, User},
     },
     oauth::scopes::{READ, READ_LISTS, READ_NOTIFICATIONS, READ_STATUSES, Scopes},
@@ -631,6 +632,7 @@ impl Connection {
             RenderSpec::Status(id) => self.render_hinted_status(*id).await,
             RenderSpec::Notification(id) => self.render_hinted_notification(*id).await,
             RenderSpec::Chat(id) => self.render_hinted_chat(*id).await,
+            RenderSpec::Conversation(id) => self.render_hinted_conversation(*id).await,
         }
     }
 
@@ -797,6 +799,46 @@ impl Connection {
             Ok(entity) => entity_json(&entity, id),
             Err(err) => {
                 warn!(%err, %id, "a streaming chat hint could not be rendered");
+                None
+            }
+        }
+    }
+
+    /// The Conversation entity JSON of the hinted participation `id` (the
+    /// reader's own row of the direct-message thread, the way the
+    /// conversations endpoints address a conversation), built by
+    /// [`crate::api::conversations`]' entity builder. `None` — the drop
+    /// signal — when the socket has no viewer or no participation of this
+    /// reader carries that id: [`conversation::get_participation`] answers
+    /// `None` for a foreign id and for no id at all, so another reader's
+    /// conversation never renders here.
+    async fn render_hinted_conversation(&self, id: Uuid) -> Option<String> {
+        let Some(viewer) = self.viewer() else {
+            debug!(%id, "a streaming conversation hint reaches a readerless socket");
+            return None;
+        };
+        let row = match conversation::get_participation(&self.state.db, viewer.id, id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                debug!(%id, "a streaming conversation hint names no participation of the reader's");
+                return None;
+            }
+            Err(err) => {
+                warn!(%err, %id, "a streaming conversation hint could not be read");
+                return None;
+            }
+        };
+        let rows = [row];
+        // Like the endpoint's single-participation reads, a hinted row goes
+        // through the page renderer on its own; that builder answers one
+        // entity per row it is handed.
+        match conversations::conversation_entities(&self.state, viewer, &rows).await {
+            Ok(entities) => entities
+                .into_iter()
+                .next()
+                .and_then(|entity| entity_json(&entity, id)),
+            Err(err) => {
+                warn!(%err, %id, "a streaming conversation hint could not be rendered");
                 None
             }
         }
@@ -1937,6 +1979,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_owner_socket_forwards_a_bare_filters_changed_frame() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "filters-changed-reader").await;
+        let stranger = account(&state, "filters-changed-stranger").await;
+        let own_stream = format!("{USER}:{}", reader.id);
+        let other_stream = format!("{USER}:{}", stranger.id);
+        let owner = for_reader(&state, &reader, &[own_stream.as_str()]).await;
+        let holding_stranger = for_reader(&state, &stranger, &[own_stream.as_str()]).await;
+        let anonymous = watching(&state, &[own_stream.as_str()]).await;
+        // The event `services::streaming::filters_changed` publishes.
+        let filters_changed = StreamEvent {
+            streams: vec![own_stream.clone()],
+            event: "filters_changed".to_owned(),
+            payload: None,
+            audience: Audience::Users(vec![reader.id]),
+            render: None,
+            local_only: false,
+        };
+
+        assert_eq!(
+            owner.frame_for(&filters_changed).await,
+            Some(format!(
+                r#"{{"stream":["{own_stream}"],"event":"filters_changed"}}"#
+            )),
+            "the owner's socket writes the bare envelope, no payload key"
+        );
+        assert!(
+            holding_stranger.frame_for(&filters_changed).await.is_none(),
+            "a reader holding the stream name but outside the audience never sees it: {other_stream}"
+        );
+        assert!(
+            anonymous.frame_for(&filters_changed).await.is_none(),
+            "and neither does an anonymous socket"
+        );
+    }
+
+    #[tokio::test]
     async fn audience_decides_who_sees_an_event() {
         let (_db, state) = state().await;
         let reader = account(&state, "stream-reader").await;
@@ -2611,7 +2690,7 @@ mod tests {
     #[tokio::test]
     async fn a_render_hint_that_cannot_be_answered_drops_the_event() {
         let (_db, state) = state().await;
-        let connection = watching(&state, &[USER_NOTIFICATION]).await;
+        let connection = watching(&state, &[USER_NOTIFICATION, DIRECT]).await;
         let hinted = StreamEvent {
             streams: vec![USER_NOTIFICATION.to_owned()],
             event: "notification".to_owned(),
@@ -2632,6 +2711,16 @@ mod tests {
         assert!(
             connection.frame_for(&hinted_chat).await.is_none(),
             "and the same for a chat hint on a readerless socket"
+        );
+        let hinted_conversation = StreamEvent {
+            streams: vec![DIRECT.to_owned()],
+            event: "conversation".to_owned(),
+            render: Some(RenderSpec::Conversation(Uuid::now_v7())),
+            ..hinted_chat
+        };
+        assert!(
+            connection.frame_for(&hinted_conversation).await.is_none(),
+            "and the same for a conversation hint, which no participation of nobody's answers"
         );
     }
 
@@ -3076,6 +3165,77 @@ mod tests {
         );
     }
 
+    /// A conversation hint renders the reader's own participation through
+    /// the conversations endpoint's builder: the thread's other
+    /// participant as account, the row's unread flag and the newest status
+    /// as this viewer sees it.
+    #[tokio::test]
+    async fn a_conversation_hint_renders_the_conversation_for_its_participant() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "conversation-hint-reader").await;
+        let author = account(&state, "conversation-hint-author").await;
+        let post = dm(&state, &author, &[&reader], "only between us").await;
+        let own = participation_id(&state, &reader, &post).await;
+        let own_stream = format!("{DIRECT}:{}", reader.id);
+        let connection = for_reader(&state, &reader, &[&own_stream]).await;
+
+        let frame = connection
+            .frame_for(&conversation_hint(&own_stream, reader.id, own))
+            .await
+            .expect("the participant's socket renders their conversation");
+
+        let entity = frame_payload(&frame);
+        assert_eq!(
+            entity["id"],
+            own.to_string(),
+            "the reader's own participation, never the thread's id"
+        );
+        assert_eq!(
+            entity["accounts"][0]["id"],
+            author.id.to_string(),
+            "the other participant as the viewer sees them"
+        );
+        assert_eq!(
+            entity["unread"], true,
+            "the side that has not answered reads unread"
+        );
+        assert_eq!(
+            entity["last_status"]["content"], "<p>only between us</p>",
+            "the thread's newest status rendered into the entity"
+        );
+    }
+
+    /// A conversation hint answers only for its own participant: another
+    /// reader's participation id, and an id nobody holds at all, both drop
+    /// the event — the same indistinguishable miss the conversations
+    /// endpoints answer with a 404.
+    #[tokio::test]
+    async fn a_conversation_hint_is_dropped_for_a_stranger_and_a_miss() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "conversation-drop-reader").await;
+        let stranger = account(&state, "conversation-drop-stranger").await;
+        let author = account(&state, "conversation-drop-author").await;
+        let post = dm(&state, &author, &[&reader], "not for you").await;
+        let own = participation_id(&state, &reader, &post).await;
+
+        let theirs = format!("{DIRECT}:{}", stranger.id);
+        let stranger_connection = for_reader(&state, &stranger, &[&theirs]).await;
+        assert!(
+            stranger_connection
+                .frame_for(&conversation_hint(&theirs, stranger.id, own))
+                .await
+                .is_none(),
+            "one participant's conversation id means nothing to another"
+        );
+        assert!(
+            stranger_connection
+                .frame_for(&conversation_hint(&theirs, stranger.id, Uuid::now_v7()))
+                .await
+                .is_none(),
+            "and so does a hint that names no participation at all"
+        );
+    }
+
     /// A `notification` event that carries only the notification render
     /// hint, for `reader`'s stream — the shape a notification producer
     /// will publish.
@@ -3101,6 +3261,73 @@ mod tests {
             render: Some(RenderSpec::Chat(id)),
             local_only: false,
         }
+    }
+
+    /// A `conversation` event that carries only the conversation render
+    /// hint, for `reader`'s direct stream — the shape a conversation
+    /// producer will publish.
+    fn conversation_hint(stream: &str, reader: Uuid, id: Uuid) -> StreamEvent {
+        StreamEvent {
+            streams: vec![stream.to_owned()],
+            event: "conversation".to_owned(),
+            payload: None,
+            audience: Audience::Users(vec![reader]),
+            render: Some(RenderSpec::Conversation(id)),
+            local_only: false,
+        }
+    }
+
+    /// `author`'s `direct` status addressed to everyone in `mentioned`,
+    /// with the create hook's participation write run over it: the state a
+    /// posted DM leaves behind, and the only way a participation row comes
+    /// to exist.
+    ///
+    /// # Panics
+    ///
+    /// If either fixture write fails.
+    async fn dm(
+        state: &AppState,
+        author: &User,
+        mentioned: &[&User],
+        text: &str,
+    ) -> status::Status {
+        let ids: Vec<Uuid> = mentioned.iter().map(|who| who.id).collect();
+        let post = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus {
+                visibility: Visibility::Direct,
+                mentioned_user_ids: ids,
+                ..NewStatus::local(author, text)
+            },
+        )
+        .await
+        .expect("the direct fixture inserts");
+        conversation::participate_for_status(&state.db, &post)
+            .await
+            .expect("the participation hook runs");
+        post
+    }
+
+    /// `reader`'s own participation id in the thread `post` was stored
+    /// into — the id a conversation hint names.
+    ///
+    /// # Panics
+    ///
+    /// If either fixture read fails, or the hook left `post` unthreaded or
+    /// `reader` out of the thread.
+    async fn participation_id(state: &AppState, reader: &User, post: &status::Status) -> Uuid {
+        let thread = status::get_by_id(&state.db, post.id)
+            .await
+            .expect("the fixture post reads")
+            .expect("the fixture post is live")
+            .direct_conversation_id
+            .expect("the participation hook threaded the fixture");
+        *conversation::participation_ids(&state.db, reader.id, &[thread])
+            .await
+            .expect("the participations read")
+            .get(&thread)
+            .expect("the reader is a participant of the fixture thread")
     }
 
     /// `nickname`'s user with one active word filter for `phrase`:

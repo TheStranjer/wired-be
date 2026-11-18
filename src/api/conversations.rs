@@ -496,13 +496,17 @@ async fn one_entity(
 /// rows the viewer may not see or that no longer exist simply leave the
 /// map, and their conversation's `last_status` goes `null`.
 ///
+/// [`crate::api::streaming`] renders a hinted conversation through this
+/// same builder, so a socket's `conversation` entity and the listing's are
+/// built the same way.
+///
 /// # Errors
 ///
 /// [`Database`](crate::error::AppError::Database) from the recipient,
 /// account, relationship, status and visibility reads;
 /// [`Internal`](crate::error::AppError::Internal) if a rendered status
 /// entity would not serialize.
-async fn conversation_entities(
+pub(crate) async fn conversation_entities(
     state: &AppState,
     viewer: &User,
     rows: &[Participation],

@@ -92,12 +92,13 @@ pub enum Audience {
 /// status emitters of [`crate::services::streaming`] publish
 /// [`RenderSpec::Status`] with an empty payload and
 /// [`crate::api::streaming`] renders each hinted entity — status,
-/// notification or chat — for its own socket's reader at send time. The
-/// notification and chat producers' slices still have to land; the framing
-/// answers their hints in the meantime.
+/// notification, chat or conversation — for its own socket's reader at send
+/// time. The conversation producer's slice still has to land; the framing
+/// answers its hints in the meantime.
 ///
 /// The variants serialize to `{"status": "<uuid>"}`,
-/// `{"notification": "<uuid>"}` and `{"chat": "<uuid>"}`: `snake_case`
+/// `{"notification": "<uuid>"}`, `{"chat": "<uuid>"}` and
+/// `{"conversation": "<uuid>"}`: `snake_case`
 /// tags, like [`Audience`]'s wire forms, so the value rides the JSON
 /// envelope unchanged.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -110,6 +111,11 @@ pub enum RenderSpec {
     /// The event points at the chat with this id — each reader's own row
     /// of the conversation, which is what the socket renders.
     Chat(Uuid),
+    /// The event points at the conversation participation with this id —
+    /// the reader's own row of the direct-message thread, which is what
+    /// the socket renders (`GET /api/v1/conversations` answers with this
+    /// same entity).
+    Conversation(Uuid),
 }
 
 /// One event on the streaming bus, in the shape a Mastodon streaming
@@ -612,7 +618,7 @@ mod tests {
         }
     }
 
-    /// The six `(render, local_only)` shapes the hub must thread through
+    /// The eight `(render, local_only)` shapes the hub must thread through
     /// the bridge: every [`RenderSpec`] variant with the flag on and off.
     fn render_cases(id: Uuid) -> Vec<(RenderSpec, bool)> {
         let mut cases = Vec::new();
@@ -620,6 +626,7 @@ mod tests {
             RenderSpec::Status(id),
             RenderSpec::Notification(id),
             RenderSpec::Chat(id),
+            RenderSpec::Conversation(id),
         ] {
             for local_only in [true, false] {
                 cases.push((render.clone(), local_only));
@@ -896,6 +903,7 @@ mod tests {
             (RenderSpec::Status(id), "status"),
             (RenderSpec::Notification(id), "notification"),
             (RenderSpec::Chat(id), "chat"),
+            (RenderSpec::Conversation(id), "conversation"),
         ] {
             let text = serde_json::to_string(&spec).unwrap();
             assert_eq!(

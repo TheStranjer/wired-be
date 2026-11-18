@@ -98,33 +98,36 @@ use crate::{
         status::{self, Status as StatusRow, Visibility},
         user::{self, User},
     },
-    services::web_push,
+    services::{streaming, web_push},
     state::AppState,
 };
 
 /// The shared creation arm behind every telling: [`notification::maybe_notify`]
 /// for `recipient` — who must be **local**, or there is nobody to tell from
-/// here — and, when the row lands, the queueing of its Web Push deliveries.
+/// here — and, when the row lands, the streaming publish and the queueing
+/// of its Web Push deliveries.
 ///
 /// Split out from [`tell`] for the two arms that pair with their own extra
 /// checks: [`tell`] adds the self-action skip, and [`on_poll_ended`]'s
 /// author arm deliberately skips *without* it (the poll closing on one's
-/// own post is one's own news). The push queueing stays best-effort here —
-/// a notification that exists but fails to wake a browser is logged, never
-/// an error back to the endpoint.
+/// own post is one's own news). Both tails stay best-effort here — the
+/// streaming emitter logs its own refusals, and a notification that exists
+/// but fails to wake a browser is logged, never an error back to the
+/// endpoint.
 async fn announce(state: &AppState, recipient: &User, note: &NewNotification<'_>) -> AppResult<()> {
     if !recipient.local.get() {
         return Ok(());
     }
     let created = notification::maybe_notify(&state.db, note).await?;
-    if let Some(row) = created
-        && let Err(err) = web_push::enqueue_deliveries(&state.db, row.id, recipient.id).await
-    {
-        warn!(
-            notification = %row.id,
-            %err,
-            "could not queue web push deliveries"
-        );
+    if let Some(row) = created {
+        streaming::notification_created(state, &row).await;
+        if let Err(err) = web_push::enqueue_deliveries(&state.db, row.id, recipient.id).await {
+            warn!(
+                notification = %row.id,
+                %err,
+                "could not queue web push deliveries"
+            );
+        }
     }
     Ok(())
 }
