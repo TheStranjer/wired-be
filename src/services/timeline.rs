@@ -17,7 +17,8 @@
 //!   unexpired mutes, domain blocks and thread mutes — always applied unless
 //!   `with_muted` is set;
 //! - what the viewer may see at all: [`push_visibility_clause`], always
-//!   applied, on top of the unconditional `deleted_at IS NULL` (a scheduled
+//!   applied, on top of the unconditional `deleted_at IS NULL` and the
+//!   author-`is_active` check of `SELECT_SQL` (a scheduled
 //!   `expires_at` is not a filter: an expired row stays readable until the
 //!   sweep takes it, as everywhere else in this schema).
 //!
@@ -60,10 +61,19 @@ use crate::{
 };
 
 /// The head of every [`TimelineQuery::fetch`] statement: the live rows
-/// (`deleted_at IS NULL`, always applied) of `statuses`, aliased `s` for the
-/// fragments [`push_visibility_clause`] and the keyset paging take. Every
-/// clause below appends its own ` AND ` to this.
-const SELECT_SQL: &str = "SELECT s.* FROM statuses s WHERE s.deleted_at IS NULL";
+/// (`deleted_at IS NULL`, always applied) of `statuses` whose author's
+/// account is active, aliased `s` for the fragments
+/// [`push_visibility_clause`] and the keyset paging take. Every clause
+/// below appends its own ` AND ` to this.
+///
+/// The author check is Pleroma's `Activity.restrict_deactivated_users`
+/// (`lib/pleroma/activity.ex`), which `fetch_activities` folds into every
+/// timeline read (`lib/pleroma/web/activity_pub/activity_pub.ex`): a
+/// deactivated account's posts leave every timeline while the flag stands,
+/// and come back with it. The admin surfaces read through
+/// [`crate::models::status::admin`] instead and keep seeing everything.
+const SELECT_SQL: &str = "SELECT s.* FROM statuses s WHERE s.deleted_at IS NULL \
+     AND EXISTS (SELECT 1 FROM users au WHERE au.id = s.user_id AND au.is_active)";
 
 /// The author of the original a reblog row boosts, as a scalar subquery over
 /// `s`: `NULL` when `s` is not a reblog, which no `= ` comparison ever

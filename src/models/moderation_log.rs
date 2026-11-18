@@ -1152,6 +1152,36 @@ pub async fn reload_emoji(pool: &PgPool, actor: &User) -> AppResult<ModerationLo
     .await
 }
 
+/// Records a `create_backup`: `@admin requested account backup for @user`.
+///
+/// Pleroma's `AdminAPIController.create_backup` clause: the account whose
+/// export was staged rides in `data.subject` (Pleroma's `subject` map) and
+/// in the subject columns, since the action speaks about that one account.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError); see [`record`].
+pub async fn create_backup(pool: &PgPool, actor: &User, target: &User) -> AppResult<ModerationLog> {
+    let message = format!(
+        "@{} requested account backup for @{}",
+        actor.nickname, target.nickname
+    );
+    let mut data = Map::new();
+    put(&mut data, "subject", Value::Object(user_map(target)));
+    record(
+        pool,
+        actor,
+        ModAction {
+            action: "create_backup".to_owned(),
+            subjects: vec![target],
+            message,
+            data,
+        },
+    )
+    .await
+}
+
 /// Records a `config_change`: `@admin changed config: :pleroma/:instance,
 /// :pleroma/:mrf`.
 ///

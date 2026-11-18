@@ -180,6 +180,19 @@ mod domain_blocks;
 /// registration modes, admin user management and the CSV imports.
 mod e2e_accounts;
 
+/// The end-to-end admin scenarios (WBE-225): the moderation flow walked
+/// through both admin report APIs with its notes, assignments, resolves,
+/// the admin status edit and delete and the deactivation that hides an
+/// account's posts from the timelines; the MRF chain configured over
+/// `POST /admin/config` and read off the inbox, the instance federation
+/// block and `NodeInfo`; the runtime-config, descriptions, document, rule
+/// and announcement walks; the moderation log's completeness over the
+/// whole admin write surface; the moderator-versus-admin and scope gates;
+/// the signed `report.created` webhook and the admin relay handshake; and
+/// the operations round — backup archive, media proxy, maintenance sweeps
+/// and the throttled bucket.
+mod e2e_admin;
+
 /// The end-to-end discovery and federation scenarios (WBE-223): the
 /// search trio over the visibility matrix, the v1 phrase filters applied
 /// to the timelines, the Atom/RSS feeds and the link card through the job

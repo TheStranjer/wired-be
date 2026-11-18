@@ -52,8 +52,9 @@
 //! `POST /backups` body `nickname` — Pleroma's `create_backup`: queues a
 //! backup for the named account through the very service the user API
 //! uses ([`crate::api::backups`]), skipping that endpoint's
-//! `BACKUP_LIMIT_DAYS` rate gate, and answers the account's backup list
-//! in the user endpoint's shape. An unknown nickname is the 404.
+//! `BACKUP_LIMIT_DAYS` rate gate, records the `create_backup` moderation
+//! entry Pleroma's controller writes, and answers the account's backup
+//! list in the user endpoint's shape. An unknown nickname is the 404.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 
@@ -86,7 +87,7 @@ use crate::{
         ApiBody, flex,
         multipart::{MultipartForm, UploadedFiles as _, upload_body_limit},
     },
-    models::{backup, media_proxy_cache, user::get_by_nickname},
+    models::{backup, media_proxy_cache, moderation_log, user::get_by_nickname},
     services::media_proxy,
     state::AppState,
 };
@@ -793,7 +794,9 @@ async fn create_backup(
         .ok_or(AppError::NotFound)?;
     let row = backup::create(&state.db, &target).await?;
     crate::api::backups::enqueue_backup_job(&state.db, row.id).await?;
+    let logged = moderation_log::create_backup(&state.db, &admin.0, &target).await?;
     debug!(
+        log = %logged.id,
         backup = %row.id,
         user = %target.id,
         admin = %admin.0.id,
