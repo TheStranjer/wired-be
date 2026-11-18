@@ -3,7 +3,10 @@
 //! `/api/pleroma/aliases`, `/api/pleroma/move_account` (WBE-137) plus
 //! `/api/pleroma/change_password`, `/api/pleroma/change_email`,
 //! `/api/pleroma/delete_account` and `/api/pleroma/disable_account`
-//! (WBE-136), Pleroma's `UtilController` actions.
+//! (WBE-136), Pleroma's `UtilController` actions — and the Mastodon twin of
+//! the move, `POST /api/v1/accounts/move` from [`mastodon_router`], the same
+//! write and the same `Move`/`Update` federation keyed by the destination's
+//! account id and answered with the caller's relationship entity.
 //!
 //! The reference is `list_aliases`, `add_alias`, `delete_alias`,
 //! `move_account`, `change_password`, `change_email`, `delete_account` and
@@ -129,7 +132,7 @@ use tracing::debug;
 use crate::{
     api::instance::sha256_hex,
     auth::AuthUser,
-    entities::account::full_nickname,
+    entities::{account::full_nickname, relationship::Relationship},
     error::{AppError, AppResult},
     extract::ApiBody,
     federation::fetch_actor::{get_or_fetch_by_acct, get_or_fetch_by_ap_id},
@@ -207,6 +210,19 @@ pub fn router() -> Router<AppState> {
         .route("/disable_account", post(disable_account))
 }
 
+/// The `/api/v1/accounts/move` twin of the Pleroma `move_account` action.
+///
+/// Merged into [`crate::api::v1`]: the same gates and the same `Move`
+/// federation, keyed by the destination's account id and answered with the
+/// caller's [`Relationship`] entity.
+///
+/// Do not call [`Router::fallback`] here (or on anything merged into the
+/// `/api/v1` tree): the app-wide JSON fallback in [`crate::app`] must answer
+/// the unmatched paths.
+pub fn mastodon_router() -> Router<AppState> {
+    Router::new().route("/accounts/move", post(move_by_id))
+}
+
 /// The `{"aliases": […]}` body of [`list_aliases`].
 #[derive(Debug, Serialize)]
 struct AliasesBody {
@@ -221,6 +237,27 @@ struct AliasesBody {
 struct AliasParams {
     /// The alias the client names.
     alias: String,
+}
+
+/// The parameters of `POST /api/v1/accounts/move`: the same move Pleroma's
+/// `move_account` performs, keyed by the destination's account id (Mastodon's
+/// spelling) instead of its `acct` handle.
+#[derive(Deserialize)]
+struct MoveByIdParams {
+    /// The account's current password; secret material.
+    password: String,
+    /// The id of the account to move to.
+    to_account: String,
+}
+
+/// `Debug` redacts the password.
+impl fmt::Debug for MoveByIdParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MoveByIdParams")
+            .field("password", &"<redacted>")
+            .field("to_account", &self.to_account)
+            .finish()
+    }
 }
 
 /// The parameters of `POST /api/pleroma/move_account`.
@@ -457,6 +494,75 @@ async fn move_account(
     transfer_followers(&state, &auth.0, &target).await?;
     after_account_moved(&state, &auth.0, &target).await;
     Ok(success_body())
+}
+
+/// `POST /api/v1/accounts/move` — move the calling account onto the account
+/// whose id [`MoveByIdParams::to_account`] names, answering the caller's
+/// [`Relationship`] to it (Mastodon's shape for this write).
+///
+/// The gates are [`move_account`]'s in Pleroma's order — password, then the
+/// alias precondition, then the cooldown — and the same writes stand behind
+/// the success: the account is marked moved, its transferable followers
+/// follow the destination, and the
+/// [`crate::services::federation_out::after_account_moved`] hook publishes
+/// the `Move` and the profile `Update` carrying the new `movedTo`. Where the
+/// two routes differ is the answer of a refusal and the resolution of the
+/// destination: this one keys it by account id, and its refusals are proper
+/// 4xx statuses rendering the same wordings — a wrong password and the two
+/// gate refusals are 422s, a malformed or unknown id the same 404 "Target
+/// account not found." the Pleroma route answers with. Pleroma's 200-body
+/// refusals have no place in a Mastodon-shaped endpoint; the ticket's
+/// wordings are kept verbatim.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
+/// the `write:accounts` check; [`AppError::Unprocessable`] for a wrong
+/// password, a destination that has not listed the origin as an alias, or a
+/// move inside the cooldown window; [`AppError::NotFoundMessage`] (404) for
+/// a destination that is malformed or names no stored account. Any database
+/// failure arrives through `?` as [`AppError::Database`].
+async fn move_by_id(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<MoveByIdParams>,
+) -> AppResult<Json<Relationship>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !password_accepted(&auth.0, &params.password) {
+        return Err(AppError::Unprocessable(INVALID_PASSWORD.to_owned()));
+    }
+    let target = resolve_move_target_by_id(&state, &params.to_account).await?;
+    if !target_lists_origin(&target, &auth.0) {
+        return Err(AppError::Unprocessable(MOVE_ALIAS_REQUIRED.to_owned()));
+    }
+    if moved_within_cooldown(auth.0.last_move_at) {
+        return Err(AppError::Unprocessable(MOVE_COOLDOWN.to_owned()));
+    }
+    user::mark_moved(&state.db, auth.0.id, &target.ap_id).await?;
+    transfer_followers(&state, &auth.0, &target).await?;
+    after_account_moved(&state, &auth.0, &target).await;
+    let relationships = Relationship::load_many(&state.db, auth.0.id, &[target.id]).await?;
+    relationships
+        .into_iter()
+        .next()
+        .map(Json)
+        .ok_or(AppError::Internal(
+            "the relationship to a just-resolved account vanished".to_owned(),
+        ))
+}
+
+/// Resolves the destination of `POST /api/v1/accounts/move`: an account id
+/// (decision 4's text) naming a stored account — local or a mirror this
+/// instance already holds. A malformed or unknown id is the same
+/// `"Target account not found."` 404 the Pleroma route answers for its
+/// handle-shaped parameter.
+async fn resolve_move_target_by_id(state: &AppState, id: &str) -> AppResult<User> {
+    let Some(parsed) = crate::util::id::parse_id(id) else {
+        return Err(AppError::NotFoundMessage(TARGET_NOT_FOUND.to_owned()));
+    };
+    user::get_by_id(&state.db, parsed)
+        .await?
+        .ok_or_else(|| AppError::NotFoundMessage(TARGET_NOT_FOUND.to_owned()))
 }
 
 /// Whether `password` matches the account's stored hash. A row without

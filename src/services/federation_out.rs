@@ -38,8 +38,10 @@
 //!   relay (our local followers are told by their timelines, not by an
 //!   activity). One burst of edits collapses into one queued activity: the
 //!   job rides a per-account `unique_key`, so a repeat while the first is
-//!   still live is dropped — and the delivery signs and serializes the
-//!   freshest row when it runs, not the snapshot the edit passed in;
+//!   still live is dropped — and the announcement carries the document of
+//!   the edit that was queued, not of whichever later edit the dedup
+//!   swallowed; the freshest row speaks again with the next write that
+//!   gets its own job.
 //! - [`after_account_moved`]: the pair that announces an account's move to
 //!   another actor — the `Move` Pleroma's `ActivityPub.move` inserts, `to`
 //!   the origin's followers collection so the REMOTE followers (the local
@@ -50,6 +52,11 @@
 //!   its author's `featured` collection or withdraws it — Pleroma's
 //!   `Builder.pin` and `Builder.unpin`, `to` the public with the author's
 //!   followers collection in `cc`, delivered to the remote followers;
+//! - [`after_list_member_changed`]: the `Add` / `Remove` that announces a
+//!   REMOTE account's joining or leaving one of the caller's lists —
+//!   `actor` the list's owner, `object` the member's actor id and `target`
+//!   the list's curated inbox url, addressed to the member alone so the
+//!   publication reaches their inbox and no follower fan-out happens;
 //! - [`after_account_deleted`]: a `Delete` of the actor, run as the first
 //!   act of the `users.delete` sweep (before it clears the relationship
 //!   rows the fan-out reads), delivered to the union of the account's
@@ -947,6 +954,67 @@ fn featured_address(actor: &User) -> String {
         .featured_url
         .clone()
         .unwrap_or_else(|| featured(&actor.ap_id))
+}
+
+/// The url of a list's curated inbox: the endpoint its owner's instance
+/// keeps for the list, where a member's instance posts what joins the
+/// curation. It is this instance's own url — the list lives here — and it
+/// rides in the announced [`Add`] / [`Remove`] as the `target` that tells
+/// the member's instance where to send.
+///
+/// [`Add`]: crate::federation::activities::add_json
+/// [`Remove`]: crate::federation::activities::remove_json
+fn list_inbox_address(config: &Config, list_id: Uuid) -> String {
+    format!("{}/api/v1/lists/{list_id}/inbox", config.base_url)
+}
+
+/// Announce a REMOTE account's joining or leaving one of the caller's
+/// lists.
+///
+/// The document is [`add_json`] or [`remove_json`]: `actor` the list's
+/// owner (whose write it was), `object` the member's actor id and `target`
+/// the list's curated inbox (`list_inbox_address`), so the member's
+/// instance learns both the membership and where the curation is asked to
+/// arrive. The addressing is the member alone: `to` names their actor id,
+/// which the publisher resolves to their personal inbox, and `cc` is
+/// empty, so the owner's followers never hear about someone joining a
+/// private curation.
+///
+/// A LOCAL member announces nothing: their timelines already hold the
+/// list's effect, the way every local pair in this module does. As every
+/// hook here the fan-out is queued, never awaited, and an enqueue that
+/// fails is logged, never returned: the membership write already stands.
+pub async fn after_list_member_changed(
+    state: &AppState,
+    owner: &User,
+    list_id: Uuid,
+    member: &User,
+    adding: bool,
+) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    if !owner.local.get() || member.local.get() {
+        return; // only our own writes about a foreign member are news
+    }
+    let curated_inbox = list_inbox_address(&state.config, list_id);
+    let to = [member.ap_id.as_str()];
+    let ctx = TargetedActivityContext {
+        config: &state.config,
+        id: new_id(),
+        actor_ap_id: &owner.ap_id,
+        object: &member.ap_id,
+        target: &curated_inbox,
+        to: &to,
+        cc: &[],
+        published: &chrono::Utc::now(),
+    };
+    let document = if adding {
+        add_json(&ctx)
+    } else {
+        remove_json(&ctx)
+    };
+    queue_activity(state, owner, &document, "list membership").await;
 }
 
 /// Announce the account whose deletion sweep is running.
@@ -4817,5 +4885,88 @@ mod tests {
         after_chat_message_deleted_by_admin(&quiet, &off_chat, &off_side).await;
 
         assert_eq!(job_count(&pool).await, 0, "none of the five queues a job");
+    }
+
+    /// Adding a REMOTE account to a local list publishes the `Add`: the
+    /// member as `object`, the list's curated inbox as `target`, the member
+    /// alone in `to` — and the fan-out reaches their PERSONAL inbox, the
+    /// endpoint that names them, nobody else's.
+    #[tokio::test]
+    async fn adding_a_remote_list_member_publishes_the_add_to_their_inbox() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let fan = remote(&pool, "fan").await;
+        let member = remote(&pool, "member").await;
+        accepted_follow(&pool, &fan, &alice).await;
+        let list_id = new_id();
+        let state = app_state(&pool);
+
+        after_list_member_changed(&state, &alice, list_id, &member, true).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Add");
+        assert_eq!(activity["actor"], alice.ap_id, "the owner speaks");
+        assert_eq!(activity["object"], member.ap_id, "the member is the object");
+        assert_eq!(
+            activity["target"],
+            format!("{TEST_BASE_URL}/api/v1/lists/{list_id}/inbox"),
+            "the curated inbox the member's instance is to post into"
+        );
+        assert_eq!(activity["to"], json!([member.ap_id]));
+        assert_eq!(activity["cc"], json!([]), "and no fan-out beyond them");
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://remote.example/users/member/inbox"],
+            "the member's own inbox, not the shared one, and not the follower's"
+        );
+    }
+
+    /// Withdrawing a remote member publishes the matching `Remove` under a
+    /// fresh activity id — the two writes are two announcements.
+    #[tokio::test]
+    async fn removing_a_remote_list_member_publishes_the_remove() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let member = remote(&pool, "member").await;
+        let list_id = new_id();
+        let state = app_state(&pool);
+
+        after_list_member_changed(&state, &alice, list_id, &member, false).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Remove");
+        assert_eq!(activity["object"], member.ap_id);
+        let id = activity["id"].as_str().expect("the Remove has an id");
+        assert!(
+            id.starts_with(&format!("{TEST_BASE_URL}/activities/")),
+            "a fresh own-instance activity id: {id}"
+        );
+    }
+
+    /// The memberships this instance keeps to itself announce nothing: a
+    /// LOCAL member (whose timeline is the delivery), an owner that is a
+    /// mirror rather than one of our actors, and a list write while
+    /// federation is switched off.
+    #[tokio::test]
+    async fn list_membership_writes_that_are_not_federated_queue_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let neighbour = local(&pool, "neighbour").await;
+        let mirror_owner = remote(&pool, "mirror-owner").await;
+        let member = remote(&pool, "member").await;
+        let list_id = new_id();
+        let state = app_state(&pool);
+
+        after_list_member_changed(&state, &alice, list_id, &neighbour, true).await;
+        after_list_member_changed(&state, &mirror_owner, list_id, &member, false).await;
+        let quiet = state_with(&pool, unfederated());
+        after_list_member_changed(&quiet, &alice, list_id, &member, true).await;
+
+        assert_eq!(job_count(&pool).await, 0, "none of the three queues a job");
     }
 }

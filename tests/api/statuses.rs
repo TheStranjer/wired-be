@@ -584,6 +584,53 @@ async fn a_bad_or_unknown_id_is_not_found() {
     }
 }
 
+/// A URI in the `{id}` segment is only a lookup once the request asks for
+/// resolution and brings a viewer to own the fetch: the flagless read, the
+/// anonymous `resolve=true` read and the flagged read of a non-URI id all
+/// stay the module's one 404 — no federation runs for a probe that cannot
+/// own its result. (The success round trip belongs to
+/// `e2e_federation_discovery.rs`.)
+#[tokio::test]
+async fn a_uri_id_needs_resolve_and_a_viewer_to_be_a_lookup() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, alice_token) = user_with_token(&pool, "alice", SCOPES).await;
+    let app = common::test_app(pool);
+
+    let uri = format!("{TEST_BASE_URL}/objects/e2f-none");
+    let encoded = uri.replace(':', "%3A").replace('/', "%2F");
+
+    let unflagged = show(&app, Some(alice_token.as_str()), &encoded).await;
+    common::assert_answer(
+        &unflagged,
+        StatusCode::NOT_FOUND,
+        "the URI id without resolve",
+    );
+
+    let anonymous = common::TestRequest::get(&format!("/api/v1/statuses/{encoded}?resolve=true"))
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &anonymous,
+        StatusCode::NOT_FOUND,
+        "the anonymous resolving read",
+    );
+
+    let not_a_uri = show(&app, Some(alice_token.as_str()), "urn:uuid:not-a-uri").await;
+    common::assert_all_refused(
+        &[
+            not_a_uri,
+            common::TestRequest::get("/api/v1/statuses/not-an-id?resolve=true")
+                .bearer(&alice_token)
+                .send(&app)
+                .await,
+        ],
+        StatusCode::NOT_FOUND,
+        NOT_FOUND,
+        "a flagged read of an id that is no URI",
+    );
+}
+
 /// A reblog's own id answers the reblog entity — the reblogger's row with
 /// empty content and the original nested one level deep — and deleting the
 /// original takes the reblog out of the API too (rule 7).

@@ -182,11 +182,15 @@
 //! `{"error":"This API requires an authenticated user"}` — see
 //! [`Config::restricts`].
 //!
-//! `lookup` resolves its `acct` parameter through
+//! `lookup` resolves its `acct` parameter — or its `q` alias — through
 //! [`get_by_acct`](crate::models::user::get_by_acct): a stored nickname,
 //! case-insensitively, with this instance's own domain stripped for local
-//! accounts. Resolving a handle this instance has never seen is left to
-//! the `WebFinger` federation ticket.
+//! accounts. With `resolve=true` a handle (or actor URL) this instance has
+//! never seen is resolved through `WebFinger` and fetched — the federation
+//! arm `resolve_actor_or_fetch` shares with `POST /api/v1/follows`, run
+//! only for an authenticated caller because resolution is a federation
+//! action on somebody's behalf (the resolving search's own rule, see
+//! [`crate::api::search`]).
 //!
 //! `relationships` requires auth: [`AuthUser`] plus the `read:follows`
 //! scope, exactly Pleroma's plug pipeline for that action
@@ -2044,44 +2048,82 @@ async fn show_account(
 
 /// The query parameters of `GET /api/v1/accounts/lookup`. The absent and
 /// blank cases are the documented 400 and 404, which the type cannot
-/// express, so the field is optional here (the `webfinger` handler's
+/// express, so the fields are optional here (the `webfinger` handler's
 /// pattern).
 #[derive(Debug, Deserialize)]
 struct LookupQuery {
     /// The handle to resolve: `nick` or `nick@domain`.
     acct: Option<String>,
+    /// The same handle under Mastodon's newer spelling: read only when
+    /// `acct` is absent or blank.
+    q: Option<String>,
+    /// `resolve`: the federation arm's switch — an unseen handle or actor
+    /// URL is `WebFinger`ed and fetched instead of answered 404. A string
+    /// because a query parameter is one, read by [`is_true`] like the
+    /// search's flags.
+    ///
+    /// [`is_true`]: crate::api::helpers::is_true
+    resolve: Option<String>,
 }
 
-/// `GET /api/v1/accounts/lookup?acct=…` — the account a handle names,
-/// resolved by [`get_by_acct`](crate::models::user::get_by_acct). The
-/// viewer behind an optional token is the account the entity is rendered
-/// for, as in `show`.
+impl LookupQuery {
+    /// The account the request asks about: `acct` when it carries text,
+    /// else the `q` alias — a blank is no answer, not a shadowing one.
+    /// Neither standing is the documented 400.
+    fn asked(&self) -> Option<&str> {
+        [self.acct.as_deref(), self.q.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|asked| !asked.is_empty())
+    }
+
+    /// Whether the request asks for federation resolution: `resolve=true`.
+    fn resolves(&self) -> bool {
+        self.resolve.as_deref().is_some_and(is_true)
+    }
+}
+
+/// `GET /api/v1/accounts/lookup?acct=…` (or `?q=…`) — the account a handle
+/// names, resolved by [`get_by_acct`](crate::models::user::get_by_acct).
+/// The viewer behind an optional token is the account the entity is
+/// rendered for, as in `show`.
+///
+/// With `resolve=true` a stored miss is not yet an answer: an
+/// authenticated caller gets the [`resolve_actor_or_fetch`] round trip —
+/// `WebFinger` and the actor fetch for a handle, the dereference for an
+/// actor URL, the mirror written on the way out. An anonymous `resolve`
+/// request keeps the stored-only answer, because resolution is a
+/// federation action somebody has to be acting for — the rule the
+/// resolving search runs by.
 ///
 /// # Errors
 ///
-/// [`AppError::BadRequest`] when `acct` is absent or blank;
-/// [`AppError::NotFound`] when it names no live account (unknown, on a
-/// foreign domain not mirrored here, or deactivated);
+/// [`AppError::BadRequest`] when neither `acct` nor `q` carries a handle;
+/// [`AppError::NotFound`] when it names no live account, stored or
+/// resolvable (unknown, on a domain whose lookup fails, or deactivated);
 /// [`AppError::Unauthorized`] from the extractor for an invalid token.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn lookup_account(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer, _): MaybeAuthUser,
+    auth: MaybeAuthUser,
     Query(query): Query<LookupQuery>,
 ) -> AppResult<Json<Account>> {
-    let Some(acct) = query
-        .acct
-        .as_deref()
-        .map(str::trim)
-        .filter(|acct| !acct.is_empty())
-    else {
+    let Some(asked) = query.asked().map(str::to_owned) else {
         return Err(AppError::BadRequest(MISSING_ACCT.to_owned()));
     };
-    let found = user::get_by_acct(&state.db, &state.config, acct)
+    let viewer = auth.0.as_ref();
+    let stored = user::get_by_acct(&state.db, &state.config, &asked)
         .await?
-        .filter(|found| found.is_active.get())
-        .ok_or(AppError::NotFound)?;
-    Ok(Json(render_account(&state, viewer.as_ref(), &found).await?))
+        .filter(|found| found.is_active.get());
+    let found = match stored {
+        Some(found) => found,
+        None if query.resolves() && viewer.is_some() => {
+            resolve_actor_or_fetch(&state, &asked).await?
+        }
+        None => return Err(AppError::NotFound),
+    };
+    Ok(Json(render_account(&state, viewer, &found).await?))
 }
 
 /// `GET /api/v1/accounts/relationships?id[]=a&id[]=b` — the caller's
@@ -2376,7 +2418,7 @@ async fn store_toggles(
 #[derive(Debug, Deserialize)]
 struct FollowByUriParams {
     /// The account to follow: `user@domain`, `@user@domain` or an actor
-    /// URL, resolved by [`resolve_follow_target`].
+    /// URL, resolved by [`resolve_actor_or_fetch`].
     #[serde(default)]
     uri: Option<String>,
     /// Mastodon's `reblogs`, the row's [`Follow::show_reblogs`] column.
@@ -2406,7 +2448,7 @@ impl FollowByUriParams {
 /// The gates and the write are [`follow_account`]'s, applied to a target
 /// resolved from the parameter instead of the path: the scope check first,
 /// then the `uri` ([`MISSING_URI`] for an absent, blank or `null` one),
-/// then [`resolve_follow_target`], and the very same
+/// then [`resolve_actor_or_fetch`], and the very same
 /// [`follow::follow`] + [`store_toggles`] sequence, the same log and the
 /// same [`after_follow_changed`] hook — so the self refusal, the block
 /// refusal and the locked-target request are the model's own answers.
@@ -2437,7 +2479,7 @@ async fn follow_by_uri(
     else {
         return Err(AppError::BadRequest(MISSING_URI.to_owned()));
     };
-    let target = resolve_follow_target(&state, uri).await?;
+    let target = resolve_actor_or_fetch(&state, uri).await?;
     let toggles = params.into_toggles();
     let created = follow::follow(&state.db, &state.config.base_url, &auth.0, &target).await?;
     let stored = store_toggles(&state, created, toggles).await?;
@@ -2454,18 +2496,19 @@ async fn follow_by_uri(
     Ok(Json(render_account(&state, Some(&auth.0), &target).await?))
 }
 
-/// Resolves the `uri` parameter of [`follow_by_uri`] to the target row:
-/// an `http(s)` URL goes through [`get_or_fetch_by_ap_id`], anything else
-/// is an `acct` handle — with a leading `@` or `acct:` prefix stripped —
-/// through [`get_or_fetch_by_acct`]. Both answer from the stored rows
-/// first, so a local account or a mirror resolves without the network,
-/// and only an unseen handle reaches for `WebFinger` and the actor fetch.
-/// Whatever the fetchers refuse — an unresolvable handle, an unreachable
-/// or invalid actor, an unknown local URL — and a row that resolves but
-/// is deactivated is the same shared [`AppError::NotFound`] the id-keyed
-/// routes give through [`account_or_404`]; the fetcher's own reason is
-/// logged, never sent (decision 8).
-async fn resolve_follow_target(state: &AppState, uri: &str) -> AppResult<User> {
+/// Resolves `uri` to the account it names: an `http(s)` URL goes through
+/// [`get_or_fetch_by_ap_id`], anything else is an `acct` handle — with a
+/// leading `@` or `acct:` prefix stripped — through [`get_or_fetch_by_acct`].
+/// Both answer from the stored rows first, so a local account or a mirror
+/// resolves without the network, and only an unseen handle reaches for
+/// `WebFinger` and the actor fetch. Whatever the fetchers refuse — an
+/// unresolvable handle, an unreachable or invalid actor, an unknown local
+/// URL — and a row that resolves but is deactivated is the same shared
+/// [`AppError::NotFound`] the id-keyed routes give through
+/// [`account_or_404`]; the fetcher's own reason is logged, never sent
+/// (decision 8). This is the shared federation arm of `POST
+/// /api/v1/follows` and of `GET /api/v1/accounts/lookup?resolve=true`.
+async fn resolve_actor_or_fetch(state: &AppState, uri: &str) -> AppResult<User> {
     let fetched = if looks_like_ap_id(uri) {
         get_or_fetch_by_ap_id(state, uri).await
     } else {

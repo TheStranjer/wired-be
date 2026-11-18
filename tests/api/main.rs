@@ -179,6 +179,58 @@ mod e2e_accounts;
 /// mock peer.
 mod e2e_discovery;
 
+/// The `remote::MockPeer` harness smoke tests (WBE-224 slice 1): the mock
+/// account resolving to the mock origin through `GET /api/v1/accounts/lookup`,
+/// one local follow-and-post delivered signed and verified out of the mock's
+/// capture, and one mock-signed `Create` folding onto the public timeline.
+mod e2e_federation;
+
+/// The end-to-end federation discovery shapes and remote resolution
+/// (WBE-224 scenarios 1 and 5): the `WebFinger`/host-meta/`NodeInfo`/actor
+/// surface read by a remote's own HTTP client and off the JSON-LD keys,
+/// the `AUTHORIZED_FETCH` gate on the actor, object and activity reads,
+/// and the `resolve=true` lookups plus the follow-by-uri write reaching the
+/// mock peer over real HTTP.
+mod e2e_federation_discovery;
+
+/// The end-to-end federation of relationships (WBE-224 scenario 2).
+///
+/// A remote `Follow` of a local account granted and answered with a signed
+/// `Accept` at the peer's inbox, a locked account's own answer, a local follow
+/// of a remote account the peer accepts, the `Undo` of a follow and of a
+/// block, blocks in both directions, and a relay subscription followed,
+/// accepted, fanned out to, announced by and withdrawn over real HTTP.
+mod e2e_federation_follow;
+
+/// The end-to-end federation of inbound content (WBE-224 scenario 3 and the
+/// chat half of scenario 7): a signed `Create Note` at each visibility and
+/// with rich content read back through the timelines, context, poll, reactions
+/// and chat endpoints; the `Update` edit history, the `Delete` tombstone and
+/// its swallowed late create; the `Like`, `EmojiReact` and `Announce` counters
+/// and tellings; the thread backfill over real HTTP and its 404 degradation;
+/// a remote ballot on a local poll; and the delivered `ChatMessage` and its
+/// sender's withdrawal — every fact reached by real signed HTTP and read
+/// through the public API, never a row dump.
+mod e2e_federation_inbound;
+
+/// The end-to-end federation of outbound content (WBE-224 scenario 4): the
+/// `Create`/`Update`/`Delete` of a status, the `Announce`, `Like` and
+/// `EmojiReact` writes and their `Undo`s delivered signed to the right
+/// inboxes across the visibility matrix, shared-inbox deduplication, the
+/// profile `Update`, `Move`, forwarded `Flag` and list `Add`/`Remove`, and
+/// the retry ladder — `500` on backoff, `503` at its `Retry-After`, `410`
+/// dropping the address for good, and a refused signature retried once —
+/// all read off a loopback mock peer's capture over real HTTP.
+mod e2e_federation_outbound;
+
+/// The end-to-end federation refusals (WBE-224 scenario 6): every way an
+/// inbox delivery is turned away — unsigned, unknown key, malformed
+/// signature, spoofed signer, tampered body or digest, ids off the signer's
+/// origin, an over-cap body, a refused private-host resolution and an
+/// `MRF`-blocked domain — each answered with its documented status and
+/// re-read through the public API as nothing having happened.
+mod e2e_federation_safety;
+
 /// The end-to-end interaction scenarios (WBE-223): favourite, reblog,
 /// bookmark + folder, pin, thread mute, reaction, poll vote, edit, expiry
 /// through the job queue, and delete, each asserted across the direct
@@ -422,6 +474,14 @@ mod relays;
 
 /// `GET /api/v1/accounts/relationships`.
 mod relationships;
+
+/// The shared loopback mock federation peer the federation scenarios drive.
+///
+/// Real actor documents under a real RSA key, a paged outbox, capturing
+/// inboxes, a `WebFinger`, a `Service` relay, a shapeable public `Note` and a
+/// `Key` mirror, plus the signed-`POST` half that lets a peer deliver to this
+/// instance's inbox.
+pub mod remote;
 
 /// Remote interaction over HTTP (`src/api/remote_interaction.rs`): the
 /// `POST /api/v1/pleroma/remote_interaction` refusals, the
