@@ -377,9 +377,12 @@ async fn update_moves_only_the_named_preferences() {
     );
 }
 
-/// A create that misses the endpoint or a key, sends a non-HTTPS or
-/// overlong endpoint, or names a policy outside the four, is the 422
-/// with Mastodon's changeset wording.
+/// A create that misses the endpoint or a key, sends an endpoint that is
+/// no URL or is overlong, or names a policy outside the four, is the 422
+/// with Mastodon's changeset wording. A plain-`http` endpoint is not among
+/// the refusals: Pleroma stores whatever it is given, and the delivery
+/// pipeline calls any `http`/`https` address (`e2e_realtime.rs` wakes a
+/// loopback mock push service over exactly such an endpoint).
 #[tokio::test]
 async fn create_validates_the_endpoint_keys_and_policy() {
     let db = common::test_db().await;
@@ -395,12 +398,12 @@ async fn create_validates_the_endpoint_keys_and_policy() {
             "Validation failed: Endpoint can't be blank",
         ),
         (
-            json!({"subscription": {"endpoint": "http://push.example/1", "keys": keys()}}),
-            "Validation failed: Endpoint must be a valid HTTPS URL",
+            json!({"subscription": {"endpoint": "not a url", "keys": keys()}}),
+            "Validation failed: Endpoint must be a valid URL",
         ),
         (
-            json!({"subscription": {"endpoint": "not a url", "keys": keys()}}),
-            "Validation failed: Endpoint must be a valid HTTPS URL",
+            json!({"subscription": {"endpoint": "ftp://push.example/1", "keys": keys()}}),
+            "Validation failed: Endpoint must be a valid URL",
         ),
         (
             json!({"subscription": {"endpoint": format!("https://p.example/{}", "x".repeat(2048)), "keys": keys()}}),
