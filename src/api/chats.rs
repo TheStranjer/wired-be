@@ -82,17 +82,19 @@
 //! Pleroma's `mark_message_as_read` and `delete_message` `with` clauses
 //! answer the same way.
 //!
-//! The read handlers finish with `after_chat_read`, the documented empty
-//! hook where Pleroma pushes its `chat_read` socket event; the pin routes
-//! broadcast nothing there and so call nothing here. The message routes
-//! finish with their federation hooks, `after_chat_message_created` and
-//! `after_chat_message_deleted`: a message posted to a REMOTE counterpart
-//! is announced to them as a `Create{ChatMessage}`, and the sender's delete
-//! of it as a `Delete` of that object
-//! ([`federation_out`]'s chat arms — Pleroma's `post_chat_message` and
+//! The read handlers finish with `after_chat_read`, which pushes Pleroma's
+//! `pleroma:chat_update` over the reader's chat socket stream; the pin
+//! routes broadcast nothing there and so call nothing here. The message
+//! routes finish with `after_chat_message_created` and
+//! `after_chat_message_deleted`: each tells every LOCAL side of the chat
+//! over the socket — a `pleroma:chat_update` on that side's own chat stream,
+//! each side carrying its own chat row — and announces the change to a
+//! REMOTE counterpart over the wire, a message posted to them as a
+//! `Create{ChatMessage}` and the sender's delete of it as a `Delete` of that
+//! object ([`federation_out`]'s chat arms — Pleroma's `post_chat_message` and
 //! `delete_message` pipelines); a local counterpart is told by their rows
-//! alone, never over HTTP. The chat sockets' events stay the streaming
-//! ticket's own, as does the recipient's notification.
+//! alone, never over HTTP. The recipient's notification stays with the
+//! notification's own producer.
 //!
 //! [`max_chat_message_chars`]: crate::config::Config::max_chat_message_chars
 //! [`federation_out`]: crate::services::federation_out
@@ -104,7 +106,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -121,7 +123,7 @@ use crate::{
     },
     oauth::scopes::{READ_CHATS, WRITE_CHATS},
     pagination::{MAX_LIMIT, PageParams, link_header, set_link_header},
-    services::federation_out,
+    services::{federation_out, streaming},
     state::AppState,
     util::id::parse_id,
 };
@@ -695,17 +697,20 @@ async fn chat_recipient(state: &AppState, row: &chat::Chat) -> AppResult<User> {
 }
 
 /// The side effect Pleroma attaches to a created chat message: the telling
-/// of a REMOTE counterpart — Pleroma's `post_chat_message` runs the message
-/// through `Pipeline.common_pipeline`, and the `Create` activity that comes
-/// out the other end is what carries the message to the recipient's inbox
-/// (beside the chat sockets and notifications, which render from the rows
-/// this endpoint already wrote).
+/// of the chat's LOCAL sides over their chat sockets — each side's own
+/// `pleroma:chat_update` — and of a REMOTE counterpart over the wire:
+/// Pleroma's `post_chat_message` runs the message through
+/// `Pipeline.common_pipeline`, and the `Create` activity that comes
+/// out the other end is what carries the message to the recipient's inbox.
 ///
-/// `message` is the sender's reference to the stored message, `sender` the
-/// local account that posted it and `recipient` the account it is addressed
-/// to, local or remote. A local recipient is told by their timeline alone —
-/// chat messages to local accounts never travel over HTTP — and everything
-/// else, including the remote pair's gates, is
+/// `message` is one side's reference to the stored message (the sender's on
+/// the local route, the local recipient's for a delivered remote message),
+/// `sender` the account that wrote it and `recipient` the account it is
+/// addressed to, local or remote. Which side `message` belongs to never
+/// matters: [`publish_chat_update`] finds each LOCAL participant's own chat
+/// row. A local recipient is told by their rows alone — chat messages to
+/// local accounts never travel over HTTP — and everything else, including
+/// the remote pair's gates, is
 /// [`federation_out::after_chat_message_created`]'s.
 ///
 /// [`federation_out::after_chat_message_created`]: crate::services::federation_out::after_chat_message_created
@@ -715,22 +720,25 @@ pub(crate) async fn after_chat_message_created(
     sender: &User,
     recipient: &User,
 ) {
+    publish_chat_update(state, message, sender, recipient).await;
     federation_out::after_chat_message_created(state, message, sender, recipient).await;
 }
 
-/// The side effect Pleroma attaches to a deleted chat message: the
-/// [`after_chat_message_created`] counterpart — Pleroma's `delete_message`
-/// ends with an `Undo` of the message's `Create` for federation when the
-/// sender withdrew it; this instance federates the withdrawal as a
-/// `Delete` of the message's reserved object id (decision 6's tombstone
-/// convention, [`crate::federation::note`]'s status `Delete` beside it).
+/// The [`after_chat_message_created`] counterpart for a deleted chat
+/// message: the chat's LOCAL sides hear it on their chat sockets, and
+/// Pleroma's `delete_message` ends with an `Undo` of the message's
+/// `Create` for federation when the sender withdrew it; this instance
+/// federates the withdrawal as a `Delete` of the message's reserved object
+/// id (decision 6's tombstone convention, [`crate::federation::note`]'s
+/// status `Delete` beside it).
 ///
 /// `user` is the caller who deleted, `other` the chat's counterpart and
-/// `message` the caller's reference as it stood before the delete. Only the
-/// sender's delete announces anything — a participant who merely took the
-/// message out of their own list withdraws nobody's copy — and a local
-/// counterpart never hears over HTTP; the gates are
-/// [`federation_out::after_chat_message_deleted`]'s.
+/// `message` the caller's reference as it stood before the delete — whose
+/// chat id is therefore the deleter's own chat row, which outlives the
+/// reference. Only the sender's delete announces anything over HTTP — a
+/// participant who merely took the message out of their own list withdraws
+/// nobody's copy — and a local counterpart never hears over HTTP; the gates
+/// are [`federation_out::after_chat_message_deleted`]'s.
 ///
 /// [`federation_out::after_chat_message_deleted`]: crate::services::federation_out::after_chat_message_deleted
 async fn after_chat_message_deleted(
@@ -739,7 +747,77 @@ async fn after_chat_message_deleted(
     user: &User,
     other: &User,
 ) {
+    publish_chat_update(state, message, user, other).await;
     federation_out::after_chat_message_deleted(state, message, user, other).await;
+}
+
+/// Tell every LOCAL side of the pair [`after_chat_message_created`] and
+/// [`after_chat_message_deleted`] name: one `pleroma:chat_update` per
+/// participant, each riding that participant's own chat stream and carrying
+/// their OWN chat row id, which is what the socket's render hint resolves
+/// through [`chat::get_owned`] (see [`streaming::chat_updated`]).
+///
+/// `message` is one side's reference to the message and names that side's
+/// chat row; the other side's row is found through their own reference to
+/// the same message, which [`publish_chat_update`] reaches even after the
+/// delete — chat rows outlive references, and a withdrawal leaves both
+/// sides' references standing. A REMOTE side is told nothing: their copy of
+/// the conversation lives on their own instance, and the wire announcement
+/// is the [`federation_out`] arm's work, not this one's.
+///
+/// Best-effort like every streaming tail: a failed read of a participant's
+/// row is a log line and no event for that side, never an error back to the
+/// request that already committed its write.
+///
+/// [`federation_out`]: crate::services::federation_out
+/// [`streaming::chat_updated`]: crate::services::streaming::chat_updated
+async fn publish_chat_update(
+    state: &AppState,
+    message: &ChatMessageReference,
+    sender: &User,
+    recipient: &User,
+) {
+    for side in [sender, recipient] {
+        match local_chat_id(state, side, message).await {
+            Ok(Some(chat_id)) => streaming::chat_updated(state, side.id, chat_id),
+            Ok(None) => {}
+            Err(err) => warn!(
+                chat = %message.chat_id,
+                message = %message.message_id,
+                user = %side.id,
+                %err,
+                "chat stream event skipped: reading the participant's own chat row failed"
+            ),
+        }
+    }
+}
+
+/// `side`'s OWN chat row for the message `message` references, or `None`
+/// when `side` holds no chat row here — a remote account, whose side of the
+/// conversation lives on their own instance, or a pair whose row was never
+/// written for them. `message`'s chat row answers first, since one call
+/// site's `message` already belongs to this side; their own reference to
+/// the same message answers otherwise, which is how the second side of the
+/// pair is found. The question the socket's hint is gated by is the same
+/// one [`chat::get_owned`] answers for the reader.
+///
+/// Any database failure arrives as [`AppError::Database`].
+async fn local_chat_id(
+    state: &AppState,
+    side: &User,
+    message: &ChatMessageReference,
+) -> AppResult<Option<Uuid>> {
+    if !side.local.get() {
+        return Ok(None);
+    }
+    if let Some(chat_row) = chat::get_owned(&state.db, side.id, message.chat_id).await? {
+        return Ok(Some(chat_row.id));
+    }
+    Ok(
+        chat::message_reference_for_user(&state.db, side.id, message.message_id)
+            .await?
+            .map(|reference| reference.chat_id),
+    )
 }
 
 /// The `with_muted` and `pinned` query parameters of both chat lists
@@ -835,7 +913,7 @@ async fn mark_chat_read(
         marked,
         "chat marked read"
     );
-    after_chat_read(&auth.0, chat_row.id, Some(last_read_id));
+    after_chat_read(&state, &auth.0, chat_row.id, Some(last_read_id));
     chat_json(&state, &chat_row).await
 }
 
@@ -870,7 +948,7 @@ async fn mark_message_read(
         user = %auth.0.id,
         "chat message marked read"
     );
-    after_chat_read(&auth.0, chat_row.id, Some(reference_id));
+    after_chat_read(&state, &auth.0, chat_row.id, Some(reference_id));
     message_json(&state, &reference).await
 }
 
@@ -1035,27 +1113,41 @@ async fn message_json(
     Ok(Json(message_of(state, reference).await?))
 }
 
-/// The side effect Pleroma attaches to a successful read, here documented and
-/// empty.
-///
-/// Pleroma's `mark_as_read` and `mark_message_as_read` (2.0-era
+/// The side effect Pleroma attaches to a successful read: Pleroma's
+/// `mark_as_read` and `mark_message_as_read` (2.0-era
 /// `chat_controller.ex`) end with
 /// `Pleroma.Web.ChatSocket.ChatSocket.broadcast_chat(user, :chat_read, id)`
-/// after storing the marker: a `chat_read` event pushed to every chat socket
-/// the reading user has connected, so their other clients clear the badge too.
-/// This instance serves no chat sockets yet — the streaming ticket owns that
-/// transport — so there is nothing to broadcast: both read handlers call this
-/// hook after the marker is stored (`chat_id` always, and `last_read_id` as
-/// the chat-wide marker or the single reference marked), and wiring the
-/// sockets up later means filling in exactly this one function.
-const fn after_chat_read(_user: &User, _chat_id: Uuid, _last_read_id: Option<Uuid>) {}
+/// after storing the marker — a push to every chat socket the reading user
+/// has connected, so their other clients clear the badge too. This instance
+/// serves that transport over the Mastodon hub ([`crate::api::streaming`]),
+/// where the push is Pleroma's `pleroma:chat_update` on the reader's own
+/// `user:pleroma_chat` stream carrying the reader's own chat row: both read
+/// handlers call this hook after the marker is stored (`chat_id` always,
+/// and `last_read_id` as the chat-wide marker or the single reference
+/// marked, neither of which the rendered chat entity shows). The reader is
+/// the only side that read anything, so the reader is the only side told —
+/// and the emission is synchronous, like [`streaming::chat_updated`].
+///
+/// [`streaming::chat_updated`]: crate::services::streaming::chat_updated
+fn after_chat_read(state: &AppState, user: &User, chat_id: Uuid, _last_read_id: Option<Uuid>) {
+    streaming::chat_updated(state, user.id, chat_id);
+}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::http::HeaderValue;
     use serde_json::json;
+    use tokio::sync::broadcast;
 
     use super::*;
+    use crate::{
+        config::{Config, TEST_BASE_URL},
+        http_client::HttpClient,
+        streaming::hub::{Audience, Hub, RenderSpec, StreamEvent},
+        uploads::UploaderBackend,
+    };
 
     /// Parses `value` as the whole-chat read's body.
     fn read_params(value: serde_json::Value) -> ReadParams {
@@ -1119,10 +1211,7 @@ mod tests {
     async fn chatter(pool: &sqlx::PgPool, nickname: &str) -> User {
         user::insert(
             pool,
-            &user::NewUser::local(
-                nickname,
-                &user::local_ap_id(crate::config::TEST_BASE_URL, nickname),
-            ),
+            &user::NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname)),
         )
         .await
         .expect("fixture user inserts")
@@ -1134,10 +1223,7 @@ mod tests {
             pool,
             &user::NewUser {
                 accepts_chat_messages: user::Flag::new(false),
-                ..user::NewUser::local(
-                    nickname,
-                    &user::local_ap_id(crate::config::TEST_BASE_URL, nickname),
-                )
+                ..user::NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname))
             },
         )
         .await
@@ -1159,6 +1245,101 @@ mod tests {
         )
         .await
         .expect("fixture remote user inserts")
+    }
+
+    /// Inserts a mirror named `nickname` on `remote.example` that accepts
+    /// chats: the remote counterpart of a delivered or addressed pair.
+    async fn remote_chatter(pool: &sqlx::PgPool, nickname: &str) -> User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                nickname: format!("{nickname}@remote.example"),
+                ap_id: format!("https://remote.example/users/{nickname}"),
+                domain: Some("remote.example".to_owned()),
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("fixture remote user inserts")
+    }
+
+    /// Test state over `pool` with the fixed test config: the hooks under
+    /// test publish through the hub it owns, which the tests subscribe to.
+    fn app_state(pool: &sqlx::PgPool) -> AppState {
+        let config = Arc::new(Config::for_tests());
+        AppState {
+            db: pool.clone(),
+            hub: Hub::new(pool),
+            config: Arc::clone(&config),
+            http_client: HttpClient::from(config.as_ref()),
+            uploader: UploaderBackend::from(config.as_ref()),
+            instance_stats_cache: Arc::default(),
+            translation_languages_cache: Arc::default(),
+            mrf_config_cache: Arc::default(),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        }
+    }
+
+    /// Writes `sender`'s message to `recipient` the way both create paths
+    /// do — [`chat::add_message`] over one connection — and answers the two
+    /// sides' references, the recipient's `None` when they are remote and
+    /// so own no row here.
+    async fn message_pair(
+        pool: &sqlx::PgPool,
+        sender: &User,
+        recipient: &User,
+    ) -> (ChatMessageReference, Option<ChatMessageReference>) {
+        let mut conn = pool.acquire().await.expect("a fixture connection");
+        let (_, sender_reference, recipient_reference) = chat::add_message(
+            &mut conn,
+            TEST_BASE_URL,
+            sender,
+            recipient,
+            &NewChatMessage::text("hello there"),
+        )
+        .await
+        .expect("the message fixture writes");
+        (sender_reference, recipient_reference)
+    }
+
+    /// The next event the hook under test handed to `rx`, which the test
+    /// subscribed to before making the call: the hub delivers every publish
+    /// to its local subscribers at once, so one awaited hook call is
+    /// already buffered here by the time this reads.
+    async fn emitted(rx: &mut broadcast::Receiver<Arc<StreamEvent>>) -> StreamEvent {
+        Arc::unwrap_or_clone(rx.recv().await.expect("the hook published an event"))
+    }
+
+    /// Asserts `rx` holds no further event: the hook told nobody else.
+    fn assert_empty(rx: &mut broadcast::Receiver<Arc<StreamEvent>>) {
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "the hook published an event it owed nobody"
+        );
+    }
+
+    /// Asserts one published `pleroma:chat_update` names `owner`'s own
+    /// stream and their own chat `chat_id` as the render hint.
+    fn assert_chat_update(event: &StreamEvent, owner: &User, chat_id: Uuid) {
+        assert_eq!(event.event, "pleroma:chat_update", "Pleroma's chat event");
+        assert_eq!(
+            event.streams,
+            vec![format!("user:pleroma_chat:{}", owner.id)],
+            "the event rides the owner's own chat stream"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(vec![owner.id]),
+            "the owner is the whole audience"
+        );
+        assert_eq!(
+            event.render,
+            Some(RenderSpec::Chat(chat_id)),
+            "the hint carries the owner's own chat row"
+        );
+        assert!(event.payload.is_none(), "no body: the socket renders it");
+        assert!(!event.local_only, "a chat update is not flagged local-only");
     }
 
     #[tokio::test]
@@ -1488,5 +1669,115 @@ mod tests {
             message_page_link("https://h", "/p", &[]).is_none(),
             "an empty page links nowhere"
         );
+    }
+
+    #[tokio::test]
+    async fn a_created_local_message_tells_both_local_sides_their_own_chat() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = chatter(&pool, "alice").await;
+        let bob = chatter(&pool, "bob").await;
+        let (alice_reference, bob_reference) = message_pair(&pool, &alice, &bob).await;
+        let bob_chat = bob_reference
+            .expect("a local recipient gets a chat row from the write")
+            .chat_id;
+        let mut rx = state.hub.subscribe();
+
+        after_chat_message_created(&state, &alice_reference, &alice, &bob).await;
+
+        assert_chat_update(&emitted(&mut rx).await, &alice, alice_reference.chat_id);
+        assert_chat_update(&emitted(&mut rx).await, &bob, bob_chat);
+        assert_ne!(
+            alice_reference.chat_id, bob_chat,
+            "the two sides carry two different chat rows"
+        );
+        assert_empty(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_created_message_to_a_remote_counterpart_tells_only_the_local_side() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = chatter(&pool, "alice").await;
+        let carol = remote_chatter(&pool, "carol").await;
+        let (alice_reference, carol_reference) = message_pair(&pool, &alice, &carol).await;
+        assert!(
+            carol_reference.is_none(),
+            "the model stores no reference for a remote recipient"
+        );
+        let mut rx = state.hub.subscribe();
+
+        after_chat_message_created(&state, &alice_reference, &alice, &carol).await;
+
+        assert_chat_update(&emitted(&mut rx).await, &alice, alice_reference.chat_id);
+        assert_empty(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_delivered_remote_message_tells_only_the_local_recipient_their_own_chat() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let bob = chatter(&pool, "bob").await;
+        let carol = remote_chatter(&pool, "carol").await;
+        // The delivery shape: the remote account writes, the local one
+        // receives, and the hook runs over the RECIPIENT's own reference —
+        // src/federation/handlers/chat.rs `deliver`.
+        let (_, delivered) = message_pair(&pool, &carol, &bob).await;
+        let bob_reference = delivered.expect("the local recipient's reference was written");
+        let mut rx = state.hub.subscribe();
+
+        after_chat_message_created(&state, &bob_reference, &carol, &bob).await;
+
+        assert_chat_update(&emitted(&mut rx).await, &bob, bob_reference.chat_id);
+        assert_empty(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_message_tells_both_local_sides_their_own_chat() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = chatter(&pool, "alice").await;
+        let bob = chatter(&pool, "bob").await;
+        let (alice_reference, bob_reference) = message_pair(&pool, &alice, &bob).await;
+        let bob_chat = bob_reference
+            .expect("the local side has a reference")
+            .chat_id;
+        assert!(
+            chat::delete_message_for(&pool, alice.id, alice_reference.id)
+                .await
+                .expect("the delete fixture writes"),
+            "alice sent the message, so her delete withdraws it"
+        );
+        let mut rx = state.hub.subscribe();
+
+        after_chat_message_deleted(&state, &alice_reference, &alice, &bob).await;
+
+        // The deleter's reference is gone but her chat row stands, and the
+        // withdrawal leaves bob's reference standing: both sides are told.
+        assert_chat_update(&emitted(&mut rx).await, &alice, alice_reference.chat_id);
+        assert_chat_update(&emitted(&mut rx).await, &bob, bob_chat);
+        assert_empty(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_read_tells_only_the_reader_their_own_chat() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = chatter(&pool, "alice").await;
+        let bob = chatter(&pool, "bob").await;
+        let chat_row = chat::get_or_create(&pool, &alice, &bob)
+            .await
+            .expect("the chat fixture creates");
+        let mut rx = state.hub.subscribe();
+
+        after_chat_read(&state, &alice, chat_row.id, None);
+
+        assert_chat_update(&emitted(&mut rx).await, &alice, chat_row.id);
+        assert_empty(&mut rx);
     }
 }

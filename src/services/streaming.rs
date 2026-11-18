@@ -25,7 +25,10 @@
 //! recipient's own `user:{id}` and `user:notification:{id}` streams with a
 //! [`RenderSpec::Notification`] hint — and never published when the
 //! recipient mutes the actor, the same mute the rendered entity reports
-//! as `pleroma.is_muted`.
+//! as `pleroma.is_muted`. [`chat_updated`] is the third: Pleroma's
+//! `pleroma:chat_update` for one participant's chat row, riding only their
+//! `user:pleroma_chat:{id}` stream with a [`RenderSpec::Chat`] hint, fired
+//! from the chat hooks of [`crate::api::chats`].
 //!
 //! The rules, stated once here and split into one helper per component:
 //!
@@ -315,6 +318,40 @@ pub async fn notification_created(state: &AppState, row: &Notification) {
         payload: None,
         audience: Audience::Users(vec![recipient]),
         render: Some(RenderSpec::Notification(row.id)),
+        local_only: false,
+    });
+}
+
+/// Publish Pleroma's `pleroma:chat_update` for `owner_id`'s chat `chat_id`.
+///
+/// The event rides the owner's one chat stream — `user:pleroma_chat:{owner}`,
+/// the hub name a client's `user:pleroma_chat` subscription expands to (see
+/// [`crate::api::streaming`]) — with the owner as the whole
+/// [`Audience::Users`] and a [`RenderSpec::Chat`] hint rather than a payload,
+/// so each socket renders the entity for its own reader as the status and
+/// notification emitters do. The hint must name the reader's OWN chat row:
+/// every participant of a conversation owns their own row ([`chat::get_or_create`]
+/// and [`chat::get_owned`]) and one participant's id means nothing to
+/// another, so each side of a chat is published to separately, with its own
+/// id. The chat hooks of [`crate::api::chats`] are the callers: a created or
+/// deleted message tells both LOCAL sides, a read marker only the reader.
+///
+/// Best-effort like the other emitters — the rows behind the change are
+/// already committed — and since nothing here reads the database, this call
+/// cannot fail and never refuses. It is synchronous, like
+/// [`Hub::publish`](crate::streaming::hub::Hub::publish) itself: handing
+/// the event to the hub is the whole emission, and the cross-instance
+/// bridge is the hub's spawned task.
+///
+/// [`chat::get_or_create`]: crate::models::chat::get_or_create
+/// [`chat::get_owned`]: crate::models::chat::get_owned
+pub fn chat_updated(state: &AppState, owner_id: Uuid, chat_id: Uuid) {
+    state.hub.publish(StreamEvent {
+        streams: vec![format!("user:pleroma_chat:{owner_id}")],
+        event: "pleroma:chat_update".to_owned(),
+        payload: None,
+        audience: Audience::Users(vec![owner_id]),
+        render: Some(RenderSpec::Chat(chat_id)),
         local_only: false,
     });
 }
@@ -615,6 +652,7 @@ mod tests {
         config::{Config, TEST_BASE_URL},
         http_client::HttpClient,
         models::{
+            chat,
             follow::FollowToggles,
             list::NewList,
             media_attachment::NewMediaAttachment,
@@ -1749,5 +1787,43 @@ mod tests {
         notification_created(&state, &row).await;
 
         assert_empty(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn chat_updated_pushes_the_owners_chat_stream_with_the_hint() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let row = chat::get_or_create(&pool, &alice, &bob)
+            .await
+            .expect("the chat fixture creates");
+        let mut rx = state.hub.subscribe();
+
+        chat_updated(&state, alice.id, row.id);
+
+        let event = emitted(&mut rx).await;
+        assert_eq!(
+            event.event, "pleroma:chat_update",
+            "Pleroma's chat update event"
+        );
+        assert_eq!(
+            event.streams,
+            vec![format!("user:pleroma_chat:{}", alice.id)],
+            "the event rides exactly the owner's pleroma_chat stream"
+        );
+        assert_eq!(
+            event.audience,
+            Audience::Users(vec![alice.id]),
+            "the owner is the whole audience"
+        );
+        assert_eq!(
+            event.render,
+            Some(RenderSpec::Chat(row.id)),
+            "the event carries the chat render hint"
+        );
+        assert!(event.payload.is_none(), "no body: the socket renders it");
+        assert!(!event.local_only, "a chat update is not flagged local-only");
     }
 }
