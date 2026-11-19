@@ -326,6 +326,54 @@ published, never what is enforced: an excluded host is still refused its
 traffic, still absent from the domain-block listing, and still out of the
 peer list.
 
+## API coverage
+
+Wired replicates the HTTP interface of **Pleroma 2.10**: paths, parameters,
+JSON shapes, status codes and headers match what Pleroma answers, because
+clients and peer instances are written against that surface and cannot be
+changed. Four families make it up:
+
+- the **Mastodon client API** under `/api/v1` and `/api/v2` — apps, accounts,
+  statuses, timelines, notifications (flat and grouped), conversations, lists,
+  filters, markers, media, polls, search, domain blocks, follow requests,
+  endorsements, scheduled statuses, push subscriptions, announcements, reports,
+  trends, the directory and the instance documents;
+- **Pleroma's own extensions** under `/api/v1/pleroma` and `/api/pleroma` —
+  emoji and emoji packs, reactions, chats, conversations, bookmarks folders,
+  scrobbles, settings, the mascot and preferred frontend, MFA, aliases, moves,
+  account deletion, the CSV imports, backups, OAuth token management,
+  `frontend_configurations`, `healthcheck`, `captcha` and `federation_status`;
+- the **admin API** — Pleroma's `/api/v1/pleroma/admin` (users, permission
+  groups, invites, statuses, chats, instances, reports, relays, rules,
+  announcements, webhooks, config, frontends, media-proxy caches, the
+  moderation log and stats) and Mastodon's `/api/v1/admin` and
+  `/api/v2/admin` (accounts and the report queue), plus the legacy
+  `/api/v0/pleroma/reports` ledger;
+- **federation and discovery** — the `ActivityPub` actors, objects, activities,
+  inboxes and outboxes (`/users/…`, `/objects/…`, `/activities/…`, `/inbox`,
+  `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the Atom and
+  RSS feeds, the media and emoji files, the proxy, the OAuth endpoints, the
+  remote-interaction pages and the streaming WebSocket.
+
+`src/api/route_inventory.rs` is the table of that surface: one row per route,
+with its method, its `:name`-style path and the credential its handler demands
+(`Public`, `User` or `Admin`). `tests/api/route_inventory.rs` is the gate — it
+requests every row without credentials and fails if the router does not match
+the path (the fallback's `x-wired-fallback: 1` marker answers) or if a `User`
+or `Admin` row answers anything other than 401 or 403. A route that exists in
+Pleroma but is missing here, or a route here that the router does not serve,
+fails CI.
+
+Routes Pleroma has and Wired deliberately does not:
+
+| Route | Why it is out |
+|---|---|
+| `POST /api/v1/pleroma/uploader_callback/:upload_path` | The per-chunk callback of Pleroma's frontend-driven resumable uploader (`UploaderController.callback`). Wired's upload endpoints take the whole file in one request, so a callback has nothing to report. |
+| Phoenix's dev and test routes — `forward /dev/mailbox`, and the `/test/api/:action` and `/test/authenticated_api/:action` reads of `AuthTestController` | The reference mounts them only when its environment is `:dev` or `:test`: a mailbox preview for sent mail and plugs that exercise its own router. Wired's tests drive the real router. |
+| `/phoenix/live_dashboard/*path`, and the `/pleroma/live_dashboard` and `/pleroma/oban` pages it redirects to | `Phoenix.LiveDashboard` and `Oban.Web.Router`: HTML UIs over BEAM process and job metrics, with no meaning outside that runtime. |
+| The SPA fallbacks `GET /:maybe_nickname_or_id` and `GET /*path` (and the `OPTIONS /*path` pair) | They hand an unknown path to the frontend's JavaScript router, or answer its preflight. Wired is API-only (see the top of this file), so an unmatched path is the JSON 404 — under `/api` Pleroma's own `api_not_implemented`, elsewhere its plain "Not found". |
+| The Shout channels socket (`GET /socket`) | Pleroma's browser-notification WebSocket. Wired delivers the same events on `/api/v1/streaming` and over Web Push. |
+
 ## Development
 
 ```sh

@@ -57,7 +57,8 @@
 //!   /api/v1/pleroma/password_reset` form spends like the emailed one.
 //!   Gated `admin:write:accounts` as Pleroma's scope pair has it, and
 //!   logged nowhere: it is a read-shaped mint, and Pleroma does not log it.
-//! - `PATCH /users/password_reset` (`force_password_reset`) — `{"nicknames"
+//! - `PATCH /users/force_password_reset` (Pleroma's path) and its alias
+//!   `PATCH /users/password_reset` (`force_password_reset`) — `{"nicknames"
 //!   : […]}`: every named account gets `password_reset_pending` raised and
 //!   its tokens revoked in one transaction (the pending flag is what refuses
 //!   its password-grant logins until a new password lands), unknown names
@@ -313,6 +314,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/users/{nickname}/password_reset", get(get_password_reset))
         .route("/users/password_reset", patch(force_password_reset))
+        .route("/users/force_password_reset", patch(force_password_reset))
         .route("/users/confirm_email", patch(confirm_email_users))
         .route(
             "/users/resend_confirmation_email",

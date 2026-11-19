@@ -1,8 +1,9 @@
 //! Tests for the API router skeleton (`src/api.rs`) and its JSON fallback:
 //! unmatched paths under `/api` answer Pleroma's `api_not_implemented`
 //! (404 `{"error":"Not implemented"}`), every other unmatched path answers
-//! 404 `{"error":"Not found"}`, and `/health` still serves 204 through the
-//! composed router.
+//! 404 `{"error":"Not found"}`, both of those carry the `x-wired-fallback`
+//! marker the route inventory (`tests/api/route_inventory.rs`) reads, and
+//! `/health` still serves 204 through the composed router.
 
 #![cfg(test)]
 
@@ -166,5 +167,30 @@ async fn fallback_covers_all_verbs() {
         error_message(&put_response).as_deref(),
         Some("Not found"),
         "PUT keeps the Not found body"
+    );
+}
+
+/// Both fallback branches mark their answer with `x-wired-fallback: 1`, and a
+/// route the router matched does not carry it: that header is what
+/// `route_inventory.rs` reads to tell "no handler is routed here" from a
+/// handler's own 404.
+#[tokio::test]
+async fn fallback_answers_carry_the_marker_header() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool);
+    for path in ["/api/v1/nothing", "/nothing"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(
+            response.header("x-wired-fallback"),
+            Some("1"),
+            "the fallback marks its own 404 for {path}"
+        );
+    }
+    let health = common::TestRequest::get("/health").send(&app).await;
+    assert_eq!(
+        health.header("x-wired-fallback"),
+        None,
+        "a matched route carries no fallback marker"
     );
 }
