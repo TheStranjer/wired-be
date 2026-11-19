@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod config;
 pub mod entities;
 pub mod error;
@@ -39,12 +40,9 @@ use crate::{
     api::media_files,
     config::{Config, SECRET_KEY_BASE_VAR},
     error::AppError,
-    http_client::HttpClient,
     jobs::{JobRegistry, Worker, scheduler},
     services::{emoji_packs, instance_actor, media_proxy, runtime_config, vapid},
     state::AppState,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
     util::token::{CREDENTIAL_BYTES, random_token},
 };
 
@@ -113,7 +111,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// [`scheduler::run`] task enqueues the [`scheduler::periodic_jobs`]
 /// recurring jobs, and a spawned
 /// [`run_pg_listener`](streaming::hub::run_pg_listener) task mirrors the
-/// other instances' [`Hub`] events onto this process' streaming bus,
+/// other instances' [`Hub`](streaming::hub::Hub) events onto this
+/// process' streaming bus,
 /// honoring the same shutdown signal as the other tasks.
 ///
 /// # Errors
@@ -132,19 +131,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(ap_id = %fetch_actor.ap_id, "instance actor ready");
     let vapid_public = vapid::ensure_instance_keypair(&db, &config).await?;
     info!(vapid_public_key = %vapid_public, "VAPID key pair ready");
-    let hub = Hub::new(&db);
-    let state = AppState {
-        db,
-        hub,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: mailer::transport_from_config(&config),
-    };
+    let state = AppState::new(db, Arc::clone(&config));
     let listener = TcpListener::bind(state.config.bind_addr).await?;
     info!(addr = %state.config.bind_addr, "listening");
     let worker = Worker::new(
