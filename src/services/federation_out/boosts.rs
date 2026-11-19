@@ -1,0 +1,412 @@
+//! The `Announce` arm of the interaction hooks: the boost a reblog row *is*
+//! (decision 6 — its document id is the row's stored `uri`) and the `Undo`
+//! that withdraws it, addressed by the boost's own visibility.
+//!
+//! [`reblog_activity`] builds both, and the delete hook hands a tombstoned
+//! boost back to the very same `Undo` — see [`super::withdrawals`]. The
+//! shared rows, addressing and publisher hand stand in the module root; the
+//! like and reaction twins are [`super::likes`] and [`super::reactions`].
+
+use serde_json::Value;
+
+use super::{PUBLIC, StatusAction, followers_address, queue_activity, status_action, withdrawal};
+use crate::{
+    federation::activities::{ObjectActivityContext, announce_json},
+    models::status::{Status, Visibility},
+    state::AppState,
+};
+
+/// Announce the boost or unboost the caller just performed.
+///
+/// The document is the `Announce` the reblog row *is* (decision 6 — its
+/// id is the row's stored `uri`, which is what a withdrawal's `Undo`
+/// embeds and a peer's later fetch names back), or the `Undo` wrapping it.
+///
+/// The addressing follows the boost's own visibility as Pleroma's
+/// `Builder.announce` follows it: a public one names the world in `to`,
+/// an unlisted or private one the actor's followers collection, and the
+/// `cc` line carries the followers collection beside the boosted status'
+/// author either way — so the fan-out reaches the remote followers' and
+/// the original author's inboxes, and a boost of a LOCAL status federates
+/// to the followers alone (the publisher resolves the local author to
+/// nothing). A `local`-visibility boost federates nothing, and neither
+/// does one whose original was `local`-visibility: those facts are this
+/// instance's alone.
+pub async fn after_reblog_changed(state: &AppState, reblog: &Status, reblogging: bool) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    let Some(original_id) = reblog.reblog_of_id else {
+        return; // not a reblog row: there is no Announce behind it
+    };
+    if reblog.visibility == Visibility::Local {
+        return; // a local-only boost stays local
+    }
+    let Some(action) = status_action(state, reblog.user_id, original_id).await else {
+        return;
+    };
+    let document = reblog_activity(state, reblog, &action, !reblogging);
+    queue_activity(state, &action.actor, &document, "reblog").await;
+}
+
+/// The `Announce` behind the reblog row `reblog`, in the undo arm wrapped
+/// in the `Undo` that withdraws it; both travel under the addressing the
+/// boost's visibility states ([`after_reblog_changed`]'s module-doc rule).
+pub(super) fn reblog_activity(
+    state: &AppState,
+    reblog: &Status,
+    action: &StatusAction,
+    undo: bool,
+) -> Value {
+    let followers = followers_address(&action.actor);
+    let to: [&str; 1] = if reblog.visibility == Visibility::Public {
+        [PUBLIC]
+    } else {
+        [followers.as_str()]
+    };
+    let cc = [followers.as_str(), action.author.ap_id.as_str()];
+    let announce = announce_json(&ObjectActivityContext {
+        config: &state.config,
+        id: &reblog.uri,
+        actor_ap_id: &action.actor.ap_id,
+        object_uri: &action.status.uri,
+        to: &to,
+        cc: &cc,
+        published: &reblog.inserted_at,
+    });
+    if undo {
+        withdrawal(state, &action.actor.ap_id, &to, &cc, &announce)
+    } else {
+        announce
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    use crate::{
+        config::TEST_BASE_URL,
+        models::{
+            emoji_reaction::{self, NewReaction},
+            favourite,
+            status::{self, NewStatus},
+        },
+        services::federation_out::{
+            after_favourite_changed, after_reaction_changed, after_status_deleted,
+            test_support::{
+                accepted_follow, app_state, delivered_inboxes, job_count, local, local_status,
+                remote, remote_status, run_publishes, the_single_activity,
+            },
+        },
+        util::time::mastodon_time,
+    };
+
+    /// Boosting a REMOTE status publishes the `Announce` the row *is*:
+    /// its stored `uri` as the id, the world in `to`, and the followers
+    /// collection beside the boosted author in `cc` — the fan-out lands
+    /// in the author's inbox and the followers' instance inbox.
+    #[tokio::test]
+    async fn boosting_a_remote_status_publishes_the_announce() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let original = remote_status(&pool, &bob, "boost-me", Visibility::Public).await;
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &original, Visibility::Public)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &reblog, true).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Announce");
+        assert_eq!(
+            activity["id"], reblog.uri,
+            "the id is the reblog row's own uri (decision 6)"
+        );
+        assert_eq!(activity["actor"], alice.ap_id);
+        assert_eq!(
+            activity["object"], original.uri,
+            "object is the original uri"
+        );
+        assert_eq!(
+            activity["to"],
+            json!([PUBLIC]),
+            "a public boost addresses the world"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id), bob.ap_id]),
+            "the followers collection and the boosted author ride cc"
+        );
+        assert_eq!(activity["published"], mastodon_time(&reblog.inserted_at));
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec![
+                "https://remote.example/inbox",
+                "https://remote.example/users/bob/inbox",
+            ],
+            "the boosted author's inbox plus the remote followers'"
+        );
+    }
+
+    /// An unlisted boost names the followers collection in `to` — the
+    /// public address goes — while the `cc` line stays the pair.
+    #[tokio::test]
+    async fn an_unlisted_boost_addresses_the_followers_in_to() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let original = remote_status(&pool, &bob, "boost-quietly", Visibility::Public).await;
+        let (reblog, wrote) = status::create_reblog(
+            &pool,
+            TEST_BASE_URL,
+            &alice,
+            &original,
+            Visibility::Unlisted,
+        )
+        .await
+        .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &reblog, true).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(
+            activity["to"],
+            json!([format!("{}/followers", alice.ap_id)]),
+            "an unlisted boost talks to the followers, not the world"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id), bob.ap_id]),
+            "the cc line is the same pair"
+        );
+    }
+
+    /// Boosting a LOCAL status federates: the document addresses the
+    /// boosted local author in `cc` (never a delivery target) and the
+    /// fan-out lands in the remote followers' inboxes alone.
+    #[tokio::test]
+    async fn boosting_a_local_status_federates_the_announce_to_the_remote_followers() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = local(&pool, "carol").await;
+        let fan = remote(&pool, "fan").await;
+        accepted_follow(&pool, &fan, &alice).await;
+        let original = local_status(&pool, &carol, "boostable at home").await;
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &original, Visibility::Public)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &reblog, true).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Announce");
+        assert_eq!(activity["id"], reblog.uri);
+        assert_eq!(activity["object"], original.uri);
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id), carol.ap_id]),
+            "the local author rides cc as any boosted author would"
+        );
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://remote.example/inbox"],
+            "the announce travels to the remote followers alone"
+        );
+    }
+
+    /// Unboosting publishes the `Undo` that embeds the `Announce` by its
+    /// stored uri and repeats the boost's addressing.
+    #[tokio::test]
+    async fn unboosting_publishes_the_undo_of_the_announce() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let original = remote_status(&pool, &bob, "boost-then-drop", Visibility::Public).await;
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &original, Visibility::Public)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let announce_uri = reblog.uri.clone();
+        let removed = status::remove_reblog(&pool, alice.id, original.id)
+            .await
+            .expect("the withdrawal runs")
+            .expect("the boost went");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &removed, false).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Undo");
+        assert_eq!(activity["object"]["type"], "Announce");
+        assert_eq!(
+            activity["object"]["id"], announce_uri,
+            "the embedded announce keeps the row's uri, tombstone or not"
+        );
+        let id = activity["id"].as_str().expect("the undo has an id");
+        assert!(
+            id.starts_with(&format!("{TEST_BASE_URL}/activities/")),
+            "the undo carries this instance's own activity shape: {id}"
+        );
+        assert_ne!(
+            id, announce_uri,
+            "the undo mints its OWN uuid, distinct from the boost's uri"
+        );
+        assert_eq!(
+            activity["to"],
+            json!([PUBLIC]),
+            "the boost's to line repeats"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{}/followers", alice.ap_id), bob.ap_id]),
+            "and its cc line"
+        );
+    }
+
+    /// A boost of a `local`-visibility original never federates, and
+    /// neither do likes or reactions of a `local`-visibility status: the
+    /// fact stays this instance's own.
+    #[tokio::test]
+    async fn nothing_federates_for_local_visibility_statuses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let hidden = remote_status(&pool, &bob, "instance-only", Visibility::Local).await;
+        let liked = favourite::favourite(&pool, TEST_BASE_URL, alice.id, hidden.id)
+            .await
+            .expect("the favourite writes")
+            .expect("the pair liked");
+        let new = NewReaction {
+            user_id: alice.id,
+            status_id: hidden.id,
+            emoji: "🎉",
+            url: None,
+        };
+        let reacted = emoji_reaction::react(&pool, TEST_BASE_URL, &new)
+            .await
+            .expect("the reaction writes");
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &hidden, Visibility::Public)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_favourite_changed(&state, &liked, true).await;
+        after_reaction_changed(&state, &reacted, true).await;
+        after_reblog_changed(&state, &reblog, true).await;
+        after_reblog_changed(&state, &reblog, false).await;
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "a local-visibility post moves no queue"
+        );
+    }
+
+    /// A boost whose own row is `local`-visibility never federates
+    /// either — the row itself, not just its original, can hold the fact
+    /// in.
+    #[tokio::test]
+    async fn a_local_visibility_boost_never_federates() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let original =
+            remote_status(&pool, &bob, "public-for-local-boost", Visibility::Public).await;
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &original, Visibility::Local)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &reblog, true).await;
+        after_reblog_changed(&state, &reblog, false).await;
+
+        assert_eq!(
+            job_count(&pool).await,
+            0,
+            "a local-only boost moves no queue"
+        );
+    }
+
+    /// The mirrored rows the inbound handlers fold belong to their maker's
+    /// instance: a remote actor's like, reaction, boost — and the delete
+    /// of a mirror boost — publish nothing.
+    #[tokio::test]
+    async fn a_remote_actors_interactions_publish_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let own = local_status(&pool, &alice, "alice speaks").await;
+        let mirrored_like = favourite::favourite_like(
+            &pool,
+            bob.id,
+            own.id,
+            "https://remote.example/activities/like-9",
+        )
+        .await
+        .expect("the mirror like writes")
+        .expect("the pair liked");
+        let new = NewReaction {
+            user_id: bob.id,
+            status_id: own.id,
+            emoji: "🎉",
+            url: None,
+        };
+        let mirrored_react = emoji_reaction::react_with_ap_id(
+            &pool,
+            &new,
+            "https://remote.example/activities/react-9",
+        )
+        .await
+        .expect("the mirror reaction writes");
+        let mirror_reblog = status::insert(
+            &pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                uri: Some("https://remote.example/activities/announce-9".to_owned()),
+                user_id: bob.id,
+                reblog_of_id: Some(own.id),
+                ..NewStatus::default()
+            },
+        )
+        .await
+        .expect("the mirror boost writes");
+        let state = app_state(&pool);
+
+        after_favourite_changed(&state, &mirrored_like, true).await;
+        after_reaction_changed(&state, &mirrored_react, true).await;
+        after_reblog_changed(&state, &mirror_reblog, true).await;
+        after_status_deleted(&state, &mirror_reblog).await;
+
+        assert_eq!(job_count(&pool).await, 0, "a mirror announces nothing");
+    }
+}
