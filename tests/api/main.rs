@@ -159,6 +159,10 @@ mod chat_federation_out;
 /// The chat API over HTTP (`/api/v1/pleroma/chats` and its v2 twin).
 mod chats;
 
+/// The `create-admin` CLI function against the database (its argument
+/// parser is unit-tested in `src/cli.rs`).
+mod cli;
+
 /// The `ActivityPub` collections over HTTP: outbox, followers, following,
 /// featured and an object's replies (`src/federation/collections.rs`).
 mod collections;

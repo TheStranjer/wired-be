@@ -4,6 +4,14 @@ Wired's API-only backend, built on [Axum](https://github.com/tokio-rs/axum), the
 framework. Wired is explicitly compatible with [Pleroma](https://pleroma.social/)'s API:
 its goal is to first replicate, and later expand upon, Pleroma's backend.
 
+One binary serves it all: the Mastodon-compatible client API (`/api/v1`,
+`/api/v2`), Pleroma's extensions and admin API, OAuth, `ActivityPub`
+federation with the MRF moderation chain, `WebFinger`/`NodeInfo` discovery
+and the streaming WebSocket — plus the Postgres-backed job worker and the
+periodic scheduler that keep the instance running (see
+[Running](#running)). There is no frontend and no Redis: PostgreSQL is the
+database and the queue.
+
 ## Requirements
 
 - Rust (stable, see `rust-version` in `Cargo.toml`)
@@ -139,6 +147,106 @@ now). The frontend must ship exactly these paths under that origin:
 | `/images/banner.png` | Default banner: the `header`/`header_static` fallback on accounts |
 | `/images/thumbnail.jpg` | Instance thumbnail on `GET /api/v1/instance` and `GET /api/v2/instance` |
 | `/images/mascot.png` | Default mascot on `GET /api/v1/pleroma/mascot` |
+
+Every setting in that table is a `pub const NAME_VAR` in `src/config.rs`
+(the one place an environment variable name is spelled), and
+`tests/config_docs.rs` is the guard: it scans the declarations and fails CI
+when one is missing from `.env.example` or from the table above.
+
+## Architecture
+
+wired-be is one binary: `src/main.rs` parses the command line, loads the
+environment configuration and either serves or runs the admin bootstrap;
+everything else lives in `src/lib.rs` and its modules, so the integration
+tests drive the same router in-process. The server federates over
+`ActivityPub` (HTTP signatures, `WebFinger`, `NodeInfo`, relays, and the
+MRF policy chain below), serves the Mastodon and Pleroma client APIs to
+apps, and the admin APIs to staff — the feature families are enumerated
+under [API coverage](#api-coverage).
+
+The module layout (the binding decisions it follows are numbered in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
+
+| Module | Contents |
+|---|---|
+| `src/api/` | One file per API area, each exposing `fn router() -> Router<AppState>` and composed in `src/api.rs` (decision 3): the Mastodon client API under `/api/v1` and `/api/v2`, Pleroma's extensions, the admin APIs, the `ActivityPub` routes, discovery, OAuth and streaming |
+| `src/models/` | The domain structs and their SQL, one file per table family |
+| `src/entities/` | The Mastodon-style JSON entities (`Account`, `Status`, `Notification`, …) built from the models |
+| `src/federation/` | `ActivityPub`: actors, objects, collections, inbox dispatch, signed delivery, authorized fetch, and the MRF policies (`src/federation/mrf/`) |
+| `src/jobs/` | The background-job handlers, the queue's claim loop (`Worker`) and the cron-like `scheduler` (decision 11: Postgres rows, no Redis) |
+| `src/services/` | Cross-cutting operations: activity ingest, media processing and proxying, mention resolution, Web Push, VAPID, translation, the runtime config store |
+| `src/auth/` | The OAuth2 bearer extractors `AuthUser`/`MaybeAuthUser` and the Mastodon scope rules (decision 9) |
+| `src/extract/` | The shared request extractors, notably `ApiBody<T>` (decision 10) |
+| `src/streaming/` | The `/api/v1/streaming` hub and its `NOTIFY` bridge between processes |
+| `src/config.rs` | The environment-only configuration (decision 12), documented in the table above |
+| `src/state.rs` | `AppState`: the one cheap-to-clone value every handler shares (pool, config, HTTP client, rate limiter, mailer, streaming hub) |
+| `src/error.rs` | The one `AppError` and its JSON rendering (decision 8) |
+| `src/http_client/`, `src/mailer/`, `src/oauth/`, `src/util/`, `src/uploads.rs`, `src/feeds.rs`, `src/middleware.rs`, `src/pagination.rs`, `src/rate_limit.rs` | The helpers around them: the SSRF-guarded outbound client, the SMTP transport, scope parsing, formatting/sanitizing/passwords/keys, upload storage, Atom/RSS feeds, the tower layers, UUIDv7 cursor pagination, the rate limiter |
+
+The shape that falls out: every primary key is a `uuid` column holding a
+`UUIDv7` minted in Rust, so `max_id`/`min_id` pagination is plain text
+comparison (decision 4); times are `timestamptz` rendered Mastodon-style
+(decision 5); statuses are relational rows, and anything that federates
+carries an `ap_id` (decision 6); one `users` table holds local accounts and
+remote mirrors alike (decision 7); background work is queue rows claimed
+`FOR UPDATE SKIP LOCKED` (decision 11).
+
+## Running
+
+```sh
+wired-be            # or the explicit `wired-be serve`
+```
+
+One process runs four cooperating tasks (`wired_be::serve`):
+
+- the HTTP server on `BIND_ADDR`;
+- the **job worker** ([`src/jobs.rs`](src/jobs.rs)): drains the `jobs`
+  table in the `JOB_QUEUES` priority order with `JOB_CONCURRENCY` handlers
+  at a time, claiming rows `FOR UPDATE SKIP LOCKED`, retrying failures with
+  exponential backoff and honouring a peer's `Retry-After`. There is no
+  separate worker binary and nothing external to run: enqueueing is
+  inserting a row, and every serving process is also a consumer — start
+  `wired-be` (or as many instances as you like) and the background work is
+  running;
+- the **periodic scheduler** ([`src/jobs/scheduler.rs`](src/jobs/scheduler.rs)):
+  a ten-second tick that enqueues the recurring jobs — status expiry, the
+  scheduled-status fires, the daily maintenance, token, jobs-table and
+  backup sweeps, the media sweep, the host probes and the
+  received-activity prune — as ordinary queue rows. Each period is one row
+  deduplicated by a unique key, so any number of schedulers agree and the
+  work runs once per period wherever a worker picks it up;
+- the streaming `NOTIFY` listener, mirroring other processes' events onto
+  this instance's WebSocket hub.
+
+`Ctrl-C` shuts all of it down gracefully: the worker stops claiming and
+waits for its in-flight jobs. An operator can also ask for a graceful
+restart over the admin API (`GET /api/v1/pleroma/admin/need_reboot` says
+whether a restart-requiring config change is pending;
+`POST /api/v1/pleroma/admin/restart` exits the process for its supervisor).
+
+## Creating the first admin
+
+```sh
+echo 'the-new-password' | \
+  wired-be create-admin --nickname alice --email alice@example.org --password-stdin
+```
+
+The command reads the same environment as the server (`DATABASE_URL` and
+`BASE_URL` required), applies any pending migrations, creates the account
+through the very registration path `POST /api/v1/accounts` uses — the
+nickname, email and password rules apply — and then sets `is_admin = true`
+on the row, writing the account's `ActivityPub` key pair as it goes. The
+password arrives on standard input only, never in the process arguments;
+`wired-be create-admin --help` prints the contract, and `wired-be --help`
+lists the commands.
+
+Because whoever runs the command already holds database access, the account
+starts email-confirmed and approved even on an instance with
+`ACCOUNT_ACTIVATION_REQUIRED` or `REGISTRATIONS_APPROVAL_REQUIRED` on — the
+first staff account of a closed or gated instance can log in immediately.
+From there the admin API mints more staff: `POST /api/v1/pleroma/admin/users`
+creates accounts through the same bypass, and the permission-group routes
+grant or revoke `admin` and `moderator`.
 
 ## Moderation filters (MRF)
 
@@ -378,8 +486,9 @@ Routes Pleroma has and Wired deliberately does not:
 
 ```sh
 cp .env.example .env   # then edit DATABASE_URL
-cargo run              # serves on BIND_ADDR
-cargo test
+cargo run              # wired-be (= `wired-be serve`): HTTP server + job worker + scheduler on BIND_ADDR
+cargo run -- create-admin --nickname alice --email alice@example.org --password-stdin
+cargo test             # the whole suite; `--test config_docs` alone is the config guard
 cargo clippy --all-targets --all-features
 cargo fmt
 scripts/ci.sh          # full gate (same as CI): exits 0 if everything passes, 1 otherwise
