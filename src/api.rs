@@ -96,6 +96,7 @@ pub mod notifications_v2;
 pub mod oauth;
 pub mod oauth_external;
 pub mod oauth_tokens;
+pub mod openapi;
 pub mod password_reset;
 pub mod pleroma;
 pub mod pleroma_account_settings;
@@ -142,6 +143,10 @@ use crate::state::AppState;
 /// media upload route sizes its body limit from
 /// [`state.config`](AppState::config) (see
 /// [`crate::extract::multipart::upload_body_limit`]).
+///
+/// [`openapi`] is the one router merged at the plain `/api` root: its single
+/// route `GET /api/openapi` is Wired's surface document, generated from
+/// [`route_inventory`] itself (WBE-227), and Pleroma routes no document there.
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .nest("/api/v1", v1::router(state))
@@ -150,4 +155,5 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .nest("/api/oauth_tokens", oauth_tokens::router())
         .nest("/api/account", accounts::email_confirmation_router())
         .nest("/api/v0/pleroma", admin::reports::legacy_router())
+        .merge(openapi::router())
 }
