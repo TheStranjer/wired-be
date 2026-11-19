@@ -6,6 +6,11 @@
 //! URL prefixes and [`crate::app`] merges the result into the application
 //! router.
 //!
+//! [`route_inventory`] is the one module here with no router of its own: it is
+//! the table of every route Pleroma answers, with the credential class each
+//! one demands, and `tests/api/route_inventory.rs` measures the composed
+//! router against it.
+//!
 //! Unmatched paths are not handled here. The app-wide JSON fallback in
 //! [`crate::app`] answers every unrouted path under `/api` with 404
 //! `{"error":"Not implemented"}` (Pleroma's `api_not_implemented`,
@@ -102,6 +107,7 @@ pub mod polls;
 pub mod push;
 pub mod remote_interaction;
 pub mod reports;
+pub mod route_inventory;
 pub mod scheduled_statuses;
 pub mod scrobbles;
 pub mod search;

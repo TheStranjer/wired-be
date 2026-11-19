@@ -766,6 +766,8 @@ fn issued_reset(nickname: &str) -> String {
 
 /// The forced-reset PATCH route.
 const FORCE_RESET: &str = "/api/v1/pleroma/admin/users/password_reset";
+/// Pleroma's own path for the forced reset, served by the same handler.
+const FORCE_RESET_PLEROMA: &str = "/api/v1/pleroma/admin/users/force_password_reset";
 /// The email-confirmation PATCH route.
 const CONFIRM: &str = "/api/v1/pleroma/admin/users/confirm_email";
 /// The confirmation-resend PATCH route.
@@ -1499,6 +1501,27 @@ async fn the_reset_token_endpoint_issues_a_spendable_link() {
         logged(&seeded.pool, "updated_users").await.is_empty(),
         "the user-facing reset completion logs no admin write"
     );
+}
+
+/// Pleroma's `PATCH /admin/users/force_password_reset` path reaches the
+/// same forced reset as the `password_reset` alias: 204 and the flag raised.
+#[tokio::test]
+async fn force_password_reset_answers_on_pleromas_path() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let victim =
+        common::create_user_with_password(&seeded.pool, "forced", "their secret pass").await;
+
+    let response = patch_json(
+        &seeded.app,
+        &token,
+        FORCE_RESET_PLEROMA,
+        &json!({ "nicknames": ["forced"] }),
+    )
+    .await;
+    assert_no_content(&response, "the forced reset on Pleroma's path");
+    assert!(pending(&seeded.pool, &victim).await, "the flag is raised");
 }
 
 /// The forced reset: 204, the flag raised and the tokens revoked per

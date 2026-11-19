@@ -535,6 +535,12 @@ mod reports;
 /// reads and the deprecated `GET /api/v1/statuses/{id}/card` endpoint.
 mod rich_media;
 
+/// The route-inventory conformance gate (WBE-221): every row of
+/// `src/api/route_inventory.rs` requested without credentials through the
+/// real router, so a route nobody routed on, or a gated route that lets an
+/// anonymous request through, fails the suite.
+mod route_inventory;
+
 /// Scheduled statuses over HTTP: the `scheduled_at` arm of
 /// `POST /api/v1/statuses` (parking a create, its window, limits, media
 /// reservation and entity answer) and the four `/api/v1/scheduled_statuses`
