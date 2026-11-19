@@ -26,6 +26,11 @@
 //! fallbacks (`GET /:maybe_nickname_or_id` and `GET /*path`) and the Shout
 //! channel socket (`/socket`) — are deliberately absent; the README's
 //! "API coverage" section names them.
+//!
+//! One row belongs to no Pleroma router: `GET /api/openapi`, Wired's own
+//! surface document. [`crate::api::openapi`] generates that document from
+//! this table, so the route is inventoried beside the ones it describes and
+//! measured by the same gate.
 
 /// Who has to present a bearer token to reach a route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +69,13 @@ pub struct RouteSpec {
 /// they may answer an anonymous request with anything other than 401 or 403.
 pub const ROUTES: &[RouteSpec] = &[
     // ── Instance and other public reads ──────────────────────────────────
+    // Wired's own route, not Pleroma's: the OpenAPI document this table
+    // generates (WBE-227).
+    RouteSpec {
+        method: "GET",
+        path: "/api/openapi",
+        auth: AuthClass::Public,
+    },
     RouteSpec {
         method: "GET",
         path: "/api/v1/instance",

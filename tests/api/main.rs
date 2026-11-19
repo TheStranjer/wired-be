@@ -455,6 +455,10 @@ mod oauth_mfa;
 /// OAuth token management (`/api/oauth_tokens` and the pleroma apps).
 mod oauth_tokens;
 
+/// `GET /api/openapi` (WBE-227): the `OpenAPI` 3.0 document generated from
+/// the route inventory, its per-row operations and its `oAuth2` scheme.
+mod openapi;
+
 /// Password reset (`/auth/password` and `/api/v1/pleroma/password_reset`).
 mod password_reset;
 
