@@ -19,7 +19,7 @@ pub(crate) async fn health() -> StatusCode {
 /// fallback as the responder: the route-inventory conformance test
 /// (`tests/api/route_inventory.rs`) sends one credential-less request per
 /// row of
-/// [`api::route_inventory::ROUTES`](crate::api::route_inventory::ROUTES)
+/// [`api::route_inventory::routes`](crate::api::route_inventory::routes)
 /// and reads this header off the
 /// answer to tell "no route matched" apart from a real handler that
 /// answered with its own 404.

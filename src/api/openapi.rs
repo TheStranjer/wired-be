@@ -3,7 +3,7 @@
 //!
 //! Pleroma builds its spec at compile time from the Phoenix router
 //! (`lib/pleroma/web/api_spec.ex`, `OpenApiSpex.Paths.from_router`). Wired's
-//! one surface table is [`crate::api::route_inventory::ROUTES`], so the
+//! one surface table is [`crate::api::route_inventory::routes`], so the
 //! document is generated at request time from it: one `paths` entry per
 //! inventory path, one operation per row, every `:name` parameter spelled as
 //! a `{name}` template segment and declared as a required string path
@@ -23,7 +23,7 @@ use axum::{Json, Router, extract::State, routing::get};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    api::route_inventory::{AuthClass, ROUTES, RouteSpec},
+    api::route_inventory::{AuthClass, RouteSpec, routes},
     state::AppState,
 };
 
@@ -36,8 +36,9 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/api/openapi", get(spec))
 }
 
-/// `GET /api/openapi` — the `OpenAPI` 3.0 document, generated from [`ROUTES`]
-/// at request time. No authentication: the surface description is public.
+/// `GET /api/openapi` — the `OpenAPI` 3.0 document, generated from
+/// [`routes()`](crate::api::route_inventory::routes) at request time. No
+/// authentication: the surface description is public.
 async fn spec(State(state): State<AppState>) -> Json<Value> {
     Json(document(
         &state.config.instance_name,
@@ -67,7 +68,7 @@ fn document(instance_name: &str, base_url: &str) -> Value {
 /// operation per row routed on that path, keyed by the lowercase method.
 fn paths() -> Value {
     let mut items: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
-    for route in ROUTES {
+    for route in routes() {
         let item = items.entry(openapi_path(route.path)).or_default();
         let _replaced = item.insert(
             route.method.to_ascii_lowercase(),
@@ -210,7 +211,7 @@ mod tests {
     /// # Panics
     ///
     /// If the row is absent from the document, which [`paths`] guarantees
-    /// against [`ROUTES`].
+    /// against [`routes()`].
     fn operation_of<'doc>(paths: &'doc Map<String, Value>, route: &RouteSpec) -> &'doc Value {
         paths
             .get(openapi_path(route.path).as_str())
@@ -261,8 +262,12 @@ mod tests {
                 ids.push(id);
             }
         }
-        assert_eq!(ids.len(), ROUTES.len(), "one operation per inventory row");
-        for route in ROUTES {
+        assert_eq!(
+            ids.len(),
+            routes().count(),
+            "one operation per inventory row"
+        );
+        for route in routes() {
             let operation = operation_of(paths, route);
             assert_eq!(
                 operation["operationId"],
@@ -363,7 +368,7 @@ mod tests {
     fn gated_routes_ask_for_the_scheme_and_public_ones_do_not() {
         let document = sample();
         let paths = paths_of(&document);
-        for route in ROUTES {
+        for route in routes() {
             let operation = operation_of(paths, route);
             if route.auth == AuthClass::Public {
                 assert!(
@@ -397,7 +402,7 @@ mod tests {
     fn operations_answer_with_the_generic_ok() {
         let document = sample();
         let paths = paths_of(&document);
-        for route in ROUTES {
+        for route in routes() {
             assert_eq!(
                 operation_of(paths, route)["responses"],
                 json!({"200": {"description": "OK"}}),

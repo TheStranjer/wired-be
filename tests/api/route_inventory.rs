@@ -1,5 +1,5 @@
 //! The route-inventory conformance gate (WBE-221): every row of
-//! [`wired_be::api::route_inventory::ROUTES`] is requested through the real
+//! [`wired_be::api::route_inventory::routes`] is requested through the real
 //! application router without credentials, and the answer must show that a
 //! handler matched the route and that the row's [`AuthClass`] describes what
 //! the handler demands.
@@ -21,7 +21,7 @@ use std::collections::HashSet;
 
 use axum::{Router, http::StatusCode};
 use uuid::Uuid;
-use wired_be::api::route_inventory::{AuthClass, ROUTES, RouteSpec};
+use wired_be::api::route_inventory::{AuthClass, RouteSpec, routes};
 
 use crate::common;
 
@@ -180,7 +180,7 @@ async fn every_inventory_route_is_routed_and_gated() {
     let db = common::test_db().await;
     let app = common::test_app(db.pool().clone());
     let mut problems: Vec<String> = Vec::new();
-    for spec in ROUTES {
+    for spec in routes() {
         if let Some(problem) = problem_in(&app, spec).await {
             problems.push(problem);
         }
@@ -189,7 +189,7 @@ async fn every_inventory_route_is_routed_and_gated() {
         problems.is_empty(),
         "{} of {} inventory routes are wrong:\n{}",
         problems.len(),
-        ROUTES.len(),
+        routes().count(),
         problems.join("\n")
     );
 }
@@ -200,7 +200,7 @@ async fn every_inventory_route_is_routed_and_gated() {
 fn inventory_names_no_route_twice() {
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     let mut duplicates: Vec<String> = Vec::new();
-    for spec in ROUTES {
+    for spec in routes() {
         if !seen.insert((spec.method, spec.path)) {
             duplicates.push(format!("{} {}", spec.method, spec.path));
         }

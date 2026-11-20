@@ -1,5 +1,5 @@
 //! Tests for `GET /api/openapi` (WBE-227): the `OpenAPI` 3.0 document the
-//! server generates from `src/api/route_inventory.rs` at request time —
+//! server generates from `src/api/route_inventory/` at request time —
 //! valid JSON, one operation per inventory row, `{name}`-spelled path
 //! parameters, the `oAuth2` security scheme and its `security` on the gated
 //! routes.
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use wired_be::{
-    api::route_inventory::{AuthClass, ROUTES, RouteSpec},
+    api::route_inventory::{AuthClass, RouteSpec, routes},
     config::{DEFAULT_INSTANCE_NAME, TEST_BASE_URL},
 };
 
@@ -67,7 +67,7 @@ fn operations(document: &Value) -> HashMap<&str, &Value> {
         .expect("the document carries a paths object")
         .as_object()
         .expect("paths is an object");
-    let mut got: HashMap<&str, &Value> = HashMap::with_capacity(ROUTES.len());
+    let mut got: HashMap<&str, &Value> = HashMap::with_capacity(routes().count());
     for (path, item) in paths {
         let item = item.as_object().expect("a path item is an object");
         for (method, operation) in item {
@@ -126,10 +126,10 @@ async fn every_inventory_route_appears_exactly_once() {
     let operations = operations(&document);
     assert_eq!(
         operations.len(),
-        ROUTES.len(),
+        routes().count(),
         "one operation per inventory row"
     );
-    for route in ROUTES {
+    for route in routes() {
         let id = expected_operation_id(route);
         assert!(
             operations.contains_key(id.as_str()),
@@ -183,7 +183,7 @@ async fn inventory_paths_become_braced_templates() {
 async fn gated_operations_secure_with_the_scheme_and_public_ones_do_not() {
     let document = fetch_document().await;
     let operations = operations(&document);
-    for route in ROUTES {
+    for route in routes() {
         let id = expected_operation_id(route);
         let operation = operations
             .get(id.as_str())
