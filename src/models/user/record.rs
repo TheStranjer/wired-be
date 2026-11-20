@@ -1,0 +1,481 @@
+//! The [`User`] row: one record of `users` (decision 7), the `Debug` impl
+//! that keeps its secrets out of logs, and the [`User::account_status`]
+//! read that weighs the account-state flags.
+
+use std::fmt;
+
+use chrono::{DateTime, NaiveDate, Utc};
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::{AccountStatus, Flag};
+
+/// One row of `users`: a local account or a mirror of a remote actor
+/// (decision 7).
+#[derive(sqlx::FromRow)]
+pub struct User {
+    /// `UUIDv7` primary key, minted by [`insert`](super::insert) (decision 4).
+    pub id: Uuid,
+    /// Handle: `alice` locally, `alice@remote.example` for remote users.
+    /// Case-insensitive (citext), unique.
+    pub nickname: String,
+    /// `ActivityPub` actor id, unique.
+    pub ap_id: String,
+    /// Whether this instance owns the account.
+    pub local: Flag,
+    /// Host of a remote actor; `None` for local users.
+    pub domain: Option<String>,
+    /// `ActivityPub` actor type (`Person`, `Service`, ...).
+    pub actor_type: String,
+    /// Account email, local users only; case-insensitive, unique.
+    pub email: Option<String>,
+    /// PHC password hash, local users only. Never in `Debug` output.
+    pub password_hash: Option<String>,
+    /// Display name; empty means "same as the nickname".
+    pub name: String,
+    /// Profile note as sanitized HTML.
+    pub bio: String,
+    /// Profile note as its source text.
+    pub raw_bio: String,
+    /// Avatar URL, if set.
+    pub avatar_url: Option<String>,
+    /// Banner URL, if set.
+    pub banner_url: Option<String>,
+    /// Human-facing profile URL (the `ActivityPub` `url`), if set.
+    pub profile_url: Option<String>,
+    /// Whether follow requests need manual approval.
+    pub locked: Flag,
+    /// Whether the account is flagged as automated.
+    pub bot: Flag,
+    /// Whether the account opted into discovery.
+    pub discoverable: Flag,
+    /// Profile metadata: JSON array of `{name, value}` objects whose value
+    /// is the rendered HTML (see [`raw_fields`](Self::raw_fields) for the
+    /// editing text behind it).
+    pub fields: Value,
+    /// Profile metadata as its source text: JSON array of `{name, value}`
+    /// objects, the same entries [`fields`](Self::fields) renders.
+    pub raw_fields: Value,
+    /// `ActivityPub` inbox endpoint, if known.
+    pub inbox: Option<String>,
+    /// Shared inbox endpoint, if known.
+    pub shared_inbox: Option<String>,
+    /// `ActivityPub` outbox collection id, if known.
+    pub outbox: Option<String>,
+    /// Followers collection id, if known.
+    pub followers_url: Option<String>,
+    /// Following collection id, if known.
+    pub following_url: Option<String>,
+    /// Featured (pinned) collection id, if known.
+    pub featured_url: Option<String>,
+    /// Actor public signing key (PEM), if known.
+    pub public_key: Option<String>,
+    /// Actor private signing key; local users only. Never in `Debug`
+    /// output.
+    pub private_key: Option<String>,
+    /// Whether the account has the admin role.
+    pub is_admin: Flag,
+    /// Whether the account has the moderator role.
+    pub is_moderator: Flag,
+    /// Whether the account is active (not deactivated or suspended).
+    pub is_active: Flag,
+    /// Whether the follower collection is hidden from other accounts.
+    pub hide_followers: Flag,
+    /// Whether the follow collection is hidden from other accounts.
+    pub hide_follows: Flag,
+    /// Whether [`followers_count`](Self::followers_count) renders as zero
+    /// for everyone but the owner.
+    pub hide_followers_count: Flag,
+    /// Whether [`following_count`](Self::following_count) renders as zero
+    /// for everyone but the owner.
+    pub hide_follows_count: Flag,
+    /// Whether the favourites list is private to the account.
+    pub hide_favorites: Flag,
+    /// Whether a `Move` of this account may take the following list with
+    /// it (Pleroma's `allow_following_move`).
+    pub allow_following_move: Flag,
+    /// Whether this account's statuses skip thread containment.
+    pub skip_thread_containment: Flag,
+    /// Whether the account accepts chat messages. A remote mirror keeps
+    /// the column default until federation sees the capability; see
+    /// [`Account`](crate::entities::account::Account) for how that
+    /// renders.
+    pub accepts_chat_messages: Flag,
+    /// Whether the admin/moderator flags may be shown to other accounts.
+    pub show_role: Flag,
+    /// Whether the account asked clients not to render rich text.
+    pub no_rich_text: Flag,
+    /// Visibility new statuses default to (`public`, `unlisted`,
+    /// `private`, `direct`).
+    pub default_scope: String,
+    /// Whether new statuses are flagged sensitive by default; the
+    /// `source.sensitive` of the entity, `false` until a profile update
+    /// says otherwise.
+    pub sensitive_default: Flag,
+    /// BCP 47 language tag new statuses default to, the `source.language`
+    /// of the entity; `None` when the account stated no preference.
+    pub language: Option<String>,
+    /// Profile tags (`pleroma.tags`).
+    pub tags: Vec<String>,
+    /// Client settings the server only stores and round-trips
+    /// (`pleroma.settings_store`): a JSON object.
+    pub settings_store: Value,
+    /// Per-account notification flags: the jsonb blob parsed by
+    /// [`notification_settings::NotificationSettings`](super::notification_settings::NotificationSettings)
+    /// (`block_from_strangers`, `hide_notification_contents`), written by
+    /// `PUT /api/pleroma/notification_settings` and read by
+    /// [`maybe_notify`](crate::models::notification::maybe_notify) and the
+    /// account entity.
+    pub notification_settings: Value,
+    /// Profile background image URL, if set (unlike the avatar and banner
+    /// it has no instance default).
+    pub background_image_url: Option<String>,
+    /// The account's birthday, if it gave one.
+    pub birthday: Option<NaiveDate>,
+    /// Whether strangers may see [`birthday`](Self::birthday).
+    pub show_birthday: Flag,
+    /// Other actor ids this account is also known as.
+    pub also_known_as: Vec<String>,
+    /// Actor id this account moved to, if it moved; the entity's top-level
+    /// `moved` renders from it.
+    pub moved_to_ap_id: Option<String>,
+    /// When the account last moved; `None` when it never did. The move
+    /// endpoint's once-per-30-days cooldown reads it.
+    pub last_move_at: Option<DateTime<Utc>>,
+    /// Whether the account email has been confirmed.
+    pub email_confirmed: Flag,
+    /// Whether a moderator still has to approve the account.
+    pub approval_pending: Flag,
+    /// The secret token the confirmation link carries, `None` once the
+    /// address is confirmed (or for an account that never had to confirm
+    /// one). Secret material: redacted from `Debug` output.
+    pub confirmation_token: Option<String>,
+    /// When the confirmation email bearing [`confirmation_token`](Self::confirmation_token)
+    /// was queued; `None` when none ever was.
+    pub confirmation_sent_at: Option<DateTime<Utc>>,
+    /// The `reason` text given at registration, kept for the later
+    /// approval flow (Pleroma's `users.registration_reason`); `None` when
+    /// the account stated none.
+    pub registration_reason: Option<String>,
+    /// When the account was last seen; `None` when it never was.
+    pub last_active_at: Option<DateTime<Utc>>,
+    /// Number of followers; moved by [`update_counts`](super::update_counts).
+    pub followers_count: i32,
+    /// Number of follows; moved by [`update_counts`](super::update_counts).
+    pub following_count: i32,
+    /// Number of posted statuses; moved by [`update_counts`](super::update_counts).
+    pub statuses_count: i32,
+    /// Insert time of the newest status this user posted.
+    pub last_status_at: Option<DateTime<Utc>>,
+    /// When a remote actor was last fetched.
+    pub last_fetched_at: Option<DateTime<Utc>>,
+    /// When the row was inserted.
+    pub inserted_at: DateTime<Utc>,
+    /// When the row last changed; refreshed by every update here.
+    pub updated_at: DateTime<Utc>,
+    /// Multi-factor authentication state: the jsonb blob parsed by
+    /// [`mfa::MfaSettings`](super::mfa::MfaSettings) (enabled flag, TOTP secret and confirmation,
+    /// backup-code hashes). Holds the TOTP secret; never in `Debug`
+    /// output.
+    pub mfa_settings: Value,
+    /// The frontend the account picked at `PUT /api/v1/pleroma/preferred_frontend`;
+    /// `None` when it never chose one. The `preferred_frontend` cookie
+    /// mirrors it (Pleroma keeps the choice in the cookie alone).
+    pub preferred_frontend: Option<String>,
+    /// Whether an admin put the account in the suggestion pool the
+    /// `GET /api/v{1,2}/suggestions` endpoints answer from
+    /// (Pleroma's `is_suggested`). Nothing here sets it: the admin API
+    /// (a later ticket) is the writer.
+    pub is_suggested: Flag,
+    /// Whether the account must change its password before it may log in
+    /// again (Pleroma's `password_reset_pending`): the admin force-reset
+    /// flow (a later ticket) sets it, and completing a password reset
+    /// clears it again. `check_account_ready` refuses a pending account.
+    pub password_reset_pending: Flag,
+    /// Whether the account wants email from the instance (Pleroma's
+    /// `email_notifications`, moved by `User.switch_email_notifications`).
+    /// The HTML unsubscribe page (a later ticket) clears it; nothing reads
+    /// it yet.
+    pub email_notifications: Flag,
+    /// When the account started its deletion (`POST
+    /// /api/pleroma/delete_account`, see [`mark_deleted`](super::mark_deleted)); `None` while
+    /// it lives. The row is kept for referential integrity even after the
+    /// purge; this is what tells a deleted account from a merely
+    /// deactivated one.
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+/// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
+/// and [`mfa_settings`](Self::mfa_settings) are secrets and render as
+/// `<redacted>`; everything else shows.
+impl fmt::Debug for User {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("User")
+            .field("id", &self.id)
+            .field("nickname", &self.nickname)
+            .field("ap_id", &self.ap_id)
+            .field("local", &self.local)
+            .field("domain", &self.domain)
+            .field("actor_type", &self.actor_type)
+            .field("email", &self.email)
+            .field("password_hash", &"<redacted>")
+            .field("name", &self.name)
+            .field("bio", &self.bio)
+            .field("raw_bio", &self.raw_bio)
+            .field("avatar_url", &self.avatar_url)
+            .field("banner_url", &self.banner_url)
+            .field("profile_url", &self.profile_url)
+            .field("locked", &self.locked)
+            .field("bot", &self.bot)
+            .field("discoverable", &self.discoverable)
+            .field("fields", &self.fields)
+            .field("raw_fields", &self.raw_fields)
+            .field("inbox", &self.inbox)
+            .field("shared_inbox", &self.shared_inbox)
+            .field("outbox", &self.outbox)
+            .field("followers_url", &self.followers_url)
+            .field("following_url", &self.following_url)
+            .field("featured_url", &self.featured_url)
+            .field("public_key", &self.public_key)
+            .field("private_key", &"<redacted>")
+            .field("is_admin", &self.is_admin)
+            .field("is_moderator", &self.is_moderator)
+            .field("is_active", &self.is_active)
+            .field("hide_followers", &self.hide_followers)
+            .field("hide_follows", &self.hide_follows)
+            .field("hide_followers_count", &self.hide_followers_count)
+            .field("hide_follows_count", &self.hide_follows_count)
+            .field("hide_favorites", &self.hide_favorites)
+            .field("allow_following_move", &self.allow_following_move)
+            .field("skip_thread_containment", &self.skip_thread_containment)
+            .field("accepts_chat_messages", &self.accepts_chat_messages)
+            .field("show_role", &self.show_role)
+            .field("no_rich_text", &self.no_rich_text)
+            .field("default_scope", &self.default_scope)
+            .field("sensitive_default", &self.sensitive_default)
+            .field("language", &self.language)
+            .field("tags", &self.tags)
+            .field("settings_store", &self.settings_store)
+            .field("notification_settings", &self.notification_settings)
+            .field("background_image_url", &self.background_image_url)
+            .field("birthday", &self.birthday)
+            .field("show_birthday", &self.show_birthday)
+            .field("also_known_as", &self.also_known_as)
+            .field("moved_to_ap_id", &self.moved_to_ap_id)
+            .field("last_move_at", &self.last_move_at)
+            .field("email_confirmed", &self.email_confirmed)
+            .field("approval_pending", &self.approval_pending)
+            .field("confirmation_token", &"<redacted>")
+            .field("confirmation_sent_at", &self.confirmation_sent_at)
+            .field("registration_reason", &self.registration_reason)
+            .field("last_active_at", &self.last_active_at)
+            .field("followers_count", &self.followers_count)
+            .field("following_count", &self.following_count)
+            .field("statuses_count", &self.statuses_count)
+            .field("last_status_at", &self.last_status_at)
+            .field("last_fetched_at", &self.last_fetched_at)
+            .field("inserted_at", &self.inserted_at)
+            .field("updated_at", &self.updated_at)
+            .field("mfa_settings", &"<redacted>")
+            .field("preferred_frontend", &self.preferred_frontend)
+            .field("is_suggested", &self.is_suggested)
+            .field("password_reset_pending", &self.password_reset_pending)
+            .field("email_notifications", &self.email_notifications)
+            .field("deleted_at", &self.deleted_at)
+            .finish()
+    }
+}
+
+impl User {
+    /// Where this account stands between registration and use, weighed in
+    /// the order Pleroma's `User.account_status` uses: deactivation, then
+    /// the staff approval `REGISTRATIONS_APPROVAL_REQUIRED` asks for, then
+    /// the email confirmation `ACCOUNT_ACTIVATION_REQUIRED` asks for.
+    ///
+    /// The two registration flags are only ever cleared for local accounts
+    /// (a federated mirror arrives confirmed and approved), so no `local`
+    /// arm is needed to reproduce Pleroma's. The login gate of
+    /// [`crate::api::oauth`] and the bearer extractors of [`crate::auth`]
+    /// both decide from this one read.
+    #[must_use]
+    pub const fn account_status(&self) -> AccountStatus {
+        if !self.is_active.get() {
+            return AccountStatus::Deactivated;
+        }
+        if self.approval_pending.get() {
+            return AccountStatus::ApprovalPending;
+        }
+        if !self.email_confirmed.get() {
+            return AccountStatus::ConfirmationPending;
+        }
+        AccountStatus::Active
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::models::user::{
+        NewUser, featured, followers, following, get_by_nickname, inbox, insert, outbox,
+        test_support::*,
+    };
+
+    #[tokio::test]
+    async fn remote_user_nickname_carries_the_host() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let ap_id = "https://remote.example/users/bob";
+        let new = NewUser {
+            nickname: "bob@remote.example".to_owned(),
+            ap_id: ap_id.to_owned(),
+            domain: Some("remote.example".to_owned()),
+            name: "Bob".to_owned(),
+            inbox: Some(inbox(ap_id)),
+            shared_inbox: Some("https://remote.example/inbox".to_owned()),
+            outbox: Some(outbox(ap_id)),
+            followers_url: Some(followers(ap_id)),
+            following_url: Some(following(ap_id)),
+            featured_url: Some(featured(ap_id)),
+            public_key: Some("REMOTE-PEM".to_owned()),
+            discoverable: Flag::new(true),
+            followers_count: 12,
+            following_count: 3,
+            statuses_count: 48,
+            last_fetched_at: Some(Utc::now()),
+            ..NewUser::default()
+        };
+        let user = insert(&pool, &new).await.unwrap();
+        assert!(!user.local.get(), "the default NewUser is a remote mirror");
+        assert_eq!(
+            user.nickname, "bob@remote.example",
+            "the user@host handle round trips"
+        );
+        assert_eq!(user.domain.as_deref(), Some("remote.example"), "domain");
+        assert_eq!(user.inbox.as_deref(), Some(inbox(ap_id).as_str()), "inbox");
+        assert_eq!(
+            user.shared_inbox.as_deref(),
+            Some("https://remote.example/inbox"),
+            "shared inbox"
+        );
+        assert_eq!(
+            user.outbox.as_deref(),
+            Some(outbox(ap_id).as_str()),
+            "outbox"
+        );
+        assert_eq!(
+            user.followers_url.as_deref(),
+            Some(followers(ap_id).as_str()),
+            "followers collection"
+        );
+        assert_eq!(
+            user.following_url.as_deref(),
+            Some(following(ap_id).as_str()),
+            "following collection"
+        );
+        assert_eq!(
+            user.featured_url.as_deref(),
+            Some(featured(ap_id).as_str()),
+            "featured collection"
+        );
+        assert!(
+            user.private_key.is_none(),
+            "remote users keep no private key"
+        );
+        assert!(user.email.is_none(), "remote users keep no email");
+        assert!(user.discoverable.get(), "flags round trip");
+        assert_eq!(
+            (
+                user.followers_count,
+                user.following_count,
+                user.statuses_count
+            ),
+            (12, 3, 48),
+            "fetched counts are stored as given"
+        );
+
+        let fetched = get_by_nickname(&pool, "bob@remote.example")
+            .await
+            .unwrap()
+            .expect("the remote handle finds the row");
+        assert_eq!(fetched.ap_id, ap_id, "same row by nickname");
+    }
+
+    #[tokio::test]
+    async fn debug_redacts_secrets_in_user_and_new_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = insert(
+            &pool,
+            &NewUser {
+                password_hash: Some(SECRET_HASH.to_owned()),
+                private_key: Some(SECRET_KEY.to_owned()),
+                confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
+                mfa_settings: json!({
+                    "enabled": true,
+                    "totp": {"secret": SECRET_TOTP, "confirmed": true},
+                    "backup_codes": [],
+                }),
+                ..local_new("erin")
+            },
+        )
+        .await
+        .unwrap();
+        let debug = format!("{user:?}");
+        assert!(
+            !debug.contains(SECRET_HASH),
+            "the password hash must not leak"
+        );
+        assert!(!debug.contains(SECRET_KEY), "the private key must not leak");
+        assert!(
+            !debug.contains(SECRET_TOTP),
+            "the TOTP secret inside mfa_settings must not leak"
+        );
+        assert!(
+            !debug.contains(SECRET_CONFIRMATION),
+            "the confirmation token must not leak: {debug}"
+        );
+        assert!(
+            debug.contains(r#"password_hash: "<redacted>""#),
+            "the redaction marker names the field"
+        );
+        assert!(
+            debug.contains(r#"private_key: "<redacted>""#),
+            "the redaction marker names the field"
+        );
+        assert!(
+            debug.contains(r#"confirmation_token: "<redacted>""#),
+            "the confirmation token keeps its own marker"
+        );
+        assert!(
+            debug.contains(r#"mfa_settings: "<redacted>""#),
+            "the MFA blob is redacted whole, secret included"
+        );
+        assert!(debug.contains("erin"), "the rest of the row is visible");
+
+        let new = NewUser {
+            password_hash: Some(SECRET_HASH.to_owned()),
+            private_key: Some(SECRET_KEY.to_owned()),
+            confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
+            mfa_settings: json!({
+                "enabled": true,
+                "totp": {"secret": SECRET_TOTP, "confirmed": true},
+                "backup_codes": [],
+            }),
+            ..local_new("erin")
+        };
+        let new_debug = format!("{new:?}");
+        assert!(
+            !new_debug.contains(SECRET_HASH)
+                && !new_debug.contains(SECRET_KEY)
+                && !new_debug.contains(SECRET_TOTP)
+                && !new_debug.contains(SECRET_CONFIRMATION),
+            "NewUser redacts the same secrets"
+        );
+        assert!(
+            new_debug.contains(r#"password_hash: "<redacted>""#),
+            "and shows the markers"
+        );
+    }
+}
