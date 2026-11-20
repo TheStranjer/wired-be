@@ -1,0 +1,306 @@
+//! The lookup by `acct` handle: [`get_or_fetch_by_acct`] through the
+//! `WebFinger` resolver, [`get_or_fetch_by_acct_with_base`]'s origin
+//! override, [`dev_webfinger_base`]'s development-mode base and the
+//! [`acct_matches`] vouch that closes the round trip.
+
+use crate::{
+    config::Config,
+    federation::{
+        fetch_actor::{FetchError, error::server_error},
+        webfinger_client::{resolve_acct_with_base, strip_finger_prefixes},
+    },
+    models::user::{User, get_by_acct},
+    state::AppState,
+};
+
+use super::get_or_fetch_by_ap_id;
+
+/// Looks an account up by `acct` handle, resolving it through `WebFinger`
+/// and fetching the actor when this instance does not know it yet.
+///
+/// The stored nickname comes first — a local account, and any remote
+/// mirror this instance already keeps under `nick@domain` (decision 7),
+/// answers straight from the database, case-insensitively, with a handle
+/// carrying this instance's own domain folded to the bare local nickname
+/// (see [`get_by_acct`]). Otherwise the [`WebFinger`] resolver finds the
+/// actor URL and [`get_or_fetch_by_ap_id`] mirrors it. The fetched actor
+/// must then vouch for the handle: its `preferredUsername@host` has to
+/// equal `acct` case-insensitively (the Mastodon round trip), or the
+/// lookup reports [`FetchError::AcctMismatch`].
+///
+/// [`WebFinger`]: crate::federation::webfinger_client
+///
+/// # Errors
+///
+/// [`FetchError::Webfinger`] when the handle cannot be resolved,
+/// [`FetchError::AcctMismatch`] when the resolved actor denies it, and
+/// otherwise whatever [`get_or_fetch_by_ap_id`] reports.
+pub async fn get_or_fetch_by_acct(state: &AppState, acct: &str) -> Result<User, FetchError> {
+    get_or_fetch_by_acct_with_base(state, acct, None).await
+}
+
+/// [`get_or_fetch_by_acct`] with the `WebFinger` origin replaced by
+/// `webfinger_base` (`scheme://authority`) when given. `WebFinger` is
+/// HTTPS-only by RFC 7033 and resolves against the handle's domain, so
+/// only [`resolve_acct_with_base`]'s test override can point it at a
+/// loopback mock; production passes [`None`] and this override keeps the
+/// account tests able to drive the same full round trip. The one exception
+/// the production path itself makes is [`dev_webfinger_base`]'s: a handle
+/// whose domain names an explicit port is fingered over plain `http://`
+/// while the instance runs in the development mode
+/// [`FetchSettings::http_allow_private_hosts`](crate::config::FetchSettings::http_allow_private_hosts)
+/// selects.
+async fn get_or_fetch_by_acct_with_base(
+    state: &AppState,
+    acct: &str,
+    webfinger_base: Option<&str>,
+) -> Result<User, FetchError> {
+    if let Some(stored) = get_by_acct(&state.db, &state.config, acct)
+        .await
+        .map_err(|err| server_error(&err))?
+    {
+        return Ok(stored);
+    }
+    let dev_base = dev_webfinger_base(&state.config, acct);
+    let base = webfinger_base.or(dev_base.as_deref());
+    let ap_id = resolve_acct_with_base(&state.http_client, acct, base).await?;
+    let user = get_or_fetch_by_ap_id(state, &ap_id).await?;
+    if !acct_matches(&user.nickname, acct) {
+        return Err(FetchError::AcctMismatch);
+    }
+    Ok(user)
+}
+
+/// The development-mode `WebFinger` origin for `acct`: while
+/// [`FetchSettings::http_allow_private_hosts`](crate::config::FetchSettings::http_allow_private_hosts)
+/// is on — the mode
+/// `HTTP_ALLOW_PRIVATE_HOSTS` selects, documented as development and tests
+/// only, and the same switch that disables the SSRF guard — a handle whose
+/// domain carries an explicit `:port` is fingered at `http://` that
+/// authority, so a federation peer running on loopback (or any host on a
+/// non-standard port) is resolvable end to end. Every other handle keeps
+/// the spec's `https://{domain}` base; production, with the flag off,
+/// never returns one.
+fn dev_webfinger_base(config: &Config, acct: &str) -> Option<String> {
+    if !config.fetch.http_allow_private_hosts {
+        return None;
+    }
+    let domain = strip_finger_prefixes(acct).rsplit_once('@')?.1;
+    domain.contains(':').then(|| format!("http://{domain}"))
+}
+
+/// The Mastodon round trip in handle terms: a mirror's nickname *is*
+/// `{preferredUsername}@{host of the actor id}` (decision 7), so its
+/// equality with the requested `acct` — case folded, `@`/`acct:` prefixes
+/// stripped — is what proves the resolved actor vouches for the same
+/// account the resolver was asked about.
+fn acct_matches(nickname: &str, acct: &str) -> bool {
+    nickname.eq_ignore_ascii_case(strip_finger_prefixes(acct))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::Ordering};
+
+    use axum::{Router, routing::get};
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        federation::{fetch_actor::test_support::*, webfinger_client::WebfingerError},
+        models::user::{NewUser, get_by_nickname, insert},
+    };
+
+    #[tokio::test]
+    async fn a_stored_nickname_answers_without_webfinger() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let stored = insert(
+            &pool,
+            &NewUser {
+                nickname: "alice@mock.example".to_owned(),
+                ap_id: "https://mock.example/users/alice".to_owned(),
+                domain: Some("mock.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .unwrap();
+        let state = test_state(pool);
+
+        // No override, no mock: `mock.example` is never contacted, the
+        // citext nickname lookup answers, case folded.
+        let found = get_or_fetch_by_acct(&state, "ALICE@MOCK.Example")
+            .await
+            .unwrap();
+
+        assert_eq!(found.id, stored.id, "the stored row, however spelled");
+    }
+
+    #[tokio::test]
+    async fn an_actor_that_denies_the_requested_handle_is_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let hits = Arc::clone(&peer.hits);
+        let jrd = json!({
+            "subject": "acct:alice@mock.example",
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("{base}/users/alice"),
+            }],
+        });
+        let app = Router::new()
+            .route(
+                "/.well-known/webfinger",
+                get(webfinger).with_state(jrd.to_string()),
+            )
+            .merge(
+                Router::new()
+                    .route("/users/alice", get(self_actor))
+                    .with_state(peer),
+            );
+        let server = spawn(listener, app);
+        let state = test_state(pool);
+
+        let error = get_or_fetch_by_acct_with_base(&state, "alice@mock.example", Some(&base))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, FetchError::AcctMismatch),
+            "the actor's own handle is alice@127.0.0.1:port, not the asked one: {error:?}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the actor URL came out of the webfinger answer and was fetched once"
+        );
+        let mirror = get_by_nickname(&state.db, &format!("alice@{}", authority_of(&base)))
+            .await
+            .unwrap()
+            .expect("the fetched actor is mirrored under its own handle");
+        assert_eq!(mirror.ap_id, format!("{base}/users/alice"), "by its id");
+        assert!(
+            get_by_nickname(&state.db, "alice@mock.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "the claimed handle was never stored"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_handle_reports_the_webfinger_error() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = test_state(pool);
+
+        let error = get_or_fetch_by_acct(&state, "alice@localhost")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, FetchError::Webfinger(WebfingerError::InvalidAcct)),
+            "a handle the resolver refuses fails before any request: {error:?}"
+        );
+    }
+
+    #[test]
+    fn the_dev_base_serves_a_ported_handle_over_http_only_in_dev_mode() {
+        let mut dev = Config::for_tests();
+        assert!(
+            dev.fetch.http_allow_private_hosts,
+            "the test config is the development mode"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice@127.0.0.1:4000").as_deref(),
+            Some("http://127.0.0.1:4000"),
+            "a handle naming an explicit port is fingered at that authority"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "@alice@Remote.Example:8080").as_deref(),
+            Some("http://Remote.Example:8080"),
+            "prefixes fold; the domain part is taken verbatim"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice@remote.example"),
+            None,
+            "a portless handle keeps the spec's https base even in dev mode"
+        );
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice"),
+            None,
+            "a bare nickname has no domain to build a base from"
+        );
+        dev.fetch.http_allow_private_hosts = false;
+        assert_eq!(
+            dev_webfinger_base(&dev, "alice@127.0.0.1:4000"),
+            None,
+            "with the guard on (production) no http base is ever offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ported_handle_resolves_through_the_dev_base_without_an_override() {
+        // The production `get_or_fetch_by_acct` arm: no `webfinger_base`
+        // override at all. The dev-mode config fingers the loopback mock at
+        // its own `http://{host:port}` origin, the actor mirrors under the
+        // handle it vouches for, and the vouch passes because the mirror
+        // nickname carries the port like the requested acct does.
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let acct = format!("alice@{}", authority_of(&base));
+        let jrd = json!({
+            "subject": format!("acct:{acct}"),
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("{base}/users/alice"),
+            }],
+        });
+        let peer = peer_at(&base);
+        let app = Router::new()
+            .route(
+                "/.well-known/webfinger",
+                get(webfinger).with_state(jrd.to_string()),
+            )
+            .merge(
+                Router::new()
+                    .route("/users/alice", get(self_actor))
+                    .with_state(peer),
+            );
+        let server = spawn(listener, app);
+        let state = test_state(pool);
+
+        let found = get_or_fetch_by_acct(&state, &acct)
+            .await
+            .expect("the ported handle resolves in dev mode");
+
+        server.abort();
+        assert_eq!(found.nickname, acct, "mirrored under the asked handle");
+        assert_eq!(found.ap_id, format!("{base}/users/alice"), "by its id");
+    }
+
+    #[test]
+    fn the_round_trip_compares_the_handle_case_insensitively() {
+        assert!(acct_matches("alice@remote.example", "alice@remote.example"));
+        assert!(acct_matches("Alice@Remote.Example", "ALICE@remote.example"));
+        assert!(acct_matches(
+            "alice@remote.example",
+            "@alice@REMOTE.example"
+        ));
+        assert!(acct_matches(
+            "alice@remote.example",
+            "acct:alice@remote.example"
+        ));
+        assert!(!acct_matches("bob@remote.example", "alice@remote.example"));
+        assert!(!acct_matches("alice@other.example", "alice@remote.example"));
+    }
+}
