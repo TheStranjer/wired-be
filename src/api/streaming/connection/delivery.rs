@@ -1,0 +1,415 @@
+//! The gate one hub event passes before this connection writes it: the
+//! audience and `local_only` checks, the payload the event arrives with (its
+//! own body, or the entity a render hint answers to for this socket's
+//! viewer), and the word-filter read of that rendered payload.
+//!
+//! [`Connection::frame_for`] is the entry point that calls these; the
+//! per-kind renders are the four `*_hints` children's.
+
+use tracing::debug;
+
+use crate::{
+    api::streaming::connection::{
+        Connection, chat_hints::render_hinted_chat, conversation_hints::render_hinted_conversation,
+        notification_hints::render_hinted_notification, status_hints::render_hinted_status,
+    },
+    streaming::hub::{Audience, RenderSpec, StreamEvent},
+};
+
+/// The payload to write for `event`: the event's own body when it
+/// carries one (the pre-serialized path, unchanged), the hinted entity
+/// rendered for this socket's viewer when it carries a [`RenderSpec`]
+/// hint without a body, and no body for an event that carries neither.
+/// The outer `None` is the drop signal that [`frame_for`] reads: a
+/// hint the socket cannot answer for its reader has no entity to show,
+/// and Mastodon's `update` *is* its entity — silence beats an
+/// entity-less frame.
+///
+/// [`frame_for`]: Connection::frame_for
+pub(super) async fn payload_for(
+    connection: &Connection,
+    event: &StreamEvent,
+) -> Option<Option<String>> {
+    if event.payload.is_some() {
+        return Some(event.payload.clone());
+    }
+    let Some(render) = event.render.as_ref() else {
+        return Some(None);
+    };
+    let payload = render_hint(connection, render).await?;
+    if connection.filters.suppresses_words(&payload) {
+        debug!("a streamed render hint matches the reader's irreversible word filters");
+        return None;
+    }
+    Some(Some(payload))
+}
+
+/// The entity JSON a [`RenderSpec`] hint answers to for this socket's
+/// viewer: each kind built by its own endpoint's render path, so one
+/// hub event becomes every reader's own view. `None` — the drop
+/// signal — when this socket cannot be shown the entity at all.
+async fn render_hint(connection: &Connection, render: &RenderSpec) -> Option<String> {
+    match render {
+        RenderSpec::Status(id) => render_hinted_status(connection, *id).await,
+        RenderSpec::Notification(id) => render_hinted_notification(connection, *id).await,
+        RenderSpec::Chat(id) => render_hinted_chat(connection, *id).await,
+        RenderSpec::Conversation(id) => render_hinted_conversation(connection, *id).await,
+    }
+}
+
+/// Whether the event's audience covers this connection's reader: a public
+/// event reaches every socket, an `Everyone` event only an authenticated
+/// one, and a `Users` event only the users it names.
+pub(super) fn audience_allows(connection: &Connection, event: &StreamEvent) -> bool {
+    match &event.audience {
+        Audience::Public => true,
+        Audience::Everyone => connection.reader.is_some(),
+        Audience::Users(ids) => connection
+            .reader_id()
+            .is_some_and(|reader| ids.contains(&reader)),
+    }
+}
+
+/// Whether the event's `local_only` flag lets this connection see it at
+/// all: the flag marks an event about this instance's local users and
+/// entities, and a socket with no authenticated reader is not one of the
+/// local viewers it may reach — whatever its audience or stream names say.
+pub(super) const fn local_allows(connection: &Connection, event: &StreamEvent) -> bool {
+    !event.local_only || connection.reader.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use uuid::Uuid;
+
+    use crate::{
+        api::streaming::{
+            filters::Filters,
+            names::{DIRECT, PUBLIC, USER, USER_NOTIFICATION},
+            test_support::{
+                account, event, for_reader, hinted_update, mute_author, state, status_payload,
+                watching,
+            },
+        },
+        config::TEST_BASE_URL,
+        models::status::{self, NewStatus},
+        streaming::hub::{Audience, RenderSpec, StreamEvent},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_public_event_is_rendered_the_mastodon_way() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &[PUBLIC]).await;
+
+        let frame = connection
+            .frame_for(&event(&["public"], r#"{"id":"7"}"#))
+            .await
+            .expect("a matching public event is rendered");
+
+        assert_eq!(
+            frame, r#"{"stream":["public"],"event":"update","payload":"{\"id\":\"7\"}"}"#,
+            "the payload stays a JSON string inside the envelope, as Mastodon sends it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_event_carries_the_status_id_as_its_payload() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &[PUBLIC]).await;
+        let id = Uuid::now_v7().to_string();
+        let deleted = StreamEvent {
+            event: "delete".to_owned(),
+            payload: Some(id.clone()),
+            ..event(&["public"], "")
+        };
+
+        let frame = connection
+            .frame_for(&deleted)
+            .await
+            .expect("a delete on a held stream is rendered");
+
+        assert_eq!(
+            frame,
+            format!(r#"{{"stream":["public"],"event":"delete","payload":"{id}"}}"#),
+            "its payload is the deleted status's id, as a plain string"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_on_another_stream_is_not_rendered() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &["hashtag:rust"]).await;
+
+        assert!(
+            connection
+                .frame_for(&event(&["public"], "{}"))
+                .await
+                .is_none(),
+            "a public event does not reach a hashtag subscription"
+        );
+        assert!(
+            connection
+                .frame_for(&event(&["hashtag", "hashtag:rust"], "{}"))
+                .await
+                .is_some(),
+            "the hashtag's own event does, on any of its streams"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_less_event_carries_no_payload_key() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &[PUBLIC]).await;
+        let filters_changed = StreamEvent {
+            event: "filters_changed".to_owned(),
+            payload: None,
+            ..event(&["public"], "")
+        };
+
+        let frame = connection
+            .frame_for(&filters_changed)
+            .await
+            .expect("an event with no body is still delivered");
+
+        assert_eq!(
+            frame, r#"{"stream":["public"],"event":"filters_changed"}"#,
+            "and Mastodon's envelope simply omits the payload it has none of"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_owner_socket_forwards_a_bare_filters_changed_frame() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "filters-changed-reader").await;
+        let stranger = account(&state, "filters-changed-stranger").await;
+        let own_stream = format!("{USER}:{}", reader.id);
+        let other_stream = format!("{USER}:{}", stranger.id);
+        let owner = for_reader(&state, &reader, &[own_stream.as_str()]).await;
+        let holding_stranger = for_reader(&state, &stranger, &[own_stream.as_str()]).await;
+        let anonymous = watching(&state, &[own_stream.as_str()]).await;
+        // The event `services::streaming::filters_changed` publishes.
+        let filters_changed = StreamEvent {
+            streams: vec![own_stream.clone()],
+            event: "filters_changed".to_owned(),
+            payload: None,
+            audience: Audience::Users(vec![reader.id]),
+            render: None,
+            local_only: false,
+        };
+
+        assert_eq!(
+            owner.frame_for(&filters_changed).await,
+            Some(format!(
+                r#"{{"stream":["{own_stream}"],"event":"filters_changed"}}"#
+            )),
+            "the owner's socket writes the bare envelope, no payload key"
+        );
+        assert!(
+            holding_stranger.frame_for(&filters_changed).await.is_none(),
+            "a reader holding the stream name but outside the audience never sees it: {other_stream}"
+        );
+        assert!(
+            anonymous.frame_for(&filters_changed).await.is_none(),
+            "and neither does an anonymous socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn audience_decides_who_sees_an_event() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "stream-reader").await;
+        let other = Uuid::now_v7();
+        let own_stream = format!("{USER}:{}", reader.id);
+        let other_stream = format!("{USER}:{other}");
+        let mut mine = watching(&state, &[own_stream.as_str()]).await;
+        mine.reader = Some(Arc::clone(&reader));
+        let on = event(&[own_stream.as_str()], "{}");
+
+        let for_me = StreamEvent {
+            audience: Audience::Users(vec![reader.id]),
+            ..on.clone()
+        };
+        let for_other = StreamEvent {
+            audience: Audience::Users(vec![other]),
+            ..on.clone()
+        };
+        let everyone = StreamEvent {
+            audience: Audience::Everyone,
+            ..on.clone()
+        };
+        let on_other_stream = event(&[other_stream.as_str()], "{}");
+
+        assert!(
+            mine.frame_for(&for_me).await.is_some(),
+            "its own user sees it"
+        );
+        assert!(
+            mine.frame_for(&for_other).await.is_none(),
+            "the audience stays the second gate even on a held stream name"
+        );
+        assert!(
+            mine.frame_for(&everyone).await.is_some(),
+            "an Everyone event reaches an authenticated socket"
+        );
+        assert!(
+            mine.frame_for(&on_other_stream).await.is_none(),
+            "another reader's uuid-named stream never matches"
+        );
+
+        let anonymous = watching(&state, &[own_stream.as_str()]).await;
+        assert!(
+            anonymous.frame_for(&for_me).await.is_none(),
+            "an anonymous socket never receives a Users event"
+        );
+        assert!(
+            anonymous.frame_for(&everyone).await.is_none(),
+            "nor an Everyone one"
+        );
+        assert!(
+            anonymous.frame_for(&on).await.is_some(),
+            "but a Public event is public"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_only_event_never_reaches_an_anonymous_socket() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "local-gate-reader").await;
+        let anonymous = watching(&state, &[PUBLIC]).await;
+        let mut member = watching(&state, &[PUBLIC]).await;
+        member.reader = Some(Arc::clone(&reader));
+        let local_public = StreamEvent {
+            local_only: true,
+            ..event(&[PUBLIC], "{}")
+        };
+
+        assert!(
+            anonymous.frame_for(&local_public).await.is_none(),
+            "a local_only event is dropped for a readerless socket, whatever its audience"
+        );
+        let local_everyone = StreamEvent {
+            audience: Audience::Everyone,
+            ..local_public.clone()
+        };
+        assert!(
+            anonymous.frame_for(&local_everyone).await.is_none(),
+            "Everyone plus local_only means authenticated local viewers only"
+        );
+        assert!(
+            member.frame_for(&local_everyone).await.is_some(),
+            "and an authenticated socket is exactly such a viewer"
+        );
+        let not_local = StreamEvent {
+            local_only: false,
+            ..local_public
+        };
+        assert!(
+            anonymous.frame_for(&not_local).await.is_some(),
+            "without the flag the same event streams on as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reader_who_muted_the_author_never_sees_the_status() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "suppressing-reader").await;
+        let author = account(&state, "suppressed-author").await;
+        let thread = Uuid::now_v7();
+        let body = status_payload(author.id, "quiet", thread);
+        mute_author(&state, &reader, &author).await;
+        let mut connection = Connection::new(state.clone(), None)
+            .await
+            .expect("the connection loads");
+        connection.reader = Some(Arc::clone(&reader));
+        connection.filters = Filters::load(&state.db, Some(reader.id))
+            .await
+            .expect("the filters load");
+        connection.subscriptions = vec![PUBLIC.to_owned()];
+
+        assert!(
+            connection
+                .frame_for(&event(&["public"], &body))
+                .await
+                .is_none(),
+            "a muted author is suppressed, on a public stream too"
+        );
+        assert!(
+            connection
+                .frame_for(&event(
+                    &["public"],
+                    &status_payload(Uuid::now_v7(), "loud", thread)
+                ))
+                .await
+                .is_some(),
+            "and somebody else's status still arrives"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_render_hint_that_cannot_be_answered_drops_the_event() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &[USER_NOTIFICATION, DIRECT]).await;
+        let hinted = StreamEvent {
+            streams: vec![USER_NOTIFICATION.to_owned()],
+            event: "notification".to_owned(),
+            payload: None,
+            audience: Audience::Public,
+            render: Some(RenderSpec::Notification(Uuid::now_v7())),
+            local_only: false,
+        };
+
+        assert!(
+            connection.frame_for(&hinted).await.is_none(),
+            "a hint no viewer can be answered for is dropped, not pushed body-less"
+        );
+        let hinted_chat = StreamEvent {
+            render: Some(RenderSpec::Chat(Uuid::now_v7())),
+            ..hinted
+        };
+        assert!(
+            connection.frame_for(&hinted_chat).await.is_none(),
+            "and the same for a chat hint on a readerless socket"
+        );
+        let hinted_conversation = StreamEvent {
+            streams: vec![DIRECT.to_owned()],
+            event: "conversation".to_owned(),
+            render: Some(RenderSpec::Conversation(Uuid::now_v7())),
+            ..hinted_chat
+        };
+        assert!(
+            connection.frame_for(&hinted_conversation).await.is_none(),
+            "and the same for a conversation hint, which no participation of nobody's answers"
+        );
+    }
+
+    /// The reader's filters judge the rendered payload: an update hinted
+    /// from a muted account never reaches the muter's socket.
+    #[tokio::test]
+    async fn a_rendered_update_is_judged_by_the_readers_filters() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "hint-filter-reader").await;
+        let author = account(&state, "hint-filter-author").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "from a muted account"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        mute_author(&state, &reader, &author).await;
+        let mut connection = watching(&state, &[PUBLIC]).await;
+        connection.reader = Some(Arc::clone(&reader));
+        connection.filters = Filters::load(&state.db, Some(reader.id))
+            .await
+            .expect("the filters load");
+
+        assert!(
+            connection.frame_for(&hinted_update(row.id)).await.is_none(),
+            "the rendered payload carries the authorship the filters read"
+        );
+    }
+}
