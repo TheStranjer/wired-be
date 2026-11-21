@@ -89,6 +89,24 @@ pub(crate) async fn resolve_mentions_with_base(
     text: &str,
     webfinger_base: Option<&str>,
 ) -> AppResult<Vec<(MentionRef, User)>> {
+    resolve_mentions_on_budget(state, text, webfinger_base, REMOTE_LOOKUP_BUDGET).await
+}
+
+/// [`resolve_mentions_with_base`] with the shared remote-lookup batch
+/// budget replaced by `budget`. Production always runs the module's
+/// [`REMOTE_LOOKUP_BUDGET`]; a test whose mock peer and leased database
+/// slot share the machine with the whole suite passes a roomy one, so
+/// suite-wide contention over Postgres and the scheduler cannot spend
+/// the five seconds the lookups get — the assertions then race the
+/// resolver's logic, not wall time. The budget itself is what the
+/// stalled-lookup test exercises, driving the module budget on a
+/// hand-stepped clock.
+pub(crate) async fn resolve_mentions_on_budget(
+    state: &AppState,
+    text: &str,
+    webfinger_base: Option<&str>,
+    budget: Duration,
+) -> AppResult<Vec<(MentionRef, User)>> {
     let mentions = extract_mentions(text);
     let mut found: HashMap<String, User> = HashMap::new();
     let mut queued: Vec<&MentionRef> = Vec::new();
@@ -101,7 +119,7 @@ pub(crate) async fn resolve_mentions_with_base(
             queued.push(mention);
         }
     }
-    resolve_queued_remotes(state, &queued, &mut found, webfinger_base).await;
+    resolve_queued_remotes(state, &queued, &mut found, webfinger_base, budget).await;
     Ok(mentions
         .into_iter()
         .filter_map(|mention| {
@@ -111,16 +129,17 @@ pub(crate) async fn resolve_mentions_with_base(
         .collect())
 }
 
-/// Runs the queued remote lookups of [`resolve_mentions_with_base`]
-/// concurrently under the single shared [`REMOTE_LOOKUP_BUDGET`] and
-/// records whoever was found, keyed as the stored arm keys it. An elapsed
-/// budget abandons the whole batch: its mentions resolve to nothing and
-/// stay the plain text they were written as.
+/// Runs the queued remote lookups of [`resolve_mentions_on_budget`]
+/// concurrently under the single shared `budget` and records whoever was
+/// found, keyed as the stored arm keys it. An elapsed budget abandons
+/// the whole batch: its mentions resolve to nothing and stay the plain
+/// text they were written as.
 async fn resolve_queued_remotes(
     state: &AppState,
     queued: &[&MentionRef],
     found: &mut HashMap<String, User>,
     webfinger_base: Option<&str>,
+    budget: Duration,
 ) {
     if queued.is_empty() {
         return;
@@ -128,7 +147,7 @@ async fn resolve_queued_remotes(
     let lookups = queued
         .iter()
         .map(|mention| resolve_remote_mention(state, mention, webfinger_base));
-    match tokio::time::timeout(REMOTE_LOOKUP_BUDGET, join_all(lookups)).await {
+    match tokio::time::timeout(budget, join_all(lookups)).await {
         Ok(outcomes) => {
             for (mention, user) in queued.iter().zip(outcomes) {
                 if let Some(user) = user {
@@ -138,7 +157,7 @@ async fn resolve_queued_remotes(
         }
         Err(_elapsed) => {
             debug!(
-                budget_secs = REMOTE_LOOKUP_BUDGET.as_secs(),
+                budget_secs = budget.as_secs(),
                 lookups = queued.len(),
                 "remote mention lookups ran past their shared budget; leaving them as plain text"
             );
@@ -313,13 +332,32 @@ mod tests {
         text: &str,
         webfinger_base: Option<&str>,
     ) -> Vec<(String, Option<String>, Uuid)> {
-        resolve_mentions_with_base(state, text, webfinger_base)
+        resolved_against_budget(state, text, webfinger_base, REMOTE_LOOKUP_BUDGET).await
+    }
+
+    /// [`resolved_against`] with the lookup batch run on `budget` instead
+    /// of the module's [`REMOTE_LOOKUP_BUDGET`].
+    async fn resolved_against_budget(
+        state: &AppState,
+        text: &str,
+        webfinger_base: Option<&str>,
+        budget: Duration,
+    ) -> Vec<(String, Option<String>, Uuid)> {
+        resolve_mentions_on_budget(state, text, webfinger_base, budget)
             .await
             .expect("resolution reads")
             .into_iter()
             .map(|(mention, user)| (mention.nickname, mention.domain, user.id))
             .collect()
     }
+
+    /// The batch budget the mock-peer success tests run with: wall-clock
+    /// headroom as a bounded failsafe, never a wait, so suite-mates
+    /// saturating Postgres or the scheduler cannot spend the module's
+    /// five seconds before the mock's answers land. The budget itself is
+    /// exercised by the stalled-lookup test, which drives it on a
+    /// hand-stepped virtual clock.
+    const ROOMY_BUDGET: Duration = Duration::from_secs(120);
 
     /// The mock remote peer: its `http://` origin plus the per-endpoint
     /// request counts the tests assert on.
@@ -611,9 +649,14 @@ mod tests {
         let (mock, server) = mock_peer(false).await;
         let state = test_state(&pool);
 
-        let pairs = resolve_mentions_with_base(&state, "hi @alice@mock.example!", Some(&mock.base))
-            .await
-            .expect("resolution reads");
+        let pairs = resolve_mentions_on_budget(
+            &state,
+            "hi @alice@mock.example!",
+            Some(&mock.base),
+            ROOMY_BUDGET,
+        )
+        .await
+        .expect("resolution reads");
         server.abort();
 
         let (mention, user) = pairs.first().expect("the remote mention resolved");
@@ -653,10 +696,11 @@ mod tests {
         let (mock, server) = mock_peer(false).await;
         let state = test_state(&pool);
 
-        let found = resolved_against(
+        let found = resolved_against_budget(
             &state,
             "@bob@mock.example @BOB@MOCK.Example and @bob@mock.example again",
             Some(&mock.base),
+            ROOMY_BUDGET,
         )
         .await;
         server.abort();
@@ -682,10 +726,11 @@ mod tests {
         config.max_remote_mention_lookups = 2;
         let state = test_state_with_config(&pool, config);
 
-        let found = resolved_against(
+        let found = resolved_against_budget(
             &state,
             "@one@mock.example @two@mock.example @three@mock.example",
             Some(&mock.base),
+            ROOMY_BUDGET,
         )
         .await;
         server.abort();
