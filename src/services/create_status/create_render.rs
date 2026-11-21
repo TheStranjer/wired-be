@@ -181,10 +181,15 @@ mod tests {
         let alice = user(pool, "remote-author").await;
         let (base, server) = mock_peer().await;
 
-        let fetched = crate::services::mentions::resolve_mentions_with_base(
+        let fetched = crate::services::mentions::resolve_mentions_on_budget(
             &app_state,
             "hi @alice@mock.example",
             Some(&base),
+            // Roomy wall-clock headroom (a bounded failsafe, never a
+            // wait): suite-mates saturating Postgres or the scheduler
+            // must not spend the module's five seconds before the mock
+            // answers. See `resolve_mentions_on_budget`.
+            std::time::Duration::from_secs(120),
         )
         .await
         .expect("the mock peer resolves")
