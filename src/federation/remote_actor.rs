@@ -58,8 +58,8 @@ const PROPERTY_VALUE_TYPE: &str = "PropertyValue";
 /// A remote actor document parsed into upsert-ready data.
 ///
 /// The field set is what [`parse_actor`] validates and extracts: the
-/// [`User`] columns a document can fill, plus the four fields
-/// [`upsert_remote_user`] does not store yet ([`also_known_as`](Self::also_known_as),
+/// [`User`](crate::models::user::User) columns a document can fill, plus the
+/// four fields [`upsert_remote_user`] does not store yet ([`also_known_as`](Self::also_known_as),
 /// [`moved_to`](Self::moved_to),
 /// [`accepts_chat_messages`](Self::accepts_chat_messages),
 /// [`published`](Self::published)). The first three have `users` columns
@@ -80,10 +80,10 @@ pub struct NewRemoteUser {
     /// Display name as sent; empty when absent.
     pub name: String,
     /// Profile note as sanitized HTML: the `summary` run through
-    /// [`sanitize_html`].
+    /// [`sanitize_html`](crate::util::sanitize::sanitize_html).
     pub bio: String,
     /// Profile note as source text: the `summary` run through
-    /// [`strip_html`].
+    /// [`strip_html`](crate::util::sanitize::strip_html).
     pub raw_bio: String,
     /// The `icon` URL, when the field carries a usable one.
     pub avatar_url: Option<String>,

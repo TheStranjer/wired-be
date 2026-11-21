@@ -70,7 +70,7 @@ pub const KIND_CLEANUP: &str = "streaming.cleanup";
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// The in-process streaming bus, shared by every handler and task of one
-/// app instance through [`AppState::hub`].
+/// app instance through [`AppState::hub`](crate::state::AppState::hub).
 ///
 /// [`subscribe`](Hub::subscribe) hands out receivers of the single
 /// [`BROADCAST_CAPACITY`]-slot channel; [`publish`](Hub::publish) hands an

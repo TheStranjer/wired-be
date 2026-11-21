@@ -22,7 +22,7 @@ pub enum ActorError {
     /// caller rather than silently rewritten.
     NicknameConflict,
     /// A server-side failure while storing the row: the database calls of
-    /// [`upsert_remote_user`].
+    /// [`upsert_remote_user`](super::upsert_remote_user).
     Failed(AppError),
 }
 
@@ -48,7 +48,7 @@ impl Error for ActorError {
 }
 
 /// Any [`AppError`] is a server-side [`ActorError::Failed`], so `?` works
-/// inside [`upsert_remote_user`].
+/// inside [`upsert_remote_user`](super::upsert_remote_user).
 impl From<AppError> for ActorError {
     fn from(err: AppError) -> Self {
         Self::Failed(err)
