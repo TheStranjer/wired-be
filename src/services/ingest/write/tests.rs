@@ -1,0 +1,203 @@
+//! The write arms' tests: attachments, emojis and hashtags land beside the
+//! status, a mirrored `Question` carries the counts the remote reported,
+//! and a root of nothing mints its own conversation.
+
+use serde_json::{Value, json};
+
+use super::*;
+use crate::{
+    models::{custom_emoji, status::Visibility},
+    services::ingest::{
+        IngestOutcome, ingest_note,
+        test_support::{app_state, author},
+    },
+};
+
+#[tokio::test]
+async fn attachments_emojis_and_hashtags_land_with_the_status() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+
+    let outcome = ingest_note(&state, &bob, &satellites_object())
+        .await
+        .expect("the satellites ingest");
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("the post writes, got {outcome:?}");
+    };
+
+    let media = media_attachment::for_statuses(&pool, &[row.id])
+        .await
+        .expect("the media reads")
+        .remove(&row.id)
+        .expect("the status carries media");
+    assert_media_rows(&media);
+
+    let emoji =
+        custom_emoji::get_by_shortcodes(&pool, &[String::from("ralph")], Some("remote.example"))
+            .await
+            .expect("the emoji reads");
+    assert_eq!(emoji.len(), 1, "the Emoji tag upserted its row");
+    assert_eq!(
+        emoji[0].domain.as_deref(),
+        Some("remote.example"),
+        "under the author's domain"
+    );
+    assert_eq!(
+        emoji[0].image_url, "https://remote.example/emoji/ralph.png",
+        "with the announced image"
+    );
+
+    let tags = sqlx::query_scalar::<_, String>(
+        "SELECT t.name FROM hashtags t
+               JOIN status_hashtags sh ON sh.hashtag_id = t.id
+              WHERE sh.status_id = $1",
+    )
+    .bind(row.id)
+    .fetch_all(&pool)
+    .await
+    .expect("the tags read");
+    assert_eq!(tags, vec!["rust".to_owned()], "the Hashtag tag linked");
+}
+
+/// The note object carrying one `Hashtag`, one `Emoji` and two
+/// `Document` attachments, the first with the full media column set.
+fn satellites_object() -> Value {
+    json!({
+        "id": "https://remote.example/objects/ingest-satellites",
+        "type": "Note",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "content": "<p>look</p>",
+        "tag": [
+            { "type": "Hashtag", "name": "#Rust" },
+            {
+                "type": "Emoji",
+                "name": ":ralph:",
+                "icon": { "type": "Image", "url": "https://remote.example/emoji/ralph.png" }
+            },
+        ],
+        "attachment": [
+            {
+                "type": "Document",
+                "mediaType": "image/png",
+                "url": "https://remote.example/media/b.png",
+                "name": "Second",
+                "blurhash": "LeHK",
+                "width": 640,
+                "height": 480
+            },
+            {
+                "type": "Document",
+                "mediaType": "image/jpeg",
+                "url": "https://remote.example/media/a.jpg",
+                "name": "First"
+            },
+        ],
+    })
+}
+
+/// The attachment rows the ingest wrote: both documents, in document
+/// order, unowned, with the stated url, alt text, placeholder and
+/// dimensions kept.
+fn assert_media_rows(media: &[media_attachment::MediaAttachment]) {
+    assert_eq!(media.len(), 2, "both attachments land");
+    assert_eq!(
+        media[0].url, "https://remote.example/media/b.png",
+        "in document order"
+    );
+    assert_eq!(
+        media[0].remote_url.as_deref(),
+        Some("https://remote.example/media/b.png"),
+        "the document url is the remote url"
+    );
+    assert_eq!(media[0].user_id, None, "remote media has no uploader");
+    assert_eq!(
+        media[0].description.as_deref(),
+        Some("Second"),
+        "and its alt text"
+    );
+    assert_eq!(
+        media[0].blurhash.as_deref(),
+        Some("LeHK"),
+        "and its placeholder"
+    );
+    assert_eq!(media[0].width, Some(640), "and its dimensions");
+    assert_eq!(media[0].height, Some(480), "both");
+}
+
+#[tokio::test]
+async fn a_question_lands_its_poll_with_the_reported_counts() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let object = json!({
+        "id": "https://remote.example/objects/ingest-poll",
+        "type": "Question",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "content": "<p>which?</p>",
+        "oneOf": [
+            { "type": "Note", "name": "Red", "replies": { "totalItems": 3 } },
+            { "type": "Note", "name": "Blue", "replies": { "totalItems": 7 } }
+        ],
+        "votersCount": 10
+    });
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("the question ingests");
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("the poll post writes, got {outcome:?}");
+    };
+
+    let stand = poll::get_for_status(&pool, row.id)
+        .await
+        .expect("the poll reads")
+        .expect("the status carries a poll");
+    assert_eq!(stand.voters_count, 10, "the reported voter count");
+    assert_eq!(stand.votes_count, 10, "and the votes total");
+    let choices = poll::options(&pool, stand.id)
+        .await
+        .expect("the options read");
+    let votes: Vec<i32> = choices.iter().map(|choice| choice.votes_count).collect();
+    assert_eq!(votes, vec![3, 7], "per option, in document order");
+}
+
+#[tokio::test]
+async fn a_direct_note_is_its_own_conversation_root() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let object = json!({
+        "id": "https://remote.example/objects/ingest-dm",
+        "type": "Note",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": ["https://test.example/users/someone"],
+        "content": "<p>a direct note</p>",
+    });
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("the direct note ingests");
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("the post writes, got {outcome:?}");
+    };
+
+    assert_eq!(
+        row.visibility,
+        Visibility::Direct,
+        "a non-public, non-followers addressing parses direct"
+    );
+    assert_eq!(
+        row.conversation_id, row.id,
+        "a root of nothing mints its own conversation"
+    );
+    assert!(
+        row.in_reply_to_id.is_none() && row.in_reply_to_ap_id.is_none(),
+        "and carries no reply reference of either kind"
+    );
+}
