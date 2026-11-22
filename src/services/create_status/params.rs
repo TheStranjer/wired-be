@@ -389,7 +389,8 @@ mod tests {
             ("poll[multiple]", "true"),
             ("poll[hide_totals]", "on"),
             ("media_ids[]", "id-1"),
-        ]);
+        ])
+        .expect("the keys nest shallowly");
         let from_form: CreateStatusParams =
             crate::extract::into_params(form).expect("the form shape fits the same type");
         let poll = from_form.poll.expect("the nested keys became a poll");

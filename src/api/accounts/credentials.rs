@@ -432,7 +432,8 @@ mod tests {
             ("source[privacy]", "direct"),
             ("source[sensitive]", "off"),
             ("source[language]", "de"),
-        ]);
+        ])
+        .expect("the keys nest shallowly");
         let from_form: ProfileParams =
             serde_json::from_value(form).expect("the form nests into the same shape");
         let block = from_form

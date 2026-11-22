@@ -6,6 +6,16 @@ use std::mem;
 use serde_json::{Map, Value};
 use url::form_urlencoded;
 
+use crate::error::AppError;
+
+/// The most segments a bracketed key may have, Rack's `param_depth_limit`:
+/// `a[b][c]` has three. Deeper keys are refused, since the tree built from
+/// them is walked recursively.
+const MAX_KEY_DEPTH: usize = 32;
+
+/// The 400 message for a key nested deeper than [`MAX_KEY_DEPTH`].
+const TOO_DEEP: &str = "Parameter nesting too deep";
+
 /// Parses `application/x-www-form-urlencoded` text (also used for the query
 /// string) into a JSON value, giving PHP/Rails-style keys their structure:
 /// `a[b]=c` nests an object, `ids[]=1&ids[]=2` appends an array, repeated
@@ -14,15 +24,24 @@ use url::form_urlencoded;
 /// {"name":…}}}`; [`index_map_to_vec`] turns such a map back into a list).
 /// Values are the percent-decoded strings (`+` a space); containers win
 /// over conflicting scalars, and the last write wins.
-pub(super) fn parse_form(text: &str) -> Value {
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] when a key has more than [`MAX_KEY_DEPTH`]
+/// segments.
+pub(super) fn parse_form(text: &str) -> Result<Value, AppError> {
     parse_pairs(form_urlencoded::parse(text.as_bytes()))
 }
 
 /// Structures already-decoded key/value pairs — the pairs of a urlencoded
 /// body, a query string, or the text fields of a multipart body — into one
 /// parameters value by the same rules as `parse_form`.
-#[must_use]
-pub fn parse_pairs<P, K, V>(pairs: P) -> Value
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] when a key has more than 32 segments (Rack's
+/// `param_depth_limit`).
+pub fn parse_pairs<P, K, V>(pairs: P) -> Result<Value, AppError>
 where
     P: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -30,30 +49,36 @@ where
 {
     let mut root = Value::Object(Map::new());
     for (key, value) in pairs {
-        let path = split_key(key.as_ref());
+        let path =
+            split_key(key.as_ref()).ok_or_else(|| AppError::BadRequest(TOO_DEEP.to_owned()))?;
         // A key starting with `[` (or empty) addresses no name; drop it.
         if matches!(path.first(), Some(first) if first.is_empty()) {
             continue;
         }
         assign(&mut root, &path, Value::String(value.as_ref().to_owned()));
     }
-    root
+    Ok(root)
 }
 
 /// Turns a parsed key like `fields_attributes[0][name]` into its segments
 /// (`fields_attributes`, `0`, `name`); `key[]` becomes (`key`, `""`), the
-/// empty segment marking an array append.
-fn split_key(key: &str) -> Vec<&str> {
+/// empty segment marking an array append. `None` when the key has more than
+/// [`MAX_KEY_DEPTH`] segments; scanning stops as soon as that is known.
+fn split_key(key: &str) -> Option<Vec<&str>> {
     let mut segments = Vec::new();
     let mut rest = key;
     while let Some((head, tail)) = rest.split_once('[') {
         // The text before `[` is a segment; when it follows a previous `]`
         // it still carries that bracket.
         segments.push(head.strip_suffix(']').unwrap_or(head));
+        // This segment is complete, and the text after `[` adds another.
+        if segments.len() >= MAX_KEY_DEPTH {
+            return None;
+        }
         rest = tail;
     }
     segments.push(rest.strip_suffix(']').unwrap_or(rest));
-    segments
+    Some(segments)
 }
 
 /// Stores `value` in the JSON tree at `node` under the bracketed path
@@ -155,33 +180,72 @@ mod tests {
 
     use super::*;
 
+    /// Parses `text`, which must not be nested too deep.
+    fn parsed(text: &str) -> Value {
+        parse_form(text).expect("shallow keys parse")
+    }
+
     #[test]
     fn keys_split_at_brackets() {
-        assert_eq!(split_key("name"), ["name"], "a plain key");
-        assert_eq!(split_key("a[b]"), ["a", "b"], "one level");
-        assert_eq!(split_key("ids[]"), ["ids", ""], "an append marker");
+        assert_eq!(split_key("name").unwrap(), ["name"], "a plain key");
+        assert_eq!(split_key("a[b]").unwrap(), ["a", "b"], "one level");
+        assert_eq!(split_key("ids[]").unwrap(), ["ids", ""], "an append marker");
         assert_eq!(
-            split_key("fields_attributes[0][name]"),
+            split_key("fields_attributes[0][name]").unwrap(),
             ["fields_attributes", "0", "name"],
             "index then field"
         );
     }
 
     #[test]
-    fn array_keys_become_json_arrays() {
-        assert_eq!(parse_form("ids[]=1&ids[]=2"), json!({"ids": ["1", "2"]}));
+    fn key_depth_is_capped() {
+        let at_limit = format!("a{}", "[x]".repeat(MAX_KEY_DEPTH - 1));
         assert_eq!(
-            parse_form("tags%5B%5D=a+b&tags[]=c"),
+            split_key(&at_limit).map(|segments| segments.len()),
+            Some(MAX_KEY_DEPTH),
+            "exactly the limit passes"
+        );
+        let over = format!("a{}", "[x]".repeat(MAX_KEY_DEPTH));
+        assert_eq!(split_key(&over), None, "one more segment is refused");
+        let appends = format!("a{}", "[]".repeat(MAX_KEY_DEPTH));
+        assert_eq!(split_key(&appends), None, "append markers count too");
+    }
+
+    #[test]
+    fn absurdly_deep_keys_are_a_bad_request_not_a_crash() {
+        let text = format!("a{}=1", "[]".repeat(200_000));
+        let err = parse_form(&text).expect_err("200k levels are refused");
+        assert!(
+            matches!(&err, AppError::BadRequest(message) if message == TOO_DEEP),
+            "a 400 naming the cause: {err:?}"
+        );
+        let shallow_then_deep = format!("ok=1&a{}=1", "[x]".repeat(5000));
+        assert!(
+            parse_form(&shallow_then_deep).is_err(),
+            "one deep key spoils the whole parse"
+        );
+    }
+
+    #[test]
+    fn array_keys_become_json_arrays() {
+        assert_eq!(parsed("ids[]=1&ids[]=2"), json!({"ids": ["1", "2"]}));
+        assert_eq!(
+            parsed("authorization[scope][]=read"),
+            json!({"authorization": {"scope": ["read"]}}),
+            "a nested append"
+        );
+        assert_eq!(
+            parsed("tags%5B%5D=a+b&tags[]=c"),
             json!({"tags": ["a b", "c"]}),
             "the encoded and plain marker are the same key"
         );
         assert_eq!(
-            parse_form("a[][b]=1&a[][b]=2"),
+            parsed("a[][b]=1&a[][b]=2"),
             json!({"a": [{"b": "1"}, {"b": "2"}]}),
             "an append in the middle opens a new element"
         );
         assert_eq!(
-            parse_form("a[b][]=x&a[b][]=y"),
+            parsed("a[b][]=x&a[b][]=y"),
             json!({"a": {"b": ["x", "y"]}}),
             "appends nest inside objects"
         );
@@ -189,14 +253,14 @@ mod tests {
 
     #[test]
     fn nested_keys_become_json_objects() {
-        assert_eq!(parse_form("a[b]=c"), json!({"a": {"b": "c"}}));
+        assert_eq!(parsed("a[b]=c"), json!({"a": {"b": "c"}}));
         assert_eq!(
-            parse_form("a[b][c]=d&a[e]=f"),
+            parsed("a[b][c]=d&a[e]=f"),
             json!({"a": {"b": {"c": "d"}, "e": "f"}}),
             "levels coexist"
         );
         assert_eq!(
-            parse_form(
+            parsed(
                 "fields_attributes[0][name]=x&fields_attributes[0][value]=y&fields_attributes[1][name]=z"
             ),
             json!({"fields_attributes": {
@@ -209,15 +273,15 @@ mod tests {
 
     #[test]
     fn repeated_plain_keys_become_arrays_and_decoding_applies() {
-        assert_eq!(parse_form("a=1&a=2"), json!({"a": ["1", "2"]}));
-        assert_eq!(parse_form("a=1&a=2&a=3"), json!({"a": ["1", "2", "3"]}));
+        assert_eq!(parsed("a=1&a=2"), json!({"a": ["1", "2"]}));
+        assert_eq!(parsed("a=1&a=2&a=3"), json!({"a": ["1", "2", "3"]}));
         assert_eq!(
-            parse_form("q=hello+world&a[b%28x%29]=1"),
+            parsed("q=hello+world&a[b%28x%29]=1"),
             json!({"q": "hello world", "a": {"b(x)": "1"}}),
             "+ and %XX"
         );
         assert_eq!(
-            parse_form("a=1&a[]=2"),
+            parsed("a=1&a[]=2"),
             json!({"a": ["1", "2"]}),
             "a lone value joins the array"
         );
@@ -226,18 +290,18 @@ mod tests {
     #[test]
     fn containers_win_and_the_last_write_wins() {
         assert_eq!(
-            parse_form("a=1&a[b]=c"),
+            parsed("a=1&a[b]=c"),
             json!({"a": {"b": "c"}}),
             "object over scalar"
         );
         assert_eq!(
-            parse_form("a[b]=c&a=1"),
+            parsed("a[b]=c&a=1"),
             json!({"a": "1"}),
             "scalar over object"
         );
-        assert_eq!(parse_form(""), json!({}), "empty text is no parameters");
+        assert_eq!(parsed(""), json!({}), "empty text is no parameters");
         assert_eq!(
-            parse_form("=1&[a]=2"),
+            parsed("=1&[a]=2"),
             json!({}),
             "keys naming nothing are dropped"
         );
@@ -245,7 +309,7 @@ mod tests {
 
     #[test]
     fn index_maps_become_lists() {
-        let map = parse_form("f[10][v]=ten&f[2][v]=two&f[1][v]=one");
+        let map = parsed("f[10][v]=ten&f[2][v]=two&f[1][v]=one");
         let fields = map.get("f").expect("parsed map").clone();
         assert_eq!(
             index_map_to_vec(fields),
