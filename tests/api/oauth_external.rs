@@ -31,6 +31,9 @@
 /// The callback's successes: the login, the echo, the oob page and the
 /// unlinked hand-off.
 mod callback;
+/// The callback of an MFA-enabled linked account: the detour and the
+/// verification that delivers the code.
+mod callback_mfa;
 /// The callback's refusals, the provider-call failures and the route edges.
 mod callback_refusals;
 /// `GET /oauth/prepare_request` and the provider redirect it feeds.

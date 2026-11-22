@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::{
     api::oauth::{
         authorize::{self, AuthorizeReply},
-        check_account_ready,
+        check_account_ready, mfa,
     },
     config::{Config, OauthProvider},
     error::{AppError, AppResult},
@@ -96,6 +96,9 @@ pub(super) async fn granted(
     let scopes = Scopes::parse(&params.scope);
     authorize::check_scopes_subset(&scopes, &app)?;
     check_account_ready(user)?;
+    if mfa::required(user) {
+        return authorize::mfa_detour(state, user, &app, &scopes, &params.delivery()).await;
+    }
     authorize::grant_code(state, user, &app, &scopes, &params.delivery()).await
 }
 
