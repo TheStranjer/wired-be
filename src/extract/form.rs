@@ -20,7 +20,7 @@ pub(super) fn parse_form(text: &str) -> Value {
 
 /// Structures already-decoded key/value pairs — the pairs of a urlencoded
 /// body, a query string, or the text fields of a multipart body — into one
-/// parameters value by the same rules as [`parse_form`].
+/// parameters value by the same rules as `parse_form`.
 #[must_use]
 pub fn parse_pairs<P, K, V>(pairs: P) -> Value
 where
