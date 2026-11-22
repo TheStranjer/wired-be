@@ -85,6 +85,15 @@ use crate::{
     state::AppState,
 };
 
+#[cfg(doc)]
+use crate::{
+    api::helpers::timeline_response,
+    auth::AuthUser,
+    config::Config,
+    pagination::PageParams,
+    services::timeline::{TimelineQuery, TimelineSource},
+};
+
 mod direct_list;
 mod home;
 mod public;
