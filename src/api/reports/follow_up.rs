@@ -22,7 +22,7 @@ use crate::{
 /// - [`webhooks::report_created`] queues the signed `report.created` event
 ///   for every enabled webhook subscribed to it (decision 11 again: the
 ///   delivery is a job, not part of this request).
-/// - [`email_staff`] posts the report to the staff mailboxes.
+/// - `email_staff` posts the report to the staff mailboxes.
 ///
 /// The inbound federation `Flag` ([`crate::federation::handlers::misc`])
 /// runs the same hook on the report it files, so whatever stands here

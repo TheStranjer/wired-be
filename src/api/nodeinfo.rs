@@ -25,6 +25,8 @@
 //! [`crate::api::instance`] publishes: the live [MRF
 //! chain](crate::federation::mrf) under the operator's `MRF_TRANSPARENCY`
 //! and `MRF_TRANSPARENCY_EXCLUSIONS` settings.
+//!
+//! [`Config`]: crate::config::Config
 
 mod document;
 mod metadata;
