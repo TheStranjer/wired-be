@@ -16,9 +16,10 @@
 //!   tokens and answer `200 {}`. Pleroma always answers 201 with an
 //!   empty body; here a foreign or unknown (or malformed) id is the
 //!   404 `{"error":"Record not found"}` of decision 8 instead.
-//! - `GET /api/v1/pleroma/apps` — the applications the caller knows:
-//!   those they registered (`oauth_apps.user_id`) **or** hold a token
-//!   for, deduplicated, newest app first, rendered with the eight keys
+//! - `GET /api/v1/pleroma/apps` — the applications the caller
+//!   registered (`oauth_apps.user_id`), newest app first, never those
+//!   they merely hold a token for (the entry carries the client secret).
+//!   It requires the `read` or `follow` scope. Each is rendered with the eight keys
 //!   `id`, `name`, `website`, `redirect_uri`, `client_id`,
 //!   `client_secret`, `trusted` and `vapid_key` (Pleroma's
 //!   `MastodonAPI.AppView.show.json` plus the flag its admin view adds;
@@ -26,8 +27,8 @@
 //!   `with_vapid_key` puts on the render once push is configured — it
 //!   always is here, see [`crate::services::vapid`]).
 //!
-//! All three routes require a user token ([`AuthUser`]); none demands a
-//! particular scope. The queries live in [`crate::models::oauth_token`]
+//! All three routes require a user token ([`AuthUser`]); only the apps
+//! listing demands a particular scope. The queries live in [`crate::models::oauth_token`]
 //! and [`crate::models::oauth_app`].
 
 use axum::{
@@ -44,6 +45,7 @@ use crate::{
     auth::AuthUser,
     error::{AppError, AppResult},
     models::{oauth_app, oauth_token},
+    oauth::scopes,
     services::vapid,
     state::AppState,
     util::id::parse_id,
@@ -112,17 +114,20 @@ async fn revoke_token(
     Ok(Json(Value::Object(Map::new())))
 }
 
-/// `GET /api/v1/pleroma/apps` — the apps the caller registered or holds
-/// a token for, deduplicated, newest first.
+/// `GET /api/v1/pleroma/apps` — the apps the caller registered, newest
+/// first (Pleroma's `App.get_user_apps/1`).
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`].
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`];
+/// [`AppError::Forbidden`] when the token grants neither `read` nor
+/// `follow` (Pleroma's `AppController` requirement).
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn list_apps(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> AppResult<Json<Vec<PleromaApp>>> {
+    auth.require_any(&[scopes::READ, scopes::FOLLOW])?;
     let apps = oauth_app::list_for_user(&state.db, auth.0.id).await?;
     let vapid_key = vapid::vapid_public_key(&state.db).await?;
     debug!(

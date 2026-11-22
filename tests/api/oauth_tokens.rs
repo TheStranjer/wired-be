@@ -1,17 +1,18 @@
 //! OAuth token management over HTTP (`/api/oauth_tokens`,
 //! `/api/v1/pleroma/apps`, WBE-49): the caller's valid tokens with their
 //! app names, revocation of one's own token, and the apps the caller
-//! registered or holds tokens for.
+//! registered.
 //!
 //! The tests pin what the ticket promises: the token list shows only the
 //! caller's own unexpired tokens, newest first, with exactly the keys
 //! `id`, `app_name` and `valid_until` (Mastodon time); a foreign,
 //! unknown or malformed revocation id is one and the same 404 "Record
 //! not found" while the owner's `DELETE` answers 200 `{}` and really
-//! removes the row; `/api/v1/pleroma/apps` merges owned and tokened
-//! apps, deduplicated and newest first, under the eight pinned keys (the
-//! VAPID public key among them, since push is always configured here);
-//! and every route answers 401 to an unauthenticated request.
+//! removes the row; `/api/v1/pleroma/apps` lists only owned apps, newest
+//! first, under the eight pinned keys (the VAPID public key among them,
+//! since push is always configured here), never the secret of an app the
+//! caller merely holds a token for, and needs `read` or `follow`; and
+//! every route answers 401 to an unauthenticated request.
 
 #![cfg(test)]
 
@@ -50,9 +51,10 @@ fn not_found() -> Value {
 /// A local user with a live bearer token acting as them.
 ///
 /// The session token deliberately grants the unrelated `push` scope:
-/// these endpoints require a user, no particular scope. The session's
-/// app is owned by the user and holds their token, so it also belongs
-/// in every fixture math for `/api/v1/pleroma/apps`.
+/// the token endpoints require a user, no particular scope (the apps
+/// listing does, see [`read_token`]). The session's app is owned by the
+/// user, so it also belongs in every fixture math for
+/// `/api/v1/pleroma/apps`.
 struct Session {
     /// The created user.
     user: User,
@@ -73,6 +75,13 @@ async fn session(pool: &PgPool, nickname: &str) -> Session {
     let app = common::create_app_named(pool, "Session", Some(&user)).await;
     let token = common::create_token(pool, &user, &app, "push").await;
     Session { user, token }
+}
+
+/// A second token for the session's user carrying the `read` scope, which
+/// `GET /api/v1/pleroma/apps` requires (the session token has only `push`).
+async fn read_token(pool: &PgPool, session: &Session) -> OauthToken {
+    let app = common::create_app_named(pool, "Reader", None).await;
+    common::create_token(pool, &session.user, &app, "read").await
 }
 
 /// The sorted JSON keys of `entry`.
@@ -238,44 +247,42 @@ async fn revoke_of_foreign_unknown_or_malformed_is_404() {
     );
 }
 
-/// `GET /api/v1/pleroma/apps` — the apps the caller owns or holds tokens
-/// for, deduplicated (the session app is both, the tokened app has two
-/// tokens), newest first, under exactly the eight pinned keys; foreign
-/// and untouched apps stay out.
+/// `GET /api/v1/pleroma/apps` — only the apps the caller registered,
+/// newest first, under exactly the eight pinned keys; an app the caller
+/// merely holds tokens for, another user's app and an untouched app stay
+/// out, so no foreign client secret is ever rendered.
 #[tokio::test]
-async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first() {
+async fn pleroma_apps_are_only_the_ones_the_caller_owns_newest_first() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let vapid_key = wired_be::services::vapid::vapid_public_key(&pool)
         .await
         .expect("the instance VAPID key is readable");
     let alice = session(&pool, "alice").await;
+    let alice_read = read_token(&pool, &alice).await;
     let owned = common::create_app_named(&pool, "Owned", Some(&alice.user)).await;
     let tokened = common::create_app_named(&pool, "Tokened", None).await;
     let _first_token = common::create_token(&pool, &alice.user, &tokened, "read").await;
     let _second_token = common::create_token(&pool, &alice.user, &tokened, "write").await;
     let bob = session(&pool, "bob").await;
+    let bob_read = read_token(&pool, &bob).await;
     let foreign = common::create_app_named(&pool, "Foreign", Some(&bob.user)).await;
     let _bobs_token = common::create_token(&pool, &bob.user, &foreign, "read").await;
     let stranger = common::create_app_named(&pool, "Stranger", None).await;
 
     let router = common::test_app(pool);
     let response = common::TestRequest::get(APPS)
-        .bearer(alice.bearer())
+        .bearer(&alice_read.token)
         .send(&router)
         .await;
     assert_eq!(response.status, StatusCode::OK, "apps listing works");
     let body = response.json_value();
     assert_eq!(
         ids_of(&body),
-        vec![
-            tokened.id.to_string(),
-            owned.id.to_string(),
-            alice.token.app_id.to_string(),
-        ],
-        "newest first, each app exactly once"
+        vec![owned.id.to_string(), alice.token.app_id.to_string()],
+        "only the owned apps, newest first"
     );
-    assert_eq!(names_of(&body), vec!["Tokened", "Owned", "Session"]);
+    assert_eq!(names_of(&body), vec!["Owned", "Session"]);
     for entry in body.as_array().expect("array body") {
         assert_eq!(keys_of(entry), APP_KEYS, "exactly the eight keys");
         assert_eq!(
@@ -285,24 +292,26 @@ async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first() {
         );
     }
     assert_eq!(body[0]["redirect_uri"], REDIRECT_URI, "as stored");
-    assert_eq!(body[0]["client_id"], tokened.client_id, "the client id");
-    assert_eq!(
-        body[0]["client_secret"], tokened.client_secret,
-        "and secret"
-    );
+    assert_eq!(body[0]["client_id"], owned.client_id, "the client id");
+    assert_eq!(body[0]["client_secret"], owned.client_secret, "and secret");
     assert_eq!(body[0]["trusted"], false, "registrations are untrusted");
     assert!(body[0]["website"].is_null(), "an unset website is null");
-    assert!(
-        !ids_of(&body).contains(&foreign.id.to_string()),
-        "another user's app stays out even when that user holds its token"
-    );
-    assert!(
-        !ids_of(&body).contains(&stranger.id.to_string()),
-        "and so does an app the caller neither owns nor holds a token for"
-    );
+    let text = body.to_string();
+    for hidden in [&tokened, &foreign, &stranger] {
+        assert!(
+            !ids_of(&body).contains(&hidden.id.to_string()),
+            "{} stays out",
+            hidden.client_name
+        );
+        assert!(
+            !text.contains(&hidden.client_secret),
+            "the secret of {} never leaks",
+            hidden.client_name
+        );
+    }
 
     let bob_side = common::TestRequest::get(APPS)
-        .bearer(bob.bearer())
+        .bearer(&bob_read.token)
         .send(&router)
         .await;
     assert_eq!(
@@ -310,6 +319,53 @@ async fn pleroma_apps_are_owned_and_tokened_deduped_newest_first() {
         vec!["Foreign", "Session"],
         "bob sees only his own two apps"
     );
+}
+
+/// A user who only logged in through an app nobody owns gets `[]`, not
+/// that app's secret.
+#[tokio::test]
+async fn pleroma_apps_is_empty_for_a_user_who_only_holds_tokens() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = common::create_local_user(&pool, "carol").await;
+    let app_b = common::create_app_named(&pool, "App B", None).await;
+    let token = common::create_token(&pool, &user, &app_b, "read").await;
+
+    let response = common::TestRequest::get(APPS)
+        .bearer(&token.token)
+        .send(&common::test_app(pool))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the listing works");
+    assert_eq!(response.json_value(), json!([]), "and lists no app");
+}
+
+/// The listing needs `read` or `follow`: a `push`-only token is a 403
+/// naming both, while a `follow` token passes.
+#[tokio::test]
+async fn pleroma_apps_demand_read_or_follow_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = session(&pool, "alice").await;
+    let router = common::test_app(pool.clone());
+
+    let denied = common::TestRequest::get(APPS)
+        .bearer(alice.bearer())
+        .send(&router)
+        .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "push alone is out");
+    assert_eq!(
+        denied.json_value(),
+        json!({"error": "Insufficient permissions: read | follow."}),
+        "the wording names both accepted scopes"
+    );
+
+    let app = common::create_app_named(&pool, "Follower", None).await;
+    let follow = common::create_token(&pool, &alice.user, &app, "follow").await;
+    let allowed = common::TestRequest::get(APPS)
+        .bearer(&follow.token)
+        .send(&router)
+        .await;
+    assert_eq!(allowed.status, StatusCode::OK, "follow suffices");
 }
 
 /// Every route answers the no-token 401 of the `AuthUser` pipeline.
