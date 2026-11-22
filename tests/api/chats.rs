@@ -42,6 +42,8 @@
 
 #![cfg(test)]
 
+/// The block gate of the create and post routes, and the gates' order.
+mod chat_blocks;
 /// The chat create and show routes and their gates.
 mod chat_create_show;
 /// The chat lists, v1 and v2: order, filters, caps and keyset walks.

@@ -46,11 +46,10 @@
 //!   with the message row (plus the sender: [`chat::sender_reference_for_key`]
 //!   is the lookup), so replaying the same key within the hour answers the
 //!   message that key created instead of writing a second one — Pleroma
-//!   keeps that mapping in a TTL cache in its posting pipeline. Pleroma
-//!   runs this action through its `statuses_actions` throttle bucket
-//!   (`config/config.exs`: ten thousand requests per fifteen seconds);
-//!   this server has no rate limiter yet, and the ticket that adds one
-//!   registers this route under that bucket name.
+//!   keeps that mapping in a TTL cache in its posting pipeline. Before
+//!   anything is written the pair goes through `chat_refusal` again, so a
+//!   chat opened before a block, or whose recipient has since stopped
+//!   accepting chats, answers the same 403 it would at creation.
 //! - `DELETE /api/v1/pleroma/chats/{id}/messages/{message_id}` — Pleroma's
 //!   `delete_message`: `message_id` is a reference id, and it resolves only
 //!   inside the caller's own chat (foreign, unknown and malformed ids are

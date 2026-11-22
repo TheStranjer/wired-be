@@ -31,7 +31,7 @@ use crate::{
 
 use super::{
     EMPTY_CHAT_MESSAGE, IDEMPOTENCY_KEY_HEADER, MEDIA_NOT_FOUND, MESSAGE_TOO_LONG,
-    chats_list::owned_chat,
+    chats_list::{chat_refusal, owned_chat},
     events::after_chat_message_created,
     messages::{chat_recipient, message_json, message_of},
 };
@@ -108,7 +108,10 @@ impl PostMessageParams {
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:chats` check; [`AppError::NotFound`] for a malformed, unknown
 /// or foreign `id`, or a recipient row that vanished with its chat;
-/// [`AppError::BadRequest`] with [`MEDIA_NOT_FOUND`] for `media_id` naming no
+/// [`AppError::Forbidden`] when [`chat_refusal`] refuses the pair — the
+/// recipient turned `accepts_chat_messages` off, or either side has blocked
+/// the other — checked before the media, the idempotency replay and the
+/// write, so an old chat stops delivering; [`AppError::BadRequest`] with [`MEDIA_NOT_FOUND`] for `media_id` naming no
 /// attachable media (malformed id text included), with [`EMPTY_CHAT_MESSAGE`]
 /// for a body with neither key, and with [`MESSAGE_TOO_LONG`] for `content`
 /// above the [`max_chat_message_chars`] setting. The model answers anything
@@ -126,6 +129,9 @@ pub(super) async fn post_message(
     auth.require(WRITE_CHATS)?;
     let chat_row = owned_chat(&state, auth.0.id, &id).await?;
     let recipient = chat_recipient(&state, &chat_row).await?;
+    if let Some(refusal) = chat_refusal(&state, &auth.0, &recipient).await? {
+        return Err(refusal);
+    }
     let attachment_media_id =
         resolve_chat_media(&state, params.media_id.as_deref(), auth.0.id).await?;
     let idempotency_key = idempotency_key(&headers);

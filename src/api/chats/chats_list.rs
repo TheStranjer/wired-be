@@ -21,7 +21,7 @@ use crate::{
     entities::chat::{Chat, ChatMessage},
     error::{AppError, AppResult},
     extract::{ApiParams, flex},
-    models::{chat, chat::ChatFilter, user::User},
+    models::{block, chat, chat::ChatFilter, user::User},
     oauth::scopes::{READ_CHATS, WRITE_CHATS},
     pagination::{MAX_LIMIT, PageParams, link_header, set_link_header},
     state::AppState,
@@ -54,7 +54,7 @@ pub(super) async fn create_chat(
 ) -> AppResult<Json<Chat>> {
     auth.require(WRITE_CHATS)?;
     let recipient = account_or_404(&state, &id).await?;
-    if let Some(refusal) = chat_refusal(&auth.0, &recipient) {
+    if let Some(refusal) = chat_refusal(&state, &auth.0, &recipient).await? {
         return Err(refusal);
     }
     let row = chat::get_or_create(&state.db, &auth.0, &recipient).await?;
@@ -73,30 +73,34 @@ pub(super) async fn create_chat(
 /// alike — is the 403 that names the flag, and a pair blocked in either
 /// direction is Pleroma's `Chat not allowed` 403, in that order.
 ///
+/// The block check is [`block::blocked_between`] over `state`'s pool.
+/// [`post_message`] asks the same question of an existing chat's pair.
+///
 /// [`accepts_chat_messages`]: crate::models::user::User::accepts_chat_messages
-fn chat_refusal(user: &User, recipient: &User) -> Option<AppError> {
+/// [`post_message`]: super::post_message::post_message
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+pub(super) async fn chat_refusal(
+    state: &AppState,
+    user: &User,
+    recipient: &User,
+) -> AppResult<Option<AppError>> {
     if user.id == recipient.id {
-        return Some(AppError::Unprocessable(CANT_CHAT_WITH_SELF.to_owned()));
+        return Ok(Some(AppError::Unprocessable(
+            CANT_CHAT_WITH_SELF.to_owned(),
+        )));
     }
     if !recipient.accepts_chat_messages.get() {
-        return Some(AppError::Forbidden(RECIPIENT_REJECTS_CHATS.to_owned()));
+        return Ok(Some(AppError::Forbidden(
+            RECIPIENT_REJECTS_CHATS.to_owned(),
+        )));
     }
-    if blocked_between(user, recipient) {
-        return Some(AppError::Forbidden(CHAT_NOT_ALLOWED.to_owned()));
+    if block::blocked_between(&state.db, user.id, recipient.id).await? {
+        return Ok(Some(AppError::Forbidden(CHAT_NOT_ALLOWED.to_owned())));
     }
-    None
-}
-
-/// Whether `user` and `recipient` have blocked each other, in either
-/// direction — what makes Pleroma's `ChatController.create` answer the 403
-/// [`CHAT_NOT_ALLOWED`].
-///
-/// No pair is blocked yet: the relationship table that records blocks (and
-/// mutes, which hide a chat from the list but do not refuse opening it)
-/// arrives with the blocks ticket, which wires this hook up the way
-/// [`crate::models::follow`]'s like-named hook waits for the same table.
-const fn blocked_between(_user: &User, _recipient: &User) -> bool {
-    false
+    Ok(None)
 }
 
 /// `GET /api/v1/pleroma/chats` — the caller's chats, newest activity first,
@@ -231,8 +235,7 @@ pub(super) async fn show_chat(
 pub(super) struct ChatListParams {
     /// Whether chats with muted accounts are listed (Pleroma's
     /// `with_muted`); absent means `false`. The exclusion itself waits for
-    /// the mutes table the way [`blocked_between`] waits for the blocks one
-    /// — see [`ChatFilter::with_muted`].
+    /// the mutes table — see [`ChatFilter::with_muted`].
     #[serde(default, deserialize_with = "flex::opt_bool")]
     with_muted: Option<bool>,
     /// `Some(true)` lists only pinned chats, `Some(false)` only unpinned
@@ -325,7 +328,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::api::chats::test_support::{chatter, quiet, quiet_remote};
+    use crate::api::chats::test_support::{app_state, chatter, quiet, quiet_remote};
 
     #[tokio::test]
     async fn chatting_with_yourself_is_the_422() {
@@ -333,7 +336,10 @@ mod tests {
         let pool = db.pool().clone();
         let alice = chatter(&pool, "alice").await;
 
-        let err = chat_refusal(&alice, &alice).expect("the self-chat is refused");
+        let err = chat_refusal(&app_state(&pool), &alice, &alice)
+            .await
+            .expect("the refusal check runs")
+            .expect("the self-chat is refused");
 
         assert!(
             matches!(err, AppError::Unprocessable(_)),
@@ -356,7 +362,9 @@ mod tests {
             quiet(&pool, "carol").await,
             quiet_remote(&pool, "mallory").await,
         ] {
-            let err = chat_refusal(&alice, &silent)
+            let err = chat_refusal(&app_state(&pool), &alice, &silent)
+                .await
+                .expect("the refusal check runs")
                 .unwrap_or_else(|| panic!("{} refuses the pair", silent.nickname));
             assert!(
                 matches!(err, AppError::Forbidden(_)),
@@ -371,26 +379,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_ordinary_pair_passes_and_no_pair_is_blocked_yet() {
+    async fn an_ordinary_pair_passes_and_a_blocked_pair_is_refused_either_way() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
+        let state = app_state(&pool);
         let alice = chatter(&pool, "alice").await;
         let bob = chatter(&pool, "bob").await;
-        let mallory = quiet_remote(&pool, "mallory").await;
+        let carol = chatter(&pool, "carol").await;
 
         assert!(
-            chat_refusal(&alice, &bob).is_none(),
+            chat_refusal(&state, &alice, &bob)
+                .await
+                .expect("the refusal check runs")
+                .is_none(),
             "two chatters may chat"
         );
+
+        let _block = block::block(&pool, &state.config.base_url, &bob, &alice)
+            .await
+            .expect("bob blocks alice");
+        for (user, recipient) in [(&alice, &bob), (&bob, &alice)] {
+            let err = chat_refusal(&state, user, recipient)
+                .await
+                .expect("the refusal check runs")
+                .expect("a blocked pair is refused");
+            assert!(
+                matches!(err, AppError::Forbidden(_)),
+                "the block is a 403: {err}"
+            );
+            assert_eq!(err.to_string(), CHAT_NOT_ALLOWED, "Pleroma's wording");
+        }
         assert!(
-            !blocked_between(&alice, &bob) && !blocked_between(&bob, &alice),
-            "no pair is blocked until the blocks ticket wires the hook up"
+            chat_refusal(&state, &alice, &carol)
+                .await
+                .expect("the refusal check runs")
+                .is_none(),
+            "the block touches only its own pair"
         );
-        // The flag gate stands ahead of the block hook: a silent recipient
-        // is refused by name whatever the block tables will one day say.
-        assert!(
-            chat_refusal(&alice, &mallory).is_some(),
-            "flag down is a refusal"
+    }
+
+    #[tokio::test]
+    async fn the_flag_gate_stands_ahead_of_the_block_gate() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = chatter(&pool, "alice").await;
+        let mallory = quiet_remote(&pool, "mallory").await;
+        let _block = block::block(&pool, &state.config.base_url, &alice, &mallory)
+            .await
+            .expect("alice blocks mallory");
+
+        let err = chat_refusal(&state, &alice, &mallory)
+            .await
+            .expect("the refusal check runs")
+            .expect("flag down is a refusal");
+        assert_eq!(
+            err.to_string(),
+            RECIPIENT_REJECTS_CHATS,
+            "the silent recipient is refused by name, not as a block"
         );
     }
 
