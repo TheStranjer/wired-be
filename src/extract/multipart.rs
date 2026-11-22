@@ -134,7 +134,7 @@ where
             .map_err(|rejection| AppError::BadRequest(rejection.body_text()))?;
         let (texts, files) = read_parts(stream, state.config.upload_limits).await?;
         Ok(Self {
-            fields: into_params(parse_pairs(texts))?,
+            fields: into_params(parse_pairs(texts)?)?,
             files,
         })
     }
@@ -447,6 +447,20 @@ mod tests {
             got["fields"],
             json!({"poll": {"options": ["yes", "no"], "expires_in": "3600"}}),
             "the same bracket rules as a urlencoded body"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_deeply_nested_multipart_text_field_gets_400() {
+        let name = format!("a{}", "[]".repeat(5000));
+        let text = text_part(&name, "1");
+        let body = multipart_body(&[text.as_bytes()]);
+
+        let response = send_multipart(&body, state_with_limits(1024, 4)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a part named with 5000 brackets"
         );
     }
 

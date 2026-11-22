@@ -837,7 +837,8 @@ mod tests {
         let form = crate::extract::parse_pairs([
             ("account_ids[]", first.as_str()),
             ("account_ids[]", second.as_str()),
-        ]);
+        ])
+        .expect("the keys nest shallowly");
         let from_form: MemberParams =
             crate::extract::into_params(form).expect("the repeated-bracket form spelling");
 

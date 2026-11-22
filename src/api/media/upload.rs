@@ -270,7 +270,8 @@ mod tests {
         if let Some(text) = focus {
             fields.push(("focus".to_owned(), text.to_owned()));
         }
-        let params = crate::extract::into_params(crate::extract::parse_pairs(fields))
+        let params = crate::extract::parse_pairs(fields)
+            .and_then(crate::extract::into_params)
             .expect("the fixture parameters deserialize");
         MultipartForm {
             fields: params,
