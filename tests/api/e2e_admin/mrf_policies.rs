@@ -8,7 +8,9 @@
 //! [`mrf`](super::mrf)'s `pub(super)` helpers.
 
 use axum::http::StatusCode;
+use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
+use wired_be::util::time::mastodon_time;
 
 use super::mrf::{
     admin_entry, create_note, deliver, federation_block, set_mrf, wire_from, wrap_create,
@@ -167,14 +169,17 @@ async fn object_age_rejects_an_old_note(world: &World, peer: &remote::MockPeer, 
         admin_entry(world, &peer.note("oa-old")).await.is_none(),
         "the over-age note is rejected by the chain"
     );
-    // A note published after the timestamp survives the same chain.
+    // A note published after the timestamp survives the same chain. Its
+    // moment is read off the running clock — a day old, inside the
+    // seven-day threshold whenever this test runs — so no pinned calendar
+    // date can age it past the gate.
     let fresh_uri = peer.note("oa-fresh");
     let oa_fresh_create = create_note(
         peer,
         actor,
         "oa-fresh",
         "<p>recent</p>",
-        json!({"published": "2026-11-15T00:00:00Z"}),
+        json!({"published": mastodon_time(&(Utc::now() - ChronoDuration::days(1)))}),
     );
     let oa_fresh_door = deliver(world, peer, &oa_fresh_create).await;
     common::assert_answer(
