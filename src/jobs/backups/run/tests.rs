@@ -48,6 +48,30 @@ fn stored_names(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Asserts that the last segment of `key` is `archive-alice-<14 digits>-<43
+/// url-safe characters>.zip`: the name carries an unguessable suffix.
+fn assert_unguessable_archive_key(key: &str) {
+    let last = key.rsplit('/').next().expect("a key has a segment");
+    let rest = last
+        .strip_prefix("archive-alice-")
+        .and_then(|rest| rest.strip_suffix(".zip"))
+        .expect("the stored name is alice's archive");
+    let (stamp, random) = rest
+        .split_once('-')
+        .expect("a random part follows the stamp");
+    assert!(
+        stamp.len() == 14 && stamp.chars().all(|c| c.is_ascii_digit()),
+        "the stamp is 14 digits, not {stamp}"
+    );
+    assert!(
+        random.len() == 43
+            && random
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "the random part is 43 url-safe characters, not {random}"
+    );
+}
+
 #[tokio::test]
 async fn the_run_handler_stores_the_archive_and_marks_the_row() {
     let db = crate::test_db::test_db().await.expect("test database slot");
@@ -78,6 +102,7 @@ async fn the_run_handler_stores_the_archive_and_marks_the_row() {
 
     let key = storage_key(alice.id, &row.file_name);
     uploads::check_key(&key).expect("the run's key is legal");
+    assert_unguessable_archive_key(&key);
     let marked = backup::get_by_id(&pool, row.id)
         .await
         .expect("the row reads")

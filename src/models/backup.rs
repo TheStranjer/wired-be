@@ -26,7 +26,9 @@
 //! is the storage key's last segment: it must be one
 //! [`crate::uploads::check_key`] accepts, so every character outside the key
 //! charset (a remote handle's `@`, above all) is replaced here, once, instead
-//! of being re-sanitized by whoever happens to ask for an export.
+//! of being re-sanitized by whoever happens to ask for an export. The name
+//! also ends in a 43-character random suffix, because the archive is served
+//! without authentication and the name is the only thing keeping it private.
 //!
 //! [`get_by_id`] is the queue job's read: the `backups.run` handler is
 //! handed the request's id by the endpoint and knows nothing else of it
@@ -47,7 +49,14 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::user::User, util::id::new_id};
+use crate::{
+    error::AppResult,
+    models::user::User,
+    util::{
+        id::new_id,
+        token::{CREDENTIAL_BYTES, random_token},
+    },
+};
 
 /// [`create`]: the id this module mints (decision 4), the owner, and the
 /// archive name built here; `file_size`, `processed`, `content_type` and
@@ -102,24 +111,38 @@ const fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
 }
 
-/// The archive name for `nickname`'s export taken at `at`:
-/// `archive-<nickname>-<YYYYMMDDHHMMSS>.zip`, Pleroma's
-/// `archive-<nickname>-<basic iso8601>.zip`.
+/// The archive name for `nickname`'s export taken at `at`, with a fresh
+/// random component: `archive-<nickname>-<YYYYMMDDHHMMSS>-<random>.zip`.
 ///
-/// Every character outside `[A-Za-z0-9._-]` becomes `_`. A remote handle's
-/// `@` is the one that matters: the name is also the last segment of the
-/// storage key, and [`crate::uploads::check_key`] does not carry `@`, so an
-/// unsanitized name would fail the guard on its way into storage. The stamp
-/// keeps the name unique per account and second, and it is UTC: `at` is a
-/// `DateTime<Utc>`, so the digits are the same whoever reads them.
+/// The random part is 32 CSPRNG bytes in URL-safe base64 (43 characters, as
+/// Pleroma's `archive-<nickname>-<datetime>-<rand_str>.zip` carries). The
+/// archive is served by the unauthenticated `/media` route, so the name is
+/// its only secret: without the random part it would be derivable from the
+/// public account id, the nickname and the creation second. See
+/// [`file_name_with`] for the pure shape.
 #[must_use]
 pub fn file_name(nickname: &str, at: DateTime<Utc>) -> String {
+    file_name_with(nickname, at, &random_token(CREDENTIAL_BYTES))
+}
+
+/// [`file_name`] with the random component given: `random` is placed after
+/// the stamp verbatim, so it must itself be made of key-safe characters
+/// (what [`random_token`] yields is).
+///
+/// Every character of `nickname` outside `[A-Za-z0-9._-]` becomes `_`. A
+/// remote handle's `@` is the one that matters: the name is also the last
+/// segment of the storage key, and [`crate::uploads::check_key`] does not
+/// carry `@`, so an unsanitized name would fail the guard on its way into
+/// storage. The stamp is UTC: `at` is a `DateTime<Utc>`, so the digits are
+/// the same whoever reads them.
+#[must_use]
+pub fn file_name_with(nickname: &str, at: DateTime<Utc>, random: &str) -> String {
     let safe: String = nickname
         .chars()
         .map(|c| if is_name_char(c) { c } else { '_' })
         .collect();
     let stamp = at.format("%Y%m%d%H%M%S");
-    format!("archive-{safe}-{stamp}.zip")
+    format!("archive-{safe}-{stamp}-{random}.zip")
 }
 
 /// One row of `backups`: one account's request for an export archive, and —
@@ -406,15 +429,23 @@ mod tests {
         // The name is this account's, stamped to the second: the request's own
         // moment is the database's `now()`, a hair before the row came back,
         // so the stamp is checked by shape rather than rebuilt.
-        let stamp = stored
+        let rest = stored
             .file_name
             .strip_prefix("archive-alice-")
             .and_then(|rest| rest.strip_suffix(".zip"))
             .expect("the name is alice's archive");
+        let (stamp, random) = rest
+            .split_once('-')
+            .expect("a random part follows the stamp");
         assert_eq!(stamp.len(), 14, "the stamp is YYYYMMDDHHMMSS");
         assert!(
             stamp.chars().all(|c| c.is_ascii_digit()),
             "and it is all digits, not {stamp}"
+        );
+        assert_eq!(random.len(), 43, "the random part is 43 characters");
+        assert!(
+            random.chars().all(is_name_char),
+            "and key-safe, not {random}"
         );
         uploads::check_key(&stored.file_name).expect("a generated name is a legal key");
     }
@@ -720,18 +751,54 @@ mod tests {
     }
 
     #[test]
-    fn file_name_is_pleromas_archive_name() {
+    fn file_name_with_places_the_random_part_after_the_stamp() {
         let at = Utc.with_ymd_and_hms(2026, 11, 13, 7, 29, 1).unwrap();
         assert_eq!(
-            file_name("alice", at),
-            "archive-alice-20261113072901.zip",
-            "archive-<nickname>-<basic iso8601>.zip"
+            file_name_with("alice", at, "R"),
+            "archive-alice-20261113072901-R.zip",
+            "archive-<nickname>-<basic iso8601>-<random>.zip"
         );
         assert_eq!(
-            file_name("a-Z_0.9", at),
-            "archive-a-Z_0.9-20261113072901.zip",
+            file_name_with("a-Z_0.9", at, "R"),
+            "archive-a-Z_0.9-20261113072901-R.zip",
             "the key charset survives untouched"
         );
+    }
+
+    #[test]
+    fn file_name_differs_per_call_for_the_same_instant() {
+        let at = Utc.with_ymd_and_hms(2026, 11, 13, 7, 29, 1).unwrap();
+        assert_ne!(
+            file_name("alice", at),
+            file_name("alice", at),
+            "the random part makes the name underivable"
+        );
+    }
+
+    #[test]
+    fn file_name_random_part_is_43_key_safe_characters() {
+        let at = Utc.with_ymd_and_hms(2026, 11, 13, 7, 29, 1).unwrap();
+        let name = file_name("alice", at);
+        let random = name
+            .strip_prefix("archive-alice-20261113072901-")
+            .and_then(|rest| rest.strip_suffix(".zip"))
+            .expect("the name has the stamp, a random part and the extension");
+        assert_eq!(random.len(), 43, "32 bytes are 43 base64url characters");
+        assert!(
+            random.chars().all(is_name_char),
+            "every character is a name character: {random}"
+        );
+    }
+
+    #[test]
+    fn file_name_stays_a_legal_storage_key() {
+        let at = Utc.with_ymd_and_hms(2026, 11, 13, 7, 29, 1).unwrap();
+        for nickname in ["alice", "bob@remote.example"] {
+            let name = file_name(nickname, at);
+            let key = format!("backups/{}/{name}", Uuid::nil());
+            uploads::check_key(&key)
+                .unwrap_or_else(|err| panic!("{key} must be a legal key: {err}"));
+        }
     }
 
     #[test]
@@ -739,18 +806,18 @@ mod tests {
         let at = Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).unwrap();
 
         assert_eq!(
-            file_name("alice@remote.example", at),
-            "archive-alice_remote.example-20261231235959.zip",
+            file_name_with("alice@remote.example", at, "R"),
+            "archive-alice_remote.example-20261231235959-R.zip",
             "a remote handle's `@` becomes `_`, its dots stay"
         );
         assert_eq!(
-            file_name("üni@coe", at),
-            "archive-_ni_coe-20261231235959.zip",
+            file_name_with("üni@coe", at, "R"),
+            "archive-_ni_coe-20261231235959-R.zip",
             "one underscore per character, not per byte"
         );
         assert_eq!(
-            file_name("a b/c?d", at),
-            "archive-a_b_c_d-20261231235959.zip",
+            file_name_with("a b/c?d", at, "R"),
+            "archive-a_b_c_d-20261231235959-R.zip",
             "spaces too, and a `/` never survives to make a path"
         );
 

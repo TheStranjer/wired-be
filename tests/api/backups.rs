@@ -329,16 +329,20 @@ async fn post_records_the_row_queues_the_job_and_answers_the_list() {
     let rows = stored(&pool, &alice).await;
     assert_eq!(rows.len(), 1, "one row recorded");
     assert_eq!(entry["id"], rows[0].id.to_string(), "and it is hers");
-    let stamp = rows[0]
+    let rest = rows[0]
         .file_name
         .strip_prefix("archive-alice-")
         .and_then(|rest| rest.strip_suffix(".zip"))
         .expect("the name is alice's archive");
+    let (stamp, random) = rest
+        .split_once('-')
+        .expect("a random part follows the stamp");
     assert_eq!(stamp.len(), 14, "the stamp is YYYYMMDDHHMMSS, {stamp}");
     assert!(
         stamp.chars().all(|c| c.is_ascii_digit()),
         "and it is all digits, not {stamp}"
     );
+    assert_eq!(random.len(), 43, "the random part is 43 characters");
 
     let jobs = queued_jobs(&pool).await;
     assert_eq!(jobs.len(), 1, "one job queued");
