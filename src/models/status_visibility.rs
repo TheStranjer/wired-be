@@ -26,8 +26,10 @@
 //! 4. `local` (Pleroma's never-federated visibility) is visible only to an
 //!    authenticated viewer this instance owns — remote users never log in,
 //!    so an anonymous request and a remote mirror both lose;
-//! 5. `private` is visible to the author and to accounts with an
-//!    **accepted** follow of the author (a pending request is not one);
+//! 5. `private` is visible to the author, to accounts with an
+//!    **accepted** follow of the author (a pending request is not one), and
+//!    to the accounts it @-mentions (`status_mentions`), as in Mastodon's
+//!    `status_policy.rb:10` and Pleroma's `visibility.ex:99-107`;
 //! 6. `direct` is visible to the author and to the accounts the status
 //!    @-mentions (`status_mentions`);
 //! 7. a reblog row is visible only if its own visibility allows it **and**
@@ -77,7 +79,8 @@ const ACCEPTED_FOLLOWER_SQL: &str = "SELECT EXISTS (SELECT 1 FROM follows \
      WHERE follower_id = $1 AND followee_id = $2 AND state = 'accepted')";
 
 /// Whether the first id is among the second's @-mentions: the `direct`
-/// audience of rule 6, as [`crate::models::mention`] stores it.
+/// audience of rule 6 and the mentionee arm of rule 5, as
+/// [`crate::models::mention`] stores it.
 const VIEWER_MENTIONED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM status_mentions \
      WHERE user_id = $1 AND status_id = $2)";
 
@@ -213,13 +216,16 @@ async fn visibility_allows(
     Ok(match status.visibility {
         Visibility::Public | Visibility::Unlisted => true,
         Visibility::Local => viewer.is_some_and(|viewer| viewer.local.get()),
-        Visibility::Private => author_or_accepted_follower(pool, status, viewer).await?,
+        Visibility::Private => author_follower_or_mentioned(pool, status, viewer).await?,
         Visibility::Direct => author_or_mentioned(pool, status, viewer).await?,
     })
 }
 
-/// Rule 5: `viewer` is the author, or has an accepted follow of them.
-async fn author_or_accepted_follower(
+/// Rule 5: `viewer` is the author, has an accepted follow of them, or is
+/// among the mentioned accounts — Mastodon's `status_policy.rb:10`
+/// (`owned? || following_author? || mention_exists?`) and Pleroma's
+/// `visibility.ex:99-107` (the viewer is in `to`/`cc`).
+async fn author_follower_or_mentioned(
     pool: &PgPool,
     status: &Status,
     viewer: Option<&User>,
@@ -230,7 +236,10 @@ async fn author_or_accepted_follower(
     if viewer.id == status.user_id {
         return Ok(true);
     }
-    exists_between(pool, ACCEPTED_FOLLOWER_SQL, viewer.id, status.user_id).await
+    if exists_between(pool, ACCEPTED_FOLLOWER_SQL, viewer.id, status.user_id).await? {
+        return Ok(true);
+    }
+    exists_between(pool, VIEWER_MENTIONED_SQL, viewer.id, status.id).await
 }
 
 /// Rule 6: `viewer` is the author, or is among the mentioned accounts.
@@ -310,7 +319,10 @@ fn push_visible_expression(
 /// `viewer` as one parenthesised group. Anonymous viewers only ever pass
 /// the `public`/`unlisted` arm; a local authenticated viewer also passes
 /// the `local` arm; `private` and `direct` add their author and `EXISTS`
-/// conditions with the viewer's id bound where needed.
+/// conditions with the viewer's id bound where needed. The `private` arm
+/// admits the author, an accepted follower, or a mentioned account (Mastodon
+/// `status_policy.rb:10`, Pleroma `visibility.ex:99-107`); `direct` admits
+/// the author or a mentioned account.
 fn push_visibility_arms(qb: &mut QueryBuilder<Postgres>, viewer: Option<&User>, alias: &str) {
     let Some(viewer) = viewer else {
         let _anonymous: &mut _ = qb
@@ -340,7 +352,11 @@ fn push_visibility_arms(qb: &mut QueryBuilder<Postgres>, viewer: Option<&User>, 
         .push_bind(viewer.id)
         .push(" AND followee_id = ")
         .push(alias)
-        .push(".user_id AND state = 'accepted') ) )");
+        .push(".user_id AND state = 'accepted') OR EXISTS (SELECT 1 FROM status_mentions WHERE user_id = ")
+        .push_bind(viewer.id)
+        .push(" AND status_id = ")
+        .push(alias)
+        .push(".id) ) )");
     let _direct: &mut _ = qb
         .push(" OR ( ")
         .push(alias)
@@ -445,6 +461,22 @@ mod tests {
         .expect("a direct post with mentions inserts")
     }
 
+    /// Inserts a `private` status of `author` mentioning `mentioned`.
+    async fn private_mentioning(pool: &PgPool, author: &User, mentioned: &[&User]) -> Status {
+        let mentioned_user_ids = mentioned.iter().map(|user| user.id).collect();
+        insert_status(
+            pool,
+            BASE,
+            &NewStatus {
+                visibility: Visibility::Private,
+                mentioned_user_ids,
+                ..NewStatus::local(author, "a followers-only reply")
+            },
+        )
+        .await
+        .expect("a private post with mentions inserts")
+    }
+
     /// Inserts `reblogger`'s reblog of `original`, itself public.
     async fn reblog(pool: &PgPool, reblogger: &User, original: &Status) -> Status {
         insert_status(
@@ -502,7 +534,7 @@ mod tests {
         rows.into_iter().map(|(id,)| id).collect()
     }
 
-    /// The seeded matrix: five accounts and eleven statuses, each one a
+    /// The seeded matrix: five accounts and twelve statuses, each one a
     /// case of the rules — see [`seed`] for which is which.
     #[derive(Debug)]
     struct Matrix {
@@ -525,6 +557,8 @@ mod tests {
         local_post: Status,
         /// alice's `private` post: alice and bob only.
         private_post: Status,
+        /// alice's `private` post mentioning mallory, a non-follower.
+        private_to_mallory: Status,
         /// alice's `direct` post mentioning bob.
         dm_to_bob: Status,
         /// alice's `direct` post mentioning nobody but its author.
@@ -578,6 +612,7 @@ mod tests {
         let unlisted = post(pool, &alice, Visibility::Unlisted, "unlisted").await;
         let local_post = post(pool, &alice, Visibility::Local, "local").await;
         let private_post = post(pool, &alice, Visibility::Private, "private").await;
+        let private_to_mallory = private_mentioning(pool, &alice, &[&mallory]).await;
         let dm_to_bob = direct(pool, &alice, &[&bob]).await;
         let dm_to_nobody = post(pool, &alice, Visibility::Direct, "to nobody").await;
         let dave_private = post(pool, &dave, Visibility::Private, "dave private").await;
@@ -600,6 +635,7 @@ mod tests {
             unlisted,
             local_post,
             private_post,
+            private_to_mallory,
             dm_to_bob,
             dm_to_nobody,
             dave_private,
@@ -621,7 +657,7 @@ mod tests {
         let pool = db.pool().clone();
         let m = seed(&pool).await;
         let all = stored_statuses(&pool).await;
-        assert_eq!(all.len(), 11, "every fixture row is stored");
+        assert_eq!(all.len(), 12, "every fixture row is stored");
         assert!(
             !can_view(&pool, &m.deleted_public, Some(&m.alice))
                 .await
@@ -652,6 +688,7 @@ mod tests {
             &m.unlisted,
             &m.local_post,
             &m.private_post,
+            &m.private_to_mallory,
             &m.dm_to_bob,
             &m.dm_to_nobody,
             &m.reblog_of_private,
@@ -662,12 +699,18 @@ mod tests {
             &m.unlisted,
             &m.local_post,
             &m.private_post,
+            &m.private_to_mallory,
             &m.dm_to_bob,
             &m.reblog_of_private,
             &m.carol_public,
         ]);
         let for_carol = ids_of(&[&m.carol_public]);
-        let for_mallory = ids_of(&[&m.public, &m.unlisted, &m.carol_public]);
+        let for_mallory = ids_of(&[
+            &m.public,
+            &m.unlisted,
+            &m.private_to_mallory,
+            &m.carol_public,
+        ]);
         let for_anonymous = ids_of(&[&m.public, &m.unlisted, &m.carol_public]);
 
         for (name, viewer, want) in [
@@ -843,6 +886,113 @@ mod tests {
             id_set(&clause_ids(&pool, Some(&alice)).await),
             id_set(&[open_post.id, dm.id, hers.id]),
             "alice's own view is narrowed by nothing here"
+        );
+    }
+
+    /// Rule 5's mentionee arm through every reader: bob does not follow
+    /// alice, but her followers-only reply mentions him.
+    #[tokio::test]
+    async fn a_private_status_is_visible_to_a_mentioned_non_follower() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let reply = private_mentioning(&pool, &alice, &[&bob]).await;
+
+        assert!(
+            can_view(&pool, &reply, Some(&bob)).await.unwrap(),
+            "the mentioned account sees it without following"
+        );
+        let kept = filter_visible(&pool, vec![reply.clone()], Some(&bob))
+            .await
+            .expect("the batch filter runs");
+        assert_eq!(ids_of(&kept.iter().collect::<Vec<_>>()), vec![reply.id]);
+        assert_eq!(clause_ids(&pool, Some(&bob)).await, vec![reply.id]);
+        assert!(
+            can_view(&pool, &reply, Some(&alice)).await.unwrap(),
+            "the author still sees it"
+        );
+        assert!(
+            !can_view(&pool, &reply, None).await.unwrap(),
+            "an anonymous request is not mentioned"
+        );
+    }
+
+    /// Regression: a private status that mentions someone else stays hidden
+    /// from a non-follower, in both readers.
+    #[tokio::test]
+    async fn a_private_status_stays_hidden_from_an_unmentioned_non_follower() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let reply = private_mentioning(&pool, &alice, &[&bob]).await;
+
+        assert!(
+            !can_view(&pool, &reply, Some(&carol)).await.unwrap(),
+            "carol is neither a follower nor mentioned"
+        );
+        let kept = filter_visible(&pool, vec![reply.clone()], Some(&carol))
+            .await
+            .expect("the batch filter runs");
+        assert!(kept.is_empty(), "the batch filter drops it too");
+        assert!(clause_ids(&pool, Some(&carol)).await.is_empty());
+    }
+
+    /// Rule 2 still outranks the mention: alice blocked bob, so her private
+    /// post mentioning him is invisible to him.
+    #[tokio::test]
+    async fn a_mentioned_viewer_blocked_by_the_author_still_sees_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let _blocked = block::block(&pool, BASE, &alice, &bob)
+            .await
+            .expect("alice's block of bob stores");
+        let reply = private_mentioning(&pool, &alice, &[&bob]).await;
+
+        assert!(!can_view(&pool, &reply, Some(&bob)).await.unwrap());
+        let kept = filter_visible(&pool, vec![reply], Some(&bob))
+            .await
+            .expect("the batch filter runs");
+        assert!(kept.is_empty(), "the block wins in the batch filter too");
+    }
+
+    /// Rule 7 with a mentioned viewer: carol's public reblog of alice's
+    /// private post, which mentions bob, reaches bob and nobody unmentioned.
+    #[tokio::test]
+    async fn a_reblog_rule_applies_to_a_mentioned_viewer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let dave = local(&pool, "dave").await;
+        let original = private_mentioning(&pool, &alice, &[&bob]).await;
+        let boosted = reblog(&pool, &carol, &original).await;
+
+        assert!(can_view(&pool, &boosted, Some(&bob)).await.unwrap());
+        let for_bob = filter_visible(&pool, vec![boosted.clone()], Some(&bob))
+            .await
+            .expect("the batch filter runs");
+        assert_eq!(
+            ids_of(&for_bob.iter().collect::<Vec<_>>()),
+            vec![boosted.id]
+        );
+        assert_eq!(
+            id_set(&clause_ids(&pool, Some(&bob)).await),
+            id_set(&[original.id, boosted.id])
+        );
+
+        assert!(!can_view(&pool, &boosted, Some(&dave)).await.unwrap());
+        let for_dave = filter_visible(&pool, vec![boosted], Some(&dave))
+            .await
+            .expect("the batch filter runs");
+        assert!(
+            for_dave.is_empty(),
+            "an unmentioned viewer loses the reblog"
         );
     }
 }
