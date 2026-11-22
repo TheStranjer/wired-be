@@ -157,11 +157,11 @@ async fn the_admin_view_nests_a_quote_the_public_view_hides() {
 
 // --- the gate --------------------------------------------------------------------------
 
-/// A moderator is Pleroma's expected caller of this controller: the staff
-/// extractor lets them read the ledger, re-scope a post and delete it, and
-/// the entries they leave name them as the actor.
+/// A moderator holds Pleroma's `messages_delete` but not `messages_read`:
+/// the staff extractor lets them re-scope a post and delete it, and the
+/// entries they leave name them as the actor.
 #[tokio::test]
-async fn a_moderator_reads_and_writes_the_ledger() {
+async fn a_moderator_writes_the_ledger() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -169,10 +169,8 @@ async fn a_moderator_reads_and_writes_the_ledger() {
     let alice = common::create_local_user(&pool, "as_mod_alice").await;
     let row = post(&pool, &alice, Visibility::Private).await;
 
-    let shown = listed(&app, &format!("{LEDGER}/{}", row.id), &token).await;
-    assert_eq!(shown["id"], row.id.to_string(), "the moderator sees it");
     let moved = rescoped(&app, &token, row.id, json!({"visibility": "public"})).await;
-    assert_eq!(moved["visibility"], "public", "and re-scopes it");
+    assert_eq!(moved["visibility"], "public", "the moderator re-scopes it");
     let gone = removed(&app, &token, row.id).await;
     common::assert_answer(&gone, StatusCode::OK, "and deletes it");
 
@@ -188,12 +186,49 @@ async fn a_moderator_reads_and_writes_the_ledger() {
     );
 }
 
+/// The four reads are `messages_read`, which only admins hold: a moderator
+/// with the read scope is refused every one with the 403 `User is not an
+/// admin.`, while an admin with the same scope reads the ledger, and a
+/// direct post is visible to them under `godmode`.
+#[tokio::test]
+async fn a_moderator_cannot_read_the_ledger_but_an_admin_can() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_mod, mod_token) = moderator(&pool, "as_rd_mod", "admin:read:statuses").await;
+    let (_root, admin_token) = admin(&pool, "as_rd_root", "admin:read:statuses").await;
+    let alice = common::create_local_user(&pool, "as_rd_alice").await;
+    let dm = post(&pool, &alice, Visibility::Direct).await;
+
+    for path in read_paths("as_rd_alice", dm.id) {
+        let refused = get_with(&app, &path, &mod_token).await;
+        common::assert_answer(&refused, StatusCode::FORBIDDEN, "a moderator read");
+        common::assert_error(&refused, NOT_ADMIN, "a moderator read");
+    }
+
+    let godmode = "godmode=true";
+    let ledger = listed(&app, &format!("{LEDGER}?{godmode}"), &admin_token).await;
+    assert_eq!(
+        ids_of(&ledger),
+        vec![dm.id.to_string()],
+        "the admin sees the DM"
+    );
+    let shown = listed(&app, &format!("{LEDGER}/{}", dm.id), &admin_token).await;
+    assert_eq!(shown["id"], dm.id.to_string(), "and shows it by id");
+    let user_page = format!("{ADMIN}/users/as_rd_alice/statuses?{godmode}");
+    let by_user = listed(&app, &user_page, &admin_token).await;
+    assert_eq!(activity_ids(&by_user), vec![dm.id.to_string()]);
+    let instance_page = format!("{ADMIN}/instances/local/statuses?{godmode}");
+    let by_instance = listed(&app, &instance_page, &admin_token).await;
+    assert_eq!(activity_ids(&by_instance), vec![dm.id.to_string()]);
+}
+
 /// Every read refuses what it must, whatever its filters: no token at all is
 /// the 401 `Invalid credentials`, an app-only token is the 403 that asks for
 /// a user, and a valid regular account's token is the 403 that says it is no
-/// staff member.
+/// admin.
 #[tokio::test]
-async fn the_reads_demand_a_token_of_a_staff_account() {
+async fn the_reads_demand_a_token_of_an_admin_account() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -212,7 +247,7 @@ async fn the_reads_demand_a_token_of_a_staff_account() {
 
         let outsider = get_with(&app, &path, &user_token).await;
         common::assert_answer(&outsider, StatusCode::FORBIDDEN, "a non-staff token");
-        common::assert_error(&outsider, NOT_STAFF, "a non-staff token");
+        common::assert_error(&outsider, NOT_ADMIN, "a non-admin token");
     }
 }
 

@@ -1,5 +1,5 @@
 //! Scenario 5: the admin/staff boundary. The staff surface (reports and
-//! statuses) accepts a moderator bearer and the admin surface refuses it
+//! status writes) accepts a moderator bearer and the admin surface refuses it
 //! with the admin sentence in both directions; a plain registered user is
 //! refused the staff and admin surfaces alike, and real admin scopes on a
 //! non-staff account still fail the role gate; scope-bearing tokens answer
@@ -19,8 +19,8 @@ use crate::common;
 
 // ────────────────────  Scenario 5: the admin/staff boundary  ────────────────────
 
-/// The staff half of the admin API: reports and statuses, both directions —
-/// a moderator bearer walks it end to end.
+/// The staff half of the admin API: reports, plus the status writes (the
+/// status reads are admin-only) — a moderator bearer walks it end to end.
 async fn staff_half(world: &World, target: &Account, status_id: &str) {
     let base = format!("{P_ADMIN}/reports");
     let filed = common::api_post(
@@ -36,15 +36,6 @@ async fn staff_half(world: &World, target: &Account, status_id: &str) {
         (
             "the report listing",
             common::api_get(&world.app, Some(&world.moderator), &base).await,
-        ),
-        (
-            "the status listing",
-            common::api_get(
-                &world.app,
-                Some(&world.moderator),
-                &format!("{P_ADMIN}/statuses"),
-            )
-            .await,
         ),
         (
             "a status edit",
@@ -109,6 +100,15 @@ async fn admin_half_denied(world: &World) {
                 Some(&world.moderator),
                 &format!("{USERS}/deactivate"),
                 &json!({"nicknames": ["root"]}),
+            )
+            .await,
+        ),
+        (
+            "the status listing",
+            common::api_get(
+                &world.app,
+                Some(&world.moderator),
+                &format!("{P_ADMIN}/statuses"),
             )
             .await,
         ),

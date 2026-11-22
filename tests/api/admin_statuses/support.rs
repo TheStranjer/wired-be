@@ -27,8 +27,8 @@ const ADMIN: &str = "/api/v1/pleroma/admin";
 const LEDGER: &str = "/api/v1/pleroma/admin/statuses";
 /// The 401 body when no token is presented.
 const NO_TOKEN: &str = "Invalid credentials";
-/// The 403 body for a valid token whose user is not staff.
-const NOT_STAFF: &str = "User is not a staff member.";
+/// The 403 body for a valid token whose user is not an admin.
+const NOT_ADMIN: &str = "User is not an admin.";
 /// The 403 body for an app-only (user-unbound) token.
 const USER_REQUIRED: &str = "This API requires an authenticated user";
 /// The 403 body of a token that grants neither `admin:read` nor
