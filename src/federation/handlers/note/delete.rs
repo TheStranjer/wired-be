@@ -1,0 +1,241 @@
+//! The `Delete` fold: a sender's own post withdrawn, or its tombstone
+//! reserved for a post never seen.
+
+use tracing::debug;
+
+#[cfg(doc)]
+use super::delete_note;
+use super::transient;
+use crate::{
+    federation::{
+        dispatch::{ActivityView, FederationError, Outcome},
+        handlers::actor,
+    },
+    models::{
+        status::{self, Status},
+        user::User,
+    },
+    services::delete_status,
+    state::AppState,
+};
+
+/// The body of [`delete_note`]: the sender's own id back to the actor
+/// handler, everything else folded as a status withdrawal.
+pub(super) async fn apply_delete(
+    state: AppState,
+    view: ActivityView,
+    signer: User,
+) -> Result<Outcome, FederationError> {
+    let Some(object_id) = view.object.id() else {
+        return Ok(Outcome::Ignored("a Delete whose object names no id"));
+    };
+    if object_id == view.actor {
+        return actor::delete_actor(state, view, signer).await;
+    }
+    let stored = status::get_by_uri(&state.db, object_id)
+        .await
+        .map_err(|err| transient("the status uri read", &err))?;
+    withdraw(&state, &signer, object_id, stored).await
+}
+
+/// The fold of [`apply_delete`]'s read: the author's live post deleted
+/// through the shared service, an already withdrawn one restated, somebody
+/// else's post nobody may withdraw, and an unseen object reserved as a
+/// tombstone so its late `Create` is swallowed.
+async fn withdraw(
+    state: &AppState,
+    signer: &User,
+    uri: &str,
+    stored: Option<Status>,
+) -> Result<Outcome, FederationError> {
+    match stored {
+        Some(row) if row.user_id != signer.id => {
+            debug!(
+                status = %row.id,
+                account = %signer.ap_id,
+                "a Delete by an account other than the post's author; ignoring"
+            );
+            Ok(Outcome::Ignored(
+                "a Delete by someone other than the author",
+            ))
+        }
+        Some(row) if row.deleted_at.is_some() => Ok(Outcome::Ignored("an already deleted status")),
+        Some(row) => {
+            let deleted = delete_status::delete_status(state, &row)
+                .await
+                .map_err(|err| transient("the status delete", &err))?;
+            if deleted {
+                debug!(status = %row.id, "a Delete folded a remote status withdrawal");
+                Ok(Outcome::Handled)
+            } else {
+                Ok(Outcome::Ignored("an already deleted status"))
+            }
+        }
+        None => {
+            let reserved = status::insert_tombstone(&state.db, uri, signer.id)
+                .await
+                .map_err(|err| transient("the tombstone reservation", &err))?;
+            match reserved {
+                Some(row) => {
+                    debug!(
+                        status = %row.id,
+                        uri, "a Delete of an unstored status reserved its tombstone"
+                    );
+                    Ok(Outcome::Handled)
+                }
+                None => Ok(Outcome::Ignored("the object's tombstone was already there")),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::super::test_support::{
+        BOB, app_state, author, author_again, live_content, mirrored, note, other, rows_for_uri,
+        view_of,
+    };
+    use super::super::{delete_note, update_note};
+    use super::*;
+    use crate::models::user;
+
+    #[tokio::test]
+    async fn the_delete_soft_deletes_the_authors_post() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/gone-1";
+        drop(mirrored(&pool, &author, uri, "doomed").await);
+
+        let outcome = delete_note(
+            state.clone(),
+            view_of("Delete", json!(uri), None),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the withdrawal is folded");
+        assert!(
+            live_content(&pool, uri).await.is_none(),
+            "the post is no longer live"
+        );
+        let tombstone = status::get_by_uri(&pool, uri)
+            .await
+            .expect("the uri read")
+            .expect("the row stays");
+        assert!(tombstone.deleted_at.is_some(), "as a tombstone");
+
+        let again = delete_note(state, view_of("Delete", json!(uri), None), author)
+            .await
+            .expect("the second fold completes");
+        assert_eq!(
+            again,
+            Outcome::Ignored("an already deleted status"),
+            "and the second sight moves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_of_an_unknown_object_leaves_a_tombstone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/deleted-before-arrival";
+
+        let outcome = delete_note(
+            state.clone(),
+            view_of("Delete", json!(uri), None),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the tombstone is reserved");
+        assert_eq!(
+            rows_for_uri(&pool, uri).await,
+            1,
+            "exactly one row carries the uri"
+        );
+
+        // A `Create` of the same object now meets the reserved tombstone in
+        // the ingest's dedupe read and is swallowed; the update path routes
+        // an unknown-to-edit object through that same ingest, so it answers
+        // identically here.
+        let swallowed = update_note(state, view_of("Create", note(uri, json!({})), None), author)
+            .await
+            .expect("the late activity completes");
+        assert_eq!(
+            swallowed,
+            Outcome::Ignored("tombstoned"),
+            "the ingest's tombstone check ignores the post that arrives after its delete"
+        );
+        assert_eq!(
+            rows_for_uri(&pool, uri).await,
+            1,
+            "and no live status re-appears"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_by_somebody_else_is_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let erin = other(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/not-yours";
+        drop(mirrored(&pool, &author, uri, "still here").await);
+
+        let outcome = delete_note(
+            state,
+            view_of("Delete", json!(uri), Some(erin.ap_id.as_str())),
+            erin,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(
+            outcome,
+            Outcome::Ignored("a Delete by someone other than the author"),
+            "one account does not withdraw another's post"
+        );
+        assert_eq!(
+            live_content(&pool, uri).await.as_deref(),
+            Some("<p>still here</p>"),
+            "and the post stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fallback_hands_the_actors_own_id_to_the_actor_handler() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let signer = author(&pool).await;
+        let signer_id = signer.id;
+
+        let outcome = delete_note(state, view_of("Delete", json!(BOB), None), signer)
+            .await
+            .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the self-delete was folded");
+        let retired = user::get_by_id(&pool, signer_id)
+            .await
+            .expect("the account read")
+            .expect("the account is still stored");
+        assert!(
+            !retired.is_active.get(),
+            "and the actor handler retired it, not this fold"
+        );
+        assert_eq!(
+            rows_for_uri(&pool, BOB).await,
+            0,
+            "and no tombstone status shadows the actor id"
+        );
+    }
+}

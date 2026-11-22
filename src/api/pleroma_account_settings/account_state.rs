@@ -1,0 +1,132 @@
+//! Departure: deleting and disabling the account.
+
+use axum::{Json, extract::State};
+use serde_json::Value;
+use tracing::debug;
+
+use super::{
+    DELETION_DISABLED, INVALID_PASSWORD, PasswordParams, error_body, password_accepted,
+    success_body,
+};
+use crate::{
+    auth::AuthUser,
+    error::{AppError, AppResult},
+    extract::ApiBody,
+    jobs::{QUEUE_BACKGROUND, deletion},
+    models::{
+        job::{NewJob, enqueue},
+        oauth_token,
+        user::{self, User},
+    },
+    oauth::scopes::WRITE_ACCOUNTS,
+    services::federation_out,
+    state::AppState,
+};
+
+/// `POST /api/pleroma/delete_account` — start deleting the account. The
+/// config gate comes first: on an instance that switched deletion off
+/// the endpoint answers 403 `{"error":"Account deletion is disabled"}`
+/// whatever else the request said. Past it, the password gate, then the
+/// start: the account is deactivated with `deleted_at` stamped and all
+/// its tokens — the presenting one included — revoked in one transaction,
+/// the [`users.delete`](deletion::KIND_DELETE) sweep is queued on
+/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
+/// sweep's own first act (see
+/// [`federation_out::after_account_deleted`](crate::services::federation_out::after_account_deleted)),
+/// not the endpoint's: the announcement reads the relationship rows the
+/// sweep is about to clear, and a client that gets this 200 must not wait
+/// on either.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`],
+/// the `write:accounts` check and the config gate. A wrong password is
+/// the 200 error body. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+pub(super) async fn delete_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<PasswordParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !state.config.allow_account_deletion.get() {
+        return Err(AppError::Forbidden(DELETION_DISABLED.to_owned()));
+    }
+    if !password_accepted(&auth.0, &params.password) {
+        return Ok(error_body(INVALID_PASSWORD));
+    }
+    let revoked = mark_and_revoke_all(&state, &auth.0).await?;
+    let queued = enqueue(
+        &state.db,
+        NewJob {
+            queue: QUEUE_BACKGROUND,
+            kind: deletion::KIND_DELETE,
+            args: deletion::job_args(auth.0.id),
+            run_at: None,
+            max_attempts: None,
+            unique_key: None,
+        },
+    )
+    .await?;
+    debug!(
+        account = %auth.0.nickname,
+        revoked,
+        queued = queued.is_some(),
+        "account deletion started"
+    );
+    Ok(success_body())
+}
+
+/// The `delete_account` write: inactive with `deleted_at` stamped, and
+/// every token gone, as one transaction — a half-started deletion must
+/// not leave the account active or still signed in.
+async fn mark_and_revoke_all(state: &AppState, account: &User) -> AppResult<u64> {
+    let mut tx = state.db.begin().await?;
+    user::mark_deleted(&mut *tx, account.id).await?;
+    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
+
+/// `POST /api/pleroma/disable_account` — deactivate the account and keep
+/// its data (Pleroma's `User.set_activation(user, false)`): the same
+/// write as [`delete_account`]'s mark without the `deleted_at` stamp and
+/// without the sweep, and its tokens are revoked whole because a
+/// disabled account must not still be acting.
+///
+/// The account publishes nothing: a deactivation leaves the actor document
+/// resolvable so the posts and follows peers already hold keep rendering,
+/// and that decision lands in
+/// [`federation_out::after_account_disabled`](crate::services::federation_out::after_account_disabled)
+/// — the hook runs after a successful write and sends nothing, in this and
+/// every configuration, until a ticket says otherwise.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check. A wrong password is the 200 error
+/// body. Any database failure arrives through `?` as [`AppError::Database`].
+pub(super) async fn disable_account(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiBody(params): ApiBody<PasswordParams>,
+) -> AppResult<Json<Value>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    if !password_accepted(&auth.0, &params.password) {
+        return Ok(error_body(INVALID_PASSWORD));
+    }
+    let revoked = deactivate_and_revoke_all(&state, &auth.0).await?;
+    federation_out::after_account_disabled(&state, &auth.0);
+    debug!(account = %auth.0.nickname, revoked, "account disabled");
+    Ok(success_body())
+}
+
+/// The `disable_account` write: `is_active = false` and every token
+/// gone, as one transaction.
+async fn deactivate_and_revoke_all(state: &AppState, account: &User) -> AppResult<u64> {
+    let mut tx = state.db.begin().await?;
+    user::set_activation(&mut *tx, account.id, false).await?;
+    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
+    tx.commit().await?;
+    Ok(revoked)
+}
