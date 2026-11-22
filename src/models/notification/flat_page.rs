@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{error::AppResult, pagination::PageParams};
 
-use super::Notification;
+use super::{BLOCKED_CAUSES, MUTED_CAUSES, Notification};
 
 /// The client filters every filtered read shares: which types to show,
 /// which to hide, and which single actor's notifications to keep. All
@@ -56,39 +56,6 @@ pub(super) fn push_scope(qb: &mut QueryBuilder<Postgres>, user_id: Uuid) {
              (SELECT 1 FROM users au WHERE au.id = n.from_account_id AND au.is_active)",
     );
 }
-
-/// The `AND` fragments that hide what the recipient refused, in Pleroma's
-/// `for_user_query` behind `exclude_blocked`: actors the recipient blocked,
-/// and actors mirrored from a domain the recipient blocked, whatever
-/// `with_muted` says. Both read the recipient off `n.user_id`, so the
-/// fragment binds nothing; a local actor's `NULL` domain never equals a
-/// blocked-domain row, so only remote actors can be domain-hidden. Pleroma
-/// keeps notifications from a domain-blocked actor it still follows; this
-/// listing hides the whole domain, the fact the flag records.
-const BLOCKED_CAUSES: &str = "
-     AND NOT EXISTS (SELECT 1 FROM blocks bl
-                      WHERE bl.blocker_id = n.user_id
-                        AND bl.blocked_id = n.from_account_id)
-     AND NOT EXISTS (SELECT 1 FROM user_domain_blocks db
-                               JOIN users au ON au.id = n.from_account_id
-                            WHERE db.user_id = n.user_id
-                              AND db.domain = au.domain)";
-
-/// The `AND` fragments that hide what the recipient muted — the exclusions
-/// Pleroma's `exclude_notification_muted` skips when its `:with_muted`
-/// option is true: actors under a still-live mute that hides notifications
-/// (a plain timeline mute never hides anything here), and notifications
-/// about a status in a thread the recipient muted.
-const MUTED_CAUSES: &str = "
-     AND NOT EXISTS (SELECT 1 FROM mutes mu
-                      WHERE mu.muter_id = n.user_id
-                        AND mu.muted_id = n.from_account_id
-                        AND mu.hide_notifications
-                        AND (mu.expires_at IS NULL OR mu.expires_at > now()))
-     AND NOT EXISTS (SELECT 1 FROM conversation_mutes cm
-                               JOIN statuses cs ON cs.id = n.status_id
-                            WHERE cm.user_id = n.user_id
-                              AND cm.conversation_id = cs.conversation_id)";
 
 /// Everything [`page_for_user`] needs: whose notifications, filtered how,
 /// whether the recipient's own mutes hide them, and which page of rows.

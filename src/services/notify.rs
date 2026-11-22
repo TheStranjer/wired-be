@@ -59,10 +59,13 @@
 //! This root file keeps the module's shared creation plumbing — the
 //! tellers and the withdrawal arm every child calls.
 //!
-//! Every creation runs through [`notification::maybe_notify`], so the
-//! recipient's `block_from_strangers` setting withholds what it withholds
-//! and the exempt [`TYPE_FOLLOW_REQUEST`](crate::models::notification::TYPE_FOLLOW_REQUEST)
-//! alone reaches a gated account through it. Before that, this module's own
+//! Every creation runs through [`notification::maybe_notify`], so what the
+//! recipient refuses never becomes a row — an actor they blocked, an actor
+//! of a domain they blocked, an actor under a live notification mute, a
+//! status in a thread they muted ([`notification::recipient_refuses`]) — and
+//! their `block_from_strangers` setting withholds what it withholds, the
+//! exempt [`TYPE_FOLLOW_REQUEST`](crate::models::notification::TYPE_FOLLOW_REQUEST)
+//! alone reaching a gated account through it. Before that, this module's own
 //! rules: a notification goes only to a **local** user (the remote one's
 //! instance is told by federation, not by a row), and nobody is notified of
 //! their own action — the one exemption is [`on_poll_ended`]'s author, whose
@@ -71,11 +74,12 @@
 //! recipient queues its Web Push deliveries — one
 //! [`push.deliver`](crate::jobs::web_push::KIND_DELIVER) job per registered
 //! subscription, [`web_push::enqueue_deliveries`] — best-effort, since the
-//! inbox row stands whatever the push service does. Blocked and muted
-//! actors are not filtered here — the reads of
-//! [`crate::models::notification`] hide their rows (Pleroma's
-//! `for_user_query`), which also retroactively suppresses tellings made
-//! before the relationship was drawn.
+//! inbox row stands whatever the push service does. A refused telling
+//! creates no row, so `announce` publishes no stream event and queues no
+//! push job for it (Pleroma's `get_notified_from_activity` drops these
+//! receivers first). The reads of [`crate::models::notification`] still
+//! hide the same causes (Pleroma's `for_user_query`), which retroactively
+//! suppresses tellings made before the relationship was drawn.
 //!
 //! The tellings are best-effort, exactly like the delete service's
 //! [`after_status_deleted`](crate::services::delete_status): the action
@@ -253,7 +257,7 @@ mod tests {
         models::user::{self, NewUser},
         services::notify::test_support::{
             BASE, app_state, ballot, followed, local, poll_on, post, push_jobs, push_token,
-            reacted, register_push, rows,
+            reacted, register_push, remote, rows,
         },
     };
 
@@ -376,5 +380,174 @@ mod tests {
             "even the self-exempt closing reaches a gated author only as \
              the setting allows, which for an unfollowed actor it does not"
         );
+    }
+
+    /// `author` posting a status that mentions `target`, as the create
+    /// service stores it.
+    async fn mention_of(
+        pool: &sqlx::PgPool,
+        author: &User,
+        target: &User,
+    ) -> crate::models::status::Status {
+        crate::models::status::insert(
+            pool,
+            BASE,
+            &crate::models::status::NewStatus {
+                mentioned_user_ids: vec![target.id],
+                ..crate::models::status::NewStatus::local(author, "hello there")
+            },
+        )
+        .await
+        .expect("the mention status inserts")
+    }
+
+    /// A recipient with one push subscription, for the refusal tests.
+    async fn subscribed(pool: &sqlx::PgPool, nickname: &str) -> User {
+        let recipient = local(pool, nickname).await;
+        let token_id = push_token(pool, recipient.id, &format!("{nickname}-app")).await;
+        let _sub = register_push(pool, &recipient, token_id).await;
+        recipient
+    }
+
+    #[tokio::test]
+    async fn a_blocked_actors_mention_makes_no_row_stream_event_or_push_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = subscribed(pool, "rf-alice").await;
+        let mallory = local(pool, "rf-mallory").await;
+        let _block = crate::models::block::block(pool, BASE, &alice, &mallory)
+            .await
+            .expect("the block lands");
+        let mut rx = state.hub.subscribe();
+
+        let status = mention_of(pool, &mallory, &alice).await;
+        on_mention(&state, &status).await;
+
+        assert!(rows(pool, alice.id).await.is_empty(), "no notification row");
+        assert!(push_jobs(pool).await.is_empty(), "no push.deliver job");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "no stream event was published"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_domain_blocked_actors_mention_makes_no_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = subscribed(pool, "rd-alice").await;
+        let mallory = remote(pool, "rd-mallory", "evil.example").await;
+        crate::models::domain_block::block_domain(pool, alice.id, "evil.example")
+            .await
+            .expect("the domain block lands");
+
+        let status = mention_of(pool, &mallory, &alice).await;
+        on_mention(&state, &status).await;
+
+        assert!(rows(pool, alice.id).await.is_empty(), "no notification row");
+        assert!(push_jobs(pool).await.is_empty(), "and no push job");
+    }
+
+    #[tokio::test]
+    async fn only_a_live_notification_mute_refuses_the_telling() {
+        use crate::models::mute::{self, MuteOptions};
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "rm-alice").await;
+        let bob = local(pool, "rm-bob").await;
+
+        let _hiding = mute::mute(pool, &alice, &bob, MuteOptions::default())
+            .await
+            .expect("the hiding mute lands");
+        let status = mention_of(pool, &bob, &alice).await;
+        on_mention(&state, &status).await;
+        assert!(
+            rows(pool, alice.id).await.is_empty(),
+            "a mute that hides notifications refuses the mention"
+        );
+
+        let _timeline = mute::mute(
+            pool,
+            &alice,
+            &bob,
+            MuteOptions {
+                notifications: false,
+                expires_in: None,
+            },
+        )
+        .await
+        .expect("the timeline-only mute replaces it");
+        on_mention(&state, &status).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            1,
+            "a timeline-only mute lets the mention through"
+        );
+
+        let _dismissed = notification::delete_all_for_user(pool, alice.id)
+            .await
+            .expect("the rows clear");
+        let _hiding_again = mute::mute(pool, &alice, &bob, MuteOptions::default())
+            .await
+            .expect("the hiding mute returns");
+        let _expired = sqlx::query("UPDATE mutes SET expires_at = now() - interval '1 hour'")
+            .execute(pool)
+            .await
+            .expect("the mute is back-dated");
+        on_mention(&state, &status).await;
+        assert_eq!(
+            rows(pool, alice.id).await.len(),
+            1,
+            "an expired mute refuses nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_muted_thread_refuses_the_favourite() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "rt-alice").await;
+        let bob = local(pool, "rt-bob").await;
+        let original = post(pool, &alice, "mute this thread").await;
+        crate::models::conversation_mute::mute(pool, alice.id, original.conversation_id)
+            .await
+            .expect("the thread mute lands");
+
+        let liked = crate::models::favourite::favourite(pool, BASE, bob.id, original.id)
+            .await
+            .expect("the favourite writes")
+            .expect("the pair was free");
+        on_favourite(&state, &liked, true).await;
+
+        assert!(
+            rows(pool, alice.id).await.is_empty(),
+            "a favourite in a muted thread writes no row"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_pair_is_still_told() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = subscribed(pool, "ru-alice").await;
+        let bob = local(pool, "ru-bob").await;
+        let carol = local(pool, "ru-carol").await;
+        let _block = crate::models::block::block(pool, BASE, &alice, &carol)
+            .await
+            .expect("an unrelated block lands");
+
+        let status = mention_of(pool, &bob, &alice).await;
+        on_mention(&state, &status).await;
+
+        assert_eq!(rows(pool, alice.id).await.len(), 1, "the mention lands");
+        assert_eq!(push_jobs(pool).await.len(), 1, "and queues its push job");
     }
 }
