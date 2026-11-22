@@ -18,7 +18,15 @@
 //!    rows go through the per-table `delete_all_for_user` writers, each
 //!    taking exactly what a hard delete of the user row would have
 //!    cascaded;
-//! 3. the user row itself is kept for referential integrity — decision 7
+//! 3. its scheduled statuses are deleted and each one's pending
+//!    `scheduled_statuses.publish` job is cancelled, so nothing fires as the
+//!    deleted actor;
+//! 4. its backups lose their stored archives first (an already-missing file
+//!    counts as gone, any other failure retries the pass) and then their
+//!    rows, so the archived direct messages stop being served;
+//! 5. its Web Push subscriptions go, the user row being kept and no cascade
+//!    firing;
+//! 6. the user row itself is kept for referential integrity — decision 7
 //!    hangs mirrors, activities and relationships off it — but its
 //!    personal data (email, password hash, display name) is replaced with
 //!    empty values, Pleroma's `purge` step.
