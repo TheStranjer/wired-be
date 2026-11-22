@@ -17,6 +17,7 @@ fn upstream(status: u16, headers: &[(&str, &str)], body: &[u8]) -> HttpResponse 
     HttpResponse {
         status,
         headers: map,
+        url: url::Url::parse("http://test.example/").unwrap(),
         body: bytes::Bytes::copy_from_slice(body),
     }
 }

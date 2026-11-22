@@ -214,6 +214,15 @@ pub(super) async fn hop(State(peer): State<Peer>) -> Response {
         .unwrap()
 }
 
+/// A 301 to the `Location` held in the route's state.
+pub(super) async fn redirect_to(State(location): State<String>) -> Response {
+    Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
 /// Moves a stored mirror's fetch stamp outside the refresh window.
 pub(super) async fn make_stale(pool: &PgPool, ap_id: &str) {
     sqlx::query("UPDATE users SET last_fetched_at = now() - interval '25 hours' WHERE ap_id = $1")
