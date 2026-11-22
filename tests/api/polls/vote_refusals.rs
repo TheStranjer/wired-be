@@ -140,6 +140,42 @@ async fn a_choice_index_naming_no_option_is_invalid_indices() {
     assert_eq!(stand.voters_count, 0);
 }
 
+/// A ballot listing more than 1000 choices is refused as invalid indices
+/// before any per-choice work runs, even when every entry is a valid
+/// index. Nothing is written.
+#[tokio::test]
+async fn a_ballot_with_more_than_a_thousand_choices_is_invalid_indices() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let (_bob, bob_token) = user_with_token(&pool, "bob", "write:statuses").await;
+    let app = common::test_app(pool.clone());
+
+    let poll_id = ballot(&app, &token, json!({})).await;
+    let oversized: Vec<i32> = (0..1001).collect();
+    refused_vote(
+        &app,
+        &bob_token,
+        &poll_id,
+        json!({"choices": oversized}),
+        (BAD_INDEX, "1001 choices"),
+    )
+    .await;
+    let all_valid = vec![0; 1001];
+    refused_vote(
+        &app,
+        &bob_token,
+        &poll_id,
+        json!({"choices": all_valid}),
+        (BAD_INDEX, "1001 copies of a valid index"),
+    )
+    .await;
+    assert_eq!(mark_rows(&pool, &poll_id).await, 0, "nothing landed");
+    let stand = poll_row(&pool, &poll_id).await;
+    assert_eq!(stand.votes_count, 0);
+    assert_eq!(stand.voters_count, 0);
+}
+
 /// A second distinct index on a single-choice poll is the too-many
 /// refusal — after deduplication, so a doubled index passes while two
 /// real choices do not — and the range rule answers first when both
