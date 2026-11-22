@@ -10,6 +10,7 @@ use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
         handlers::actor,
+        json,
     },
     models::{
         status::{self, Status},
@@ -41,7 +42,8 @@ pub(super) async fn apply_delete(
 /// The fold of [`apply_delete`]'s read: the author's live post deleted
 /// through the shared service, an already withdrawn one restated, somebody
 /// else's post nobody may withdraw, and an unseen object reserved as a
-/// tombstone so its late `Create` is swallowed.
+/// tombstone so its late `Create` is swallowed, provided the object is on
+/// the signer's own host (a foreign host's object is ignored, writing nothing).
 async fn withdraw(
     state: &AppState,
     signer: &User,
@@ -72,6 +74,16 @@ async fn withdraw(
             }
         }
         None => {
+            let uri_host = json::http_host(uri);
+            if uri_host.is_none() || uri_host != json::http_host(&signer.ap_id) {
+                debug!(
+                    account = %signer.ap_id,
+                    uri, "a Delete of an unstored object on another host; reserving nothing"
+                );
+                return Ok(Outcome::Ignored(
+                    "a Delete of a foreign object this instance never stored",
+                ));
+            }
             let reserved = status::insert_tombstone(&state.db, uri, signer.id)
                 .await
                 .map_err(|err| transient("the tombstone reservation", &err))?;
@@ -140,7 +152,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delete_of_an_unknown_object_leaves_a_tombstone() {
+    async fn a_delete_of_an_unstored_same_host_object_reserves_its_tombstone() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let state = app_state(&pool);
@@ -179,6 +191,111 @@ mod tests {
             1,
             "and no live status re-appears"
         );
+    }
+
+    /// A stored remote account `nick` on `host`.
+    async fn remote_on(pool: &sqlx::PgPool, host: &str, nick: &str) -> User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                nickname: format!("{nick}@{host}"),
+                ap_id: format!("https://{host}/users/{nick}"),
+                local: user::Flag::new(false),
+                domain: Some(host.to_owned()),
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote account fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn a_delete_of_an_unstored_foreign_object_reserves_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let signer = remote_on(&pool, "peer.example", "m").await;
+        let uri = "https://other.example/notes/1";
+        let actor = signer.ap_id.clone();
+
+        let outcome = delete_note(
+            state,
+            view_of("Delete", json!(uri), Some(actor.as_str())),
+            signer,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(
+            outcome,
+            Outcome::Ignored("a Delete of a foreign object this instance never stored"),
+            "a host cannot reserve another host's object"
+        );
+        assert_eq!(rows_for_uri(&pool, uri).await, 0, "and nothing is written");
+    }
+
+    #[tokio::test]
+    async fn a_delete_of_an_unstored_object_with_no_host_reserves_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let signer = author(&pool).await;
+        let uri = "urn:example:not-a-url";
+
+        let outcome = delete_note(state, view_of("Delete", json!(uri), None), signer)
+            .await
+            .expect("the fold completes");
+
+        assert_eq!(
+            outcome,
+            Outcome::Ignored("a Delete of a foreign object this instance never stored"),
+            "an id with no http host matches no signer"
+        );
+        assert_eq!(rows_for_uri(&pool, uri).await, 0, "and nothing is written");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_delete_does_not_block_a_later_create() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let evil = remote_on(&pool, "peer.example", "m").await;
+        let real = remote_on(&pool, "other.example", "alice").await;
+        let uri = "https://other.example/notes/1";
+        let evil_actor = evil.ap_id.clone();
+
+        let refused = delete_note(
+            state.clone(),
+            view_of("Delete", json!(uri), Some(evil_actor.as_str())),
+            evil,
+        )
+        .await
+        .expect("the foreign delete completes");
+        assert_eq!(
+            refused,
+            Outcome::Ignored("a Delete of a foreign object this instance never stored"),
+            "the foreign delete is refused"
+        );
+
+        let real_actor = real.ap_id.clone();
+        let created = update_note(
+            state,
+            view_of(
+                "Create",
+                note(uri, json!({ "attributedTo": real_actor })),
+                Some(real_actor.as_str()),
+            ),
+            real,
+        )
+        .await
+        .expect("the create completes");
+
+        assert_eq!(
+            created,
+            Outcome::Handled,
+            "the real author's post still arrives"
+        );
+        assert_eq!(rows_for_uri(&pool, uri).await, 1, "as one live row");
     }
 
     #[tokio::test]
