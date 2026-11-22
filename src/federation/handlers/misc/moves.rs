@@ -15,7 +15,7 @@ use crate::{
         block, follow,
         user::{self, User},
     },
-    services::notify,
+    services::{federation_out, notify},
     state::AppState,
 };
 
@@ -118,7 +118,9 @@ async fn migrate_followers(
 /// account, then unfollow the old — and neither for a pair that has
 /// blocked the target, which keeps its relationship whole (the same
 /// nothing-halfway rule the account-move endpoint's transfer states, see
-/// [`crate::api::pleroma_account_settings`]).
+/// [`crate::api::pleroma_account_settings`]). Each write is then announced
+/// through [`federation_out::after_follow_changed`]: the `Follow` of a remote
+/// target and the `Undo` to the origin, as the follow endpoints do.
 async fn migrate_one_follower(
     state: &AppState,
     follower: &User,
@@ -135,12 +137,21 @@ async fn migrate_one_follower(
         );
         return Ok(());
     }
-    let _opened = follow::follow(&state.db, &state.config.base_url, follower, target)
+    let opened = follow::follow(&state.db, &state.config.base_url, follower, target)
         .await
         .map_err(|err| transient("migrated follow", &err))?;
-    let _lifted = follow::unfollow(&state.db, follower, origin)
+    federation_out::after_follow_changed(state, follower, target, Some(&opened), true).await;
+    // The row the delete removes is read while it still exists: the `Undo`
+    // names the stored `Follow` activity, and `unfollow` answers only
+    // whether a row was there.
+    let previous = follow::get(&state.db, follower.id, origin.id)
+        .await
+        .map_err(|err| transient("migrated unfollow lookup", &err))?;
+    let lifted = follow::unfollow(&state.db, follower, origin)
         .await
         .map_err(|err| transient("migrated unfollow", &err))?;
+    let removed = previous.filter(|_| lifted);
+    federation_out::after_follow_changed(state, follower, origin, removed.as_ref(), false).await;
     Ok(())
 }
 
@@ -457,6 +468,161 @@ mod tests {
         assert!(
             ignored(gone_target).contains("cannot be resolved"),
             "a target with no actor behind it moves nobody"
+        );
+    }
+
+    /// Gives every mirror in the database a personal inbox, so a delivery
+    /// to it has somewhere to be addressed.
+    async fn give_inboxes(pool: &PgPool) {
+        let _stamped = sqlx::query("UPDATE users SET inbox = ap_id || '/inbox' WHERE NOT local")
+            .execute(pool)
+            .await
+            .expect("the fixture stamps the inboxes");
+    }
+
+    /// The args of every queued `federator.deliver` job, oldest first.
+    async fn deliveries(pool: &PgPool) -> Vec<serde_json::Value> {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id",
+        )
+        .bind(crate::federation::delivery::KIND_DELIVER)
+        .fetch_all(pool)
+        .await
+        .expect("the delivery jobs read")
+    }
+
+    /// The count of jobs of any kind.
+    async fn job_total(pool: &PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+            .fetch_one(pool)
+            .await
+            .expect("the job count")
+    }
+
+    /// A migrated local follower's re-follow of a remote target is sent to
+    /// the target as a `Follow`, and its withdrawal from the origin as an
+    /// `Undo` of the stored `Follow` — one pair for `bob`, nothing for the
+    /// blocked or the remote follower.
+    #[tokio::test]
+    async fn a_move_to_a_remote_target_queues_a_follow_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let scene = move_scenario(&pool).await;
+        give_inboxes(&pool).await;
+        let old_follow = follow::get(&pool, scene.bob, scene.alice)
+            .await
+            .unwrap()
+            .expect("bob follows the origin");
+        let bob = fresh_user(&pool, scene.bob).await;
+
+        let moved = handle_move(
+            state,
+            move_activity("move-1"),
+            fresh_user(&pool, scene.alice).await,
+        )
+        .await;
+        assert_handled(&moved);
+
+        let jobs = deliveries(&pool).await;
+        assert_eq!(jobs.len(), 2, "one Follow and one Undo, for bob alone");
+        let sent_follow = jobs
+            .iter()
+            .find(|job| job["body"]["type"] == "Follow")
+            .expect("a Follow was queued");
+        assert_eq!(sent_follow["inbox"], format!("{CAROL}/inbox"));
+        assert_eq!(sent_follow["body"]["actor"], bob.ap_id);
+        assert_eq!(sent_follow["body"]["object"], CAROL);
+        let new_follow = follow::get(&pool, scene.bob, scene.carol.id)
+            .await
+            .unwrap()
+            .expect("the new follow is stored");
+        assert_eq!(
+            sent_follow["body"]["id"].as_str(),
+            new_follow.ap_id.as_deref(),
+            "the Follow carries the stored row's id"
+        );
+        let sent_undo = jobs
+            .iter()
+            .find(|job| job["body"]["type"] == "Undo")
+            .expect("an Undo was queued");
+        assert_eq!(sent_undo["inbox"], format!("{ALICE}/inbox"));
+        assert_eq!(sent_undo["body"]["actor"], bob.ap_id);
+        assert_eq!(sent_undo["body"]["object"]["type"], "Follow");
+        assert_eq!(sent_undo["body"]["object"]["object"], ALICE);
+        assert_eq!(
+            sent_undo["body"]["object"]["id"].as_str(),
+            old_follow.ap_id.as_deref(),
+            "the Undo names the stored old Follow"
+        );
+    }
+
+    /// With federation off the follower still migrates, but no job is queued.
+    #[tokio::test]
+    async fn a_move_with_federation_disabled_queues_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut state = app_state(&pool);
+        let mut config = crate::config::Config::for_tests();
+        config.federation_enabled = crate::config::Toggle::new(false);
+        state.config = std::sync::Arc::new(config);
+        let scene = move_scenario(&pool).await;
+        give_inboxes(&pool).await;
+
+        let moved = handle_move(
+            state,
+            move_activity("move-1"),
+            fresh_user(&pool, scene.alice).await,
+        )
+        .await;
+        assert_handled(&moved);
+
+        assert!(
+            follow::get(&pool, scene.bob, scene.carol.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the follow still moves"
+        );
+        assert_eq!(job_total(&pool).await, 0, "and nothing is queued");
+    }
+
+    /// A follower blocked with the target keeps its follow of the origin
+    /// and sends nothing.
+    #[tokio::test]
+    async fn a_blocked_follower_is_not_migrated_and_nothing_is_sent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = remote_signer(&pool).await;
+        let carol = move_target(&pool, &[ALICE]).await;
+        let erin = local_user(&pool, "blocked-erin").await;
+        accepted_follow(&pool, &erin, &alice).await;
+        let _blocked = block::block(&pool, BASE, &erin, &carol)
+            .await
+            .expect("the blocked-pair fixture stores");
+        give_inboxes(&pool).await;
+        let before = job_total(&pool).await;
+
+        let alice_id = alice.id;
+        let moved = handle_move(state, move_activity("move-1"), alice).await;
+        assert_handled(&moved);
+
+        assert!(
+            follow::get(&pool, erin.id, alice_id)
+                .await
+                .unwrap()
+                .is_some()
+                && follow::get(&pool, erin.id, carol.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+            "the blocked pair keeps its old follow and gains no new one"
+        );
+        assert_eq!(
+            job_total(&pool).await,
+            before,
+            "so nothing is sent to either account"
         );
     }
 }
