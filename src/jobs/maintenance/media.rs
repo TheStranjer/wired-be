@@ -1,6 +1,7 @@
 //! The orphaned-media sweep: one six-hourly pass over the locally stored
 //! media rows no status ever claimed — unposted, not a mirror of a remote
-//! file, older than `MEDIA_STALE_HOURS` and carried by no chat message.
+//! file, older than `MEDIA_STALE_HOURS` and carried by neither a chat
+//! message nor a pending scheduled status.
 //!
 //! [`handle_sweep_media`] is the [`JobRegistry`](crate::jobs::JobRegistry)
 //! handler of job kind [`KIND_MEDIA`]; `sweep_media` walks the backlog behind
@@ -46,14 +47,13 @@ const MEDIA_BATCH_SIZE: i64 = 200;
 /// this instance stores, not a mirror of a remote one), and `inserted_at`
 /// beyond [`MEDIA_STALE_HOURS`] hours ago. The `NOT EXISTS` arm skips the
 /// media a live chat message still carries through
-/// `attachment_media_id` — the one other stored reference to unposted
-/// media in today's schema (`migrations/1791714489_chats.sql`).
-///
-/// The exclusion grows when the scheduled-statuses ticket lands: media
-/// kept for a not-yet-due post will need the same guard against that
-/// table. `scheduled_at` is only a deferred parameter in
-/// `src/services/create_status.rs` today, so no table exists to name here
-/// yet and this statement deliberately names none.
+/// `attachment_media_id`, the first stored reference to unposted media
+/// (`migrations/1791714489_chats.sql`). The second `NOT EXISTS` arm skips
+/// media a pending scheduled status reserves: such media stays `status_id
+/// IS NULL` until publish and is named only inside the scheduled row's
+/// `params -> 'media_ids'` array, tested with the same containment as
+/// `reserved_media_ids` (`src/models/scheduled_status/limits_due.rs`).
+/// Ids under any other key, such as `in_reply_to_id`, do not reserve.
 const SWEEP_MEDIA_CANDIDATES_SQL: &str = "SELECT id, storage_key FROM media_attachments
          WHERE status_id IS NULL
            AND remote_url IS NULL
@@ -62,6 +62,10 @@ const SWEEP_MEDIA_CANDIDATES_SQL: &str = "SELECT id, storage_key FROM media_atta
            AND NOT EXISTS (
                SELECT 1 FROM chat_messages cm
                 WHERE cm.attachment_media_id = media_attachments.id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM scheduled_statuses ss
+                WHERE ss.params -> 'media_ids' @> jsonb_build_array(media_attachments.id::text)
            )
          ORDER BY id
          LIMIT $3";

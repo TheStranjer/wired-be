@@ -58,9 +58,10 @@
 //! six-hourly sweep of locally stored media no status ever claimed. The
 //! candidates are `status_id IS NULL` (unposted), `remote_url IS NULL`
 //! (this instance's own file, not a mirror), at least `MEDIA_STALE_HOURS`
-//! hours old, and not referenced by any
-//! `chat_messages` row — today the only other stored reference to unposted
-//! media (`attachment_media_id`, `migrations/1791714489_chats.sql`). Each
+//! hours old, and referenced by neither a `chat_messages` row
+//! (`attachment_media_id`, `migrations/1791714489_chats.sql`) nor a pending
+//! `scheduled_statuses` row (its id inside `params -> 'media_ids'`, the
+//! reservation that outlives the grace period until the post publishes). Each
 //! reclaimed row loses its stored file first, through
 //! [`UploaderBackend::delete`](crate::uploads::UploaderBackend::delete),
 //! and then itself; a file whose removal fails keeps its row for the next
