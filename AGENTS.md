@@ -4,7 +4,9 @@ Rules for anyone (human or AI) changing this codebase.
 
 ## The gate
 
-`scripts/ci.sh` runs every check: `cargo fmt --check`, Clippy, the tests, and rustdoc with warnings denied. It keeps going after a failure, so one run reports everything that's broken. It exits 0 only when all checks pass and 1 otherwise. `.github/workflows/ci.yml` runs this same script, so a green local run means a green pipeline. A change is not done until `scripts/ci.sh` exits 0. To add a check, add it to the script, not the workflow.
+`scripts/ci.sh` runs every check: a tracked-file length gate, `cargo fmt --check`, Clippy, the tests, and rustdoc with warnings denied. It keeps going after a failure, so one run reports everything that's broken. It exits 0 only when all checks pass and 1 otherwise. `.github/workflows/ci.yml` runs this same script, so a green local run means a green pipeline. A change is not done until `scripts/ci.sh` exits 0. To add a check, add it to the script, not the workflow.
+
+No tracked file may exceed 1,000 lines (`Cargo.lock` is exempt as generated); new code should aim for ≤500. When the gate flags a file, the fix is to split it into submodules, never to add an exemption.
 
 ## Commands you may run
 
