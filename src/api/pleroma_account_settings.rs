@@ -134,8 +134,6 @@ mod moves;
 #[cfg(test)]
 mod test_support;
 
-pub(crate) use moves::looks_like_ap_id;
-
 use self::{
     account_state::{delete_account, disable_account},
     aliases::{add_alias, delete_alias, list_aliases},
@@ -145,6 +143,15 @@ use self::{
 #[cfg(doc)]
 use crate::{auth::AuthUser, entities::relationship::Relationship, models::follow};
 use crate::{models::user::User, state::AppState, util::password::verify_password};
+
+/// Whether `text` is given as an `ActivityPub` actor id rather than an
+/// `acct` handle: a case-insensitive `http://` or `https://` prefix.
+/// Shared with [`crate::api::accounts`]' `POST /api/v1/follows`, which
+/// splits its `uri` parameter the same way.
+pub(crate) fn looks_like_ap_id(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
 
 /// 200 error body when the submitted password does not match the stored
 /// hash (Pleroma's `confirm_current_password` wording, period included —

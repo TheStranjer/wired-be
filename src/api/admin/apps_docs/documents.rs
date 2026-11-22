@@ -7,7 +7,7 @@ use axum::{
     Json,
     extract::{Path as AxumPath, State},
     http::header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE},
-    response::{IntoResponse, Response},
+    response::{IntoResponse as _, Response},
 };
 use bytes::Bytes;
 use tracing::debug;

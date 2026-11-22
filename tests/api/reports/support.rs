@@ -7,8 +7,7 @@ use uuid::Uuid;
 use wired_be::{
     federation::publisher,
     models::{
-        instance_rule,
-        report::{self},
+        instance_rule, report,
         status::Visibility,
         user::{Flag, NewUser, User},
     },

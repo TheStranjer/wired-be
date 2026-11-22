@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
-use super::{moves::looks_like_ap_id, success_body};
+use super::{looks_like_ap_id, success_body};
 use crate::{
     auth::AuthUser,
     entities::account::full_nickname,

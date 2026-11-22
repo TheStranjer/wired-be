@@ -182,15 +182,6 @@ pub(super) async fn resolve_move_target(state: &AppState, acct: &str) -> AppResu
     })
 }
 
-/// Whether `text` is given as an `ActivityPub` actor id rather than an
-/// `acct` handle: a case-insensitive `http://` or `https://` prefix.
-/// Shared with [`crate::api::accounts`]' `POST /api/v1/follows`, which
-/// splits its `uri` parameter the same way.
-pub(crate) fn looks_like_ap_id(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
-}
-
 /// The `ActivityPub.move` precondition: the target must have listed the
 /// moving account's own actor id among its aliases.
 fn target_lists_origin(target: &User, origin: &User) -> bool {
@@ -251,7 +242,10 @@ async fn after_account_moved(state: &AppState, old: &User, new: &User) {
 mod tests {
     use chrono::{Duration, Utc};
 
-    use super::super::test_support::{ALIAS, aliases, template_user};
+    use super::super::{
+        looks_like_ap_id,
+        test_support::{ALIAS, aliases, template_user},
+    };
     use super::*;
 
     #[test]
