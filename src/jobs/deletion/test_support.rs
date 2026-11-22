@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -12,16 +13,20 @@ use super::{handle_delete, handle_delete_remote, job_args};
 use crate::{
     config::{Config, TEST_BASE_URL},
     http_client::HttpClient,
-    jobs::{AttemptInfo, JobError},
+    jobs::{AttemptInfo, JobError, scheduled_statuses},
     models::{
-        bookmark,
+        backup, bookmark,
         emoji_reaction::{self, NewReaction},
         favourite::{self, Favourite},
         follow,
         list::{self, List, NewList},
         notification::{self, NewNotification, Notification},
+        oauth_app::{self, NewOauthApp},
+        oauth_token::{self, NewToken},
+        scheduled_status::{self, NewScheduledStatus, ScheduledStatus},
         status::{self, NewStatus, Status},
         user::{self, Flag, NewUser, User, insert, local_ap_id},
+        web_push_subscription::{self, NewSubscription},
     },
     state::AppState,
     uploads::UploaderBackend,
@@ -364,4 +369,107 @@ pub(super) async fn departed_mirror(pool: &PgPool) -> Departed {
         bobs_post,
         bobs_notification,
     }
+}
+
+/// Test state whose uploads live in a fresh temporary directory, with the
+/// directory's guard: the sweep deletes from that same directory, so the
+/// guard must outlive the run.
+pub(super) fn uploads_state(pool: &PgPool) -> (tempfile::TempDir, AppState) {
+    let dir = tempfile::TempDir::new().expect("a temp uploads dir");
+    let mut state = app_state(pool);
+    let mut config = Config::for_tests();
+    config.uploads_dir = dir.path().to_path_buf();
+    state.uploader = UploaderBackend::from(&config);
+    (dir, state)
+}
+
+/// A schedule of `owner` due tomorrow, with its publish job queued under
+/// the `sched:<id>` key, as the create endpoint leaves it.
+pub(super) async fn scheduled_with_job(state: &AppState, owner: &User) -> ScheduledStatus {
+    let row = scheduled_status::insert(
+        &state.db,
+        &NewScheduledStatus {
+            user_id: owner.id,
+            scheduled_at: Utc::now() + chrono::TimeDelta::days(1),
+            params: serde_json::json!({ "status": "later" }),
+        },
+    )
+    .await
+    .expect("the schedule fixture inserts");
+    scheduled_statuses::schedule(state, &row).await;
+    row
+}
+
+/// How many `available` jobs carry the unique key `key`.
+pub(super) async fn available_jobs_keyed(pool: &PgPool, key: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state = 'available' AND unique_key = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("the job count reads")
+}
+
+/// A processed backup of `owner` whose archive of `bytes` is stored in
+/// `state`'s uploader; answers the row and the key.
+pub(super) async fn processed_backup(
+    state: &AppState,
+    owner: &User,
+    bytes: &'static [u8],
+) -> (backup::Backup, String) {
+    let row = backup::create(&state.db, owner)
+        .await
+        .expect("the backup fixture creates");
+    let key = format!("backups/{}/{}", owner.id, row.id);
+    state
+        .uploader
+        .put(&key, Bytes::from_static(bytes), "application/zip")
+        .await
+        .expect("the archive fixture stores");
+    let size = i64::try_from(bytes.len()).expect("a fixture's length is an i64");
+    let marked = backup::mark_processed(&state.db, row.id, size, &key)
+        .await
+        .expect("the mark runs")
+        .expect("the requested row is there");
+    (marked, key)
+}
+
+/// Registers a push subscription for `owner` under a fresh app and token.
+pub(super) async fn push_subscription(pool: &PgPool, owner: &User, endpoint: &str) {
+    let app = oauth_app::create(
+        pool,
+        &NewOauthApp {
+            client_name: "Push Tester".to_owned(),
+            redirect_uris: "https://client.example/callback".to_owned(),
+            scopes: "push".to_owned(),
+            website: None,
+            user_id: Some(owner.id),
+        },
+    )
+    .await
+    .expect("the app fixture inserts");
+    let token = oauth_token::create_token(
+        pool,
+        &NewToken {
+            user_id: Some(owner.id),
+            app_id: app.id,
+            scopes: "push".to_owned(),
+            ttl: None,
+        },
+    )
+    .await
+    .expect("the token fixture inserts");
+    let _stored = web_push_subscription::create(
+        pool,
+        &NewSubscription {
+            user_id: owner.id,
+            token_id: token.id,
+            endpoint: endpoint.to_owned(),
+            key_p256dh: "BFraw-key".to_owned(),
+            key_auth: "auth_secret".to_owned(),
+            alerts: serde_json::json!({ "follow": true }),
+            policy: "all".to_owned(),
+        },
+    )
+    .await
+    .expect("the subscription fixture registers");
 }

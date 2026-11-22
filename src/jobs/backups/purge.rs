@@ -71,7 +71,11 @@ pub fn handle_purge(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
 /// [`super::maintenance`](crate::jobs::maintenance).
 ///
 /// [`UploaderBackend::delete`]: crate::uploads::UploaderBackend::delete
-async fn sweep_archive_file(state: &AppState, row: &backup::Backup, key: &str) -> bool {
+pub(in crate::jobs) async fn sweep_archive_file(
+    state: &AppState,
+    row: &backup::Backup,
+    key: &str,
+) -> bool {
     match state.uploader.delete(key).await {
         Ok(()) => true,
         Err(AppError::NotFound) => {

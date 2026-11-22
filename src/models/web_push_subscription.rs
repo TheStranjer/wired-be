@@ -240,6 +240,24 @@ pub async fn delete_for_token(pool: &PgPool, token_id: Uuid) -> AppResult<bool> 
     Ok(deleted.rows_affected() > 0)
 }
 
+/// Removes every subscription of `user_id`, returning how many went.
+///
+/// The account-deletion sweep's writer: the user row is kept, so the
+/// cascade never takes these rows, and a push to a deleted account's
+/// browser must stop. Nothing to delete answers `0`, so a rerun is a no-op.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query("DELETE FROM web_push_subscriptions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
