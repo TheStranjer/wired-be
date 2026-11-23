@@ -98,6 +98,25 @@ async fn chat_message_with_media(pool: &PgPool, owner: &User, other: &User, medi
     );
 }
 
+/// Inserts a `scheduled_statuses` row for `owner` due in a week, its
+/// `params` the given JSON: the stored reference that reserves the ids
+/// inside `params -> 'media_ids'`. Returns the row's id.
+async fn scheduled_row(pool: &PgPool, owner: &User, params: Value) -> Uuid {
+    let id = Uuid::now_v7();
+    let written = query(
+        "INSERT INTO scheduled_statuses (id, user_id, scheduled_at, params)
+              VALUES ($1, $2, now() + make_interval(days => 7), $3)",
+    )
+    .bind(id)
+    .bind(owner.id)
+    .bind(params)
+    .execute(pool)
+    .await
+    .expect("the scheduled status fixture inserts");
+    assert_eq!(written.rows_affected(), 1, "the schedule row was written");
+    id
+}
+
 /// Stores `body` at `key` through the test backend and answers whether
 /// the file is on disk under the temporary uploads directory.
 async fn put_media_file(backend: &UploaderBackend, key: &str) {
@@ -364,5 +383,105 @@ async fn an_unreachable_database_retries_the_media_sweep() {
     assert!(
         row_exists(&pool, "media_attachments", orphan).await,
         "the healthy pool sees no work the broken one claimed to do"
+    );
+}
+
+/// A stale unposted row a pending scheduled status names in `media_ids`
+/// survives the sweep with its stored file; a stale row named nowhere
+/// beside it is still reclaimed.
+#[tokio::test]
+async fn the_media_sweep_keeps_media_reserved_by_a_scheduled_status() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let (dir, state, backend) = uploads_state(&pool);
+    let alice = user(&pool, "alice").await;
+    let key = format!("alice/{}/reserved.png", Uuid::now_v7());
+    put_media_file(&backend, &key).await;
+    let reserved = unposted_media_row(&pool, &alice, Some(&key), None, 49).await;
+    let orphan = unposted_media_row(&pool, &alice, None, None, 49).await;
+    let _schedule = scheduled_row(
+        &pool,
+        &alice,
+        json!({ "status": "later", "media_ids": [reserved] }),
+    )
+    .await;
+
+    let outcome = handle_sweep_media(state, FIRST_ATTEMPT, json!({})).await;
+
+    assert_eq!(outcome, Ok(()), "the sweep succeeds");
+    assert!(
+        row_exists(&pool, "media_attachments", reserved).await,
+        "the scheduled status still reserves the row"
+    );
+    assert!(
+        file_on_disk(dir.path(), &key),
+        "and its stored file stays on disk"
+    );
+    assert!(
+        !row_exists(&pool, "media_attachments", orphan).await,
+        "an unreferenced stale row is still deleted"
+    );
+}
+
+/// An id a scheduled status carries only as `in_reply_to_id` reserves
+/// nothing: the stale row is reclaimed.
+#[tokio::test]
+async fn a_scheduled_in_reply_to_id_does_not_reserve_media() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let media = unposted_media_row(&pool, &alice, None, None, 49).await;
+    let _schedule = scheduled_row(
+        &pool,
+        &alice,
+        json!({ "status": "later", "in_reply_to_id": media, "media_ids": [] }),
+    )
+    .await;
+
+    let outcome = handle_sweep_media(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+
+    assert_eq!(outcome, Ok(()), "the sweep succeeds");
+    assert!(
+        !row_exists(&pool, "media_attachments", media).await,
+        "only `media_ids` reserves media, not `in_reply_to_id`"
+    );
+}
+
+/// Once the scheduled row is gone, the next sweep reclaims the media
+/// and its file.
+#[tokio::test]
+async fn the_next_sweep_reclaims_media_once_its_schedule_is_gone() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let (dir, state, backend) = uploads_state(&pool);
+    let alice = user(&pool, "alice").await;
+    let key = format!("alice/{}/released.png", Uuid::now_v7());
+    put_media_file(&backend, &key).await;
+    let media = unposted_media_row(&pool, &alice, Some(&key), None, 49).await;
+    let schedule = scheduled_row(&pool, &alice, json!({ "media_ids": [media] })).await;
+
+    let first = handle_sweep_media(state.clone(), FIRST_ATTEMPT, json!({})).await;
+    assert_eq!(first, Ok(()), "the first sweep succeeds");
+    assert!(
+        row_exists(&pool, "media_attachments", media).await,
+        "the pending schedule keeps the row through the first sweep"
+    );
+
+    let removed = query("DELETE FROM scheduled_statuses WHERE id = $1")
+        .bind(schedule)
+        .execute(&pool)
+        .await
+        .expect("the schedule deletes");
+    assert_eq!(removed.rows_affected(), 1, "the schedule row was removed");
+
+    let second = handle_sweep_media(state, FIRST_ATTEMPT, json!({})).await;
+    assert_eq!(second, Ok(()), "the second sweep succeeds");
+    assert!(
+        !row_exists(&pool, "media_attachments", media).await,
+        "with the schedule gone the row is reclaimed"
+    );
+    assert!(
+        !file_on_disk(dir.path(), &key),
+        "and its stored file goes with it"
     );
 }
