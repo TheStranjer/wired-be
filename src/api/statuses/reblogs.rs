@@ -188,7 +188,9 @@ pub(super) async fn unreblog_status(
 /// the same list. The status resolves through [`status_for_viewer_or_404`],
 /// so an invisible post hides its boosters behind the shared 404, and —
 /// Pleroma's `reblogged_by` walking the original object's `announcements`
-/// — a reblog row's id answers its original's list.
+/// — a reblog row's id answers its original's list. Only `public` and
+/// `unlisted` boosts are listed; a followers-only or direct boost never
+/// appears, even to an anonymous caller who may see the original.
 ///
 /// # Errors
 ///

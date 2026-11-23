@@ -506,6 +506,9 @@ mod push;
 /// The per-route rate limiter: mounted buckets, headers, and 429s.
 mod rate_limit;
 
+/// `…/reblogged_by` lists only distributable (public / unlisted) boosts.
+mod reblogged_by_visibility;
+
 /// Reblogs over HTTP (`/api/v1/statuses/{id}/reblog`, its `…/unreblog`
 /// twin and the `…/reblogged_by` listing).
 mod reblogs;
