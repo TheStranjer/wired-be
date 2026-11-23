@@ -48,7 +48,20 @@ use super::{
 /// [`WebfingerError::DomainMismatch`] when it does not belong to the
 /// requested domain.
 pub async fn resolve_acct(http: &HttpClient, acct: &str) -> Result<String, WebfingerError> {
-    resolve_acct_with_base(http, acct, None).await
+    resolve_acct_with_base(http, acct, None)
+        .await
+        .map(|resolved| resolved.actor)
+}
+
+/// What a `WebFinger` answer resolved a handle to: the actor URL and the
+/// document's own `subject`, which a split-domain account uses to name the
+/// handle its actor (hosted elsewhere) answers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The self link's `href`, verbatim.
+    pub actor: String,
+    /// The document's `subject` (usually `acct:nick@domain`), when it has one.
+    pub subject: Option<String>,
 }
 
 /// [`resolve_acct`] with `scheme_and_authority_override` replacing the
@@ -62,12 +75,15 @@ pub(crate) async fn resolve_acct_with_base(
     http: &HttpClient,
     acct: &str,
     scheme_and_authority_override: Option<&str>,
-) -> Result<String, WebfingerError> {
+) -> Result<Resolved, WebfingerError> {
     let (response, domain) = fetch_answer(http, acct, scheme_and_authority_override).await?;
     let document = parse_finger_response(&response)?;
     let actor = document.actor_href().ok_or(WebfingerError::NoActorLink)?;
     verify_round_trip(document.subject.as_deref(), actor, &domain)?;
-    Ok(actor.to_owned())
+    Ok(Resolved {
+        actor: actor.to_owned(),
+        subject: document.subject.clone(),
+    })
 }
 
 /// Resolves a remote handle through `WebFinger` and answers the whole

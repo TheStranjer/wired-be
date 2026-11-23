@@ -7,9 +7,10 @@ use crate::{
     config::Config,
     federation::{
         fetch_actor::{FetchError, error::server_error},
-        webfinger_client::{resolve_acct_with_base, strip_finger_prefixes},
+        remote_actor::ActorError,
+        webfinger_client::{Resolved, resolve_acct_with_base, strip_finger_prefixes},
     },
-    models::user::{User, get_by_acct},
+    models::user::{User, get_by_acct, set_nickname},
     state::AppState,
 };
 
@@ -26,7 +27,9 @@ use super::get_or_fetch_by_ap_id;
 /// actor URL and [`get_or_fetch_by_ap_id`] mirrors it. The fetched actor
 /// must then vouch for the handle: its `preferredUsername@host` has to
 /// equal `acct` case-insensitively (the Mastodon round trip), or the
-/// lookup reports [`FetchError::AcctMismatch`].
+/// `WebFinger` subject has to name `acct` while the fetched actor is the
+/// one the answer pointed at (a split-domain account, whose mirror is then
+/// renamed to `acct`), or the lookup reports [`FetchError::AcctMismatch`].
 ///
 /// [`WebFinger`]: crate::federation::webfinger_client
 ///
@@ -63,12 +66,32 @@ async fn get_or_fetch_by_acct_with_base(
     }
     let dev_base = dev_webfinger_base(&state.config, acct);
     let base = webfinger_base.or(dev_base.as_deref());
-    let ap_id = resolve_acct_with_base(&state.http_client, acct, base).await?;
-    let user = get_or_fetch_by_ap_id(state, &ap_id).await?;
-    if !acct_matches(&user.nickname, acct) {
+    let resolved = resolve_acct_with_base(&state.http_client, acct, base).await?;
+    let user = get_or_fetch_by_ap_id(state, &resolved.actor).await?;
+    if acct_matches(&user.nickname, acct) {
+        return Ok(user);
+    }
+    if !subject_vouches(&resolved, &user, acct) {
         return Err(FetchError::AcctMismatch);
     }
-    Ok(user)
+    let nickname = strip_finger_prefixes(acct);
+    set_nickname(&state.db, user.id, nickname)
+        .await
+        .map_err(|err| server_error(&err))?
+        .ok_or_else(|| FetchError::from(ActorError::NicknameConflict))
+}
+
+/// The split-domain vouch: the `WebFinger` answer's `subject` names the
+/// requested handle (case-insensitively, `acct:` stripped) and the fetched
+/// actor is the very one that answer pointed at, so the handle belongs to
+/// that actor even though its id lives on another host. A subject naming a
+/// different handle, or none, vouches for nothing.
+fn subject_vouches(resolved: &Resolved, user: &User, acct: &str) -> bool {
+    resolved
+        .subject
+        .as_deref()
+        .is_some_and(|subject| acct_matches(strip_finger_prefixes(subject), acct))
+        && user.ap_id == resolved.actor
 }
 
 /// The development-mode `WebFinger` origin for `acct`: while
@@ -146,7 +169,7 @@ mod tests {
         let peer = peer_at(&base);
         let hits = Arc::clone(&peer.hits);
         let jrd = json!({
-            "subject": "acct:alice@mock.example",
+            "subject": "acct:bob@mock.example",
             "links": [{
                 "rel": "self",
                 "type": "application/activity+json",
@@ -192,6 +215,109 @@ mod tests {
             "the claimed handle was never stored"
         );
         server.abort();
+    }
+
+    /// Serves `jrd` at the `WebFinger` path and the self-identifying alice
+    /// actor, on `listener`; the task is the caller's to abort.
+    fn serve_alice(listener: tokio::net::TcpListener, base: &str, jrd: &str) -> ServedAlice {
+        let peer = peer_at(base);
+        let hits = Arc::clone(&peer.hits);
+        let app = Router::new()
+            .route(
+                "/.well-known/webfinger",
+                get(webfinger).with_state(jrd.to_owned()),
+            )
+            .merge(
+                Router::new()
+                    .route("/users/alice", get(self_actor))
+                    .with_state(peer),
+            );
+        ServedAlice {
+            server: spawn(listener, app),
+            hits,
+        }
+    }
+
+    /// The running mock of [`serve_alice`] and its actor-fetch counter.
+    struct ServedAlice {
+        server: tokio::task::JoinHandle<()>,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A JRD whose subject is `subject` and whose self link is alice's actor
+    /// at `base`.
+    fn jrd_for(subject: &str, base: &str) -> String {
+        json!({
+            "subject": subject,
+            "links": [{
+                "rel": "self",
+                "type": "application/activity+json",
+                "href": format!("{base}/users/alice"),
+            }],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_split_domain_subject_vouches_and_renames_the_mirror() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let served = serve_alice(listener, &base, &jrd_for("acct:Alice@mock.example", &base));
+        let state = test_state(pool);
+
+        let found = get_or_fetch_by_acct_with_base(&state, "@alice@mock.example", Some(&base))
+            .await
+            .expect("the subject names the handle and the actor is the one linked");
+
+        served.server.abort();
+        assert_eq!(found.nickname, "alice@mock.example", "the handle sticks");
+        assert_eq!(found.ap_id, format!("{base}/users/alice"), "by its id");
+        let stored = get_by_nickname(&state.db, "alice@mock.example")
+            .await
+            .unwrap()
+            .expect("stored under the handle");
+        assert_eq!(stored.id, found.id, "one row, renamed");
+        assert!(
+            get_by_nickname(&state.db, &format!("alice@{}", authority_of(&base)))
+                .await
+                .unwrap()
+                .is_none(),
+            "the host-derived nickname was replaced"
+        );
+        let again = get_or_fetch_by_acct_with_base(&state, "alice@mock.example", Some(&base))
+            .await
+            .unwrap();
+        assert_eq!(again.id, found.id, "the next lookup answers from storage");
+        assert_eq!(served.hits.load(Ordering::SeqCst), 1, "fetched once");
+    }
+
+    #[tokio::test]
+    async fn a_subject_naming_another_handle_is_a_mismatch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let served = serve_alice(listener, &base, &jrd_for("acct:bob@mock.example", &base));
+        let state = test_state(pool);
+
+        let error = get_or_fetch_by_acct_with_base(&state, "alice@mock.example", Some(&base))
+            .await
+            .unwrap_err();
+
+        served.server.abort();
+        assert!(
+            matches!(error, FetchError::AcctMismatch),
+            "the subject is bob, not the asked alice: {error:?}"
+        );
+        assert!(
+            get_by_nickname(&state.db, "alice@mock.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "the claimed handle was never stored"
+        );
     }
 
     #[tokio::test]

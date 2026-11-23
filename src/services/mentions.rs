@@ -210,7 +210,9 @@ async fn fetch_remote_acct(
     match webfinger_base {
         None => get_or_fetch_by_acct(state, acct).await,
         Some(base) => {
-            let ap_id = resolve_acct_with_base(&state.http_client, acct, Some(base)).await?;
+            let ap_id = resolve_acct_with_base(&state.http_client, acct, Some(base))
+                .await?
+                .actor;
             get_or_fetch_by_ap_id(state, &ap_id).await
         }
     }
