@@ -76,10 +76,11 @@ fn within_update_interval(stamp: Option<DateTime<Utc>>) -> bool {
 
 /// What a refused actor document means for the activity: a document that is
 /// not a usable actor, and a nickname another stored account already owns,
-/// are nothing to fold — ignored, with the reason in the debug log. (The
-/// second is the takeover shape Pleroma renames its stale row for; this
-/// instance refuses the write and says so.) A database failure is the one
-/// arm a retry can fix.
+/// are nothing to fold — ignored, with the reason in the debug log. (A
+/// stale remote mirror of the same origin holding the nickname is renamed
+/// by [`upsert_remote_user`] and never gets here; the refused holder is a
+/// local or foreign-domain row.) A database failure is the one arm a retry
+/// can fix.
 fn refused(err: ActorError) -> Result<Outcome, FederationError> {
     match err {
         ActorError::Failed(err) => Err(transient("actor mirror", &err)),
