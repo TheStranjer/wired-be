@@ -82,22 +82,47 @@ pub async fn mark_deleted_by_domain(pool: &PgPool, domain: &str) -> AppResult<Ve
     Ok(ids)
 }
 
-/// The `UPDATE` behind [`purge_personal_data`]: nulls the two personal
-/// columns, blanks the display name, and refreshes `updated_at`.
+/// The `UPDATE` behind [`purge_personal_data`]: nulls the email and
+/// password hash, blanks the display name and every profile column (bio,
+/// fields, images, birthday, tags, aliases, settings), drops the roles,
+/// discoverability and lock, zeroes the counters, and refreshes
+/// `updated_at`. `id`, `ap_id`, `nickname`, the keys and `deleted_at` stay.
 const PURGE_PERSONAL_DATA_SQL: &str = "UPDATE users
        SET email = NULL,
            password_hash = NULL,
            name = '',
+           bio = '',
+           raw_bio = '',
+           fields = '[]',
+           raw_fields = '[]',
+           avatar_url = NULL,
+           banner_url = NULL,
+           background_image_url = NULL,
+           birthday = NULL,
+           show_birthday = false,
+           tags = '{}',
+           also_known_as = '{}',
+           settings_store = '{}',
+           is_admin = false,
+           is_moderator = false,
+           discoverable = false,
+           locked = false,
+           followers_count = 0,
+           following_count = 0,
+           statuses_count = 0,
            updated_at = now()
      WHERE id = $1";
 
 /// Replaces user `id`'s personal data with empty values: the final step of
 /// the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
 ///
-/// Email, password hash and display name are the account's person data —
-/// the three go, the row stays (decision 7: other tables and mirrored
-/// actors reference it), and nothing that was said about the account can
-/// be attributed to a person any more.
+/// Email, password hash, display name and the whole public profile (bio,
+/// fields, avatar, banner, background, birthday, tags, aliases, settings
+/// store) go, as do the roles, discoverability, lock and counters; the row
+/// stays (decision 7: other tables and mirrored actors reference it) with
+/// its id, `ap_id`, nickname, keys and `deleted_at`, so nothing that was
+/// said about the account can be attributed to a person any more and a
+/// lookup renders no profile data beyond the handle.
 ///
 /// # Errors
 ///
@@ -117,8 +142,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+    use serde_json::json;
+
     use super::*;
-    use crate::models::user::{NewUser, User, get_by_id, insert};
+    use crate::models::user::{Flag, NewUser, User, get_by_id, insert};
 
     /// A remote mirror of `domain` named `nickname`, inserted.
     async fn mirror_of(pool: &PgPool, nickname: &str, domain: &str) -> User {
@@ -195,5 +223,85 @@ mod tests {
             second_pass.is_empty(),
             "a repeat pass restamps nobody, the pre-stamped row included"
         );
+    }
+
+    /// [`purge_personal_data`] blanks every profile column of a fully
+    /// populated local account and zeroes its counters, while the handle,
+    /// the actor id and the deletion stamp stand.
+    #[tokio::test]
+    async fn purge_personal_data_blanks_the_whole_profile() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let full = insert(
+            &pool,
+            &NewUser {
+                email: Some("full@example.org".to_owned()),
+                password_hash: Some("hash-of-a-secret".to_owned()),
+                name: "Full Profile".to_owned(),
+                bio: "<p>about me</p>".to_owned(),
+                raw_bio: "about me".to_owned(),
+                fields: json!([{"name": "site", "value": "<a>x</a>"}]),
+                raw_fields: json!([{"name": "site", "value": "https://x.example"}]),
+                avatar_url: Some("https://cdn.example/avatar.png".to_owned()),
+                banner_url: Some("https://cdn.example/banner.png".to_owned()),
+                background_image_url: Some("https://cdn.example/bg.png".to_owned()),
+                birthday: NaiveDate::from_ymd_opt(1990, 5, 17),
+                show_birthday: Flag::new(true),
+                tags: vec!["force_unlisted".to_owned()],
+                also_known_as: vec!["https://other.example/users/full".to_owned()],
+                settings_store: json!({"theme": "dark"}),
+                is_admin: Flag::new(true),
+                is_moderator: Flag::new(true),
+                discoverable: Flag::new(true),
+                locked: Flag::new(true),
+                followers_count: 12,
+                following_count: 3,
+                statuses_count: 48,
+                ..NewUser::local("full", "https://test.example/users/full")
+            },
+        )
+        .await
+        .expect("the populated fixture inserts");
+        mark_deleted(&pool, full.id).await.expect("the stamp lands");
+        let stamped = must_get(&pool, full.id).await;
+        assert!(stamped.deleted_at.is_some(), "the fixture is stamped");
+
+        purge_personal_data(&pool, full.id)
+            .await
+            .expect("the purge runs");
+
+        let purged = must_get(&pool, full.id).await;
+        assert!(purged.email.is_none(), "email is gone");
+        assert!(purged.password_hash.is_none(), "password hash is gone");
+        assert_eq!(purged.name, "", "display name is blank");
+        assert_eq!(purged.bio, "", "bio is blank");
+        assert_eq!(purged.raw_bio, "", "raw bio is blank");
+        assert_eq!(purged.fields, json!([]), "fields are empty");
+        assert_eq!(purged.raw_fields, json!([]), "raw fields are empty");
+        assert!(purged.avatar_url.is_none(), "avatar is gone");
+        assert!(purged.banner_url.is_none(), "banner is gone");
+        assert!(purged.background_image_url.is_none(), "background is gone");
+        assert!(purged.birthday.is_none(), "birthday is gone");
+        assert!(!purged.show_birthday.get(), "birthday is not shown");
+        assert!(purged.tags.is_empty(), "tags are empty");
+        assert!(purged.also_known_as.is_empty(), "aliases are empty");
+        assert_eq!(purged.settings_store, json!({}), "settings store is empty");
+        assert!(!purged.is_admin.get(), "admin role is dropped");
+        assert!(!purged.is_moderator.get(), "moderator role is dropped");
+        assert!(!purged.discoverable.get(), "discoverability is off");
+        assert!(!purged.locked.get(), "the lock is off");
+        assert_eq!(
+            (
+                purged.followers_count,
+                purged.following_count,
+                purged.statuses_count
+            ),
+            (0, 0, 0),
+            "counters are zeroed"
+        );
+
+        assert_eq!(purged.nickname, stamped.nickname, "the handle stays");
+        assert_eq!(purged.ap_id, stamped.ap_id, "the actor id stays");
+        assert_eq!(purged.deleted_at, stamped.deleted_at, "the stamp stays");
     }
 }
