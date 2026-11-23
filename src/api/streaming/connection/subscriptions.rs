@@ -199,7 +199,7 @@ mod tests {
         }
 
         let over = connection
-            .on_client_text(r#"{"type":"subscribe","stream":"hashtag","tag":"one-too-many"}"#)
+            .on_client_text(r#"{"type":"subscribe","stream":"hashtag","tag":"onetoomany"}"#)
             .await;
 
         assert_eq!(

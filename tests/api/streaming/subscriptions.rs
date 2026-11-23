@@ -129,7 +129,7 @@ async fn the_subscription_past_the_cap_is_refused() {
     }
     send(
         &mut client,
-        r#"{"type":"subscribe","stream":"hashtag","tag":"one-too-many"}"#,
+        r#"{"type":"subscribe","stream":"hashtag","tag":"onetoomany"}"#,
     )
     .await;
 
@@ -142,7 +142,7 @@ async fn the_subscription_past_the_cap_is_refused() {
 
     server.publish(event_on(&["hashtag:cap0"], "held", Audience::Public));
     server.publish(event_on(
-        &["hashtag:one-too-many"],
+        &["hashtag:onetoomany"],
         "refused",
         Audience::Public,
     ));
