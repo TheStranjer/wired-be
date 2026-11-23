@@ -38,6 +38,7 @@
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     federation::{
@@ -45,7 +46,7 @@ use crate::{
         fetch_object, json,
         note_parser::OBJECT_TYPES,
     },
-    models::user::User,
+    models::user::{self, User},
     services::ingest::{self, IngestOutcome},
     state::AppState,
 };
@@ -106,7 +107,8 @@ async fn apply_create(
         );
         return Ok(Outcome::Ignored("attributedTo is not the activity actor"));
     }
-    match ingest::ingest_note(&state, &signer, object).await? {
+    let owner = load_inbox_owner(&state, view.inbox_owner).await?;
+    match ingest::ingest_note_delivered(&state, &signer, object, owner.as_ref()).await? {
         IngestOutcome::Created(row) => {
             debug!(status = %row.id, "a Create folded a new remote status");
             Ok(Outcome::Handled)
@@ -117,6 +119,21 @@ async fn apply_create(
         }
         IngestOutcome::Ignored(reason) => Ok(Outcome::Ignored(reason)),
     }
+}
+
+/// Loads the local account whose personal inbox received the delivery. A
+/// gone row means the account was deleted after the delivery was queued: the
+/// post is folded as a shared-inbox delivery would be.
+async fn load_inbox_owner(
+    state: &AppState,
+    owner_id: Option<Uuid>,
+) -> Result<Option<User>, FederationError> {
+    let Some(id) = owner_id else {
+        return Ok(None);
+    };
+    user::get_by_id(&state.db, id)
+        .await
+        .map_err(|err| FederationError::Transient(format!("the inbox owner read failed: {err}")))
 }
 
 /// The reference arm of [`apply_create`]: a `Create` whose object is only
