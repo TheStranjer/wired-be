@@ -4,10 +4,12 @@
 //! (`x-request-id`, kept from the client or generated as a UUID), `tracing`
 //! logging of each request/response, CORS following Pleroma's `cors_plug`,
 //! a 30 s request timeout answered with 408, and a 16 MiB request body limit
-//! answered with 413. Logging never emits the `Authorization` header and
-//! never emits an `access_token` query parameter value.
+//! answered with 413. Logging never emits the `Authorization` header, the
+//! value of a secret query parameter (`access_token`, `mfa_token`, `code`,
+//! `state`, `token`), or the secret segment of a password-reset,
+//! email-confirmation or unsubscribe path.
 
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use axum::{
     Router,
@@ -33,9 +35,18 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pleroma's `cors_plug`.
 pub const CORS_MAX_AGE: Duration = Duration::from_hours(24);
 
-/// Query parameter whose value must never reach the log (the streaming API
-/// accepts the bearer token there).
-const ACCESS_TOKEN_PARAM: &str = "access_token";
+/// Query parameters whose value must never reach the log: the bearer token
+/// the streaming API accepts, the MFA challenge token, and the OAuth callback
+/// `code` and `state`, plus any generic `token`.
+const REDACTED_PARAMS: [&str; 5] = ["access_token", "mfa_token", "code", "state", "token"];
+
+/// Route prefixes whose path carries a secret, each with whether the first
+/// segment after the prefix (a user id) is kept and only the rest redacted.
+const SECRET_PATH_PREFIXES: [(&str, bool); 3] = [
+    ("/api/v1/pleroma/password_reset/", false),
+    ("/api/account/confirm_email/", true),
+    ("/mailer/unsubscribe/", false),
+];
 
 /// Stands in for a redacted value in logged URIs.
 const REDACTED: &str = "[redacted]";
@@ -103,22 +114,48 @@ fn http_span<B>(request: &Request<B>) -> Span {
     )
 }
 
-/// The request target fit for the log: the path, plus the query string with
-/// every `access_token` value replaced by [`REDACTED`].
+/// The request target fit for the log: the path with any secret segment
+/// replaced (see [`redact_path`]), plus the query string with the value of
+/// every secret parameter replaced by [`REDACTED`] (see [`redact_query`]).
 fn sanitized_uri(uri: &Uri) -> String {
+    let path = redact_path(uri.path());
     uri.query().map_or_else(
-        || uri.path().to_owned(),
-        |query| format!("{}?{}", uri.path(), redact_query(query)),
+        || path.to_string(),
+        |query| format!("{path}?{}", redact_query(query)),
     )
 }
 
-/// The query string with the value of each `access_token` parameter replaced
-/// by [`REDACTED`]; every other parameter is kept as sent.
+/// The path with the secret segment of each secret-bearing route replaced by
+/// [`REDACTED`]: everything after the password-reset and unsubscribe prefixes,
+/// and the token (last segment) after the email-confirmation prefix, whose
+/// leading user id is kept. Any other path is returned as is.
+fn redact_path(path: &str) -> Cow<'_, str> {
+    for (prefix, keeps_leading_segment) in SECRET_PATH_PREFIXES {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return Cow::Borrowed(path);
+        }
+        let kept = if keeps_leading_segment {
+            rest.rfind('/')
+                .and_then(|slash| rest.get(..=slash))
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        return Cow::Owned(format!("{prefix}{kept}{REDACTED}"));
+    }
+    Cow::Borrowed(path)
+}
+
+/// The query string with the value of each parameter in [`REDACTED_PARAMS`]
+/// replaced by [`REDACTED`]; every other parameter is kept as sent.
 fn redact_query(query: &str) -> String {
     query
         .split('&')
         .map(|param| match param.split_once('=') {
-            Some((name, _value)) if name == ACCESS_TOKEN_PARAM => {
+            Some((name, _value)) if REDACTED_PARAMS.contains(&name) => {
                 format!("{name}={REDACTED}")
             }
             _ => param.to_owned(),
@@ -364,6 +401,20 @@ mod tests {
                 .unwrap()
         }
 
+        /// A password-reset link request, whose path carries the token.
+        fn reset_request() -> Request<Body> {
+            Request::get(format!("/api/v1/pleroma/password_reset/{SECRET}").as_str())
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        /// An MFA detour request, whose query carries the MFA token.
+        fn mfa_request() -> Request<Body> {
+            Request::get(format!("/oauth/mfa?mfa_token={SECRET}&lang=en").as_str())
+                .body(Body::empty())
+                .unwrap()
+        }
+
         let buffer = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -380,8 +431,9 @@ mod tests {
         drop(test_app().oneshot(secret_request()).await.unwrap());
         tracing_core::callsite::rebuild_interest_cache();
 
-        let response = test_app().oneshot(secret_request()).await.unwrap();
-        drop(response);
+        drop(test_app().oneshot(secret_request()).await.unwrap());
+        drop(test_app().oneshot(reset_request()).await.unwrap());
+        drop(test_app().oneshot(mfa_request()).await.unwrap());
         drop(guard);
 
         let logged = buffer.contents();
@@ -398,6 +450,80 @@ mod tests {
             "the redacted placeholder stands in: {logged}"
         );
         assert!(logged.contains("lang=en"), "harmless params stay: {logged}");
+        assert!(
+            logged.contains(&format!("/api/v1/pleroma/password_reset/{REDACTED}")),
+            "the reset path is redacted: {logged}"
+        );
+        assert!(
+            logged.contains(&format!("mfa_token={REDACTED}")),
+            "the MFA token is redacted: {logged}"
+        );
+    }
+
+    #[test]
+    fn password_reset_token_path_is_redacted() {
+        let uri = Uri::from_static("/api/v1/pleroma/password_reset/abc");
+        assert_eq!(
+            sanitized_uri(&uri),
+            "/api/v1/pleroma/password_reset/[redacted]"
+        );
+    }
+
+    #[test]
+    fn confirm_email_token_is_redacted_and_user_id_kept() {
+        let id = Uuid::nil();
+        let path = format!("/api/account/confirm_email/{id}/tok");
+        let uri = Uri::try_from(path.as_str()).unwrap();
+        assert_eq!(
+            sanitized_uri(&uri),
+            format!("/api/account/confirm_email/{id}/[redacted]")
+        );
+    }
+
+    #[test]
+    fn unsubscribe_token_path_is_redacted() {
+        let uri = Uri::from_static("/mailer/unsubscribe/tok%20en?lang=en");
+        assert_eq!(
+            sanitized_uri(&uri),
+            "/mailer/unsubscribe/[redacted]?lang=en"
+        );
+    }
+
+    #[test]
+    fn secret_prefix_without_a_segment_is_left_as_is() {
+        assert_eq!(
+            redact_path("/mailer/unsubscribe/"),
+            "/mailer/unsubscribe/",
+            "nothing to redact"
+        );
+        assert!(
+            matches!(redact_path("/api/v1/timelines/public"), Cow::Borrowed(_)),
+            "an unrelated path is not copied"
+        );
+    }
+
+    #[test]
+    fn mfa_token_is_redacted_and_other_params_kept() {
+        let uri = Uri::from_static("/oauth/mfa?mfa_token=x&redirect_uri=y");
+        assert_eq!(
+            sanitized_uri(&uri),
+            "/oauth/mfa?mfa_token=[redacted]&redirect_uri=y"
+        );
+    }
+
+    #[test]
+    fn oauth_callback_code_and_state_are_redacted() {
+        let uri = Uri::from_static("/oauth/github/callback?code=c&state=s");
+        assert_eq!(
+            sanitized_uri(&uri),
+            "/oauth/github/callback?code=[redacted]&state=[redacted]"
+        );
+    }
+
+    #[test]
+    fn generic_token_param_is_redacted() {
+        let uri = Uri::from_static("/x?token=t&other=o");
+        assert_eq!(sanitized_uri(&uri), "/x?token=[redacted]&other=o");
     }
 
     #[test]
