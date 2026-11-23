@@ -42,14 +42,27 @@ pub(super) async fn route_undo(
     }
 }
 
-/// The inner activity of an `Undo` as `(type, actor id)`: an embedded
-/// object states both itself; an object that is only an id is looked up
-/// among the stored remote activities. `None` (after the debug log that
-/// says why) is an `Undo` of nothing this instance can route.
+/// The inner activity of an `Undo` as `(type, actor id)`: an object that
+/// names an id is looked up among the stored remote activities first (what
+/// this instance stored is what it withdraws, whatever type the `Undo`
+/// embeds — a Misskey reaction arrives as an embedded `Like` yet is stored
+/// as an emoji reaction); an embedded object with no stored row states its
+/// own type and actor. `None` (after the debug log that says why) is an
+/// `Undo` of nothing this instance can route.
 async fn undo_inner(
     state: &AppState,
     view: &ActivityView,
 ) -> Result<Option<(String, String)>, JobError> {
+    if let ObjectRef::Embedded(object) = &view.object
+        && let Some(id) = object.get("id").and_then(serde_json::Value::as_str)
+    {
+        let stored = activity::find_by_ap_id(&state.db, id)
+            .await
+            .map_err(|err| JobError::Retry(format!("the undo lookup failed: {err}")))?;
+        if let Some((kind, actor)) = stored {
+            return Ok(Some((kind.to_owned(), actor)));
+        }
+    }
     match &view.object {
         ObjectRef::Embedded(object) => {
             let Some(kind) = object.get("type").and_then(json::first_type) else {
@@ -84,7 +97,7 @@ mod tests {
 
     use crate::federation::{
         dispatch::{
-            dispatch_activity,
+            Handlers, dispatch_activity,
             test_support::{
                 app_state, incoming_args, local_user, seen, signer, test_handlers, undo_activity,
             },
@@ -260,6 +273,157 @@ mod tests {
                 + seen("undo-follow", "https://peer.example/activities/undo-7"),
             0,
             "neither undo reached a handler"
+        );
+    }
+
+    /// A public post by a fresh local account, for a remote actor to like.
+    async fn target_post(pool: &sqlx::PgPool) -> crate::models::status::Status {
+        let author = local_user(pool, "carol").await;
+        crate::models::status::insert(
+            pool,
+            "https://test.example",
+            &crate::models::status::NewStatus::local(&author, "react to me"),
+        )
+        .await
+        .expect("the status fixture inserts")
+    }
+
+    /// How many emoji reaction rows exist.
+    async fn reaction_rows(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM emoji_reactions")
+            .fetch_one(pool)
+            .await
+            .expect("the table reads")
+    }
+
+    /// How many favourite rows exist.
+    async fn favourite_rows(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM favourites")
+            .fetch_one(pool)
+            .await
+            .expect("the table reads")
+    }
+
+    /// A Misskey-family reaction arrives as a `Like` with `content` and is
+    /// stored as an emoji reaction; the `Undo` that embeds that `Like`
+    /// resolves through the stored row, not the embedded type.
+    #[tokio::test]
+    async fn an_undo_embedding_a_reaction_like_withdraws_the_reaction() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let post = target_post(&pool).await;
+        let handlers = Handlers::default();
+        let like = json!({
+            "id": "https://peer.example/activities/reaction-like-1",
+            "type": "Like",
+            "actor": "https://peer.example/users/alice",
+            "object": post.uri,
+            "content": "🍮",
+        });
+        let delivered = dispatch_activity(
+            &app_state(&pool),
+            incoming_args(&like, &alice),
+            &handlers,
+            mrf::filter_incoming_boxed,
+        )
+        .await;
+        assert_eq!(delivered, Ok(()), "the reaction delivers");
+        assert_eq!(reaction_rows(&pool).await, 1, "and is stored");
+
+        let undo = json!({
+            "id": "https://peer.example/activities/undo-reaction-1",
+            "type": "Undo",
+            "actor": "https://peer.example/users/alice",
+            "object": like,
+        });
+        let undone = dispatch_activity(
+            &app_state(&pool),
+            incoming_args(&undo, &alice),
+            &handlers,
+            mrf::filter_incoming_boxed,
+        )
+        .await;
+        assert_eq!(undone, Ok(()), "the undo completes");
+        assert_eq!(reaction_rows(&pool).await, 0, "the reaction is gone");
+    }
+
+    /// An embedded `Like` that is a plain favourite still unfavourites.
+    #[tokio::test]
+    async fn an_undo_embedding_a_plain_like_still_unfavourites() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let post = target_post(&pool).await;
+        let handlers = Handlers::default();
+        let like = json!({
+            "id": "https://peer.example/activities/plain-like-1",
+            "type": "Like",
+            "actor": "https://peer.example/users/alice",
+            "object": post.uri,
+        });
+        let delivered = dispatch_activity(
+            &app_state(&pool),
+            incoming_args(&like, &alice),
+            &handlers,
+            mrf::filter_incoming_boxed,
+        )
+        .await;
+        assert_eq!(delivered, Ok(()), "the like delivers");
+        assert_eq!(favourite_rows(&pool).await, 1, "and is stored");
+
+        let undo = json!({
+            "id": "https://peer.example/activities/undo-plain-like-1",
+            "type": "Undo",
+            "actor": "https://peer.example/users/alice",
+            "object": like,
+        });
+        let undone = dispatch_activity(
+            &app_state(&pool),
+            incoming_args(&undo, &alice),
+            &handlers,
+            mrf::filter_incoming_boxed,
+        )
+        .await;
+        assert_eq!(undone, Ok(()), "the undo completes");
+        assert_eq!(favourite_rows(&pool).await, 0, "the favourite is gone");
+    }
+
+    /// An embedded `Follow` whose id nothing stores falls back to the
+    /// embedded type and still routes to the Follow undo handler.
+    #[tokio::test]
+    async fn an_undo_embedding_an_unknown_follow_still_routes_by_embedded_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let activity = json!({
+            "id": "https://peer.example/activities/undo-unknown-follow",
+            "type": "Undo",
+            "actor": "https://peer.example/users/alice",
+            "object": {
+                "id": "https://peer.example/activities/never-stored-follow",
+                "type": "Follow",
+                "actor": "https://peer.example/users/alice",
+                "object": "https://test.example/users/bob",
+            },
+        });
+
+        let outcome = dispatch_activity(
+            &app_state(&pool),
+            incoming_args(&activity, &alice),
+            &test_handlers(),
+            mrf::filter_incoming_boxed,
+        )
+        .await;
+
+        assert_eq!(outcome, Ok(()), "the undo completes");
+        assert_eq!(
+            seen(
+                "undo-follow",
+                "https://peer.example/activities/undo-unknown-follow"
+            ),
+            1,
+            "and routed through the Follow undo handler"
         );
     }
 }
