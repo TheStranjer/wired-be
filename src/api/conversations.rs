@@ -63,7 +63,7 @@
 //! [`status_visibility`]: crate::models::status_visibility
 //! [`Conversation`]: crate::entities::conversation::Conversation
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use axum::{
     Json, Router,
@@ -77,7 +77,10 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::notifications_v2::{NO_EXTRA_QUERY, StringList, names_of},
+    api::{
+        helpers::{distinct, distinct_ids},
+        notifications_v2::{NO_EXTRA_QUERY, StringList, names_of},
+    },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -192,23 +195,8 @@ impl ListParams {
     /// empty page on its own (the other id-array readers here skip
     /// likewise).
     fn recipient_ids(&self) -> Vec<Uuid> {
-        recipient_ids(names_of(self.recipients.as_ref()))
+        distinct_ids(names_of(self.recipients.as_ref())).0
     }
-}
-
-/// The parsed, deduplicated ids of `values`, in the order sent, skipping
-/// the text that is no id.
-fn recipient_ids<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = Vec::new();
-    for value in values {
-        let Some(id) = parse_id(value) else {
-            continue;
-        };
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    ids
 }
 
 /// `POST /api/v1/conversations/{id}/read` — flag the caller's
@@ -389,16 +377,12 @@ async fn update(
 /// [`NotFoundMessage`](crate::error::AppError::NotFoundMessage) when any
 /// value is not id text.
 fn requested_recipients(list: &StringList) -> AppResult<Vec<Uuid>> {
-    let mut ids: Vec<Uuid> = Vec::new();
-    for name in list.names() {
-        let Some(id) = parse_id(name) else {
-            return Err(unknown_conversation());
-        };
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
+    let (ids, all_ids) = distinct_ids(list.names());
+    if all_ids {
+        Ok(ids)
+    } else {
+        Err(unknown_conversation())
     }
-    Ok(ids)
 }
 
 /// The addressee list the rewrite stores: the requested ids with the
@@ -554,12 +538,6 @@ pub(crate) async fn conversation_entities(
         })
         .collect();
     Ok(entities)
-}
-
-/// The distinct ids of `values`, in order of first appearance.
-fn distinct(values: impl Iterator<Item = Uuid>) -> Vec<Uuid> {
-    let mut seen = HashSet::new();
-    values.filter(|id| seen.insert(*id)).collect()
 }
 
 /// The status rows `ids` names, as `viewer` may see them, rendered and

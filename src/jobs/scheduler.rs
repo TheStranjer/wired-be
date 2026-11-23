@@ -97,10 +97,9 @@ pub struct PeriodicJob {
 /// ([`KIND_TOKENS`](super::maintenance::KIND_TOKENS)) shares the queue: the
 /// validity lookups already refuse those rows, so the period only decides how
 /// long the storage lives on after them. The daily prune of terminal queue
-/// rows and replay-guard rows
-/// ([`KIND_JOBS`](super::maintenance::KIND_JOBS)) shares it too: a job that
-/// ended a week ago and an activity redelivered after its window are pure
-/// bookkeeping, so the period only decides how long their storage lives on.
+/// rows ([`KIND_JOBS`](super::maintenance::KIND_JOBS)) shares it too: a job
+/// that ended a week ago is pure bookkeeping, so the period only decides how
+/// long its storage lives on.
 /// The daily hard purge of the local statuses soft-deleted beyond the
 /// configured age
 /// ([`KIND_DELETED_STATUSES`](super::maintenance::KIND_DELETED_STATUSES))

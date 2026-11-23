@@ -3,7 +3,7 @@
 //! a dead pool, the signer and local-account rows, the delivery args and
 //! activity builders, the ledger read and the `deliver` helper. Test-only.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
@@ -14,11 +14,9 @@ use super::{ActivityView, FederationError, Handlers, Outcome, dispatch_activity}
 use crate::{
     config::Config,
     federation::mrf,
-    http_client::HttpClient,
     jobs::{AttemptInfo, JobError},
     models::user::{Flag, NewUser, User, insert, local_ap_id},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// Every `(label, activity id)` a fake handler ran for. Handlers are
@@ -44,19 +42,7 @@ pub(super) fn seen(label: &str, ap_id: &str) -> usize {
 
 /// Test state over `pool`.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Test state over a pool that cannot answer: the database being

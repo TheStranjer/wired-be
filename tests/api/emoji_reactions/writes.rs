@@ -72,6 +72,40 @@ async fn a_unicode_reaction_answers_the_status_with_the_reaction_on_it() {
 }
 
 #[tokio::test]
+async fn an_emoji_outside_the_old_blocks_is_a_reaction() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = reader_and_writer(&pool, "alice").await;
+    let status_id = public_post(&pool, "bob").await;
+    let star = "\u{2B50}";
+    let red_square = "\u{1F7E5}";
+
+    let body = reacted(&app, &token, &status_id, star).await;
+    assert_eq!(
+        body["pleroma"]["emoji_reactions"],
+        json!([summary(star, 1, true, &Value::Null, &[&alice.id])]),
+        "⭐ (U+2B50, outside the old blocks) is counted like any emoji"
+    );
+    react_ok(&app, &token, &status_id, red_square).await;
+    let mut rows = stored(&pool).await;
+    rows.sort();
+    let mut expected = vec![
+        (alice.id.to_string(), status_id.to_string(), star.to_owned()),
+        (
+            alice.id.to_string(),
+            status_id.to_string(),
+            red_square.to_owned(),
+        ),
+    ];
+    expected.sort();
+    assert_eq!(
+        rows, expected,
+        "🟥 (U+1F7E5) is stored as a second reaction"
+    );
+}
+
+#[tokio::test]
 async fn a_custom_reaction_carries_its_shortcode_and_image() {
     let db = common::test_db().await;
     let pool = db.pool().clone();

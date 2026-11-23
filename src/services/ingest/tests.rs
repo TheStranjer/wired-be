@@ -165,7 +165,7 @@ async fn an_unparseable_object_is_a_permanent_failure() {
 }
 
 #[tokio::test]
-async fn the_unsolicited_gate_drops_public_posts_from_unfollowed_authors() {
+async fn the_unsolicited_gate_drops_public_notes_from_unfollowed_authors() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = gating_state(&pool);
@@ -283,4 +283,139 @@ fn gating_state(pool: &PgPool) -> AppState {
     })
     .expect("the gating test config is valid");
     state_with_config(pool, config)
+}
+
+/// A direct note by `bob` named `n`: nobody addressed, as a `bcc` delivery
+/// reads once the sender stripped the field.
+fn bcc_note(n: &str) -> Value {
+    json!({
+        "id": format!("https://remote.example/objects/{n}"),
+        "type": "Note",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": [],
+        "content": "<p>for your eyes only</p>",
+    })
+}
+
+/// Inserts the local account `nickname`.
+async fn local_user(state: &AppState, nickname: &str) -> User {
+    user::insert(
+        &state.db,
+        &NewUser::local(
+            nickname,
+            &user::local_ap_id(&state.config.base_url, nickname),
+        ),
+    )
+    .await
+    .expect("the local account inserts")
+}
+
+/// The `user_id`s mentioned by `status_id`.
+async fn mention_rows(pool: &PgPool, status_id: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM status_mentions WHERE status_id = $1")
+        .bind(status_id)
+        .fetch_all(pool)
+        .await
+        .expect("the mention rows read")
+}
+
+#[tokio::test]
+async fn a_direct_note_delivered_to_a_personal_inbox_mentions_its_owner() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let alice = local_user(&state, "alice").await;
+
+    let outcome = ingest_note_delivered(&state, &bob, &bcc_note("ingest-bcc"), Some(&alice))
+        .await
+        .expect("the delivery ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("a first-seen note must be created, got {outcome:?}");
+    };
+    assert_eq!(row.visibility, Visibility::Direct, "nobody is addressed");
+    assert_eq!(
+        mention_rows(&pool, row.id).await,
+        vec![alice.id],
+        "the inbox owner is mentioned"
+    );
+    assert!(
+        crate::models::status_visibility::can_view(&pool, &row, Some(&alice))
+            .await
+            .expect("the visibility check runs"),
+        "so the one person it was delivered to can see it"
+    );
+}
+
+#[tokio::test]
+async fn a_shared_inbox_delivery_adds_no_mention() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let alice = local_user(&state, "alice").await;
+
+    let outcome = ingest_note_delivered(&state, &bob, &bcc_note("ingest-shared"), None)
+        .await
+        .expect("the delivery ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("a first-seen note must be created, got {outcome:?}");
+    };
+    assert!(
+        mention_rows(&pool, row.id).await.is_empty(),
+        "no owner, no mention"
+    );
+    assert!(
+        !crate::models::status_visibility::can_view(&pool, &row, Some(&alice))
+            .await
+            .expect("the visibility check runs"),
+        "and nobody is told about it"
+    );
+}
+
+#[tokio::test]
+async fn an_owner_already_mentioned_is_not_duplicated() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let alice = local_user(&state, "alice").await;
+    let mut object = bcc_note("ingest-twice");
+    object["tag"] = json!([{ "type": "Mention", "href": alice.ap_id.clone(), "name": "@alice" }]);
+
+    let outcome = ingest_note_delivered(&state, &bob, &object, Some(&alice))
+        .await
+        .expect("the delivery ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("a first-seen note must be created, got {outcome:?}");
+    };
+    assert_eq!(
+        mention_rows(&pool, row.id).await,
+        vec![alice.id],
+        "one row, not two"
+    );
+}
+
+#[tokio::test]
+async fn a_non_direct_note_delivered_to_a_personal_inbox_adds_no_mention() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let alice = local_user(&state, "alice").await;
+
+    let outcome = ingest_note_delivered(&state, &bob, &note("ingest-public-owner"), Some(&alice))
+        .await
+        .expect("the delivery ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("a first-seen note must be created, got {outcome:?}");
+    };
+    assert!(
+        mention_rows(&pool, row.id).await.is_empty(),
+        "a public post reaches the owner through follows, not a mention"
+    );
 }

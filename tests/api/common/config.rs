@@ -1,13 +1,10 @@
 //! The test database, the config variants and the router builders.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use axum::Router;
 use sqlx::PgPool;
-use wired_be::{
-    config::Config, http_client::HttpClient, mailer::MemoryTransport, state::AppState,
-    test_db::TestDb, uploads::UploaderBackend,
-};
+use wired_be::{config::Config, state::AppState, test_db::TestDb, uploads::UploaderBackend};
 
 /// A private, fully migrated, empty test database: the slot pool fixture from
 /// [`wired_be::test_db`], handed over as [`TestDb`] with its [`PgPool`].
@@ -169,22 +166,7 @@ pub fn test_app_with_restricted_areas(pool: PgPool, areas: &[&str]) -> Router {
 /// [`test_app_with_config`] wraps the very same state into the router.
 #[must_use]
 pub fn test_app_state(pool: PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    let hub = wired_be::streaming::hub::Hub::new(&pool);
-    AppState {
-        db: pool,
-        hub,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(wired_be::rate_limit::RateLimiter::from_config(
-            config.as_ref(),
-        )),
-        mailer: Arc::new(MemoryTransport::new()),
-    }
+    AppState::for_tests(pool, config)
 }
 
 /// The real application router from [`wired_be::app`] over `pool` and

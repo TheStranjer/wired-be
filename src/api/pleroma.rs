@@ -30,12 +30,12 @@ use crate::{
 };
 
 /// The `/api/pleroma` router, merged into [`crate::api`].
-pub fn router() -> Router<AppState> {
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .nest("/accounts/mfa", mfa::router())
         .nest("/notifications", notifications::pleroma_router())
         .merge(misc::frontend_configurations_router())
         .merge(notification_settings::router())
         .merge(pleroma_account_settings::router())
-        .merge(pleroma_import::router())
+        .merge(pleroma_import::router(state))
 }

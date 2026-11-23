@@ -103,12 +103,9 @@ pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 # `pulldown-cmark-escape`) are off — `render_markdown` renders the event stream
 # itself and sanitizes it with `ammonia`.
 pulldown-cmark = { version = "0.13.4", default-features = false }
-# XML for both directions of the feed and federation surface: the reader
-# (`Reader`/`Event`) parses the XRD documents of the WebFinger client
-# (`src/federation/webfinger_client.rs`), and the writer (`Writer`, always
-# compiled in) builds the Atom/RSS documents of `src/feeds.rs` so every
-# database-sourced string is escaped by the library. The optional features
-# (encoding detection, serialize, serde-types) stay off.
+# XML reader (`Reader`/`Event`) for the XRD documents of the WebFinger client
+# (`src/federation/webfinger_client.rs`). The optional features (encoding
+# detection, serialize, serde-types) stay off.
 quick-xml = "0.42.0"
 # RSA key pairs and SHA-256 signing (`src/util/keys.rs`): rsa with PEM and
 # PKCS#1 v1.5 support, rand pinned to the 0.8 line because rsa 0.9 takes a

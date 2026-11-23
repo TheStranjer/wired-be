@@ -18,14 +18,12 @@
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
 //!
-//! [`media_files`], [`activitypub`], [`feeds`], [`well_known`], [`nodeinfo`],
+//! [`media_files`], [`activitypub`], [`well_known`], [`nodeinfo`],
 //! [`oauth`], [`oauth_external`] and [`emoji_packs::files_router`] are the
 //! routers in this module that [`crate::app`] does not nest under `/api`:
 //! uploaded files live at `/media/{key}`, the address [`crate::uploads`]
 //! writes into activities; `ActivityPub` actors live at `/users/{nickname}`,
-//! the address federation sends as an actor's id; [`feeds`] joins it at
-//! `/users/{nickname}/feed*` and `/tags/{tag}`, the syndication addresses
-//! readers discover; `WebFinger` and host-meta live at `/.well-known/…`,
+//! the address federation sends as an actor's id; `WebFinger` and host-meta live at `/.well-known/…`,
 //! the discovery addresses fixed by their RFCs;
 //! `NodeInfo` lives at `/.well-known/nodeinfo` and `/nodeinfo/{version}`,
 //! the addresses fixed by its schema; the OAuth endpoints live at
@@ -74,7 +72,6 @@ pub mod emoji_packs;
 pub mod emoji_reactions;
 pub mod endorsements;
 pub mod federation_status;
-pub mod feeds;
 pub mod filters;
 pub mod follow_requests;
 pub mod helpers;
@@ -131,9 +128,9 @@ use crate::state::AppState;
 /// `/api/oauth_tokens` ([`oauth_tokens`]) Pleroma's token-management
 /// endpoints and `/api/account` ([`accounts::email_confirmation_router`])
 /// the email-confirmation link Pleroma serves outside its versioned API;
-/// `/api/v0/pleroma` carries Pleroma's legacy admin report ledger
-/// ([`admin::reports::legacy_router`]), the historical mount of the two
-/// admin report reads. [`media_files`] and [`activitypub`] are the exceptions:
+/// `/api/v0/pleroma` carries the reporter's own report reads
+/// ([`reports::own_router`]: the caller's filed reports, under
+/// `read:reports`). [`media_files`] and [`activitypub`] are the exceptions:
 /// they serve `/media` and `/users`, addresses that go out in
 /// `ActivityPub` documents, and [`crate::app`] merges them directly.
 ///
@@ -151,9 +148,9 @@ pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .nest("/api/v1", v1::router(state))
         .nest("/api/v2", v2::router(state))
-        .nest("/api/pleroma", pleroma::router())
+        .nest("/api/pleroma", pleroma::router(state))
         .nest("/api/oauth_tokens", oauth_tokens::router())
         .nest("/api/account", accounts::email_confirmation_router())
-        .nest("/api/v0/pleroma", admin::reports::legacy_router())
+        .nest("/api/v0/pleroma", reports::own_router())
         .merge(openapi::router())
 }

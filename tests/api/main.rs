@@ -86,8 +86,8 @@ mod admin_federation;
 /// frontend catalogue and installer, and the admin backup trigger.
 mod admin_ops;
 
-/// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`
-/// and the legacy `/api/v0/pleroma/reports`, WBE-200): the filtered,
+/// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`,
+/// WBE-200): the filtered,
 /// paged entity list, the entity show with its visibility-free statuses
 /// and notes, the bulk assignment, the note lifecycle with its
 /// moderation-log entries, and the staff-and-scope gate on every route.
@@ -199,7 +199,7 @@ mod e2e_admin;
 
 /// The end-to-end discovery and federation scenarios (WBE-223): the
 /// search trio over the visibility matrix, the v1 phrase filters applied
-/// to the timelines, the Atom/RSS feeds and the link card through the job
+/// to the timelines, and the link card through the job
 /// queue, and a remote mention resolved and delivered against a loopback
 /// mock peer.
 mod e2e_discovery;
@@ -309,9 +309,6 @@ mod endorsements;
 /// the unreachable-host ledger, its empty shape, its per-host timestamps,
 /// its lack of any auth gate, and its database failure.
 mod federation_status;
-
-/// Atom and RSS feeds (`/users/{nickname}/feed*`, `/tags/{tag}`).
-mod feeds;
 
 /// Filters over HTTP (`/api/v1/filters`).
 mod filters;

@@ -210,8 +210,14 @@ pub(super) async fn completed(
     let stored = live_state(state, name, query.state.as_deref()).await?;
     let params = StoredParams::of_state(&stored)?;
     match identified(state, provider, query).await? {
-        Landing::Denied => authorize::denied(&params.delivery()),
-        Landing::Linked(user) => granted(state, &user, &params).await,
+        Landing::Denied => {
+            let _burned = oauth_login_state::delete(&state.db, &stored.state).await?;
+            authorize::denied(&params.delivery())
+        }
+        Landing::Linked(user) => {
+            let _burned = oauth_login_state::delete(&state.db, &stored.state).await?;
+            granted(state, &user, &params).await
+        }
         Landing::Unlinked(account) => {
             let pending = pending_of(&provider.name, &account);
             if !oauth_login_state::set_pending(&state.db, &stored.state, &pending).await? {

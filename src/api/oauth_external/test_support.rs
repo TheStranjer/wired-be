@@ -3,16 +3,12 @@
 //! over, the named header value of a response, and the decoded query
 //! parameters of a URL. Test-only.
 
-use std::sync::Arc;
-
 use axum::{http::HeaderName, response::Response};
 use url::form_urlencoded;
 
 use crate::{
     config::{Config, OauthProvider},
-    http_client::HttpClient,
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The provider the fixtures describe.
@@ -37,22 +33,7 @@ pub(super) fn provider(name: &str) -> OauthProvider {
 pub(super) fn test_state(names: &[&str]) -> AppState {
     let mut config = Config::for_tests();
     config.oauth_providers = names.iter().map(|name| provider(name)).collect();
-    let config = Arc::new(config);
-    let db = sqlx::PgPool::connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no server");
-    let hub = crate::streaming::hub::Hub::new(&db);
-    AppState {
-        db,
-        hub,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::lazy_for_tests(config)
 }
 
 /// The named header value of a response, as text.

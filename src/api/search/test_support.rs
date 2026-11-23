@@ -27,7 +27,6 @@ use crate::{
     http_client::HttpClient,
     models::user::{NewUser, User, insert, local_ap_id},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 use super::params::SearchParams;
@@ -47,18 +46,9 @@ const TEST_UA: &str = "Wired (https://test.example)";
 /// Test state over `pool`: the fixed test config with a client whose SSRF
 /// guard is off, so the handle lookup may reach the loopback mock.
 pub(super) fn test_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
     AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
         http_client: HttpClient::new_for_tests(TEST_UA),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        ..AppState::for_tests(pool.clone(), Config::for_tests())
     }
 }
 

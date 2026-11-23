@@ -1,5 +1,5 @@
-//! The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`
-//! and the legacy `/api/v0/pleroma/reports`, WBE-200): the entity list
+//! The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`,
+//! WBE-200): the entity list
 //! with its `state` / `rule_id` / `assigned_account` filters and its
 //! `limit` / `page` / `page_size` window beside the total, the entity
 //! show with its cited statuses rendered although the reading admin has
@@ -38,8 +38,6 @@ use crate::common;
 
 /// The admin reports route.
 const ADMIN: &str = "/api/v1/pleroma/admin/reports";
-/// The legacy v0 mount of the two admin reads.
-const V0: &str = "/api/v0/pleroma/reports";
 /// The 401 body when no token is presented.
 const NO_TOKEN: &str = "Invalid credentials";
 /// The 403 body for a valid token whose user is not staff.
@@ -835,66 +833,4 @@ async fn the_report_scopes_gate_reads_and_writes() {
         writer.nickname
     );
     assert_ne!(modder.nickname, writer.nickname, "two distinct moderators");
-}
-
-/// The legacy `/api/v0/pleroma` pair serves the same two reads — the same
-/// `{total, reports}` answer, the same entity, the same filters — behind
-/// the same staff-and-scope gate.
-#[tokio::test]
-async fn the_legacy_v0_pair_serves_the_same_entities_behind_the_same_gate() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = common::test_app(pool.clone());
-    let (_root, token) = admin(&pool, "ar_v0_root", "admin:read:reports").await;
-    let alice = common::create_local_user(&pool, "ar_v0_alice").await;
-    let bob = common::create_local_user(&pool, "ar_v0_bob").await;
-    let kept = file(&pool, &alice, &bob, &filing("kept")).await;
-    let dropped = file(&pool, &alice, &bob, &filing("dropped")).await;
-    let _closed = report::set_state(&pool, dropped.id, ReportState::Closed, None)
-        .await
-        .expect("the fixture closes")
-        .expect("the report exists");
-
-    let listed = list_ok(&app, V0, "", &token).await;
-    let admin_listed = list_ok(&app, ADMIN, "", &token).await;
-    assert_eq!(listed["total"], json!(2), "the same total");
-    assert_eq!(
-        report_ids(&listed),
-        report_ids(&admin_listed),
-        "the same page in the same order"
-    );
-    let filtered = list_ok(&app, V0, "state=open", &token).await;
-    assert_eq!(
-        report_ids(&filtered),
-        vec![kept.id.to_string()],
-        "the same filters"
-    );
-
-    let shown = show(&app, V0, kept.id, &token).await;
-    common::assert_answer(&shown, StatusCode::OK, "the legacy show");
-    let admin_shown = show(&app, ADMIN, kept.id, &token).await;
-    assert_eq!(
-        shown.json_value(),
-        admin_shown.json_value(),
-        "one and the same entity, rendered for the same viewer"
-    );
-    assert_eq!(
-        shown.json_value()["actor"]["id"],
-        alice.id.to_string(),
-        "the admin wrappers ride along"
-    );
-
-    let (_, plain_token) = regular(&pool, "ar_v0_plain", "admin:read").await;
-    let not_staff = common::TestRequest::get(V0)
-        .bearer(&plain_token)
-        .send(&app)
-        .await;
-    common::assert_answer(&not_staff, StatusCode::FORBIDDEN, "a non-staff v0 read");
-    common::assert_error(&not_staff, NOT_STAFF, "a non-staff v0 read");
-    let anonymous = show(&app, V0, kept.id, "no-token").await;
-    common::assert_answer(
-        &anonymous,
-        StatusCode::UNAUTHORIZED,
-        "the anonymous v0 read",
-    );
 }
