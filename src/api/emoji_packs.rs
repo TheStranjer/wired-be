@@ -163,8 +163,6 @@ const ZIP_CONTENT_TYPE: &str = "application/zip";
 /// `cache-control` for pack images: packs are edited in place (unlike the
 /// random upload keys), so images are cacheable for a day, not `immutable`.
 const CACHE_CONTROL: &str = "public, max-age=86400";
-/// `x-content-type-options`: the type sent here is the type to use.
-const NOSNIFF: &str = "nosniff";
 /// Pack images render inline; nothing else this route could name is served.
 const INLINE: &str = "inline";
 /// Largest emoji file the `/packs/files` create route accepts, uploaded
