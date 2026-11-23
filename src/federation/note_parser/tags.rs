@@ -6,11 +6,11 @@ use serde_json::Value;
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::user::User,
+    util::url::is_http_url,
 };
 
 use super::{
     MAX_HASHTAG_CHARS, MAX_TAGS,
-    envelope::is_http_url,
     types::{RemoteEmoji, TagSets},
 };
 

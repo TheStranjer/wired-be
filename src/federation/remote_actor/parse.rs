@@ -7,15 +7,17 @@ use url::Url;
 use super::{
     ACTOR_TYPES, ActorError, NewRemoteUser,
     fields::{
-        bool_field, is_http_url, optional_http_url, parse_accepts_chat_messages,
-        parse_also_known_as, parse_fields, parse_media_url, parse_published, required_http_url,
-        string_field,
+        bool_field, optional_http_url, parse_accepts_chat_messages, parse_also_known_as,
+        parse_fields, parse_media_url, parse_published, required_http_url, string_field,
     },
 };
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::user::{DEFAULT_ACTOR_TYPE, Flag},
-    util::sanitize::{sanitize_html, strip_html},
+    util::{
+        sanitize::{sanitize_html, strip_html},
+        url::{host_with_port, is_http_url, parse_http_url},
+    },
 };
 
 /// Parses a fetched actor document into the data of a mirror row.
@@ -92,23 +94,22 @@ fn parse_actor_id(json: &Value) -> Result<(String, String), ActorError> {
     let url = Url::parse(raw).map_err(|_parse_err| {
         ActorError::Invalid("`id` is not an absolute http(s) URL".to_owned())
     })?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(ActorError::Invalid("`id` is not an http(s) URL".to_owned()));
+    // The shared check decides; the checks below only pick which message
+    // names the failing part.
+    if parse_http_url(raw).is_none() {
+        let message = if matches!(url.scheme(), "http" | "https") {
+            "`id` has no host"
+        } else {
+            "`id` is not an http(s) URL"
+        };
+        return Err(ActorError::Invalid(message.to_owned()));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| ActorError::Invalid("`id` has no host".to_owned()))?;
     // A non-default port belongs to the host the handle names: Mastodon's
     // `Addressable` domain keeps it, and decision 7's `user@host` nickname
     // has to be the handle `WebFinger` was asked for — which for a peer on
-    // an explicit port carries that port. `Url::port()` reports `None` for a
-    // scheme's default (and for an unspelled port), so only a real,
-    // non-default port is appended.
-    let port = url
-        .port()
-        .map_or_else(String::new, |port| format!(":{port}"));
-    let domain = format!("{host}{port}");
-    Ok((raw.to_owned(), domain))
+    // an explicit port carries that port. `host_with_port` appends only a
+    // real, non-default port.
+    Ok((raw.to_owned(), host_with_port(&url)))
 }
 
 /// The `preferredUsername`: required, non-empty, and limited to the handle

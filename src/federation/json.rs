@@ -16,7 +16,6 @@
 //! checks compare.
 
 use serde_json::{Map, Value};
-use url::Url;
 
 /// Object keys that name a reference on a link or `Image` object, in the
 /// order [`value_or_id`] and [`first_string`] try them: `id` (the
@@ -101,17 +100,10 @@ pub fn references(value: &Value) -> Vec<String> {
 
 /// The host of an absolute `http(s)` URL, `None` for anything else.
 ///
-/// URL parsing lowercases the host, so hosts compare case-insensitively.
 /// `ActivityPub` ids are URLs, and containment ([`super::dispatch`])
-/// compares the host of one id against the host of another.
-#[must_use]
-pub fn http_host(text: &str) -> Option<String> {
-    let parsed = Url::parse(text).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    parsed.host_str().map(str::to_owned)
-}
+/// compares the host of one id against the host of another. The one
+/// definition lives in [`crate::util::url`].
+pub use crate::util::url::http_host;
 
 /// The first [`REFERENCE_KEYS`] entry of `map` that holds a string, resolved
 /// recursively so a `{"url": [...]}` object reaches into its array.
@@ -291,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn http_host_reads_absolute_http_urls_only() {
+    fn the_host_reexport_reads_absolute_http_urls_only() {
         assert_eq!(
             http_host("https://Peer.Example/users/alice"),
             Some("peer.example".to_owned()),

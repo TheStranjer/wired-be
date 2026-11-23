@@ -6,7 +6,6 @@
 use chrono::Utc;
 use serde_json::Value;
 use tracing::debug;
-use url::Url;
 
 use super::{
     Inbound, InboxAuthError,
@@ -21,6 +20,7 @@ use crate::{
     },
     models::{instance_policy_domain, user::User},
     state::AppState,
+    util::url::http_host,
 };
 
 /// Verifies the signature against the signer's stored key, retrying once
@@ -122,12 +122,10 @@ pub(super) async fn require_unblocked(
 ///
 /// It is the authority of its `keyId` (or, equivalently, of the actor URL
 /// it points at) — the canonical spelling `instance_policy_domains` rows
-/// keep. `None` when the URL cannot be parsed.
+/// keep. `None` when the URL is not an absolute `http(s)` URL with a host.
 #[must_use]
 pub fn signer_host(key_id: &str) -> Option<String> {
-    let parsed = Url::parse(key_id).ok()?;
-    let host = parsed.host_str()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    http_host(key_id)
 }
 
 #[cfg(test)]

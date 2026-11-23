@@ -94,14 +94,6 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
     outcome
 }
 
-/// Parses an inbox into a deliverable URL: `http`/`https` with a host, and
-/// nothing else. `None` is [`enqueue_delivery`]'s refusal.
-pub(super) fn parse_inbox(inbox: &str) -> Option<Url> {
-    let target = Url::parse(inbox).ok()?;
-    let deliverable = matches!(target.scheme(), "http" | "https") && target.host_str().is_some();
-    deliverable.then_some(target)
-}
-
 /// Whether `inbox` is served by this very instance: its authority (host,
 /// plus the port when it is not the scheme's default) is the authority of
 /// the local signing actor's own id, which lives on this instance's origin
@@ -187,6 +179,7 @@ mod tests {
             throttled,
         },
         models::user::{NewUser, insert, local_ap_id},
+        util::url::parse_http_url,
     };
 
     #[test]
@@ -260,13 +253,13 @@ mod tests {
             "",
         ] {
             assert!(
-                parse_inbox(inbox).is_none(),
+                parse_http_url(inbox).is_none(),
                 "`{inbox}` is not an http(s) inbox"
             );
         }
         for inbox in ["http://peer.example/inbox", "https://peer.example/inbox"] {
             assert!(
-                parse_inbox(inbox).is_some(),
+                parse_http_url(inbox).is_some(),
                 "`{inbox}` is an http(s) inbox"
             );
         }
