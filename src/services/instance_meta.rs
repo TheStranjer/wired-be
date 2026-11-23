@@ -12,6 +12,8 @@
 
 use serde_json::{Value, json};
 
+use crate::config::Config;
+
 /// The feature flags Pleroma 2.10.2 advertises under
 /// `pleroma.metadata.features` (`InstanceView.features/0`,
 /// `lib/pleroma/web/mastodon_api/views/instance_view.ex`) when read with
@@ -59,23 +61,31 @@ pub const fn features() -> &'static [&'static str] {
 }
 
 /// The `restrict_unauthenticated` block: which reads an unauthenticated
-/// request must not make.
+/// request must not make, built from the operator's setting.
 ///
-/// Pleroma's `:restrict_unauthenticated` config (`config/config.exs`) sets
-/// every key to `:if_instance_is_private`, so a public instance — wired-be
-/// has no private-instance mode to configure — answers all-false with the
-/// same three groups and sub-keys. This is that fixed advertisement: the
-/// operator-side setting that closes a read is
-/// [`RESTRICT_UNAUTHENTICATED`](crate::config::RESTRICT_UNAUTHENTICATED_VAR),
-/// read through [`crate::config::Config::restricts`], and the endpoints that
-/// gate on it are the ones that say so in their own docs; wiring this block
-/// to it is the instance documents' ticket.
+/// Pleroma publishes the same three groups (`timelines`, `profiles`,
+/// `activities`), each with a `local` and a `federated`/`remote` key
+/// (`restrict_unauthenticated_access?` in `lib/pleroma/config.ex`, and
+/// `InstanceView` in `lib/pleroma/web/mastodon_api/views/instance_view.ex`).
+/// Each flag here is [`Config::restricts`] for the matching
+/// [`RESTRICT_UNAUTHENTICATED_AREAS`](crate::config::RESTRICT_UNAUTHENTICATED_AREAS)
+/// name, so what is advertised is what the gated endpoints enforce; with
+/// `RESTRICT_UNAUTHENTICATED` unset every flag is `false`.
 #[must_use]
-pub fn restrict_unauthenticated() -> Value {
+pub fn restrict_unauthenticated(config: &Config) -> Value {
     json!({
-        "timelines": { "local": false, "federated": false },
-        "profiles": { "local": false, "remote": false },
-        "activities": { "local": false, "remote": false },
+        "timelines": {
+            "local": config.restricts("timelines_local"),
+            "federated": config.restricts("timelines_federated"),
+        },
+        "profiles": {
+            "local": config.restricts("profiles_local"),
+            "remote": config.restricts("profiles_remote"),
+        },
+        "activities": {
+            "local": config.restricts("activities_local"),
+            "remote": config.restricts("activities_remote"),
+        },
     })
 }
 
@@ -142,7 +152,7 @@ mod tests {
 
     #[test]
     fn a_public_instance_restricts_nothing() {
-        let restrictions = restrict_unauthenticated();
+        let restrictions = restrict_unauthenticated(&Config::for_tests());
         let groups = restrictions
             .as_object()
             .expect("an object of access groups");
@@ -157,6 +167,64 @@ mod tests {
             for value in keys.values() {
                 assert_eq!(value, &json!(false), "a public instance restricts nothing");
             }
+        }
+    }
+
+    /// A [`Config`] parsed through `from_lookup` with `RESTRICT_UNAUTHENTICATED=areas`.
+    fn config_restricting(areas: &str) -> Config {
+        Config::from_lookup(|key| match key {
+            crate::config::DATABASE_URL_VAR => Some("postgres://localhost/test".to_owned()),
+            crate::config::BASE_URL_VAR => Some("https://test.example".to_owned()),
+            crate::config::RESTRICT_UNAUTHENTICATED_VAR => Some(areas.to_owned()),
+            _ => None,
+        })
+        .expect("a valid configuration")
+    }
+
+    #[test]
+    fn the_configured_areas_are_exactly_the_true_flags() {
+        let config = config_restricting("profiles_local,timelines_federated");
+        assert_eq!(
+            restrict_unauthenticated(&config),
+            json!({
+                "timelines": { "local": false, "federated": true },
+                "profiles": { "local": true, "remote": false },
+                "activities": { "local": false, "remote": false },
+            })
+        );
+    }
+
+    #[test]
+    fn a_second_mix_of_areas_is_published_as_configured() {
+        let config = config_restricting("timelines_federated,activities_local");
+        assert_eq!(
+            restrict_unauthenticated(&config),
+            json!({
+                "timelines": { "local": false, "federated": true },
+                "profiles": { "local": false, "remote": false },
+                "activities": { "local": true, "remote": false },
+            })
+        );
+    }
+
+    #[test]
+    fn every_area_flag_equals_config_restricts() {
+        let mut config = Config::for_tests();
+        config.restrict_unauthenticated = crate::config::RESTRICT_UNAUTHENTICATED_AREAS
+            .iter()
+            .map(|area| (*area).to_owned())
+            .collect();
+        let value = restrict_unauthenticated(&config);
+        for (area, flag) in [
+            ("timelines_local", &value["timelines"]["local"]),
+            ("timelines_federated", &value["timelines"]["federated"]),
+            ("profiles_local", &value["profiles"]["local"]),
+            ("profiles_remote", &value["profiles"]["remote"]),
+            ("activities_local", &value["activities"]["local"]),
+            ("activities_remote", &value["activities"]["remote"]),
+        ] {
+            assert_eq!(flag, &json!(config.restricts(area)), "{area}");
+            assert_eq!(flag, &json!(true), "{area} is restricted");
         }
     }
 }

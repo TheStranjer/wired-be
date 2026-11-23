@@ -95,7 +95,7 @@ impl Metadata {
             invites_enabled: config.invites_enabled,
             mailer_enabled: Toggle::new(false),
             features: instance_meta::features(),
-            restrict_unauthenticated: instance_meta::restrict_unauthenticated(),
+            restrict_unauthenticated: instance_meta::restrict_unauthenticated(config),
             skip_thread_containment: Toggle::new(true),
             markup: Markup::pleroma_defaults(),
         }

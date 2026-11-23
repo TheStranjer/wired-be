@@ -18,6 +18,9 @@
 //! This file is deliberately standalone — it reads text files and needs
 //! no database, no router and no `wired_be` symbols — so it costs nothing
 //! of the relink the one-test-crate rule (decision 13) exists to avoid.
+//!
+//! Paths are resolved from `CARGO_MANIFEST_DIR` at compile time, so the
+//! guard always reads the checkout it was built from.
 
 #![cfg(test)]
 

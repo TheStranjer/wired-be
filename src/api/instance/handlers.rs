@@ -166,9 +166,11 @@ async fn list_peers(state: &AppState) -> AppResult<Vec<String>> {
 /// timeline from anonymous callers — the Akkoma-style gate Pleroma's
 /// `peers` action grows behind it: an instance that will not serve remote
 /// content to strangers publishes no peer list either. wired-be has no
-/// private-instance mode to set, so today this is always `false`.
-fn peers_restricted() -> bool {
-    instance_meta::restrict_unauthenticated()
+/// private-instance mode to set, so this follows `config`'s
+/// `timelines_federated` restriction (the advertised
+/// `restrict_unauthenticated.timelines.federated`).
+fn peers_restricted(config: &Config) -> bool {
+    instance_meta::restrict_unauthenticated(config)
         .get("timelines")
         .and_then(|timelines| timelines.get("federated"))
         == Some(&Value::Bool(true))
@@ -182,7 +184,8 @@ fn peers_restricted() -> bool {
 /// Any database failure arrives through `?` as
 /// [`AppError::Database`](crate::error::AppError).
 pub(super) async fn show_peers(State(state): State<AppState>) -> AppResult<Json<Vec<String>>> {
-    if peers_restricted() {
+    let config = effective_instance_config(&state).await?;
+    if peers_restricted(&config) {
         return Ok(Json(Vec::new()));
     }
     Ok(Json(list_peers(&state).await?))
