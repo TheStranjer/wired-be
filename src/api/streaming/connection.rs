@@ -27,7 +27,7 @@ use crate::{
     auth,
     error::AppResult,
     models::{list, user::User},
-    oauth::scopes::Scopes,
+    oauth::scopes::{READ_LISTS, Scopes},
     state::AppState,
     streaming::hub::{StreamEvent, stream_matches},
 };
@@ -37,8 +37,8 @@ use super::{
     facts::parse_uuid,
     filters::Filters,
     names::{
-        AUTHENTICATE, FILTER_TTL, LIST, LIST_SCOPES, PRIVATE_SCOPES, STREAM_FIELD, SUBSCRIBE,
-        UNSUBSCRIBE, grants, is_user_stream, public_topic,
+        AUTHENTICATE, FILTER_TTL, LIST, STREAM_FIELD, SUBSCRIBE, UNSUBSCRIBE, is_user_stream,
+        public_topic, required_scope,
     },
     run::heartbeat_period,
 };
@@ -206,31 +206,30 @@ impl Connection {
         public_topic(name, args).ok_or(Refusal::Unknown)
     }
 
-    /// A private user stream: the socket needs a user whose token grants one
-    /// of [`PRIVATE_SCOPES`] (Pleroma's `get_topic` `@user_streams` clause is
-    /// the same user-bound-token match with one scope per stream; the ticket
-    /// lists the three accepted scopes together, and `read` covers them all),
-    /// and the topic it holds is the reader's own: the requested `name` with
-    /// the reader's uuid suffixed onto it.
+    /// A private user stream: the socket needs a user whose token grants the
+    /// stream's own [`required_scope`] (Pleroma's `get_topic` `@user_streams`
+    /// clause; `read` covers them all), and the topic it holds is the
+    /// reader's own: the requested `name` with the reader's uuid suffixed
+    /// onto it.
     fn user_topic(&self, name: &str) -> Result<String, Refusal> {
         let Some(reader) = self
             .reader_id()
-            .filter(|_| grants(&self.scopes, &PRIVATE_SCOPES))
+            .filter(|_| self.scopes.contains(required_scope(name)))
         else {
             return Err(Refusal::Unauthorized);
         };
         Ok(format!("{name}:{reader}"))
     }
 
-    /// A list stream: one of [`PRIVATE_SCOPES`] or [`LIST_SCOPES`], and a list
-    /// the reader does not own is the `:bad_topic` Pleroma's
-    /// `get_topic("list", …)` answers too.
+    /// A list stream: `read:lists` (or `read`), and a list the reader does
+    /// not own is the `:bad_topic` Pleroma's `get_topic("list", …)` answers
+    /// too.
     async fn list_topic(&self, args: &StreamArgs) -> Result<String, Refusal> {
         let refused = Err(Refusal::Unauthorized);
         let Some(reader) = self.reader_id() else {
             return refused;
         };
-        if !(grants(&self.scopes, &PRIVATE_SCOPES) || grants(&self.scopes, &LIST_SCOPES)) {
+        if !self.scopes.contains(READ_LISTS) {
             return refused;
         }
         let Some(id) = args.list.as_deref().and_then(parse_uuid) else {
@@ -318,7 +317,7 @@ mod tests {
             test_support::{account, query, state},
         },
         models::list::NewList,
-        oauth::scopes::{READ, READ_LISTS, READ_STATUSES},
+        oauth::scopes::{READ, READ_NOTIFICATIONS, READ_STATUSES},
     };
 
     use super::*;
@@ -416,6 +415,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn each_user_stream_checks_its_own_scope() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "per-stream-scope-reader").await;
+        let mut connection = Connection::new(state, None).await.unwrap();
+        connection.reader = Some(Arc::clone(&reader));
+        let streams = [USER, USER_NOTIFICATION, USER_PLEROMA_CHAT, DIRECT];
+
+        for (scope, allowed) in [
+            (READ_NOTIFICATIONS, vec![USER_NOTIFICATION]),
+            (READ_STATUSES, vec![USER, USER_PLEROMA_CHAT, DIRECT]),
+            (READ, streams.to_vec()),
+            (READ_LISTS, Vec::new()),
+        ] {
+            connection.scopes = Scopes::parse(scope);
+            assert_user_streams(&connection, &reader, scope, &allowed).await;
+        }
+    }
+
+    /// Asserts that `connection` admits exactly the user streams in `allowed`
+    /// and refuses the rest, `scope` being what its token grants.
+    async fn assert_user_streams(
+        connection: &Connection,
+        reader: &User,
+        scope: &str,
+        allowed: &[&str],
+    ) {
+        for name in [USER, USER_NOTIFICATION, USER_PLEROMA_CHAT, DIRECT] {
+            let expected = allowed
+                .contains(&name)
+                .then(|| format!("{name}:{}", reader.id))
+                .ok_or(Refusal::Unauthorized);
+            assert_eq!(
+                connection.topic_for(name, &StreamArgs::default()).await,
+                expected,
+                "`{scope}` on `{name}`"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_list_stream_needs_a_list_the_reader_owns_and_a_read_scope() {
         let (_db, state) = state().await;
         let reader = account(&state, "list-owner").await;
@@ -436,25 +475,34 @@ mod tests {
             ..StreamArgs::default()
         };
 
-        connection.scopes = Scopes::parse(READ_STATUSES);
+        connection.scopes = Scopes::parse(READ_LISTS);
         let topic = connection
             .topic_for(LIST, &args)
             .await
-            .expect("read:statuses is a read scope");
+            .expect("read:lists is the list scope");
         assert_eq!(
             topic,
             format!("list:{}", mine.id),
             "an owned list is a topic"
         );
 
-        connection.scopes = Scopes::parse(READ_LISTS);
+        connection.scopes = Scopes::parse(READ);
         assert!(
             connection
                 .topic_for(LIST, &args)
                 .await
                 .is_ok_and(|name| name == topic),
-            "and so is read:lists, Pleroma's other grant here"
+            "and so is read, which covers it"
         );
+
+        for scope in [READ_STATUSES, READ_NOTIFICATIONS] {
+            connection.scopes = Scopes::parse(scope);
+            assert_eq!(
+                connection.topic_for(LIST, &args).await,
+                Err(Refusal::Unauthorized),
+                "{scope} does not reach list timelines"
+            );
+        }
 
         connection.scopes = Scopes::parse("write");
         assert_eq!(

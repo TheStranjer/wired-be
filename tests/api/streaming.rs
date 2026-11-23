@@ -44,6 +44,9 @@ mod harness;
 /// the send-time render, the favourite's notification and the announcement.
 mod live_events;
 
+/// The scope each private stream requires, over a live socket.
+mod scopes;
+
 /// The subscription frames: `subscribe` and `unsubscribe`, the list stream,
 /// the refusal frames, the cap and `pleroma:authenticate`.
 mod subscriptions;

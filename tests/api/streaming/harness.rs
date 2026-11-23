@@ -117,7 +117,7 @@ impl Drop for Server {
 
 /// A connected client. Every test ends it by dropping, which closes the
 /// connection out from under the server's loop.
-type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(super) type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// A fresh local account named `nickname`.
 ///

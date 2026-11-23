@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::{
     models::hashtag,
-    oauth::scopes::{READ, READ_LISTS, READ_NOTIFICATIONS, READ_STATUSES, Scopes},
+    oauth::scopes::{READ_NOTIFICATIONS, READ_STATUSES},
 };
 
 use super::args::StreamArgs;
@@ -94,18 +94,16 @@ pub(super) const DIRECT: &str = "direct";
 /// One of the reader's lists (`list` names it).
 pub(super) const LIST: &str = "list";
 
-/// The scopes the ticket accepts for one of the private streams — `user`,
-/// `user:notification`, `user:pleroma_chat`, `direct` and `list`: any one of
-/// them, and through [`Scopes::contains`] a plain `read` token covers them all.
-pub(super) const PRIVATE_SCOPES: [&str; 3] = [READ, READ_STATUSES, READ_NOTIFICATIONS];
-/// The scope [`LIST`] additionally accepts: Pleroma's `read:lists` on its
-/// `get_topic("list", …)` clause, beside the ticket's private-set list.
-pub(super) const LIST_SCOPES: [&str; 1] = [READ_LISTS];
-
-/// Whether `granted` covers any scope of `allowed` (through the Mastodon
-/// hierarchy [`Scopes::contains`] implements).
-pub(super) fn grants(granted: &Scopes, allowed: &[&'static str]) -> bool {
-    allowed.iter().any(|scope| granted.contains(scope))
+/// The scope one private user stream requires: `read:notifications` for
+/// [`USER_NOTIFICATION`], `read:statuses` for every other one (`user`,
+/// `user:pleroma_chat`, `direct`), as Pleroma's `Streamer` requires. A plain
+/// `read` token covers both through [`Scopes::contains`].
+pub(super) fn required_scope(name: &str) -> &'static str {
+    if name == USER_NOTIFICATION {
+        READ_NOTIFICATIONS
+    } else {
+        READ_STATUSES
+    }
 }
 
 /// Whether `name` is one of the private user streams, the streams that need a
@@ -202,6 +200,18 @@ mod tests {
             None,
             "a hashtag with no tag names no stream"
         );
+    }
+
+    #[test]
+    fn each_private_stream_requires_its_own_scope() {
+        assert_eq!(required_scope(USER_NOTIFICATION), READ_NOTIFICATIONS);
+        for name in [USER, USER_PLEROMA_CHAT, DIRECT] {
+            assert_eq!(
+                required_scope(name),
+                READ_STATUSES,
+                "`{name}` needs read:statuses"
+            );
+        }
     }
 
     #[test]
