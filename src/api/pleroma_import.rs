@@ -40,8 +40,11 @@
 //! here is that a follows row naming something other than `true`/`false`
 //! is dropped, and a handle with interior whitespace is never a handle).
 //!
-//! Rate limiting (one import per kind per hour) is deliberately not
-//! implemented: the ticket defers it.
+//! All three routes share the `imports` rate-limit bucket (WBE-504, one
+//! import per user per hour by default, see [`crate::rate_limit`]): every
+//! entry may cost a `WebFinger` and an actor fetch, so an unthrottled client
+//! could make this server flood third-party hosts. Over the budget a
+//! request is refused 429 `{"error":"Throttled"}` before any list is read.
 
 use axum::{
     Json, Router,
@@ -64,6 +67,8 @@ use crate::{
     state::AppState,
 };
 
+/// The rate-limit bucket the three import routes share.
+const IMPORTS_BUCKET: &str = "imports";
 /// The form field the list arrives in, Pleroma's required `:list`.
 const LIST_FIELD: &str = "list";
 /// 400 body when the request names no `list` at all (Pleroma's
@@ -94,11 +99,23 @@ const HEADER_WORD: &str = "address";
 /// Do not call [`Router::fallback`] here (or on anything merged into this
 /// tree): the app-wide JSON fallback in [`crate::app`] must answer the
 /// unmatched paths.
-pub fn router() -> Router<AppState> {
+///
+/// Each route is layered with the `imports` rate-limit bucket built from
+/// `state`.
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .route("/follow_import", post(follow_import))
-        .route("/blocks_import", post(blocks_import))
-        .route("/mutes_import", post(mutes_import))
+        .route(
+            "/follow_import",
+            post(follow_import).layer(crate::rate_limit::rate_limit(state, IMPORTS_BUCKET)),
+        )
+        .route(
+            "/blocks_import",
+            post(blocks_import).layer(crate::rate_limit::rate_limit(state, IMPORTS_BUCKET)),
+        )
+        .route(
+            "/mutes_import",
+            post(mutes_import).layer(crate::rate_limit::rate_limit(state, IMPORTS_BUCKET)),
+        )
         .layer(DefaultBodyLimit::max(MAX_IMPORT_BODY_BYTES))
 }
 
