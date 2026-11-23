@@ -218,8 +218,10 @@ async fn distinct_peers_are_distinct_windows() {
     );
 }
 
-/// `TRUST_PROXY_HEADERS=true` makes the leftmost `X-Forwarded-For` entry
-/// the subject: two forwarded clients behind one proxy keep two windows.
+/// `TRUST_PROXY_HEADERS=true` makes the rightmost `X-Forwarded-For` entry
+/// (the hop the proxy appended) the subject: two forwarded clients behind
+/// one proxy keep two windows, and prepending arbitrary entries changes
+/// nothing.
 /// While the flag is off — the default — the same pair shares the proxy's
 /// socket window however the header claims otherwise.
 #[tokio::test]
@@ -252,13 +254,13 @@ async fn forwarded_for_names_the_client_only_when_trusted() {
     let trusted_app = common::test_app_with_config(pool, config);
     let alice = token_request()
         .peer(peer(7))
-        .header("x-forwarded-for", "198.51.100.1, 70.41.3.18")
+        .header("x-forwarded-for", "70.41.3.18, 198.51.100.1")
         .send(&trusted_app)
         .await;
     common::assert_answer(&alice, StatusCode::BAD_REQUEST, "alice passes");
     let bob = token_request()
         .peer(peer(7))
-        .header("x-forwarded-for", "198.51.100.2, 70.41.3.18")
+        .header("x-forwarded-for", "70.41.3.18, 198.51.100.2")
         .send(&trusted_app)
         .await;
     common::assert_answer(
@@ -268,7 +270,7 @@ async fn forwarded_for_names_the_client_only_when_trusted() {
     );
     let alice_again = token_request()
         .peer(peer(7))
-        .header("x-forwarded-for", "198.51.100.1")
+        .header("x-forwarded-for", "9.9.9.9, 198.51.100.1")
         .send(&trusted_app)
         .await;
     common::assert_answer(

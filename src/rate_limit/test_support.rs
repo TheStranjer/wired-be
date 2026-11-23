@@ -56,14 +56,26 @@ pub(super) struct Flags {
     pub(super) enabled: bool,
     /// The value of `TRUST_PROXY_HEADERS`.
     pub(super) trust: bool,
+    /// The value of `TRUSTED_PROXY_HOPS`.
+    pub(super) hops: usize,
 }
 
 /// The flags every middleware test runs on unless it names others:
-/// limiting, unproxied.
+/// limiting, unproxied, one trusted hop.
 pub(super) const FLAGS_ON: Flags = Flags {
     enabled: true,
     trust: false,
+    hops: 1,
 };
+
+/// Limiting on, the proxy header trusted, `hops` proxies in front.
+pub(super) const fn trusting(hops: usize) -> Flags {
+    Flags {
+        enabled: true,
+        trust: true,
+        hops,
+    }
+}
 
 /// The middleware app over the `authentication` bucket of `max`
 /// requests per ten seconds.
@@ -93,6 +105,7 @@ pub(super) fn app_on_pool(
     config.rate_limit.limits = limits.clone();
     config.rate_limit.enabled = crate::config::Toggle::new(flags.enabled);
     config.rate_limit.trust_proxy_headers = crate::config::Toggle::new(flags.trust);
+    config.rate_limit.trusted_proxy_hops = flags.hops;
     let owned = Arc::clone(clock);
     let time: Arc<dyn Clock> = owned;
     let state = AppState {

@@ -106,10 +106,16 @@ pub struct RateLimitConfig {
     /// variable's `bucket=max:window_secs` entries overriding them; a
     /// bucket the table does not name is unlimited.
     pub limits: BTreeMap<String, RateLimit>,
-    /// Whether the leftmost `X-Forwarded-For` entry may name the client a
-    /// window counts against, from `TRUST_PROXY_HEADERS`: while off (the
-    /// default) the socket peer always does.
+    /// Whether the `X-Forwarded-For` header may name the client a window
+    /// counts against, from `TRUST_PROXY_HEADERS`: while off (the default)
+    /// the socket peer always does.
     pub trust_proxy_headers: Toggle,
+    /// How many reverse proxies sit in front of the server, from
+    /// `TRUSTED_PROXY_HOPS` (default 1): the client is the entry that many
+    /// places from the right of `X-Forwarded-For` — the address the
+    /// outermost trusted proxy saw. Entries further left are
+    /// client-controlled and never used.
+    pub trusted_proxy_hops: usize,
 }
 
 /// The two numbers that bound how far federation fetching may go, from
@@ -193,10 +199,16 @@ mod tests {
     use crate::{
         config::{
             Config,
-            defaults::{DEFAULT_RATE_LIMITS_ENABLED, DEFAULT_TRUST_PROXY_HEADERS},
+            defaults::{
+                DEFAULT_RATE_LIMITS_ENABLED, DEFAULT_TRUST_PROXY_HEADERS,
+                DEFAULT_TRUSTED_PROXY_HOPS,
+            },
             error::ConfigError,
             test_support::{config_with, try_config_with},
-            vars::{RATE_LIMITS_ENABLED_VAR, RATE_LIMITS_VAR, TRUST_PROXY_HEADERS_VAR},
+            vars::{
+                RATE_LIMITS_ENABLED_VAR, RATE_LIMITS_VAR, TRUST_PROXY_HEADERS_VAR,
+                TRUSTED_PROXY_HOPS_VAR,
+            },
         },
         rate_limit,
     };
@@ -347,6 +359,43 @@ mod tests {
             let err = try_config_with(&[(var, "maybe")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidBoolean(var), "error for {var}");
         }
+    }
+
+    /// `TRUSTED_PROXY_HOPS` defaults to one proxy, reads a whole number,
+    /// keeps the default when blank and refuses anything else.
+    #[test]
+    fn trusted_proxy_hops_parse_a_number() {
+        assert_eq!(
+            config_with(&[]).rate_limit.trusted_proxy_hops,
+            DEFAULT_TRUSTED_PROXY_HOPS,
+            "one proxy by default"
+        );
+        assert_eq!(DEFAULT_TRUSTED_PROXY_HOPS, 1, "the documented default");
+        assert_eq!(
+            config_with(&[(TRUSTED_PROXY_HOPS_VAR, "3")])
+                .rate_limit
+                .trusted_proxy_hops,
+            3,
+            "a custom hop count"
+        );
+        assert_eq!(
+            config_with(&[(TRUSTED_PROXY_HOPS_VAR, "")])
+                .rate_limit
+                .trusted_proxy_hops,
+            DEFAULT_TRUSTED_PROXY_HOPS,
+            "blank keeps the default"
+        );
+        let err = try_config_with(&[(TRUSTED_PROXY_HOPS_VAR, "two")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::InvalidNumber(TRUSTED_PROXY_HOPS_VAR),
+            "error variant"
+        );
+        let debug = format!("{:?}", config_with(&[(TRUSTED_PROXY_HOPS_VAR, "2")]));
+        assert!(
+            debug.contains("trusted_proxy_hops: 2"),
+            "the hop count is visible in Debug output: {debug}"
+        );
     }
 
     /// The named toggle's value on this config.

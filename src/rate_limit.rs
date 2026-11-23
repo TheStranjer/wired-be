@@ -23,9 +23,13 @@
 //! The source port is not part of the key (each connection draws a new
 //! one, which would give every connection its own window), and an IPv6
 //! client is keyed by its /64 prefix so one host cannot rotate through its
-//! own prefix. The leftmost `X-Forwarded-For` entry is honored *only* when
-//! `TRUST_PROXY_HEADERS=true` (off by default), and only then may a client
-//! name itself into someone else's window. A limited route reached without
+//! own prefix. `X-Forwarded-For` is honored *only* when
+//! `TRUST_PROXY_HEADERS=true` (off by default), and then the client is the
+//! entry `TRUSTED_PROXY_HOPS` (default 1) places from the *right* — the
+//! address the outermost trusted proxy saw. A proxy appends the peer to
+//! whatever the client sent, so entries further left are client-controlled
+//! and never read; a header with fewer entries than hops, or whose chosen
+//! entry is not an IP address, falls back to the socket peer. A limited route reached without
 //! a socket peer (an in-process test request carrying no `ConnectInfo`)
 //! shares the `unknown` subject.
 //!
