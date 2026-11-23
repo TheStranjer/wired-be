@@ -49,7 +49,7 @@ use crate::{
         follow::{self, FollowToggles},
         job::{NewJob, enqueue},
         mute::{self, MuteOptions},
-        user::{self, User},
+        user::{self, AccountStatus, User},
     },
     state::AppState,
 };
@@ -191,16 +191,28 @@ pub fn handle_mutes(state: AppState, _attempt: AttemptInfo, args: Value) -> Hand
     })
 }
 
-/// The importer the job acts as. A vanished user is permanent (discard);
-/// a database that cannot answer is a retry.
+/// The importer the job acts as. A vanished user, or one that can no
+/// longer act (deactivated, deleted, or awaiting approval), is permanent
+/// (discard); a database that cannot answer is a retry.
 ///
 /// # Errors
 ///
-/// [`JobError::Discard`] when the user row is gone, [`JobError::Retry`]
-/// on a database failure.
+/// [`JobError::Discard`] when the user row is gone or the account can no
+/// longer act, [`JobError::Retry`] on a database failure.
 async fn load_importer(state: &AppState, user_id: Uuid) -> Result<User, JobError> {
     match user::get_by_id(&state.db, user_id).await {
-        Ok(Some(importer)) => Ok(importer),
+        Ok(Some(importer)) => {
+            let blocked = matches!(
+                importer.account_status(),
+                AccountStatus::Deactivated | AccountStatus::ApprovalPending
+            ) || importer.deleted_at.is_some();
+            if blocked {
+                return Err(JobError::Discard(format!(
+                    "the import job's user {user_id} can no longer act"
+                )));
+            }
+            Ok(importer)
+        }
         Ok(None) => Err(JobError::Discard(format!(
             "the import job's user {user_id} no longer exists"
         ))),
@@ -767,6 +779,145 @@ mod tests {
             Ok(()) => panic!("a vanished user must not complete the job"),
             Err(other) => panic!("a vanished user must discard, not {other}"),
         }
+    }
+
+    /// Asserts `outcome` is the "can no longer act" discard.
+    fn assert_cannot_act(outcome: Result<(), JobError>) {
+        match outcome {
+            Err(JobError::Discard(detail)) => assert!(
+                detail.contains("can no longer act"),
+                "the discard says why: {detail}"
+            ),
+            Ok(()) => panic!("an inactive importer must not complete the job"),
+            Err(other) => panic!("an inactive importer must discard, not {other}"),
+        }
+    }
+
+    /// A deleted importer's follow import is discarded: no follow row, and
+    /// no next chunk even when the list exceeds one chunk.
+    #[tokio::test]
+    async fn a_deleted_importer_follows_nothing_and_ends_the_chain() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let mut names: Vec<String> = Vec::new();
+        let mut users = Vec::new();
+        for i in 0..60 {
+            users.push(remote_user(&pool, &format!("user{i}"), "chunk.example").await);
+            names.push(format!("user{i}@chunk.example"));
+        }
+        user::mark_deleted(&pool, alice.id)
+            .await
+            .expect("alice is marked deleted");
+        let args = job_args(alice.id, &names, &[]);
+
+        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, args).await;
+
+        assert_cannot_act(outcome);
+        for target in &users {
+            assert!(
+                !relation_exists(&pool, &alice, target).await,
+                "no follow row for {}",
+                target.nickname
+            );
+        }
+        assert!(
+            jobs_of(&pool, KIND_FOLLOWS).await.is_empty(),
+            "no next chunk is enqueued"
+        );
+    }
+
+    /// A deactivated importer's block and mute imports are discarded and
+    /// write nothing.
+    #[tokio::test]
+    async fn a_deactivated_importer_blocks_and_mutes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = remote_user(&pool, "bob", "remote.example").await;
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .map(drop)
+            .expect("alice is deactivated");
+        let args = job_args(alice.id, std::slice::from_ref(&bob.nickname), &[]);
+        let state = app_state(&pool);
+
+        assert_cannot_act(handle_blocks(state.clone(), FIRST_ATTEMPT, args.clone()).await);
+        assert_cannot_act(handle_mutes(state, FIRST_ATTEMPT, args).await);
+
+        assert!(
+            !block::is_blocking(&pool, alice.id, bob.id).await.unwrap(),
+            "no block was written"
+        );
+        assert!(
+            !mute::is_muting(&pool, alice.id, bob.id).await.unwrap(),
+            "no mute was written"
+        );
+    }
+
+    /// An importer awaiting staff approval cannot act either.
+    #[tokio::test]
+    async fn an_unapproved_importer_is_discarded() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        sqlx::query("UPDATE users SET approval_pending = true WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .map(drop)
+            .expect("alice awaits approval");
+
+        let outcome = handle_blocks(
+            app_state(&pool),
+            FIRST_ATTEMPT,
+            job_args(alice.id, &[], &[]),
+        )
+        .await;
+
+        assert_cannot_act(outcome);
+    }
+
+    /// An active importer still applies its entries.
+    #[tokio::test]
+    async fn an_active_importer_still_applies_entries() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = remote_user(&pool, "bob", "remote.example").await;
+        let carol = remote_user(&pool, "carol", "remote.example").await;
+        let dave = remote_user(&pool, "dave", "remote.example").await;
+        let state = app_state(&pool);
+        let args_for =
+            |target: &User| job_args(alice.id, std::slice::from_ref(&target.nickname), &[]);
+
+        assert_eq!(
+            handle_follows(state.clone(), FIRST_ATTEMPT, args_for(&bob)).await,
+            Ok(())
+        );
+        assert_eq!(
+            handle_blocks(state.clone(), FIRST_ATTEMPT, args_for(&carol)).await,
+            Ok(())
+        );
+        assert_eq!(
+            handle_mutes(state, FIRST_ATTEMPT, args_for(&dave)).await,
+            Ok(())
+        );
+
+        assert!(
+            relation_exists(&pool, &alice, &bob).await,
+            "the follow was written"
+        );
+        assert!(
+            block::is_blocking(&pool, alice.id, carol.id).await.unwrap(),
+            "the block was written"
+        );
+        assert!(
+            mute::is_muting(&pool, alice.id, dave.id).await.unwrap(),
+            "the mute was written"
+        );
     }
 
     /// A database that cannot answer is transient: retry, so the import
