@@ -18,6 +18,7 @@ use axum::{
     response::{IntoResponse as _, Response},
 };
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 use super::{
     MISSING_TOKEN, NO_CACHE, NO_STORE,
@@ -26,9 +27,13 @@ use super::{
 use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
-    models::oauth_token,
+    models::{oauth_app::OauthApp, oauth_token, oauth_token::OauthToken},
     state::AppState,
 };
+
+/// The `token_type_hint` value (RFC 7009 §2.1) that makes the lookup try
+/// the refresh-token column before the access-token one.
+const REFRESH_TOKEN_HINT: &str = "refresh_token";
 
 /// `POST /oauth/revoke` — retire one of the application's access tokens
 /// (Pleroma's `token_revoke`, RFC 7009). No bearer authentication: the
@@ -69,13 +74,36 @@ async fn revoke_token(
         return Err(AppError::BadRequest(MISSING_TOKEN.to_owned()));
     };
     let app = validate_app(state, headers, params.body_credentials()).await?;
-    if let Some((found, owner)) = oauth_token::get_with_app(&state.db, token).await? {
+    let hint_is_refresh = params.token_type_hint.as_deref() == Some(REFRESH_TOKEN_HINT);
+    if let Some((found, owner)) = find_pair(&state.db, token, hint_is_refresh).await? {
         if owner.id != app.id {
             return Err(invalid_credentials());
         }
         oauth_token::delete_token(&state.db, found.id).await?;
     }
     Ok(Json(RevokeResponse))
+}
+
+/// Looks `token` up as an access token and as a refresh token (RFC 7009
+/// §2.1: both are revocable), returning the pair row with its issuing
+/// application. The `token_type_hint` only picks which column is tried
+/// first (`hint_is_refresh`); a miss in the hinted column falls through to
+/// the other one (§2.1: the hint is optional and may be wrong).
+async fn find_pair(
+    pool: &PgPool,
+    token: &str,
+    hint_is_refresh: bool,
+) -> AppResult<Option<(OauthToken, OauthApp)>> {
+    if hint_is_refresh {
+        if let Some(found) = oauth_token::get_by_refresh_token(pool, token).await? {
+            return Ok(Some(found));
+        }
+        return oauth_token::get_with_app(pool, token).await;
+    }
+    if let Some(found) = oauth_token::get_with_app(pool, token).await? {
+        return Ok(Some(found));
+    }
+    oauth_token::get_by_refresh_token(pool, token).await
 }
 
 /// The request parameters of `POST /oauth/revoke`: the access token to
@@ -90,6 +118,11 @@ pub(super) struct RevokeParams {
     /// [`MISSING_TOKEN`]. Renders as `<redacted>` in `Debug` output.
     #[serde(default)]
     token: Option<String>,
+    /// RFC 7009's optional `token_type_hint`: `refresh_token` makes the
+    /// lookup try the refresh-token column first; any other value (or
+    /// none) tries the access token first. It never narrows the search.
+    #[serde(default)]
+    token_type_hint: Option<String>,
     /// The public OAuth client id, when not presented through HTTP Basic.
     #[serde(default)]
     client_id: Option<String>,
@@ -105,6 +138,7 @@ impl fmt::Debug for RevokeParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RevokeParams")
             .field("token", &"<redacted>")
+            .field("token_type_hint", &self.token_type_hint)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
             .finish()
@@ -170,6 +204,7 @@ mod tests {
     ) -> RevokeParams {
         RevokeParams {
             token: token.map(str::to_owned),
+            token_type_hint: None,
             client_id: client_id.map(str::to_owned),
             client_secret: secret.map(str::to_owned),
         }

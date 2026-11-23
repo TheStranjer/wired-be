@@ -305,3 +305,119 @@ async fn revoking_twice_succeeds_both_times() {
     assert_eq!(second.json_value(), json!({}), "and answers alike");
     assert_no_store(&second);
 }
+
+/// A token-grant body carrying app `app`'s credentials, redeeming
+/// `refresh_token`.
+fn refresh_grant_body(app: &OauthApp, refresh_token: &str) -> Value {
+    json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": app.client_id,
+        "client_secret": app.client_secret,
+    })
+}
+
+/// Revoking by the refresh token answers `{}` and kills the whole pair:
+/// the access token stops authenticating `verify_credentials` (401) and
+/// the refresh grant with the same refresh token is a 400.
+#[tokio::test]
+async fn revoke_by_refresh_token_kills_the_pair() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (user, app) = fixtures(&pool, "hana", "read").await;
+    let token = common::create_token(&pool, &user, &app, "read").await;
+    let http = common::test_app(pool.clone());
+
+    let before = common::TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(&token.token)
+        .send(&http)
+        .await;
+    assert_eq!(before.status, StatusCode::OK, "the token works before");
+
+    let response = post_revoke_json(&http, &revoke_body(&app, &token.refresh_token)).await;
+    assert_eq!(response.status, StatusCode::OK, "the revocation succeeds");
+    assert_eq!(response.json_value(), json!({}), "the empty object");
+    assert_no_store(&response);
+
+    assert_eq!(token_rows(&pool, &token.token).await, 0, "the row is gone");
+    let after = common::TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(&token.token)
+        .send(&http)
+        .await;
+    assert_eq!(
+        after.status,
+        StatusCode::UNAUTHORIZED,
+        "the access token of the pair is dead"
+    );
+    let refresh = common::TestRequest::post("/oauth/token")
+        .json(&refresh_grant_body(&app, &token.refresh_token))
+        .send(&http)
+        .await;
+    assert_eq!(
+        refresh.status,
+        StatusCode::BAD_REQUEST,
+        "the refresh token no longer rotates"
+    );
+}
+
+/// `token_type_hint` only orders the lookup: a right hint, a wrong hint
+/// and an unknown hint all still revoke by the refresh token.
+#[tokio::test]
+async fn revoke_by_refresh_token_honours_or_ignores_the_hint() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (user, app) = fixtures(&pool, "iris", "read").await;
+    let http = common::test_app(pool.clone());
+
+    for hint in ["refresh_token", "access_token", "nonsense"] {
+        let token = common::create_token(&pool, &user, &app, "read").await;
+        let mut body = revoke_body(&app, &token.refresh_token);
+        body["token_type_hint"] = json!(hint);
+        let response = post_revoke_json(&http, &body).await;
+        assert_eq!(response.status, StatusCode::OK, "hint {hint}: succeeds");
+        assert_eq!(
+            token_rows(&pool, &token.token).await,
+            0,
+            "hint {hint}: the pair is gone"
+        );
+    }
+
+    let token = common::create_token(&pool, &user, &app, "read").await;
+    let mut body = revoke_body(&app, &token.token);
+    body["token_type_hint"] = json!("refresh_token");
+    let response = post_revoke_json(&http, &body).await;
+    assert_eq!(response.status, StatusCode::OK, "a wrong hint is not fatal");
+    assert_eq!(
+        token_rows(&pool, &token.token).await,
+        0,
+        "the access token is still found and revoked"
+    );
+}
+
+/// Another application's refresh token is refused like a foreign access
+/// token — 400 "Invalid credentials" — and the pair survives.
+#[tokio::test]
+async fn revoke_refuses_a_foreign_refresh_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (user, owner) = fixtures(&pool, "jane", "read").await;
+    let stranger = common::create_app(&pool, "read").await;
+    let token = common::create_token(&pool, &user, &owner, "read").await;
+    let http = common::test_app(pool.clone());
+
+    let response = post_revoke_json(&http, &revoke_body(&stranger, &token.refresh_token)).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
+    assert_eq!(
+        error_text(&response),
+        "Invalid credentials",
+        "the shared refusal"
+    );
+    assert_no_store(&response);
+    assert_eq!(
+        token_rows(&pool, &token.token).await,
+        1,
+        "the pair was not deleted"
+    );
+    let probe = probe_user_endpoint(&http, &token.token).await;
+    assert_eq!(probe.status, StatusCode::OK, "and it still authenticates");
+}
