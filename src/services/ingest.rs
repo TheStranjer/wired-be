@@ -44,7 +44,10 @@
 //!    `MAX_MENTION_LOOKUPS` of them per status, and whatever stays
 //!    unresolved — a dead peer, an elapsed timeout, a mention past the
 //!    cap — is dropped rather than refused;
-//! 6. remote emojis upsert `custom_emojis` under the author's domain;
+//! 6. remote emojis upsert `custom_emojis` under the author's domain —
+//!    only once the unsolicited gate has let the post through, and only
+//!    the image URL of an emoji already stored, so a moderator's flags
+//!    survive;
 //! 7. attachments become `media_attachments` rows with no `user_id` (nobody
 //!    uploaded them) and `remote_url` beside `url` (the media proxy decides
 //!    what to mirror), ordered as the document lists them, written on the
@@ -240,11 +243,11 @@ pub async fn ingest_note_delivered(
     {
         mentioned.push(owner.clone());
     }
-    upsert_emojis(state, &parsed.emojis).await?;
     if drops_unsolicited(state, &parsed, author, &reply, &mentioned).await? {
         debug!(account = %author.ap_id, "an unsolicited public post from an unfollowed author is dropped");
         return Ok(IngestOutcome::Ignored("unsolicited public"));
     }
+    upsert_emojis(state, &parsed.emojis).await?;
     let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
     let row = write_ingested(state, &new, &parsed).await?;
     after_status_created(state, &row).await;

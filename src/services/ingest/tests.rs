@@ -10,6 +10,7 @@ use super::*;
 use crate::{
     config::Config,
     models::{
+        custom_emoji::{self, NewCustomEmoji},
         status::NewStatus,
         user::{self, NewUser},
     },
@@ -271,6 +272,124 @@ async fn a_reply_to_a_local_status_passes_the_unsolicited_gate() {
         Some(local_post.id),
         "and keeps its link to the local parent"
     );
+}
+
+/// `bob`'s public note named `n` announcing `:ralph:` at `image_url`.
+fn emoji_note(n: &str, image_url: &str) -> Value {
+    let mut object = note(n);
+    object["tag"] = json!([{
+        "type": "Emoji",
+        "name": ":ralph:",
+        "icon": {"type": "Image", "url": image_url},
+    }]);
+    object
+}
+
+/// Counts the `custom_emojis` rows of any shortcode.
+async fn emoji_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM custom_emojis")
+        .fetch_one(pool)
+        .await
+        .expect("the emoji count reads")
+}
+
+#[tokio::test]
+async fn a_dropped_unsolicited_post_writes_no_emoji_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = gating_state(&pool);
+    let bob = author(&pool).await;
+
+    let dropped = ingest_note(
+        &state,
+        &bob,
+        &emoji_note("ingest-emoji-dropped", "https://remote.example/e.png"),
+    )
+    .await
+    .expect("the refusal is not an error");
+
+    assert_eq!(
+        dropped,
+        IngestOutcome::Ignored("unsolicited public"),
+        "the gate drops the post"
+    );
+    assert_eq!(emoji_rows(&pool).await, 0, "and its emoji never lands");
+}
+
+#[tokio::test]
+async fn a_post_refreshes_a_stored_emoji_image_but_keeps_its_moderation_flags() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let stored = NewCustomEmoji {
+        shortcode: "ralph".to_owned(),
+        domain: Some("remote.example".to_owned()),
+        image_url: "https://remote.example/old.png".to_owned(),
+        category: Some("pack".to_owned()),
+        tags: vec!["dog".to_owned()],
+        visible_in_picker: false,
+        disabled: true,
+        ..NewCustomEmoji::default()
+    };
+    let _seeded = custom_emoji::upsert(&pool, &stored)
+        .await
+        .expect("the emoji seeds");
+
+    let outcome = ingest_note(
+        &state,
+        &bob,
+        &emoji_note("ingest-emoji-kept", "https://remote.example/new.png"),
+    )
+    .await
+    .expect("the post ingests");
+    assert!(
+        matches!(outcome, IngestOutcome::Created(_)),
+        "the post is created, got {outcome:?}"
+    );
+
+    let rows =
+        custom_emoji::get_by_shortcodes(&pool, &["ralph".to_owned()], Some("remote.example"))
+            .await
+            .expect("the emoji reads");
+    let [row] = rows.as_slice() else {
+        panic!("one emoji row expected, got {}", rows.len());
+    };
+    assert_eq!(
+        row.image_url, "https://remote.example/new.png",
+        "the image url follows the newest post"
+    );
+    assert!(row.disabled, "a disabled emoji stays disabled");
+    assert!(!row.visible_in_picker, "picker visibility is kept");
+    assert_eq!(row.category.as_deref(), Some("pack"), "so is the pack");
+    assert_eq!(row.tags, ["dog"], "and the tags");
+}
+
+#[tokio::test]
+async fn a_post_with_an_unknown_emoji_stores_it_with_the_defaults() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+
+    let _outcome = ingest_note(
+        &state,
+        &bob,
+        &emoji_note("ingest-emoji-new", "https://remote.example/new.png"),
+    )
+    .await
+    .expect("the post ingests");
+
+    let rows =
+        custom_emoji::get_by_shortcodes(&pool, &["ralph".to_owned()], Some("remote.example"))
+            .await
+            .expect("the emoji reads");
+    let [row] = rows.as_slice() else {
+        panic!("one emoji row expected, got {}", rows.len());
+    };
+    assert_eq!(row.image_url, "https://remote.example/new.png", "stored");
+    assert!(!row.disabled, "enabled by default");
+    assert!(row.visible_in_picker, "visible by default");
 }
 
 /// The state with `ACCEPT_UNSOLICITED_PUBLIC` off: the gate under test.
