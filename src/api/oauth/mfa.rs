@@ -32,6 +32,12 @@
 //! `recovery` matches the code's SHA-256 against the stored backup-code
 //! hashes, removing a hit so each code works exactly once.
 //!
+//! A wrong code is counted against its challenge
+//! ([`mfa_token::record_failure`]); the challenge that has taken
+//! [`MAX_MFA_ATTEMPTS`] of them is deleted, so the client must restart
+//! from the password, and the two code-checking routes also run in the
+//! limiter's `authentication` bucket (WBE-668).
+//!
 //! Every answer — token, error, page or redirect — carries
 //! `Cache-Control: no-store` like the rest of `/oauth`: challenge tokens
 //! and codes are single-use material.
@@ -57,7 +63,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams},
     models::{
-        mfa_token::{self, MfaToken},
+        mfa_token::{self, MAX_MFA_ATTEMPTS, MfaToken},
         oauth_app::{self, OauthApp},
         oauth_token::{self, OauthAuthorization},
         user::{self, User, mfa},
@@ -120,11 +126,37 @@ pub(crate) async fn start_challenge(
 
 /// The `/oauth/mfa` routes — the JSON challenge and the browser's page
 /// and verification — merged into the `/oauth` router by [`super::router`].
-pub fn router() -> Router<AppState> {
+///
+/// The two routes that check a code run in the limiter's `authentication`
+/// bucket (WBE-668), so `state` is handed over for the middleware layer;
+/// the page that only renders the form is not throttled.
+pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route(MFA_PATH, get(show))
-        .route("/oauth/mfa/verify", post(verify))
-        .route("/oauth/mfa/challenge", post(challenge))
+        .route(
+            "/oauth/mfa/verify",
+            post(verify).layer(crate::rate_limit::rate_limit(state, "authentication")),
+        )
+        .route(
+            "/oauth/mfa/challenge",
+            post(challenge).layer(crate::rate_limit::rate_limit(state, "authentication")),
+        )
+}
+
+/// Counts a wrong code against the challenge `stored` (WBE-668).
+///
+/// Once it has taken [`MAX_MFA_ATTEMPTS`] of them the row is deleted, so
+/// the client must restart from the password.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+async fn note_failure(state: &AppState, stored: &MfaToken) -> AppResult<()> {
+    let attempts = mfa_token::record_failure(&state.db, stored.id).await?;
+    if attempts >= MAX_MFA_ATTEMPTS {
+        mfa_token::delete(&state.db, stored.id).await?;
+    }
+    Ok(())
 }
 
 /// The one 400 every challenge failure shares.
@@ -180,6 +212,7 @@ async fn run_challenge(
     )
     .await?
     {
+        note_failure(state, &stored).await?;
         return Err(invalid_code());
     }
     finish_challenge(state, &user, &app, &stored, &authorization).await
@@ -279,6 +312,7 @@ async fn complete_authorization(state: &AppState, attrs: &MfaAttrs) -> AppResult
         return Ok(retry(attrs));
     }
     if !second_factor_ok(state, &user, attrs.challenge_type(), attrs.code.as_deref()).await? {
+        note_failure(state, &stored).await?;
         return Ok(retry(attrs));
     }
     mfa_token::delete(&state.db, stored.id).await?;
@@ -856,9 +890,15 @@ mod tests {
         AppState::lazy_for_tests(Config::for_tests())
     }
 
+    /// The MFA router over [`test_state`].
+    fn test_router() -> Router {
+        let state = test_state();
+        router(&state).with_state(state)
+    }
+
     #[tokio::test]
     async fn the_challenge_route_refuses_an_empty_body() {
-        let app = router().with_state(test_state());
+        let app = test_router();
         let request = Request::post("/oauth/mfa/challenge")
             .header("content-type", "application/json")
             .body(axum::body::Body::empty())
@@ -878,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_page_route_renders_the_form_it_was_asked_for() {
-        let app = router().with_state(test_state());
+        let app = test_router();
         let request = Request::get("/oauth/mfa?mfa_token=t0ken&state=st")
             .body(axum::body::Body::empty())
             .unwrap();
@@ -893,7 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_verify_route_refuses_a_submission_without_a_token() {
-        let app = router().with_state(test_state());
+        let app = test_router();
         let request = Request::post("/oauth/mfa/verify")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(json!({}).to_string()))
