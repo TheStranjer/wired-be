@@ -45,6 +45,16 @@ pub(super) async fn body_text(
     else {
         return Ok(String::new());
     };
+    if row.deleted_at.is_some() {
+        return Ok(String::new());
+    }
+    // A content warning hides the text until the reader opts in, so the
+    // lock screen shows the warning and never the content (Mastodon's
+    // `spoiler_text.presence || text`).
+    let spoiler = row.spoiler_text.trim();
+    if !spoiler.is_empty() {
+        return Ok(format::truncate_chars(spoiler, BODY_CHARS));
+    }
     let plain = sanitize::strip_html(&row.content);
     Ok(format::truncate_chars(plain.trim(), BODY_CHARS))
 }
@@ -156,6 +166,101 @@ mod tests {
             payload["body"], "look at this",
             "the body is the status's plain text"
         );
+    }
+
+    /// The body for a mention of a status with `spoiler` and `content`,
+    /// computed for a recipient whose contents are hidden when `hidden`.
+    async fn body_of(
+        pool: &PgPool,
+        tag: &str,
+        spoiler: &str,
+        content: &str,
+        hidden: bool,
+    ) -> String {
+        let actor = local(pool, &format!("{tag}-alice"), "Alice").await;
+        let recipient = account(pool, &format!("{tag}-bob")).await;
+        if hidden {
+            user::notification_settings::save(
+                pool,
+                recipient.user.id,
+                &NotificationSettings {
+                    hide_notification_contents: true,
+                    ..NotificationSettings::default()
+                },
+            )
+            .await
+            .expect("the settings save");
+        }
+        let post = status::insert(
+            pool,
+            TEST_BASE_URL,
+            &status::NewStatus {
+                content: content.to_owned(),
+                spoiler_text: spoiler.to_owned(),
+                ..status::NewStatus::local(&actor, "raw")
+            },
+        )
+        .await
+        .expect("the status fixture inserts");
+        let note = note_about(
+            pool,
+            &recipient.user,
+            &actor,
+            notification::TYPE_MENTION,
+            Some(post.id),
+        )
+        .await;
+        let recipient_user = user::get_by_id(pool, recipient.user.id)
+            .await
+            .expect("the lookup runs")
+            .expect("the recipient exists");
+        body_text(pool, &recipient_user, &note)
+            .await
+            .expect("the body renders")
+    }
+
+    #[tokio::test]
+    async fn a_content_warning_replaces_the_text_in_the_body() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let body = body_of(&pool, "wp-cw", "cw: food", "<p>secret</p>", false).await;
+
+        assert_eq!(body, "cw: food", "the warning is the body");
+        assert!(!body.contains("secret"), "the hidden text never leaves");
+    }
+
+    #[tokio::test]
+    async fn a_blank_content_warning_leaves_the_stripped_content() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let empty = body_of(&pool, "wp-e", "", "<p>plain words</p>", false).await;
+        let blank = body_of(&pool, "wp-b", "  \n ", "<p>plain words</p>", false).await;
+
+        assert_eq!(empty, "plain words", "no warning, the content shows");
+        assert_eq!(blank, "plain words", "a whitespace warning is no warning");
+    }
+
+    #[tokio::test]
+    async fn a_long_content_warning_is_cut_to_the_body_limit() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let body = body_of(&pool, "wp-l", &"w".repeat(200), "<p>secret</p>", false).await;
+
+        assert_eq!(body.chars().count(), BODY_CHARS, "cut to 140 characters");
+        assert!(body.chars().all(|c| c == 'w'), "the warning, not the text");
+    }
+
+    #[tokio::test]
+    async fn hidden_contents_beat_the_content_warning() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let body = body_of(&pool, "wp-hc", "cw: food", "<p>secret</p>", true).await;
+
+        assert_eq!(body, "", "a hiding recipient gets no body at all");
     }
 
     #[tokio::test]

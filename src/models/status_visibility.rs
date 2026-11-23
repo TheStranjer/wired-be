@@ -67,6 +67,17 @@ use crate::{
     },
 };
 
+/// The active-author predicate every status read appends, over statuses
+/// aliased `s`: the author's account is still active.
+///
+/// It is Pleroma's `Activity.restrict_deactivated_users`
+/// (`lib/pleroma/activity.ex`): a suspended or deactivated account's posts
+/// leave the timelines and the status search while the flag stands, and
+/// come back with it. Starts with ` AND `, so it is pushed onto a statement
+/// that already has a `WHERE`.
+pub const ACTIVE_AUTHOR: &str =
+    " AND EXISTS (SELECT 1 FROM users au WHERE au.id = s.user_id AND au.is_active)";
+
 /// Whether the status's author blocked the viewer: the two ids, in the
 /// block's direction, into [`AUTHOR_BLOCKED_SQL`].
 const AUTHOR_BLOCKED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM blocks \

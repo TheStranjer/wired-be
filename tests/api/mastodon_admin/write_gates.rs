@@ -1,5 +1,5 @@
 //! The gate in front of the account writes over HTTP (WBE-213): the five
-//! writes are an admin's — where the reads stop at staff — and the scope half
+//! writes are an admin's, as the reads are, and the scope half
 //! is the accounts write scope, with the refusals naming the class root.
 
 use axum::http::StatusCode;
@@ -12,9 +12,8 @@ use super::write_support::{
 use crate::common;
 
 /// The five writes are an admin's: no token, an unknown one and an app-only
-/// one are the shared refusals on every route, and a moderator — who reads
-/// this surface — is told they are not an admin, as is a plain account's
-/// token, however well scoped.
+/// one are the shared refusals on every route, and a moderator is told they
+/// are not an admin, as is a plain account's token, however well scoped.
 #[tokio::test]
 async fn the_writes_demand_an_admin_user() {
     let db = common::test_db().await;

@@ -8,12 +8,13 @@
 //! (`lib/pleroma/web/admin_api/controllers/instance_document_controller.ex`)
 //! over `Pleroma.Web.InstanceDocument`
 //! (`lib/pleroma/web/instance_document.ex`). Pleroma gates every app
-//! action with `admin:write` and the documents with `admin:read` /
-//! `admin:write` per action; the ticket splits the apps the way every
-//! other admin read is split here — the read asks `admin:read:oauth_apps`,
-//! the writes `admin:write:oauth_apps` — and documents live in the area
-//! `instance_documents`. Every admin route takes the [`AdminUser`]
-//! extractor and its [`require`] scope gate.
+//! action — the listing included, since [`AdminOauthApp`] carries every
+//! `client_secret` — with `admin:write`, and so does this port: all four
+//! app routes ask `admin:write` or `admin:write:oauth_apps`, and a read
+//! grant (`admin:read`, `admin:read:oauth_apps`) opens none of them.
+//! The documents are gated `admin:read` / `admin:write` per action, in
+//! the area `instance_documents`. Every admin route takes the
+//! [`AdminUser`] extractor and its [`require`] scope gate.
 //!
 //! The OAuth apps:
 //!
@@ -100,12 +101,13 @@ use crate::{config::Config, extract::multipart::upload_body_limit, state::AppSta
 mod apps;
 mod documents;
 
-/// The read endpoint class of [`AdminUser::require`].
+/// The read endpoint class of [`AdminUser::require`] (the documents'
+/// reads; every app route is a write).
 const CLASS_READ: &str = "read";
 /// The write endpoint class of [`AdminUser::require`].
 const CLASS_WRITE: &str = "write";
 /// The admin scope area of the app routes
-/// (`admin:read:oauth_apps` / `admin:write:oauth_apps`).
+/// (`admin:write:oauth_apps`).
 const AREA_APPS: &str = "oauth_apps";
 /// The admin scope area of the instance-document routes
 /// (`admin:read:instance_documents` / `admin:write:instance_documents`).

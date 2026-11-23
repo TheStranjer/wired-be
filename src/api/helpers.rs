@@ -32,7 +32,7 @@ use crate::{
         oauth_token,
         status::{self, Status, Visibility},
         status_visibility,
-        user::{self, User, admin},
+        user::{self, AccountStatus, User, admin},
     },
     pagination::{link_header, set_link_header},
     services::{
@@ -73,6 +73,53 @@ pub async fn account_or_404(state: &AppState, id_str: &str) -> AppResult<User> {
     user::get_by_id(&state.db, id)
         .await?
         .filter(|found| found.is_active.get())
+        .ok_or(AppError::NotFound)
+}
+
+/// Whether `viewer` may see `account` at all (`None`: an anonymous request).
+///
+/// Pleroma's `User.visible_for/2`: the account itself and staff (an admin or
+/// a moderator, who can manage activation state) may see an account that
+/// is still waiting on approval or email confirmation; everyone else sees
+/// only an account with nothing waiting on it ([`AccountStatus::Active`]),
+/// so registration spam shows nothing before a moderator has looked at it.
+/// A deactivated (or deleted) account stays hidden from every viewer, as
+/// [`account_or_404`] has always answered.
+#[must_use]
+pub fn visible_to(account: &User, viewer: Option<&User>) -> bool {
+    if !account.is_active.get() {
+        return false;
+    }
+    if let Some(viewer) = viewer
+        && (viewer.id == account.id || viewer.is_admin.get() || viewer.is_moderator.get())
+    {
+        return true;
+    }
+    matches!(account.account_status(), AccountStatus::Active)
+}
+
+/// [`account_or_404`] for a request made by `viewer`: the row is returned
+/// only when [`visible_to`] says the viewer may see it.
+///
+/// A malformed id, an unknown id and an account the viewer may not see are
+/// the same [`AppError::NotFound`], so the endpoint never tells a pending
+/// registration from a missing one.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives
+/// through `?` as [`AppError::Database`].
+pub async fn visible_account_or_404(
+    state: &AppState,
+    id_str: &str,
+    viewer: Option<&User>,
+) -> AppResult<User> {
+    let Some(id) = parse_id(id_str) else {
+        return Err(AppError::NotFound);
+    };
+    user::get_by_id(&state.db, id)
+        .await?
+        .filter(|found| visible_to(found, viewer))
         .ok_or(AppError::NotFound)
 }
 

@@ -147,6 +147,15 @@ pub struct PackMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub fallback_src_sha256: Option<String>,
+    /// SHA-256 of the archive this instance serves, hex: the digest a
+    /// listing announces for a shared pack. Read from remote listings to
+    /// verify a download; never stored in an installed manifest.
+    #[serde(
+        default,
+        rename = "download-sha256",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub download_sha256: Option<String>,
     /// Whether this instance may hand the pack's files to others: the
     /// archive endpoint's gate, Pleroma's `pack.pack["share-files"]`.
     #[serde(default, rename = "share-files")]

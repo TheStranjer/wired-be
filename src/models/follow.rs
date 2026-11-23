@@ -55,7 +55,7 @@ mod test_support;
 pub use audience::{
     accepted_local_follower_ids, move_followers_of, remote_followees, remote_followers, subscribers,
 };
-pub use delete::{delete_all_for_user, delete_all_for_user_with_counts};
+pub use delete::delete_all_for_user_with_counts;
 pub use familiar::familiar_followers;
 pub use lookup::{
     find_by_ap_id, following_ids, get, get_by_ap_id, has_accepted_follow, has_local_followers,

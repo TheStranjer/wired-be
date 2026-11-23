@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tracing::debug;
 
-use super::{AREA_APPS, CLASS_READ, CLASS_WRITE};
+use super::{AREA_APPS, CLASS_WRITE};
 use crate::{
     api::apps::{RedirectUris, normalize_redirect_uris},
     auth::admin::AdminUser,
@@ -199,14 +199,16 @@ fn prepare(body: AppBody, on_create: bool) -> Result<Prepared, AppsError> {
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:read` gate; [`AppError::BadRequest`] for a `trusted`
-/// that is no boolean; [`AppError::Database`] from the two reads.
+/// and its `admin:write` gate (the listing serializes every
+/// `client_secret`, so a read grant never opens it); [`AppError::BadRequest`]
+/// for a `trusted` that is no boolean; [`AppError::Database`] from the two
+/// reads.
 pub(super) async fn list_apps(
     State(state): State<AppState>,
     admin: AdminUser,
     Query(params): Query<HashMap<String, String>>,
 ) -> AppsResult<Json<AdminOauthAppPage>> {
-    admin.require(CLASS_READ, AREA_APPS)?;
+    admin.require(CLASS_WRITE, AREA_APPS)?;
     let search = search_params(&params)?;
     let page = oauth_app::search(&state.db, &search).await?;
     debug!(

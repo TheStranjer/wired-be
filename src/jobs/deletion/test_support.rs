@@ -48,6 +48,20 @@ pub(super) async fn broken_state() -> AppState {
     app_state(&pool)
 }
 
+/// Inserts a locked local user named `nickname`, so a follow of it waits
+/// in `pending` until the user answers.
+pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
+    insert(
+        pool,
+        &NewUser {
+            locked: Flag::new(true),
+            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+        },
+    )
+    .await
+    .expect("the locked fixture inserts")
+}
+
 /// Inserts a local user named `nickname` carrying the personal data the
 /// purge step must blank: an email, a password hash and a display name.
 pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {

@@ -386,6 +386,39 @@ async fn local_reblogger_ids_answers_the_live_local_boosters() {
 }
 
 #[tokio::test]
+async fn the_reblogger_page_lists_only_distributable_reblogs() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let original = post(&pool, &alice, "boosted at every visibility").await;
+    let mut listed = Vec::new();
+    for (name, visibility) in [
+        ("public", Visibility::Public),
+        ("unlisted", Visibility::Unlisted),
+        ("private", Visibility::Private),
+        ("direct", Visibility::Direct),
+    ] {
+        let booster = user(&pool, name).await;
+        let (_, created) = create_reblog(&pool, BASE, &booster, &original, visibility)
+            .await
+            .expect("the reblog writes");
+        assert!(created, "the fixture pair had not reblogged yet");
+        if matches!(visibility, Visibility::Public | Visibility::Unlisted) {
+            listed.push(booster.id);
+        }
+    }
+
+    let entries = reblogger_page(&pool, original.id, page("")).await.unwrap();
+    let mut got: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
+    got.sort();
+    listed.sort();
+    assert_eq!(
+        got, listed,
+        "the public and unlisted boosts are listed; private and direct are not"
+    );
+}
+
+#[tokio::test]
 async fn the_reblogger_page_walks_the_reblog_row_ids() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();

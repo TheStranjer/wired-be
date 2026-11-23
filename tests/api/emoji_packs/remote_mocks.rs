@@ -20,7 +20,10 @@ use axum::{
 };
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
-use wired_be::services::emoji_packs::{self, Pack};
+use wired_be::{
+    api::instance::sha256_hex_bytes,
+    services::emoji_packs::{self, Pack},
+};
 
 use super::support::{GIF_BYTES, PNG_BYTES};
 
@@ -66,9 +69,24 @@ pub(super) fn good_archive() -> Vec<u8> {
     ])
 }
 
+/// The SHA-256 a mock remote's one-pack listing declares for its archive.
+#[derive(Debug, Default)]
+pub(super) enum Declared {
+    /// The real digest of the served archive, in `download-sha256` and
+    /// `fallback-src-sha256` (unless the listing script sets its own).
+    #[default]
+    Matching,
+    /// No digest at all.
+    Absent,
+    /// This exact text, whatever the archive hashes to.
+    Exactly(String),
+}
+
 /// The scripted answer of a mock remote instance.
 #[derive(Debug)]
 pub(super) struct MockRemote {
+    /// The digest the one-pack listing declares for the archive.
+    pub(super) declared: Declared,
     /// The body of `GET /api/v1/pleroma/emoji/packs` (the relay's source).
     pub(super) packs: Value,
     /// The body of `GET /api/v1/pleroma/emoji/pack` for the first
@@ -95,6 +113,7 @@ pub(super) struct MockRemote {
 impl Default for MockRemote {
     fn default() -> Self {
         Self {
+            declared: Declared::Matching,
             packs: json!({"count": 0, "packs": {}}),
             pack_first: json!({
                 "pack": {"share-files": true},
@@ -149,7 +168,24 @@ async fn serve_pack_show(State(remote): State<Arc<MockRemote>>, uri: Uri) -> Res
         (Some(full), false) => full,
         _ => &remote.pack_first,
     };
-    mock_json(remote.list_status, body)
+    mock_json(remote.list_status, &with_declared_digest(&remote, body))
+}
+
+/// `listing` with the digest `remote` is scripted to declare written
+/// into its `pack` block, except where the script already set one.
+fn with_declared_digest(remote: &MockRemote, listing: &Value) -> Value {
+    let digest = match &remote.declared {
+        Declared::Absent => return listing.clone(),
+        Declared::Matching => sha256_hex_bytes(&remote.archive),
+        Declared::Exactly(text) => text.clone(),
+    };
+    let mut listing = listing.clone();
+    if let Some(pack) = listing.get_mut("pack").and_then(Value::as_object_mut) {
+        for key in ["download-sha256", "fallback-src-sha256"] {
+            let _entry: &mut Value = pack.entry(key).or_insert_with(|| json!(digest));
+        }
+    }
+    listing
 }
 
 /// Serves the pack archive and counts the hit.

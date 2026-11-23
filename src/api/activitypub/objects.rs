@@ -213,11 +213,11 @@ pub(super) async fn nickname_owns(
     }))
 }
 
-/// Whether the visibility admits this read: `public` and `unlisted` answer
-/// anyone, `local` is never federated and answers nobody, and `private`
-/// and `direct` are served only when an HTTP Signature proves a reader —
-/// with `AUTHORIZED_FETCH` off, unsigned reads answer `Ok(None)` for that
-/// reader — and [`status_visibility::can_view`] admits the one it proved.
+/// Whether this read is admitted. `local` is never federated and answers
+/// nobody; every other visibility is [`status_visibility::can_view`]'s
+/// decision, made for the signer `fetch_signer` proves (or for no signer,
+/// when `AUTHORIZED_FETCH` is off and the request is unsigned). So a blocked
+/// signer or a deactivated author is refused even for a public post.
 /// A signature that fails to verify is `fetch_signer`'s 401, not a 404:
 /// the requester claimed an identity and could not back it.
 pub(super) async fn read_admitted(
@@ -226,16 +226,11 @@ pub(super) async fn read_admitted(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> AppResult<bool> {
-    match status.visibility {
-        Visibility::Local => Ok(false),
-        Visibility::Public | Visibility::Unlisted => Ok(true),
-        Visibility::Private | Visibility::Direct => {
-            let Some(signer) = fetch_signer(state, &Method::GET, uri, headers).await? else {
-                return Ok(false);
-            };
-            status_visibility::can_view(&state.db, status, Some(&signer)).await
-        }
+    if status.visibility == Visibility::Local {
+        return Ok(false);
     }
+    let signer = fetch_signer(state, &Method::GET, uri, headers).await?;
+    status_visibility::can_view(&state.db, status, signer.as_ref()).await
 }
 
 /// The `Tombstone` a soft-deleted status is served as: the 410 whose body

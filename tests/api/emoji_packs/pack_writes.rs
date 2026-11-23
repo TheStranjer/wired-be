@@ -226,6 +226,7 @@ async fn patch_merges_one_key_into_a_full_metadata_block() {
                 description: Some("keep me".to_owned()),
                 fallback_src: Some("https://emoji.example/cats.zip".to_owned()),
                 fallback_src_sha256: None,
+                download_sha256: None,
                 share_files: false,
             },
             files: BTreeMap::from([("cat".to_owned(), "cat.png".to_owned())]),

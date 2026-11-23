@@ -155,8 +155,15 @@ impl ExtendedDescription {
 /// with — which is why it is public.
 #[must_use]
 pub fn sha256_hex(text: &str) -> String {
+    sha256_hex_bytes(text.as_bytes())
+}
+
+/// The lowercase hex `SHA-256` of `bytes`: [`sha256_hex`] for data that
+/// is not text, such as a downloaded emoji pack archive.
+#[must_use]
+pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(Sha256::output_size() * 2);
-    for &byte in &Sha256::digest(text.as_bytes()) {
+    for &byte in &Sha256::digest(bytes) {
         hex.push(hex_digit(byte >> 4));
         hex.push(hex_digit(byte & 0x0F));
     }

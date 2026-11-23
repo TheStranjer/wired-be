@@ -11,7 +11,6 @@ async fn create_answers_the_entity_the_listing_finds_first() {
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let token = admin(&pool, "root", "admin:write").await;
-    let read_token = admin(&pool, "reader", "admin:read").await;
 
     let created = create_app(
         &app,
@@ -63,8 +62,8 @@ async fn create_answers_the_entity_the_listing_finds_first() {
         "the credentials were minted"
     );
 
-    let listed = TestRequest::get(APPS).bearer(&read_token).send(&app).await;
-    common::assert_answer(&listed, StatusCode::OK, "the admin read lists");
+    let listed = TestRequest::get(APPS).bearer(&token).send(&app).await;
+    common::assert_answer(&listed, StatusCode::OK, "the admin write lists");
     let page = listed.json_value();
     assert_eq!(page["page_size"], json!(50), "the admin default window");
     assert_eq!(

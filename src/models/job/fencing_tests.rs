@@ -12,7 +12,7 @@ use super::{
 /// limit, rescues it and claims it again; returns the second claim
 /// (`attempts = 2`), leaving the row `executing` under it.
 async fn claim_rescue_and_reclaim(pool: &PgPool, queue: &'static str) -> Job {
-    enqueue(pool, new_job(queue, "slow"))
+    let _job = enqueue(pool, new_job(queue, "slow"))
         .await
         .unwrap()
         .expect("the job inserts");
@@ -21,7 +21,7 @@ async fn claim_rescue_and_reclaim(pool: &PgPool, queue: &'static str) -> Job {
         .unwrap()
         .expect("the first claim succeeds");
     assert_eq!(first.attempts, 1, "the first claim is attempt one");
-    sqlx::query("UPDATE jobs SET locked_at = now() - interval '1 hour' WHERE id = $1")
+    let _aged = sqlx::query("UPDATE jobs SET locked_at = now() - interval '1 hour' WHERE id = $1")
         .bind(first.id)
         .execute(pool)
         .await
@@ -41,7 +41,7 @@ async fn claim_rescue_and_reclaim(pool: &PgPool, queue: &'static str) -> Job {
 async fn complete_with_the_current_attempt_completes() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    enqueue(&pool, new_job("default", "quick"))
+    let _job = enqueue(&pool, new_job("default", "quick"))
         .await
         .unwrap()
         .expect("the job inserts");
@@ -98,12 +98,12 @@ async fn fail_with_a_stale_attempt_changes_nothing() {
 
     // Discard arm.
     let discarding = claim_rescue_and_reclaim(&pool, "discarding").await;
-    let written = fail(&pool, discarding.id, 1, "late", None).await.unwrap();
-    assert!(!written, "a stale discard write matches no row");
-    let row = fetch(&pool, discarding.id).await;
-    assert_eq!(row.state, "executing", "the second claim still runs");
-    assert_eq!(row.attempts, 2, "its attempt count is intact");
-    assert!(row.last_error.is_none(), "no stale error is recorded");
+    let discarded = fail(&pool, discarding.id, 1, "late", None).await.unwrap();
+    assert!(!discarded, "a stale discard write matches no row");
+    let kept = fetch(&pool, discarding.id).await;
+    assert_eq!(kept.state, "executing", "the second claim still runs");
+    assert_eq!(kept.attempts, 2, "its attempt count is intact");
+    assert!(kept.last_error.is_none(), "no stale error is recorded");
 
     let current = fail(&pool, discarding.id, 2, "real", None).await.unwrap();
     assert!(current, "the current claim's failure lands");
