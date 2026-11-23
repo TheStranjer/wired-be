@@ -4,9 +4,12 @@
 use serde_json::Value;
 use url::Url;
 
-use crate::federation::json::{as_array, first_string};
+use crate::{
+    federation::json::{as_array, first_string},
+    util::url::is_http_url,
+};
 
-use super::{ATTACHMENT_TYPES, MAX_ATTACHMENTS, envelope::is_http_url, types::ParsedAttachment};
+use super::{ATTACHMENT_TYPES, MAX_ATTACHMENTS, types::ParsedAttachment};
 
 /// The kept `attachment` entries, at most [`MAX_ATTACHMENTS`] of them, in
 /// document order.

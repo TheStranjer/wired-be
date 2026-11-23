@@ -8,7 +8,8 @@
 //! sanitizer in [`sanitize`], the content formatter in [`mod@format`], the
 //! mention/hashtag extraction and link builders in [`entities`], what counts
 //! as one reaction emoji in [`emoji`] and the XML escaper in [`xml`].
-//! Time-expiring in-memory values go through [`cache`].
+//! Time-expiring in-memory values go through [`cache`], and the `http(s)` URL
+//! checks every origin, signing and delivery guard shares live in [`mod@url`].
 
 pub mod cache;
 pub mod emoji;
@@ -21,4 +22,5 @@ pub mod sanitize;
 pub mod time;
 pub mod token;
 pub mod totp;
+pub mod url;
 pub mod xml;

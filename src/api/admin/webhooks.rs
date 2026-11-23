@@ -60,7 +60,6 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tracing::debug;
-use url::Url;
 
 use crate::{
     auth::admin::AdminUser,
@@ -69,7 +68,7 @@ use crate::{
     extract::{ApiBody, flex},
     models::{moderation_log, webhook},
     state::AppState,
-    util::id::parse_id,
+    util::{id::parse_id, url::is_http_url},
 };
 
 /// The read endpoint class of [`AdminUser::require`].
@@ -467,15 +466,6 @@ fn check_events(events: Option<&[String]>) -> WebhookResult<()> {
         });
     }
     Ok(())
-}
-
-/// Whether `text` parses as a URL on the `http` or `https` scheme with a
-/// host — the delivery targets Pleroma's `Uri` type accepts (its
-/// `ObjectValidators.Uri` likewise demands the two web schemes).
-fn is_http_url(text: &str) -> bool {
-    Url::parse(text).is_ok_and(|parsed| {
-        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()
-    })
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 
 use super::{
     KIND_DELIVER, MAX_ATTEMPTS, UNIQUE_KEY_PREFIX,
-    send::{activity_id_of, is_local_inbox, parse_inbox},
+    send::{activity_id_of, is_local_inbox},
 };
 use crate::{
     error::AppResult,
@@ -24,6 +24,7 @@ use crate::{
         user::User,
     },
     state::AppState,
+    util::url::parse_http_url,
 };
 
 /// The inbox to deliver to `actor`: their shared (instance-wide) inbox when
@@ -84,7 +85,7 @@ pub async fn enqueue_delivery(
         debug!(inbox, "delivery skipped: federation is disabled");
         return Ok(());
     }
-    let Some(target) = parse_inbox(inbox) else {
+    let Some(target) = parse_http_url(inbox) else {
         warn!(inbox, "delivery refused: the inbox is not an http(s) URL");
         return Ok(());
     };

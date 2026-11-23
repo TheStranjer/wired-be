@@ -33,7 +33,10 @@ use url::Url;
 
 use crate::{
     error::{AppError, AppResult},
-    util::keys::sign_sha256,
+    util::{
+        keys::sign_sha256,
+        url::{host_with_port, parse_http_url},
+    },
 };
 
 /// Digest scheme named in every `Digest` header value the fediverse accepts.
@@ -107,17 +110,6 @@ fn request_target(method: &str, url: &Url) -> String {
     format!("{} {path_with_query}", method.to_lowercase())
 }
 
-/// The `host` header value to sign: the URL's host, plus `:port` only when
-/// the URL spells out a non-default port (`Url::port` reports `None` for
-/// an absent or default one). Only called with URLs [`sign_request`] has
-/// accepted, which always carry a host.
-#[must_use]
-fn host_of(url: &Url) -> String {
-    let host = url.host_str().unwrap_or_default();
-    url.port()
-        .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"))
-}
-
 /// Assembles the exact text that gets signed from the signed header values.
 ///
 /// One `name: value` line per `(name, value)` pair, in the given order,
@@ -155,15 +147,18 @@ pub fn sign_request(
     key: &SigningKey<'_>,
     now: DateTime<Utc>,
 ) -> AppResult<SignedHeaders> {
-    let parsed = Url::parse(url)
-        .map_err(|err| AppError::BadRequest(format!("cannot sign `{url}`: {err}")))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+    let Some(parsed) = parse_http_url(url) else {
+        // The shared check decided; the parse is repeated only to name why.
+        let reason = match Url::parse(url) {
+            Err(err) => err.to_string(),
+            Ok(_) => "only http and https URLs with a host can be signed".to_owned(),
+        };
         return Err(AppError::BadRequest(format!(
-            "cannot sign `{url}`: only http and https URLs with a host can be signed"
+            "cannot sign `{url}`: {reason}"
         )));
-    }
+    };
     let target = request_target(method, &parsed);
-    let host = host_of(&parsed);
+    let host = host_with_port(&parsed);
     let date = date_header(now);
     let digest = body.map(digest_header);
     let mut signed_lines = vec![
@@ -498,12 +493,12 @@ mod tests {
     #[test]
     fn the_host_helper_builds_host_and_optional_port() {
         let plain = Url::parse("http://a.example/x").unwrap();
-        assert_eq!(host_of(&plain), "a.example");
+        assert_eq!(host_with_port(&plain), "a.example");
         let ported = Url::parse("http://a.example:8080/x").unwrap();
-        assert_eq!(host_of(&ported), "a.example:8080");
+        assert_eq!(host_with_port(&ported), "a.example:8080");
         let default = Url::parse("http://a.example:80/x").unwrap();
         assert_eq!(
-            host_of(&default),
+            host_with_port(&default),
             "a.example",
             "the http default port is never signed"
         );
