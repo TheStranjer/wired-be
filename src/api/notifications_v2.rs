@@ -75,7 +75,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::{account_or_404, distinct},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -491,28 +491,16 @@ async fn groups_response(
 /// within each group newest-first, each named once across groups (Pleroma's
 /// envelope flattens its samples and dedupes by id).
 fn collect_actor_ids(groups: &[(&str, &GroupInfo)]) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = Vec::new();
-    for (_, info) in groups {
-        for actor in &info.sample_account_ids {
-            if !ids.contains(actor) {
-                ids.push(*actor);
-            }
-        }
-    }
-    ids
+    distinct(
+        groups
+            .iter()
+            .flat_map(|(_, info)| info.sample_account_ids.iter().copied()),
+    )
 }
 
 /// The distinct status ids the groups name, in group order.
 fn collect_status_ids(groups: &[(&str, &GroupInfo)]) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = Vec::new();
-    for (_, info) in groups {
-        if let Some(status_id) = info.status_id
-            && !ids.contains(&status_id)
-        {
-            ids.push(status_id);
-        }
-    }
-    ids
+    distinct(groups.iter().filter_map(|(_, info)| info.status_id))
 }
 
 /// Expands account ids into [`Account`] entities as seen by `viewer`:
