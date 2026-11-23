@@ -153,10 +153,14 @@ mod tests {
 
     /// The empty-usage document for `version`, built on the test config.
     fn document(version: SchemaVersion) -> Value {
-        let config = Config::for_tests();
+        document_with(version, &Config::for_tests())
+    }
+
+    /// The empty-usage document for `version`, built on `config`.
+    fn document_with(version: SchemaVersion, config: &Config) -> Value {
         let document = NodeInfo::build(
             version,
-            &config,
+            config,
             Usage {
                 users: UserCounts {
                     total: 0,
@@ -165,9 +169,27 @@ mod tests {
                 },
                 local_posts: 0,
             },
-            Metadata::build(&config, Vec::new(), Federation::federating()),
+            Metadata::build(config, Vec::new(), Federation::federating()),
         );
         serde_json::to_value(&document).unwrap()
+    }
+
+    #[test]
+    fn the_metadata_reports_the_configured_restrictions() {
+        let mut config = Config::for_tests();
+        config.restrict_unauthenticated = ["timelines_federated", "activities_local"]
+            .iter()
+            .map(|area| (*area).to_owned())
+            .collect();
+        let document = document_with(SchemaVersion::V21, &config);
+        assert_eq!(
+            document["metadata"]["restrict_unauthenticated"],
+            json!({
+                "timelines": { "local": false, "federated": true },
+                "profiles": { "local": false, "remote": false },
+                "activities": { "local": true, "remote": false },
+            })
+        );
     }
 
     #[test]
@@ -293,7 +315,7 @@ mod tests {
         );
         assert_eq!(
             metadata["restrict_unauthenticated"],
-            instance_meta::restrict_unauthenticated(),
+            instance_meta::restrict_unauthenticated(&Config::for_tests()),
             "the shared access restrictions, under its snake_case key"
         );
         assert_eq!(metadata["staffAccounts"], json!([]), "no staff fixture");
