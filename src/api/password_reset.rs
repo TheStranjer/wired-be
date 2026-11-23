@@ -294,29 +294,39 @@ async fn reset_attempt(
         return Ok(reset_form_page(None, token, Some(PASSWORD_MISMATCH)));
     }
     let new_hash = hash_password(password)?;
-    complete_reset(state, &target, record.id, &new_hash).await?;
+    if !complete_reset(state, &target, record.id, &new_hash).await? {
+        return Ok(reset_form_page(None, token, Some(INVALID_TOKEN)));
+    }
     debug!(account = %target.nickname, "password reset: password changed");
     Ok(success_page())
 }
 
-/// The write half, as one transaction: the new hash (which also clears
-/// `password_reset_pending`), the token's spend, the account's other
+/// The write half, as one transaction: the token's spend, the new hash
+/// (which also clears `password_reset_pending`), the account's other
 /// tokens, and every OAuth token the account holds. A failure anywhere
 /// lands none of them.
+///
+/// The spend goes first and is conditional: when a concurrent completion
+/// already spent the token it answers `false`, the transaction rolls back
+/// with nothing written, and so does this function (`false`: the token is
+/// no longer valid). `true` means the reset landed.
 async fn complete_reset(
     state: &AppState,
     target: &User,
     token_id: Uuid,
     hash: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let mut tx = state.db.begin().await?;
+    if !password_reset::mark_used(&mut *tx, token_id).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     user::set_password(&mut *tx, target.id, hash).await?;
-    password_reset::mark_used(&mut *tx, token_id).await?;
     let others = password_reset::delete_others(&mut *tx, target.id, token_id).await?;
     let revoked = oauth_token::delete_all_for_user(&mut *tx, target.id).await?;
     tx.commit().await?;
     debug!(account = %target.nickname, others, revoked, "password reset: tokens revoked");
-    Ok(())
+    Ok(true)
 }
 
 /// The configured token window as a [`Duration`] — the same
@@ -563,5 +573,95 @@ mod tests {
         assert!(invalid_token_page().contains("<h2>Invalid Token</h2>"));
         assert!(success_page().contains("<h2>Password changed!</h2>"));
         assert!(invalid_token_page().starts_with("<!DOCTYPE html>"));
+    }
+
+    /// The stored password hash of the account `id`.
+    async fn stored_hash(state: &AppState, id: Uuid) -> Option<String> {
+        user::get_by_id(&state.db, id)
+            .await
+            .expect("the account reads")
+            .expect("the account exists")
+            .password_hash
+    }
+
+    #[tokio::test]
+    async fn a_second_reset_with_a_spent_token_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), crate::config::Config::for_tests());
+        let ap_id = user::local_ap_id(&state.config.base_url, "replayed");
+        let target = user::insert(&state.db, &user::NewUser::local("replayed", &ap_id))
+            .await
+            .expect("the account fixture inserts");
+        let record = password_reset::create_for_user(&state.db, target.id)
+            .await
+            .expect("the token mints");
+
+        let first = reset_attempt(
+            &state,
+            &record.token,
+            "first-new-password",
+            "first-new-password",
+        )
+        .await
+        .expect("the first completion runs");
+        assert!(first.contains("Password changed!"), "{first}");
+        let landed = stored_hash(&state, target.id).await;
+        assert!(landed.is_some(), "the first reset set a password");
+
+        let second = reset_attempt(
+            &state,
+            &record.token,
+            "second-new-password",
+            "second-new-password",
+        )
+        .await
+        .expect("the replay runs");
+        assert!(second.contains("Invalid Token"), "{second}");
+        assert_eq!(
+            stored_hash(&state, target.id).await,
+            landed,
+            "the replay left the password unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_reset_with_a_token_spent_underneath_it_rolls_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), crate::config::Config::for_tests());
+        let ap_id = user::local_ap_id(&state.config.base_url, "raced");
+        let target = user::insert(&state.db, &user::NewUser::local("raced", &ap_id))
+            .await
+            .expect("the account fixture inserts");
+        let record = password_reset::create_for_user(&state.db, target.id)
+            .await
+            .expect("the token mints");
+        let sibling = password_reset::create_for_user(&state.db, target.id)
+            .await
+            .expect("the sibling token mints");
+        let before = stored_hash(&state, target.id).await;
+
+        // The rival completion lands its spend after this one's lookup.
+        assert!(
+            password_reset::mark_used(&state.db, record.id)
+                .await
+                .expect("the rival spend runs"),
+            "the rival wins the spend"
+        );
+        let landed = complete_reset(&state, &target, record.id, "$argon2id$loser")
+            .await
+            .expect("the losing completion runs");
+        assert!(!landed, "the loser is told the token is spent");
+        assert_eq!(
+            stored_hash(&state, target.id).await,
+            before,
+            "the loser's password did not land"
+        );
+        assert!(
+            password_reset::get_valid(&state.db, &sibling.token, Duration::from_hours(1))
+                .await
+                .expect("the lookup runs")
+                .is_some(),
+            "the loser's rollback kept the account's other tokens"
+        );
     }
 }
