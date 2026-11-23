@@ -3,7 +3,7 @@
 //! row's own `(list_id, user_id)` primary key — which is what makes adding
 //! twice one membership and removing twice one removal.
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::error::AppResult;
@@ -24,6 +24,15 @@ ON CONFLICT (list_id, user_id) DO NOTHING";
 /// held.
 const REMOVE_MEMBERS_SQL: &str = "DELETE FROM list_members
      WHERE list_id = $1 AND user_id = ANY($2)";
+
+/// [`remove_between`]: every membership of either account of a pair in a list
+/// the other owns — what a block of the pair must not leave behind, since a
+/// list member is a followed account.
+const REMOVE_BETWEEN_SQL: &str = "DELETE FROM list_members AS lm
+     USING lists AS l
+     WHERE l.id = lm.list_id
+       AND ((l.user_id = $1 AND lm.user_id = $2)
+         OR (l.user_id = $2 AND lm.user_id = $1))";
 
 /// Adds `member_ids` to the list `list_id`, returning how many memberships
 /// were new.
@@ -73,6 +82,26 @@ pub async fn remove_members(pool: &PgPool, list_id: Uuid, member_ids: &[Uuid]) -
     Ok(deleted.rows_affected())
 }
 
+/// Removes `first` from every list `second` owns and `second` from every list
+/// `first` owns, returning how many memberships went away.
+///
+/// Runs on the caller's connection so a block can sever the pair's lists in the
+/// same transaction as its row. A pair with no shared memberships matches
+/// nothing and answers `0`; other accounts' lists are never touched.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remove_between(conn: &mut PgConnection, first: Uuid, second: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(REMOVE_BETWEEN_SQL)
+        .bind(first)
+        .bind(second)
+        .execute(&mut *conn)
+        .await?;
+    Ok(deleted.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +109,55 @@ mod tests {
         error::AppError,
         models::list::{delete, lists_containing, member_ids, test_support::*},
     };
+
+    #[tokio::test]
+    async fn remove_between_takes_both_directions_and_only_the_pair() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let hers = seed(&pool, &alice, "hers").await;
+        let his = seed(&pool, &bob, "his").await;
+        let carols = seed(&pool, &carol, "carols").await;
+        add_member(&pool, &hers, &bob).await;
+        add_member(&pool, &hers, &carol).await;
+        add_member(&pool, &his, &alice).await;
+        add_member(&pool, &carols, &bob).await;
+
+        let mut conn = pool.acquire().await.expect("a connection");
+        assert_eq!(
+            remove_between(&mut conn, alice.id, bob.id)
+                .await
+                .expect("the pair's memberships go"),
+            2,
+            "one membership each way"
+        );
+        assert_eq!(
+            member_ids(&pool, hers.id).await.expect("members read"),
+            vec![carol.id],
+            "alice's list keeps carol"
+        );
+        assert!(
+            member_ids(&pool, his.id)
+                .await
+                .expect("members read")
+                .is_empty(),
+            "bob's list lost alice"
+        );
+        assert_eq!(
+            member_ids(&pool, carols.id).await.expect("members read"),
+            vec![bob.id],
+            "a third account's list is untouched"
+        );
+        assert_eq!(
+            remove_between(&mut conn, bob.id, alice.id)
+                .await
+                .expect("repeating is not an error"),
+            0,
+            "and removes nothing the second time"
+        );
+    }
 
     #[tokio::test]
     async fn membership_is_idempotent_only_through_the_key() {

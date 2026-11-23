@@ -106,8 +106,6 @@ async fn post_event(state: &AppState, hook: &Webhook, args: &DeliverArgs) -> Res
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use serde_json::json;
     use sqlx::PgPool;
     use tokio::task::JoinHandle;
@@ -120,9 +118,7 @@ mod tests {
         },
     };
     use super::*;
-    use crate::{
-        config::Config, http_client::HttpClient, streaming::hub::Hub, uploads::UploaderBackend,
-    };
+    use crate::config::Config;
 
     #[tokio::test]
     async fn a_delivery_posts_the_signed_labeled_envelope() {
@@ -274,23 +270,7 @@ mod tests {
         let pool = db.pool().clone();
         let mut config = Config::for_tests();
         config.fetch.http_allow_private_hosts = false;
-        let state = {
-            let config = Arc::new(config);
-            AppState {
-                db: pool.clone(),
-                hub: Hub::new(&pool),
-                config: Arc::clone(&config),
-                http_client: HttpClient::from(config.as_ref()),
-                uploader: UploaderBackend::from(config.as_ref()),
-                instance_stats_cache: Arc::default(),
-                mrf_config_cache: Arc::default(),
-                translation_languages_cache: Arc::default(),
-                rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(
-                    config.as_ref(),
-                )),
-                mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-            }
-        };
+        let state = AppState::for_tests(pool.clone(), config);
         let blocked = hook(&pool, "http://127.0.0.1:9/hook", &[EVENT_REPORT_CREATED]).await;
         let junk = hook(&pool, "not-a-url", &[EVENT_REPORT_CREATED]).await;
 

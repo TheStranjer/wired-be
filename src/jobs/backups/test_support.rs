@@ -4,8 +4,6 @@
 //! attempt info they pass. Each child's `tests` adds the fixtures only its
 //! own tests read. Test-only.
 
-use std::sync::Arc;
-
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,7 +11,6 @@ use uuid::Uuid;
 use super::{handle_purge, handle_run};
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     jobs::{AttemptInfo, JobError},
     models::{
         bookmark, favourite,
@@ -21,7 +18,6 @@ use crate::{
         user::{NewUser, User, insert as insert_user, local_ap_id},
     },
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The instance origin the fixtures post under.
@@ -36,19 +32,7 @@ pub(super) const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {
 
 /// Test state over `pool` with `config`.
 pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// Test state over `pool` with the fixed test config.

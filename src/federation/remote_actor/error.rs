@@ -13,13 +13,15 @@ pub enum ActorError {
     /// malformed, or the `publicKey` names a different actor. The string
     /// names the offending field.
     Invalid(String),
-    /// The nickname the document implies (`preferredUsername@host`) is
-    /// already stored under a different `ap_id`: the account moved or was
-    /// recreated while the old mirror still holds the handle. Pleroma
-    /// renames the stale row in this case
-    /// (`ActivityPub.maybe_handle_clashing_nickname`); this instance
-    /// refuses the upsert instead, so a takeover attempt is visible to the
-    /// caller rather than silently rewritten.
+    /// The nickname the document implies (`preferredUsername@host`) is held
+    /// by a different `ap_id` that is *not* a stale mirror of the same
+    /// origin: a local row, or a remote row of another domain. A remote row
+    /// of the same domain is the account moved or recreated, and the upsert
+    /// renames it to `<its id>.<nickname>` and proceeds, as Pleroma does
+    /// (`ActivityPub.maybe_handle_clashing_nickname`). Since the nickname's
+    /// host is the actor id's host, only a local holder can reach this in
+    /// practice; it stays as a guard so such a row is never renamed or
+    /// overwritten.
     NicknameConflict,
     /// A server-side failure while storing the row: the database calls of
     /// [`upsert_remote_user`](super::upsert_remote_user).

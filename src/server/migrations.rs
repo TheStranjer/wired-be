@@ -16,6 +16,8 @@ mod chats;
 #[cfg(test)]
 mod push;
 #[cfg(test)]
+mod status_fk_indexes;
+#[cfg(test)]
 mod sweep_indexes;
 #[cfg(test)]
 mod users;

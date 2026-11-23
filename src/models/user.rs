@@ -32,6 +32,7 @@ mod birthdays;
 mod credentials;
 mod deletion;
 mod directory;
+mod inboxes;
 mod insert;
 mod lookup;
 mod mrf_preload;
@@ -53,6 +54,7 @@ pub use birthdays::birthday_accounts;
 pub use credentials::{set_activation, set_email, set_password, set_password_reset_pending};
 pub use deletion::{mark_deleted, mark_deleted_by_domain, purge_personal_data};
 pub use directory::{DirectoryOrder, directory_page};
+pub use inboxes::all_remote_inboxes;
 pub use insert::{CountDelta, insert};
 pub use lookup::{
     active_local_ids, find_password_reset_target, get_by_acct, get_by_ap_id, get_by_email,
@@ -93,6 +95,12 @@ pub const INSTANCE_ACTOR_NICKNAME: &str = "internal.fetch";
 ///
 /// The literal is kept in step with [`INSTANCE_ACTOR_NICKNAME`] by a test.
 pub const NOT_INSTANCE_ACTOR: &str = " AND nickname <> 'internal.fetch'";
+
+/// [`NOT_INSTANCE_ACTOR`] for a query that aliases `users` as `u`:
+/// ` AND u.nickname <> 'internal.fetch'`.
+///
+/// The literal is kept in step with [`INSTANCE_ACTOR_NICKNAME`] by a test.
+pub const NOT_INSTANCE_ACTOR_U: &str = " AND u.nickname <> 'internal.fetch'";
 
 /// A Postgres `boolean` column as a named flag.
 ///
@@ -198,6 +206,10 @@ mod tests {
         assert!(
             NOT_INSTANCE_ACTOR.contains(INSTANCE_ACTOR_NICKNAME),
             "the SQL fragment excludes the account the constant names"
+        );
+        assert!(
+            NOT_INSTANCE_ACTOR_U.contains(INSTANCE_ACTOR_NICKNAME),
+            "so does the `u`-aliased fragment"
         );
     }
 

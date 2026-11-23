@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     error::{AppError, AppResult},
-    models::{follow, user::User},
+    models::{endorsement, follow, list, user::User},
     util::id::new_id,
 };
 
@@ -39,7 +39,9 @@ const UNBLOCK_SQL: &str = "DELETE FROM blocks WHERE blocker_id = $1 AND blocked_
 /// directions' accepted follows and both directions' pending requests, the
 /// denormalised counters of [`crate::models::user::User::followers_count`] and
 /// [`following_count`](crate::models::user::User::following_count) fixed for
-/// every accepted row that goes. All of it is one transaction: the block row
+/// every accepted row that goes, plus each account's list memberships in the
+/// other's lists and the endorsements between them, which an unfollow drops
+/// too. All of it is one transaction: the block row
 /// and the follows it severs can never be seen apart.
 ///
 /// `base_url` is the instance origin, i.e. [`Config::base_url`], which the
@@ -101,6 +103,10 @@ async fn write_block(
         return required(get(&mut *tx, blocker.id, target.id).await?);
     };
     follow::sever_between(&mut tx, blocker.id, target.id).await?;
+    // A list member and an endorsed account are followed accounts, so they go
+    // with the follow, as they do on an unfollow.
+    let _memberships: u64 = list::remove_between(&mut tx, blocker.id, target.id).await?;
+    let _endorsements: u64 = endorsement::remove_between(&mut tx, blocker.id, target.id).await?;
     tx.commit().await?;
     Ok(block)
 }
@@ -313,6 +319,79 @@ mod tests {
             follow::get(&pool, dave.id, carol.id).await.unwrap(),
             Some(rejected),
             "the rejected row is still there, unchanged"
+        );
+    }
+
+    /// List memberships and endorsements between the pair go with the block,
+    /// in both directions; a third account's list holding the target stays,
+    /// and blocking again changes nothing.
+    #[tokio::test]
+    async fn a_block_drops_list_memberships_and_endorsements_between_the_pair() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        for (owner, member) in [(&alice, &bob), (&bob, &alice)] {
+            seed_follow(&pool, owner, member).await;
+            endorsement::endorse(&pool, owner.id, member.id)
+                .await
+                .expect("the fixture endorsement stores");
+        }
+        let hers = list::create(&pool, alice.id, &list::NewList::default())
+            .await
+            .expect("alice's list creates");
+        let his = list::create(&pool, bob.id, &list::NewList::default())
+            .await
+            .expect("bob's list creates");
+        let carols = list::create(&pool, carol.id, &list::NewList::default())
+            .await
+            .expect("carol's list creates");
+        for (target_list, member) in [(&hers, &bob), (&his, &alice), (&carols, &bob)] {
+            let added = list::add_members(&pool, target_list.id, &[member.id])
+                .await
+                .expect("the fixture membership adds");
+            assert_eq!(added, 1, "one membership went in");
+        }
+
+        seed_block(&pool, &alice, &bob).await;
+
+        assert!(
+            list::member_ids(&pool, hers.id).await.unwrap().is_empty(),
+            "bob left alice's list"
+        );
+        assert!(
+            list::member_ids(&pool, his.id).await.unwrap().is_empty(),
+            "alice left bob's list"
+        );
+        assert!(
+            endorsement::endorsed_ids(&pool, alice.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "alice no longer endorses bob"
+        );
+        assert!(
+            endorsement::endorsed_ids(&pool, bob.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "bob no longer endorses alice"
+        );
+        assert_eq!(
+            list::member_ids(&pool, carols.id).await.unwrap(),
+            vec![bob.id],
+            "carol's list still holds bob"
+        );
+
+        let again = block(&pool, TEST_BASE_URL, &alice, &bob)
+            .await
+            .expect("the repeat block is not an error");
+        assert_eq!(again.blocked_id, bob.id, "the stored row answers");
+        assert_eq!(
+            list::member_ids(&pool, carols.id).await.unwrap(),
+            vec![bob.id],
+            "and the repeat changed nothing"
         );
     }
 

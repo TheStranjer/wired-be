@@ -94,6 +94,34 @@ impl AppState {
         }
     }
 
+    /// Test support: the state [`new`](Self::new) builds over `db` and
+    /// `config`, with the recording
+    /// [`MemoryTransport`](crate::mailer::MemoryTransport) as the mailer.
+    /// A test that customises one field uses struct update:
+    /// `AppState { http_client, ..AppState::for_tests(db, config) }`.
+    #[cfg(any(test, feature = "integration-tests"))]
+    #[must_use]
+    pub fn for_tests(db: PgPool, config: Config) -> Self {
+        Self {
+            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+            ..Self::new(db, Arc::new(config))
+        }
+    }
+
+    /// Test support: [`for_tests`](Self::for_tests) over a lazy pool that
+    /// never connects, for tests whose routes never reach the database.
+    #[cfg(any(test, feature = "integration-tests"))]
+    #[must_use]
+    pub fn lazy_for_tests(config: Config) -> Self {
+        let options = sqlx::postgres::PgConnectOptions::new()
+            .host("localhost")
+            .database("unused");
+        Self::for_tests(
+            sqlx::postgres::PgPoolOptions::new().connect_lazy_with(options),
+            config,
+        )
+    }
+
     /// The [`MemoryTransport`](crate::mailer::MemoryTransport) behind
     /// [`mailer`](Self::mailer), when the state was built with one — the
     /// mailbox integration and unit tests assert deliveries on. `None` for
@@ -107,5 +135,33 @@ impl AppState {
             .as_any()
             .downcast_ref::<crate::mailer::MemoryTransport>()
             .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn for_tests_carries_a_recording_mailbox() {
+        let db = crate::test_db::test_db().await.unwrap();
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        assert!(state.mailbox().is_some());
+    }
+
+    #[tokio::test]
+    async fn lazy_for_tests_carries_a_recording_mailbox() {
+        let state = AppState::lazy_for_tests(Config::for_tests());
+        assert!(state.mailbox().is_some());
+    }
+
+    #[tokio::test]
+    async fn new_has_no_recording_mailbox() {
+        let state = AppState::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy_with(sqlx::postgres::PgConnectOptions::new().host("localhost")),
+            Arc::new(Config::for_tests()),
+        );
+        assert!(state.mailbox().is_none());
     }
 }
