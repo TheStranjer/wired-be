@@ -55,8 +55,10 @@
 //! - [`after_account_deleted`]: a `Delete` of the actor, run as the first
 //!   act of the `users.delete` sweep (before it clears the relationship
 //!   rows the fan-out reads), delivered to the union of the account's
-//!   remote followers' and remote followees' inboxes (both sides learned
-//!   something from the actor, both must learn it is gone);
+//!   remote followers' and remote followees' inboxes plus the accepted
+//!   relays' (both sides learned something from the actor, both must learn
+//!   it is gone), then in a second publish to every other known remote
+//!   inbox;
 //! - [`after_account_disabled`]: nothing — deactivation deliberately
 //!   federates no activity, so the hook is the documented landing point for
 //!   a ticket that ever changes that answer;
