@@ -11,8 +11,8 @@ use axum::{Json, extract::State};
 use tracing::debug;
 
 use super::{
-    AREA_EMOJI, CLASS_READ, CLASS_WRITE, COULD_NOT_DOWNLOAD, FILE_FIELD, MISSING_FILE, OK_BODY,
-    PACK_NOT_SHAREABLE, REMOTE_ARCHIVE_PATH,
+    AREA_EMOJI, CLASS_READ, CLASS_WRITE, COULD_NOT_DOWNLOAD, FILE_FIELD, INVALID_CHECKSUM,
+    MISSING_FILE, OK_BODY, PACK_NOT_SHAREABLE, REMOTE_ARCHIVE_PATH,
     pack_writes::{resync, trimmed_name},
     params::PackParams,
     remote::{
@@ -21,6 +21,7 @@ use super::{
     },
 };
 use crate::{
+    api::instance::sha256_hex_bytes,
     auth::admin::AdminUser,
     error::{AppError, AppResult},
     extract::{
@@ -35,29 +36,51 @@ use crate::{
 /// `fetch_pack_info` decision: a pack that shares its files downloads
 /// from its instance's archive endpoint; an unshared one only through a
 /// `fallback-src` it names; a pack with neither is refused with the
-/// ticket's pinned 400.
-fn archive_source(request: &DownloadRequest<'_>, listing: &RemotePackListing) -> AppResult<String> {
+/// ticket's pinned 400. Returns the archive URL with the SHA-256 the
+/// download must match — the listing's `download-sha256` for a shared
+/// pack, `fallback-src-sha256` for a fallback; like Pleroma, a source
+/// whose digest is missing or blank is refused with the same 400.
+fn archive_source(
+    request: &DownloadRequest<'_>,
+    listing: &RemotePackListing,
+) -> AppResult<(String, String)> {
+    let not_shareable = || AppError::BadRequest(PACK_NOT_SHAREABLE.to_owned());
     if listing.pack.share_files {
-        return instance_api_url(
+        let url = instance_api_url(
             request.base,
             REMOTE_ARCHIVE_PATH,
             &[("name", request.remote_name)],
-        );
+        )?;
+        let digest =
+            non_blank(listing.pack.download_sha256.as_deref()).ok_or_else(not_shareable)?;
+        return Ok((url, digest));
     }
-    listing
-        .pack
-        .fallback_src
-        .as_deref()
+    let url = non_blank(listing.pack.fallback_src.as_deref()).ok_or_else(not_shareable)?;
+    let digest =
+        non_blank(listing.pack.fallback_src_sha256.as_deref()).ok_or_else(not_shareable)?;
+    Ok((url, digest))
+}
+
+/// `value` trimmed and owned, `None` when absent or blank.
+fn non_blank(value: Option<&str>) -> Option<String> {
+    value
         .map(str::trim)
-        .filter(|src| !src.is_empty())
+        .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
-        .ok_or_else(|| AppError::BadRequest(PACK_NOT_SHAREABLE.to_owned()))
+}
+
+/// Whether `bytes` hash to the hex SHA-256 `expected`, compared
+/// case-insensitively (Pleroma writes uppercase hex); a value that is
+/// not a SHA-256 hex digest never matches.
+fn checksum_matches(bytes: &[u8], expected: &str) -> bool {
+    sha256_hex_bytes(bytes).eq_ignore_ascii_case(expected.trim())
 }
 
 /// Extracts a pack archive into the freshly created pack `name` and
 /// writes the manifest that stands: the one the archive carries itself
 /// when it parses and names files that landed, else `listing`'s map (a
-/// remote pack's own shortcode map) or the stems of the extracted
+/// remote pack's own shortcode map, without the archive digest that
+/// described only the download) or the stems of the extracted
 /// images (an upload without a manifest). Every entry of the stored
 /// manifest names a file that actually arrived, so an installed pack
 /// always lists, serves and archives. Returns the stored entry count.
@@ -126,7 +149,10 @@ fn manifest_from_listing(
     extracted: &BTreeSet<String>,
 ) -> emoji_packs::Pack {
     emoji_packs::Pack {
-        pack: listing.pack.clone(),
+        pack: emoji_packs::PackMeta {
+            download_sha256: None,
+            ..listing.pack.clone()
+        },
         files: listing
             .files
             .iter()
@@ -208,7 +234,7 @@ pub(super) async fn download(
         let full = listing.files_count.to_string();
         listing = fetch_pack_listing(&state, &request, &full).await?;
     }
-    let source = archive_source(&request, &listing)?;
+    let (source, expected_sha256) = archive_source(&request, &listing)?;
     let archive = fetch_remote(
         &state,
         &source,
@@ -216,6 +242,9 @@ pub(super) async fn download(
         COULD_NOT_DOWNLOAD,
     )
     .await?;
+    if !checksum_matches(&archive.body, &expected_sha256) {
+        return Err(AppError::BadRequest(INVALID_CHECKSUM.to_owned()));
+    }
     emoji_packs::create_pack(&state.config.emoji_dir, request.local_name).await?;
     let installed =
         install_pack_archive(&state, request.local_name, &archive.body, Some(listing)).await;
@@ -323,13 +352,34 @@ mod tests {
         assert_eq!(request.local_name, "packed-cats");
         let shared = listing_with(emoji_packs::PackMeta {
             share_files: true,
+            download_sha256: Some(" ABCD ".to_owned()),
+            fallback_src: Some("https://files.example/ignored.zip".to_owned()),
+            fallback_src_sha256: Some("ffff".to_owned()),
             ..emoji_packs::PackMeta::default()
         });
         assert_eq!(
             archive_source(&request, &shared).unwrap(),
-            "https://remote.example/api/v1/pleroma/emoji/packs/archive?name=cats+and+dogs",
-            "the instance's own archive endpoint, name encoded"
+            (
+                "https://remote.example/api/v1/pleroma/emoji/packs/archive?name=cats+and+dogs"
+                    .to_owned(),
+                "ABCD".to_owned()
+            ),
+            "the instance's own archive endpoint, name encoded, with download-sha256"
         );
+        for digest in [None, Some("  ".to_owned())] {
+            let undeclared = listing_with(emoji_packs::PackMeta {
+                share_files: true,
+                download_sha256: digest,
+                fallback_src_sha256: Some("ffff".to_owned()),
+                ..emoji_packs::PackMeta::default()
+            });
+            let err = archive_source(&request, &undeclared).unwrap_err();
+            assert!(
+                matches!(err, AppError::BadRequest(_)),
+                "a shared pack without download-sha256 is a 400, not {err}"
+            );
+            assert_eq!(err.to_string(), PACK_NOT_SHAREABLE, "the pinned wording");
+        }
     }
 
     #[test]
@@ -338,17 +388,32 @@ mod tests {
         let request = DownloadRequest::from_params(&body).unwrap();
         let with_src = listing_with(emoji_packs::PackMeta {
             fallback_src: Some("  https://files.example/cats.zip  ".to_owned()),
+            fallback_src_sha256: Some("beef".to_owned()),
+            download_sha256: Some("ignored".to_owned()),
             ..emoji_packs::PackMeta::default()
         });
         assert_eq!(
             archive_source(&request, &with_src).unwrap(),
-            "https://files.example/cats.zip",
-            "the declared archive, as given"
+            (
+                "https://files.example/cats.zip".to_owned(),
+                "beef".to_owned()
+            ),
+            "the declared archive, as given, with fallback-src-sha256"
         );
         for meta in [
             emoji_packs::PackMeta::default(),
             emoji_packs::PackMeta {
                 fallback_src: Some("   ".to_owned()),
+                fallback_src_sha256: Some("beef".to_owned()),
+                ..emoji_packs::PackMeta::default()
+            },
+            emoji_packs::PackMeta {
+                fallback_src: Some("https://files.example/cats.zip".to_owned()),
+                ..emoji_packs::PackMeta::default()
+            },
+            emoji_packs::PackMeta {
+                fallback_src: Some("https://files.example/cats.zip".to_owned()),
+                fallback_src_sha256: Some(" ".to_owned()),
                 ..emoji_packs::PackMeta::default()
             },
         ] {
@@ -362,11 +427,40 @@ mod tests {
     }
 
     #[test]
+    fn the_checksum_comparison_ignores_case_and_rejects_everything_else() {
+        let bytes = b"an archive";
+        let lower = sha256_hex_bytes(bytes);
+        assert_eq!(lower.len(), 64, "a SHA-256 is 64 hex digits");
+        assert!(checksum_matches(bytes, &lower), "lowercase hex matches");
+        assert!(
+            checksum_matches(bytes, &lower.to_uppercase()),
+            "uppercase hex, as Pleroma writes it, matches"
+        );
+        assert!(
+            checksum_matches(bytes, &format!(" {lower}\n")),
+            "surrounding whitespace is not part of the digest"
+        );
+        assert!(
+            !checksum_matches(b"another archive", &lower),
+            "other bytes do not match"
+        );
+        assert!(
+            !checksum_matches(bytes, &sha256_hex_bytes(b"other")),
+            "a wrong digest is refused"
+        );
+        let truncated: String = lower.chars().take(63).collect();
+        for bad in ["", "beef", "not hex at all", truncated.as_str()] {
+            assert!(!checksum_matches(bytes, bad), "{bad:?} is no digest of it");
+        }
+    }
+
+    #[test]
     fn the_listing_manifest_keeps_only_files_that_landed() {
         let listing = RemotePackListing {
             pack: emoji_packs::PackMeta {
                 license: Some("MIT".to_owned()),
                 share_files: true,
+                download_sha256: Some("beef".to_owned()),
                 ..emoji_packs::PackMeta::default()
             },
             files: BTreeMap::from([
@@ -384,6 +478,10 @@ mod tests {
             "the remote metadata rides into the stored manifest"
         );
         assert!(pack.pack.share_files, "including its share flag");
+        assert_eq!(
+            pack.pack.download_sha256, None,
+            "but not the digest of the download"
+        );
         assert_eq!(
             pack.files
                 .iter()
