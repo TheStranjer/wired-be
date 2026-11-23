@@ -315,9 +315,12 @@ async fn token_page_answers_invalid_for_unknown_spent_and_lapsed() {
         .await
         .expect("the lookup runs")
         .expect("the first token is live");
-    password_reset::mark_used(&pool, record.id)
-        .await
-        .expect("the spend runs");
+    assert!(
+        password_reset::mark_used(&pool, record.id)
+            .await
+            .expect("the spend runs"),
+        "the first spend lands"
+    );
     lapse_token(&pool, &lapsed).await;
 
     for token in ["never-minted".to_owned(), spent, lapsed] {
