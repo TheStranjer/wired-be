@@ -53,6 +53,7 @@
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
@@ -251,18 +252,24 @@ async fn apply_accept(
     let _granted = follow::accept(&state.db, row.id)
         .await
         .map_err(|err| transient("follow acceptance", &err))?;
-    // The relay arm (see `crate::services::relay`): when the followee is a
-    // relay this instance follows, granting the follow also turns the
-    // subscription accepted, opening its inbox to the publisher's fan-out.
-    // For every other followee this writes nothing.
-    let relay_granted = relay::mark_accepted(&state.db, &signer.ap_id)
+    // The relay arm (see `crate::services::relay`): when the granted follow
+    // is the instance actor's own follow of a relay, the subscription turns
+    // accepted, opening the relay's inbox to the publisher's fan-out. A
+    // local user's follow of the relay actor is no subscription and writes
+    // nothing here.
+    if follower_is_instance_actor(&state.db, row.follower_id)
         .await
-        .map_err(|err| transient("relay acceptance", &err))?;
-    if relay_granted {
-        debug!(
-            relay = %signer.ap_id,
-            "an inbound Accept granted a relay follow: the subscription stands accepted"
-        );
+        .map_err(|err| transient("instance actor lookup", &err))?
+    {
+        let relay_granted = relay::mark_accepted(&state.db, &signer.ap_id)
+            .await
+            .map_err(|err| transient("relay acceptance", &err))?;
+        if relay_granted {
+            debug!(
+                relay = %signer.ap_id,
+                "an inbound Accept granted a relay follow: the subscription stands accepted"
+            );
+        }
     }
     debug!(
         follower = %row.follower_id,
@@ -302,12 +309,39 @@ async fn apply_reject(
     let _removed = follow::reject(&state.db, row.id)
         .await
         .map_err(|err| transient("follow rejection", &err))?;
+    // The relay arm: a relay revokes (or refuses) a subscription with a
+    // `Reject` of the instance actor's follow. The `follows` row is gone, so
+    // the subscription goes back to pending and the relay's inbox leaves
+    // the fan-out. A local user's follow of the relay actor changes nothing.
+    if follower_is_instance_actor(&state.db, row.follower_id)
+        .await
+        .map_err(|err| transient("instance actor lookup", &err))?
+    {
+        let relay_revoked = relay::mark_pending(&state.db, &signer.ap_id)
+            .await
+            .map_err(|err| transient("relay revocation", &err))?;
+        if relay_revoked {
+            debug!(
+                relay = %signer.ap_id,
+                "an inbound Reject revoked a relay follow: the subscription is pending again"
+            );
+        }
+    }
     debug!(
         follower = %row.follower_id,
         followee = %signer.nickname,
         "an inbound Reject removed a follow this instance made"
     );
     Ok(Outcome::Handled)
+}
+
+/// Whether `follower_id` is the instance actor — the account whose follows
+/// are relay subscriptions. A missing instance actor (never provisioned)
+/// means no relay follow can exist, so it answers `false` without creating
+/// one.
+async fn follower_is_instance_actor(pool: &PgPool, follower_id: Uuid) -> AppResult<bool> {
+    let instance = user::get_by_nickname(pool, user::INSTANCE_ACTOR_NICKNAME).await?;
+    Ok(instance.is_some_and(|actor| actor.id == follower_id))
 }
 
 /// The body of [`handle_undo_follow`]: the inner actor's belt, the signer's
@@ -637,6 +671,197 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "and nothing was folded"
+        );
+    }
+
+    /// The relay actor every relay fixture here answers as.
+    const RELAY_AP: &str = "https://peer.example/relay";
+    /// Its inbox, the fan-out address the ledger carries.
+    const RELAY_INBOX: &str = "https://peer.example/relay/inbox";
+
+    /// The relay's `Accept` or `Reject` (`kind`, named `n`) of the follow
+    /// `follower_ap_id` made of the relay, the inner `Follow` embedded whole.
+    fn relay_answer(kind: &str, n: &str, follower_ap_id: &str) -> ActivityView {
+        view(
+            kind,
+            n,
+            RELAY_AP,
+            &json!({"type": "Follow", "actor": follower_ap_id, "object": RELAY_AP}),
+        )
+    }
+
+    /// A relay mirror whose subscription row stands `pending` in the
+    /// ledger, plus the instance actor that would follow it.
+    async fn relay_fixture(pool: &PgPool, state: &AppState) -> (User, User) {
+        let relay_user = mirror(pool, "relay", RELAY_AP).await;
+        let _row = relay::upsert(pool, RELAY_AP, RELAY_INBOX)
+            .await
+            .expect("the subscription row stores");
+        let instance = crate::services::instance_actor::ensure_instance_actor(pool, &state.config)
+            .await
+            .expect("the instance actor provisions");
+        (relay_user, instance)
+    }
+
+    /// A local user's follow of the relay actor, once the relay accepts it,
+    /// is a granted follow and nothing more: the instance's subscription
+    /// stays `pending` and the relay's inbox joins no fan-out.
+    #[tokio::test]
+    async fn an_accept_of_a_local_users_follow_of_a_relay_leaves_the_subscription_pending() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let (relay_user, _instance) = relay_fixture(&pool, &state).await;
+        let alice = local(&pool, "relay-accept-alice").await;
+        let relay_id = relay_user.id;
+        let _row = follow::follow(&pool, TEST_BASE_URL, &alice, &relay_user)
+            .await
+            .expect("the local follow records");
+
+        let outcome = handle_accept(
+            state,
+            relay_answer("Accept", "relay-accept-local", &alice.ap_id),
+            relay_user,
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(Outcome::Handled)), "{outcome:?}");
+        let granted = follow::get(&pool, alice.id, relay_id)
+            .await
+            .unwrap()
+            .expect("the follow stands");
+        assert_eq!(
+            granted.state,
+            FollowState::Accepted,
+            "the follow is granted"
+        );
+        let subscription = relay::get(&pool, RELAY_AP).await.unwrap().expect("a row");
+        assert_eq!(
+            subscription.state,
+            relay::RelayState::Pending,
+            "but the instance's subscription was never answered"
+        );
+        assert!(
+            relay::accepted_inboxes(&pool).await.unwrap().is_empty(),
+            "so the relay's inbox is no fan-out target"
+        );
+    }
+
+    /// The relay's `Accept` of the instance actor's own follow turns the
+    /// subscription accepted and opens the relay's inbox to the fan-out.
+    #[tokio::test]
+    async fn an_accept_of_the_instance_actors_follow_marks_the_relay_accepted() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let (relay_user, instance) = relay_fixture(&pool, &state).await;
+        let relay_id = relay_user.id;
+        let _row = follow::follow(&pool, TEST_BASE_URL, &instance, &relay_user)
+            .await
+            .expect("the instance actor's follow records");
+
+        let outcome = handle_accept(
+            state,
+            relay_answer("Accept", "relay-accept-instance", &instance.ap_id),
+            relay_user,
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(Outcome::Handled)), "{outcome:?}");
+        let granted = follow::get(&pool, instance.id, relay_id)
+            .await
+            .unwrap()
+            .expect("the follow stands");
+        assert_eq!(
+            granted.state,
+            FollowState::Accepted,
+            "the follow is granted"
+        );
+        assert!(
+            relay::is_accepted(&pool, RELAY_AP).await.unwrap(),
+            "the subscription stands accepted"
+        );
+        assert_eq!(
+            relay::accepted_inboxes(&pool).await.unwrap(),
+            vec![RELAY_INBOX.to_owned()],
+            "and the relay's inbox is a fan-out target"
+        );
+    }
+
+    /// A relay's `Reject` of the instance actor's follow revokes the
+    /// subscription: the follow is gone, the ledger row is `pending` again
+    /// and the relay's inbox leaves the fan-out.
+    #[tokio::test]
+    async fn a_reject_of_the_instance_actors_relay_follow_takes_the_relay_out_of_fan_out() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let (relay_user, instance) = relay_fixture(&pool, &state).await;
+        let relay_id = relay_user.id;
+        let _row = follow::follow(&pool, TEST_BASE_URL, &instance, &relay_user)
+            .await
+            .expect("the instance actor's follow records");
+        let _granted = relay::mark_accepted(&pool, RELAY_AP).await.unwrap();
+        assert_eq!(
+            relay::accepted_inboxes(&pool).await.unwrap().len(),
+            1,
+            "the relay starts as a fan-out target"
+        );
+
+        let outcome = handle_reject(
+            state,
+            relay_answer("Reject", "relay-reject-instance", &instance.ap_id),
+            relay_user,
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(Outcome::Handled)), "{outcome:?}");
+        assert!(
+            follow::get(&pool, instance.id, relay_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the follow row is removed"
+        );
+        assert!(
+            relay::accepted_inboxes(&pool).await.unwrap().is_empty(),
+            "the relay's inbox leaves the fan-out"
+        );
+        assert!(
+            !relay::is_accepted(&pool, RELAY_AP).await.unwrap(),
+            "and its Announces no longer fold"
+        );
+        let subscription = relay::get(&pool, RELAY_AP).await.unwrap().expect("a row");
+        assert_eq!(subscription.state, relay::RelayState::Pending);
+    }
+
+    /// A relay's `Reject` of a *local user's* follow of the relay actor is
+    /// no revocation of the instance's subscription: the accepted relay
+    /// keeps its place in the fan-out.
+    #[tokio::test]
+    async fn a_reject_of_a_local_users_follow_of_a_relay_leaves_the_subscription_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let (relay_user, _instance) = relay_fixture(&pool, &state).await;
+        let alice = local(&pool, "relay-reject-alice").await;
+        let _row = follow::follow(&pool, TEST_BASE_URL, &alice, &relay_user)
+            .await
+            .expect("the local follow records");
+        let _granted = relay::mark_accepted(&pool, RELAY_AP).await.unwrap();
+
+        let outcome = handle_reject(
+            state,
+            relay_answer("Reject", "relay-reject-local", &alice.ap_id),
+            relay_user,
+        )
+        .await;
+
+        assert!(matches!(outcome, Ok(Outcome::Handled)), "{outcome:?}");
+        assert_eq!(
+            relay::accepted_inboxes(&pool).await.unwrap(),
+            vec![RELAY_INBOX.to_owned()],
+            "the instance's accepted subscription stands"
         );
     }
 

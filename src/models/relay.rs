@@ -3,7 +3,8 @@
 //! One row per followed relay, keyed by the relay actor's `ActivityPub` id
 //! — the `object` of the `Follow` [`crate::services::relay`] sends, and
 //! the `actor` of the `Accept` that turns [`RelayState::Pending`] into
-//! [`RelayState::Accepted`] ([`mark_accepted`]) and of the `Announce`es the
+//! [`RelayState::Accepted`] ([`mark_accepted`]), of the `Reject` that
+//! takes it back to pending ([`mark_pending`]) and of the `Announce`es the
 //! [Announce handler](crate::federation::handlers::interactions) folds
 //! without a reblog row. The reference is Pleroma's
 //! `Pleroma.Web.ActivityPub.Relay`
@@ -13,6 +14,12 @@
 //! [publisher](crate::federation::publisher) fans public activities to
 //! ([`crate::models::instance::relay_inboxes`], answering
 //! [`accepted_inboxes`]).
+//!
+//! The subscription is the *instance actor's* follow of the relay, so only
+//! the answers to that follow move the state: the inbound `Accept` and
+//! `Reject` handlers call [`mark_accepted`] and [`mark_pending`] only when
+//! the answered follow's follower is the instance actor. A local user's
+//! own follow of a relay actor never touches this table.
 //!
 //! Nothing here talks the network or builds documents: the handshake is
 //! [`crate::services::relay`]'s; this module is the table.
@@ -62,6 +69,13 @@ const UPSERT_SQL: &str = "INSERT INTO relays (actor_ap_id, inbox) VALUES ($1, $2
 /// row that stands accepted already matches nothing here.
 const MARK_ACCEPTED_SQL: &str = "UPDATE relays SET state = 'accepted' \
                                  WHERE actor_ap_id = $1 AND state <> 'accepted'";
+
+/// [`mark_pending`]: the revocation alone — an unknown actor or a row that
+/// stands pending already matches nothing here. The row is kept (not
+/// deleted) so the ledger still shows the relay the instance asked to
+/// follow, and a later re-follow upserts onto it.
+const MARK_PENDING_SQL: &str = "UPDATE relays SET state = 'pending' \
+                                WHERE actor_ap_id = $1 AND state <> 'pending'";
 
 /// [`get`]: the one subscription named by its actor id.
 const GET_SQL: &str = "SELECT actor_ap_id, inbox, state, inserted_at FROM relays \
@@ -140,6 +154,30 @@ pub async fn upsert(pool: &PgPool, actor_ap_id: &str, inbox: &str) -> AppResult<
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn mark_accepted(pool: &PgPool, actor_ap_id: &str) -> AppResult<bool> {
     let moved = sqlx::query(MARK_ACCEPTED_SQL)
+        .bind(actor_ap_id)
+        .execute(pool)
+        .await?;
+    Ok(moved.rows_affected() > 0)
+}
+
+/// Takes the subscription to `actor_ap_id` back to pending.
+///
+/// This is the arm the inbound `Reject` handler runs after it removes the
+/// instance actor's follow of a relay: the relay revoked (or refused) the
+/// subscription, so its inbox leaves [`accepted_inboxes`] and its
+/// `Announce`es stop folding ([`is_accepted`]). The row stays, matching a
+/// never-answered follow.
+///
+/// `true` is the accepted row this revocation moved; `false` means there
+/// was nothing to move — the actor is not one of our relays or its row
+/// stood pending already.
+///
+/// # Errors
+///
+/// Any database failure (connection) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn mark_pending(pool: &PgPool, actor_ap_id: &str) -> AppResult<bool> {
+    let moved = sqlx::query(MARK_PENDING_SQL)
         .bind(actor_ap_id)
         .execute(pool)
         .await?;
@@ -371,6 +409,39 @@ mod tests {
                 .unwrap(),
             "an unknown actor is no accepted relay"
         );
+    }
+
+    /// [`mark_pending`] moves an accepted row back, is quiet about a pending
+    /// one, and refuses to invent a row for an unknown actor.
+    #[tokio::test]
+    async fn mark_pending_moves_only_an_accepted_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        assert!(
+            !mark_pending(&pool, RELAY).await.unwrap(),
+            "a stranger has nothing to revoke"
+        );
+        assert_eq!(relay_count(&pool).await, 0, "and no row was made");
+
+        let _pending = upsert(&pool, RELAY, INBOX).await.unwrap();
+        assert!(
+            !mark_pending(&pool, RELAY).await.unwrap(),
+            "a pending row has nothing to move"
+        );
+        let _granted = mark_accepted(&pool, RELAY).await.unwrap();
+        assert!(
+            mark_pending(&pool, RELAY).await.unwrap(),
+            "the accepted row moves back"
+        );
+        assert!(
+            !is_accepted(&pool, RELAY).await.unwrap(),
+            "and no longer counts as accepted"
+        );
+        assert!(
+            accepted_inboxes(&pool).await.unwrap().is_empty(),
+            "its inbox leaves the fan-out"
+        );
+        assert_eq!(relay_count(&pool).await, 1, "while the row stays");
     }
 
     /// [`accepted_inboxes`] answers only the granted subscriptions, oldest
