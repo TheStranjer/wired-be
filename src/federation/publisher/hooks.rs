@@ -1,8 +1,9 @@
 //! Tests of the conditions that change a publish: federation switched off,
-//! the relay hook, the unreachable-host hook and an actor's own
-//! self-broadcasts.
+//! the relay hook, the unreachable-host hook and which of an actor's own
+//! self-broadcasts reach relays (the public ones only).
 
 use chrono::{Duration, Utc};
+use sqlx::PgPool;
 
 use super::test_support::*;
 use super::*;
@@ -101,8 +102,8 @@ async fn the_relay_hook_adds_the_accepted_inboxes_to_the_fan_out() {
         "the queue holds the follower's delivery and the relay's"
     );
 
-    // A non-public activity of the same actor — no public address, no
-    // self-broadcast type — never carries the relay's inbox.
+    // A non-public activity of the same actor — no public address —
+    // never carries the relay's inbox.
     let private = json!({
         "id": CORRECTION_ID,
         "type": "Create",
@@ -186,28 +187,197 @@ async fn the_unreachable_hook_drops_and_restores_a_marked_host() {
     );
 }
 
-/// The self-broadcast arm runs the relay hook without any subscription
-/// standing: the actor's own `Update` consults the `relays` table, finds
-/// no accepted relay, and reaches its followers only.
+/// Subscribes to and accepts the fixture relay, so its inbox is one the
+/// publisher adds to a relay-eligible (public) fan-out.
+async fn accepted_relay(pool: &PgPool) {
+    let _subscription = relay::upsert(pool, "https://relay.example/relay", RELAY_INBOX)
+        .await
+        .unwrap();
+    let _granted = relay::mark_accepted(pool, "https://relay.example/relay")
+        .await
+        .unwrap();
+}
+
+/// An actor's own `Update` addressed to its followers (an edit of a
+/// followers-only note) reaches the followers and never the accepted
+/// relay: the body of a private post must not leave through a relay.
 #[tokio::test]
-async fn an_actor_self_broadcast_runs_the_relay_arm() {
+async fn a_followers_only_update_stays_off_the_relay() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     followed(&pool, &erin, &alice).await;
+    accepted_relay(&pool).await;
     let state = test_state(&pool);
     let update = json!({
         "id": ACTIVITY_ID,
         "type": "Update",
         "actor": alice.ap_id,
-        "object": alice.ap_id,
+        "object": {"type": "Note", "id": "https://test.example/objects/1", "content": "secret"},
         "to": [alice.followers_url],
     });
 
     assert_eq!(
         publish_default(&state, &alice, &update).await,
         1,
-        "the actor's Update fans out to followers and consults the empty relay ledger"
+        "the Update fans out to the follower alone"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX],
+        "and no delivery job names the relay's inbox"
+    );
+}
+
+/// An `Undo` of a block, addressed to the one remote actor it concerns,
+/// reaches that actor and not the relay.
+#[tokio::test]
+async fn an_undo_block_stays_off_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let undo = json!({
+        "id": ACTIVITY_ID,
+        "type": "Undo",
+        "actor": alice.ap_id,
+        "object": {"type": "Block", "actor": alice.ap_id, "object": erin.ap_id},
+        "to": [erin.ap_id],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &undo).await,
+        1,
+        "the Undo goes to the unblocked actor alone"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX],
+        "the target's inbox gets its job and the relay's inbox gets none"
+    );
+}
+
+/// An `Undo` of a follow published with `only_to` reaches the named
+/// actor and never the relay, whatever the document's own addressing.
+#[tokio::test]
+async fn an_undo_follow_with_only_to_stays_off_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let undo = json!({
+        "id": ACTIVITY_ID,
+        "type": "Undo",
+        "actor": alice.ap_id,
+        "object": {"type": "Follow", "actor": alice.ap_id, "object": erin.ap_id},
+        "to": [erin.ap_id],
+    });
+    let opts = PublishOpts {
+        only_to: Some(vec![erin.ap_id.clone()]),
+        ..PublishOpts::default()
+    };
+
+    assert_eq!(
+        publish_ok(&state, &alice, &undo, opts).await,
+        1,
+        "the Undo goes to the unfollowed actor alone"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX],
+        "and no job names the relay's inbox"
+    );
+}
+
+/// `only_to` closes the relay arm even when the list names the public
+/// address: the caller narrowed the audience.
+#[tokio::test]
+async fn only_to_naming_the_public_still_skips_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let opts = PublishOpts {
+        only_to: Some(vec![PUBLIC.to_owned(), erin.ap_id.clone()]),
+        ..PublishOpts::default()
+    };
+
+    assert_eq!(
+        publish_ok(&state, &alice, &public_activity(&alice), opts).await,
+        1,
+        "only the named actor is a target"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX],
+        "the relay's inbox is left out"
+    );
+}
+
+/// Regression: the `Delete` of a public note carries the public address,
+/// so the accepted relay still gets it beside the follower.
+#[tokio::test]
+async fn a_public_delete_still_reaches_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+    followed(&pool, &erin, &alice).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let delete = json!({
+        "id": ACTIVITY_ID,
+        "type": "Delete",
+        "actor": alice.ap_id,
+        "object": "https://test.example/objects/1",
+        "to": [PUBLIC],
+        "cc": [alice.followers_url],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &delete).await,
+        2,
+        "the follower and the relay are both targets"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX, RELAY_INBOX],
+        "the relay's inbox is queued"
+    );
+}
+
+/// Regression: the profile `Update` is addressed to the public, so the
+/// accepted relay still gets it.
+#[tokio::test]
+async fn a_public_profile_update_still_reaches_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let update = json!({
+        "id": ACTIVITY_ID,
+        "type": "Update",
+        "actor": alice.ap_id,
+        "object": alice.ap_id,
+        "to": [PUBLIC],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &update).await,
+        1,
+        "the relay is the one target"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![RELAY_INBOX],
+        "and its inbox is queued"
     );
 }

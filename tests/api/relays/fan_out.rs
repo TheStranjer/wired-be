@@ -1,6 +1,6 @@
 //! The publisher's fan-out over the accepted relay subscription — public
 //! activities reach the relay's inbox, non-public ones leave it out, and
-//! the actor's own `Update` rides the self-broadcast arm — and the relay's
+//! so does the actor's own followers-only `Update` — and the relay's
 //! `Announce` fold: an accepted relay ingests without boosting, a
 //! non-relay still boosts, and a `pending` relay folds like a stranger's.
 
@@ -89,8 +89,8 @@ async fn public_activities_reach_the_accepted_relay_only() {
 }
 
 /// The accepted relay stays out of the fan-out of activities that name
-/// nobody public — and the actor's own `Update` reaches it through the
-/// self-broadcast arm, so relays keep their copies fresh.
+/// nobody public — including the actor's own `Update`, which relays see
+/// only when it carries the public address.
 #[tokio::test]
 async fn non_public_activities_leave_the_accepted_relay_out() {
     let db = common::test_db().await;
@@ -138,7 +138,7 @@ async fn non_public_activities_leave_the_accepted_relay_out() {
     assert_eq!(direct, 0, "a non-public Announce is nobody's relay feed");
 
     // The actor's own Update, addressed only to a followers collection:
-    // the self-broadcast arm carries it to the relay too.
+    // it names no public address, so the relay stays out of it too.
     let own_update = json!({
         "id": format!("{BASE}/activities/relay-fanout-8"),
         "type": "Update",
@@ -150,15 +150,14 @@ async fn non_public_activities_leave_the_accepted_relay_out() {
         .await
         .expect("the publish runs");
     assert_eq!(
-        self_broadcast, 1,
-        "the actor's own Update runs the relay arm"
+        self_broadcast, 0,
+        "a non-public Update of the actor's own reaches no relay"
     );
 
     let inboxes = queued_inboxes(&pool).await;
-    assert_eq!(
-        inboxes,
-        vec![mock.inbox_url()],
-        "and the queue holds exactly that one relay delivery"
+    assert!(
+        inboxes.is_empty(),
+        "and the queue holds no delivery at all, got {inboxes:?}"
     );
 }
 

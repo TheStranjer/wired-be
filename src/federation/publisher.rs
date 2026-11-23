@@ -35,9 +35,13 @@
 //!   nor this instance's own actor ever receives a copy);
 //! - relay inboxes ([`relay_inboxes`](crate::models::instance::relay_inboxes),
 //!   the `inbox` of every relay this instance follows and that has
-//!   accepted the follow) join the set for
-//!   activities with public addressing and for the actor's own
-//!   `Delete`/`Undo`/`Update`, so relays keep their copies fresh;
+//!   accepted the follow) join the set only for activities whose addressing
+//!   carries the public address and that are not narrowed by
+//!   [`PublishOpts::only_to`] — the public `Delete`/`Update` of a note, the
+//!   profile `Update` and the account `Delete` all do, so relays keep their
+//!   copies fresh, while an `Update`, `Delete` or `Undo` with no public
+//!   address (a followers-only edit, an unfollow, an unblock) never reaches
+//!   a relay;
 //! - inboxes whose host instance policy rejects — by its own table or by
 //!   the [`mrf`] domain lists — or whose
 //!   [`instances`](crate::models::instance) row carries an unreachable mark
@@ -93,7 +97,7 @@ use crate::{
 #[cfg(test)]
 mod fan_out;
 /// The tests of the conditions that change a publish: federation off, the
-/// relay and unreachable hooks, and an actor's self-broadcasts.
+/// relay and unreachable hooks, and which self-broadcasts reach relays.
 #[cfg(test)]
 mod hooks;
 /// The last fan-out stage: the deliverable, deduplicated inbox set.
@@ -108,7 +112,7 @@ mod test_support;
 
 use inboxes::{deliverable_inboxes, unreachable_grace};
 pub use job::handle;
-use recipients::{addressed_to, expand_recipients, includes_public, relays_should_see};
+use recipients::{addressed_to, expand_recipients, includes_public};
 
 /// The job kind of a backgrounded fan-out, on
 /// [`QUEUE_FEDERATOR_OUTGOING`], handled by [`handle`].
@@ -117,12 +121,6 @@ pub const KIND_PUBLISH: &str = "federator.publish";
 /// The addressing properties whose values name recipients, in the order
 /// [`publish`] reads them.
 const ADDRESSING_FIELDS: [&str; 5] = ["to", "cc", "bto", "bcc", "audience"];
-
-/// The activity types through which an actor corrects, retracts or deletes
-/// what peers (and relays) hold about it: its own `Delete`, `Undo` and
-/// `Update`. Pleroma's relay flow subscribes relays to exactly these, so
-/// they join the target set beside the follower expansion.
-const SELF_BROADCAST_TYPES: [&str; 3] = ["Delete", "Undo", "Update"];
 
 /// What a caller adds to [`publish`]'s computation beyond the activity's
 /// own addressing.
@@ -169,7 +167,8 @@ type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
 /// [`PublishOpts::only_to`], when set), with the actor's followers
 /// collection expanded to their remote followers' shared-or-personal
 /// inboxes, every other resolved remote recipient at their personal inbox,
-/// relay inboxes for public or self-broadcast activities,
+/// relay inboxes for activities addressed to the public (never when
+/// [`PublishOpts::only_to`] is set),
 /// [`PublishOpts::extra_inboxes`] added, and everything undeliverable —
 /// local, refused, rejected, unreachable, unknown, already counted —
 /// dropped.
@@ -223,7 +222,7 @@ async fn publish_filtered(
         .map_or_else(|| addressed_to(&activity), Clone::clone);
     let policy = mrf::load_config(state).await;
     let mut candidates = expand_recipients(&state.db, actor, &addresses).await?;
-    if includes_public(&addresses) || relays_should_see(&activity, &actor.ap_id) {
+    if opts.only_to.is_none() && includes_public(&addresses) {
         candidates.extend(instance::relay_inboxes(&state.db).await?);
     }
     candidates.extend(opts.extra_inboxes);

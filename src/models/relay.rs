@@ -179,7 +179,7 @@ pub async fn is_accepted(pool: &PgPool, actor_ap_id: &str) -> AppResult<bool> {
 
 /// The inbox URLs of every accepted relay, oldest follow first: the body
 /// behind [`crate::models::instance::relay_inboxes`], the set the
-/// publisher adds for public and self-broadcast activities.
+/// publisher adds for activities addressed to the public.
 ///
 /// # Errors
 ///
