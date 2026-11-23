@@ -5,11 +5,11 @@ use serde_json::Value;
 
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
-    models::user::User,
+    models::{hashtag::normalize_name, user::User},
 };
 
 use super::{
-    MAX_HASHTAG_CHARS, MAX_TAGS,
+    MAX_TAGS,
     envelope::is_http_url,
     types::{RemoteEmoji, TagSets},
 };
@@ -37,15 +37,11 @@ pub(super) fn parse_tags(json: &Value, author: &User) -> TagSets {
     sets
 }
 
-/// One `Hashtag` tag: its `name` without the leading `#`, lowercased;
-/// empty or over-long ([`MAX_HASHTAG_CHARS`] characters) names are skipped.
+/// One `Hashtag` tag: its `name` as [`normalize_name`] spells it (no leading
+/// `#`, lowercased); names it refuses — empty, over-long, outside the tag
+/// character set or all digits — are skipped.
 fn parse_hashtag(entry: &Value) -> Option<String> {
-    let name = entry.get("name").and_then(Value::as_str)?;
-    let tag = name.strip_prefix('#').unwrap_or(name);
-    if tag.is_empty() || tag.chars().count() > MAX_HASHTAG_CHARS {
-        return None;
-    }
-    Some(tag.to_lowercase())
+    normalize_name(entry.get("name").and_then(Value::as_str)?)
 }
 
 /// One `Emoji` tag: the colon-stripped `name` and the first `http(s)` url
@@ -136,5 +132,18 @@ mod tests {
             ["rust", "plain", "tada"],
             "hash dropped, lowercased; a bare hash is no tag"
         );
+    }
+
+    #[test]
+    fn hashtag_names_outside_the_tag_character_set_are_skipped() {
+        let mut document = minimal_note();
+        document["tag"] = json!([
+            {"type": "Hashtag", "name": "#bad tag"},
+            {"type": "Hashtag", "name": "#a/b?x=<y>"},
+            {"type": "Hashtag", "name": "#123"},
+            {"type": "Hashtag", "name": "#good_tag"},
+        ]);
+        let parsed = parse(&document);
+        assert_eq!(parsed.hashtags, ["good_tag"], "only the clean name stays");
     }
 }
