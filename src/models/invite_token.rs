@@ -17,12 +17,17 @@
 //! [`InviteToken::is_valid`] answers whether an invite may still register
 //! someone on a given day: it was never spent (`used` is false), its
 //! expiry — when it carries one — is today or later, and its use count —
-//! when capped — has not reached `max_use`. [`consume`] records one registration against the
-//! invite: it raises `uses` and marks `used` for a `OneTime` invite or once
-//! `max_use` is reached, so a `DateLimited` invite serves every registration
-//! up to its date while a capped one stops exactly at its cap. The
-//! registration endpoint consumes on the transaction that creates the user,
-//! so an invite is never spent by a registration that did not happen.
+//! when capped — has not reached `max_use`. [`consume`] records one
+//! registration against the invite, and only while those same limits still
+//! hold in the database: the update is conditional, so it raises `uses` and
+//! marks `used` (for a `OneTime` invite or once `max_use` is reached) on a
+//! still-valid invite and answers `false` on a spent, capped or expired one.
+//! A `DateLimited` invite serves every registration up to its date while a
+//! capped one stops exactly at its cap, even under concurrent
+//! registrations that all read the invite as valid. The registration
+//! endpoint consumes on the transaction that creates the user, so an invite
+//! is never spent by a registration that did not happen, and a refused
+//! consumption rolls the user back.
 //!
 //! `token` is secret material until the operator hands the invite out: the
 //! manual [`Debug`](InviteToken) impl below redacts it. [`create`],
@@ -36,7 +41,7 @@ use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::{
-    error::{AppError, AppResult},
+    error::AppResult,
     util::{id::new_id, token::random_token},
 };
 
@@ -63,15 +68,26 @@ const LIST_SQL: &str = "SELECT * FROM invite_tokens ORDER BY id";
 /// [`revoke`]: one invite by its token text.
 const DELETE_BY_TOKEN_SQL: &str = "DELETE FROM invite_tokens WHERE token = $1";
 
-/// [`consume`]: one registration recorded against the invite. The `uses`
-/// and `used` on the right-hand side are the pre-update values, so one
-/// statement raises the count and decides the spent flag from the same
-/// snapshot; `used` stays sticky once set.
+/// [`consume`]: one registration recorded against a still-valid invite. The
+/// `uses` and `used` on the right-hand side are the pre-update values, so
+/// one statement raises the count and decides the spent flag from the same
+/// snapshot; `used` stays sticky once set. The `WHERE` repeats the limits
+/// of [`InviteToken::is_valid`] (never spent, below the cap, not expired),
+/// so the row lock a concurrent update waits on is re-checked against the
+/// committed row and only one of two racing registrations can spend a
+/// one-time invite.
 const CONSUME_SQL: &str = "UPDATE invite_tokens
        SET uses = uses + 1,
            used = used OR invite_type = 'one_time'
                     OR (max_use IS NOT NULL AND uses + 1 >= max_use)
-     WHERE id = $1";
+     WHERE id = $1 AND NOT used
+       AND (max_use IS NULL OR uses < max_use)
+       AND (expires_at IS NULL OR expires_at >= CURRENT_DATE)";
+
+/// The 400 message every refused invite answers on registration: absent,
+/// unknown, spent, expired or exhausted — including an invite that was
+/// valid when read but lost the race to be consumed.
+pub const INVALID_INVITE_MESSAGE: &str = "Invalid token";
 
 /// The lifecycle of an [`InviteToken`], stored in the `invite_type` text
 /// column as its `snake_case` variant name (which is exactly what the
@@ -273,34 +289,32 @@ pub async fn revoke(pool: &PgPool, token: &str) -> AppResult<bool> {
     Ok(outcome.rows_affected() > 0)
 }
 
-/// Records one registration against the invite `id`: raises `uses` and
-/// marks the row `used` for a [`InviteType::OneTime`] invite or once
-/// `max_use` is reached — the accounting of [`InviteToken::is_valid`]'s
-/// limits.
+/// Records one registration against the invite `id` if it is still valid,
+/// answering whether it did.
+///
+/// A valid invite gets `uses` raised and is marked `used` for a
+/// [`InviteType::OneTime`] invite or once `max_use` is reached — the
+/// accounting of [`InviteToken::is_valid`]'s limits. The answer is `true`
+/// when the invite was spent and `false` when it was not: already `used`,
+/// at its `max_use` cap, past its `expires_at` day, or no longer there
+/// (revoked). The check and the write are one statement, so two concurrent
+/// callers cannot both spend the last use.
 ///
 /// Runs on the caller's open transaction (or any executor), so the
 /// registration endpoint spends the invite in the same transaction that
-/// creates the user: a rolled-back registration spends nothing.
+/// creates the user: a rolled-back registration spends nothing, and a
+/// `false` answer is the caller's cue to roll back.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, constraint) arrives as
-/// [`AppError::Database`](crate::error::AppError). Consuming an id no
-/// invite carries (one revoked under the caller's feet) is reported as
-/// [`AppError::Internal`]: the caller read the row moments ago on the
-/// same connection, so a missed update is a broken expectation, not a
-/// client error.
-pub async fn consume<'e, E>(executor: E, id: Uuid) -> AppResult<()>
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn consume<'e, E>(executor: E, id: Uuid) -> AppResult<bool>
 where
     E: Executor<'e, Database = Postgres>,
 {
     let outcome = sqlx::query(CONSUME_SQL).bind(id).execute(executor).await?;
-    if outcome.rows_affected() == 0 {
-        return Err(AppError::Internal(
-            "invite consumption matched no row".to_owned(),
-        ));
-    }
-    Ok(())
+    Ok(outcome.rows_affected() > 0)
 }
 
 #[cfg(test)]
@@ -354,9 +368,10 @@ mod tests {
     /// database untouched: the proof the write really runs on its executor.
     async fn consume_rolled_back(pool: &PgPool, id: Uuid) {
         let mut tx = pool.begin().await.expect("a transaction begins");
-        consume(&mut *tx, id)
+        let spent = consume(&mut *tx, id)
             .await
             .expect("consume runs on the transaction");
+        assert!(spent, "the invite is spent inside the transaction");
         tx.rollback().await.expect("the rollback runs");
     }
 
@@ -596,17 +611,95 @@ mod tests {
         let created = create(&pool, &InviteParams::one_time())
             .await
             .expect("the insert runs");
-        consume(&pool, created.id)
-            .await
-            .expect("the first consume runs");
+        assert!(
+            consume(&pool, created.id)
+                .await
+                .expect("the first consume runs"),
+            "a fresh invite is spent"
+        );
         let after = stored(&pool, created.id).await;
         assert_eq!(after.uses, 1, "the count rose");
         assert!(after.used, "one_time marks the invite used");
         assert!(!after.is_valid(today()), "and it never registers again");
+    }
 
-        consume_rolled_back(&pool, after.id).await;
+    #[tokio::test]
+    async fn a_rolled_back_consume_spends_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let created = create(&pool, &InviteParams::one_time())
+            .await
+            .expect("the insert runs");
+        consume_rolled_back(&pool, created.id).await;
         let unchanged = stored(&pool, created.id).await;
-        assert_eq!(unchanged.uses, 1, "a rolled-back transaction spent nothing");
+        assert_eq!(unchanged.uses, 0, "a rolled-back transaction spent nothing");
+        assert!(!unchanged.used, "and left the invite open");
+    }
+
+    #[tokio::test]
+    async fn consume_refuses_a_spent_one_time_invite() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let created = create(&pool, &InviteParams::one_time())
+            .await
+            .expect("the insert runs");
+        assert!(
+            consume(&pool, created.id)
+                .await
+                .expect("first consume runs"),
+            "the first consume spends it"
+        );
+        assert!(
+            !consume(&pool, created.id)
+                .await
+                .expect("second consume runs"),
+            "the second finds it spent"
+        );
+        let after = stored(&pool, created.id).await;
+        assert_eq!(after.uses, 1, "the refused consume counted nothing");
+        assert!(after.used, "and the invite stays spent");
+    }
+
+    #[tokio::test]
+    async fn consume_refuses_a_capped_invite_at_its_cap() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let params = InviteParams {
+            expires_at: None,
+            max_use: Some(2),
+        };
+        let created = create(&pool, &params).await.expect("the insert runs");
+        for round in 1..=2 {
+            assert!(
+                consume(&pool, created.id).await.expect("consume runs"),
+                "use {round} of 2 is served"
+            );
+        }
+        assert!(
+            !consume(&pool, created.id).await.expect("consume runs"),
+            "the third use is refused"
+        );
+        let after = stored(&pool, created.id).await;
+        assert_eq!(after.uses, 2, "uses stops at the cap");
+        assert!(after.used, "the capped invite is marked used");
+    }
+
+    #[tokio::test]
+    async fn consume_refuses_an_expired_invite() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let params = InviteParams {
+            expires_at: Some(day_shift(-1)),
+            max_use: None,
+        };
+        let created = create(&pool, &params).await.expect("the insert runs");
+        assert!(
+            !consume(&pool, created.id).await.expect("consume runs"),
+            "an invite whose day has passed is not spent"
+        );
+        let after = stored(&pool, created.id).await;
+        assert_eq!(after.uses, 0, "nothing was counted");
+        assert!(!after.used, "and nothing was marked");
     }
 
     #[tokio::test]
@@ -618,16 +711,22 @@ mod tests {
             max_use: Some(2),
         };
         let created = create(&pool, &params).await.expect("the insert runs");
-        consume(&pool, created.id)
-            .await
-            .expect("the first consume runs");
+        assert!(
+            consume(&pool, created.id)
+                .await
+                .expect("the first consume runs"),
+            "the first use is served"
+        );
         let once = stored(&pool, created.id).await;
         assert_eq!(once.uses, 1, "one of two served");
         assert!(!once.used, "one registration short of the cap stays open");
         assert!(once.is_valid(today()), "and it is still valid");
-        consume(&pool, once.id)
-            .await
-            .expect("the second consume runs");
+        assert!(
+            consume(&pool, once.id)
+                .await
+                .expect("the second consume runs"),
+            "the second use is served"
+        );
         let twice = stored(&pool, created.id).await;
         assert_eq!(twice.uses, 2, "both served");
         assert!(twice.used, "reaching max_use marks the invite used");
@@ -643,12 +742,12 @@ mod tests {
             max_use: None,
         };
         let created = create(&pool, &params).await.expect("the insert runs");
-        consume(&pool, created.id)
-            .await
-            .expect("the first consume runs");
-        consume(&pool, created.id)
-            .await
-            .expect("the second consume runs");
+        for round in 1..=2 {
+            assert!(
+                consume(&pool, created.id).await.expect("consume runs"),
+                "use {round} of the date-limited invite is served"
+            );
+        }
         let after = stored(&pool, created.id).await;
         assert_eq!(after.uses, 2, "the count still rises");
         assert!(
@@ -671,7 +770,10 @@ mod tests {
             max_use: Some(1),
         };
         let created = create(&pool, &params).await.expect("the insert runs");
-        consume(&pool, created.id).await.expect("the consume runs");
+        assert!(
+            consume(&pool, created.id).await.expect("the consume runs"),
+            "the invite's one use is served"
+        );
         let after = stored(&pool, created.id).await;
         assert_eq!(after.uses, 1, "the count rose");
         assert!(after.used, "the cap of one is reached at once");
@@ -679,15 +781,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_of_a_vanished_invite_is_an_error() {
+    async fn consume_of_a_vanished_invite_is_refused() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let err = consume(&pool, Uuid::now_v7())
-            .await
-            .expect_err("no invite carries this id");
         assert!(
-            matches!(err, AppError::Internal(_)),
-            "a missed update is the internal arm, got {err}"
+            !consume(&pool, Uuid::now_v7())
+                .await
+                .expect("the update runs"),
+            "no invite carries this id, so nothing is spent"
         );
     }
 

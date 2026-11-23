@@ -21,7 +21,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::util::sanitize::escape_html;
+use crate::{models::hashtag::normalize_name, util::sanitize::escape_html};
 
 /// The mention pattern: a leading start-of-text, whitespace or one of `(`,
 /// `[`, `{`, then `@` and a nickname of `[A-Za-z0-9_.-]` whose last character
@@ -305,14 +305,12 @@ fn whole_owned(caps: &Captures<'_>) -> String {
 }
 
 /// Turns a matched hashtag word into the tag it yields: the first
-/// [`MAX_HASHTAG_LEN`] characters, lowercased, and only when at least one of
-/// the characters kept is not a digit.
+/// [`MAX_HASHTAG_LEN`] characters, normalized by
+/// [`crate::models::hashtag::normalize_name`] (lowercased, and only when
+/// at least one of the characters kept is not a digit).
 fn normalized_tag(word: &str) -> Option<String> {
     let tag: String = word.chars().take(MAX_HASHTAG_LEN).collect();
-    if tag.chars().all(char::is_numeric) {
-        return None;
-    }
-    Some(tag.to_lowercase())
+    normalize_name(&tag)
 }
 
 /// Whether the `@` directly before the nickname starting at `nick_start` is

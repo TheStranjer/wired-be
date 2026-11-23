@@ -57,7 +57,7 @@ pub use self::{
     jobs::run_all_jobs,
     request::{MultipartPart, TestRequest},
     response::{
-        TestResponse, assert_all_answered, assert_all_errors, assert_all_refused, assert_answer,
-        assert_error,
+        TestResponse, activity_json, assert_all_answered, assert_all_errors, assert_all_refused,
+        assert_answer, assert_error,
     },
 };

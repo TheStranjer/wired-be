@@ -213,7 +213,7 @@ async fn registration_creates_the_user_and_mints_a_working_code() {
     );
     assert_eq!(code.len(), 43, "the 43-character Pleroma code shape");
 
-    let redeemed = oauth_token::consume_authorization(&pool, &code, site.app.id)
+    let redeemed = oauth_token::consume_authorization(&pool, &code, site.app.id, Some(REDIRECT))
         .await
         .expect("the redemption reaches the database")
         .expect("the owning app can redeem the code");

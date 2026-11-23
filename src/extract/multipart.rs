@@ -270,22 +270,15 @@ pub fn upload_body_limit(config: &Config) -> DefaultBodyLimit {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::{Json, Router, routing::post};
     use http_body_util::BodyExt as _;
     use serde_json::{Value, json};
-    use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::{
-        config::{
-            BASE_URL_VAR, DATABASE_URL_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
-            UPLOAD_LIMIT_BYTES_VAR, UPLOAD_MAX_FILES_VAR,
-        },
-        http_client::HttpClient,
-        uploads::UploaderBackend,
+    use crate::config::{
+        BASE_URL_VAR, DATABASE_URL_VAR, TEST_BASE_URL, TEST_DATABASE_URL, UPLOAD_LIMIT_BYTES_VAR,
+        UPLOAD_MAX_FILES_VAR,
     };
 
     /// Boundary the test bodies are written with.
@@ -312,23 +305,7 @@ mod tests {
     /// State for extractor tests: the given upload limits over a pool that
     /// never connects (these handlers do not touch the database).
     fn state_with_limits(max_file_bytes: usize, max_files: usize) -> AppState {
-        let config = Arc::new(config_with_limits(max_file_bytes, max_files));
-        let db = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .unwrap();
-        let hub = crate::streaming::hub::Hub::new(&db);
-        AppState {
-            db,
-            hub,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::lazy_for_tests(config_with_limits(max_file_bytes, max_files))
     }
 
     /// The JSON an upload handler reports: what parsed, what arrived.

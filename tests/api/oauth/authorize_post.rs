@@ -62,13 +62,18 @@ async fn post_authorize_redirects_with_a_stored_code() {
         "the checked boxes are what got stored"
     );
 
-    let redeemed = oauth_token::consume_authorization(&pool, &code, app.id)
+    assert_eq!(
+        fresh.redirect_uri.as_deref(),
+        Some(REDIRECT),
+        "the code is bound to the URI it was delivered to"
+    );
+    let redeemed = oauth_token::consume_authorization(&pool, &code, app.id, Some(REDIRECT))
         .await
         .expect("the exchange reaches the database")
         .expect("the owning app can redeem the code");
     assert!(redeemed.used, "redemption flips the flag");
     assert!(
-        oauth_token::consume_authorization(&pool, &code, app.id)
+        oauth_token::consume_authorization(&pool, &code, app.id, Some(REDIRECT))
             .await
             .expect("the second attempt reaches the database")
             .is_none(),

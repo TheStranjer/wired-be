@@ -28,18 +28,14 @@
 //! table, on the hour.
 //!
 //! [`handle_jobs`] (job kind [`KIND_JOBS`]) is the third: one daily pass of
-//! batched prunes. It first deletes the `jobs` rows that reached a terminal
+//! batched prunes. It deletes the `jobs` rows that reached a terminal
 //! state more than `JOBS_RETENTION_DAYS` days ago — which sweeps the
 //! redeliverable-queue deduplication out too, since the queue keeps its
 //! `incoming:{activity id}` unique key (see [`crate::api::activitypub`]).
-//! It then prunes the `received_activities` rows older than
-//! `RECEIVED_ACTIVITIES_RETENTION_DAYS` days, existence-guarded: a probe at
-//! job time asks whether the table is there, and the dispatcher ticket
-//! ([`crate::federation::dispatch`]) has since added it, so the step
-//! reclaims the stale ledger rows beside its queue rows — the same horizon
-//! the dispatcher's own `federation.cleanup_received` pass keeps. The
-//! reference is the cron purges under
-//! Pleroma's `lib/pleroma/workers/cron/`.
+//! It leaves `received_activities` alone: the dispatcher's own
+//! `federation.cleanup_received` pass ([`crate::federation::dispatch`]) is
+//! the one place that table's retention is set. The reference is the cron
+//! purges under Pleroma's `lib/pleroma/workers/cron/`.
 //!
 //! [`handle_purge_deleted_statuses`] (job kind [`KIND_DELETED_STATUSES`]) is
 //! the fourth: one daily pass hard-deleting the LOCAL statuses soft-deleted
@@ -71,7 +67,7 @@
 //!
 //! This module is a tree, one child per sweep: `notifications` the
 //! dismissed-notification delete, `tokens` the credential sweeps, `prunes`
-//! the batched queue-row and replay-guard deletes, `deleted_statuses` the
+//! the batched queue-row delete, `deleted_statuses` the
 //! stale local tombstone purge and `media` the orphaned local-file sweep;
 //! `test_support` holds the fixtures the children's unit tests share, and
 //! each child's `tests` the sweep's own. Every kind and handler is

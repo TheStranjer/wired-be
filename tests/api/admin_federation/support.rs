@@ -3,9 +3,10 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    Json, Router,
+    Router,
     extract::State,
     http::StatusCode,
+    response::Response,
     routing::{get, post},
 };
 use serde_json::{Value, json};
@@ -111,13 +112,13 @@ impl Drop for MockRelay {
 
 /// The `GET /relay` fixture: an `Application` actor with its inbox under
 /// its own id.
-pub(super) async fn relay_actor(State(mock): State<Mock>) -> Json<Value> {
-    Json(actor_doc(&mock, "relay", "Application"))
+pub(super) async fn relay_actor(State(mock): State<Mock>) -> Response {
+    common::activity_json(&actor_doc(&mock, "relay", "Application"))
 }
 
 /// Not a relay: a `Group` is outside the three followable shapes.
-pub(super) async fn group_actor(State(mock): State<Mock>) -> Json<Value> {
-    Json(actor_doc(&mock, "group", "Group"))
+pub(super) async fn group_actor(State(mock): State<Mock>) -> Response {
+    common::activity_json(&actor_doc(&mock, "group", "Group"))
 }
 
 /// A self-naming actor document of `kind` at `{base}/{path}`.

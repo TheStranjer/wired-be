@@ -28,7 +28,7 @@ pub(super) const CLIENT_SCOPES: &str = "read write follow push admin:read admin:
 pub(super) const BASE: &str = TEST_BASE_URL;
 /// The Pleroma admin API root.
 pub(super) const P_ADMIN: &str = "/api/v1/pleroma/admin";
-/// The legacy Pleroma admin reports mount (WBE-200).
+/// The reporter's own reports mount.
 pub(super) const V0_REPORTS: &str = "/api/v0/pleroma/reports";
 /// The Mastodon admin reports root (WBE-214).
 pub(super) const M_ADMIN_REPORTS: &str = "/api/v1/admin/reports";

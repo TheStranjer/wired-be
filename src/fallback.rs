@@ -66,14 +66,9 @@ mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request};
     use http_body_util::BodyExt as _;
-    use sqlx::postgres::PgPoolOptions;
-    use std::sync::Arc;
     use tower::ServiceExt as _;
 
-    use crate::{
-        app, config::Config, http_client::HttpClient, mailer, rate_limit, state::AppState,
-        streaming::hub::Hub, uploads::UploaderBackend,
-    };
+    use crate::{app, config::Config, state::AppState};
 
     /// A config with only the required variables set, for tests that don't
     /// exercise config.
@@ -83,22 +78,7 @@ mod tests {
 
     /// Router backed by a pool that never connects, for routes that don't touch the DB.
     fn test_app() -> Router {
-        let db = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .unwrap();
-        let config = Arc::new(test_config());
-        app(AppState {
-            hub: Hub::new(&db),
-            db,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(mailer::MemoryTransport::new()),
-        })
+        app(AppState::lazy_for_tests(test_config()))
     }
 
     #[tokio::test]

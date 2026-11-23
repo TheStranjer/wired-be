@@ -22,9 +22,10 @@
 //! endorsement row's id — the cursor the listings walk by (decision 4).
 //! Deleting either account takes the endorsement through the foreign
 //! key's cascade; unfollowing the target also removes the endorsement
-//! (see [`crate::models::follow::unfollow`]).
+//! (see [`crate::models::follow::unfollow`]), and so does a block of the
+//! pair, in both directions ([`remove_between`]).
 
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{error::AppResult, models::user::User, pagination::PageParams, util::id::new_id};
@@ -40,6 +41,11 @@ ON CONFLICT (user_id, target_id) DO NOTHING";
 /// [`unendorse`]: one endorser's one pair; a never-endorsed or already
 /// withdrawn pair deletes nothing, so withdrawing is idempotent too.
 const UNENDORSE_SQL: &str = "DELETE FROM endorsements WHERE user_id = $1 AND target_id = $2";
+
+/// [`remove_between`]: the endorsements of a pair in both directions, what a
+/// block must not leave on either public profile.
+const REMOVE_BETWEEN_SQL: &str = "DELETE FROM endorsements
+     WHERE (user_id = $1 AND target_id = $2) OR (user_id = $2 AND target_id = $1)";
 
 /// [`endorsed_ids`]: every endorsed account of one endorser, oldest
 /// endorsement first (the `UUIDv7` text sorts in creation order,
@@ -112,6 +118,26 @@ pub async fn unendorse(pool: &PgPool, user_id: Uuid, target_id: Uuid) -> AppResu
         .await
         .map(drop)?;
     Ok(())
+}
+
+/// Removes the endorsements between `first` and `second` in both directions,
+/// returning how many went away.
+///
+/// Runs on the caller's connection so a block severs the pair's endorsements in
+/// the same transaction as its row. A pair with no endorsements matches nothing
+/// and answers `0`; other accounts' endorsements are never touched.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remove_between(conn: &mut PgConnection, first: Uuid, second: Uuid) -> AppResult<u64> {
+    let deleted = sqlx::query(REMOVE_BETWEEN_SQL)
+        .bind(first)
+        .bind(second)
+        .execute(&mut *conn)
+        .await?;
+    Ok(deleted.rows_affected())
 }
 
 /// The ids of the accounts `user_id` endorses, oldest endorsement first.
@@ -279,6 +305,49 @@ mod tests {
             .await
             .expect("withdrawing again is not an error");
         assert_eq!(stored_ids(&pool).await.len(), 0, "and deletes nothing");
+    }
+
+    #[tokio::test]
+    async fn remove_between_takes_both_directions_and_only_the_pair() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        endorse(&pool, alice.id, bob.id).await.unwrap();
+        endorse(&pool, bob.id, alice.id).await.unwrap();
+        endorse(&pool, alice.id, carol.id).await.unwrap();
+        endorse(&pool, carol.id, bob.id).await.unwrap();
+
+        let mut conn = pool.acquire().await.expect("a connection");
+        assert_eq!(
+            remove_between(&mut conn, alice.id, bob.id)
+                .await
+                .expect("the pair's endorsements go"),
+            2,
+            "one each way"
+        );
+        assert_eq!(
+            endorsed_ids(&pool, alice.id).await.unwrap(),
+            vec![carol.id],
+            "alice keeps her other endorsement"
+        );
+        assert!(
+            endorsed_ids(&pool, bob.id).await.unwrap().is_empty(),
+            "bob's is gone"
+        );
+        assert_eq!(
+            endorsed_ids(&pool, carol.id).await.unwrap(),
+            vec![bob.id],
+            "a third account's endorsement is untouched"
+        );
+        assert_eq!(
+            remove_between(&mut conn, bob.id, alice.id)
+                .await
+                .expect("repeating is not an error"),
+            0,
+            "and removes nothing the second time"
+        );
     }
 
     #[tokio::test]

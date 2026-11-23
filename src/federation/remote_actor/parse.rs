@@ -5,12 +5,14 @@ use serde_json::Value;
 use url::Url;
 
 use super::{
-    ACTOR_TYPES, ActorError, NewRemoteUser,
+    ACTOR_TYPES, ActorError, MAX_REMOTE_BIO_CHARS, MAX_REMOTE_NAME_CHARS, MAX_USERNAME_CHARS,
+    NewRemoteUser,
     fields::{
         bool_field, is_http_url, optional_http_url, parse_accepts_chat_messages,
         parse_also_known_as, parse_fields, parse_media_url, parse_published, required_http_url,
         string_field,
     },
+    truncate_chars,
 };
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
@@ -40,15 +42,17 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
     let inbox = required_http_url(json, "inbox")?;
     let public_key = parse_public_key(json, &ap_id)?;
     let summary = string_field(json, "summary");
+    let summary = truncate_chars(&summary, MAX_REMOTE_BIO_CHARS);
+    let name = string_field(json, "name");
     Ok(NewRemoteUser {
         nickname: format!("{username}@{domain}"),
         ap_id,
         local: Flag::new(false),
         domain,
         actor_type: parse_actor_type(json)?,
-        name: string_field(json, "name"),
-        bio: sanitize_html(&summary),
-        raw_bio: strip_html(&summary),
+        name: truncate_chars(&name, MAX_REMOTE_NAME_CHARS).to_owned(),
+        bio: sanitize_html(summary),
+        raw_bio: strip_html(summary),
         avatar_url: parse_media_url(json, "icon"),
         banner_url: parse_media_url(json, "image"),
         profile_url: json
@@ -125,6 +129,15 @@ fn parse_preferred_username(json: &Value) -> Result<&str, ActorError> {
                  [A-Za-z0-9_.-]"
                     .to_owned(),
             )
+        })
+        .and_then(|name| {
+            if name.chars().count() > MAX_USERNAME_CHARS {
+                Err(ActorError::Invalid(format!(
+                    "`preferredUsername` is longer than {MAX_USERNAME_CHARS} characters"
+                )))
+            } else {
+                Ok(name)
+            }
         })
 }
 
