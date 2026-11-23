@@ -22,8 +22,7 @@ use crate::{
         note_parser::{ParsedNote, RemoteEmoji},
     },
     models::{
-        custom_emoji::{self, NewCustomEmoji},
-        status,
+        custom_emoji, status,
         user::{self, User},
     },
     state::AppState,
@@ -159,16 +158,14 @@ pub(super) async fn upsert_emojis(
     emojis: &[RemoteEmoji],
 ) -> Result<(), FederationError> {
     for emoji in emojis {
-        let new = NewCustomEmoji {
-            shortcode: emoji.shortcode.clone(),
-            domain: emoji.domain.clone(),
-            image_url: emoji.url.clone(),
-            ..NewCustomEmoji::default()
-        };
-        custom_emoji::upsert(&state.db, &new)
-            .await
-            .map(drop)
-            .map_err(|err| transient("the custom emoji upsert", &err))?;
+        custom_emoji::upsert_remote(
+            &state.db,
+            &emoji.shortcode,
+            emoji.domain.as_deref(),
+            &emoji.url,
+        )
+        .await
+        .map_err(|err| transient("the custom emoji upsert", &err))?;
     }
     Ok(())
 }
