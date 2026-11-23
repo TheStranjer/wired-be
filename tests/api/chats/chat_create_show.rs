@@ -97,8 +97,7 @@ async fn creating_a_chat_gets_the_same_row_every_time() {
 /// the 403 that names the flag, and a malformed, unknown or deactivated id
 /// is the one 404 [`account_or_404`] keeps; a remote mirror still at the
 /// flag default may be chatted with, and no refusal leaves a chat row
-/// behind. (The block refusal behind these waits for the blocks ticket —
-/// see the `blocked_between` hook's unit tests for its wiring.)
+/// behind. (The block refusal behind these is in `chat_blocks`.)
 ///
 /// [`account_or_404`]: wired_be::api::helpers::account_or_404
 #[tokio::test]

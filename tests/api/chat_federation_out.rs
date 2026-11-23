@@ -436,8 +436,9 @@ async fn a_local_counterpart_is_never_delivered_to() {
 }
 
 /// The counterpart's `accepts_chat_messages` flag still gates the wire
-/// after the chat stands: with the flag down the message posts — the
-/// sender's own rows always take it — but nothing is delivered.
+/// after the chat stands: with the flag down the post is refused with the
+/// flag's 403 (WBE-609), so no message row is written and nothing is
+/// delivered.
 #[tokio::test]
 async fn a_remote_counterpart_with_the_flag_down_is_not_delivered_to() {
     let db = common::test_db().await;
@@ -453,13 +454,27 @@ async fn a_remote_counterpart_with_the_flag_down_is_not_delivered_to() {
             .await
             .expect("the flag update runs");
 
-    let _sent = send_message(&app, &token, &chat_id, json!({"content": "anybody there?"})).await;
+    let refused = common::TestRequest::post(&format!("{ROOT}/{chat_id}/messages"))
+        .bearer(&token)
+        .json(&json!({"content": "anybody there?"}))
+        .send(&app)
+        .await;
 
-    assert_eq!(
-        stored_message(&pool).await.content,
-        "<p>anybody there?</p>",
-        "the message itself stands"
+    common::assert_answer(
+        &refused,
+        StatusCode::FORBIDDEN,
+        "the lowered flag refuses the post",
     );
+    assert_eq!(
+        refused.json_value()["error"],
+        "Recipient doesn't accept chat messages",
+        "with the flag's message"
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM chat_messages")
+        .fetch_one(&pool)
+        .await
+        .expect("the count runs");
+    assert_eq!(stored, 0, "no message row is written");
     assert!(
         published(&pool).await.is_empty(),
         "and the lowered flag keeps it off the wire"
