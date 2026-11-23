@@ -13,9 +13,9 @@
 //!   `with_muted`, `visibility` exclusions, `reply_visibility`,
 //!   `exclude_replies`, `exclude_reblogs`, `instance`, `pinned_only`,
 //!   `tagged`);
-//! - what the viewer asked to never see again: the viewer's blocks,
-//!   unexpired mutes, domain blocks and thread mutes — always applied unless
-//!   `with_muted` is set;
+//! - what the viewer asked to never see again: the viewer's blocks and
+//!   domain blocks (always applied) and unexpired mutes and thread mutes
+//!   (applied unless `with_muted` is set);
 //! - what the viewer may see at all: [`push_visibility_clause`], always
 //!   applied, on top of the unconditional `deleted_at IS NULL` and the
 //!   author-`is_active` check of `SELECT_SQL` (a scheduled
@@ -73,7 +73,7 @@ pub use filters::TimelineFilters;
 pub use source::{ReplyVisibility, TimelineSource};
 
 use arms::push_source;
-use visibility_arms::push_moderation_exclusions;
+use visibility_arms::{push_block_exclusions, push_mute_exclusions};
 
 /// The head of every [`TimelineQuery::fetch`] statement: the live rows
 /// (`deleted_at IS NULL`, always applied) of `statuses`, aliased `s` for the
@@ -135,8 +135,8 @@ pub struct TimelineQuery {
 impl TimelineQuery {
     /// Builds the one statement the timeline is and runs it: `SELECT s.*
     /// FROM statuses s WHERE s.deleted_at IS NULL`, then the source
-    /// predicate, the filters, the moderation exclusions (unless
-    /// `with_muted`), [`push_visibility_clause`], and the keyset page.
+    /// predicate, the filters, the block exclusions, the mute exclusions
+    /// (unless `with_muted`), [`push_visibility_clause`], and the keyset page.
     /// Answers the rows newest-first (a `min_id` page read ascending comes
     /// back flipped).
     ///
@@ -159,8 +159,9 @@ impl TimelineQuery {
         let _active: &mut _ = builder.push(ACTIVE_AUTHOR);
         push_source(&mut builder, &self.source, viewer);
         self.filters.push_clauses(&mut builder, viewer);
+        push_block_exclusions(&mut builder, viewer);
         if !self.filters.with_muted.get() {
-            push_moderation_exclusions(&mut builder, viewer);
+            push_mute_exclusions(&mut builder, viewer);
         }
         push_visibility_clause(&mut builder, viewer, "s");
         self.page.apply_keyset(&mut builder, "s.id");

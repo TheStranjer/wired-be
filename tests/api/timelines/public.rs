@@ -276,8 +276,9 @@ async fn public_pages_walk_the_id_cursor_under_link_headers() {
 }
 
 /// The viewer's own exclusions apply to the public page as everywhere else:
-/// blocked and muted authors leave it (until `with_muted=true` waves them
-/// back), and nobody else reads through the exclusions.
+/// blocked and muted authors leave it (`with_muted=true` waves the muted
+/// one back, never the blocked one), and nobody else reads through the
+/// exclusions.
 #[tokio::test]
 async fn the_public_page_hides_blocked_and_muted_authors_from_its_viewer() {
     let db = common::test_db().await;
@@ -312,8 +313,8 @@ async fn the_public_page_hides_blocked_and_muted_authors_from_its_viewer() {
     let shown = get(&app, Some(&reader), &format!("{PUBLIC}?with_muted=true")).await;
     assert_eq!(
         ids(&shown.json_value()),
-        newest_first(&[&from_bob, &from_carol, &from_alice]),
-        "`with_muted=true` lifts the viewer's own exclusions"
+        newest_first(&[&from_bob, &from_alice]),
+        "`with_muted=true` lifts the mute but never the block"
     );
     let anonymous = get(&app, None, PUBLIC).await;
     assert_eq!(

@@ -1,6 +1,6 @@
 //! The viewer-relative arms of the timeline statement: the `reply_visibility`
-//! filter's arms and the moderation exclusions (blocks, mutes, domain
-//! blocks, thread mutes) the viewer lives by.
+//! filter's arms, the block exclusions (blocks, domain blocks) and the mute
+//! exclusions (mutes, thread mutes) the viewer lives by.
 
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
@@ -67,25 +67,19 @@ fn push_following_arms(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
         .push(" OR mf.id IS NOT NULL))");
 }
 
-/// Appends the exclusions the viewer lives by — statuses authored by
-/// accounts the viewer blocked or still mutes (an unexpired mute), reblogs
-/// **of** those accounts' statuses, statuses by authors on a domain-blocked
-/// domain, and statuses inside a thread-muted conversation (the viewer's
-/// own posts in a muted thread excepted). All four read the viewer, so an
-/// anonymous request gains no condition; `with_muted` skips the whole
-/// group, while [`push_visibility_clause`] — the author's side of a block —
-/// keeps applying either way.
+/// Appends the block exclusions — statuses authored by accounts the viewer
+/// blocked, reblogs **of** those accounts' statuses, and statuses by authors
+/// on a domain the viewer blocked. They read the viewer, so an anonymous
+/// request gains no condition. Applied on every timeline, `with_muted` or
+/// not (Pleroma's `restrict_blocked`); [`push_visibility_clause`] — the
+/// author's side of a block — applies alongside.
 ///
 /// [`push_visibility_clause`]: crate::models::status_visibility::push_visibility_clause
-pub(super) fn push_moderation_exclusions(
-    builder: &mut QueryBuilder<Postgres>,
-    viewer: Option<&User>,
-) {
+pub(super) fn push_block_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>) {
     let Some(viewer_id) = viewer.map(|user| user.id) else {
         return;
     };
     push_author_edge_exclusion(builder, viewer_id);
-    push_muted_edge_exclusion(builder, viewer_id);
     let _domain: &mut _ = builder
         .push(
             " AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb \
@@ -94,6 +88,19 @@ pub(super) fn push_moderation_exclusions(
         )
         .push_bind(viewer_id)
         .push(" AND udb.domain = d.domain)");
+}
+
+/// Appends the mute exclusions — statuses authored by accounts the viewer
+/// still mutes (an unexpired mute), reblogs **of** those accounts' statuses,
+/// and statuses inside a thread-muted conversation (the viewer's own posts in
+/// a muted thread excepted). They read the viewer, so an anonymous request
+/// gains no condition; `with_muted` skips this group (Pleroma's
+/// `restrict_muted`) but never [`push_block_exclusions`].
+pub(super) fn push_mute_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>) {
+    let Some(viewer_id) = viewer.map(|user| user.id) else {
+        return;
+    };
+    push_muted_edge_exclusion(builder, viewer_id);
     let _thread: &mut _ = builder
         .push(
             " AND NOT EXISTS (SELECT 1 FROM conversation_mutes cm \
@@ -259,8 +266,9 @@ mod tests {
 
     /// Blocks, unexpired mutes and domain blocks pull an author's rows out
     /// of every timeline the viewer reads — and so do reblogs **of** those
-    /// rows — while a lapsed mute counts as absent and `with_muted` waves
-    /// the whole group back through. None of it touches an anonymous page.
+    /// rows — while a lapsed mute counts as absent. None of it touches an
+    /// anonymous page; `with_muted` is covered by
+    /// `with_muted_never_lifts_blocks_or_domain_blocks`.
     #[tokio::test]
     async fn blocked_muted_and_domain_blocked_authors_leave_the_page() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -323,22 +331,84 @@ mod tests {
             ]),
             "none of this is an anonymous request's problem"
         );
-        let with_muted = page_ids(
-            &pool,
-            &filtered(
-                Some(alice),
-                TimelineSource::Public,
+    }
+
+    /// Seeds alice's Home and Public world: she follows `bob` (who boosts
+    /// the blocked `carol`), `carol` (blocked, yet a follow row survives),
+    /// `dave` (muted); `mallory` is a remote author on a blocked domain.
+    /// Answers `(alice, [carol_post, bob_reb_carol, mallory_post, dave_post])`.
+    async fn moderated_world(pool: &sqlx::PgPool) -> (User, [Status; 4]) {
+        let alice = local(pool, "alice").await;
+        let bob = local(pool, "bob").await;
+        let carol = local(pool, "carol").await;
+        let dave = local(pool, "dave").await;
+        let mallory = remote(pool, "mallory", "remote.example").await;
+        for followee in [&bob, &carol, &dave] {
+            let _follow = follow::follow(pool, BASE, &alice, followee)
+                .await
+                .expect("alice follows");
+        }
+        let _accepted = sqlx::query("UPDATE follows SET state = 'accepted'")
+            .execute(pool)
+            .await
+            .expect("the follows are accepted");
+        let _blocked = block::block(pool, BASE, &alice, &carol)
+            .await
+            .expect("alice blocks carol");
+        let _restored = sqlx::query(
+            "INSERT INTO follows (id, follower_id, followee_id, state)
+             VALUES (gen_random_uuid(), $1, $2, 'accepted')",
+        )
+        .bind(alice.id)
+        .bind(carol.id)
+        .execute(pool)
+        .await
+        .expect("a follow of the blocked author is on file");
+        let _muted = mute::mute(pool, &alice, &dave, MuteOptions::default())
+            .await
+            .expect("alice mutes dave");
+        domain_block::block_domain(pool, alice.id, "remote.example")
+            .await
+            .expect("alice domain-blocks remote.example");
+        let carol_post = post(pool, &carol, Visibility::Public, "blocked carol").await;
+        let boost = reblog(pool, &bob, &carol_post).await;
+        let mallory_post = remote_post(pool, &mallory, "mal-public", &[]).await;
+        let dave_post = post(pool, &dave, Visibility::Public, "muted dave").await;
+        (alice, [carol_post, boost, mallory_post, dave_post])
+    }
+
+    /// `with_muted` lifts the mute and nothing else: a blocked followed
+    /// author's post, a boost of a blocked author's post and a domain-blocked
+    /// author's post stay off Home and Public either way, while the muted
+    /// author's post returns; without `with_muted` all four are absent.
+    #[tokio::test]
+    async fn with_muted_never_lifts_blocks_or_domain_blocks() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (alice, [carol_post, boost, mallory_post, dave_post]) = moderated_world(&pool).await;
+
+        for source in [TimelineSource::Home, TimelineSource::Public] {
+            let with_muted = filtered(
+                Some(as_viewer(&pool, &alice).await),
+                source.clone(),
                 TimelineFilters {
                     with_muted: Flag::new(true),
                     ..TimelineFilters::default()
                 },
-            ),
-        )
-        .await;
-        assert_eq!(
-            with_muted, anonymous,
-            "with_muted brings the whole group back, exactly the unfiltered page"
-        );
+            );
+            assert_eq!(
+                page_ids(&pool, &with_muted).await,
+                newest_first(&[&dave_post]),
+                "with_muted keeps only the muted author's post of the four"
+            );
+            let plain = timeline(Some(as_viewer(&pool, &alice).await), source);
+            let page = page_ids(&pool, &plain).await;
+            let hidden = [&carol_post, &boost, &mallory_post, &dave_post];
+            assert!(
+                hidden.iter().all(|status| !page.contains(&status.id)),
+                "without with_muted none of the four shows"
+            );
+        }
     }
 
     /// A thread mute takes the muted conversation's foreign rows out of the
