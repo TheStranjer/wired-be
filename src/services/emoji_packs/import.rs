@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    PACK_IMAGE_EXTENSIONS, Pack, PackMeta, emoji_image_url, list_packs, load_pack, names::io_error,
-    names::pack_name_valid, save_pack, shortcode_valid,
+    PACK_IMAGE_EXTENSIONS, Pack, PackMeta, emoji_image_url, file_name_valid, list_packs, load_pack,
+    names::io_error, names::pack_name_valid, save_pack, shortcode_valid,
 };
 
 /// Pleroma's `import_from_filesystem`: write the missing pack manifests.
@@ -151,6 +151,15 @@ pub async fn sync_custom_emojis(pool: &PgPool, base_url: &str, dir: &Path) -> Ap
     let mut stored = Vec::new();
     for (name, pack) in &packs {
         for (shortcode, file) in &pack.files {
+            if !shortcode_valid(shortcode) || !file_name_valid(file) {
+                debug!(
+                    pack = name.as_str(),
+                    shortcode = shortcode.as_str(),
+                    file = file.as_str(),
+                    "skipped a pack entry with an invalid shortcode or file name"
+                );
+                continue;
+            }
             let new = NewCustomEmoji {
                 category: Some(name.clone()),
                 tags: vec![name.clone()],
@@ -395,6 +404,35 @@ mod tests {
                 .is_none_or(|(_, kept_id)| kept_id == id)),
             "surviving pack emojis keep their ids"
         );
+    }
+
+    #[tokio::test]
+    async fn sync_skips_entries_with_an_invalid_shortcode_or_file_name() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let dir = temp_dir();
+        save_pack(
+            dir.path(),
+            "cats",
+            &pack_with(
+                true,
+                &[
+                    ("cat", "cat.png"),
+                    ("bad code", "cat.png"),
+                    ("<x>", "cat.png"),
+                    ("sneaky", "../cat.png"),
+                ],
+            ),
+        )
+        .await
+        .unwrap();
+        write_file(&dir.path().join("cats").join("cat.png"), PNG_BYTES);
+
+        let stored = sync_custom_emojis(&pool, BASE, dir.path()).await.unwrap();
+        assert_eq!(stored, 1, "only the valid entry counts");
+        let rows = custom_emoji::list_local(&pool).await.unwrap();
+        let codes: Vec<&str> = rows.iter().map(|row| row.shortcode.as_str()).collect();
+        assert_eq!(codes, ["cat"], "no invalid shortcode or path is stored");
     }
 
     #[tokio::test]

@@ -118,7 +118,9 @@ async fn stored_manifest(
 /// The manifest a remote pack gets from its listing: the metadata block
 /// as the peer describes it, keeping only the files the extraction
 /// landed (an archive may carry less than the listing claims, and never
-/// more than this instance stores).
+/// more than this instance stores) under a valid shortcode: the peer
+/// controls the keys, so any it names that fail
+/// [`emoji_packs::shortcode_valid`] are dropped.
 fn manifest_from_listing(
     listing: &RemotePackListing,
     extracted: &BTreeSet<String>,
@@ -128,7 +130,7 @@ fn manifest_from_listing(
         files: listing
             .files
             .iter()
-            .filter(|(_, file)| extracted.contains(*file))
+            .filter(|(code, file)| emoji_packs::shortcode_valid(code) && extracted.contains(*file))
             .map(|(code, file)| (code.clone(), file.clone()))
             .collect(),
     }
@@ -389,6 +391,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("cat", "cat.png"), ("nested", "sub/nested.gif")],
             "the announced file that never landed is not entered"
+        );
+    }
+
+    #[test]
+    fn the_listing_manifest_drops_invalid_shortcodes() {
+        let listing = RemotePackListing {
+            pack: emoji_packs::PackMeta::default(),
+            files: BTreeMap::from([
+                ("ok".to_owned(), "a.png".to_owned()),
+                ("bad code".to_owned(), "a.png".to_owned()),
+                ("<x>".to_owned(), "a.png".to_owned()),
+                (":colon:".to_owned(), "a.png".to_owned()),
+                (format!("{}\"", "a".repeat(10)), "a.png".to_owned()),
+                (String::new(), "a.png".to_owned()),
+            ]),
+            files_count: 6,
+        };
+        let extracted = BTreeSet::from(["a.png".to_owned()]);
+        let pack = manifest_from_listing(&listing, &extracted);
+        assert_eq!(
+            pack.files.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["ok"],
+            "only the valid shortcode is entered, though every file landed"
         );
     }
 
