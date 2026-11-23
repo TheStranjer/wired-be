@@ -94,6 +94,12 @@ pub const INSTANCE_ACTOR_NICKNAME: &str = "internal.fetch";
 /// The literal is kept in step with [`INSTANCE_ACTOR_NICKNAME`] by a test.
 pub const NOT_INSTANCE_ACTOR: &str = " AND nickname <> 'internal.fetch'";
 
+/// [`NOT_INSTANCE_ACTOR`] for a query that aliases `users` as `u`:
+/// ` AND u.nickname <> 'internal.fetch'`.
+///
+/// The literal is kept in step with [`INSTANCE_ACTOR_NICKNAME`] by a test.
+pub const NOT_INSTANCE_ACTOR_U: &str = " AND u.nickname <> 'internal.fetch'";
+
 /// A Postgres `boolean` column as a named flag.
 ///
 /// `User` and `NewUser` carry twenty booleans each; Clippy's
@@ -198,6 +204,10 @@ mod tests {
         assert!(
             NOT_INSTANCE_ACTOR.contains(INSTANCE_ACTOR_NICKNAME),
             "the SQL fragment excludes the account the constant names"
+        );
+        assert!(
+            NOT_INSTANCE_ACTOR_U.contains(INSTANCE_ACTOR_NICKNAME),
+            "so does the `u`-aliased fragment"
         );
     }
 
