@@ -15,11 +15,12 @@ use crate::common;
 
 /// Marks `app` trusted straight in the table.
 async fn trust(pool: &PgPool, app: &OauthApp) {
-    sqlx::query("UPDATE oauth_apps SET trusted = true WHERE id = $1")
+    let trusted = sqlx::query("UPDATE oauth_apps SET trusted = true WHERE id = $1")
         .bind(app.id)
         .execute(pool)
         .await
         .expect("the trusted flag is set");
+    assert_eq!(trusted.rows_affected(), 1, "the app row is marked trusted");
 }
 
 /// A token with `token_scopes` from a trusted "frontend" app for a fresh
@@ -111,19 +112,32 @@ async fn json_get_refuses_bad_requests() {
     let app = register_app(&pool, "Third Party", REDIRECT, "read").await;
     let http = common::test_app(pool);
 
-    let (status, body) = get_json_status(&http, "nobody", REDIRECT, "read").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown client");
-    assert_eq!(body["error"], "invalid_client", "its code");
-    assert_eq!(body["error_description"], "Invalid client", "its text");
+    let (client_status, client_body) = get_json_status(&http, "nobody", REDIRECT, "read").await;
+    assert_eq!(client_status, StatusCode::BAD_REQUEST, "unknown client");
+    assert_eq!(client_body["error"], "invalid_client", "its code");
+    assert_eq!(
+        client_body["error_description"], "Invalid client",
+        "its text"
+    );
 
     let other = "https://elsewhere.example/cb";
-    let (status, body) = get_json_status(&http, &app.client_id, other, "read").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unregistered redirect");
-    assert_eq!(body["error"], "invalid_request", "its code");
+    let (redirect_status, redirect_body) =
+        get_json_status(&http, &app.client_id, other, "read").await;
+    assert_eq!(
+        redirect_status,
+        StatusCode::BAD_REQUEST,
+        "unregistered redirect"
+    );
+    assert_eq!(redirect_body["error"], "invalid_request", "its code");
 
-    let (status, body) = get_json_status(&http, &app.client_id, REDIRECT, "write").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "scope outside the app");
-    assert_eq!(body["error"], "invalid_scope", "its code");
+    let (scope_status, scope_body) =
+        get_json_status(&http, &app.client_id, REDIRECT, "write").await;
+    assert_eq!(
+        scope_status,
+        StatusCode::BAD_REQUEST,
+        "scope outside the app"
+    );
+    assert_eq!(scope_body["error"], "invalid_scope", "its code");
 
     let response = common::TestRequest::get("/oauth/authorize?client_id=x")
         .header("accept", "application/json")
@@ -254,23 +268,34 @@ async fn json_post_refuses_untrusted_apps_missing_scopes_and_dead_tokens() {
     let http = common::test_app(pool.clone());
     let ask = verdict(&app, REDIRECT, "read", true);
 
-    let response = post_verdict(&http, Some(&untrusted_token.token), &ask).await;
-    assert_eq!(response.status, StatusCode::FORBIDDEN, "untrusted app");
-    assert_eq!(response.json_value()["error"], "unauthorized_client");
+    let untrusted_response = post_verdict(&http, Some(&untrusted_token.token), &ask).await;
+    assert_eq!(
+        untrusted_response.status,
+        StatusCode::FORBIDDEN,
+        "untrusted app"
+    );
+    assert_eq!(
+        untrusted_response.json_value()["error"],
+        "unauthorized_client"
+    );
 
     let wants_write = verdict(&app, REDIRECT, "read write", true);
-    let response = post_verdict(&http, Some(&narrow), &wants_write).await;
-    assert_eq!(response.status, StatusCode::FORBIDDEN, "scope escalation");
-    assert_eq!(response.json_value()["error"], "invalid_scope");
+    let narrow_response = post_verdict(&http, Some(&narrow), &wants_write).await;
+    assert_eq!(
+        narrow_response.status,
+        StatusCode::FORBIDDEN,
+        "scope escalation"
+    );
+    assert_eq!(narrow_response.json_value()["error"], "invalid_scope");
 
-    let response = post_verdict(&http, None, &ask).await;
-    assert_eq!(response.status, StatusCode::UNAUTHORIZED, "no token");
+    let anonymous = post_verdict(&http, None, &ask).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "no token");
 
-    let response = post_verdict(&http, Some(&dead.token), &ask).await;
-    assert_eq!(response.status, StatusCode::UNAUTHORIZED, "revoked token");
+    let revoked = post_verdict(&http, Some(&dead.token), &ask).await;
+    assert_eq!(revoked.status, StatusCode::UNAUTHORIZED, "revoked token");
 
-    let response = post_verdict(&http, Some("not-a-token"), &ask).await;
-    assert_eq!(response.status, StatusCode::UNAUTHORIZED, "unknown token");
+    let unknown = post_verdict(&http, Some("not-a-token"), &ask).await;
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "unknown token");
 
     assert_eq!(authorization_count(&pool).await, 0, "nothing was minted");
 }
@@ -284,22 +309,23 @@ async fn json_post_validates_the_request() {
     let http = common::test_app(pool.clone());
 
     let unknown = json!({ "client_id": "nobody", "redirect_uri": REDIRECT, "approve": true });
-    let response = post_verdict(&http, Some(&token), &unknown).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.json_value()["error"], "invalid_client");
+    let client_response = post_verdict(&http, Some(&token), &unknown).await;
+    assert_eq!(client_response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(client_response.json_value()["error"], "invalid_client");
 
     let bad_redirect = verdict(&app, "https://elsewhere.example/cb", "read", true);
-    let response = post_verdict(&http, Some(&token), &bad_redirect).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.json_value()["error"], "invalid_request");
+    let redirect_response = post_verdict(&http, Some(&token), &bad_redirect).await;
+    assert_eq!(redirect_response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(redirect_response.json_value()["error"], "invalid_request");
 
-    let response = post_verdict(&http, Some(&token), &verdict(&app, REDIRECT, "write", true)).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.json_value()["error"], "invalid_scope");
+    let wider = verdict(&app, REDIRECT, "write", true);
+    let scope_response = post_verdict(&http, Some(&token), &wider).await;
+    assert_eq!(scope_response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(scope_response.json_value()["error"], "invalid_scope");
 
     let no_verdict = json!({ "client_id": app.client_id, "redirect_uri": REDIRECT });
-    let response = post_verdict(&http, Some(&token), &no_verdict).await;
-    assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.json_value()["error"], "invalid_request");
+    let verdict_response = post_verdict(&http, Some(&token), &no_verdict).await;
+    assert_eq!(verdict_response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(verdict_response.json_value()["error"], "invalid_request");
     assert_eq!(authorization_count(&pool).await, 0, "nothing was minted");
 }
