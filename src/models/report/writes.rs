@@ -29,10 +29,12 @@ const INSERT_SQL: &str = "INSERT INTO reports (
 /// transaction as the row they belong to, so a report is never visible with
 /// half its context. `ON CONFLICT (report_id, status_id) DO NOTHING` makes a
 /// status cited twice in one request one row (the pair is the table's key).
-/// Unknown ids are the caller's question and this statement's failure: the
-/// foreign key refuses them and the transaction rolls back.
+/// Only statuses authored by the report's target (`$3`) are attached: an id
+/// that names another account's status, or no status at all, is dropped, so
+/// no caller can pull a bystander's posts into the moderation record.
 const ATTACH_STATUSES_SQL: &str = "INSERT INTO report_statuses (report_id, status_id)
-     SELECT $1::uuid, id FROM unnest($2::uuid[]) AS requested(id)
+     SELECT $1::uuid, s.id FROM statuses s
+     WHERE s.id = ANY($2::uuid[]) AND s.user_id = $3
 ON CONFLICT (report_id, status_id) DO NOTHING";
 
 /// [`get`]: the one report behind a primary key.
@@ -60,6 +62,9 @@ const STATUSES_FOR_SQL: &str = "SELECT rs.status_id FROM report_statuses rs
 /// two reports: nothing here deduplicates a pair, and every filing mints its
 /// own id (decision 4).
 ///
+/// Only statuses authored by `target` are cited: `new.status_ids` entries
+/// that belong to anyone else, or to no status, are silently left out.
+///
 /// `base_url` is the instance origin, i.e. [`Config::base_url`], which the
 /// model layer is handed rather than reading configuration itself; a reporter
 /// this instance owns mints a fresh `{base_url}/activities/{uuid}` for the
@@ -72,7 +77,7 @@ const STATUSES_FOR_SQL: &str = "SELECT rs.status_id FROM report_statuses rs
 ///
 /// [`AppError::Unprocessable`] with `"Can not report yourself"` when the two
 /// users are the same account. Any database failure (connection, encoding, a
-/// cited status or rule that names no row) arrives as
+/// cited rule that names no row) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn create(
     pool: &PgPool,
@@ -100,6 +105,7 @@ pub async fn create(
         let _attached = sqlx::query(ATTACH_STATUSES_SQL)
             .bind(row.id)
             .bind(&new.status_ids)
+            .bind(target.id)
             .execute(&mut *tx)
             .await?;
     }
@@ -384,34 +390,89 @@ mod tests {
         assert_eq!(citation_count(&pool).await, 2);
     }
 
-    /// A cited status that names no row is the foreign key's refusal, and the
-    /// transaction's: the report row goes with it, so no report is ever stored
-    /// with half its context.
+    /// A cited status that names no row is dropped, not an error: the report
+    /// files with the citations that do belong to the target.
     #[tokio::test]
-    async fn citing_an_unknown_status_files_nothing() {
+    async fn citing_an_unknown_status_attaches_nothing() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let bob = local_user(&pool, "bob").await;
+        let real = post(&pool, &bob, "real").await;
 
-        let err = create(
+        let row = create(
             &pool,
             TEST_BASE_URL,
             &alice,
             &bob,
             &NewReport {
-                status_ids: vec![Uuid::now_v7()],
+                status_ids: vec![Uuid::now_v7(), real.id],
                 ..bare()
             },
         )
         .await
-        .expect_err("the foreign key refuses");
-        assert!(
-            matches!(err, AppError::Database(_)),
-            "a constraint failure is the database variant: {err}"
+        .expect("an unknown id is dropped, not refused");
+        assert_eq!(report_count(&pool).await, 1, "the report filed");
+        assert_eq!(
+            statuses_for(&pool, row.id).await.unwrap(),
+            vec![real.id],
+            "only the stored status is cited"
         );
-        assert_eq!(report_count(&pool).await, 0, "the row rolled back");
-        assert_eq!(citation_count(&pool).await, 0);
+        assert_eq!(citation_count(&pool).await, 1);
+    }
+
+    /// Only the target's statuses are cited: a status by anyone else in the
+    /// request (a bystander's private post, the reporter's own) is dropped.
+    #[tokio::test]
+    async fn only_the_targets_statuses_are_cited() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let carol = local_user(&pool, "carol").await;
+        let by_bob = post(&pool, &bob, "the reported post").await;
+        let by_carol = post(&pool, &carol, "a bystander's post").await;
+        let by_alice = post(&pool, &alice, "the reporter's post").await;
+
+        let row = create(
+            &pool,
+            TEST_BASE_URL,
+            &alice,
+            &bob,
+            &NewReport {
+                status_ids: vec![by_carol.id, by_bob.id, by_alice.id],
+                ..bare()
+            },
+        )
+        .await
+        .expect("the report files");
+        assert_eq!(
+            statuses_for(&pool, row.id).await.unwrap(),
+            vec![by_bob.id],
+            "only the target's status is attached"
+        );
+        assert_eq!(citation_count(&pool).await, 1);
+
+        let only_others = create(
+            &pool,
+            TEST_BASE_URL,
+            &alice,
+            &bob,
+            &NewReport {
+                status_ids: vec![by_carol.id],
+                ..bare()
+            },
+        )
+        .await
+        .expect("a report citing only others' statuses still files");
+        assert!(
+            statuses_for(&pool, only_others.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is cited"
+        );
+        assert_eq!(citation_count(&pool).await, 1, "no new citation row");
     }
 
     #[tokio::test]

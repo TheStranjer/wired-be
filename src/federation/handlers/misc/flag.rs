@@ -176,11 +176,49 @@ mod tests {
             Some("https://peer.example/activities/flag-1"),
             "the row stands for the delivered activity"
         );
-        let mut want = vec![cited_local.id, cited_remote.id];
-        want.sort_unstable();
-        let mut cited = report::statuses_for(&pool, row.id).await.unwrap();
-        cited.sort_unstable();
-        assert_eq!(cited, want, "both stored statuses matched by uri");
+        assert_eq!(
+            report::statuses_for(&pool, row.id).await.unwrap(),
+            vec![cited_local.id],
+            "only the target's stored status is cited; the reporter's is not"
+        );
+    }
+
+    /// A `Flag` that lists another local account's private status among its
+    /// objects files the report with zero cited statuses: the model keeps
+    /// only the target's own posts.
+    #[tokio::test]
+    async fn a_flag_naming_a_bystanders_status_cites_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = remote_signer(&pool).await;
+        let target = local_user(&pool, "flag-target").await;
+        let bystander = local_user(&pool, "flag-bystander").await;
+        let private = local_post(&pool, &bystander, "a private post").await;
+
+        let filed = handle_flag(
+            state,
+            view(
+                "Flag",
+                "flag-5",
+                ALICE,
+                json!({ "object": [target.ap_id.clone(), private.uri.clone()] }),
+            ),
+            alice,
+        )
+        .await;
+        assert_handled(&filed);
+
+        let rows = stored_reports(&pool).await;
+        assert_eq!(rows.len(), 1, "the Flag still files its report");
+        assert_eq!(rows[0].target_id, target.id, "about the local account");
+        assert!(
+            report::statuses_for(&pool, rows[0].id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the bystander's status is not cited"
+        );
     }
 
     /// The `Flag` route, bare shape: an object that is a lone account id and
