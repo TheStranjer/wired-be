@@ -43,18 +43,26 @@ pub(super) async fn render_hinted_notification(
         }
     };
     let rows = [row];
-    // Like the endpoint's single-notification read, a hinted row keeps
-    // its full render: `filters: &[]` is that pass's no-op spelling.
-    let entities =
-        match notifications::render_notifications(&connection.state, viewer, &rows, &[]).await {
-            Ok(entities) => entities,
-            Err(err) => {
-                warn!(%err, %id, "a streaming notification hint could not be rendered");
-                return None;
-            }
-        };
+    // The render applies the reader's phrase filters in the
+    // `notifications` context to the named status, as the endpoint's
+    // listing does: a warn match annotates it, an irreversible match
+    // takes the notification out of the answer.
+    let entities = match notifications::render_notifications(
+        &connection.state,
+        viewer,
+        &rows,
+        &connection.filters.words,
+    )
+    .await
+    {
+        Ok(entities) => entities,
+        Err(err) => {
+            warn!(%err, %id, "a streaming notification hint could not be rendered");
+            return None;
+        }
+    };
     let Some(entity) = entities.into_iter().next() else {
-        debug!(%id, "a streaming notification hint has no renderable actor");
+        debug!(%id, "a streaming notification hint has no renderable actor or is filtered");
         return None;
     };
     entity_json(&entity, id)
@@ -77,6 +85,66 @@ mod tests {
         streaming::hub::{Audience, RenderSpec, StreamEvent},
     };
 
+    /// The word filter judges a rendered notification in the
+    /// `notifications` context: the text of its own status falls to an
+    /// irreversible filter of that context, a `home` one is not asked, and
+    /// a warn filter annotates the embedded status instead.
+    #[tokio::test]
+    async fn the_notifications_context_filters_judge_the_embedded_status() {
+        let (_db, state) = state().await;
+        let actor = account(&state, "wordfilter-note-context-actor").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&actor, "a post full of spoilers"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let home_only =
+            phrase_filter(&state, "wordfilter-note-home", "spoilers", true, "home").await;
+        let warner = phrase_filter(
+            &state,
+            "wordfilter-note-warner",
+            "spoilers",
+            false,
+            "notifications",
+        )
+        .await;
+
+        for (reader, annotated) in [(&home_only, false), (&warner, true)] {
+            let note = notification::create(
+                &state.db,
+                &NewNotification {
+                    user_id: reader.id,
+                    from_account_id: actor.id,
+                    notification_type: "favourite",
+                    status_id: Some(row.id),
+                    emoji: None,
+                    report_id: None,
+                    chat_message_id: None,
+                },
+            )
+            .await
+            .expect("the notification fixture writes");
+            let own_stream = format!("{USER_NOTIFICATION}:{}", reader.id);
+            let connection = for_reader(&state, reader, &[&own_stream]).await;
+
+            let frame = connection
+                .frame_for(&notification_hint(&own_stream, reader.id, note.id))
+                .await
+                .expect("neither filter drops the notification");
+            let entity = frame_payload(&frame);
+            let filtered = &entity["status"]["filtered"];
+            assert_eq!(
+                filtered
+                    .as_array()
+                    .is_some_and(|results| !results.is_empty()),
+                annotated,
+                "only the notifications-context warn filter annotates: {filtered}"
+            );
+        }
+    }
+
     /// The word filter judges every rendered kind the same way: the text
     /// of the notification's own status falls, and its recipient can never
     /// be the socket's anonymous nobody.
@@ -89,7 +157,7 @@ mod tests {
             "wordfilter-note-recipient",
             "spoilers",
             true,
-            "home",
+            "notifications",
         )
         .await;
         let row = status::insert(

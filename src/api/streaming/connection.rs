@@ -288,9 +288,10 @@ impl Connection {
     /// socket its own view. A rendered entity then replaces the frame's
     /// `payload` (Mastodon's string-in-envelope rule), and the reader's
     /// `Filters` judge it: relationship suppression weighs the rendered
-    /// payload as it weighs any other, and a rendered entity whose text
-    /// matches one of the reader's active irreversible word filters is
-    /// dropped rather than shown.
+    /// payload as it weighs any other, and the reader's phrase filters
+    /// (`services::filter`) judge the rendered status in the context of
+    /// the stream it arrived on — an irreversible match is dropped, a warn
+    /// match rides the entity's `filtered` array.
     ///
     /// [`status_created`]: crate::services::streaming::status_created
     /// [`status_edited`]: crate::services::streaming::status_edited

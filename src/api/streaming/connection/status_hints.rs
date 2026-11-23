@@ -10,7 +10,10 @@ use uuid::Uuid;
 use crate::{
     api::streaming::{connection::Connection, filters::entity_json},
     models::{status, status_visibility, user},
-    services::render_status::{ViewerMode, render_status},
+    services::{
+        filter::{FilterContext, apply_to_entity},
+        render_status::{ViewerMode, render_status},
+    },
 };
 
 /// The Status entity JSON of the hinted status `id`, rendered for this
@@ -18,18 +21,38 @@ use crate::{
 /// unreadable (a status deleted before this socket caught up reads as
 /// gone: [`status::get_by_id`] hides tombstones), when
 /// [`status_visibility::can_view`] says no for this viewer or the
-/// author's account is deactivated, or when the renderer has no view
-/// of it at all.
+/// author's account is deactivated, when the renderer has no view of it
+/// at all, or when one of the reader's irreversible phrase filters
+/// matches it in `context` ([`apply_to_entity`]). A warn filter's match
+/// rides the entity's `filtered` array instead.
 ///
 /// [`status::get_by_id`]: crate::models::status::get_by_id
-pub(super) async fn render_hinted_status(connection: &Connection, id: Uuid) -> Option<String> {
+pub(super) async fn render_hinted_status(
+    connection: &Connection,
+    id: Uuid,
+    context: Option<FilterContext>,
+) -> Option<String> {
     let row = hinted_status_row(connection, id).await?;
     if !status_admits_reader(connection, &row, id).await {
         return None;
     }
     let viewer = connection.viewer();
     match render_status(&connection.state, ViewerMode::User(viewer), &row).await {
-        Ok(Some(entity)) => entity_json(&entity, id),
+        Ok(Some(mut entity)) => {
+            let dropped = context.is_some_and(|context| {
+                !apply_to_entity(
+                    &mut entity,
+                    &connection.filters.words,
+                    context,
+                    connection.reader_id(),
+                )
+            });
+            if dropped {
+                debug!(%id, "a streamed status matches the reader's irreversible word filters");
+                return None;
+            }
+            entity_json(&entity, id)
+        }
         Ok(None) => {
             debug!(%id, "a streaming render hint has no renderable view");
             None
@@ -111,6 +134,7 @@ mod tests {
         config::TEST_BASE_URL,
         models::{
             follow,
+            media_attachment::{self, NewMediaAttachment},
             status::{self, NewStatus, Visibility},
         },
         streaming::hub::{Audience, StreamEvent},
@@ -257,11 +281,21 @@ mod tests {
         );
     }
 
-    /// An active irreversible word filter of a streaming context drops the
-    /// rendered event; the same phrase as a warn filter (not irreversible)
-    /// or outside the streaming contexts leaves it on the wire.
+    /// The `update` event of status `id` on the single hub stream `stream`.
+    fn update_on(stream: &str, id: Uuid) -> StreamEvent {
+        StreamEvent {
+            streams: vec![stream.to_owned()],
+            ..hinted_update(id)
+        }
+    }
+
+    /// An irreversible filter judges a streamed status in the context of
+    /// the stream it arrives on: a `public`-only filter drops it from the
+    /// public stream and leaves it on the home (`user`) stream, a `home`
+    /// one the reverse, and a filter of a non-streaming context judges
+    /// neither.
     #[tokio::test]
-    async fn an_irreversible_word_filter_drops_a_rendered_status() {
+    async fn an_irreversible_word_filter_judges_the_stream_context() {
         let (_db, state) = state().await;
         let author = account(&state, "wordfilter-author").await;
         let row = status::insert(
@@ -271,25 +305,189 @@ mod tests {
         )
         .await
         .expect("the status fixture inserts");
-        let warner = phrase_filter(&state, "wordfilter-warner", "spoilers", false, "home").await;
-        let hider = phrase_filter(&state, "wordfilter-hider", "spoilers", true, "home").await;
+        let public_only =
+            phrase_filter(&state, "wordfilter-public", "spoilers", true, "public").await;
+        let home_only = phrase_filter(&state, "wordfilter-home", "spoilers", true, "home").await;
         let outsider =
             phrase_filter(&state, "wordfilter-outsider", "spoilers", true, "account").await;
 
-        let aloud = for_reader(&state, &warner, &[PUBLIC]).await;
+        for (reader, dropped_on, kept_on) in [
+            (
+                &public_only,
+                PUBLIC.to_owned(),
+                format!("{USER}:{}", public_only.id),
+            ),
+            (
+                &home_only,
+                format!("{USER}:{}", home_only.id),
+                PUBLIC.to_owned(),
+            ),
+        ] {
+            let connection = for_reader(&state, reader, &[&dropped_on, &kept_on]).await;
+            assert!(
+                connection
+                    .frame_for(&update_on(&dropped_on, row.id))
+                    .await
+                    .is_none(),
+                "the filter names `{dropped_on}`'s context and drops the match"
+            );
+            assert!(
+                connection
+                    .frame_for(&update_on(&kept_on, row.id))
+                    .await
+                    .is_some(),
+                "and the same status on `{kept_on}` is outside its context"
+            );
+        }
+        let own_stream = format!("{USER}:{}", outsider.id);
+        let standing = for_reader(&state, &outsider, &[PUBLIC, &own_stream]).await;
+        for stream in [PUBLIC, own_stream.as_str()] {
+            assert!(
+                standing
+                    .frame_for(&update_on(stream, row.id))
+                    .await
+                    .is_some(),
+                "a filter outside the streaming contexts judges no stream"
+            );
+        }
+    }
+
+    /// The viewer's own post is exempt, as it is on the REST timelines.
+    #[tokio::test]
+    async fn the_readers_own_matching_post_is_delivered() {
+        let (_db, state) = state().await;
+        let reader = phrase_filter(&state, "wordfilter-own", "spoilers", true, "home").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&reader, "my own post about spoilers"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let own_stream = format!("{USER}:{}", reader.id);
+        let connection = for_reader(&state, &reader, &[&own_stream]).await;
+
         assert!(
-            aloud.frame_for(&hinted_update(row.id)).await.is_some(),
-            "a warn filter never drops the event; the client covers it"
+            connection
+                .frame_for(&update_on(&own_stream, row.id))
+                .await
+                .is_some(),
+            "the reader's own match stays on their stream"
         );
-        let silent = for_reader(&state, &hider, &[PUBLIC]).await;
-        assert!(
-            silent.frame_for(&hinted_update(row.id)).await.is_none(),
-            "the irreversible streaming filter matches the rendered content and drops"
+    }
+
+    /// A phrase is matched against the plain text, not the markup: `p`
+    /// is the paragraph tag of the rendered content and no word of it.
+    #[tokio::test]
+    async fn a_phrase_matching_only_markup_does_not_drop() {
+        let (_db, state) = state().await;
+        let author = account(&state, "wordfilter-markup-author").await;
+        let reader = phrase_filter(&state, "wordfilter-markup", "p", true, "home").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "hello world"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let own_stream = format!("{USER}:{}", reader.id);
+        let connection = for_reader(&state, &reader, &[&own_stream]).await;
+
+        let frame = connection
+            .frame_for(&update_on(&own_stream, row.id))
+            .await
+            .expect("the markup is no text to match");
+        assert_eq!(
+            frame_payload(&frame)["content"],
+            "<p>hello world</p>",
+            "the entity carries the markup the phrase would have matched"
         );
-        let standing = for_reader(&state, &outsider, &[PUBLIC]).await;
+    }
+
+    /// A warn filter delivers the status with its `filtered` annotation.
+    #[tokio::test]
+    async fn a_warn_filter_annotates_the_streamed_status() {
+        let (_db, state) = state().await;
+        let author = account(&state, "wordfilter-warn-author").await;
+        let reader = phrase_filter(&state, "wordfilter-warn", "spoilers", false, "home").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "a plain post about spoilers"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let own_stream = format!("{USER}:{}", reader.id);
+        let connection = for_reader(&state, &reader, &[&own_stream, PUBLIC]).await;
+
+        let frame = connection
+            .frame_for(&update_on(&own_stream, row.id))
+            .await
+            .expect("a warn filter never drops the event");
+        let entity = frame_payload(&frame);
+        let filtered = entity["filtered"]
+            .as_array()
+            .expect("the streamed status carries a filtered array");
+        assert_eq!(filtered.len(), 1, "one warn filter matched");
+        assert_eq!(
+            filtered[0]["keyword_matches"][0], "spoilers",
+            "and the result names the matched keyword"
+        );
+
+        let public = connection
+            .frame_for(&update_on(PUBLIC, row.id))
+            .await
+            .expect("the public stream delivers it too");
+        assert_eq!(
+            frame_payload(&public)["filtered"],
+            serde_json::json!([]),
+            "a home-only warn filter leaves the public stream's status unannotated"
+        );
+    }
+
+    /// A media description is text the filter reads, on the contexts the
+    /// filter names.
+    #[tokio::test]
+    async fn a_media_description_match_drops_on_the_filtered_stream() {
+        let (_db, state) = state().await;
+        let author = account(&state, "wordfilter-media-author").await;
+        let reader = phrase_filter(&state, "wordfilter-media", "secret", true, "public").await;
+        let row = status::insert(
+            &state.db,
+            TEST_BASE_URL,
+            &NewStatus::local(&author, "a picture"),
+        )
+        .await
+        .expect("the status fixture inserts");
+        let _attached = media_attachment::insert(
+            &state.db,
+            &NewMediaAttachment {
+                user_id: Some(author.id),
+                status_id: Some(row.id),
+                url: format!("{TEST_BASE_URL}/media/fixture.png"),
+                content_type: "image/png".to_owned(),
+                description: Some("a secret garden".to_owned()),
+                ..NewMediaAttachment::default()
+            },
+        )
+        .await
+        .expect("the attachment fixture inserts");
+        let own_stream = format!("{USER}:{}", reader.id);
+        let connection = for_reader(&state, &reader, &[PUBLIC, &own_stream]).await;
+
         assert!(
-            standing.frame_for(&hinted_update(row.id)).await.is_some(),
-            "a filter outside the streaming contexts judges no stream"
+            connection
+                .frame_for(&update_on(PUBLIC, row.id))
+                .await
+                .is_none(),
+            "the description matches in the public context and drops"
+        );
+        assert!(
+            connection
+                .frame_for(&update_on(&own_stream, row.id))
+                .await
+                .is_some(),
+            "and the home stream is outside it"
         );
     }
 
