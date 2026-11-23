@@ -352,6 +352,7 @@ pub(crate) fn test_rate_limit() -> RateLimitConfig {
         enabled: Toggle::new(false),
         limits: rate_limit::default_limits(),
         trust_proxy_headers: Toggle::new(DEFAULT_TRUST_PROXY_HEADERS),
+        trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
     }
 }
 /// The admin-managed static content defaults — no installable frontend,
@@ -447,6 +448,10 @@ pub const DEFAULT_RATE_LIMITS_ENABLED: bool = true;
 /// is always the client, so a plain `X-Forwarded-For` header cannot name
 /// another one.
 pub const DEFAULT_TRUST_PROXY_HEADERS: bool = false;
+/// Proxy hops used when `TRUSTED_PROXY_HOPS` is unset: one reverse proxy
+/// in front of the server, so the rightmost `X-Forwarded-For` entry is the
+/// client it saw.
+pub const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
 /// `DATABASE_URL` used by [`Config::for_tests`]: a placeholder URL that
 /// points at nothing; integration tests get their real pool from the fixture
 /// in [`crate::test_db`].

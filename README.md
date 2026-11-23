@@ -131,7 +131,8 @@ below.
 | `VAPID_PUBLIC_KEY` | no | | The instance's Web Push public key (URL-safe base64 of the uncompressed P-256 point); the `server_key` the push endpoints and the `Application` entity advertise, and the `vapid_key` / `vapid_public_key` of the app and instance responses |
 | `RATE_LIMITS_ENABLED` | no | `true` | Whether routes that mount a rate-limit bucket throttle their requests; while off they answer uncounted and without `x-ratelimit-*` headers (`true`/`false`, or `1`/`0`) |
 | `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60, imports=1:3600`; a bucket off the table is unlimited |
-| `TRUST_PROXY_HEADERS` | no | `false` | Let the leftmost `X-Forwarded-For` entry name the client a rate-limit window counts against; while off the socket peer always does (`true`/`false`, or `1`/`0`) |
+| `TRUST_PROXY_HEADERS` | no | `false` | Let `X-Forwarded-For` name the client a rate-limit window counts against — the entry `TRUSTED_PROXY_HOPS` places from the right (by default the rightmost, the hop your reverse proxy appended); while off the socket peer always does (`true`/`false`, or `1`/`0`) |
+| `TRUSTED_PROXY_HOPS` | no | `1` | How many reverse proxies sit in front of the server; with `TRUST_PROXY_HEADERS` on, the client is the `X-Forwarded-For` entry that many places from the right. A header with fewer entries, or a non-IP entry there, falls back to the socket peer (whole number) |
 
 ### Default assets
 

@@ -43,17 +43,20 @@ pub(super) async fn authenticated_subject(
     }
 }
 
-/// The client an anonymous request is counted against: the leftmost
-/// `X-Forwarded-For` entry while `TRUST_PROXY_HEADERS` is on, else (or
-/// when the header says nothing usable) the socket peer's address;
-/// [`UNKNOWN_SUBJECT`] when even that is absent. The source port is never
-/// part of the key (every connection draws a fresh one), and an IPv6
-/// address is keyed by its /64 prefix (see [`ip_key`]).
+/// The client an anonymous request is counted against: while
+/// `TRUST_PROXY_HEADERS` is on, the `X-Forwarded-For` entry
+/// `TRUSTED_PROXY_HOPS` places from the right (the address the outermost
+/// trusted proxy saw, never the client-controlled left), else (or when the
+/// header says nothing usable: absent, too short, not an IP) the socket
+/// peer's address; [`UNKNOWN_SUBJECT`] when even that is absent. The
+/// source port is never part of the key (every connection draws a fresh
+/// one), and an IPv6 address is keyed by its /64 prefix (see [`ip_key`]).
 pub(super) fn client(app: &AppState, request: &Request) -> String {
-    if app.config.rate_limit.trust_proxy_headers.get()
-        && let Some(forwarded) = forwarded_for(request)
+    let settings = &app.config.rate_limit;
+    if settings.trust_proxy_headers.get()
+        && let Some(forwarded) = forwarded_for(request, settings.trusted_proxy_hops)
     {
-        return forwarded.parse::<IpAddr>().map_or(forwarded, ip_key);
+        return ip_key(forwarded);
     }
     request
         .extensions()
@@ -77,16 +80,25 @@ fn ip_key(ip: IpAddr) -> String {
     }
 }
 
-/// The leftmost, trimmed, non-empty `X-Forwarded-For` entry — the first hop
-/// the trusted proxy appended; `None` without one.
-fn forwarded_for(request: &Request) -> Option<String> {
+/// The client address the outermost trusted proxy saw: the trimmed,
+/// non-empty `X-Forwarded-For` entry `hops` places from the right (`hops`
+/// = 1 is the rightmost entry, the one the proxy appended). Entries left of
+/// it are client-controlled and never read. `None` when the header is
+/// absent, holds fewer entries than `hops`, `hops` is zero, or the chosen
+/// entry is not an IP address.
+fn forwarded_for(request: &Request, hops: usize) -> Option<IpAddr> {
     let value = request
         .headers()
         .get(&FORWARDED_FOR_HEADER)?
         .to_str()
         .ok()?;
-    let first = value.split(',').next()?.trim();
-    (!first.is_empty()).then(|| first.to_owned())
+    let entries: Vec<&str> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let index = entries.len().checked_sub(hops)?;
+    entries.get(index)?.parse::<IpAddr>().ok()
 }
 
 #[cfg(test)]
@@ -99,8 +111,8 @@ mod tests {
     use super::super::{
         clock::ManualClock,
         test_support::{
-            FLAGS_ON, Flags, app_on_pool, auth_app, auth_limits, forwarded_post, limited_post,
-            limited_request, login,
+            FLAGS_ON, app_on_pool, auth_app, auth_limits, forwarded_post, limited_post,
+            limited_request, login, trusting,
         },
     };
     use super::*;
@@ -227,14 +239,7 @@ mod tests {
     #[tokio::test]
     async fn forwarded_ipv6_is_keyed_by_prefix() {
         let clock = Arc::new(ManualClock::new());
-        let app = auth_app(
-            &clock,
-            1,
-            Flags {
-                enabled: true,
-                trust: true,
-            },
-        );
+        let app = auth_app(&clock, 1, trusting(1));
         let first = app
             .clone()
             .oneshot(forwarded_post("10.0.0.1:1", "2001:db8::1"))
@@ -258,22 +263,15 @@ mod tests {
     #[tokio::test]
     async fn forwarded_for_is_honored_only_when_trusted() {
         let trusted_clock = Arc::new(ManualClock::new());
-        let trusted_app = auth_app(
-            &trusted_clock,
-            1,
-            Flags {
-                enabled: true,
-                trust: true,
-            },
-        );
+        let trusted_app = auth_app(&trusted_clock, 1, trusting(1));
         let alice = trusted_app
             .clone()
-            .oneshot(forwarded_post("10.0.0.1:1", "203.0.113.1, 70.41.3.18"))
+            .oneshot(forwarded_post("10.0.0.1:1", "70.41.3.18"))
             .await
             .unwrap();
         assert_eq!(alice.status(), StatusCode::OK, "the first hop passes");
         let bob = trusted_app
-            .oneshot(forwarded_post("10.0.0.1:1", "203.0.113.2, 70.41.3.18"))
+            .oneshot(forwarded_post("10.0.0.1:1", "70.41.3.19"))
             .await
             .unwrap();
         assert_eq!(
@@ -299,6 +297,128 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "while untrusted the header is noise: one socket, one window"
         );
+    }
+
+    /// The parsed address of `header` at `hops`, as `client` would read it.
+    fn forwarded(header: &str, hops: usize) -> Option<String> {
+        forwarded_for(&forwarded_post("10.0.0.1:1", header), hops).map(|ip| ip.to_string())
+    }
+
+    /// The entry `hops` places from the right is the client; entries left of
+    /// it are never read, and a header too short, empty-entried or
+    /// unparseable names nobody.
+    #[test]
+    fn forwarded_for_picks_the_entry_hops_from_the_right() {
+        assert_eq!(
+            forwarded("1.1.1.1, 2.2.2.2", 1).as_deref(),
+            Some("2.2.2.2"),
+            "one hop: the rightmost entry"
+        );
+        assert_eq!(
+            forwarded("9.9.9.9, 1.1.1.1, 2.2.2.2", 2).as_deref(),
+            Some("1.1.1.1"),
+            "two hops: the one before the rightmost"
+        );
+        assert_eq!(
+            forwarded("1.1.1.1, 2.2.2.2, ", 1).as_deref(),
+            Some("2.2.2.2"),
+            "empty entries are dropped"
+        );
+        assert_eq!(forwarded("2.2.2.2", 2), None, "fewer entries than hops");
+        assert_eq!(forwarded("1.1.1.1, foo", 1), None, "a non-IP entry");
+        assert_eq!(forwarded("foo, 2.2.2.2", 1).as_deref(), Some("2.2.2.2"));
+        assert_eq!(forwarded("2.2.2.2", 0), None, "zero hops trusts nothing");
+        assert_eq!(forwarded(" ,, ", 1), None, "no entries at all");
+    }
+
+    /// Behind one trusted proxy, requests whose spoofed left parts differ
+    /// but whose appended right part is the same share one window.
+    #[tokio::test]
+    async fn a_spoofed_leftmost_entry_does_not_open_a_new_window() {
+        let clock = Arc::new(ManualClock::new());
+        let app = auth_app(&clock, 1, trusting(1));
+        let first = app
+            .clone()
+            .oneshot(forwarded_post("10.0.0.1:1", "1.1.1.1, 2.2.2.2"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "the first request passes");
+        let second = app
+            .clone()
+            .oneshot(forwarded_post("10.0.0.1:2", "3.3.3.3, 2.2.2.2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "changing only the left part keeps the window"
+        );
+        let other = app
+            .oneshot(forwarded_post("10.0.0.1:3", "1.1.1.1, 4.4.4.4"))
+            .await
+            .unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::OK,
+            "another appended address has its own window"
+        );
+    }
+
+    /// Two trusted hops read the second entry from the right.
+    #[tokio::test]
+    async fn two_hops_key_on_the_second_entry_from_the_right() {
+        let clock = Arc::new(ManualClock::new());
+        let app = auth_app(&clock, 1, trusting(2));
+        let first = app
+            .clone()
+            .oneshot(forwarded_post("10.0.0.1:1", "9.9.9.9, 1.1.1.1, 2.2.2.2"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "the first request passes");
+        let same_client = app
+            .clone()
+            .oneshot(forwarded_post("10.0.0.1:2", "8.8.8.8, 1.1.1.1, 5.5.5.5"))
+            .await
+            .unwrap();
+        assert_eq!(
+            same_client.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the same second-from-right entry shares the window"
+        );
+        let other_client = app
+            .oneshot(forwarded_post("10.0.0.1:3", "9.9.9.9, 6.6.6.6, 2.2.2.2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            other_client.status(),
+            StatusCode::OK,
+            "another second-from-right entry has its own window"
+        );
+    }
+
+    /// A header with fewer entries than hops, or whose chosen entry is not
+    /// an IP address, falls back to the socket peer's window.
+    #[tokio::test]
+    async fn unusable_forwarded_headers_fall_back_to_the_peer() {
+        for (hops, first, second) in [(2, "1.1.1.1", "3.3.3.3"), (1, "foo", "bar")] {
+            let clock = Arc::new(ManualClock::new());
+            let app = auth_app(&clock, 1, trusting(hops));
+            let opener = app
+                .clone()
+                .oneshot(forwarded_post("10.0.0.1:1", first))
+                .await
+                .unwrap();
+            assert_eq!(opener.status(), StatusCode::OK, "{first:?} passes");
+            let repeat = app
+                .oneshot(forwarded_post("10.0.0.1:2", second))
+                .await
+                .unwrap();
+            assert_eq!(
+                repeat.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "{first:?} and {second:?} both count against the peer"
+            );
+        }
     }
 
     /// A valid user bearer token keys the window on the user id, not the

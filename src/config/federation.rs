@@ -10,7 +10,8 @@ use super::Config;
 use super::{
     defaults::{
         DEFAULT_ACCEPT_UNSOLICITED_PUBLIC, DEFAULT_FEDERATION_ENABLED, DEFAULT_MRF_TRANSPARENCY,
-        DEFAULT_RATE_LIMITS_ENABLED, DEFAULT_TRUST_PROXY_HEADERS, DEFAULT_UNREACHABLE_GRACE_SECS,
+        DEFAULT_RATE_LIMITS_ENABLED, DEFAULT_TRUST_PROXY_HEADERS, DEFAULT_TRUSTED_PROXY_HOPS,
+        DEFAULT_UNREACHABLE_GRACE_SECS,
     },
     error::ConfigError,
     federation_types::{MrfSettings, RateLimitConfig, Toggle},
@@ -18,7 +19,8 @@ use super::{
     vars::{
         ACCEPT_UNSOLICITED_PUBLIC_VAR, FEDERATION_ENABLED_VAR, MRF_POLICIES_VAR,
         MRF_TRANSPARENCY_EXCLUSIONS_VAR, MRF_TRANSPARENCY_VAR, RATE_LIMITS_ENABLED_VAR,
-        RATE_LIMITS_VAR, TRUST_PROXY_HEADERS_VAR, UNREACHABLE_GRACE_SECS_VAR,
+        RATE_LIMITS_VAR, TRUST_PROXY_HEADERS_VAR, TRUSTED_PROXY_HOPS_VAR,
+        UNREACHABLE_GRACE_SECS_VAR,
     },
 };
 
@@ -114,6 +116,7 @@ where
     let enabled = boolean(lookup, RATE_LIMITS_ENABLED_VAR, DEFAULT_RATE_LIMITS_ENABLED)?.into();
     let trust_proxy_headers =
         boolean(lookup, TRUST_PROXY_HEADERS_VAR, DEFAULT_TRUST_PROXY_HEADERS)?.into();
+    let trusted_proxy_hops = number(lookup, TRUSTED_PROXY_HOPS_VAR, DEFAULT_TRUSTED_PROXY_HOPS)?;
     let mut limits = rate_limit::default_limits();
     if let Some(text) = lookup(RATE_LIMITS_VAR).filter(|text| !text.trim().is_empty()) {
         limits.extend(rate_limit::parse_limits(&text).map_err(ConfigError::InvalidRateLimits)?);
@@ -122,6 +125,7 @@ where
         enabled,
         limits,
         trust_proxy_headers,
+        trusted_proxy_hops,
     })
 }
 

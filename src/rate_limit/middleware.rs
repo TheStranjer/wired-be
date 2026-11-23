@@ -224,6 +224,7 @@ mod tests {
             Flags {
                 enabled: false,
                 trust: false,
+                hops: 1,
             },
         );
         for _ in 0..5 {

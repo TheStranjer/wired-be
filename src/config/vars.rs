@@ -325,6 +325,10 @@ pub const MRF_TRANSPARENCY_EXCLUSIONS_VAR: &str = "MRF_TRANSPARENCY_EXCLUSIONS";
 pub const RATE_LIMITS_ENABLED_VAR: &str = "RATE_LIMITS_ENABLED";
 /// Environment variable holding the rate limiter's bucket overrides.
 pub const RATE_LIMITS_VAR: &str = "RATE_LIMITS";
-/// Environment variable holding whether the leftmost `X-Forwarded-For`
-/// entry may name the client for rate limiting.
+/// Environment variable holding whether the `X-Forwarded-For` header may
+/// name the client for rate limiting.
 pub const TRUST_PROXY_HEADERS_VAR: &str = "TRUST_PROXY_HEADERS";
+/// Environment variable holding how many reverse proxies sit in front of
+/// this server, i.e. how many `X-Forwarded-For` entries from the right
+/// were appended by trusted hops.
+pub const TRUSTED_PROXY_HOPS_VAR: &str = "TRUSTED_PROXY_HOPS";
