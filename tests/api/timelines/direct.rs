@@ -161,10 +161,9 @@ async fn direct_pages_walk_the_id_cursor_under_link_headers() {
 }
 
 /// A DM from an account the viewer blocked stays off their direct
-/// timeline, and `with_muted=true` brings it back — the viewer's own
-/// exclusion lifted, the conversation still theirs.
+/// timeline, `with_muted=true` or not — the toggle lifts mutes only.
 #[tokio::test]
-async fn direct_hides_blocked_senders_unless_with_muted() {
+async fn direct_hides_blocked_senders_even_with_muted() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
@@ -185,10 +184,15 @@ async fn direct_hides_blocked_senders_unless_with_muted() {
         "bob's DM is blocked away from alice's direct timeline"
     );
     let shown = get(&app, Some(&token), &format!("{DIRECT}?with_muted=true")).await;
+    let shown_ids = ids(&shown.json_value());
     assert_eq!(
-        ids(&shown.json_value()),
-        newest_first(&[&from_bob, &own]),
-        "`with_muted=true` lifts alice's own exclusions"
+        shown_ids,
+        newest_first(&[&own]),
+        "`with_muted=true` never lifts alice's block"
+    );
+    assert!(
+        !shown_ids.contains(&from_bob.id.to_string()),
+        "bob's DM stays off the page"
     );
 }
 

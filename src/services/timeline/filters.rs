@@ -24,11 +24,11 @@ pub struct TimelineFilters {
     pub remote_only: Flag,
     /// Keep only statuses carrying at least one row of `media_attachments`.
     pub only_media: Flag,
-    /// Show what the viewer's own blocks, mutes, domain blocks and thread
-    /// mutes would otherwise drop — Pleroma's `with_muted` parameter, whose
-    /// default is `false`. [`push_visibility_clause`] is applied either
-    /// way: the toggle brings back what the viewer put away, never the rows
-    /// of authors who blocked the viewer.
+    /// Show what the viewer's own mutes and thread mutes would otherwise
+    /// drop — Pleroma's `with_muted` parameter, whose default is `false`.
+    /// The viewer's blocks and domain blocks, and
+    /// [`push_visibility_clause`], apply either way: the toggle never brings
+    /// back blocked authors or the rows of authors who blocked the viewer.
     ///
     /// [`push_visibility_clause`]: crate::models::status_visibility::push_visibility_clause
     pub with_muted: Flag,
