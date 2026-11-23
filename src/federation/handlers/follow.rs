@@ -179,7 +179,7 @@ async fn apply_follow(
     let stored = user::get_by_ap_id(&state.db, object_id)
         .await
         .map_err(|err| transient("follow target", &err))?;
-    let Some(target) = stored.filter(|found| found.local.get() && found.is_active.get()) else {
+    let Some(target) = stored.filter(User::is_local_active) else {
         return Ok(Outcome::Ignored(
             "a Follow whose object is not a stored active local account",
         ));

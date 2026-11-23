@@ -200,7 +200,7 @@ async fn local_subscribe_actor(state: &AppState, nickname: &str) -> Option<User>
             return None;
         }
     };
-    found.filter(|user| user.local.get() && user.is_active.get())
+    found.filter(User::is_local_active)
 }
 
 /// The 302 to `{FRONTEND_BASE_URL}/{path}` (the shape

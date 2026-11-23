@@ -7,7 +7,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::User;
-use crate::{config::Config, error::AppResult};
+use crate::{
+    config::Config,
+    error::{AppError, AppResult},
+};
 
 /// Fetches the user whose primary key is `id`, `None` when no row matches.
 ///
@@ -39,6 +42,27 @@ pub async fn get_by_nickname(pool: &PgPool, nickname: &str) -> AppResult<Option<
         .bind(nickname)
         .fetch_optional(pool)
         .await?;
+    Ok(user)
+}
+
+/// Fetches the local, active user named `nickname` for a route that serves
+/// one account's public face.
+///
+/// # Errors
+///
+/// [`AppError::RouteNotFound`] for an unknown nickname or a remote mirror's
+/// (neither is told apart from a missing route), [`AppError::Gone`] for a
+/// deactivated local account, [`AppError::Database`] on a lookup failure.
+pub async fn require_local_active(pool: &PgPool, nickname: &str) -> AppResult<User> {
+    let Some(user) = get_by_nickname(pool, nickname).await? else {
+        return Err(AppError::RouteNotFound);
+    };
+    if !user.local.get() {
+        return Err(AppError::RouteNotFound);
+    }
+    if !user.is_active.get() {
+        return Err(AppError::Gone);
+    }
     Ok(user)
 }
 
@@ -446,5 +470,46 @@ mod tests {
         );
         assert!(!ids.contains(&gone.id), "a deactivated account is out");
         assert!(!ids.contains(&mirror.id), "and so is a remote mirror");
+    }
+
+    #[tokio::test]
+    async fn require_local_active_answers_by_account_state() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        let gone = insert(&pool, &local_new("gone")).await.unwrap();
+        set_activation(&pool, gone.id, false).await.unwrap();
+        insert(
+            &pool,
+            &NewUser {
+                nickname: "mirror@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/mirror".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+
+        let found = require_local_active(&pool, "ALICE")
+            .await
+            .expect("a local active account is served, whatever the case");
+        assert_eq!(found.id, alice.id, "the row behind the nickname");
+
+        let unknown = require_local_active(&pool, "nobody").await;
+        assert!(
+            matches!(unknown, Err(AppError::RouteNotFound)),
+            "an unknown nickname is a missing route, got {unknown:?}"
+        );
+        let remote = require_local_active(&pool, "mirror@remote.example").await;
+        assert!(
+            matches!(remote, Err(AppError::RouteNotFound)),
+            "a remote mirror is a missing route, got {remote:?}"
+        );
+        let deactivated = require_local_active(&pool, "gone").await;
+        assert!(
+            matches!(deactivated, Err(AppError::Gone)),
+            "a deactivated local account is gone, got {deactivated:?}"
+        );
     }
 }

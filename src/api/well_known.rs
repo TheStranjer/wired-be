@@ -169,7 +169,7 @@ async fn find_local_active_user(state: &AppState, resource: &str) -> AppResult<O
         Resource::Nickname(nickname) => get_by_nickname(&state.db, nickname).await?,
         Resource::ActorId(ap_id) => get_by_ap_id(&state.db, ap_id).await?,
     };
-    Ok(user.filter(|found| found.local.get() && found.is_active.get()))
+    Ok(user.filter(User::is_local_active))
 }
 
 /// Whether the client asked for the XRD XML representation: a `format`
