@@ -18,9 +18,9 @@ use super::{
     validate::HAS_ALREADY_BEEN_TAKEN,
 };
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{
-        invite_token::{self, InviteToken},
+        invite_token::{self, INVALID_INVITE_MESSAGE, InviteToken},
         user::{
             Flag, NewUser, User, featured, followers, following, get_by_email, get_by_nickname,
             inbox, insert, local_ap_id, outbox,
@@ -101,9 +101,12 @@ pub(super) async fn build_and_insert(
 /// The invited registration's write: user insert and invite consumption
 /// in one transaction, so the two land together or not at all. A failed
 /// insert aborts the transaction and the invite keeps its count and its
-/// flag; the [`AppError`]s propagate as the caller's own (a
-/// [`consume`] miss — the invite revoked under the registration's feet —
-/// stays the internal arm it reports).
+/// flag; the [`AppError`]s propagate as the caller's own. [`consume`] is
+/// conditional, so an invite that was valid when `spent` was read but is
+/// spent, capped, expired or revoked by now (a concurrent registration won
+/// it) answers `false`: the transaction is dropped, rolling the user back,
+/// and the registration fails with the same 400 [`INVALID_INVITE_MESSAGE`]
+/// the endpoint gives for any invalid invite.
 ///
 /// [`consume`]: invite_token::consume
 /// [`AppError`]: crate::error::AppError
@@ -114,7 +117,9 @@ async fn insert_with_invite(
 ) -> AppResult<User> {
     let mut tx = pool.begin().await?;
     let user = insert(&mut *tx, new_user).await?;
-    invite_token::consume(&mut *tx, spent.id).await?;
+    if !invite_token::consume(&mut *tx, spent.id).await? {
+        return Err(AppError::BadRequest(INVALID_INVITE_MESSAGE.to_owned()));
+    }
     tx.commit().await?;
     Ok(user)
 }
@@ -393,6 +398,31 @@ mod tests {
         let spent = stored_invite(&pool, invite.id).await;
         assert_eq!(spent.uses, 1, "the registration was counted");
         assert!(spent.used, "and the one-time invite is spent");
+    }
+
+    #[tokio::test]
+    async fn a_second_registration_on_a_spent_invite_creates_no_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let invite = invite_token::create(&pool, &invite_token::InviteParams::one_time())
+            .await
+            .expect("the invite mints");
+        // Both registrations hold the same pre-read, still-valid row, as two
+        // concurrent requests would.
+        let first = insert_with_invite(&pool, &local_new("first"), &invite)
+            .await
+            .expect("the first registration spends the invite");
+        assert_eq!(first.nickname, "first", "the first user landed");
+        let err = insert_with_invite(&pool, &local_new("second"), &invite)
+            .await
+            .expect_err("the second registration finds the invite spent");
+        assert!(
+            matches!(&err, AppError::BadRequest(message) if message == INVALID_INVITE_MESSAGE),
+            "the invalid-invite refusal, got {err:?}"
+        );
+        assert_eq!(user_count(&pool).await, 1, "only one user exists");
+        let spent = stored_invite(&pool, invite.id).await;
+        assert_eq!(spent.uses, 1, "the invite was spent exactly once");
     }
 
     #[tokio::test]
