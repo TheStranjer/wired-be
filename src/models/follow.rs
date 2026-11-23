@@ -64,7 +64,7 @@ pub use lookup::{
 pub use pages::{followers_page, following_page};
 pub use pending::{outgoing_requests_from, pending_count, pending_requests_for};
 pub use state_accept::{accept, reject};
-pub use state_remove::{remove_follower, sever_between};
+pub use state_remove::{SeveredByDomain, remove_follower, sever_between, sever_with_domain};
 pub use state_toggles::{set_notify, set_toggles};
 pub use types::{Follow, FollowPageEntry, FollowState, FollowToggles};
 pub use unfollow::unfollow;

@@ -3,8 +3,6 @@
 //! account and status fixture writers and the outcome and row readers.
 //! Test-only.
 
-use std::sync::Arc;
-
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -12,14 +10,12 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     federation::dispatch::{ActivityView, FederationError, Outcome},
-    http_client::HttpClient,
     models::{
         follow, report,
         status::{self, NewStatus, Status},
         user::{self, NewUser, User, insert},
     },
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The mirror every fixture here is sent by: alice on `peer.example`.
@@ -35,19 +31,7 @@ pub(super) const FEATURED: &str = "https://peer.example/users/alice/collections/
 
 /// Test state over `pool` with the fixed test config.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Normalizes a fixture activity: `kind` named

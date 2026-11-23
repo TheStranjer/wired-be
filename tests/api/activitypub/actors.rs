@@ -449,3 +449,58 @@ async fn a_deactivated_user_is_gone() {
         "the redirect is the ordinary frontend profile URL"
     );
 }
+
+/// The Atom/RSS feed addresses are not served: the account feed in its three
+/// spellings and the tag feed fall through to the app-wide JSON 404 (marked
+/// `x-wired-fallback: 1`), whatever `Accept` says, for a user that exists.
+#[tokio::test]
+async fn the_feed_addresses_fall_through_to_the_fallback() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool.clone());
+    for path in [
+        "/users/alice/feed.atom",
+        "/users/alice/feed.rss",
+        "/users/alice/feed",
+        "/tags/rust.rss",
+    ] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(
+            response.status,
+            StatusCode::NOT_FOUND,
+            "{path} is no route of an API-only backend"
+        );
+        assert_eq!(
+            response.header("x-wired-fallback"),
+            Some("1"),
+            "{path} is answered by the router fallback, not a handler"
+        );
+    }
+}
+
+/// With the feed subpaths gone the actor address itself still negotiates:
+/// `Accept: application/activity+json` on `/users/alice` is the actor
+/// document.
+#[tokio::test]
+async fn the_actor_address_still_serves_activity_json() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool.clone());
+    let response = common::TestRequest::get("/users/alice")
+        .header("accept", "application/activity+json")
+        .send(&app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "the actor is served");
+    assert_eq!(
+        response.header("content-type"),
+        Some(ACTIVITY_JSON),
+        "as ActivityPub JSON"
+    );
+    assert_eq!(
+        response.json_value()["id"],
+        format!("{BASE}/users/alice"),
+        "alice's own document"
+    );
+}

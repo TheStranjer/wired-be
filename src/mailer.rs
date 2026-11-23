@@ -471,10 +471,7 @@ mod tests {
     use sqlx::{PgPool, postgres::PgPoolOptions};
 
     use super::*;
-    use crate::{
-        config::Config, http_client::HttpClient, jobs::AttemptInfo, models::job::Job,
-        uploads::UploaderBackend,
-    };
+    use crate::{config::Config, jobs::AttemptInfo, models::job::Job};
 
     /// A queued email, distinct in every field the job must carry.
     fn sample_email() -> Email {
@@ -504,21 +501,8 @@ mod tests {
     /// [`MemoryTransport`], returned together so the test can assert on the
     /// same mailbox through both handles.
     fn state_with_mailbox(pool: PgPool, config: Config) -> (AppState, MemoryTransport) {
-        let config = Arc::new(config);
-        let hub = crate::streaming::hub::Hub::new(&pool);
-        let mailbox = MemoryTransport::new();
-        let state = AppState {
-            db: pool,
-            hub,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(mailbox.clone()),
-        };
+        let state = AppState::for_tests(pool, config);
+        let mailbox = state.mailbox().unwrap();
         (state, mailbox)
     }
 
@@ -529,19 +513,9 @@ mod tests {
 
     /// The same with `transport` in place of the memory mailbox.
     fn state_with_transport(transport: Arc<dyn MailTransport + Send + Sync>) -> AppState {
-        let config = Arc::new(enabled_config());
-        let db = lazy_pool();
         AppState {
-            hub: crate::streaming::hub::Hub::new(&db),
-            db,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
             mailer: transport,
+            ..AppState::for_tests(lazy_pool(), enabled_config())
         }
     }
 

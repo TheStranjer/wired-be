@@ -4,6 +4,7 @@
 
 use futures::future::BoxFuture;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::error::FederationError;
 use crate::{
@@ -102,6 +103,11 @@ pub struct ActivityView {
     /// The document as received, for handlers that need fields beyond the
     /// normalized five and for the MRF's re-normalization.
     pub raw: Value,
+    /// The `users.id` of the local account whose personal inbox received
+    /// the delivery; `None` for the shared inboxes and for views not built
+    /// from a delivery. Parsing a document leaves it `None`; the
+    /// dispatcher sets it from the job args.
+    pub inbox_owner: Option<Uuid>,
 }
 
 impl ActivityView {
@@ -124,6 +130,7 @@ impl ActivityView {
             to: raw.get("to").map_or_else(Vec::new, json::references),
             cc: raw.get("cc").map_or_else(Vec::new, json::references),
             raw: raw.clone(),
+            inbox_owner: None,
         })
     }
 }

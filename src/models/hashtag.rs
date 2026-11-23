@@ -34,7 +34,10 @@
 //! the rest of the crate uses is re-exported below, so every outside path
 //! stays `crate::models::hashtag::…`.
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use uuid::Uuid;
 
 use crate::util::entities::MAX_HASHTAG_LEN;
@@ -57,7 +60,7 @@ pub use links::{
 };
 pub use search::search_prefix;
 pub use tags::{find_or_create, get_by_name, upsert_many};
-pub use usage::{day_counts, public_posts};
+pub use usage::day_counts;
 
 /// One row of `hashtags`: one tag name, shared by every status that uses it.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
@@ -81,13 +84,26 @@ struct StatusHashtagRow {
     hashtag: Hashtag,
 }
 
+/// The characters a stored tag name may hold: anything alphanumeric, any
+/// Unicode combining mark, `_`, the middle dot `U+00B7`, the katakana middle
+/// dot `U+30FB` and the zero-width non-joiner `U+200C` (Mastodon's
+/// `HASHTAG_NAME_RE` set, plus the marks its Thai range covers).
+const NAME_PATTERN: &str = r"^[\p{Alphabetic}\p{N}\p{M}_\x{00B7}\x{30FB}\x{200C}]+$";
+
+/// The compiled [`NAME_PATTERN`], or `None` if the fixed pattern ever failed
+/// to compile (it cannot; every name is then refused rather than stored
+/// unchecked).
+static NAME_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(NAME_PATTERN).ok());
+
 /// The normalized form of one written tag name, or `None` when it is not a
-/// usable tag: trimmed, leading `#`s dropped, lowercased — and non-empty
-/// and at most [`MAX_HASHTAG_LEN`] characters once normalized.
+/// usable tag: trimmed, leading `#`s dropped, lowercased — and non-empty,
+/// at most [`MAX_HASHTAG_LEN`] characters once normalized, made only of the
+/// characters [`NAME_PATTERN`] allows, and not all digits.
 ///
-/// The tag endpoints ([`crate::api::tags`]) run the path segment through
-/// this before storing or rendering anything: `None` is their
-/// "Invalid hashtag" case, the lowercased text the entity's name.
+/// This is the single authority on what may be stored in `hashtags.name`:
+/// the tag endpoints ([`crate::api::tags`]) and the federation note parser
+/// run text through it before storing or rendering anything. `None` is the
+/// endpoints' "Invalid hashtag" case, the lowercased text the entity's name.
 pub(crate) fn normalize_name(name: &str) -> Option<String> {
     let trimmed = name.trim().trim_start_matches('#').trim();
     if trimmed.is_empty() {
@@ -99,5 +115,62 @@ pub(crate) fn normalize_name(name: &str) -> Option<String> {
     if tag.chars().count() > MAX_HASHTAG_LEN {
         return None;
     }
+    if !NAME_RE.as_ref().is_some_and(|re| re.is_match(&tag)) {
+        return None;
+    }
+    // A purely numeric name is no tag (the extractor refuses it too).
+    if tag.chars().all(char::is_numeric) {
+        return None;
+    }
     Some(tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_outside_the_tag_character_set_are_refused() {
+        for name in ["foo bar", "a/b", "x?y", "<b>", "a#b", "../x", "a%b", "a-b"] {
+            assert_eq!(normalize_name(name), None, "`{name}` is no tag");
+        }
+    }
+
+    #[test]
+    fn all_numeric_names_are_refused() {
+        for name in ["123", "#2024", "٣٤"] {
+            assert_eq!(normalize_name(name), None, "`{name}` is all digits");
+        }
+        assert_eq!(normalize_name("1a"), Some("1a".to_owned()), "a digit mix");
+    }
+
+    #[test]
+    fn valid_names_are_lowercased_and_unhashed() {
+        assert_eq!(
+            normalize_name("#Rust_Lang"),
+            Some("rust_lang".to_owned()),
+            "hash dropped, lowercased, underscore kept"
+        );
+        assert_eq!(
+            normalize_name("日本語"),
+            Some("日本語".to_owned()),
+            "letters of any script"
+        );
+        for name in [
+            "เก็บ",
+            "e\u{301}",
+            "a\u{00B7}b",
+            "カ\u{30FB}カ",
+            "a\u{200C}b",
+        ] {
+            assert_eq!(normalize_name(name), Some(name.to_owned()), "`{name}`");
+        }
+    }
+
+    #[test]
+    fn blank_and_over_long_names_are_refused() {
+        assert_eq!(normalize_name(" # "), None, "nothing left");
+        assert!(normalize_name(&"a".repeat(MAX_HASHTAG_LEN)).is_some());
+        assert_eq!(normalize_name(&"a".repeat(MAX_HASHTAG_LEN + 1)), None);
+    }
 }

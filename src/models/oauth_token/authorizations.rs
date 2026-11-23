@@ -36,6 +36,10 @@ pub struct OauthAuthorization {
     /// Approved scopes, space-separated; the exchange copies them onto
     /// the token.
     pub scopes: String,
+    /// The redirect URI the code was issued for; the exchange must
+    /// present the same one. `NULL` for legacy rows and for codes never
+    /// delivered to a client.
+    pub redirect_uri: Option<String>,
     /// Expiry; fresh codes live [`AUTHORIZATION_CODE_TTL`].
     pub valid_until: DateTime<Utc>,
     /// Whether [`consume_authorization`] has already redeemed the code.
@@ -56,6 +60,7 @@ impl fmt::Debug for OauthAuthorization {
             .field("user_id", &self.user_id)
             .field("app_id", &self.app_id)
             .field("scopes", &self.scopes)
+            .field("redirect_uri", &self.redirect_uri)
             .field("valid_until", &self.valid_until)
             .field("used", &self.used)
             .field("inserted_at", &self.inserted_at)
@@ -69,15 +74,17 @@ impl fmt::Debug for OauthAuthorization {
 /// from the bound interval by the database clock, and `RETURNING *`
 /// brings back the row with its defaults (`used`) and timestamps.
 const INSERT_AUTHORIZATION_SQL: &str = "INSERT INTO oauth_authorizations (
-     id, token, user_id, app_id, scopes, valid_until
-) VALUES ($1, $2, $3, $4, $5, now() + $6) RETURNING *";
+     id, token, user_id, app_id, scopes, valid_until, redirect_uri
+) VALUES ($1, $2, $3, $4, $5, now() + $6, NULLIF($7::text, '')) RETURNING *";
 
 /// Creates an authorization code for `user_id` approving `scopes` on
-/// behalf of `app_id`, and returns the stored row.
+/// behalf of `app_id`, bound to `redirect_uri`, and returns the stored
+/// row.
 ///
 /// The id is a fresh `UUIDv7` and the code a 43-character random token
 /// (Pleroma's `add_token`); the row starts unused and expires after
-/// [`AUTHORIZATION_CODE_TTL`].
+/// [`AUTHORIZATION_CODE_TTL`]. An empty `redirect_uri` (a code that is
+/// never delivered to a client) is stored as `NULL`.
 ///
 /// # Errors
 ///
@@ -88,6 +95,7 @@ pub async fn create_authorization(
     user_id: Uuid,
     app_id: Uuid,
     scopes: &str,
+    redirect_uri: &str,
 ) -> AppResult<OauthAuthorization> {
     let authorization = sqlx::query_as::<_, OauthAuthorization>(INSERT_AUTHORIZATION_SQL)
         .bind(new_id())
@@ -96,6 +104,7 @@ pub async fn create_authorization(
         .bind(app_id)
         .bind(scopes)
         .bind(AUTHORIZATION_CODE_TTL)
+        .bind(redirect_uri)
         .fetch_one(pool)
         .await?;
     Ok(authorization)
@@ -128,7 +137,10 @@ pub async fn get_authorization_by_id(
 /// `valid_until` lies in the future and whose `app_id` matches flips to
 /// `used = true` and comes back. A second attempt on the same code
 /// never succeeds — not even concurrently — and the wrong app cannot
-/// burn (or read) another app's code.
+/// burn (or read) another app's code. A row bound to a redirect URI is
+/// consumed only when `redirect_uri` is that same URI (RFC 6749
+/// §4.1.3); a missing or different one leaves it untouched. A row with
+/// no stored URI (legacy, or never delivered) accepts any `redirect_uri`.
 ///
 /// # Errors
 ///
@@ -138,15 +150,18 @@ pub async fn consume_authorization(
     pool: &PgPool,
     code: &str,
     app_id: Uuid,
+    redirect_uri: Option<&str>,
 ) -> AppResult<Option<OauthAuthorization>> {
     let consumed = sqlx::query_as::<_, OauthAuthorization>(
         "UPDATE oauth_authorizations
             SET used = true, updated_at = now()
           WHERE token = $1 AND app_id = $2 AND used = false AND valid_until > now()
+            AND (redirect_uri IS NULL OR redirect_uri = $3)
         RETURNING *",
     )
     .bind(code)
     .bind(app_id)
+    .bind(redirect_uri)
     .fetch_optional(pool)
     .await?;
     Ok(consumed)
@@ -158,13 +173,73 @@ mod tests {
     use super::*;
     use crate::util::id::new_id;
 
+    /// The redirect URI the codes in these tests are issued for.
+    const REDIRECT_A: &str = "https://client.example/a";
+    /// Another URI of the same client, never the one a code was issued for.
+    const REDIRECT_B: &str = "https://client.example/b";
+
+    #[tokio::test]
+    async fn a_code_only_redeems_with_the_redirect_uri_it_was_issued_for() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let omar = insert_user(&pool, "omar").await;
+        let app = insert_app(&pool, "Bound").await;
+        let authorization = create_authorization(&pool, omar.id, app.id, "read", REDIRECT_A)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorization.redirect_uri.as_deref(),
+            Some(REDIRECT_A),
+            "the URI round trips"
+        );
+
+        for presented in [Some(REDIRECT_B), None, Some("")] {
+            assert!(
+                consume_authorization(&pool, &authorization.token, app.id, presented)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{presented:?} does not redeem a code issued for {REDIRECT_A}"
+            );
+            assert!(
+                authorization_unused(&pool, authorization.id).await,
+                "the refused exchange left the row unused"
+            );
+        }
+
+        let consumed = consume_authorization(&pool, &authorization.token, app.id, Some(REDIRECT_A))
+            .await
+            .unwrap();
+        assert!(consumed.is_some(), "the matching URI redeems the code");
+    }
+
+    #[tokio::test]
+    async fn a_code_without_a_stored_redirect_uri_is_consumable() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let pam = insert_user(&pool, "pam").await;
+        let app = insert_app(&pool, "Legacy").await;
+        let authorization = create_authorization(&pool, pam.id, app.id, "read", "")
+            .await
+            .unwrap();
+        assert!(
+            authorization.redirect_uri.is_none(),
+            "an empty URI is stored as NULL"
+        );
+
+        let consumed = consume_authorization(&pool, &authorization.token, app.id, Some(REDIRECT_B))
+            .await
+            .unwrap();
+        assert!(consumed.is_some(), "a NULL-URI legacy row accepts any URI");
+    }
+
     #[tokio::test]
     async fn authorization_codes_are_one_time() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let judy = insert_user(&pool, "judy").await;
         let app = insert_app(&pool, "Redeem").await;
-        let authorization = create_authorization(&pool, judy.id, app.id, "read write")
+        let authorization = create_authorization(&pool, judy.id, app.id, "read write", REDIRECT_A)
             .await
             .unwrap();
 
@@ -185,7 +260,7 @@ mod tests {
             "the code is ten minutes out, got {remaining}s"
         );
 
-        let consumed = consume_authorization(&pool, &authorization.token, app.id)
+        let consumed = consume_authorization(&pool, &authorization.token, app.id, Some(REDIRECT_A))
             .await
             .unwrap()
             .expect("the owning app can redeem the code");
@@ -196,7 +271,7 @@ mod tests {
             "the stored row is used now"
         );
 
-        let again = consume_authorization(&pool, &authorization.token, app.id)
+        let again = consume_authorization(&pool, &authorization.token, app.id, Some(REDIRECT_A))
             .await
             .unwrap();
         assert!(again.is_none(), "a code cannot be spent twice");
@@ -209,11 +284,11 @@ mod tests {
         let ken = insert_user(&pool, "ken").await;
         let app = insert_app(&pool, "Owner").await;
         let thief = insert_app(&pool, "Stranger").await;
-        let authorization = create_authorization(&pool, ken.id, app.id, "read")
+        let authorization = create_authorization(&pool, ken.id, app.id, "read", REDIRECT_A)
             .await
             .unwrap();
 
-        let denied = consume_authorization(&pool, &authorization.token, thief.id)
+        let denied = consume_authorization(&pool, &authorization.token, thief.id, Some(REDIRECT_A))
             .await
             .unwrap();
         assert!(denied.is_none(), "another app's exchange fails");
@@ -222,7 +297,7 @@ mod tests {
             "and does not even mark the code used"
         );
 
-        let ok = consume_authorization(&pool, &authorization.token, app.id)
+        let ok = consume_authorization(&pool, &authorization.token, app.id, Some(REDIRECT_A))
             .await
             .unwrap();
         assert!(ok.is_some(), "the owning app still gets its code");
@@ -234,12 +309,12 @@ mod tests {
         let pool = db.pool().clone();
         let luna = insert_user(&pool, "luna").await;
         let app = insert_app(&pool, "Timebox").await;
-        let authorization = create_authorization(&pool, luna.id, app.id, "read")
+        let authorization = create_authorization(&pool, luna.id, app.id, "read", REDIRECT_A)
             .await
             .unwrap();
         expire_authorization(&pool, authorization.id).await;
         assert!(
-            consume_authorization(&pool, &authorization.token, app.id)
+            consume_authorization(&pool, &authorization.token, app.id, Some(REDIRECT_A))
                 .await
                 .unwrap()
                 .is_none(),
@@ -257,7 +332,7 @@ mod tests {
         let pool = db.pool().clone();
         let nick = insert_user(&pool, "nick").await;
         let app = insert_app(&pool, "Byld").await;
-        let authorization = create_authorization(&pool, nick.id, app.id, "read write")
+        let authorization = create_authorization(&pool, nick.id, app.id, "read write", REDIRECT_A)
             .await
             .unwrap();
 

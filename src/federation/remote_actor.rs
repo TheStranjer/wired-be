@@ -28,6 +28,14 @@
 //! extracted onto [`NewRemoteUser`]: the fetch and move tickets consume
 //! them, and parsing them here is what validates their shape.
 //!
+//! A remote actor recreated under a new id (an origin that reinstalled,
+//! moved its actor paths, or deleted and recreated the account) keeps its
+//! `preferredUsername@host` handle. [`upsert_remote_user`] frees the handle
+//! by renaming the stale mirror of the same domain to `<old id>.<nickname>`
+//! and stores the new actor, as Pleroma's `maybe_handle_clashing_nickname`
+//! does; [`ActorError::NicknameConflict`] is kept for a holder that is not
+//! such a mirror (a local row, or another domain).
+//!
 //! Network access is out of scope for this module on purpose: documents
 //! arrive already fetched; retrieving them is the next ticket.
 
@@ -54,6 +62,30 @@ const ACTOR_TYPES: [&str; 5] = ["Person", "Service", "Group", "Organization", "A
 /// field (Mastodon's profile metadata, Pleroma's
 /// `Enum.filter(..., & &1["type"] == "PropertyValue")`).
 const PROPERTY_VALUE_TYPE: &str = "PropertyValue";
+
+/// Longest display name kept, in characters (Mastodon's `name` cap).
+const MAX_REMOTE_NAME_CHARS: usize = 2048;
+/// Longest raw `summary` kept, in characters, applied before sanitizing.
+const MAX_REMOTE_BIO_CHARS: usize = 20_000;
+/// Most profile fields kept; later `PropertyValue` entries are dropped.
+const MAX_REMOTE_FIELDS: usize = 50;
+/// Longest profile-field name kept, in characters.
+const MAX_FIELD_NAME_CHARS: usize = 512;
+/// Longest profile-field value kept, in characters.
+const MAX_FIELD_VALUE_CHARS: usize = 2048;
+/// Most `alsoKnownAs` aliases kept; later entries are dropped.
+const MAX_ALIASES: usize = 256;
+/// Longest `preferredUsername` accepted, in characters; longer is rejected.
+const MAX_USERNAME_CHARS: usize = 2048;
+
+/// The longest prefix of `text` of at most `max` characters, cut on a char
+/// boundary.
+fn truncate_chars(text: &str, max: usize) -> &str {
+    text.char_indices()
+        .nth(max)
+        .and_then(|(end, _)| text.get(..end))
+        .unwrap_or(text)
+}
 
 /// A remote actor document parsed into upsert-ready data.
 ///

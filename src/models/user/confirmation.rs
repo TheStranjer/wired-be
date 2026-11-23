@@ -199,26 +199,10 @@ mod tests {
     /// An [`AppState`] over a test slot, with `SMTP_HOST` set so [`send`]
     /// really queues, and its recording mailbox.
     async fn state_with_mailbox() -> (crate::test_db::TestDb, AppState) {
-        use std::sync::Arc;
-
-        use crate::{http_client::HttpClient, mailer::MemoryTransport, uploads::UploaderBackend};
-
         let db = crate::test_db::test_db().await.expect("test database slot");
         let mut config = Config::for_tests();
         config.smtp_host = Some("smtp.example.org".to_owned());
-        let config = Arc::new(config);
-        let state = AppState {
-            db: db.pool().clone(),
-            hub: crate::streaming::hub::Hub::new(db.pool()),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(MemoryTransport::new()),
-        };
+        let state = AppState::for_tests(db.pool().clone(), config);
         (db, state)
     }
 

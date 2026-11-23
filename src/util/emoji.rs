@@ -17,6 +17,8 @@
 
 use unicode_segmentation::UnicodeSegmentation as _;
 
+mod table;
+
 /// A reaction emoji as the API names it, classified from its text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Emoji<'a> {
@@ -64,77 +66,25 @@ pub fn shortcode(text: &str) -> Option<&str> {
     .then_some(inner)
 }
 
-/// Whether `text` is exactly one grapheme cluster that reads as an emoji.
+/// Whether `text` is exactly one grapheme cluster that is an emoji.
 ///
 /// The cluster count is Unicode's extended grapheme cluster rule (what a
 /// double-emoji sequence, a ZWJ family, a flag pair and a skin-tone modifier
 /// each count as), so `🙂🙂` is two clusters while `👍🏽`, `🇺🇸` and
-/// `👨‍👩‍👧` are one each. Whether that one cluster *is* an
-/// emoji is `looks_like_emoji`.
+/// `👨‍👩‍👧` are one each. Whether that one cluster *is* an emoji is the
+/// table's answer: every fully-qualified sequence of Unicode's
+/// `emoji-test.txt`, those sequences with their U+FE0F selectors left out
+/// (so the unqualified `❤` passes like `❤️`) and the lone regional
+/// indicators — see the `table` submodule. A letter wearing a skin-tone
+/// modifier, or a lone joiner or selector, is one cluster and is not an
+/// emoji.
 #[must_use]
 pub fn is_single_emoji(text: &str) -> bool {
     let mut clusters = text.graphemes(true);
     let (Some(cluster), None) = (clusters.next(), clusters.next()) else {
         return false;
     };
-    looks_like_emoji(cluster)
-}
-
-/// Whether one grapheme cluster carries an emoji.
-///
-/// Two ways: some scalar of it lies in an emoji block ([`in_emoji_block`],
-/// the pictographs, emoticons, transport signs, flags, dingbats and the
-/// modifiers that ride on them), or it is a keycap sequence — `#`, `*` or a
-/// digit made into a keycap by U+20E3, the one emoji shape whose base is
-/// plain ASCII.
-///
-/// The joiners themselves never decide anything: a lone U+200D or U+FE0F is
-/// one cluster and is not an emoji, and neither is the letter `a` wearing a
-/// variation selector.
-fn looks_like_emoji(cluster: &str) -> bool {
-    is_keycap(cluster) || cluster.chars().any(in_emoji_block)
-}
-
-/// Whether `cluster` is a keycap: an ASCII `#`, `*` or digit whose remaining
-/// scalars end in U+20E3 (the variation selector and backspaces between them
-/// being whatever the client sent).
-fn is_keycap(cluster: &str) -> bool {
-    let base = cluster.chars().next();
-    cluster.ends_with('\u{20E3}') && matches!(base, Some('#' | '*' | '0'..='9'))
-}
-
-/// Whether `ch` lies in one of the blocks Unicode's emoji data assigns emoji
-/// to.
-///
-/// The ranges are the blocks the emoji sequences of [`is_single_emoji`] are
-/// built out of: the symbol-and-pictograph planes (which hold the skin-tone
-/// modifiers too), the emoticons, transport signs, the regional indicators a
-/// flag pair is made of, and the misc symbols and dingbats that carry
-/// text-presented emoji. Not every
-/// code point of these blocks is an emoji, and a few emoji (the `#`/digit
-/// keycaps, the tag characters of subdivision flags) live outside them; the
-/// keycaps get [`is_keycap`] and a flag's tags ride in the same cluster as
-/// their indicators, so the blocks decide for everything else.
-const fn in_emoji_block(ch: char) -> bool {
-    matches!(
-        ch,
-        // misc symbols
-        '\u{2600}'..='\u{26FF}'
-        // dingbats
-        | '\u{2700}'..='\u{27BF}'
-        // regional indicators (flags)
-        | '\u{1F1E6}'..='\u{1F1FF}'
-        // misc symbols and pictographs, skin-tone modifiers included
-        | '\u{1F300}'..='\u{1F5FF}'
-        // emoticons
-        | '\u{1F600}'..='\u{1F64F}'
-        // transport and map signs
-        | '\u{1F680}'..='\u{1F6FF}'
-        // supplemental symbols and pictographs
-        | '\u{1F900}'..='\u{1F9FF}'
-        // symbols and pictographs extended-A
-        | '\u{1FA70}'..='\u{1FAFF}'
-    )
+    table::is_emoji(cluster)
 }
 
 #[cfg(test)]
@@ -171,6 +121,18 @@ mod tests {
             "👨\u{200D}👩\u{200D}👧\u{200D}👦",
             "#\u{FE0F}\u{20E3}",
             "9\u{FE0F}\u{20E3}",
+            "\u{2B50}",
+            "\u{231B}",
+            "\u{203C}\u{FE0F}",
+            "\u{A9}\u{FE0F}",
+            "\u{1F004}",
+            "\u{1F7E5}",
+            "\u{1F170}\u{FE0F}",
+            "\u{2764}",
+            "\u{2764}\u{FE0F}",
+            "\u{1F44D}\u{1F3FD}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{1F1EF}\u{1F1F5}",
         ] {
             assert!(is_single_emoji(text), "{text} is one emoji grapheme");
             assert_eq!(
@@ -198,6 +160,10 @@ mod tests {
             "a\u{FE0F}",
             "\u{1F600}x",
             "\u{1F600}\u{1F600}",
+            "a\u{1F3FB}",
+            "ab",
+            "x",
+            "\u{1F44D}\u{1F44D}",
         ] {
             assert!(!is_single_emoji(text), "{text} is not one emoji");
             assert_eq!(classified(text), "nothing", "{text} classifies to nothing");

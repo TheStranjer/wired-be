@@ -201,7 +201,7 @@ mod tests {
         let token = create_token(&pool, &new_token(Some(ivan.id), app.id))
             .await
             .unwrap();
-        let authorization = create_authorization(&pool, ivan.id, app.id, "read")
+        let authorization = create_authorization(&pool, ivan.id, app.id, "read", "")
             .await
             .unwrap();
         assert_eq!(token_rows(&pool, token.id).await, 1, "fixtures exist");

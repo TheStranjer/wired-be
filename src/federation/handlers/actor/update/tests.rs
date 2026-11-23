@@ -254,7 +254,7 @@ async fn an_unfoldable_update_is_ignored_not_retried() {
     let state = app_state(&pool);
     let alice = mirror(&pool).await;
     let alice_id = alice.id;
-    let squatter = remote_user(&pool, "mallory", "https://other.example/users/mallory").await;
+    let squatter = local_user(&pool, "mallory@peer.example").await;
     let ours = local_user(&pool, "alice-here").await;
     let ours_id = ours.id;
 
@@ -284,8 +284,8 @@ async fn an_unfoldable_update_is_ignored_not_retried() {
         "a takeover-shaped nickname is refused"
     );
     assert_eq!(
-        fresh_user(&pool, squatter.id).await.ap_id,
-        "https://other.example/users/mallory",
+        fresh_user(&pool, squatter.id).await.nickname,
+        "mallory@peer.example",
         "the squatter's row was neither renamed nor overwritten"
     );
 

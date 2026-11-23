@@ -10,7 +10,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Router, response::Response};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
@@ -125,38 +125,38 @@ impl Drop for MockRelay {
 
 /// The `GET /relay` fixture: the `Application` actor the follow tests are
 /// about, its inbox at `/relay/inbox`.
-async fn relay_actor(State(mock): State<Mock>) -> Json<Value> {
+async fn relay_actor(State(mock): State<Mock>) -> Response {
     actor_doc(&mock, "relay", "relay", "Application")
 }
 
 /// A relay served as a `Service`, the kind Pleroma's own relay actor
 /// wears.
-async fn service_actor(State(mock): State<Mock>) -> Json<Value> {
+async fn service_actor(State(mock): State<Mock>) -> Response {
     actor_doc(&mock, "service", "relay", "Service")
 }
 
 /// A hand-run relay: a plain `Person`.
-async fn person_actor(State(mock): State<Mock>) -> Json<Value> {
+async fn person_actor(State(mock): State<Mock>) -> Response {
     actor_doc(&mock, "person", "someone", "Person")
 }
 
 /// Not a relay: a `Group` is outside the ticket's three kinds.
-async fn group_actor(State(mock): State<Mock>) -> Json<Value> {
+async fn group_actor(State(mock): State<Mock>) -> Response {
     actor_doc(&mock, "group", "gang", "Group")
 }
 
 /// The note's author, and every other name-addressed account on this
 /// mock.
-async fn named_actor(State(mock): State<Mock>, Path(name): Path<String>) -> Json<Value> {
+async fn named_actor(State(mock): State<Mock>, Path(name): Path<String>) -> Response {
     actor_doc(&mock, &format!("users/{name}"), &name, "Person")
 }
 
 /// A self-naming actor document of `kind` at `{base}/{path}`, with an
 /// inbox under its own id and the inert public key the fetch fixtures
 /// store.
-fn actor_doc(mock: &Mock, path: &str, preferred: &str, kind: &str) -> Json<Value> {
+fn actor_doc(mock: &Mock, path: &str, preferred: &str, kind: &str) -> Response {
     let id = format!("{}/{path}", mock.base);
-    Json(json!({
+    common::activity_json(&json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "type": kind,
         "id": id,
@@ -181,9 +181,9 @@ async fn capture(State(mock): State<Mock>, body: Bytes) -> StatusCode {
 
 /// The public note a relay re-broadcasts: authored by this mock's own
 /// account, addressed to the world.
-async fn note(State(mock): State<Mock>, Path(name): Path<String>) -> Json<Value> {
+async fn note(State(mock): State<Mock>, Path(name): Path<String>) -> Response {
     let id = format!("{}/objects/{name}", mock.base);
-    Json(json!({
+    common::activity_json(&json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": id,
         "type": "Note",

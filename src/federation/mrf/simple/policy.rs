@@ -13,7 +13,8 @@ use super::{
     lists::{List, Reason},
     rewrite::{
         activity_host, activity_type, actor_document_host, followers_collection, has_attachments,
-        is_note_activity, limit_document, note_object_mut, rewrite_each_document, unlist_document,
+        is_note_activity, limit_document, note_object_mut, object_reference_host,
+        rewrite_each_document, unlist_document,
     },
 };
 
@@ -130,6 +131,13 @@ impl MrfPolicy for SimplePolicy {
             return Ok(activity);
         };
         if let Some(reason) = self.refusal(&host, &ctx.local_domain, &activity) {
+            return Err(reason);
+        }
+        // Pleroma's `check_object`: the host the activity points at is
+        // judged by the domain lists too, but not by the type refusals.
+        if let Some(object_host) = object_reference_host(&activity)
+            && let Some(reason) = self.domain_refusal(&object_host, &ctx.local_domain)
+        {
             return Err(reason);
         }
         Ok(self.rewrite(activity, &host))
@@ -274,6 +282,128 @@ mod tests {
             Ok(create()),
             "and its notes are still folded"
         );
+    }
+
+    /// The object reference is judged by the domain lists too: an
+    /// `Announce` or `Like` by an admitted host of a post on a `reject`ed
+    /// one is refused, naming the rejected host.
+    #[test]
+    fn an_object_on_a_rejected_host_is_refused() {
+        let lists = json!({"reject": [["evil.example", "bots"]]});
+        for kind in ["Announce", "Like"] {
+            assert_eq!(
+                filtered(&lists, reacting(kind, "https://evil.example/notes/1")),
+                Err(
+                    "[SimplePolicy] the host evil.example is on the `reject` list (bots)"
+                        .to_owned()
+                ),
+                "{kind} of a rejected host's post is refused"
+            );
+        }
+        let allowed = reacting("Announce", "https://good.example/notes/1");
+        assert_eq!(
+            filtered(&lists, allowed.clone()),
+            Ok(allowed),
+            "an Announce of an unlisted host's post passes"
+        );
+    }
+
+    /// An embedded object with an `actor` (an `Undo`'s `Follow`) is judged
+    /// by that actor's host, an embedded actor document by its own `id`'s,
+    /// and any other embedded object — a note — by nobody's.
+    #[test]
+    fn an_embedded_object_is_judged_by_its_actor_or_its_own_identity() {
+        let lists = json!({"reject": ["evil.example"]});
+        let undo = json!({
+            "id": format!("https://{PEER}/activities/8"),
+            "type": "Undo",
+            "actor": ALICE,
+            "object": {
+                "type": "Follow",
+                "actor": "https://evil.example/users/mallory",
+                "object": ALICE,
+            },
+        });
+        assert_eq!(
+            filtered(&lists, undo),
+            Err("[SimplePolicy] the host evil.example is on the `reject` list".to_owned()),
+            "the embedded Follow's actor is on a rejected host"
+        );
+        for kind in ["Person", "Service", "Group", "Organization", "Application"] {
+            let update = json!({
+                "id": format!("https://{PEER}/activities/9"),
+                "type": "Update",
+                "actor": ALICE,
+                "object": {"id": "https://evil.example/users/mallory", "type": kind},
+            });
+            assert_eq!(
+                filtered(&lists, update),
+                Err("[SimplePolicy] the host evil.example is on the `reject` list".to_owned()),
+                "an embedded {kind} document is judged by its own id"
+            );
+        }
+        let by_array_type = json!({
+            "id": format!("https://{PEER}/activities/10"),
+            "type": "Update",
+            "actor": ALICE,
+            "object": {"id": "https://evil.example/users/mallory", "type": ["Person", "Extra"]},
+        });
+        assert!(
+            filtered(&lists, by_array_type).is_err(),
+            "the first of several types decides"
+        );
+        let mut foreign_note = create();
+        foreign_note["object"]["attributedTo"] = json!("https://evil.example/users/mallory");
+        foreign_note["object"]["id"] = json!("https://evil.example/objects/1");
+        assert_eq!(
+            filtered(&lists, foreign_note.clone()),
+            Ok(foreign_note),
+            "an embedded note has no actor and is no actor: Pleroma lets it by"
+        );
+    }
+
+    /// The object's host meets the domain lists only: a `reject_deletes`
+    /// or `report_removal` entry for it does not refuse the activity.
+    #[test]
+    fn the_object_host_meets_no_type_refusals() {
+        let lists = json!({
+            "reject_deletes": ["evil.example"],
+            "report_removal": ["evil.example"],
+        });
+        for kind in ["Delete", "Flag"] {
+            let activity = reacting(kind, "https://evil.example/notes/1");
+            assert_eq!(
+                filtered(&lists, activity.clone()),
+                Ok(activity),
+                "{kind} of a post there is not refused: the lists name the sender"
+            );
+        }
+    }
+
+    /// With an allowlist, an object on an unlisted host is refused, and one
+    /// on this instance or a listed host passes.
+    #[test]
+    fn the_accept_list_covers_the_object_host() {
+        let lists = json!({"accept": ["peer.example", "friend.example"]});
+        assert_eq!(
+            filtered(
+                &lists,
+                reacting("Announce", "https://stranger.example/notes/1")
+            ),
+            Err("[SimplePolicy] the host stranger.example is not on the `accept` list".to_owned()),
+            "an unlisted host's post is refused"
+        );
+        for object in [
+            format!("https://{LOCAL}/notes/1"),
+            "https://friend.example/notes/1".to_owned(),
+        ] {
+            let activity = reacting("Announce", &object);
+            assert_eq!(
+                filtered(&lists, activity.clone()),
+                Ok(activity),
+                "the local domain and listed hosts pass: {object}"
+            );
+        }
     }
 
     /// The actor stage: `avatar_removal`, `banner_removal` and

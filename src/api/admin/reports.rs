@@ -2,7 +2,6 @@
 //! filed reports under `/api/v1/pleroma/admin/reports` (WBE-200, with the
 //! WBE-212 state change).
 //!
-//! The same two reads ride the legacy `/api/v0/pleroma/reports` mount.
 //! The reference is Pleroma's `AdminAPI.ReportController`
 //! (`lib/pleroma/web/admin_api/controllers/report_controller.ex`) over its
 //! `ReportView` (`lib/pleroma/web/admin_api/views/report_view.ex`), routed
@@ -64,13 +63,9 @@
 //!   `404` for a pair that names no note.
 //!
 //! `GET /api/v0/pleroma/reports` and `/api/v0/pleroma/reports/{id}` are
-//! the legacy mount of the same `index`/`show` pair — [`legacy_router`],
-//! nested at the root by [`crate::api`]. Pleroma serves those paths from
-//! its `PleromaAPI.ReportController`, the historical admin report ledger
-//! (its client counterpart is `POST /api/v1/reports`, [`crate::api::reports`],
-//! a different surface entirely); the ticket pins this pair to the same
-//! [`StaffUser`]-gated admin entities, so both mounts run the very same
-//! handlers.
+//! not served here: Pleroma's `PleromaAPI.ReportController` gives them to
+//! the reporter as their own filed reports, which is
+//! [`crate::api::reports`]'s `own_router`.
 //!
 //! The ids are this schema's `UUIDv7` text rather than Pleroma's integers
 //! (decision 4).
@@ -137,13 +132,4 @@ pub fn router() -> Router<AppState> {
         .route("/reports/{id}", get(show_report))
         .route("/reports/{id}/notes", post(add_note))
         .route("/reports/{report_id}/notes/{id}", delete(delete_note))
-}
-
-/// The legacy `/api/v0/pleroma` mount of the two admin reads, nested by
-/// [`crate::api`] at the root: the same handlers, the same gate, the same
-/// entities.
-pub fn legacy_router() -> Router<AppState> {
-    Router::new()
-        .route("/reports", get(list_reports))
-        .route("/reports/{id}", get(show_report))
 }

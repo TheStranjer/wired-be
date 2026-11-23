@@ -30,11 +30,9 @@ use super::SignedActivity;
 use crate::{
     config::Config,
     federation::signature::{SigningKey, sign_request},
-    http_client::HttpClient,
     models::user::{NewUser, User, insert},
     services::runtime_config,
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The origin test requests are addressed to and sign their `Host` as:
@@ -89,20 +87,7 @@ pub(super) fn test_state(pool: PgPool) -> AppState {
 /// The state under test over an explicit config (the size-cap test
 /// needs a small `inbox_max_bytes`).
 pub(super) fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    let hub = crate::streaming::hub::Hub::new(&pool);
-    AppState {
-        db: pool,
-        hub,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool, config)
 }
 
 /// The router under test: one `POST /inbox` gated by the extractor.
