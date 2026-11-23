@@ -227,6 +227,79 @@ mod tests {
         assert_eq!(purged.nickname, "alice", "the handle stays for the refs");
     }
 
+    /// After the job, the purged row renders as an `Account` with no
+    /// profile data beyond its handle: empty note, no fields or tags, the
+    /// default avatar and header, no background, and no roles.
+    #[tokio::test]
+    async fn the_handler_leaves_an_account_that_renders_no_profile() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = insert(
+            &pool,
+            &NewUser {
+                email: Some("carol@example.org".to_owned()),
+                password_hash: Some("hash-of-a-secret".to_owned()),
+                name: "Carol".to_owned(),
+                bio: "<p>carol's bio</p>".to_owned(),
+                raw_bio: "carol's bio".to_owned(),
+                fields: json!([{"name": "site", "value": "https://carol.example"}]),
+                raw_fields: json!([{"name": "site", "value": "https://carol.example"}]),
+                avatar_url: Some("https://cdn.example/carol.png".to_owned()),
+                banner_url: Some("https://cdn.example/carol-banner.png".to_owned()),
+                background_image_url: Some("https://cdn.example/carol-bg.png".to_owned()),
+                tags: vec!["force_unlisted".to_owned()],
+                is_admin: Flag::new(true),
+                is_moderator: Flag::new(true),
+                discoverable: Flag::new(true),
+                ..NewUser::local("carol", &local_ap_id(TEST_BASE_URL, "carol"))
+            },
+        )
+        .await
+        .expect("the populated fixture inserts");
+        let state = app_state(&pool);
+
+        run(&state, carol.id).await.expect("the delete job runs");
+
+        let reloaded = user::get_by_id(&pool, carol.id)
+            .await
+            .unwrap()
+            .expect("the row is kept for referential integrity");
+        let account = crate::entities::account::Account::from_user(&reloaded, &state.config);
+        assert_eq!(account.note, "", "the bio is gone");
+        assert!(account.fields.is_empty(), "the fields are gone");
+        assert_eq!(account.display_name, "", "the display name is gone");
+        assert_eq!(
+            account.avatar,
+            format!(
+                "{}{}",
+                state.config.frontend_base_url,
+                crate::entities::account::DEFAULT_AVATAR_PATH
+            ),
+            "the avatar is the default"
+        );
+        assert_eq!(
+            account.header,
+            format!(
+                "{}{}",
+                state.config.frontend_base_url,
+                crate::entities::account::DEFAULT_BANNER_PATH
+            ),
+            "the header is the default"
+        );
+        assert!(account.pleroma.tags.is_empty(), "the tags are gone");
+        assert!(
+            account.pleroma.background_image.is_none(),
+            "the background is gone"
+        );
+        assert!(!account.discoverable.0, "the account is not discoverable");
+        assert!(!account.pleroma.is_admin.0, "the admin role is gone");
+        assert!(
+            !account.pleroma.is_moderator.0,
+            "the moderator role is gone"
+        );
+        assert_eq!(account.acct, "carol", "the handle stays");
+    }
+
     /// The sweep's relationship half: both directions of every follow,
     /// the account's own likes and marks, its notifications in both
     /// roles, its lists and its memberships — while every row of other
