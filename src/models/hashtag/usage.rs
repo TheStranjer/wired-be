@@ -1,18 +1,15 @@
 //! One tag's usage: the per-UTC-day buckets that make up the tag
-//! endpoints' `history` ([`day_counts`]) and the page of live `public` root
-//! posts the tag's `Atom`/`RSS` feeds enumerate ([`public_posts`]).
+//! endpoints' `history` ([`day_counts`]).
 //!
-//! Both reads are of the tag's *live* statuses: a soft-deleted row's content
+//! The read is of the tag's *live* statuses: a soft-deleted row's content
 //! is gone, so its use of the tag counts nowhere here. [`day_counts`] is
-//! grouped by calendar day with the boundary pinned to UTC, and
-//! [`public_posts`] walks the `(hashtag_id, status_id DESC)` index that
-//! exists to serve exactly that page.
+//! grouped by calendar day with the boundary pinned to UTC.
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::status::Status};
+use crate::error::AppResult;
 
 /// The statement behind [`day_counts`]: the tag's live statuses bucketed by
 /// UTC calendar day. `AT TIME ZONE 'UTC'` makes the day boundary explicit
@@ -27,21 +24,6 @@ const DAY_COUNTS_SQL: &str = "SELECT (s.inserted_at AT TIME ZONE 'UTC')::date,
        WHERE sh.hashtag_id = $1 AND s.deleted_at IS NULL AND s.inserted_at >= $2
        GROUP BY 1
        ORDER BY 1";
-
-/// [`public_posts`]: the live `public` root posts carrying one tag, newest
-/// id first over the `(hashtag_id, status_id DESC)` index, optionally a
-/// keyset page older than the cursor. Replies and reblogs are out: the tag
-/// feed advertises what people said, not their boosts or thread replies.
-const PUBLIC_POSTS_SQL: &str = "SELECT s.* FROM statuses s
-   JOIN status_hashtags sh ON sh.status_id = s.id
-  WHERE sh.hashtag_id = $1
-    AND s.visibility = 'public'
-    AND s.deleted_at IS NULL
-    AND s.in_reply_to_id IS NULL
-    AND s.reblog_of_id IS NULL
-    AND ($2::uuid IS NULL OR s.id < $2)
-ORDER BY s.id DESC
-    LIMIT $3";
 
 /// The per-UTC-day usage of tag `hashtag_id`, oldest bucket first, for every
 /// live status created at or after `since`.
@@ -67,34 +49,6 @@ pub async fn day_counts(
     Ok(rows)
 }
 
-/// The newest `limit` live `public` root posts carrying tag `hashtag_id`,
-/// newest first (decision 4): the page the tag's `Atom`/`RSS` feeds
-/// ([`crate::api::feeds`]) enumerate.
-///
-/// This is the reverse lookup the `status_hashtags_hashtag_id_idx` index
-/// exists to serve. As in the account feed, replies and reblogs are out and
-/// only `public` visibility counts; `max_id`, when given, keys the page on
-/// the status id.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn public_posts(
-    pool: &PgPool,
-    hashtag_id: Uuid,
-    max_id: Option<Uuid>,
-    limit: i64,
-) -> AppResult<Vec<Status>> {
-    let statuses = sqlx::query_as::<_, Status>(PUBLIC_POSTS_SQL)
-        .bind(hashtag_id)
-        .bind(max_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-    Ok(statuses)
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Duration;
@@ -102,8 +56,7 @@ mod tests {
     use super::*;
     use crate::models::{
         hashtag::{find_or_create, get_by_name, test_support::*},
-        status::{self, NewStatus, Visibility},
-        user::{NewUser, insert as insert_user, local_ap_id},
+        status,
     };
 
     /// The `(day, uses, accounts)` buckets of tag `name` over the last week,
@@ -227,100 +180,6 @@ mod tests {
             wide.len(),
             3,
             "the thirty-day day plus the two inside the week"
-        );
-    }
-    /// `public_posts` reads the tag's feed page: the live, `public`, root
-    /// posts carrying the tag, newest id first, keyset-paged by `max_id`
-    /// and cut by `limit` — the other visibilities, replies, reblogs,
-    /// tombstones and untagged posts stay out, and a tag no status has
-    /// used answers empty rather than failing.
-    #[tokio::test]
-    async fn public_posts_pages_the_tagged_public_roots() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let author = insert_user(&pool, &NewUser::local("alice", &local_ap_id(BASE, "alice")))
-            .await
-            .expect("fixture user inserts");
-        let one = status::insert(&pool, BASE, &NewStatus::local(&author, "one #rust"))
-            .await
-            .expect("fixture status inserts");
-        let _unlisted = {
-            let mut new = NewStatus::local(&author, "unlisted #rust");
-            new.visibility = Visibility::Unlisted;
-            status::insert(&pool, BASE, &new)
-                .await
-                .expect("fixture status inserts")
-        };
-        let two = status::insert(&pool, BASE, &NewStatus::local(&author, "two #rust"))
-            .await
-            .expect("fixture status inserts");
-        let _reply = {
-            let mut new = NewStatus::local(&author, "in answer #rust");
-            new.in_reply_to_id = Some(one.id);
-            status::insert(&pool, BASE, &new)
-                .await
-                .expect("fixture status inserts")
-        };
-        let three = status::insert(&pool, BASE, &NewStatus::local(&author, "three #rust"))
-            .await
-            .expect("fixture status inserts");
-        let _untagged = status::insert(&pool, BASE, &NewStatus::local(&author, "plain talk"))
-            .await
-            .expect("fixture status inserts");
-        assert!(
-            status::soft_delete(&pool, two.id).await.unwrap().is_some(),
-            "one tagged public root is deleted"
-        );
-
-        let tag = get_by_name(&pool, "rust")
-            .await
-            .unwrap()
-            .expect("the tag row exists");
-        let page_ids = |statuses: Vec<Status>| {
-            statuses
-                .into_iter()
-                .map(|found| found.id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            page_ids(public_posts(&pool, tag.id, None, 20).await.unwrap()),
-            vec![three.id, one.id],
-            "newest first, the tombstone gone, the unlisted post and the \
-             reply out, and the untagged post never in"
-        );
-        assert_eq!(
-            page_ids(
-                public_posts(&pool, tag.id, Some(three.id), 20)
-                    .await
-                    .unwrap()
-            ),
-            vec![one.id],
-            "the cursor pages strictly older posts"
-        );
-        assert_eq!(
-            page_ids(public_posts(&pool, tag.id, None, 1).await.unwrap()),
-            vec![three.id],
-            "the limit cuts the page"
-        );
-    }
-
-    /// A tag with no statuses linked answers the empty page rather than
-    /// failing: what makes the feed route's "unknown tag is a valid empty
-    /// feed" the ordinary answer.
-    #[tokio::test]
-    async fn public_posts_of_an_unused_tag_is_empty() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let tag = find_or_create(&pool, "neverused")
-            .await
-            .unwrap()
-            .expect("the tag row is created");
-        assert!(
-            public_posts(&pool, tag.id, None, 20)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a tag no status carries has nothing to show"
         );
     }
 }

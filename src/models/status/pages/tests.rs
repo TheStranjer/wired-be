@@ -9,20 +9,6 @@ use crate::models::{
     user::User,
 };
 
-/// Inserts `text` as `author`'s reblog of `original`.
-async fn reblog(pool: &PgPool, author: &User, original: &Status, text: &str) -> Status {
-    insert(
-        pool,
-        BASE,
-        &NewStatus {
-            reblog_of_id: Some(original.id),
-            ..NewStatus::local(author, text)
-        },
-    )
-    .await
-    .expect("a reblog of a stored status inserts")
-}
-
 /// Inserts `text` as `author`'s status at the given visibility.
 async fn visible(pool: &PgPool, author: &User, text: &str, visibility: Visibility) -> Status {
     insert(
@@ -35,67 +21,6 @@ async fn visible(pool: &PgPool, author: &User, text: &str, visibility: Visibilit
     )
     .await
     .expect("a fixture status at any visibility inserts")
-}
-
-/// The ids `newest_public_posts` answers, newest first, only the live
-/// `public` roots of the asked-for author: the other visibilities, the
-/// replies, the reblogs and the tombstones stay out, another author's
-/// posts stay out, `max_id` keys the next page on the id (decision 4),
-/// and `limit` cuts the page.
-#[tokio::test]
-async fn newest_public_posts_reads_the_author_s_public_roots() {
-    let db = crate::test_db::test_db().await.expect("test database slot");
-    let pool = db.pool().clone();
-    let alice = user(&pool, "alice").await;
-    let bob = user(&pool, "bob").await;
-    let one = post(&pool, &alice, "one").await;
-    let _unlisted = visible(&pool, &alice, "unlisted", Visibility::Unlisted).await;
-    let _direct = visible(&pool, &alice, "direct", Visibility::Direct).await;
-    let _private = visible(&pool, &alice, "private", Visibility::Private).await;
-    let _localonly = visible(&pool, &alice, "local", Visibility::Local).await;
-    let _reply = reply(&pool, &alice, &one, "in answer").await;
-    let two = post(&pool, &alice, "two").await;
-    let _reblog = reblog(&pool, &alice, &two, "").await;
-    let three = post(&pool, &alice, "three").await;
-    let bob_post = post(&pool, &bob, "bob speaks").await;
-    assert!(
-        soft_delete(&pool, two.id).await.unwrap().is_some(),
-        "one public root is deleted"
-    );
-
-    assert_eq!(
-        ids(&newest_public_posts(&pool, alice.id, None, 20)
-            .await
-            .unwrap()),
-        vec![three.id, one.id],
-        "newest first; the unlisted, direct, private, local, reply, \
-             reblog and deleted rows are out, and bob's posts were never in"
-    );
-    assert_eq!(
-        ids(&newest_public_posts(&pool, alice.id, Some(three.id), 20)
-            .await
-            .unwrap()),
-        vec![one.id],
-        "the cursor page holds only the strictly older posts"
-    );
-    assert_eq!(
-        ids(&newest_public_posts(&pool, alice.id, None, 1).await.unwrap()),
-        vec![three.id],
-        "the limit cuts the page"
-    );
-    let carol = user(&pool, "carol").await;
-    assert!(
-        newest_public_posts(&pool, carol.id, None, 20)
-            .await
-            .unwrap()
-            .is_empty(),
-        "an author with nothing to show answers the empty page"
-    );
-    assert_eq!(
-        ids(&newest_public_posts(&pool, bob.id, None, 20).await.unwrap()),
-        vec![bob_post.id],
-        "the other author keeps their own single public root"
-    );
 }
 
 /// The outbox page answers the author's live `public` and `unlisted`

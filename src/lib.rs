@@ -14,7 +14,6 @@ pub mod error;
 pub mod extract;
 pub mod fallback;
 pub mod federation;
-pub mod feeds;
 pub mod http_client;
 pub mod jobs;
 pub mod mailer;
@@ -49,8 +48,8 @@ use crate::{
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
 /// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
 /// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/users/{nickname}`
-/// and `/internal/fetch` ([`api::activitypub`]) and its feed variants plus
-/// `/tags/{tag}` ([`api::feeds`]), `/.well-known` ([`api::well_known`]),
+/// and `/internal/fetch` ([`api::activitypub`]), `/.well-known`
+/// ([`api::well_known`]),
 /// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
@@ -83,7 +82,6 @@ pub fn app(state: AppState) -> Router {
             .route("/health", get(health))
             .merge(api::router(&state))
             .merge(api::activitypub::router(&state.config))
-            .merge(api::feeds::router())
             .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())
             .merge(api::password_reset::auth_router(&state))

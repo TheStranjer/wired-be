@@ -57,7 +57,7 @@ pub use links::{
 };
 pub use search::search_prefix;
 pub use tags::{find_or_create, get_by_name, upsert_many};
-pub use usage::{day_counts, public_posts};
+pub use usage::day_counts;
 
 /// One row of `hashtags`: one tag name, shared by every status that uses it.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
