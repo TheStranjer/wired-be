@@ -14,10 +14,12 @@
 //!    [`soft_delete_all_for_user`](crate::models::status::soft_delete_all_for_user)
 //!    batching 100 rows per statement and looping until a pass clears none
 //!    (the ticket's soft delete in batches of 100);
-//! 2. its follows, favourites, bookmarks, notifications, lists and media
-//!    rows go through the per-table `delete_all_for_user` writers, each
-//!    taking exactly what a hard delete of the user row would have
-//!    cascaded;
+//! 2. its follows go through
+//!    [`delete_all_for_user_with_counts`](crate::models::follow::delete_all_for_user_with_counts),
+//!    which also steps the counters of the live peers, and its favourites,
+//!    bookmarks, notifications, lists and media rows go through the
+//!    per-table `delete_all_for_user` writers, each taking exactly what a
+//!    hard delete of the user row would have cascaded;
 //! 3. its scheduled statuses are deleted and each one's pending
 //!    `scheduled_statuses.publish` job is cancelled, so nothing fires as the
 //!    deleted actor;
@@ -35,11 +37,8 @@
 //! account that was never ours: the inbound `Delete` of a peer's own actor
 //! ([`crate::federation::handlers::actor`]) marks the mirror inactive and
 //! queues it. The differences are the ones the mirror forces — there is no
-//! personal data to purge, no list to own and no upload to unlink, but the
-//! peers whose follow rows go are live accounts whose denormalised counters
-//! have to be stepped, so the follow half runs through
-//! [`delete_all_for_user_with_counts`](crate::models::follow::delete_all_for_user_with_counts)
-//! and the reaction half through
+//! personal data to purge, no list to own and no upload to unlink; the
+//! follow half is the same counted sweep, and the reaction half runs through
 //! [`delete_all_for_user`](crate::models::emoji_reaction::delete_all_for_user)
 //! (a local account's reactions leave with its row's cascade; a kept mirror
 //! row keeps them alive until this sweeps them).

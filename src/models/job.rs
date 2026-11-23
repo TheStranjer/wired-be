@@ -575,7 +575,10 @@ mod tests {
             "executing counts as live for the dedup index"
         );
 
-        complete(&pool, claimed.id, claimed.attempts).await.unwrap();
+        assert!(
+            complete(&pool, claimed.id, claimed.attempts).await.unwrap(),
+            "the claim completes its own attempt"
+        );
         let reopened = enqueue(
             &pool,
             NewJob {
@@ -612,15 +615,18 @@ mod tests {
             .expect("it is due at once");
         assert_eq!(first.id, job.id, "the flaky job was claimed");
 
-        fail(
-            &pool,
-            first.id,
-            first.attempts,
-            "boom",
-            Some(Duration::from_secs(0)),
-        )
-        .await
-        .unwrap();
+        assert!(
+            fail(
+                &pool,
+                first.id,
+                first.attempts,
+                "boom",
+                Some(Duration::from_secs(0)),
+            )
+            .await
+            .unwrap(),
+            "the first claim records its own failure"
+        );
         let retry = fetch(&pool, job.id).await;
         assert_eq!(
             retry.state, "retryable",
@@ -640,15 +646,18 @@ mod tests {
         assert_eq!(second.id, job.id, "the same job comes back");
         assert_eq!(second.attempts, 2, "the retry is the second attempt");
 
-        fail(
-            &pool,
-            second.id,
-            second.attempts,
-            "bang",
-            Some(Duration::from_secs(60)),
-        )
-        .await
-        .unwrap();
+        assert!(
+            fail(
+                &pool,
+                second.id,
+                second.attempts,
+                "bang",
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap(),
+            "the second claim records its own failure"
+        );
         let dead = fetch(&pool, job.id).await;
         assert_eq!(
             dead.state, "discarded",
@@ -662,7 +671,12 @@ mod tests {
 
         let after = claim_next(&pool, &["default"]).await.unwrap();
         assert!(after.is_none(), "a discarded job never returns");
+    }
 
+    #[tokio::test]
+    async fn fail_without_a_retry_delay_discards_at_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let doomed = enqueue(&pool, new_job("default", "doomed"))
             .await
             .unwrap()
@@ -672,9 +686,12 @@ mod tests {
             .unwrap()
             .expect("it is due at once");
         assert_eq!(third.id, doomed.id, "the doomed job was claimed");
-        fail(&pool, third.id, third.attempts, "fatal", None)
-            .await
-            .unwrap();
+        assert!(
+            fail(&pool, third.id, third.attempts, "fatal", None)
+                .await
+                .unwrap(),
+            "the doomed claim records its own failure"
+        );
         let dropped = fetch(&pool, doomed.id).await;
         assert_eq!(
             dropped.state, "discarded",
@@ -718,9 +735,12 @@ mod tests {
             .unwrap();
         assert_eq!(fresh, 0, "a lock younger than the limit is not stuck");
 
-        complete(&pool, claimed_one.id, claimed_one.attempts)
-            .await
-            .unwrap();
+        assert!(
+            complete(&pool, claimed_one.id, claimed_one.attempts)
+                .await
+                .unwrap(),
+            "the first claim completes its own attempt"
+        );
         let rescued = rescue_stuck(&pool, Duration::from_secs(0)).await.unwrap();
         assert_eq!(rescued, 1, "only the still-executing job is rescued");
 
@@ -831,15 +851,18 @@ mod tests {
             0,
             "an executing job is in a worker's hands, not this cancel's"
         );
-        fail(
-            &pool,
-            running.id,
-            claimed.attempts,
-            "boom",
-            Some(Duration::from_secs(60)),
-        )
-        .await
-        .unwrap();
+        assert!(
+            fail(
+                &pool,
+                running.id,
+                claimed.attempts,
+                "boom",
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap(),
+            "the running claim records its own failure"
+        );
         assert_eq!(
             cancel_pending(&pool, "sched/2").await.unwrap(),
             0,
@@ -848,11 +871,12 @@ mod tests {
         let waiting = fetch(&pool, running.id).await;
         assert_eq!(waiting.state, "retryable", "the row and its key stand");
 
-        sqlx::query("UPDATE jobs SET run_at = now() - interval '1 second' WHERE id = $1")
-            .bind(running.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        let _backdated =
+            sqlx::query("UPDATE jobs SET run_at = now() - interval '1 second' WHERE id = $1")
+                .bind(running.id)
+                .execute(&pool)
+                .await
+                .unwrap();
         let again = claim_next(&pool, &["scheduled"])
             .await
             .unwrap()

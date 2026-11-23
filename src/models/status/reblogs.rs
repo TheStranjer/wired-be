@@ -66,8 +66,8 @@ const REBLOGGED_IDS_SQL: &str = "SELECT reblog_of_id FROM statuses
 /// [`reblogger_page`]: the accounts that reblogged one original, each
 /// entry led by the id of the reblog row behind it — the id the page keys
 /// on. The text stops where its one placeholder belongs, because that is
-/// where [`reblogger_page`] pushes its bind; the live-row filter and the
-/// keyset then run on the reblog row id `s.id`.
+/// where [`reblogger_page`] pushes its bind; the live-row and distributable
+/// visibility filters and the keyset then run on the reblog row `s`.
 pub(super) const REBLOGGERS_PAGE_SQL: &str = "SELECT s.id AS reblog_id, u.* FROM statuses s
      JOIN users u ON u.id = s.user_id
       WHERE s.reblog_of_id = ";
@@ -208,7 +208,10 @@ pub async fn reblogged_status_ids(
 /// `announcements` list): the page keys on the *reblog row* id, so the
 /// endpoint's `max_id`/`min_id`/`since_id` cursors and its `Link` header
 /// carry reblog row ids, not account ids. A tombstoned reblog is off the
-/// page — a withdrawn boost names no reblogger. Who may see the list is the
+/// page — a withdrawn boost names no reblogger. Only distributable reblogs
+/// (`public` or `unlisted`) are listed, as Mastodon's `distributable_visibility`
+/// does: a followers-only or direct boost is its author's business, and no
+/// per-viewer follower check is attempted. Who may see the *original* is the
 /// endpoint's gate (the shared status visibility check), not this query's.
 ///
 /// # Errors
@@ -225,6 +228,7 @@ pub async fn reblogger_page(
     // it keeps the statement from having an unused result (decision 14).
     let _bound: &mut _ = builder.push_bind(original_id);
     let _live: &mut _ = builder.push(" AND s.deleted_at IS NULL");
+    let _distributable: &mut _ = builder.push(" AND s.visibility IN ('public','unlisted')");
     page.apply_keyset(&mut builder, "s.id");
     let entries = builder
         .build_query_as::<ReblogPageEntry>()

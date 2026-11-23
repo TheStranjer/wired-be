@@ -17,16 +17,18 @@
 //! text that is no id and an id that names no row are the same 404
 //! `{"error":"Record not found"}`.
 //!
-//! The controller runs the `admin_api` pipeline, whose gate plug is
-//! `UserIsStaffPlug`, and its `OAuthScopesPlug` pair: `admin:read:accounts`
-//! on the reads, `admin:write:accounts` on the writes. The reads keep
-//! Pleroma's staff reading — an admin or a moderator, [`StaffUser`] — while
-//! the ticket pins the five writes to [`AdminUser`], the admin role alone:
-//! moderation is the sharpest edge in this API and the console that owns it
+//! The controller's `OAuthScopesPlug` pair is `admin:read:accounts` on the
+//! reads and `admin:write:accounts` on the writes. All eight routes take
+//! [`AdminUser`], the admin role alone. Pleroma routes the three reads
+//! through `:require_privileged_role_users_read`, a privilege only
+//! `admin_privileges` holds, and the entity they answer carries every
+//! account's `email` and `ip`s — the same personal data the Pleroma console's
+//! admin-only `/users` read serves, so the two URLs share one gate.
+//! Moderation is the sharpest edge in this API and the console that owns it
 //! is an admin's. A moderator's otherwise valid token is therefore the 403
-//! `"User is not an admin."` on all five. Each handler's first statement is
-//! the scope half of the same pipeline: [`StaffUser::require`] with the
-//! `admin:read` class, or [`AdminUser::require`] with `admin:write`, both on
+//! `"User is not an admin."` on all eight. Each handler's first statement is
+//! the scope half of the same pipeline: [`AdminUser::require`] with the
+//! `admin:read` class on the reads or `admin:write` on the writes, both on
 //! the `accounts` area, so `admin:read` and `admin:read:accounts` read,
 //! `admin:write` and `admin:write:accounts` write, and nothing else does.
 //!
@@ -135,8 +137,6 @@
 //!   `type` at all the 422 `"Validation failed: Type is required"` its
 //!   `required: [:type]` asks for.
 //!
-//! [`StaffUser`]: crate::auth::admin::StaffUser
-//! [`StaffUser::require`]: crate::auth::admin::StaffUser::require
 //! [`AdminUser`]: crate::auth::admin::AdminUser
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
 //! [`AdminAccount`]: crate::entities::mastodon_admin::AdminAccount
@@ -170,7 +170,7 @@ use self::{
     writes::{approve_account, delete_account, enable_account, reject_account},
 };
 
-/// The read endpoint class of [`StaffUser::require`].
+/// The read endpoint class of [`AdminUser::require`].
 const CLASS_READ: &str = "read";
 /// The write endpoint class of [`AdminUser::require`]: every one of the five
 /// moderation actions is gated by it, the three reads by [`CLASS_READ`]

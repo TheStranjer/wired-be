@@ -35,7 +35,9 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, is_true, normalize_tag, push_visibility, timeline_response},
+    api::helpers::{
+        is_true, normalize_tag, push_visibility, timeline_response, visible_account_or_404,
+    },
     auth::MaybeAuthUser,
     entities::status::Status as StatusEntity,
     error::AppResult,
@@ -110,7 +112,7 @@ pub(super) async fn list_statuses(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     auth.require_user_scope(READ_STATUSES)?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0;
     require_profile_read(&state.config, viewer.as_ref(), &target)?;
     let query = StatusesParams::parse(uri.query()).into_timeline(target.id, viewer, page);

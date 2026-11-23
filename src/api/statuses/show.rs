@@ -189,7 +189,7 @@ pub(super) async fn get_status_card(
     Ok(Json(
         cards
             .get(&row.id)
-            .and_then(stored_card_json)
+            .and_then(|card| stored_card_json(card, &state.config))
             .unwrap_or(Value::Null),
     ))
 }

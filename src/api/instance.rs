@@ -65,7 +65,7 @@ mod test_support;
 mod v1;
 mod v2;
 
-pub use domain_blocks::sha256_hex;
+pub use domain_blocks::{sha256_hex, sha256_hex_bytes};
 use handlers::{
     show_activity, show_domain_blocks, show_extended_description, show_instance, show_instance_v2,
     show_peers, show_rules, show_translation_languages,

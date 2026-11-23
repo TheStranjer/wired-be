@@ -214,9 +214,12 @@ const COULD_NOT_FETCH: &str = "Could not fetch the pack list";
 /// be fetched, read or extracted within
 /// [`MAX_PACK_ARCHIVE_BYTES`](emoji_packs::MAX_PACK_ARCHIVE_BYTES).
 const COULD_NOT_DOWNLOAD: &str = "Could not download the pack archive";
+/// The 400 for an archive whose bytes do not hash to the SHA-256 its
+/// listing declared (Pleroma's `:invalid_checksum`).
+const INVALID_CHECKSUM: &str = "Invalid pack checksum";
 /// 400 body for a remote pack that shares no files and names no
-/// fallback archive (Pleroma's `fetch_pack_info` refusal, the ticket's
-/// exact wording).
+/// fallback archive, or declares no SHA-256 for the one it has (Pleroma's
+/// `fetch_pack_info` refusal, the ticket's exact wording).
 const PACK_NOT_SHAREABLE: &str =
     "The pack was not set as shared and there is no fallback src to download from";
 /// The remote path of an instance's pack listing.

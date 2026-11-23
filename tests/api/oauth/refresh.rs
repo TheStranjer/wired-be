@@ -1,7 +1,8 @@
 //! The `refresh_token` grant over `POST /oauth/token`: the rotation into
 //! a fresh pair with the same user and scopes verbatim, the old access
 //! and refresh credentials left dead, expired access tokens still
-//! refreshable, and the 400 "Invalid credentials" for a foreign app's, an
+//! refreshable within the grace window, a refresh token redeemable only
+//! once even under a race, and the 400 "Invalid credentials" for a foreign app's, an
 //! unknown or a deactivated owner's refresh token, with its own "Missing
 //! parameter: `refresh_token`" refusal.
 
@@ -197,6 +198,109 @@ async fn an_expired_access_token_is_still_refreshable() {
     let access = body["access_token"].as_str().expect("a token string");
     let alive = probe_user_endpoint(&http, access).await;
     assert_eq!(alive.status, StatusCode::OK, "and it authenticates");
+}
+
+/// Moves the pair `id`'s `valid_until` `days` days into the past.
+async fn lapse_days_ago(pool: &PgPool, id: Uuid, days: i32) {
+    let outcome = sqlx::query(
+        "UPDATE oauth_tokens SET valid_until = now() - make_interval(days => $2) WHERE id = $1",
+    )
+    .bind(id)
+    .bind(days)
+    .execute(pool)
+    .await
+    .expect("the back-dating runs");
+    assert_eq!(outcome.rows_affected(), 1, "the update hit the token row");
+}
+
+/// The refresh token lives only [`oauth_token::REFRESH_GRACE`] past the
+/// pair's `valid_until`, whether or not the sweep has run: a pair that lapsed
+/// eight days ago is the shared 400 "Invalid credentials" (and its row is
+/// left alone), one that lapsed six days ago still rotates.
+#[tokio::test]
+async fn the_refresh_token_works_only_within_the_grace_window() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (user, app) = fixtures(&pool, "gwen", "read").await;
+    let stale = common::create_token(&pool, &user, &app, "read").await;
+    let recent = common::create_token(&pool, &user, &app, "read").await;
+    lapse_days_ago(&pool, stale.id, 8).await;
+    lapse_days_ago(&pool, recent.id, 6).await;
+    let http = common::test_app(pool.clone());
+
+    let late = post_json(&http, &refresh_body(&app, &stale.refresh_token)).await;
+    assert_eq!(
+        late.status,
+        StatusCode::BAD_REQUEST,
+        "past the grace: a 400"
+    );
+    assert_eq!(
+        error_text(&late),
+        "Invalid credentials",
+        "the shared refusal"
+    );
+    assert_no_store(&late);
+    assert_eq!(token_rows(&pool, &stale.token).await, 1, "nothing deleted");
+    assert_eq!(token_count(&pool).await, 2, "and nothing minted");
+
+    let in_time = post_json(&http, &refresh_body(&app, &recent.refresh_token)).await;
+    assert_eq!(
+        in_time.status,
+        StatusCode::OK,
+        "six days past valid_until is inside the window"
+    );
+    assert_eq!(token_rows(&pool, &recent.token).await, 0, "old row gone");
+    assert_eq!(token_count(&pool).await, 2, "the stale row and the new one");
+}
+
+/// A refresh token is single-use: the first of two sequential refreshes
+/// with it is a 200, the second a 400, and exactly one new pair exists.
+#[tokio::test]
+async fn a_refresh_token_redeems_once() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (user, app) = fixtures(&pool, "hal", "read").await;
+    let old = common::create_token(&pool, &user, &app, "read").await;
+    let http = common::test_app(pool.clone());
+
+    let first = post_json(&http, &refresh_body(&app, &old.refresh_token)).await;
+    assert_eq!(first.status, StatusCode::OK, "the first redemption works");
+    let second = post_json(&http, &refresh_body(&app, &old.refresh_token)).await;
+    assert_eq!(
+        second.status,
+        StatusCode::BAD_REQUEST,
+        "the second finds the token spent"
+    );
+    assert_eq!(error_text(&second), "Invalid credentials", "shared 400");
+    assert_eq!(token_count(&pool).await, 1, "one pair minted, no more");
+}
+
+/// Two refreshes with one token racing each other: exactly one wins a pair,
+/// the other is the shared 400, and one row is left.
+#[tokio::test]
+async fn concurrent_refreshes_with_one_token_mint_one_pair() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (user, app) = fixtures(&pool, "ivo", "read").await;
+    let old = common::create_token(&pool, &user, &app, "read").await;
+    let http = common::test_app(pool.clone());
+    let body = refresh_body(&app, &old.refresh_token);
+
+    let (left, right) = tokio::join!(post_json(&http, &body), post_json(&http, &body));
+
+    let mut statuses = [left.status, right.status];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::BAD_REQUEST],
+        "one redemption wins and the other is refused"
+    );
+    assert_eq!(token_count(&pool).await, 1, "a single new pair exists");
+    assert_eq!(
+        token_rows(&pool, &old.token).await,
+        0,
+        "the old one is gone"
+    );
 }
 
 /// A refresh token issued to another application is the shared 400
