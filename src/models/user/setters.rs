@@ -6,7 +6,7 @@ use serde_json::Value;
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
-use super::CountDelta;
+use super::{CountDelta, User};
 use crate::error::AppResult;
 
 /// Adds `delta` to the denormalised counters of user `id` atomically,
@@ -208,6 +208,36 @@ pub async fn set_email_notifications(pool: &PgPool, id: Uuid, enabled: bool) -> 
         .await
         .map(drop)?;
     Ok(())
+}
+
+/// The `UPDATE` behind [`set_nickname`]: renames user `id` unless another
+/// row already holds the nickname (the same ownership probe
+/// [`upsert_remote_user`](crate::federation::remote_actor::upsert_remote_user)
+/// runs), in one statement so the check and the write cannot interleave.
+const SET_NICKNAME_SQL: &str = "UPDATE users
+      SET nickname = $2, updated_at = now()
+    WHERE id = $1
+      AND NOT EXISTS (SELECT 1 FROM users WHERE nickname = $2::citext AND id <> $1)
+RETURNING *";
+
+/// Renames user `id` to `nickname` and answers the updated row.
+///
+/// Used when a remote mirror is vouched for under a handle other than
+/// `preferredUsername@host` (a split-domain account). The rename is refused
+/// when a different row already holds the nickname: the answer is then
+/// [`None`], the same as for an unknown `id`, and nothing changes.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_nickname(pool: &PgPool, id: Uuid, nickname: &str) -> AppResult<Option<User>> {
+    let user = sqlx::query_as::<_, User>(SET_NICKNAME_SQL)
+        .bind(id)
+        .bind(nickname)
+        .fetch_optional(pool)
+        .await?;
+    Ok(user)
 }
 
 #[cfg(test)]
@@ -443,5 +473,35 @@ mod tests {
         set_email_notifications(&pool, new_id(), false)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_nickname_renames_unless_another_row_holds_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+        let bob = insert(&pool, &local_new("bob")).await.unwrap();
+
+        let renamed = set_nickname(&pool, alice.id, "alice@mock.example")
+            .await
+            .unwrap()
+            .expect("a free nickname is taken");
+        assert_eq!(renamed.nickname, "alice@mock.example", "the row answers");
+        assert_eq!(fetch(&pool, alice.id).await.nickname, "alice@mock.example");
+
+        let refused = set_nickname(&pool, bob.id, "ALICE@mock.example")
+            .await
+            .unwrap();
+        assert!(refused.is_none(), "another row holds it, case folded");
+        assert_eq!(fetch(&pool, bob.id).await.nickname, "bob", "bob untouched");
+
+        let same = set_nickname(&pool, alice.id, "alice@mock.example")
+            .await
+            .unwrap();
+        assert!(same.is_some(), "a row may keep its own nickname");
+        let unknown = set_nickname(&pool, new_id(), "ghost@mock.example")
+            .await
+            .unwrap();
+        assert!(unknown.is_none(), "an unknown id matches no row");
     }
 }

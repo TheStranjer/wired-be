@@ -185,7 +185,9 @@ pub(super) async fn serve(app: Router) -> (JoinHandle<()>, String) {
 /// scheme-and-authority override.
 pub(super) async fn resolve_against(app: Router, acct: &str) -> Result<String, WebfingerError> {
     let (server, base) = serve(app).await;
-    let result = resolve_acct_with_base(&client(), acct, Some(&base)).await;
+    let result = resolve_acct_with_base(&client(), acct, Some(&base))
+        .await
+        .map(|resolved| resolved.actor);
     server.abort();
     result
 }

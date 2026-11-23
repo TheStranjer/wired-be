@@ -63,8 +63,8 @@ pub use new_user::NewUser;
 pub use profile::{PleromaPrefs, ProfileFields, update_profile};
 pub use record::User;
 pub use setters::{
-    mark_moved, set_also_known_as, set_email_notifications, set_moved_to, set_preferred_frontend,
-    set_settings_store, update_counts,
+    mark_moved, set_also_known_as, set_email_notifications, set_moved_to, set_nickname,
+    set_preferred_frontend, set_settings_store, update_counts,
 };
 
 /// `actor_type` a [`NewUser`] starts with: the `ActivityPub` default actor

@@ -65,7 +65,7 @@ pub use self::{acct::split_acct, resolve::resolve_acct};
 
 pub(crate) use self::{
     acct::strip_finger_prefixes,
-    resolve::{finger_with_base, resolve_acct_with_base},
+    resolve::{Resolved, finger_with_base, resolve_acct_with_base},
 };
 
 /// Response body cap for every `WebFinger` exchange (256 KiB): JRD and XRD
