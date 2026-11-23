@@ -80,9 +80,13 @@ pub const NEW_PACK_MANIFEST: &str = r#"{"pack": {}, "files": {}}"#;
 /// Largest pack archive [`extract_pack_archive`] installs, fetched or
 /// uploaded.
 ///
-/// The ticket's 20 MiB. One fetched entry is capped at the same size,
-/// so no single file can inflate out of the archive's own budget.
+/// The ticket's 20 MiB. One unpacked entry is capped at the same size;
+/// [`MAX_PACK_EXTRACTED_BYTES`] bounds all entries together.
 pub const MAX_PACK_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
+/// Most bytes all entries of one pack archive may inflate to together.
+/// [`extract_pack_archive`] refuses the archive with
+/// [`ARCHIVE_TOO_LARGE`] before writing past it.
+pub const MAX_PACK_EXTRACTED_BYTES: usize = 100 * 1024 * 1024;
 /// Largest number of entries a pack archive may hold (the ticket's
 /// 2000); one more refuses the whole archive.
 pub const MAX_PACK_ARCHIVE_ENTRIES: usize = 2000;
@@ -98,6 +102,9 @@ pub const ARCHIVE_UNREADABLE: &str = "Could not read the pack archive";
 /// 400 body for one entry whose unpacked bytes pass
 /// [`MAX_PACK_ARCHIVE_BYTES`] — the archive bomb this cap defuses.
 pub const ARCHIVE_ENTRY_TOO_LARGE: &str = "Pack archive contains an oversized file";
+/// 400 body for an archive whose entries together unpack past
+/// [`MAX_PACK_EXTRACTED_BYTES`].
+pub const ARCHIVE_TOO_LARGE: &str = "Pack archive unpacks to too much data";
 /// The image media types an emoji file may be, read from the bytes
 /// themselves.
 ///
