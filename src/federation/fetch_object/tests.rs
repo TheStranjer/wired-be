@@ -224,6 +224,23 @@ async fn serve_fixed(State(document): State<Value>) -> Response {
     json_response(&document)
 }
 
+/// A one-route server whose exact `path` answers a 301 to `location`.
+fn redirect_app(path: &str, location: String) -> Router {
+    let exact = path.to_owned();
+    Router::new()
+        .route(&exact, get(serve_redirect))
+        .with_state(location)
+}
+
+/// [`redirect_app`]'s handler.
+async fn serve_redirect(State(location): State<String>) -> Response {
+    (
+        StatusCode::MOVED_PERMANENTLY,
+        [(header::LOCATION, location)],
+    )
+        .into_response()
+}
+
 /// One fixed document plus the peer counter its deliveries run up.
 #[derive(Clone)]
 struct ServedDoc {

@@ -18,9 +18,12 @@
 //! request is refused with 429 `{"error":"Throttled"}` (decision 8's
 //! shape, Pleroma's wording) and a `Retry-After`.
 //!
-//! The client IP is the socket peer — [`serve`] wires
+//! The client IP is the socket peer's address — [`serve`] wires
 //! `into_make_service_with_connect_info` so [`ConnectInfo`] carries it.
-//! The leftmost `X-Forwarded-For` entry is honored *only* when
+//! The source port is not part of the key (each connection draws a new
+//! one, which would give every connection its own window), and an IPv6
+//! client is keyed by its /64 prefix so one host cannot rotate through its
+//! own prefix. The leftmost `X-Forwarded-For` entry is honored *only* when
 //! `TRUST_PROXY_HEADERS=true` (off by default), and only then may a client
 //! name itself into someone else's window. A limited route reached without
 //! a socket peer (an in-process test request carrying no `ConnectInfo`)

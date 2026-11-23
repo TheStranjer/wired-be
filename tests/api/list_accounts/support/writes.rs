@@ -308,3 +308,58 @@ async fn unfollowing_prunes_the_followers_lists() {
         "while carol's membership of bob is alice's not to prune"
     );
 }
+
+/// How many jobs of any kind the queue holds.
+async fn queued_jobs(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+        .fetch_one(pool)
+        .await
+        .expect("the jobs count reads")
+}
+
+/// A list is its owner's private bookmark: adding a followed REMOTE account
+/// to it, and removing it again (or "removing" a remote account that was
+/// never a member), queues no job — no `federator.publish`, nothing at all.
+#[tokio::test]
+async fn list_membership_writes_queue_no_federation() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let scene = Scene::new(&pool).await;
+    let remote = common::create_remote_user(&pool, "remote", "peer.example").await;
+    let stranger = common::create_remote_user(&pool, "stranger", "peer.example").await;
+    let pending = follow::follow(&pool, TEST_BASE_URL, &scene.alice, &remote)
+        .await
+        .expect("the fixture follow records");
+    let _granted = follow::accept(&pool, pending.id)
+        .await
+        .expect("the fixture grants the follow");
+    let app = common::test_app(pool.clone());
+    assert_eq!(queued_jobs(&pool).await, 0, "the fixtures queue nothing");
+
+    added(&app, &scene.token, scene.list.id, &[remote.id]).await;
+    assert_eq!(
+        accts(&listed(&app, &scene.token, scene.list.id, "limit=0").await),
+        ["remote@peer.example"],
+        "the remote account is a member"
+    );
+    assert_eq!(
+        queued_jobs(&pool).await,
+        0,
+        "adding a remote member queues nothing"
+    );
+
+    let dropped = remove_json(
+        &app,
+        &scene.token,
+        scene.list.id,
+        account_ids(&[remote.id, stranger.id]),
+    )
+    .await;
+    common::assert_answer(&dropped, StatusCode::OK, "the removal is written");
+    assert_members(&app, &scene, &[], "the member is gone").await;
+    assert_eq!(
+        queued_jobs(&pool).await,
+        0,
+        "removing a remote member, or a remote non-member, queues nothing"
+    );
+}

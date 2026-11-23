@@ -33,9 +33,8 @@
 //! - the `Move` and moved-document `Update` behind
 //!   `POST /api/v1/accounts/move`, the forwarded `Flag` behind
 //!   `POST /api/v1/accounts/{id}/flag` spoken by the instance actor and
-//!   filed into the admin queue, and the `Add` / `Remove` behind a
-//!   list-membership write, `target` the list's curated inbox and the
-//!   member's personal inbox the only recipient;
+//!   filed into the admin queue, and the silence of a list-membership
+//!   write: a list is private, so no `Add` / `Remove` reaches the member;
 //! - a `500` retried on the queue's own backoff and a `503` at its
 //!   `Retry-After` moment, both resending the exact same signed bytes; a
 //!   `410 Gone` discarded for good, its host marked unreachable so later

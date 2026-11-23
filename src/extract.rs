@@ -126,7 +126,7 @@ where
     async fn from_request(req: Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
         let query = req.uri().query().unwrap_or_default().to_owned();
         let body = body_value(req).await?;
-        Ok(Self(into_params(merge_over(&parse_form(&query), body))?))
+        Ok(Self(into_params(merge_over(&parse_form(&query)?, body))?))
     }
 }
 
@@ -163,7 +163,7 @@ fn parse_body(text: &str, content_type: &str) -> Result<Value, AppError> {
     }
     let media_type = media_type_of(content_type);
     if media_type == FORM_MIME {
-        Ok(parse_form(text))
+        parse_form(text)
     } else if media_type == JSON_MIME {
         serde_json::from_str(text)
             .map_err(|err| AppError::BadRequest(format!("{MALFORMED_JSON}{err}")))

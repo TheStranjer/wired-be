@@ -70,6 +70,7 @@ mod run;
 #[cfg(test)]
 mod test_support;
 
+pub(in crate::jobs) use self::purge::sweep_archive_file;
 pub use self::{
     archive::{BackupArchive, build},
     purge::handle_purge,

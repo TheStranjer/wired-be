@@ -13,7 +13,8 @@
 //! the endpoint ticket that stores the row and [schedules](schedule) its fire.
 //!
 //! Both handlers drop a row that can never fire — an author the database no
-//! longer has, a create the service refuses (a parent since deleted, media
+//! longer has or whose account can no longer post (deactivated, deleted or
+//! awaiting approval, the states the API refuses at token resolution), a create the service refuses (a parent since deleted, media
 //! claimed by a live status meanwhile, blank text) — and complete: the
 //! schedule is spent, and a retry would only drop it again after another
 //! round of backoff. Every database or internal failure keeps the row for
@@ -243,6 +244,14 @@ async fn publish_one(state: &AppState, row: &ScheduledStatus) -> Result<(), JobE
         Ok(None) => return drop_row(state, row, "the scheduling account is gone").await,
         Err(err) => return Err(retry(&err)),
     };
+    if author.deleted_at.is_some()
+        || matches!(
+            author.account_status(),
+            user::AccountStatus::Deactivated | user::AccountStatus::ApprovalPending
+        )
+    {
+        return drop_row(state, row, "the scheduling account can no longer post").await;
+    }
     publish_params(state, row, &author, params).await
 }
 
@@ -469,6 +478,8 @@ mod tests {
         .await
         .expect("a fixture upload inserts")
     }
+
+    mod barred_authors;
 
     /// The handler's attempt info: the first of however many the job gets.
     const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {

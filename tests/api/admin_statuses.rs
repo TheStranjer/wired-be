@@ -29,16 +29,19 @@
 //!   the one domain's (`local` being this instance's own authors) under the
 //!   same filters and window, the total the whole set the filters select,
 //!   and the unknown nickname the same 404;
-//! - every route sits behind [`StaffUser`] — a moderator passes where a
-//!   regular account is refused — plus its scope: `admin:read:statuses` on
-//!   the four reads, `admin:write:statuses` on the two writes, another
-//!   admin area's grant, a bare `read` and an app-only token all refused.
+//! - the four reads sit behind [`AdminUser`] (Pleroma's `messages_read`,
+//!   admins only) and the two writes behind [`StaffUser`] (`messages_delete`,
+//!   which moderators hold) — a moderator is refused every read and keeps
+//!   both writes — plus the scope: `admin:read:statuses` on the four reads,
+//!   `admin:write:statuses` on the two writes, another admin area's grant, a
+//!   bare `read` and an app-only token all refused.
 //!
 //! Statuses are seeded through [`wired_be::models::status`] directly (the
 //! posting endpoint is `statuses.rs`'s business), and the newest-first
 //! expectations read the stored `ORDER BY s.id DESC` order back, so nothing
 //! depends on which millisecond a fixture's `UUIDv7` landed in.
 //!
+//! [`AdminUser`]: wired_be::auth::admin::AdminUser
 //! [`StaffUser`]: wired_be::auth::admin::StaffUser
 //! [`Status`]: wired_be::entities::status::Status
 //! [`Account`]: wired_be::entities::account::Account

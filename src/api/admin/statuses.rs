@@ -10,12 +10,16 @@
 //! (`lib/pleroma/web/admin_api/controllers/instance_controller.ex`), all
 //! three routed in `lib/pleroma/web/router.ex` under the `admin_api`
 //! pipeline and its `OAuthScopesPlug` grants `admin:read:statuses` on the
-//! reads and `admin:write:statuses` on the two writes. That pipeline's role
-//! plug is `UserIsStaffPlug`, which is why every route here takes the
-//! [`StaffUser`] extractor — a moderator is Pleroma's expected caller of
-//! this controller — and why the scope half of the gate is the
-//! [`StaffUser::require`] call each handler makes first, on the area
-//! `statuses`.
+//! reads and `admin:write:statuses` on the two writes. The role half of the
+//! gate follows Pleroma's privileges: the four reads sit behind
+//! `:require_privileged_role_messages_read`, a privilege the defaults give
+//! to admins only (`admin_privileges` lists `:messages_read`,
+//! `moderator_privileges` does not), so they take the [`AdminUser`]
+//! extractor and a moderator is refused — otherwise every moderator could
+//! read every direct message on the instance. The two writes are
+//! `:messages_delete`, which moderators hold, so they take the
+//! [`StaffUser`] extractor. The scope half of the gate is the `require` call
+//! each handler makes first, on the area `statuses`.
 //!
 //! The entities are the ordinary client-API [`Status`], the way Pleroma's
 //! `AdminAPI.StatusView` is itself a thin `defdelegate` over
@@ -78,6 +82,8 @@
 //! (decision 4), and the `page`/`page_size` window is read with the lenient
 //! rules [`super`] states for every admin listing.
 //!
+//! [`AdminUser`]: crate::auth::admin::AdminUser
+//! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
 //! [`StaffUser`]: crate::auth::admin::StaffUser
 //! [`StaffUser::require`]: crate::auth::admin::StaffUser::require
 //! [`Account`]: crate::entities::account::Account
@@ -103,7 +109,7 @@ use sqlx::PgPool;
 use tracing::debug;
 
 use crate::{
-    auth::admin::StaffUser,
+    auth::admin::{AdminUser, StaffUser},
     entities::{admin::AdminStatusPage, status::Status},
     error::{AppError, AppResult},
     extract::{ApiBody, flex},
@@ -117,7 +123,7 @@ use crate::{
     util::id::parse_id,
 };
 
-/// The read endpoint class of [`StaffUser::require`].
+/// The read endpoint class of [`AdminUser::require`].
 const CLASS_READ: &str = "read";
 /// The write endpoint class of [`StaffUser::require`].
 const CLASS_WRITE: &str = "write";
@@ -169,16 +175,16 @@ pub fn router() -> Router<AppState> {
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:read` gate; [`AppError::BadRequest`] for a `godmode`,
 /// `local_only` or `with_reblogs` that is no boolean; [`AppError::Database`]
 /// from the listing read.
 async fn list_statuses(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     Query(query): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Vec<Status>>> {
-    staff.require(CLASS_READ, AREA_STATUSES)?;
+    admin.require(CLASS_READ, AREA_STATUSES)?;
     let params = list_params(&query)?;
     let rows = status::admin::list(&state.db, &params).await?;
     debug!(
@@ -188,7 +194,7 @@ async fn list_statuses(
         with_reblogs = params.with_reblogs.get(),
         "admin statuses listed"
     );
-    Ok(Json(rendered(&state, &staff.0, &rows).await?))
+    Ok(Json(rendered(&state, &admin.0, &rows).await?))
 }
 
 /// `GET /api/v1/pleroma/admin/statuses/{id}` — Pleroma's `show`: the one
@@ -197,19 +203,19 @@ async fn list_statuses(
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:read` gate; [`AppError::RouteNotFound`] for a malformed or
 /// unknown id (see [`live_status`]) and for the row the render cannot answer;
 /// [`AppError::Database`] from the two reads.
 async fn show_status(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     Path(raw): Path<String>,
 ) -> AppResult<Json<Status>> {
-    staff.require(CLASS_READ, AREA_STATUSES)?;
+    admin.require(CLASS_READ, AREA_STATUSES)?;
     let row = live_status(&state.db, &raw).await?;
     debug!(status = %row.id, "admin status shown");
-    one(&state, &staff.0, &row).await.map(Json)
+    one(&state, &admin.0, &row).await.map(Json)
 }
 
 /// `PUT /api/v1/pleroma/admin/statuses/{id}` — Pleroma's `update`: the two
@@ -300,17 +306,17 @@ async fn delete_status(
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:read` gate; [`AppError::RouteNotFound`] for text that is
 /// no stored nickname and no id; [`AppError::BadRequest`] for an unusable
 /// filter; [`AppError::Database`] from the two reads.
 async fn list_user_statuses(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     Query(query): Query<HashMap<String, String>>,
     Path(raw): Path<String>,
 ) -> AppResult<Json<AdminStatusPage>> {
-    staff.require(CLASS_READ, AREA_STATUSES)?;
+    admin.require(CLASS_READ, AREA_STATUSES)?;
     let target = user::admin::get_by_nickname_or_id(&state.db, &raw)
         .await?
         .ok_or(AppError::RouteNotFound)?;
@@ -318,7 +324,7 @@ async fn list_user_statuses(
         user_id: Some(target.id),
         ..list_params(&query)?
     };
-    envelope(&state, &staff.0, &params).await.map(Json)
+    envelope(&state, &admin.0, &params).await.map(Json)
 }
 
 /// `GET /api/v1/pleroma/admin/instances/{instance}/statuses` — Pleroma's
@@ -328,16 +334,16 @@ async fn list_user_statuses(
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:read` gate; [`AppError::BadRequest`] for an unusable
 /// filter; [`AppError::Database`] from the two reads.
 async fn list_instance_statuses(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     Query(query): Query<HashMap<String, String>>,
     Path(raw): Path<String>,
 ) -> AppResult<Json<AdminStatusPage>> {
-    staff.require(CLASS_READ, AREA_STATUSES)?;
+    admin.require(CLASS_READ, AREA_STATUSES)?;
     let open = list_params(&query)?;
     let params = if raw == LOCAL {
         status::admin::ListParams {
@@ -350,7 +356,7 @@ async fn list_instance_statuses(
             ..open
         }
     };
-    envelope(&state, &staff.0, &params).await.map(Json)
+    envelope(&state, &admin.0, &params).await.map(Json)
 }
 
 /// One `{total, activities}` answer: the whole count the filters select,
@@ -363,7 +369,7 @@ async fn list_instance_statuses(
 /// [`AppError::Database`] from either read.
 async fn envelope(
     state: &AppState,
-    staff: &User,
+    viewer: &User,
     params: &status::admin::ListParams,
 ) -> AppResult<AdminStatusPage> {
     let total = status::admin::count(&state.db, params).await?;
@@ -376,7 +382,7 @@ async fn envelope(
     );
     Ok(AdminStatusPage {
         total,
-        activities: rendered(state, staff, &rows).await?,
+        activities: rendered(state, viewer, &rows).await?,
     })
 }
 
@@ -477,14 +483,14 @@ async fn live_status(pool: &PgPool, text: &str) -> AppResult<StatusRow> {
         .ok_or(AppError::RouteNotFound)
 }
 
-/// `rows` as the [`Status`] entities of the admin view: the staff member's
-/// own flags, the visibility rules bypassed.
+/// `rows` as the [`Status`] entities of the admin view: the viewing
+/// account's own flags, the visibility rules bypassed.
 ///
 /// # Errors
 ///
 /// [`AppError::Database`] from the batch's reads.
-async fn rendered(state: &AppState, staff: &User, rows: &[StatusRow]) -> AppResult<Vec<Status>> {
-    render_statuses(state, ViewerMode::Admin(staff), rows).await
+async fn rendered(state: &AppState, viewer: &User, rows: &[StatusRow]) -> AppResult<Vec<Status>> {
+    render_statuses(state, ViewerMode::Admin(viewer), rows).await
 }
 
 /// One `row` as the admin view's [`Status`] entity, the row a render cannot
@@ -495,8 +501,8 @@ async fn rendered(state: &AppState, staff: &User, rows: &[StatusRow]) -> AppResu
 ///
 /// [`AppError::RouteNotFound`] as described; [`AppError::Database`] from the
 /// batch's reads.
-async fn one(state: &AppState, staff: &User, row: &StatusRow) -> AppResult<Status> {
-    render_status(state, ViewerMode::Admin(staff), row)
+async fn one(state: &AppState, viewer: &User, row: &StatusRow) -> AppResult<Status> {
+    render_status(state, ViewerMode::Admin(viewer), row)
         .await?
         .ok_or(AppError::RouteNotFound)
 }

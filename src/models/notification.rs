@@ -60,7 +60,7 @@ mod unread;
 #[cfg(test)]
 mod test_support;
 
-pub use create::{already_notified, create, maybe_notify};
+pub use create::{already_notified, create, maybe_notify, recipient_refuses};
 pub use delete::{
     delete_all_for_user, delete_for_chat_message, delete_for_status, delete_matching,
 };
@@ -74,6 +74,44 @@ pub use grouping::{
 };
 pub use telling::{Telling, already_told, delete_telling};
 pub use unread::{UnreadParams, unread_count};
+
+/// The `AND` fragments that hide what the recipient refused, in Pleroma's
+/// `for_user_query` behind `exclude_blocked`: actors the recipient blocked,
+/// and actors mirrored from a domain the recipient blocked, whatever
+/// `with_muted` says. Both read the recipient off `n.user_id`, so the
+/// fragment binds nothing; a local actor's `NULL` domain never equals a
+/// blocked-domain row, so only remote actors can be domain-hidden. Pleroma
+/// keeps notifications from a domain-blocked actor it still follows; this
+/// listing hides the whole domain, the fact the flag records.
+///
+/// One definition for two readers: the listings append it to their `WHERE`
+/// on the `n` alias, and [`maybe_notify`]'s refusal check evaluates it over a
+/// one-row `n` built from the notification about to be written.
+const BLOCKED_CAUSES: &str = "
+     AND NOT EXISTS (SELECT 1 FROM blocks bl
+                      WHERE bl.blocker_id = n.user_id
+                        AND bl.blocked_id = n.from_account_id)
+     AND NOT EXISTS (SELECT 1 FROM user_domain_blocks db
+                               JOIN users au ON au.id = n.from_account_id
+                            WHERE db.user_id = n.user_id
+                              AND db.domain = au.domain)";
+
+/// The `AND` fragments that hide what the recipient muted — the exclusions
+/// Pleroma's `exclude_notification_muted` skips when its `:with_muted`
+/// option is true: actors under a still-live mute that hides notifications
+/// (a plain timeline mute never hides anything here), and notifications
+/// about a status in a thread the recipient muted. Shared like
+/// [`BLOCKED_CAUSES`].
+const MUTED_CAUSES: &str = "
+     AND NOT EXISTS (SELECT 1 FROM mutes mu
+                      WHERE mu.muter_id = n.user_id
+                        AND mu.muted_id = n.from_account_id
+                        AND mu.hide_notifications
+                        AND (mu.expires_at IS NULL OR mu.expires_at > now()))
+     AND NOT EXISTS (SELECT 1 FROM conversation_mutes cm
+                               JOIN statuses cs ON cs.id = n.status_id
+                            WHERE cm.user_id = n.user_id
+                              AND cm.conversation_id = cs.conversation_id)";
 
 /// The favourite type: groupable, keyed by the favourited status.
 pub const TYPE_FAVOURITE: &str = "favourite";

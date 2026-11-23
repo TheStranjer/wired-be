@@ -56,7 +56,9 @@ pub use limits_due::{
     utc_day_bounds,
 };
 pub use pages::page_for_user;
-pub use rows::{delete, delete_owned, get_by_id, get_owned, insert, reschedule};
+pub use rows::{
+    delete, delete_all_for_user, delete_owned, get_by_id, get_owned, insert, reschedule,
+};
 
 /// One row of `scheduled_statuses`: a create-status request waiting for its
 /// moment.

@@ -7,6 +7,7 @@
 
 use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use serde_json::Value;
+use url::Url;
 
 use crate::{
     federation::{
@@ -20,6 +21,7 @@ use crate::{
 
 use super::{
     ACTOR_ACCEPT, FetchError, JSON_MARKER, MAX_BODY_BYTES, STATUS_GONE, STATUS_NOT_FOUND,
+    containment::{ensure_not_redirected, ensure_same_host, names_served_url},
     signer::{Signer, fetch_signer, sign_get},
 };
 
@@ -32,8 +34,9 @@ use super::{
 /// [`sign_request`](crate::federation::signature::sign_request)), the shape of an authorized fetch.
 ///
 /// The returned document is contained as the [module
-/// docs](super) describe: its `id` either equals `url` or names a document
-/// fetched once at its own `id` that names itself.
+/// docs](super) describe: its `id` either names the URL that served it or
+/// names a document fetched once, without a redirect, at its own `id` that
+/// names itself. A redirect to another host is rejected.
 ///
 /// # Errors
 ///
@@ -48,15 +51,17 @@ pub async fn fetch_actor_json(
     url: &str,
     signer: Option<&Signer>,
 ) -> Result<Value, FetchError> {
-    let document = fetch_document(http, url, signer, MAX_BODY_BYTES).await?;
+    let (document, served) = fetch_document(http, url, signer, MAX_BODY_BYTES).await?;
+    ensure_same_host(url, &served)?;
     let claimed = document_id(&document)?;
-    if claimed == url {
+    if names_served_url(url, &served, claimed) {
         return Ok(document);
     }
-    // The document names a different id than the URL it was fetched from
-    // (or the peer redirected elsewhere): follow the claim exactly once
-    // and accept only a document that names itself.
-    let refetched = fetch_document(http, claimed, signer, MAX_BODY_BYTES).await?;
+    // The document names a different id than the URL that served it:
+    // follow the claim exactly once, without a redirect, and accept only a
+    // document that names itself.
+    let (refetched, refetched_from) = fetch_document(http, claimed, signer, MAX_BODY_BYTES).await?;
+    ensure_not_redirected(claimed, &refetched_from)?;
     let refetched_id = document_id(&refetched)?;
     if refetched_id != claimed {
         return Err(FetchError::Invalid(format!(
@@ -70,13 +75,14 @@ pub async fn fetch_actor_json(
 /// status, size, content-type and JSON rules of [`fetch_actor_json`] with
 /// the body cap at `max_bytes`. Shared with the object fetcher (see
 /// [`crate::federation::fetch_object`]), which caps at its own 2 MiB and
-/// folds the error into its own vocabulary.
+/// folds the error into its own vocabulary. Returns the document with the
+/// final URL that served it, so callers can contain redirects.
 pub(crate) async fn fetch_document(
     http: &HttpClient,
     url: &str,
     signer: Option<&Signer>,
     max_bytes: usize,
-) -> Result<Value, FetchError> {
+) -> Result<(Value, Url), FetchError> {
     let signed_request = signer.map(|key| sign_get(url, key)).transpose()?;
     let mut headers = vec![("accept", ACTOR_ACCEPT)];
     if let Some(signed) = &signed_request {
@@ -102,7 +108,7 @@ pub(crate) async fn fetch_document(
     let document: Value = response.json().map_err(|err| {
         FetchError::Invalid(format!("the body of `{url}` is not parseable JSON: {err}"))
     })?;
-    Ok(document)
+    Ok((document, response.url))
 }
 
 /// Whether a response declares a JSON body: its `Content-Type` mentions
@@ -357,19 +363,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirects_are_followed_and_the_original_id_is_accepted() {
+    async fn a_same_host_redirect_whose_body_names_the_final_url_is_accepted() {
         let listener = bind().await;
         let base = origin(&listener);
         let peer = peer_at(&base);
         let hits = Arc::clone(&peer.hits);
         let app = Router::new()
             .route("/actor", get(hop))
-            .with_state(peer.clone())
-            .merge(
-                Router::new()
-                    .route("/users/alice", get(redirect_target_actor))
-                    .with_state(peer),
-            );
+            .route("/users/alice", get(self_actor))
+            .with_state(peer);
         let server = spawn(listener, app);
 
         let document = fetch_actor_json(&client(), &format!("{base}/actor"), None)
@@ -378,13 +380,101 @@ mod tests {
 
         assert_eq!(
             document["id"],
-            format!("{base}/actor"),
-            "the document names the URL that was requested (through the hop)"
+            format!("{base}/users/alice"),
+            "the document names the URL that served it"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "no refetch was needed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_redirected_body_naming_the_original_url_is_rejected() {
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let hits = Arc::clone(&peer.hits);
+        let app = Router::new()
+            .route("/actor", get(hop))
+            .route("/users/alice", get(redirect_target_actor))
+            .with_state(peer);
+        let server = spawn(listener, app);
+
+        let error = fetch_actor_json(&client(), &format!("{base}/actor"), None)
+            .await
+            .unwrap_err();
+
+        let detail = invalid_detail(error);
+        assert!(
+            detail.contains("redirects"),
+            "the refetch of the original URL may not redirect: {detail}"
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
-            1,
-            "the hop plus the target, once each"
+            2,
+            "the original URL and its refetch each reached the target once, then it was refused"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_authority_is_a_cross_domain_failure() {
+        let victim = bind().await;
+        let attacker = bind().await;
+        let victim_base = origin(&victim);
+        let attacker_base = origin(&attacker);
+        let forged = peer_at(&attacker_base);
+        let victim_app = Router::new().route(
+            "/actor",
+            get(redirect_to).with_state(format!("{attacker_base}/actor")),
+        );
+        let attacker_app = Router::new()
+            .route("/actor", get(redirect_target_actor))
+            .with_state(forged);
+        let victim_server = spawn(victim, victim_app);
+        let attacker_server = spawn(attacker, attacker_app);
+
+        let error = fetch_actor_json(&client(), &format!("{victim_base}/actor"), None)
+            .await
+            .unwrap_err();
+
+        let detail = invalid_detail(error);
+        assert!(
+            detail.contains("cross-domain"),
+            "a body from another host is refused: {detail}"
+        );
+        victim_server.abort();
+        attacker_server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_claimed_id_that_redirects_is_rejected() {
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let hits = Arc::clone(&peer.hits);
+        let app = Router::new()
+            .route("/users/alice", get(moved_actor))
+            .route("/moved/home", get(moved_home_actor))
+            .with_state(peer)
+            .route(
+                "/moved/alice",
+                get(redirect_to).with_state(format!("{base}/moved/home")),
+            );
+        let server = spawn(listener, app);
+
+        let error = fetch_actor_json(&client(), &format!("{base}/users/alice"), None)
+            .await
+            .unwrap_err();
+
+        let detail = invalid_detail(error);
+        assert!(
+            detail.contains("redirects"),
+            "the refetch of the claimed id may not redirect: {detail}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the moved document and the redirected target were read, then refused"
         );
         server.abort();
     }

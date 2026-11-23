@@ -203,6 +203,110 @@ async fn a_cross_origin_id_is_refused_without_a_refetch() {
 }
 
 #[tokio::test]
+async fn a_redirect_to_another_authority_is_a_cross_domain_failure() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = test_state(db.pool().clone());
+    let victim = bind().await;
+    let attacker = bind().await;
+    let victim_base = origin(&victim);
+    let attacker_base = origin(&attacker);
+    let attacker_peer = peer_at(&attacker_base);
+    let victim_server = spawn(
+        victim,
+        redirect_app("/objects/out", object_url(&attacker_base, "forged")),
+    );
+    let attacker_server = spawn(attacker, peer_app(attacker_peer));
+
+    let err = fetch_object_json(&state, &object_url(&victim_base, "out"))
+        .await
+        .expect_err("a body from another host is not the victim's object");
+
+    assert!(
+        matches!(&err, FetchError::Invalid(detail) if detail.contains("cross-domain")),
+        "a cross-authority redirect is Invalid: {err}"
+    );
+    victim_server.abort();
+    attacker_server.abort();
+}
+
+#[tokio::test]
+async fn a_same_host_redirect_whose_body_names_the_original_url_is_refused() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = test_state(db.pool().clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let original = object_url(&base, "original");
+    let app = redirect_app("/objects/original", object_url(&base, "landing")).merge(fixed_app(
+        "/objects/landing",
+        json!({"id": original, "type": "Note"}),
+    ));
+    let server = spawn(listener, app);
+
+    let err = fetch_object_json(&state, &original)
+        .await
+        .expect_err("the original URL redirects, so it cannot vouch for the body");
+
+    assert!(
+        matches!(&err, FetchError::Invalid(detail) if detail.contains("redirects")),
+        "the refetch of the claimed id may not redirect: {err}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_claimed_id_that_redirects_is_refused() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = test_state(db.pool().clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let peer = peer_at(&base);
+    let real = object_url(&base, "real");
+    let app = Router::new()
+        .route("/objects/moved", get(serve_moved).with_state(peer.clone()))
+        .merge(redirect_app("/objects/real", object_url(&base, "landing")))
+        .merge(fixed_app(
+            "/objects/landing",
+            json!({"id": real, "type": "Note"}),
+        ));
+    let server = spawn(listener, app);
+
+    let err = fetch_object_json(&state, &object_url(&base, "moved"))
+        .await
+        .expect_err("a claimed id answered through a redirect is not accepted");
+
+    assert!(
+        matches!(&err, FetchError::Invalid(detail) if detail.contains("redirects")),
+        "the redirecting refetch is Invalid: {err}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_same_host_redirect_whose_body_names_the_final_url_is_accepted() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = test_state(db.pool().clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let landing = object_url(&base, "landing");
+    let app = redirect_app("/objects/old", landing.clone()).merge(fixed_app(
+        "/objects/landing",
+        json!({"id": landing, "type": "Note"}),
+    ));
+    let server = spawn(listener, app);
+
+    let document = fetch_object_json(&state, &object_url(&base, "old"))
+        .await
+        .expect("a redirect that lands on a document naming itself resolves");
+
+    assert_eq!(
+        document["id"],
+        json!(landing),
+        "the document names the URL that served it"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn redirect_chains_are_bounded_by_three_hops() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let state = test_state(db.pool().clone());
