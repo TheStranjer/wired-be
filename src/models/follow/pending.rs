@@ -18,7 +18,7 @@ use super::{pages::page_rows, types::FollowPageEntry};
 /// `f.id`.
 const PENDING_REQUESTS_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.follower_id
-     WHERE f.state = 'pending' AND f.followee_id = ";
+     WHERE f.state = 'pending' AND u.is_active AND f.followee_id = ";
 
 /// The outgoing side of [`outgoing_requests_from`]: the users whose follow of
 /// the bound account is still waiting on their answer — the accounts a pending
@@ -29,13 +29,14 @@ const PENDING_REQUESTS_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
 /// `$1`; the keyset it then appends runs on the relationship id `f.id`.
 const PENDING_OUTGOING_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.followee_id
-     WHERE f.state = 'pending' AND f.follower_id = ";
+     WHERE f.state = 'pending' AND u.is_active AND f.follower_id = ";
 
 /// [`pending_count`]: the same queue [`pending_requests_for`] pages through,
 /// counted rather than listed. The `::int` cast is what makes `count(*)`'s
 /// `bigint` arrive as the `i32` this layer's counters all are.
-const PENDING_COUNT_SQL: &str = "SELECT count(*)::int FROM follows
-     WHERE followee_id = $1 AND state = 'pending'";
+const PENDING_COUNT_SQL: &str = "SELECT count(*)::int FROM follows f
+    JOIN users u ON u.id = f.follower_id
+     WHERE f.followee_id = $1 AND f.state = 'pending' AND u.is_active";
 
 /// The users waiting for `target_id` — the followed account, the row's
 /// [`Follow::followee_id`](super::Follow::followee_id) — to answer their follow request, newest request
@@ -112,10 +113,58 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            follow::{FollowState, accept, follow, followers_page, reject, test_support::*},
-            user::User,
+            follow::{
+                Follow, FollowState, accept, follow, followers_page, reject, test_support::*,
+            },
+            user::{User, set_activation},
         },
     };
+
+    /// A deactivated requester leaves the incoming queue and its count; a
+    /// deactivated target leaves the requester's outgoing list.
+    #[tokio::test]
+    async fn deactivated_accounts_are_left_out_of_the_queues() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = locked_user(&pool, "carol").await;
+        let dave = locked_user(&pool, "dave").await;
+        let active = local_user(&pool, "active").await;
+        let gone = local_user(&pool, "gone").await;
+        for requester in [&active, &gone] {
+            let _row: Follow = follow(&pool, TEST_BASE_URL, requester, &carol)
+                .await
+                .unwrap();
+        }
+        let _ask: Follow = follow(&pool, TEST_BASE_URL, &active, &dave).await.unwrap();
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            2,
+            "both wait"
+        );
+
+        set_activation(&pool, gone.id, false).await.unwrap();
+        assert_eq!(
+            entry_ids(
+                &pending_requests_for(&pool, carol.id, page(""))
+                    .await
+                    .unwrap()
+            ),
+            vec![active.id],
+            "the deactivated requester is absent from the queue"
+        );
+        assert_eq!(
+            pending_count(&pool, carol.id).await.unwrap(),
+            1,
+            "and from its count"
+        );
+
+        set_activation(&pool, dave.id, false).await.unwrap();
+        assert_eq!(
+            entry_ids(&asks_from(&pool, &active, "").await),
+            vec![carol.id],
+            "a deactivated target is absent from the outgoing asks"
+        );
+    }
 
     #[tokio::test]
     async fn pending_requests_are_paged_and_answered_away() {
