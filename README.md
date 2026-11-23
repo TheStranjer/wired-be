@@ -434,6 +434,29 @@ published, never what is enforced: an excluded host is still refused its
 traffic, still absent from the domain-block listing, and still out of the
 peer list.
 
+## OAuth
+
+Third-party clients use the authorization-code flow at `/oauth/authorize`
+and `POST /oauth/token`. A browser `GET`/`POST` of `/oauth/authorize` still
+gets the server-rendered login and consent page. A frontend that renders the
+consent page itself uses the JSON half of the same path instead:
+
+- `GET /oauth/authorize?response_type=code&client_id=…&redirect_uri=…&scope=…&state=…`
+  with `Accept: application/json` answers
+  `{"app":{"name","website"},"scopes":[…],"redirect_uri","state"}`, or a 400
+  `{"error":"invalid_request"|"invalid_client"|"invalid_scope","error_description"}`.
+- `POST /oauth/authorize` with `Authorization: Bearer <token>` and a JSON body
+  `{client_id, redirect_uri, scope, state, approve}` mints the code for the
+  token's user and answers `{"redirect_uri":"…?code=…&state=…"}` (or
+  `{"code"}` for `urn:ietf:wg:oauth:2.0:oob`); `approve: false` answers the
+  redirect with `error=access_denied`. A missing or dead token is a 401, and a
+  token whose scopes do not cover the request a 403 `invalid_scope`.
+
+**The frontend's own OAuth app must be marked trusted**
+(`PATCH /api/v1/pleroma/admin/oauth_app/{id}` with `trusted`): the JSON `POST`
+answers 403 `unauthorized_client` for a token issued to any other app, so an
+app holding a user token cannot mint codes for other apps.
+
 ## API coverage
 
 Wired replicates the HTTP interface of **Pleroma 2.10**: paths, parameters,

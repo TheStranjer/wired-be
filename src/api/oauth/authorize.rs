@@ -34,14 +34,14 @@
 //! whichever ticket gives `/oauth` sessions). `lang` sets the page's
 //! language attribute.
 //!
-//! Trusted apps and the consent form (WBE-205): admins set the
-//! `oauth_apps.trusted` flag through
-//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`, and Pleroma's
-//! `OAuthController.authorize` skips the confirmation screen for an app
-//! carrying it. This endpoint does not act on the flag yet — every
-//! visit renders the form; skipping the consent for trusted apps is
-//! left to the ticket that reworks this flow, and until then the flag
-//! is stored, listed and answered but inert here.
+//! Trusted apps (WBE-205, WBE-666): admins set the `oauth_apps.trusted`
+//! flag through `PATCH /api/v1/pleroma/admin/oauth_app/{id}`. The HTML
+//! consent form does not act on it. The JSON half (`authorize/json.rs`, for a
+//! frontend that renders the consent page itself) does: `GET` with
+//! `Accept: application/json` describes the request, and `POST` with a
+//! bearer token and a JSON body approves or denies it, but only for a
+//! token whose own app is trusted. **WiredFE's own app must therefore
+//! be marked `trusted`.**
 
 use std::fmt;
 
@@ -49,7 +49,7 @@ use axum::{
     Router,
     extract::State,
     http::{
-        HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, LOCATION},
     },
     response::{Html, IntoResponse, Response},
@@ -64,7 +64,7 @@ use super::{NO_STORE, mfa};
 use crate::{
     api::oauth::check_account_ready,
     error::{AppError, AppResult},
-    extract::{ApiBody, ApiParams},
+    extract::{ApiBody, ApiParams, into_params},
     models::{
         oauth_app::{self, OauthApp},
         oauth_token::{self, OauthAuthorization},
@@ -76,6 +76,8 @@ use crate::{
     },
     state::AppState,
 };
+
+mod json;
 
 /// The only response type this endpoint speaks (RFC 6749 §4.1.2).
 pub(crate) const RESPONSE_TYPE_CODE: &str = "code";
@@ -132,24 +134,43 @@ pub(crate) struct Delivery<'a> {
 
 /// `GET /oauth/authorize` — validate the request and render the
 /// login-and-consent page. No authentication: this is where it comes
-/// from. Every answer gets the no-store header.
+/// from. `Accept: application/json` gets [`json::describe`]'s JSON
+/// instead of the page. Every answer gets the no-store header.
 async fn show(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ApiParams(query): ApiParams<AuthorizeQuery>,
 ) -> Response {
-    let response = match consent(&state, query).await {
-        Ok(page) => Html(page).into_response(),
-        Err(err) => err.into_response(),
+    let response = if json::wants_json(&headers) {
+        json::describe(&state, &query).await
+    } else {
+        match consent(&state, query).await {
+            Ok(page) => Html(page).into_response(),
+            Err(err) => err.into_response(),
+        }
     };
     no_store(response)
 }
 
-/// `POST /oauth/authorize` — the consent form submission; same answer
-/// header treatment as [`show`].
-async fn create(State(state): State<AppState>, ApiBody(form): ApiBody<AuthorizeForm>) -> Response {
-    let response = match authorize_submission(&state, form).await {
-        Ok(reply) => reply.into_response(),
-        Err(err) => err.into_response(),
+/// `POST /oauth/authorize` — the consent form submission, or, with a
+/// bearer token or a JSON body, the frontend's verdict ([`json::approve`]);
+/// same answer header treatment as [`show`].
+async fn create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiBody(body): ApiBody<Value>,
+) -> Response {
+    let response = if json::is_json_approval(&headers, &body) {
+        json::approve(&state, &headers, body).await
+    } else {
+        let submitted = match into_params::<AuthorizeForm>(body) {
+            Ok(form) => authorize_submission(&state, form).await,
+            Err(err) => Err(err),
+        };
+        match submitted {
+            Ok(reply) => reply.into_response(),
+            Err(err) => err.into_response(),
+        }
     };
     no_store(response)
 }
