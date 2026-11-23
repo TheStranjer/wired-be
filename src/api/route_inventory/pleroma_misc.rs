@@ -162,11 +162,11 @@ pub(super) const ROWS: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
         path: "/api/v0/pleroma/reports",
-        auth: AuthClass::Admin,
+        auth: AuthClass::User,
     },
     RouteSpec {
         method: "GET",
         path: "/api/v0/pleroma/reports/:id",
-        auth: AuthClass::Admin,
+        auth: AuthClass::User,
     },
 ];

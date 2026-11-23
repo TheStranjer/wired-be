@@ -455,8 +455,9 @@ changed. Four families make it up:
   groups, invites, statuses, chats, instances, reports, relays, rules,
   announcements, webhooks, config, frontends, media-proxy caches, the
   moderation log and stats) and Mastodon's `/api/v1/admin` and
-  `/api/v2/admin` (accounts and the report queue), plus the legacy
-  `/api/v0/pleroma/reports` ledger;
+  `/api/v2/admin` (accounts and the report queue); the reporter's own
+  `/api/v0/pleroma/reports` reads (`read:reports`) are a user endpoint, not
+  an admin one;
 - **federation and discovery** — the `ActivityPub` actors, objects, activities,
   inboxes and outboxes (`/users/…`, `/objects/…`, `/activities/…`, `/inbox`,
   `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the Atom and

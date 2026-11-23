@@ -24,7 +24,7 @@ use crate::{
     util::id::parse_id,
 };
 
-/// `GET /api/v1/pleroma/admin/reports` (and the legacy mount) — Pleroma's
+/// `GET /api/v1/pleroma/admin/reports` — Pleroma's
 /// `index`: the filtered page of [`AdminReport`] entities beside the total
 /// the filters select.
 ///
@@ -54,7 +54,7 @@ pub(super) async fn list_reports(
     }))
 }
 
-/// `GET /api/v1/pleroma/admin/reports/{id}` (and the legacy mount) —
+/// `GET /api/v1/pleroma/admin/reports/{id}` —
 /// Pleroma's `show`: the one entity the id names.
 ///
 /// # Errors
