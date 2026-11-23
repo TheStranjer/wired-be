@@ -208,9 +208,7 @@ pub(super) async fn nickname_owns(
         return Ok(true);
     };
     let owner = get_by_nickname(&state.db, nickname).await?;
-    Ok(owner.is_some_and(|owner| {
-        owner.id == status.user_id && owner.local.get() && owner.is_active.get()
-    }))
+    Ok(owner.is_some_and(|owner| owner.id == status.user_id && owner.is_local_active()))
 }
 
 /// Whether this read is admitted. `local` is never federated and answers

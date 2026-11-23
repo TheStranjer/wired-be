@@ -287,6 +287,14 @@ impl fmt::Debug for User {
 }
 
 impl User {
+    /// Whether this is one of this instance's own accounts and is not
+    /// deactivated: the test every public, federated or account-bound
+    /// surface applies before it serves or acts for a user.
+    #[must_use]
+    pub const fn is_local_active(&self) -> bool {
+        self.local.get() && self.is_active.get()
+    }
+
     /// Where this account stands between registration and use, weighed in
     /// the order Pleroma's `User.account_status` uses: deactivation, then
     /// the staff approval `REGISTRATIONS_APPROVAL_REQUIRED` asks for, then
@@ -400,6 +408,27 @@ mod tests {
             .unwrap()
             .expect("the remote handle finds the row");
         assert_eq!(fetched.ap_id, ap_id, "same row by nickname");
+    }
+
+    #[tokio::test]
+    async fn is_local_active_needs_both_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut row = insert(&pool, &local_new("flags")).await.unwrap();
+        for (local, active, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            row.local = Flag::new(local);
+            row.is_active = Flag::new(active);
+            assert_eq!(
+                row.is_local_active(),
+                expected,
+                "local={local}, active={active}"
+            );
+        }
     }
 
     #[tokio::test]

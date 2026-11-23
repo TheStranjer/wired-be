@@ -49,7 +49,10 @@ use tracing::warn;
 use crate::{
     config::Config,
     error::{AppError, AppResult},
-    models::{instance_setting, user::get_by_nickname},
+    models::{
+        instance_setting,
+        user::{User, get_by_nickname},
+    },
     state::AppState,
     util::password::verify_password,
 };
@@ -283,7 +286,8 @@ fn require_mongooseim(state: &AppState) -> AppResult<()> {
 async fn local_active_user_exists(pool: &PgPool, nickname: &str) -> AppResult<bool> {
     Ok(get_by_nickname(pool, nickname)
         .await?
-        .is_some_and(|found| found.local.get() && found.is_active.get()))
+        .as_ref()
+        .is_some_and(User::is_local_active))
 }
 
 /// Whether `password` is the credential of the local, active user named
@@ -299,7 +303,7 @@ async fn valid_credentials(pool: &PgPool, nickname: &str, password: &str) -> App
     let Some(found) = get_by_nickname(pool, nickname).await? else {
         return Ok(false);
     };
-    if !(found.local.get() && found.is_active.get()) {
+    if !found.is_local_active() {
         return Ok(false);
     }
     let Some(stored) = found.password_hash.as_deref() else {
