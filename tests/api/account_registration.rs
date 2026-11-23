@@ -801,3 +801,93 @@ async fn a_rejected_invited_registration_spends_nothing() {
     assert!(!after.used, "and marked nothing");
     assert_eq!(user_count(&pool).await, 0, "and stored nobody");
 }
+
+/// The frontend origin the confirmation-link tests configure, distinct from
+/// the test `BASE_URL` so a redirect to the wrong origin shows.
+const FRONTEND: &str = "https://fe.example";
+
+/// A router whose instance requires email confirmation and serves its
+/// frontend from [`FRONTEND`], with `SMTP_HOST` set so the letter queues.
+fn confirmation_app(pool: &PgPool) -> Router {
+    let config = Config {
+        account_activation_required: Toggle::new(true),
+        smtp_host: Some("smtp.example.org".to_owned()),
+        frontend_base_url: FRONTEND.to_owned(),
+        ..common::test_config()
+    };
+    common::test_app_with_config(pool.clone(), config)
+}
+
+/// The stored row of `username`.
+async fn stored_user(pool: &PgPool, username: &str) -> user::User {
+    user::get_by_nickname(pool, username)
+        .await
+        .expect("the lookup reaches the database")
+        .unwrap_or_else(|| panic!("no account {username} was registered"))
+}
+
+/// A valid confirmation link confirms the address and redirects with a 302
+/// to the frontend's root, not to `BASE_URL`.
+#[tokio::test]
+async fn a_valid_confirmation_link_redirects_to_the_frontend() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = confirmation_app(&pool);
+    let bearer = common::create_app_only_token(&pool, FULL_SCOPES).await;
+    let registered = register_json(&app, &bearer, &body_for("fefriend")).await;
+    assert_eq!(registered.status, StatusCode::OK, "the registration lands");
+    let row = stored_user(&pool, "fefriend").await;
+    assert!(!row.email_confirmed.get(), "the account starts unconfirmed");
+    let token = row
+        .confirmation_token
+        .clone()
+        .expect("the registration minted a token");
+
+    let response =
+        common::TestRequest::get(&format!("/api/account/confirm_email/{}/{token}", row.id))
+            .send(&app)
+            .await;
+
+    assert_eq!(response.status, StatusCode::FOUND, "an explicit 302");
+    assert_eq!(
+        response.header("location"),
+        Some("https://fe.example/"),
+        "to the frontend's root"
+    );
+    assert!(
+        stored_user(&pool, "fefriend").await.email_confirmed.get(),
+        "and the address is confirmed"
+    );
+}
+
+/// An invalid token redirects to the same place and changes nothing.
+#[tokio::test]
+async fn an_invalid_confirmation_token_redirects_to_the_frontend_unchanged() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = confirmation_app(&pool);
+    let bearer = common::create_app_only_token(&pool, FULL_SCOPES).await;
+    let registered = register_json(&app, &bearer, &body_for("fefoe")).await;
+    assert_eq!(registered.status, StatusCode::OK, "the registration lands");
+    let row = stored_user(&pool, "fefoe").await;
+
+    let response = common::TestRequest::get(&format!(
+        "/api/account/confirm_email/{}/not-the-token",
+        row.id
+    ))
+    .send(&app)
+    .await;
+
+    assert_eq!(response.status, StatusCode::FOUND, "still a 302");
+    assert_eq!(
+        response.header("location"),
+        Some("https://fe.example/"),
+        "to the same frontend root"
+    );
+    let after = stored_user(&pool, "fefoe").await;
+    assert!(!after.email_confirmed.get(), "nothing was confirmed");
+    assert_eq!(
+        after.confirmation_token, row.confirmation_token,
+        "and the pending token is untouched"
+    );
+}
