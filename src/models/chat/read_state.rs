@@ -9,9 +9,12 @@ use crate::error::AppResult;
 use super::{ChatMessageReference, references::reference_by_id};
 
 /// [`unread_count`]: how many messages of one participant's chat they have still
-/// to read (Pleroma's `MessageReference.unread_count_for_chat`).
-const UNREAD_COUNT_SQL: &str = "SELECT count(*) FROM chat_message_references
-     WHERE chat_id = $1 AND unread";
+/// to read (Pleroma's `MessageReference.unread_count_for_chat`). A withdrawn
+/// message leaves its references behind as tombstones, but Pleroma deletes them,
+/// so the join leaves every reference whose message is a tombstone out.
+const UNREAD_COUNT_SQL: &str = "SELECT count(*) FROM chat_message_references r
+      JOIN chat_messages m ON m.id = r.message_id
+     WHERE r.chat_id = $1 AND r.unread AND m.deleted_at IS NULL";
 
 /// [`mark_read`]: every unread message of one chat up to a point, Pleroma's
 /// `set_all_seen_for_chat`. A `None` `last_read_id` arrives as SQL `NULL` in
@@ -103,7 +106,10 @@ pub async fn mark_message_read(
 mod tests {
     use super::*;
     use crate::{
-        models::chat::test_support::{local, newest_by_id, send},
+        models::chat::{
+            test_support::{local, newest_by_id, send},
+            withdraw,
+        },
         util::id::new_id,
     };
 
@@ -240,6 +246,67 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "and so is a known reference under an unknown chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_message_is_not_counted_unread() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let (first, _, first_ref) = send(&pool, &alice, &bob, "one").await;
+        let (second, _, _) = send(&pool, &alice, &bob, "two").await;
+        let chat_id = first_ref.expect("bob is local").chat_id;
+
+        assert_eq!(
+            unread_count(&pool, chat_id).await.unwrap(),
+            2,
+            "both unread"
+        );
+        assert!(
+            withdraw(&pool, first.id).await.unwrap(),
+            "first is withdrawn"
+        );
+        assert_eq!(
+            unread_count(&pool, chat_id).await.unwrap(),
+            1,
+            "the withdrawn message is not counted"
+        );
+        assert!(
+            withdraw(&pool, second.id).await.unwrap(),
+            "second is withdrawn"
+        );
+        assert_eq!(
+            unread_count(&pool, chat_id).await.unwrap(),
+            0,
+            "withdrawing the last unread message leaves nothing unread"
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_read_still_flips_tombstoned_references() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let (first, _, first_ref) = send(&pool, &alice, &bob, "one").await;
+        let _live = send(&pool, &alice, &bob, "two").await;
+        let chat_id = first_ref.expect("bob is local").chat_id;
+        assert!(
+            withdraw(&pool, first.id).await.unwrap(),
+            "first is withdrawn"
+        );
+
+        assert_eq!(
+            mark_read(&pool, chat_id, None).await.unwrap(),
+            2,
+            "the tombstoned reference is flipped along with the live one"
+        );
+        assert_eq!(
+            unread_count(&pool, chat_id).await.unwrap(),
+            0,
+            "nothing unread"
         );
     }
 

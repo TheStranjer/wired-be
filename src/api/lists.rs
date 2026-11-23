@@ -76,7 +76,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::{account_or_404, distinct_ids},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -393,7 +393,7 @@ async fn remove_list_accounts(
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
     let list_id = owned_list(&state, &auth, &id).await?;
-    let (members, _unknown_ignored) = requested_ids(&params.account_ids);
+    let (members, _unknown_ignored) = distinct_ids(params.account_ids.iter().map(String::as_str));
     let removed = list::remove_members(&state.db, list_id, &members).await?;
     debug!(
         removed,
@@ -426,26 +426,7 @@ async fn owned_list(state: &AppState, auth: &AuthUser, id: &str) -> AppResult<Uu
     Ok(list_id)
 }
 
-/// The account ids of an `account_ids[]` parameter, in the order the client
-/// sent them and with repeats folded into one, plus whether every entry was an
-/// id at all: the strict caller ([`requested_accounts`]) turns a `false` into
-/// the 404 an unknown account owes, the lenient one
-/// ([`remove_list_accounts`]) has nothing to refuse, because an id that names
-/// no account is, literally, not a member.
-fn requested_ids(texts: &[String]) -> (Vec<Uuid>, bool) {
-    let mut ids: Vec<Uuid> = Vec::with_capacity(texts.len());
-    let mut all_ids = true;
-    for text in texts {
-        match parse_id(text) {
-            Some(id) if !ids.contains(&id) => ids.push(id),
-            Some(_) => {}
-            None => all_ids = false,
-        }
-    }
-    (ids, all_ids)
-}
-
-/// The accounts an `add` names: every id of [`requested_ids`] must be parseable
+/// The accounts an `add` names: every id of `account_ids[]` must be parseable
 /// and must name an account this instance knows, or the whole batch is the
 /// 404 — nothing is added for a request that names somebody who does not
 /// exist.
@@ -455,7 +436,7 @@ fn requested_ids(texts: &[String]) -> (Vec<Uuid>, bool) {
 /// [`AppError::NotFound`] as described; any database failure arrives through
 /// `?` as [`AppError::Database`].
 async fn requested_accounts(state: &AppState, texts: &[String]) -> AppResult<Vec<Uuid>> {
-    let (ids, all_ids) = requested_ids(texts);
+    let (ids, all_ids) = distinct_ids(texts.iter().map(String::as_str));
     if !all_ids {
         return Err(AppError::NotFound);
     }
@@ -786,7 +767,7 @@ mod tests {
     /// The account ids the `account_ids` of `params` name, asserted to be
     /// ids all the way through.
     fn requested(texts: &[String]) -> Vec<Uuid> {
-        let (ids, all_ids) = requested_ids(texts);
+        let (ids, all_ids) = distinct_ids(texts.iter().map(String::as_str));
         assert!(all_ids, "the fixture names only ids");
         ids
     }
@@ -845,7 +826,7 @@ mod tests {
             "not-a-uuid".to_owned(),
             second.to_string(),
         ];
-        let (ids, all_ids) = requested_ids(&texts);
+        let (ids, all_ids) = distinct_ids(texts.iter().map(String::as_str));
         assert!(!all_ids, "one of the four entries is no id at all");
         assert_eq!(
             ids,
@@ -858,7 +839,7 @@ mod tests {
     #[test]
     fn an_empty_membership_parameter_names_nobody() {
         assert_eq!(
-            requested_ids(&[]),
+            distinct_ids([]),
             (Vec::new(), true),
             "no ids is not the same as a bad id: an empty batch is complete"
         );

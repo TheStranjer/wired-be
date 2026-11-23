@@ -40,7 +40,7 @@ mod test_support;
 
 pub use containing::{lists_containing, lists_following_member};
 pub use crud::{create, delete, delete_all_for_user, for_user, get_owned, update};
-pub use members::{add_members, remove_members};
+pub use members::{add_members, remove_between, remove_members};
 pub use membership_pages::{member_ids, members_page};
 
 use chrono::{DateTime, Utc};

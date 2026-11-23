@@ -265,7 +265,6 @@ mod tests {
         config::TEST_BASE_URL,
         http_client::HttpClient,
         models::user::{NewUser, get_by_id, insert},
-        uploads::UploaderBackend,
     };
 
     /// The instance the fixtures resolve against.
@@ -281,18 +280,9 @@ mod tests {
 
     /// The state under test on `config` instead of the stock test one.
     fn test_state_with_config(pool: &PgPool, config: Config) -> AppState {
-        let config = Arc::new(config);
         AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: Arc::clone(&config),
             http_client: HttpClient::new_for_tests(TEST_UA),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+            ..AppState::for_tests(pool.clone(), config)
         }
     }
 

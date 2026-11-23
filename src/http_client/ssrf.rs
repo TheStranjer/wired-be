@@ -35,11 +35,22 @@ type BoxedError = Box<dyn Error + Send + Sync>;
 
 /// Whether `ip` is an address a federating client must never connect to.
 ///
-/// Blocked ranges: loopback, RFC 1918 private (10/8, 172.16/12,
-/// 192.168/16), link-local (169.254/16, `fe80::/10`), unique-local
-/// (`fc00::/7`), unspecified, multicast, broadcast, CGNAT (100.64/10),
-/// and an IPv4-mapped IPv6 (`::ffff:0:0/96`) of any of those. All ports
-/// are allowed; only the address is judged.
+/// Blocked ranges (a superset of Mastodon's `PrivateAddressCheck` list):
+///
+/// - IPv4: `0.0.0.0/8`, loopback, RFC 1918 private (10/8, 172.16/12,
+///   192.168/16), link-local (169.254/16), CGNAT (100.64/10), the
+///   documentation and special-purpose blocks (192.0.0.0/24, 192.0.2.0/24,
+///   192.88.99.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24),
+///   multicast and everything from 240.0.0.0/4 up (including broadcast).
+/// - IPv6: loopback, unspecified, multicast, link-local (`fe80::/10`),
+///   deprecated site-local (`fec0::/10`), unique-local (`fc00::/7`), NAT64
+///   (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4 (`2002::/16`), Teredo
+///   (`2001::/32`), discard-only (`100::/64`), ORCHID (`2001:10::/28`,
+///   `2001:20::/28`), documentation (`2001:db8::/32`, `3fff::/20`).
+/// - An IPv4-mapped (`::ffff:0:0/96`) or IPv4-compatible (`::a.b.c.d`) IPv6
+///   address is judged by the IPv4 address it embeds.
+///
+/// All ports are allowed; only the address is judged.
 #[must_use]
 pub fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
@@ -54,13 +65,43 @@ fn blocked_v4(ip: Ipv4Addr) -> bool {
     ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
-        || ip.is_unspecified()
         || ip.is_multicast()
-        || ip.is_broadcast()
+        || first == 0
+        || first >= 240
         || (first == 100 && (64..=127).contains(&second))
+        || (first == 198 && matches!(second, 18 | 19))
+        || matches!(
+            ip.octets(),
+            [192, 0, 0 | 2, _] | [192, 88, 99, _] | [198, 51, 100, _] | [203, 0, 113, _]
+        )
 }
 
-/// The IPv6 half of [`is_blocked_ip`], including IPv4-mapped addresses.
+/// IPv6 prefixes (address, prefix length) refused outright by
+/// [`blocked_v6`].
+const BLOCKED_V6_PREFIXES: [(Ipv6Addr, u32); 12] = [
+    (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96),
+    (Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+    (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
+    (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0), 28),
+    (Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0), 28),
+    (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
+    (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+    (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+];
+
+/// Whether the top `len` bits of `ip` equal those of `prefix` (`len` is
+/// 1..=128; a `len` of 0 would match everything).
+const fn in_prefix(ip: u128, prefix: u128, len: u32) -> bool {
+    let shift = 128 - len;
+    (ip >> shift) == (prefix >> shift)
+}
+
+/// The IPv6 half of [`is_blocked_ip`], including IPv4-mapped and
+/// IPv4-compatible addresses.
 fn blocked_v6(ip: Ipv6Addr) -> bool {
     if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return true;
@@ -68,8 +109,15 @@ fn blocked_v6(ip: Ipv6Addr) -> bool {
     if let Some(mapped) = ip.to_ipv4_mapped() {
         return blocked_v4(mapped);
     }
-    let [head, ..] = ip.segments();
-    (head & 0xffc0) == 0xfe80 || (head & 0xfe00) == 0xfc00
+    if let [0, 0, 0, 0, 0, 0, high, low] = ip.segments() {
+        let [a, b] = high.to_be_bytes();
+        let [c, d] = low.to_be_bytes();
+        return blocked_v4(Ipv4Addr::new(a, b, c, d));
+    }
+    let bits = u128::from(ip);
+    BLOCKED_V6_PREFIXES
+        .iter()
+        .any(|&(prefix, len)| in_prefix(bits, u128::from(prefix), len))
 }
 
 /// The address filtering every outbound [`HttpClient`] request passes
@@ -273,6 +321,43 @@ mod tests {
             ("::ffff:0.0.0.0", "IPv4-mapped unspecified"),
             ("::ffff:255.255.255.255", "IPv4-mapped broadcast"),
             ("::ffff:224.0.0.1", "IPv4-mapped multicast"),
+            ("0.1.2.3", "0.0.0.0/8, not just 0.0.0.0"),
+            ("0.255.255.255", "0.0.0.0/8 upper edge"),
+            ("192.0.0.1", "192.0.0.0/24"),
+            ("192.0.2.1", "192.0.2.0/24 (TEST-NET-1)"),
+            ("192.88.99.1", "192.88.99.0/24 (6to4 relay anycast)"),
+            ("198.18.0.1", "198.18.0.0/15 lower edge"),
+            ("198.19.255.255", "198.18.0.0/15 upper edge"),
+            ("198.51.100.1", "198.51.100.0/24 (TEST-NET-2)"),
+            ("203.0.113.1", "203.0.113.0/24 (TEST-NET-3)"),
+            ("240.0.0.1", "240.0.0.0/4 lower edge"),
+            ("254.1.2.3", "240.0.0.0/4 reserved"),
+            ("239.255.255.254", "IPv4 multicast upper edge"),
+            ("::7f00:1", "IPv4-compatible loopback"),
+            ("::a00:1", "IPv4-compatible private"),
+            ("::a9fe:a9fe", "IPv4-compatible link-local (metadata)"),
+            ("64:ff9b::a00:1", "NAT64 64:ff9b::/96"),
+            ("64:ff9b::a9fe:a9fe", "NAT64 of 169.254.169.254"),
+            (
+                "64:ff9b::808:808",
+                "NAT64 of a public address is still refused",
+            ),
+            ("64:ff9b:1::1", "NAT64 local-use 64:ff9b:1::/48"),
+            ("64:ff9b:1:ffff::1", "NAT64 local-use upper edge"),
+            ("2002:a00:1::1", "6to4 2002::/16"),
+            ("2002:ffff::1", "6to4 upper edge"),
+            ("2001::1", "Teredo 2001::/32"),
+            ("2001:0:ffff::1", "Teredo upper edge"),
+            ("100::1", "discard-only 100::/64"),
+            ("2001:10::1", "ORCHID 2001:10::/28"),
+            ("2001:1f::1", "ORCHID 2001:10::/28 upper edge"),
+            ("2001:20::1", "ORCHIDv2 2001:20::/28"),
+            ("2001:2f::1", "ORCHIDv2 2001:20::/28 upper edge"),
+            ("2001:db8::1", "documentation 2001:db8::/32"),
+            ("3fff::1", "documentation 3fff::/20"),
+            ("3fff:fff:ffff::1", "documentation 3fff::/20 upper edge"),
+            ("fec0::1", "site-local fec0::/10"),
+            ("feff::1", "site-local fec0::/10 upper edge"),
         ] {
             let ip = IpAddr::from_str(text).unwrap();
             assert!(is_blocked_ip(ip), "{text} ({range}) must be blocked");
@@ -295,10 +380,42 @@ mod tests {
             ("169.255.0.1", "just above 169.254/16"),
             ("fe7f:ffff::1", "just below fe80::/10"),
             ("::ffff:8.8.8.8", "IPv4-mapped public address"),
+            ("198.17.255.255", "just below 198.18/15"),
+            ("198.20.0.0", "just above 198.18/15"),
+            ("1.0.0.1", "just above 0/8"),
+            ("2003::1", "just above 2002::/16"),
+            ("2a00:1450::1", "public Google IPv6"),
+            ("2001:1::1", "just above Teredo, below ORCHID"),
+            ("2001:30::1", "just above 2001:20::/28"),
+            ("2001:db9::1", "just above documentation 2001:db8::/32"),
+            ("3fff:1000::1", "just above 3fff::/20"),
+            ("::808:808", "IPv4-compatible public address"),
+            ("64:ff9a::1", "just below NAT64"),
+            ("fe00::1", "just below fe80::/10 (not site-local)"),
         ] {
             let ip = IpAddr::from_str(text).unwrap();
             assert!(!is_blocked_ip(ip), "{text} ({range}) must pass");
         }
+    }
+
+    #[test]
+    fn in_prefix_compares_only_the_leading_bits() {
+        let prefix = u128::from(Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0));
+        let inside = u128::from(Ipv6Addr::new(0x2001, 0x001f, 1, 2, 3, 4, 5, 6));
+        let outside = u128::from(Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0));
+        assert!(in_prefix(inside, prefix, 28), "same top 28 bits match");
+        assert!(
+            !in_prefix(outside, prefix, 28),
+            "a differing bit in the top 28 does not"
+        );
+        assert!(
+            in_prefix(prefix, prefix, 128),
+            "a full-length prefix matches itself"
+        );
+        assert!(
+            !in_prefix(inside, prefix, 128),
+            "a full-length prefix is exact"
+        );
     }
 
     #[test]
@@ -313,6 +430,9 @@ mod tests {
             "http://[fd00::1]/t",
             "http://[::ffff:192.168.0.1]/s",
             "http://[::1]/r",
+            "http://[64:ff9b::a9fe:a9fe]/q",
+            "http://[2002:a00:1::1]/p",
+            "http://240.0.0.1/o",
         ] {
             let reason = blocked_redirect_reason(&url(text))
                 .unwrap_or_else(|| panic!("{text} must be refused by the redirect policy"));

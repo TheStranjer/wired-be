@@ -10,7 +10,7 @@ use crate::federation::{
     note_parser::{OBJECT_TYPES, PUBLIC_RECIPIENTS},
 };
 
-use super::{ADDRESS_FIELDS, FOLLOWERS_SUFFIX, PUBLIC_ADDRESS, WRAPPING_TYPES};
+use super::{ACTOR_TYPES, ADDRESS_FIELDS, FOLLOWERS_SUFFIX, PUBLIC_ADDRESS, WRAPPING_TYPES};
 
 /// The first string of a document's `type`, which may itself be an array.
 pub(in crate::federation::mrf) fn activity_type(document: &Value) -> Option<String> {
@@ -22,6 +22,33 @@ pub(in crate::federation::mrf) fn activity_type(document: &Value) -> Option<Stri
 /// actor is not an `http(s)` URL.
 pub(in crate::federation::mrf) fn activity_host(activity: &Value) -> Option<String> {
     reference_host(activity.get("actor"))
+}
+
+/// The host of the thing an activity's `object` points at, the second
+/// origin the lists compare against (Pleroma's `check_object`): a string
+/// `object` is its own reference; an embedded one with an `actor` (an
+/// `Undo`'s `Follow`) stands for that actor's host; an embedded actor
+/// document for its own `id`'s host. Any other embedded object — a note,
+/// say — names no host to judge, and neither does a missing `object`.
+pub(super) fn object_reference_host(activity: &Value) -> Option<String> {
+    match activity.get("object")? {
+        Value::String(reference) => json::http_host(reference),
+        Value::Object(object) => {
+            if let Some(actor) = object.get("actor") {
+                return reference_host(Some(actor));
+            }
+            let is_actor = object
+                .get("type")
+                .and_then(json::first_type)
+                .is_some_and(|kind| ACTOR_TYPES.contains(&kind.as_str()));
+            if is_actor {
+                reference_host(object.get("id"))
+            } else {
+                None
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => None,
+    }
 }
 
 /// The host an actor document's own `id` names, `None` when the document

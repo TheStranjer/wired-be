@@ -82,8 +82,7 @@ pub use delete::{
 };
 pub use new_status::{NewStatus, insert, insert_conn};
 pub use pages::{
-    backup_page, newest_public_posts, outbox_page, public_replies_count, public_replies_page,
-    status_visibility_counts,
+    backup_page, outbox_page, public_replies_count, public_replies_page, status_visibility_counts,
 };
 pub use quoting::quoting_page;
 pub use reads::{

@@ -76,12 +76,18 @@
 //! [`report_to_admin`](crate::mailer::templates::report_to_admin) letter to
 //! every mailable staff account.
 //!
+//! The reporter's read side — `GET /api/v0/pleroma/reports` and its `{id}`
+//! twin, the user's own filed reports under `read:reports` — is the
+//! `own` submodule, mounted at `/api/v0/pleroma` by [`crate::api`] as
+//! [`own_router`].
+//!
 //! [`report::create`]: crate::models::report::create
 //! [`report::set_state`]: crate::models::report::set_state
 //! [`report::assign`]: crate::models::report::assign
 //! [`status_visibility`]: crate::models::status_visibility
 
 mod follow_up;
+mod own;
 mod params;
 
 use axum::{
@@ -106,7 +112,7 @@ use crate::{
     state::AppState,
 };
 
-pub use self::follow_up::after_report_created;
+pub use self::{follow_up::after_report_created, own::own_router};
 
 /// The `/api/v1` reports router, merged into [`crate::api::v1`].
 ///

@@ -43,7 +43,7 @@ pub(super) async fn password_grant(
     let user = authenticate_user(&state.db, params).await?;
     check_account_ready(&user)?;
     if mfa::required(&user) {
-        let challenge = mfa::start_challenge(state, &user, &app, &scopes).await?;
+        let challenge = mfa::start_challenge(state, &user, &app, &scopes, "").await?;
         return Ok(TokenReply::MfaRequired(Json(MfaRequiredResponse {
             error: MFA_REQUIRED,
             mfa_token: challenge,
@@ -76,9 +76,11 @@ pub(super) async fn client_credentials_grant(
 /// `token_exchange` clause for `grant_type=authorization_code`). The
 /// application authenticates exactly like on the other grants; the code
 /// is redeemed by [`consume_authorization`], whose one statement takes
-/// only an unused, unexpired row of *this* application and flips it used,
-/// so a replay, an expired code and another app's code all answer the
-/// shared 400 [`INVALID_CREDENTIALS`](super::INVALID_CREDENTIALS). The pair carries the authorization's
+/// only an unused, unexpired row of *this* application — and, when the row
+/// stores a redirect URI, only with that same `redirect_uri` (RFC 6749
+/// §4.1.3) — and flips it used, so a replay, an expired code, another app's
+/// code and a missing or different `redirect_uri` all answer the shared 400
+/// [`INVALID_CREDENTIALS`](super::INVALID_CREDENTIALS). The pair carries the authorization's
 /// approved scopes — not a `scope` the client now asks for — and acts as
 /// the account that consented, which still has to exist and be ready to
 /// log in: staff can deactivate or hold an account between the consent
@@ -102,9 +104,10 @@ pub(super) async fn authorization_code_grant(
         return Err(AppError::BadRequest(MISSING_CODE.to_owned()));
     };
     let app = validate_app(state, headers, params.body_credentials()).await?;
-    let authorized = oauth_token::consume_authorization(&state.db, code, app.id)
-        .await?
-        .ok_or_else(invalid_credentials)?;
+    let authorized =
+        oauth_token::consume_authorization(&state.db, code, app.id, params.redirect_uri.as_deref())
+            .await?
+            .ok_or_else(invalid_credentials)?;
     let owner = user::get_by_id(&state.db, authorized.user_id)
         .await?
         .ok_or_else(invalid_credentials)?;

@@ -1,0 +1,220 @@
+1F480                                                  ; fully-qualified     # 💀 E0.6 skull
+1F4A9                                                  ; fully-qualified     # 💩 E0.6 pile of poo
+1F48C                                                  ; fully-qualified     # 💌 E0.6 love letter
+1F498                                                  ; fully-qualified     # 💘 E0.6 heart with arrow
+1F49D                                                  ; fully-qualified     # 💝 E0.6 heart with ribbon
+1F496                                                  ; fully-qualified     # 💖 E0.6 sparkling heart
+1F497                                                  ; fully-qualified     # 💗 E0.6 growing heart
+1F493                                                  ; fully-qualified     # 💓 E0.6 beating heart
+1F49E                                                  ; fully-qualified     # 💞 E0.6 revolving hearts
+1F495                                                  ; fully-qualified     # 💕 E0.6 two hearts
+1F49F                                                  ; fully-qualified     # 💟 E0.6 heart decoration
+1F494                                                  ; fully-qualified     # 💔 E0.6 broken heart
+1F49B                                                  ; fully-qualified     # 💛 E0.6 yellow heart
+1F49A                                                  ; fully-qualified     # 💚 E0.6 green heart
+1F499                                                  ; fully-qualified     # 💙 E0.6 blue heart
+1F49C                                                  ; fully-qualified     # 💜 E0.6 purple heart
+1F48B                                                  ; fully-qualified     # 💋 E0.6 kiss mark
+1F4AF                                                  ; fully-qualified     # 💯 E0.6 hundred points
+1F4A2                                                  ; fully-qualified     # 💢 E0.6 anger symbol
+1F4A5                                                  ; fully-qualified     # 💥 E0.6 collision
+1F4AB                                                  ; fully-qualified     # 💫 E0.6 dizzy
+1F4A6                                                  ; fully-qualified     # 💦 E0.6 sweat droplets
+1F4A8                                                  ; fully-qualified     # 💨 E0.6 dashing away
+1F4AC                                                  ; fully-qualified     # 💬 E0.6 speech balloon
+1F4AD                                                  ; fully-qualified     # 💭 E1.0 thought balloon
+1F4A4                                                  ; fully-qualified     # 💤 E0.6 ZZZ
+1F485                                                  ; fully-qualified     # 💅 E0.6 nail polish
+1F485 1F3FB                                            ; fully-qualified     # 💅🏻 E1.0 nail polish: light skin tone
+1F485 1F3FC                                            ; fully-qualified     # 💅🏼 E1.0 nail polish: medium-light skin tone
+1F485 1F3FD                                            ; fully-qualified     # 💅🏽 E1.0 nail polish: medium skin tone
+1F485 1F3FE                                            ; fully-qualified     # 💅🏾 E1.0 nail polish: medium-dark skin tone
+1F485 1F3FF                                            ; fully-qualified     # 💅🏿 E1.0 nail polish: dark skin tone
+1F4AA                                                  ; fully-qualified     # 💪 E0.6 flexed biceps
+1F4AA 1F3FB                                            ; fully-qualified     # 💪🏻 E1.0 flexed biceps: light skin tone
+1F4AA 1F3FC                                            ; fully-qualified     # 💪🏼 E1.0 flexed biceps: medium-light skin tone
+1F4AA 1F3FD                                            ; fully-qualified     # 💪🏽 E1.0 flexed biceps: medium skin tone
+1F4AA 1F3FE                                            ; fully-qualified     # 💪🏾 E1.0 flexed biceps: medium-dark skin tone
+1F4AA 1F3FF                                            ; fully-qualified     # 💪🏿 E1.0 flexed biceps: dark skin tone
+1F481                                                  ; fully-qualified     # 💁 E0.6 person tipping hand
+1F481 1F3FB                                            ; fully-qualified     # 💁🏻 E1.0 person tipping hand: light skin tone
+1F481 1F3FC                                            ; fully-qualified     # 💁🏼 E1.0 person tipping hand: medium-light skin tone
+1F481 1F3FD                                            ; fully-qualified     # 💁🏽 E1.0 person tipping hand: medium skin tone
+1F481 1F3FE                                            ; fully-qualified     # 💁🏾 E1.0 person tipping hand: medium-dark skin tone
+1F481 1F3FF                                            ; fully-qualified     # 💁🏿 E1.0 person tipping hand: dark skin tone
+1F481 200D 2642 FE0F                                   ; fully-qualified     # 💁‍♂️ E4.0 man tipping hand
+1F481 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 💁🏻‍♂️ E4.0 man tipping hand: light skin tone
+1F481 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 💁🏼‍♂️ E4.0 man tipping hand: medium-light skin tone
+1F481 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 💁🏽‍♂️ E4.0 man tipping hand: medium skin tone
+1F481 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 💁🏾‍♂️ E4.0 man tipping hand: medium-dark skin tone
+1F481 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 💁🏿‍♂️ E4.0 man tipping hand: dark skin tone
+1F481 200D 2640 FE0F                                   ; fully-qualified     # 💁‍♀️ E4.0 woman tipping hand
+1F481 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 💁🏻‍♀️ E4.0 woman tipping hand: light skin tone
+1F481 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 💁🏼‍♀️ E4.0 woman tipping hand: medium-light skin tone
+1F481 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 💁🏽‍♀️ E4.0 woman tipping hand: medium skin tone
+1F481 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 💁🏾‍♀️ E4.0 woman tipping hand: medium-dark skin tone
+1F481 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 💁🏿‍♀️ E4.0 woman tipping hand: dark skin tone
+1F482                                                  ; fully-qualified     # 💂 E0.6 guard
+1F482 1F3FB                                            ; fully-qualified     # 💂🏻 E1.0 guard: light skin tone
+1F482 1F3FC                                            ; fully-qualified     # 💂🏼 E1.0 guard: medium-light skin tone
+1F482 1F3FD                                            ; fully-qualified     # 💂🏽 E1.0 guard: medium skin tone
+1F482 1F3FE                                            ; fully-qualified     # 💂🏾 E1.0 guard: medium-dark skin tone
+1F482 1F3FF                                            ; fully-qualified     # 💂🏿 E1.0 guard: dark skin tone
+1F482 200D 2642 FE0F                                   ; fully-qualified     # 💂‍♂️ E4.0 man guard
+1F482 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 💂🏻‍♂️ E4.0 man guard: light skin tone
+1F482 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 💂🏼‍♂️ E4.0 man guard: medium-light skin tone
+1F482 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 💂🏽‍♂️ E4.0 man guard: medium skin tone
+1F482 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 💂🏾‍♂️ E4.0 man guard: medium-dark skin tone
+1F482 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 💂🏿‍♂️ E4.0 man guard: dark skin tone
+1F482 200D 2640 FE0F                                   ; fully-qualified     # 💂‍♀️ E4.0 woman guard
+1F482 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 💂🏻‍♀️ E4.0 woman guard: light skin tone
+1F482 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 💂🏼‍♀️ E4.0 woman guard: medium-light skin tone
+1F482 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 💂🏽‍♀️ E4.0 woman guard: medium skin tone
+1F482 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 💂🏾‍♀️ E4.0 woman guard: medium-dark skin tone
+1F482 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 💂🏿‍♀️ E4.0 woman guard: dark skin tone
+1F486                                                  ; fully-qualified     # 💆 E0.6 person getting massage
+1F486 1F3FB                                            ; fully-qualified     # 💆🏻 E1.0 person getting massage: light skin tone
+1F486 1F3FC                                            ; fully-qualified     # 💆🏼 E1.0 person getting massage: medium-light skin tone
+1F486 1F3FD                                            ; fully-qualified     # 💆🏽 E1.0 person getting massage: medium skin tone
+1F486 1F3FE                                            ; fully-qualified     # 💆🏾 E1.0 person getting massage: medium-dark skin tone
+1F486 1F3FF                                            ; fully-qualified     # 💆🏿 E1.0 person getting massage: dark skin tone
+1F486 200D 2642 FE0F                                   ; fully-qualified     # 💆‍♂️ E4.0 man getting massage
+1F486 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 💆🏻‍♂️ E4.0 man getting massage: light skin tone
+1F486 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 💆🏼‍♂️ E4.0 man getting massage: medium-light skin tone
+1F486 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 💆🏽‍♂️ E4.0 man getting massage: medium skin tone
+1F486 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 💆🏾‍♂️ E4.0 man getting massage: medium-dark skin tone
+1F486 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 💆🏿‍♂️ E4.0 man getting massage: dark skin tone
+1F486 200D 2640 FE0F                                   ; fully-qualified     # 💆‍♀️ E4.0 woman getting massage
+1F486 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 💆🏻‍♀️ E4.0 woman getting massage: light skin tone
+1F486 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 💆🏼‍♀️ E4.0 woman getting massage: medium-light skin tone
+1F486 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 💆🏽‍♀️ E4.0 woman getting massage: medium skin tone
+1F486 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 💆🏾‍♀️ E4.0 woman getting massage: medium-dark skin tone
+1F486 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 💆🏿‍♀️ E4.0 woman getting massage: dark skin tone
+1F487                                                  ; fully-qualified     # 💇 E0.6 person getting haircut
+1F487 1F3FB                                            ; fully-qualified     # 💇🏻 E1.0 person getting haircut: light skin tone
+1F487 1F3FC                                            ; fully-qualified     # 💇🏼 E1.0 person getting haircut: medium-light skin tone
+1F487 1F3FD                                            ; fully-qualified     # 💇🏽 E1.0 person getting haircut: medium skin tone
+1F487 1F3FE                                            ; fully-qualified     # 💇🏾 E1.0 person getting haircut: medium-dark skin tone
+1F487 1F3FF                                            ; fully-qualified     # 💇🏿 E1.0 person getting haircut: dark skin tone
+1F487 200D 2642 FE0F                                   ; fully-qualified     # 💇‍♂️ E4.0 man getting haircut
+1F487 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 💇🏻‍♂️ E4.0 man getting haircut: light skin tone
+1F487 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 💇🏼‍♂️ E4.0 man getting haircut: medium-light skin tone
+1F487 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 💇🏽‍♂️ E4.0 man getting haircut: medium skin tone
+1F487 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 💇🏾‍♂️ E4.0 man getting haircut: medium-dark skin tone
+1F487 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 💇🏿‍♂️ E4.0 man getting haircut: dark skin tone
+1F487 200D 2640 FE0F                                   ; fully-qualified     # 💇‍♀️ E4.0 woman getting haircut
+1F487 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 💇🏻‍♀️ E4.0 woman getting haircut: light skin tone
+1F487 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 💇🏼‍♀️ E4.0 woman getting haircut: medium-light skin tone
+1F487 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 💇🏽‍♀️ E4.0 woman getting haircut: medium skin tone
+1F487 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 💇🏾‍♀️ E4.0 woman getting haircut: medium-dark skin tone
+1F487 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 💇🏿‍♀️ E4.0 woman getting haircut: dark skin tone
+1F483                                                  ; fully-qualified     # 💃 E0.6 woman dancing
+1F483 1F3FB                                            ; fully-qualified     # 💃🏻 E1.0 woman dancing: light skin tone
+1F483 1F3FC                                            ; fully-qualified     # 💃🏼 E1.0 woman dancing: medium-light skin tone
+1F483 1F3FD                                            ; fully-qualified     # 💃🏽 E1.0 woman dancing: medium skin tone
+1F483 1F3FE                                            ; fully-qualified     # 💃🏾 E1.0 woman dancing: medium-dark skin tone
+1F483 1F3FF                                            ; fully-qualified     # 💃🏿 E1.0 woman dancing: dark skin tone
+1F48F                                                  ; fully-qualified     # 💏 E0.6 kiss
+1F48F 1F3FB                                            ; fully-qualified     # 💏🏻 E13.1 kiss: light skin tone
+1F48F 1F3FC                                            ; fully-qualified     # 💏🏼 E13.1 kiss: medium-light skin tone
+1F48F 1F3FD                                            ; fully-qualified     # 💏🏽 E13.1 kiss: medium skin tone
+1F48F 1F3FE                                            ; fully-qualified     # 💏🏾 E13.1 kiss: medium-dark skin tone
+1F48F 1F3FF                                            ; fully-qualified     # 💏🏿 E13.1 kiss: dark skin tone
+1F491                                                  ; fully-qualified     # 💑 E0.6 couple with heart
+1F491 1F3FB                                            ; fully-qualified     # 💑🏻 E13.1 couple with heart: light skin tone
+1F491 1F3FC                                            ; fully-qualified     # 💑🏼 E13.1 couple with heart: medium-light skin tone
+1F491 1F3FD                                            ; fully-qualified     # 💑🏽 E13.1 couple with heart: medium skin tone
+1F491 1F3FE                                            ; fully-qualified     # 💑🏾 E13.1 couple with heart: medium-dark skin tone
+1F491 1F3FF                                            ; fully-qualified     # 💑🏿 E13.1 couple with heart: dark skin tone
+1F490                                                  ; fully-qualified     # 💐 E0.6 bouquet
+1F4AE                                                  ; fully-qualified     # 💮 E0.6 white flower
+1F492                                                  ; fully-qualified     # 💒 E0.6 wedding
+1F488                                                  ; fully-qualified     # 💈 E0.6 barber pole
+1F4BA                                                  ; fully-qualified     # 💺 E0.6 seat
+1F4A7                                                  ; fully-qualified     # 💧 E0.6 droplet
+1F4FF                                                  ; fully-qualified     # 📿 E1.0 prayer beads
+1F484                                                  ; fully-qualified     # 💄 E0.6 lipstick
+1F48D                                                  ; fully-qualified     # 💍 E0.6 ring
+1F48E                                                  ; fully-qualified     # 💎 E0.6 gem stone
+1F4E2                                                  ; fully-qualified     # 📢 E0.6 loudspeaker
+1F4E3                                                  ; fully-qualified     # 📣 E0.6 megaphone
+1F4EF                                                  ; fully-qualified     # 📯 E1.0 postal horn
+1F4FB                                                  ; fully-qualified     # 📻 E0.6 radio
+1F4F1                                                  ; fully-qualified     # 📱 E0.6 mobile phone
+1F4F2                                                  ; fully-qualified     # 📲 E0.6 mobile phone with arrow
+1F4DE                                                  ; fully-qualified     # 📞 E0.6 telephone receiver
+1F4DF                                                  ; fully-qualified     # 📟 E0.6 pager
+1F4E0                                                  ; fully-qualified     # 📠 E0.6 fax machine
+1F4BB                                                  ; fully-qualified     # 💻 E0.6 laptop
+1F4BD                                                  ; fully-qualified     # 💽 E0.6 computer disk
+1F4BE                                                  ; fully-qualified     # 💾 E0.6 floppy disk
+1F4BF                                                  ; fully-qualified     # 💿 E0.6 optical disk
+1F4C0                                                  ; fully-qualified     # 📀 E0.6 dvd
+1F4FD FE0F                                             ; fully-qualified     # 📽️ E0.7 film projector
+1F4FA                                                  ; fully-qualified     # 📺 E0.6 television
+1F4F7                                                  ; fully-qualified     # 📷 E0.6 camera
+1F4F8                                                  ; fully-qualified     # 📸 E1.0 camera with flash
+1F4F9                                                  ; fully-qualified     # 📹 E0.6 video camera
+1F4FC                                                  ; fully-qualified     # 📼 E0.6 videocassette
+1F4A1                                                  ; fully-qualified     # 💡 E0.6 light bulb
+1F4D4                                                  ; fully-qualified     # 📔 E0.6 notebook with decorative cover
+1F4D5                                                  ; fully-qualified     # 📕 E0.6 closed book
+1F4D6                                                  ; fully-qualified     # 📖 E0.6 open book
+1F4D7                                                  ; fully-qualified     # 📗 E0.6 green book
+1F4D8                                                  ; fully-qualified     # 📘 E0.6 blue book
+1F4D9                                                  ; fully-qualified     # 📙 E0.6 orange book
+1F4DA                                                  ; fully-qualified     # 📚 E0.6 books
+1F4D3                                                  ; fully-qualified     # 📓 E0.6 notebook
+1F4D2                                                  ; fully-qualified     # 📒 E0.6 ledger
+1F4C3                                                  ; fully-qualified     # 📃 E0.6 page with curl
+1F4DC                                                  ; fully-qualified     # 📜 E0.6 scroll
+1F4C4                                                  ; fully-qualified     # 📄 E0.6 page facing up
+1F4F0                                                  ; fully-qualified     # 📰 E0.6 newspaper
+1F4D1                                                  ; fully-qualified     # 📑 E0.6 bookmark tabs
+1F4B0                                                  ; fully-qualified     # 💰 E0.6 money bag
+1F4B4                                                  ; fully-qualified     # 💴 E0.6 yen banknote
+1F4B5                                                  ; fully-qualified     # 💵 E0.6 dollar banknote
+1F4B6                                                  ; fully-qualified     # 💶 E1.0 euro banknote
+1F4B7                                                  ; fully-qualified     # 💷 E1.0 pound banknote
+1F4B8                                                  ; fully-qualified     # 💸 E0.6 money with wings
+1F4B3                                                  ; fully-qualified     # 💳 E0.6 credit card
+1F4B9                                                  ; fully-qualified     # 💹 E0.6 chart increasing with yen
+1F4E7                                                  ; fully-qualified     # 📧 E0.6 e-mail
+1F4E8                                                  ; fully-qualified     # 📨 E0.6 incoming envelope
+1F4E9                                                  ; fully-qualified     # 📩 E0.6 envelope with arrow
+1F4E4                                                  ; fully-qualified     # 📤 E0.6 outbox tray
+1F4E5                                                  ; fully-qualified     # 📥 E0.6 inbox tray
+1F4E6                                                  ; fully-qualified     # 📦 E0.6 package
+1F4EB                                                  ; fully-qualified     # 📫 E0.6 closed mailbox with raised flag
+1F4EA                                                  ; fully-qualified     # 📪 E0.6 closed mailbox with lowered flag
+1F4EC                                                  ; fully-qualified     # 📬 E0.7 open mailbox with raised flag
+1F4ED                                                  ; fully-qualified     # 📭 E0.7 open mailbox with lowered flag
+1F4EE                                                  ; fully-qualified     # 📮 E0.6 postbox
+1F4DD                                                  ; fully-qualified     # 📝 E0.6 memo
+1F4BC                                                  ; fully-qualified     # 💼 E0.6 briefcase
+1F4C1                                                  ; fully-qualified     # 📁 E0.6 file folder
+1F4C2                                                  ; fully-qualified     # 📂 E0.6 open file folder
+1F4C5                                                  ; fully-qualified     # 📅 E0.6 calendar
+1F4C6                                                  ; fully-qualified     # 📆 E0.6 tear-off calendar
+1F4C7                                                  ; fully-qualified     # 📇 E0.6 card index
+1F4C8                                                  ; fully-qualified     # 📈 E0.6 chart increasing
+1F4C9                                                  ; fully-qualified     # 📉 E0.6 chart decreasing
+1F4CA                                                  ; fully-qualified     # 📊 E0.6 bar chart
+1F4CB                                                  ; fully-qualified     # 📋 E0.6 clipboard
+1F4CC                                                  ; fully-qualified     # 📌 E0.6 pushpin
+1F4CD                                                  ; fully-qualified     # 📍 E0.6 round pushpin
+1F4CE                                                  ; fully-qualified     # 📎 E0.6 paperclip
+1F4CF                                                  ; fully-qualified     # 📏 E0.6 straight ruler
+1F4D0                                                  ; fully-qualified     # 📐 E0.6 triangular ruler
+1F4A3                                                  ; fully-qualified     # 💣 E0.6 bomb
+1F4E1                                                  ; fully-qualified     # 📡 E0.6 satellite antenna
+1F489                                                  ; fully-qualified     # 💉 E0.6 syringe
+1F48A                                                  ; fully-qualified     # 💊 E0.6 pill
+1F4F5                                                  ; fully-qualified     # 📵 E1.0 no mobile phones
+1F4F6                                                  ; fully-qualified     # 📶 E0.6 antenna bars
+1F4F3                                                  ; fully-qualified     # 📳 E0.6 vibration mode
+1F4F4                                                  ; fully-qualified     # 📴 E0.6 mobile phone off
+1F4B1                                                  ; fully-qualified     # 💱 E0.6 currency exchange
+1F4B2                                                  ; fully-qualified     # 💲 E0.6 heavy dollar sign
+1F4DB                                                  ; fully-qualified     # 📛 E0.6 name badge
+1F4A0                                                  ; fully-qualified     # 💠 E0.6 diamond with a dot

@@ -73,5 +73,10 @@ const STATUS_NOT_FOUND: u16 = 404;
 /// tombstone answer; the one refresh failure that must not hide behind a
 /// stale mirror).
 const STATUS_GONE: u16 = 410;
-/// Substring every JSON-family media type the peers answer with shares.
-const JSON_MARKER: &str = "json";
+/// The `ActivityPub` media type Mastodon and Pleroma serve documents as.
+const ACTIVITY_JSON: &str = "application/activity+json";
+/// The JSON-LD media type, an `ActivityPub` one only with the
+/// `ActivityStreams` profile.
+const LD_JSON: &str = "application/ld+json";
+/// The `profile` value that makes an `application/ld+json` body `ActivityPub`.
+const ACTIVITYSTREAMS_PROFILE: &str = "https://www.w3.org/ns/activitystreams";

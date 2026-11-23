@@ -1,8 +1,6 @@
 //! Fixtures the actor handler tests share: states, activities and
 //! mirror rows.
 
-use std::sync::Arc;
-
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
@@ -13,7 +11,6 @@ use crate::{
         dispatch::{ActivityView, FederationError, Outcome},
         remote_actor::{parse_actor, upsert_remote_user},
     },
-    http_client::HttpClient,
     jobs::deletion::KIND_DELETE_REMOTE,
     models::{
         follow::{self, Follow},
@@ -21,7 +18,6 @@ use crate::{
         user::{self, Flag, NewUser, User, insert},
     },
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The mirror every fixture here speaks about: alice on `peer.example`,
@@ -40,19 +36,7 @@ pub(super) const NEW_PEM: &str =
 
 /// Test state over `pool` with the fixed test config.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Test state over a pool that cannot answer: the database having gone

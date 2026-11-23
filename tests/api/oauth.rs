@@ -52,6 +52,10 @@ mod authorize_get;
 mod authorize_post;
 /// The `client_credentials` grant and the app-only token it mints.
 mod client_credentials;
+/// The `authorization_code` grant's `redirect_uri` binding.
+mod code_grant;
+/// The JSON `GET`/`POST /oauth/authorize` a trusted frontend drives.
+mod json_authorize;
 /// The `password` grant over JSON, form and Basic: successes and the
 /// shared credential refusals.
 mod password_grant;

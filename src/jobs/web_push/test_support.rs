@@ -25,7 +25,6 @@ use super::{MAX_ATTEMPTS, handle_deliver, job_args};
 use crate::services::web_push;
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     jobs::{AttemptInfo, JobError},
     models::{
         notification::{self, NewNotification, Notification},
@@ -35,8 +34,6 @@ use crate::{
         web_push_subscription::{self, NewSubscription, WebPushSubscription},
     },
     state::AppState,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
 };
 
 /// Test state over `pool` on the fixed test config, whose HTTP client
@@ -49,19 +46,7 @@ pub(super) fn app_state(pool: &PgPool) -> AppState {
 /// [`app_state`] built on `config`, for the tests that read a setting
 /// away from its test default.
 pub(super) fn app_state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        db: pool.clone(),
-        hub: Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// The first attempt of the [`MAX_ATTEMPTS`] the queue hands the job.

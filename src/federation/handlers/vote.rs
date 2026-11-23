@@ -405,21 +405,7 @@ mod tests {
 
     /// Test state: `pool` and the fixed test config, collaborators inert.
     fn app_state(pool: &sqlx::PgPool) -> AppState {
-        let config = std::sync::Arc::new(crate::config::Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: std::sync::Arc::clone(&config),
-            http_client: crate::http_client::HttpClient::from(config.as_ref()),
-            uploader: crate::uploads::UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: std::sync::Arc::default(),
-            mrf_config_cache: std::sync::Arc::default(),
-            translation_languages_cache: std::sync::Arc::default(),
-            rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::from_config(
-                config.as_ref(),
-            )),
-            mailer: std::sync::Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
     }
 
     /// The stored mirror of the fixture voter.
