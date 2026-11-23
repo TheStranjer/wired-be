@@ -12,6 +12,8 @@
 //! ([`start_deletion`] and [`approve_account`]), and more as later tickets
 //! need it.
 
+use std::{collections::HashSet, hash::Hash};
+
 use axum::{
     Json,
     http::{HeaderMap, Uri},
@@ -433,6 +435,39 @@ pub async fn approve_account(state: &AppState, pending: User) -> AppResult<User>
     Ok(updated)
 }
 
+/// The distinct `values`, in order of first appearance. One pass over a
+/// [`HashSet`], so a body-sized id list costs linear time, not the
+/// quadratic `Vec::contains` scan.
+pub fn distinct<T, I>(values: I) -> Vec<T>
+where
+    T: Copy + Eq + Hash,
+    I: IntoIterator<Item = T>,
+{
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(*value))
+        .collect()
+}
+
+/// The ids `texts` spell, each named once, in the order sent (see
+/// [`distinct`]), plus whether every text was an id at all.
+///
+/// The strict callers turn a `false` into the 404 an unknown id owes; the
+/// lenient ones ignore it, because text that is no id names no row.
+pub fn distinct_ids<'a, I>(texts: I) -> (Vec<Uuid>, bool)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut all_ids = true;
+    let ids = distinct(texts.into_iter().filter_map(|text| {
+        let id = parse_id(text);
+        all_ids &= id.is_some();
+        id
+    }));
+    (ids, all_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +685,42 @@ mod tests {
             vec![Visibility::Public, Visibility::Direct],
             "the verbatim spellings count, a capitalization and junk do not"
         );
+    }
+
+    #[test]
+    fn distinct_keeps_first_occurrences_in_order() {
+        assert_eq!(distinct([3, 1, 3, 2, 1, 2]), vec![3, 1, 2]);
+        assert_eq!(distinct([7, 7, 7]), vec![7], "all repeats fold into one");
+        assert_eq!(distinct([1, 2, 3]), vec![1, 2, 3], "no repeats: unchanged");
+    }
+
+    #[test]
+    fn distinct_of_nothing_is_empty() {
+        assert_eq!(distinct(Vec::<u8>::new()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn distinct_ids_parses_dedupes_and_keeps_order() {
+        let (ids, all_ids) = distinct_ids([ID_B, ID_A, ID_B, ID_A]);
+        assert!(all_ids, "every text was an id");
+        assert_eq!(
+            ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![ID_B, ID_A],
+            "first-occurrence order"
+        );
+    }
+
+    #[test]
+    fn distinct_ids_flags_junk_and_keeps_the_ids_around_it() {
+        let (found, every_text_parsed) = distinct_ids([ID_A, "junk", ID_A, ""]);
+        assert!(!every_text_parsed, "junk clears the flag");
+        assert_eq!(found.len(), 1, "the ids around the junk are still kept");
+    }
+
+    #[test]
+    fn distinct_ids_of_nothing_is_complete_and_empty() {
+        let (none, nothing_wrong) = distinct_ids(Vec::<&str>::new());
+        assert_eq!(none, Vec::<Uuid>::new(), "no ids");
+        assert!(nothing_wrong, "nothing asked: nothing wrong");
     }
 }
