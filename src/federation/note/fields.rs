@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::{
-    AS_PUBLIC, NoteContext, TYPE_NOTE, TYPE_QUESTION, activities::json_ld_context,
+    AS_PUBLIC, NoteContext, TYPE_NOTE, TYPE_QUESTION, activities::json_ld_context_for,
     tags::attachments_json, tags::poll_fields, tags::tags_json,
 };
 
@@ -61,8 +61,9 @@ fn note_fields(ctx: &NoteContext) -> Vec<(&'static str, Value)> {
         ctx.config.base_url, ctx.status.conversation_id
     );
     let (to, cc) = addressing(ctx);
-    vec![
-        ("@context", json_ld_context(&ctx.config)),
+    let language = ctx.status.language.as_deref().filter(|tag| !tag.is_empty());
+    let mut fields = vec![
+        ("@context", json_ld_context_for(&ctx.config, language)),
         ("id", json!(&ctx.status.uri)),
         ("type", json!(object_type(ctx))),
         ("attributedTo", json!(&ctx.author.ap_id)),
@@ -70,6 +71,11 @@ fn note_fields(ctx: &NoteContext) -> Vec<(&'static str, Value)> {
         ("to", Value::Array(to)),
         ("cc", Value::Array(cc)),
         ("content", json!(&ctx.status.content)),
+    ];
+    if let Some(tag) = language {
+        fields.push(("contentMap", json!({ tag: &ctx.status.content })));
+    }
+    fields.extend([
         ("source", source_json(&ctx.status)),
         ("summary", summary_json(&ctx.status)),
         ("sensitive", json!(ctx.status.sensitive)),
@@ -83,7 +89,8 @@ fn note_fields(ctx: &NoteContext) -> Vec<(&'static str, Value)> {
             "attachment",
             Value::Array(attachments_json(&ctx.attachments)),
         ),
-    ]
+    ]);
+    fields
 }
 
 /// `Question` when the status carries a poll, `Note` otherwise.
@@ -181,7 +188,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        federation::note::test_support::*,
+        config::Config,
+        federation::note::{create_activity_json, test_support::*, update_activity_json},
         util::{id::new_id, time::parse_time},
     };
 
@@ -216,6 +224,67 @@ mod tests {
             "the whole document, field for field"
         );
         assert_eq!(json_keys(&document), NOTE_KEYS, "and nothing else");
+    }
+
+    #[test]
+    fn a_status_language_federates_as_context_and_content_map() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.status.language = Some("en".to_owned());
+        let document = note_json(&ctx).expect("a language-tagged note renders");
+        assert_eq!(
+            document["contentMap"],
+            json!({"en": "<p>hello</p>"}),
+            "the content, keyed by its language"
+        );
+        assert_eq!(document["content"], "<p>hello</p>", "content stays plain");
+        assert_eq!(
+            document["@context"][2],
+            json!({"@language": "en"}),
+            "the language map names the status language"
+        );
+        let mut keys: Vec<&str> = NOTE_KEYS.to_vec();
+        keys.push("contentMap");
+        keys.sort_unstable();
+        assert_eq!(json_keys(&document), keys, "exactly one key more");
+    }
+
+    #[test]
+    fn a_status_without_language_carries_no_content_map() {
+        for language in [None, Some(String::new())] {
+            let mut ctx = note_context(Visibility::Public);
+            ctx.status.language = language;
+            let document = note_json(&ctx).expect("a note renders");
+            assert!(document.get("contentMap").is_none(), "no content map");
+            assert_eq!(
+                document["@context"][2],
+                json!({"@language": "und"}),
+                "the language stays undetermined"
+            );
+        }
+    }
+
+    #[test]
+    fn the_activity_wrappers_carry_the_notes_context() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.status.language = Some("de".to_owned());
+        let note = note_json(&ctx).expect("a language-tagged note renders");
+        let config = Config::for_tests();
+        let create = create_activity_json(&note, &ctx.status, &config);
+        assert_eq!(create["@context"], note["@context"], "the create's context");
+        assert_eq!(
+            create["@context"][2],
+            json!({"@language": "de"}),
+            "carries the status language"
+        );
+        let update = update_activity_json(&note, new_id(), &config);
+        assert_eq!(update["@context"], note["@context"], "the update's context");
+
+        let bare = json!({"actor": AUTHOR_AP});
+        assert_eq!(
+            create_activity_json(&bare, &ctx.status, &config)["@context"],
+            expected_context(),
+            "a note without a context falls back to the undetermined one"
+        );
     }
 
     #[test]
