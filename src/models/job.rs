@@ -671,7 +671,12 @@ mod tests {
 
         let after = claim_next(&pool, &["default"]).await.unwrap();
         assert!(after.is_none(), "a discarded job never returns");
+    }
 
+    #[tokio::test]
+    async fn fail_without_a_retry_delay_discards_at_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
         let doomed = enqueue(&pool, new_job("default", "doomed"))
             .await
             .unwrap()
