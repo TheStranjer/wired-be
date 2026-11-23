@@ -18,7 +18,7 @@ use crate::{
         names::{FULL_FRAME, MAX_SUBSCRIPTIONS, UNAUTHORIZED_FRAME, UNKNOWN_STREAM_FRAME},
     },
     auth,
-    models::user::User,
+    models::{oauth_token::OauthToken, user::User},
     oauth::scopes::Scopes,
 };
 
@@ -79,7 +79,7 @@ pub(super) async fn on_authenticate(
     match auth::credential(&connection.state, raw).await {
         Ok(Some(found)) => match found.user {
             Some(reader) => {
-                adopt(connection, reader, &found.token.scopes).await;
+                adopt(connection, reader, &found.token).await;
                 Vec::new()
             }
             None => refused,
@@ -93,11 +93,12 @@ pub(super) async fn on_authenticate(
 }
 
 /// Takes an authenticated reader over from an anonymous socket: the user
-/// row, its token's scopes, and the suppression sets that go with them.
-/// A failed read leaves the (empty) sets in place rather than dropping
-/// the connection; the next refresh retries.
-async fn adopt(connection: &mut Connection, reader: User, scopes: &str) {
-    connection.scopes = Scopes::parse(scopes);
+/// row, its token's id and scopes, and the suppression sets that go with
+/// them. A failed read leaves the (empty) sets in place rather than
+/// dropping the connection; the next refresh retries.
+async fn adopt(connection: &mut Connection, reader: User, token: &OauthToken) {
+    connection.scopes = Scopes::parse(&token.scopes);
+    connection.token_id = Some(token.id);
     let reader_id = reader.id;
     connection.reader = Some(Arc::new(reader));
     match Filters::load(&connection.state.db, Some(reader_id)).await {
