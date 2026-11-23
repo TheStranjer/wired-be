@@ -213,7 +213,7 @@ async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResul
     };
     check_account_ready(&user)?;
     if mfa::required(&user) {
-        return mfa_detour(state, &user, &app, &scopes, &attrs).await;
+        return mfa_detour(state, &user, &app, &scopes, &attrs.delivery()).await;
     }
     grant_code(state, &user, &app, &scopes, &attrs.delivery()).await
 }
@@ -229,12 +229,12 @@ async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResul
 /// Any database failure arrives as [`AppError::Database`]; a redirect
 /// URI that cannot become a header value is a 400
 /// [`INVALID_REDIRECT_URI`].
-async fn mfa_detour(
+pub(crate) async fn mfa_detour(
     state: &AppState,
     user: &User,
     app: &OauthApp,
     scopes: &Scopes,
-    attrs: &AuthorizationAttrs,
+    delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
     let challenge = mfa::start_challenge(state, user, app, scopes).await?;
     let scope_text = scopes.to_string();
@@ -242,12 +242,9 @@ async fn mfa_detour(
         ("mfa_token", challenge.as_str()),
         ("client_id", app.client_id.as_str()),
         ("scope", scope_text.as_str()),
-        (
-            "redirect_uri",
-            attrs.redirect_uri.as_deref().unwrap_or_default(),
-        ),
+        ("redirect_uri", delivery.redirect_uri),
     ];
-    if let Some(client_state) = attrs.state.as_deref() {
+    if let Some(client_state) = delivery.state {
         params.push(("state", client_state));
     }
     redirect_to(mfa::MFA_PATH, &params)
