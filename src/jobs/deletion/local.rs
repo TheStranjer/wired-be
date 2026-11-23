@@ -71,7 +71,7 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
     let statuses = status::soft_delete_all_for_user(db, id)
         .await
         .map_err(|err| retry(&err))?;
-    let follows = follow::delete_all_for_user(db, id)
+    let follows = follow::delete_all_for_user_with_counts(db, id)
         .await
         .map_err(|err| retry(&err))?;
     let favourites = favourite::delete_all_for_user(db, id)
@@ -155,9 +155,9 @@ mod tests {
 
     use super::super::test_support::{
         BATCH_OVERSHOOT, accepted_follow, app_state, available_jobs_keyed, broken_state,
-        count_where, follows, has_follow, likes, list_of, live_statuses, local_user, marks,
-        media_row, notify, post, post_many, processed_backup, push_subscription, run,
-        scheduled_with_job, status_deleted_at, uploads_state,
+        count_where, follows, fresh_user, has_follow, likes, list_of, live_statuses, local_user,
+        locked_user, marks, media_row, notify, post, post_many, processed_backup,
+        push_subscription, run, scheduled_with_job, status_deleted_at, uploads_state,
     };
     use super::super::{KIND_DELETE, job_args};
     use super::*;
@@ -225,6 +225,79 @@ mod tests {
         );
         assert_eq!(purged.name, "", "and the display name is blanked");
         assert_eq!(purged.nickname, "alice", "the handle stays for the refs");
+    }
+
+    /// After the job, the purged row renders as an `Account` with no
+    /// profile data beyond its handle: empty note, no fields or tags, the
+    /// default avatar and header, no background, and no roles.
+    #[tokio::test]
+    async fn the_handler_leaves_an_account_that_renders_no_profile() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = insert(
+            &pool,
+            &NewUser {
+                email: Some("carol@example.org".to_owned()),
+                password_hash: Some("hash-of-a-secret".to_owned()),
+                name: "Carol".to_owned(),
+                bio: "<p>carol's bio</p>".to_owned(),
+                raw_bio: "carol's bio".to_owned(),
+                fields: json!([{"name": "site", "value": "https://carol.example"}]),
+                raw_fields: json!([{"name": "site", "value": "https://carol.example"}]),
+                avatar_url: Some("https://cdn.example/carol.png".to_owned()),
+                banner_url: Some("https://cdn.example/carol-banner.png".to_owned()),
+                background_image_url: Some("https://cdn.example/carol-bg.png".to_owned()),
+                tags: vec!["force_unlisted".to_owned()],
+                is_admin: Flag::new(true),
+                is_moderator: Flag::new(true),
+                discoverable: Flag::new(true),
+                ..NewUser::local("carol", &local_ap_id(TEST_BASE_URL, "carol"))
+            },
+        )
+        .await
+        .expect("the populated fixture inserts");
+        let state = app_state(&pool);
+
+        run(&state, carol.id).await.expect("the delete job runs");
+
+        let reloaded = user::get_by_id(&pool, carol.id)
+            .await
+            .unwrap()
+            .expect("the row is kept for referential integrity");
+        let account = crate::entities::account::Account::from_user(&reloaded, &state.config);
+        assert_eq!(account.note, "", "the bio is gone");
+        assert!(account.fields.is_empty(), "the fields are gone");
+        assert_eq!(account.display_name, "", "the display name is gone");
+        assert_eq!(
+            account.avatar,
+            format!(
+                "{}{}",
+                state.config.frontend_base_url,
+                crate::entities::account::DEFAULT_AVATAR_PATH
+            ),
+            "the avatar is the default"
+        );
+        assert_eq!(
+            account.header,
+            format!(
+                "{}{}",
+                state.config.frontend_base_url,
+                crate::entities::account::DEFAULT_BANNER_PATH
+            ),
+            "the header is the default"
+        );
+        assert!(account.pleroma.tags.is_empty(), "the tags are gone");
+        assert!(
+            account.pleroma.background_image.is_none(),
+            "the background is gone"
+        );
+        assert!(!account.discoverable.0, "the account is not discoverable");
+        assert!(!account.pleroma.is_admin.0, "the admin role is gone");
+        assert!(
+            !account.pleroma.is_moderator.0,
+            "the moderator role is gone"
+        );
+        assert_eq!(account.acct, "carol", "the handle stays");
     }
 
     /// The sweep's relationship half: both directions of every follow,
@@ -408,6 +481,109 @@ mod tests {
             0,
             "and the account stays fully tombstoned"
         );
+    }
+
+    /// The peers of a deleted local account are live: the follower of it
+    /// stops counting a followee and the account it followed stops counting
+    /// a follower, while the deleted account's own counters drop to zero.
+    #[tokio::test]
+    async fn the_handler_steps_the_peers_follow_counters_down() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let carol = local_user(&pool, "carol").await;
+        let dave = local_user(&pool, "dave").await;
+        let erin = local_user(&pool, "erin").await;
+        follows(&pool, &carol, &alice).await;
+        follows(&pool, &alice, &dave).await;
+        follows(&pool, &carol, &erin).await;
+        assert_eq!(fresh_user(&pool, carol.id).await.following_count, 2);
+        assert_eq!(fresh_user(&pool, dave.id).await.followers_count, 1);
+
+        run(&app_state(&pool), alice.id)
+            .await
+            .expect("the delete job runs");
+
+        assert_eq!(
+            fresh_user(&pool, carol.id).await.following_count,
+            1,
+            "carol no longer counts alice but keeps erin"
+        );
+        assert_eq!(
+            fresh_user(&pool, dave.id).await.followers_count,
+            0,
+            "dave no longer counts alice as a follower"
+        );
+        assert_eq!(
+            fresh_user(&pool, erin.id).await.followers_count,
+            1,
+            "erin's follower is nobody the sweep touches"
+        );
+        let departed = fresh_user(&pool, alice.id).await;
+        assert_eq!(
+            (departed.followers_count, departed.following_count),
+            (0, 0),
+            "the deleted account's own counters are zero"
+        );
+    }
+
+    /// A pending request from the deleted account to a locked account
+    /// goes without moving any counter.
+    #[tokio::test]
+    async fn a_pending_request_moves_no_counter() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let gated = locked_user(&pool, "gated").await;
+        follows(&pool, &alice, &gated).await;
+        assert!(has_follow(&pool, &alice, &gated).await, "the request waits");
+
+        run(&app_state(&pool), alice.id)
+            .await
+            .expect("the delete job runs");
+
+        assert!(
+            !has_follow(&pool, &alice, &gated).await,
+            "the request went with the account"
+        );
+        let locked = fresh_user(&pool, gated.id).await;
+        assert_eq!(
+            (locked.followers_count, locked.following_count),
+            (0, 0),
+            "a request that never counted steps nothing"
+        );
+    }
+
+    /// A second pass over the cleared account steps no counter again.
+    #[tokio::test]
+    async fn a_second_pass_leaves_the_peers_counters_alone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let carol = local_user(&pool, "carol").await;
+        let dave = local_user(&pool, "dave").await;
+        let erin = local_user(&pool, "erin").await;
+        follows(&pool, &carol, &alice).await;
+        follows(&pool, &alice, &dave).await;
+        follows(&pool, &carol, &erin).await;
+        follows(&pool, &dave, &erin).await;
+
+        let state = app_state(&pool);
+        run(&state, alice.id).await.expect("the first pass runs");
+        run(&state, alice.id).await.expect("the second pass runs");
+
+        assert_eq!(
+            fresh_user(&pool, carol.id).await.following_count,
+            1,
+            "carol's remaining follow of erin still counts"
+        );
+        assert_eq!(fresh_user(&pool, dave.id).await.followers_count, 0);
+        assert_eq!(
+            fresh_user(&pool, dave.id).await.following_count,
+            1,
+            "dave's follow of erin is untouched by the rerun"
+        );
+        assert_eq!(fresh_user(&pool, erin.id).await.followers_count, 2);
     }
 
     /// A payload that is not `{user_id}` can never run: discarded, not

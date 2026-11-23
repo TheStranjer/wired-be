@@ -99,6 +99,9 @@ const WRAPPING_TYPES: [&str; 2] = ["Create", "Update"];
 const DELETE_TYPE: &str = "Delete";
 /// The activity type [`List::ReportRemoval`] refuses.
 const FLAG_TYPE: &str = "Flag";
+/// The `type`s of an actor document: an embedded `object` of one of these
+/// stands for its own `id`'s host.
+const ACTOR_TYPES: [&str; 5] = ["Person", "Service", "Group", "Organization", "Application"];
 /// The public address as this policy writes it back: the full
 /// `ActivityStreams` iri, the spelling every reader accepts
 /// ([`PUBLIC_RECIPIENTS`](crate::federation::note_parser::PUBLIC_RECIPIENTS)

@@ -4,7 +4,7 @@ use super::*;
 
 /// The auth matrix over both areas: no token is 401, an app-only token
 /// and a non-admin user are 403, and the scope gates answer per class
-/// and area — `admin:read:oauth_apps` opens the listing but no write,
+/// and area — `admin:read:oauth_apps` opens neither the listing nor a write,
 /// `admin:write:instance_documents` the document writes but not their
 /// read, and a foreign area scope opens nothing.
 #[tokio::test]
@@ -40,7 +40,7 @@ async fn the_auth_gates_answer_per_class_and_area() {
         .send(&app)
         .await;
     common::assert_answer(&wrong_area, StatusCode::FORBIDDEN, "a foreign area scope");
-    common::assert_error(&wrong_area, NO_ADMIN_READ, "names the class root");
+    common::assert_error(&wrong_area, NO_ADMIN_WRITE, "names the class root");
 
     let read_write = TestRequest::post(APPS)
         .bearer(&apps_read_admin)
@@ -81,7 +81,56 @@ async fn the_auth_gates_answer_per_class_and_area() {
         .await;
     common::assert_answer(
         &listing,
-        StatusCode::OK,
-        "the narrow read scope opens its own area",
+        StatusCode::FORBIDDEN,
+        "the narrow read scope no longer lists the apps",
     );
+    common::assert_error(&listing, NO_ADMIN_WRITE, "the listing asks the write root");
+}
+
+/// The listing hands out every `client_secret`, so only a write grant
+/// opens it: `admin:read` and `admin:read:oauth_apps` are 403 naming
+/// `admin:write`, while `admin:write` and `admin:write:oauth_apps` get
+/// the secret.
+#[tokio::test]
+async fn only_a_write_grant_lists_the_client_secrets() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let root = admin(&pool, "root", "admin:write").await;
+    let read_all = admin(&pool, "readall", "admin:read").await;
+    let read_apps = admin(&pool, "readapps", "admin:read:oauth_apps").await;
+    let write_apps = admin(&pool, "writeapps", "admin:write:oauth_apps").await;
+
+    let created = create_app(&app, &root, json!({"name": "Vault", "redirect_uris": OOB})).await;
+    common::assert_answer(&created, StatusCode::OK, "the fixture app");
+    let secret = created.json_value()["client_secret"]
+        .as_str()
+        .expect("a client secret")
+        .to_owned();
+
+    for (token, what) in [
+        (&read_all, "admin:read"),
+        (&read_apps, "admin:read:oauth_apps"),
+    ] {
+        let refused = TestRequest::get(APPS).bearer(token).send(&app).await;
+        common::assert_answer(&refused, StatusCode::FORBIDDEN, what);
+        common::assert_error(&refused, NO_ADMIN_WRITE, what);
+        assert!(
+            !refused.text().contains(&secret),
+            "{what} must not see the secret"
+        );
+    }
+
+    for (token, what) in [
+        (&root, "admin:write"),
+        (&write_apps, "admin:write:oauth_apps"),
+    ] {
+        let listed = TestRequest::get(APPS).bearer(token).send(&app).await;
+        common::assert_answer(&listed, StatusCode::OK, what);
+        assert_eq!(
+            listed.json_value()["apps"][0]["client_secret"],
+            json!(secret),
+            "{what} lists the client secret"
+        );
+    }
 }

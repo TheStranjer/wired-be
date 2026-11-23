@@ -12,6 +12,8 @@
 //! ([`start_deletion`] and [`approve_account`]), and more as later tickets
 //! need it.
 
+use std::{collections::HashSet, hash::Hash};
+
 use axum::{
     Json,
     http::{HeaderMap, Uri},
@@ -30,7 +32,7 @@ use crate::{
         oauth_token,
         status::{self, Status, Visibility},
         status_visibility,
-        user::{self, User, admin},
+        user::{self, AccountStatus, User, admin},
     },
     pagination::{link_header, set_link_header},
     services::{
@@ -71,6 +73,53 @@ pub async fn account_or_404(state: &AppState, id_str: &str) -> AppResult<User> {
     user::get_by_id(&state.db, id)
         .await?
         .filter(|found| found.is_active.get())
+        .ok_or(AppError::NotFound)
+}
+
+/// Whether `viewer` may see `account` at all (`None`: an anonymous request).
+///
+/// Pleroma's `User.visible_for/2`: the account itself and staff (an admin or
+/// a moderator, who can manage activation state) may see an account that
+/// is still waiting on approval or email confirmation; everyone else sees
+/// only an account with nothing waiting on it ([`AccountStatus::Active`]),
+/// so registration spam shows nothing before a moderator has looked at it.
+/// A deactivated (or deleted) account stays hidden from every viewer, as
+/// [`account_or_404`] has always answered.
+#[must_use]
+pub fn visible_to(account: &User, viewer: Option<&User>) -> bool {
+    if !account.is_active.get() {
+        return false;
+    }
+    if let Some(viewer) = viewer
+        && (viewer.id == account.id || viewer.is_admin.get() || viewer.is_moderator.get())
+    {
+        return true;
+    }
+    matches!(account.account_status(), AccountStatus::Active)
+}
+
+/// [`account_or_404`] for a request made by `viewer`: the row is returned
+/// only when [`visible_to`] says the viewer may see it.
+///
+/// A malformed id, an unknown id and an account the viewer may not see are
+/// the same [`AppError::NotFound`], so the endpoint never tells a pending
+/// registration from a missing one.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives
+/// through `?` as [`AppError::Database`].
+pub async fn visible_account_or_404(
+    state: &AppState,
+    id_str: &str,
+    viewer: Option<&User>,
+) -> AppResult<User> {
+    let Some(id) = parse_id(id_str) else {
+        return Err(AppError::NotFound);
+    };
+    user::get_by_id(&state.db, id)
+        .await?
+        .filter(|found| visible_to(found, viewer))
         .ok_or(AppError::NotFound)
 }
 
@@ -433,6 +482,39 @@ pub async fn approve_account(state: &AppState, pending: User) -> AppResult<User>
     Ok(updated)
 }
 
+/// The distinct `values`, in order of first appearance. One pass over a
+/// [`HashSet`], so a body-sized id list costs linear time, not the
+/// quadratic `Vec::contains` scan.
+pub fn distinct<T, I>(values: I) -> Vec<T>
+where
+    T: Copy + Eq + Hash,
+    I: IntoIterator<Item = T>,
+{
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(*value))
+        .collect()
+}
+
+/// The ids `texts` spell, each named once, in the order sent (see
+/// [`distinct`]), plus whether every text was an id at all.
+///
+/// The strict callers turn a `false` into the 404 an unknown id owes; the
+/// lenient ones ignore it, because text that is no id names no row.
+pub fn distinct_ids<'a, I>(texts: I) -> (Vec<Uuid>, bool)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut all_ids = true;
+    let ids = distinct(texts.into_iter().filter_map(|text| {
+        let id = parse_id(text);
+        all_ids &= id.is_some();
+        id
+    }));
+    (ids, all_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +732,42 @@ mod tests {
             vec![Visibility::Public, Visibility::Direct],
             "the verbatim spellings count, a capitalization and junk do not"
         );
+    }
+
+    #[test]
+    fn distinct_keeps_first_occurrences_in_order() {
+        assert_eq!(distinct([3, 1, 3, 2, 1, 2]), vec![3, 1, 2]);
+        assert_eq!(distinct([7, 7, 7]), vec![7], "all repeats fold into one");
+        assert_eq!(distinct([1, 2, 3]), vec![1, 2, 3], "no repeats: unchanged");
+    }
+
+    #[test]
+    fn distinct_of_nothing_is_empty() {
+        assert_eq!(distinct(Vec::<u8>::new()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn distinct_ids_parses_dedupes_and_keeps_order() {
+        let (ids, all_ids) = distinct_ids([ID_B, ID_A, ID_B, ID_A]);
+        assert!(all_ids, "every text was an id");
+        assert_eq!(
+            ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![ID_B, ID_A],
+            "first-occurrence order"
+        );
+    }
+
+    #[test]
+    fn distinct_ids_flags_junk_and_keeps_the_ids_around_it() {
+        let (found, every_text_parsed) = distinct_ids([ID_A, "junk", ID_A, ""]);
+        assert!(!every_text_parsed, "junk clears the flag");
+        assert_eq!(found.len(), 1, "the ids around the junk are still kept");
+    }
+
+    #[test]
+    fn distinct_ids_of_nothing_is_complete_and_empty() {
+        let (none, nothing_wrong) = distinct_ids(Vec::<&str>::new());
+        assert_eq!(none, Vec::<Uuid>::new(), "no ids");
+        assert!(nothing_wrong, "nothing asked: nothing wrong");
     }
 }

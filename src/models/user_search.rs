@@ -15,12 +15,21 @@
 //! that sets `pg_trgm.similarity_threshold` locally.
 //!
 //! The rows that survive a search are the active accounts
-//! ([`is_active`](User::is_active), Pleroma's `filter_deactivated_users`);
-//! for an authenticated viewer, accounts that blocked the viewer never
-//! appear, and the viewer's own blocks and unexpired mutes are hidden too
-//! — unless `following_only` asks for the viewer's following list instead,
-//! where a mute does not hide the row (the list is the viewer's own) and
-//! only *accepted* follows are in at all.
+//! ([`is_active`](User::is_active), Pleroma's `filter_deactivated_users`).
+//! A local account must also be approved and email-confirmed
+//! ([`approval_pending`](User::approval_pending) unset,
+//! [`email_confirmed`](User::email_confirmed) set), as Mastodon's
+//! `Account.searchable` is `without_unapproved.without_suspended`
+//! (`app/models/account.rb`); a remote mirror is exempt from that test. The
+//! instance actor ([`NOT_INSTANCE_ACTOR_U`]) is never listed, as Pleroma's
+//! `filter_internal_users` drops internal actors. For an authenticated
+//! viewer, accounts that blocked the viewer never appear, and the viewer's
+//! own blocks, blocked domains (Pleroma's `filter_blocked_domains`,
+//! `lib/pleroma/user/search.ex`; the `user_domain_blocks` timelines honour)
+//! and unexpired mutes are hidden too — unless `following_only` asks for
+//! the viewer's following list instead, where neither a mute nor a blocked
+//! domain hides the row (the list is the viewer's own) and only *accepted*
+//! follows are in at all.
 //!
 //! The order is the ranking the ticket fixes: exact nickname match first,
 //! then the accounts the viewer follows, then local accounts before remote
@@ -34,7 +43,10 @@
 
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
-use crate::{error::AppResult, models::user::User};
+use crate::{
+    error::AppResult,
+    models::user::{NOT_INSTANCE_ACTOR_U, User},
+};
 
 /// The knobs of one [`search_accounts`] call: the page and the two flags
 /// the client sends (Pleroma's `search_options` reduced to the account
@@ -61,10 +73,17 @@ pub struct SearchOpts {
 }
 
 /// The shared head of every [`search_accounts`] statement: active accounts
-/// only (Pleroma's `filter_deactivated_users`), and the opening of the
-/// match clause [`push_match_arms`] fills and closes. The viewer
-/// exclusions, the ranking and the page follow, appended in that order.
-const BASE_SQL: &str = "SELECT u.* FROM users u WHERE u.is_active AND (";
+/// only (Pleroma's `filter_deactivated_users`), and a local account only
+/// once approved and confirmed (Mastodon's `without_unapproved`; remote
+/// mirrors carry neither flag's meaning, so they pass whatever the flags
+/// say). [`NOT_INSTANCE_ACTOR_U`] and [`MATCH_OPEN_SQL`] follow it.
+const BASE_SQL: &str = "SELECT u.* FROM users u WHERE u.is_active \
+                        AND (NOT u.local OR (NOT u.approval_pending AND u.email_confirmed))";
+
+/// The opening of the match clause [`push_match_arms`] fills and closes.
+/// The viewer exclusions, the ranking and the page follow, appended in
+/// that order.
+const MATCH_OPEN_SQL: &str = " AND (";
 
 /// Sets the `pg_trgm` similarity threshold the `%` operator arms of the
 /// match clause compare against, locally to the caller's transaction:
@@ -113,6 +132,7 @@ pub async fn search_accounts(
         .await
         .map(drop)?;
     let mut builder = QueryBuilder::<Postgres>::new(BASE_SQL);
+    let _head: &mut _ = builder.push(NOT_INSTANCE_ACTOR_U).push(MATCH_OPEN_SQL);
     push_match_arms(&mut builder, &needle);
     push_exclusions(&mut builder, viewer, opts.following_only);
     push_ranking(&mut builder, &needle, viewer);
@@ -212,6 +232,10 @@ fn push_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>, 
         .push(" AND NOT EXISTS (SELECT 1 FROM blocks b2 WHERE b2.blocker_id = ")
         .push_bind(viewer_id)
         .push(" AND b2.blocked_id = u.id)");
+    let _blocked_domain: &mut _ = builder
+        .push(" AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb WHERE udb.user_id = ")
+        .push_bind(viewer_id)
+        .push(" AND udb.domain = u.domain)");
     let _viewer_mutes: &mut _ = builder
         .push(" AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.muter_id = ")
         .push_bind(viewer_id)
@@ -276,9 +300,11 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            block, follow,
+            block,
+            domain_block::block_domain,
+            follow,
             mute::{self, MuteOptions},
-            user::{NewUser, insert, local_ap_id},
+            user::{Flag, INSTANCE_ACTOR_NICKNAME, NewUser, insert, local_ap_id},
         },
     };
 
@@ -682,6 +708,136 @@ mod tests {
             ids(&search(&pool, None, "alic").await),
             vec![alice.id],
             "not even for a query both accounts match by prefix"
+        );
+    }
+
+    /// A local user named `nickname` awaiting staff approval.
+    async fn pending_approval(pool: &PgPool, nickname: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                approval_pending: Flag::new(true),
+                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+            },
+        )
+        .await
+        .expect("the pending fixture inserts")
+    }
+
+    /// A local user named `nickname` whose email is not confirmed.
+    async fn unconfirmed(pool: &PgPool, nickname: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                email_confirmed: Flag::new(false),
+                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+            },
+        )
+        .await
+        .expect("the unconfirmed fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn an_account_awaiting_approval_is_not_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let approved = user(&pool, "waitapproved").await;
+        let _pending = pending_approval(&pool, "waitpending").await;
+
+        assert_eq!(
+            ids(&search(&pool, None, "wait").await),
+            vec![approved.id],
+            "only the approved account is searchable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_local_account_is_not_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let confirmed = user(&pool, "mailok").await;
+        let _waiting = unconfirmed(&pool, "mailwait").await;
+
+        assert_eq!(
+            ids(&search(&pool, None, "mail").await),
+            vec![confirmed.id],
+            "an unconfirmed address keeps the account out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_account_is_found_whatever_its_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mirror = insert(
+            &pool,
+            &NewUser {
+                nickname: "ghost@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/ghost".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                approval_pending: Flag::new(true),
+                email_confirmed: Flag::new(false),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the flagged mirror inserts");
+
+        assert_eq!(
+            ids(&search(&pool, None, "ghost").await),
+            vec![mirror.id],
+            "the registration flags mean nothing for a remote mirror"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_instance_actor_is_never_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = user(&pool, INSTANCE_ACTOR_NICKNAME).await;
+        let other = user(&pool, "internalaffairs").await;
+        let viewer = user(&pool, "viewer").await;
+
+        assert_eq!(
+            ids(&search(&pool, None, "internal").await),
+            vec![other.id],
+            "the actor is hidden from an anonymous search"
+        );
+        assert!(
+            !ids(&search(&pool, Some(&viewer), "internal.fetch").await).contains(&actor.id),
+            "and from an exact-nickname search by a viewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_viewer_does_not_find_accounts_on_a_domain_they_blocked() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let viewer = user(&pool, "viewer").await;
+        let other = user(&pool, "bystander").await;
+        let blocked = remote(&pool, "zed").await;
+        block_domain(&pool, viewer.id, "remote.example")
+            .await
+            .expect("the fixture domain block writes");
+
+        assert!(
+            search(&pool, Some(&viewer), "zed").await.is_empty(),
+            "the blocked domain's account is out of the viewer's search"
+        );
+        assert_eq!(
+            ids(&search(&pool, Some(&other), "zed").await),
+            vec![blocked.id],
+            "another viewer still finds it"
+        );
+        assert_eq!(
+            ids(&search(&pool, None, "zed").await),
+            vec![blocked.id],
+            "so does an anonymous search"
+        );
+        assert_eq!(
+            ids(&following_only(&pool, &viewer, "zed").await),
+            Vec::<Uuid>::new(),
+            "the following search still needs an accepted follow"
         );
     }
 

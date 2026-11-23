@@ -1,0 +1,226 @@
+263A FE0F                                              ; fully-qualified     # ☺️ E0.6 smiling face
+2639 FE0F                                              ; fully-qualified     # ☹️ E0.7 frowning face
+2620 FE0F                                              ; fully-qualified     # ☠️ E1.0 skull and crossbones
+2763 FE0F                                              ; fully-qualified     # ❣️ E1.0 heart exclamation
+2764 FE0F 200D 1F525                                   ; fully-qualified     # ❤️‍🔥 E13.1 heart on fire
+2764 FE0F 200D 1FA79                                   ; fully-qualified     # ❤️‍🩹 E13.1 mending heart
+2764 FE0F                                              ; fully-qualified     # ❤️ E0.6 red heart
+270B                                                   ; fully-qualified     # ✋ E0.6 raised hand
+270B 1F3FB                                             ; fully-qualified     # ✋🏻 E1.0 raised hand: light skin tone
+270B 1F3FC                                             ; fully-qualified     # ✋🏼 E1.0 raised hand: medium-light skin tone
+270B 1F3FD                                             ; fully-qualified     # ✋🏽 E1.0 raised hand: medium skin tone
+270B 1F3FE                                             ; fully-qualified     # ✋🏾 E1.0 raised hand: medium-dark skin tone
+270B 1F3FF                                             ; fully-qualified     # ✋🏿 E1.0 raised hand: dark skin tone
+270C FE0F                                              ; fully-qualified     # ✌️ E0.6 victory hand
+270C 1F3FB                                             ; fully-qualified     # ✌🏻 E1.0 victory hand: light skin tone
+270C 1F3FC                                             ; fully-qualified     # ✌🏼 E1.0 victory hand: medium-light skin tone
+270C 1F3FD                                             ; fully-qualified     # ✌🏽 E1.0 victory hand: medium skin tone
+270C 1F3FE                                             ; fully-qualified     # ✌🏾 E1.0 victory hand: medium-dark skin tone
+270C 1F3FF                                             ; fully-qualified     # ✌🏿 E1.0 victory hand: dark skin tone
+261D FE0F                                              ; fully-qualified     # ☝️ E0.6 index pointing up
+261D 1F3FB                                             ; fully-qualified     # ☝🏻 E1.0 index pointing up: light skin tone
+261D 1F3FC                                             ; fully-qualified     # ☝🏼 E1.0 index pointing up: medium-light skin tone
+261D 1F3FD                                             ; fully-qualified     # ☝🏽 E1.0 index pointing up: medium skin tone
+261D 1F3FE                                             ; fully-qualified     # ☝🏾 E1.0 index pointing up: medium-dark skin tone
+261D 1F3FF                                             ; fully-qualified     # ☝🏿 E1.0 index pointing up: dark skin tone
+270A                                                   ; fully-qualified     # ✊ E0.6 raised fist
+270A 1F3FB                                             ; fully-qualified     # ✊🏻 E1.0 raised fist: light skin tone
+270A 1F3FC                                             ; fully-qualified     # ✊🏼 E1.0 raised fist: medium-light skin tone
+270A 1F3FD                                             ; fully-qualified     # ✊🏽 E1.0 raised fist: medium skin tone
+270A 1F3FE                                             ; fully-qualified     # ✊🏾 E1.0 raised fist: medium-dark skin tone
+270A 1F3FF                                             ; fully-qualified     # ✊🏿 E1.0 raised fist: dark skin tone
+270D FE0F                                              ; fully-qualified     # ✍️ E0.7 writing hand
+270D 1F3FB                                             ; fully-qualified     # ✍🏻 E1.0 writing hand: light skin tone
+270D 1F3FC                                             ; fully-qualified     # ✍🏼 E1.0 writing hand: medium-light skin tone
+270D 1F3FD                                             ; fully-qualified     # ✍🏽 E1.0 writing hand: medium skin tone
+270D 1F3FE                                             ; fully-qualified     # ✍🏾 E1.0 writing hand: medium-dark skin tone
+270D 1F3FF                                             ; fully-qualified     # ✍🏿 E1.0 writing hand: dark skin tone
+26F7 FE0F                                              ; fully-qualified     # ⛷️ E0.7 skier
+26F9 FE0F                                              ; fully-qualified     # ⛹️ E0.7 person bouncing ball
+26F9 1F3FB                                             ; fully-qualified     # ⛹🏻 E2.0 person bouncing ball: light skin tone
+26F9 1F3FC                                             ; fully-qualified     # ⛹🏼 E2.0 person bouncing ball: medium-light skin tone
+26F9 1F3FD                                             ; fully-qualified     # ⛹🏽 E2.0 person bouncing ball: medium skin tone
+26F9 1F3FE                                             ; fully-qualified     # ⛹🏾 E2.0 person bouncing ball: medium-dark skin tone
+26F9 1F3FF                                             ; fully-qualified     # ⛹🏿 E2.0 person bouncing ball: dark skin tone
+26F9 FE0F 200D 2642 FE0F                               ; fully-qualified     # ⛹️‍♂️ E4.0 man bouncing ball
+26F9 1F3FB 200D 2642 FE0F                              ; fully-qualified     # ⛹🏻‍♂️ E4.0 man bouncing ball: light skin tone
+26F9 1F3FC 200D 2642 FE0F                              ; fully-qualified     # ⛹🏼‍♂️ E4.0 man bouncing ball: medium-light skin tone
+26F9 1F3FD 200D 2642 FE0F                              ; fully-qualified     # ⛹🏽‍♂️ E4.0 man bouncing ball: medium skin tone
+26F9 1F3FE 200D 2642 FE0F                              ; fully-qualified     # ⛹🏾‍♂️ E4.0 man bouncing ball: medium-dark skin tone
+26F9 1F3FF 200D 2642 FE0F                              ; fully-qualified     # ⛹🏿‍♂️ E4.0 man bouncing ball: dark skin tone
+26F9 FE0F 200D 2640 FE0F                               ; fully-qualified     # ⛹️‍♀️ E4.0 woman bouncing ball
+26F9 1F3FB 200D 2640 FE0F                              ; fully-qualified     # ⛹🏻‍♀️ E4.0 woman bouncing ball: light skin tone
+26F9 1F3FC 200D 2640 FE0F                              ; fully-qualified     # ⛹🏼‍♀️ E4.0 woman bouncing ball: medium-light skin tone
+26F9 1F3FD 200D 2640 FE0F                              ; fully-qualified     # ⛹🏽‍♀️ E4.0 woman bouncing ball: medium skin tone
+26F9 1F3FE 200D 2640 FE0F                              ; fully-qualified     # ⛹🏾‍♀️ E4.0 woman bouncing ball: medium-dark skin tone
+26F9 1F3FF 200D 2640 FE0F                              ; fully-qualified     # ⛹🏿‍♀️ E4.0 woman bouncing ball: dark skin tone
+2618 FE0F                                              ; fully-qualified     # ☘️ E1.0 shamrock
+2615                                                   ; fully-qualified     # ☕ E0.6 hot beverage
+26F0 FE0F                                              ; fully-qualified     # ⛰️ E0.7 mountain
+26EA                                                   ; fully-qualified     # ⛪ E0.6 church
+26E9 FE0F                                              ; fully-qualified     # ⛩️ E0.7 shinto shrine
+26F2                                                   ; fully-qualified     # ⛲ E0.6 fountain
+26FA                                                   ; fully-qualified     # ⛺ E0.6 tent
+2668 FE0F                                              ; fully-qualified     # ♨️ E0.6 hot springs
+26FD                                                   ; fully-qualified     # ⛽ E0.6 fuel pump
+2693                                                   ; fully-qualified     # ⚓ E0.6 anchor
+26F5                                                   ; fully-qualified     # ⛵ E0.6 sailboat
+26F4 FE0F                                              ; fully-qualified     # ⛴️ E0.7 ferry
+2708 FE0F                                              ; fully-qualified     # ✈️ E0.6 airplane
+231B                                                   ; fully-qualified     # ⌛ E0.6 hourglass done
+23F3                                                   ; fully-qualified     # ⏳ E0.6 hourglass not done
+231A                                                   ; fully-qualified     # ⌚ E0.6 watch
+23F0                                                   ; fully-qualified     # ⏰ E0.6 alarm clock
+23F1 FE0F                                              ; fully-qualified     # ⏱️ E1.0 stopwatch
+23F2 FE0F                                              ; fully-qualified     # ⏲️ E1.0 timer clock
+2600 FE0F                                              ; fully-qualified     # ☀️ E0.6 sun
+2B50                                                   ; fully-qualified     # ⭐ E0.6 star
+2601 FE0F                                              ; fully-qualified     # ☁️ E0.6 cloud
+26C5                                                   ; fully-qualified     # ⛅ E0.6 sun behind cloud
+26C8 FE0F                                              ; fully-qualified     # ⛈️ E0.7 cloud with lightning and rain
+2602 FE0F                                              ; fully-qualified     # ☂️ E0.7 umbrella
+2614                                                   ; fully-qualified     # ☔ E0.6 umbrella with rain drops
+26F1 FE0F                                              ; fully-qualified     # ⛱️ E0.7 umbrella on ground
+26A1                                                   ; fully-qualified     # ⚡ E0.6 high voltage
+2744 FE0F                                              ; fully-qualified     # ❄️ E0.6 snowflake
+2603 FE0F                                              ; fully-qualified     # ☃️ E0.7 snowman
+26C4                                                   ; fully-qualified     # ⛄ E0.6 snowman without snow
+2604 FE0F                                              ; fully-qualified     # ☄️ E1.0 comet
+2728                                                   ; fully-qualified     # ✨ E0.6 sparkles
+26BD                                                   ; fully-qualified     # ⚽ E0.6 soccer ball
+26BE                                                   ; fully-qualified     # ⚾ E0.6 baseball
+26F3                                                   ; fully-qualified     # ⛳ E0.6 flag in hole
+26F8 FE0F                                              ; fully-qualified     # ⛸️ E0.7 ice skate
+2660 FE0F                                              ; fully-qualified     # ♠️ E0.6 spade suit
+2665 FE0F                                              ; fully-qualified     # ♥️ E0.6 heart suit
+2666 FE0F                                              ; fully-qualified     # ♦️ E0.6 diamond suit
+2663 FE0F                                              ; fully-qualified     # ♣️ E0.6 club suit
+265F FE0F                                              ; fully-qualified     # ♟️ E11.0 chess pawn
+26D1 FE0F                                              ; fully-qualified     # ⛑️ E0.7 rescue worker’s helmet
+260E FE0F                                              ; fully-qualified     # ☎️ E0.6 telephone
+2328 FE0F                                              ; fully-qualified     # ⌨️ E1.0 keyboard
+2709 FE0F                                              ; fully-qualified     # ✉️ E0.6 envelope
+270F FE0F                                              ; fully-qualified     # ✏️ E0.6 pencil
+2712 FE0F                                              ; fully-qualified     # ✒️ E0.6 black nib
+2702 FE0F                                              ; fully-qualified     # ✂️ E0.6 scissors
+26CF FE0F                                              ; fully-qualified     # ⛏️ E0.7 pick
+2692 FE0F                                              ; fully-qualified     # ⚒️ E1.0 hammer and pick
+2694 FE0F                                              ; fully-qualified     # ⚔️ E1.0 crossed swords
+2699 FE0F                                              ; fully-qualified     # ⚙️ E1.0 gear
+2696 FE0F                                              ; fully-qualified     # ⚖️ E1.0 balance scale
+26D3 FE0F                                              ; fully-qualified     # ⛓️ E0.7 chains
+2697 FE0F                                              ; fully-qualified     # ⚗️ E1.0 alembic
+26B0 FE0F                                              ; fully-qualified     # ⚰️ E1.0 coffin
+26B1 FE0F                                              ; fully-qualified     # ⚱️ E1.0 funeral urn
+267F                                                   ; fully-qualified     # ♿ E0.6 wheelchair symbol
+26A0 FE0F                                              ; fully-qualified     # ⚠️ E0.6 warning
+26D4                                                   ; fully-qualified     # ⛔ E0.6 no entry
+2622 FE0F                                              ; fully-qualified     # ☢️ E1.0 radioactive
+2623 FE0F                                              ; fully-qualified     # ☣️ E1.0 biohazard
+2B06 FE0F                                              ; fully-qualified     # ⬆️ E0.6 up arrow
+2197 FE0F                                              ; fully-qualified     # ↗️ E0.6 up-right arrow
+27A1 FE0F                                              ; fully-qualified     # ➡️ E0.6 right arrow
+2198 FE0F                                              ; fully-qualified     # ↘️ E0.6 down-right arrow
+2B07 FE0F                                              ; fully-qualified     # ⬇️ E0.6 down arrow
+2199 FE0F                                              ; fully-qualified     # ↙️ E0.6 down-left arrow
+2B05 FE0F                                              ; fully-qualified     # ⬅️ E0.6 left arrow
+2196 FE0F                                              ; fully-qualified     # ↖️ E0.6 up-left arrow
+2195 FE0F                                              ; fully-qualified     # ↕️ E0.6 up-down arrow
+2194 FE0F                                              ; fully-qualified     # ↔️ E0.6 left-right arrow
+21A9 FE0F                                              ; fully-qualified     # ↩️ E0.6 right arrow curving left
+21AA FE0F                                              ; fully-qualified     # ↪️ E0.6 left arrow curving right
+2934 FE0F                                              ; fully-qualified     # ⤴️ E0.6 right arrow curving up
+2935 FE0F                                              ; fully-qualified     # ⤵️ E0.6 right arrow curving down
+269B FE0F                                              ; fully-qualified     # ⚛️ E1.0 atom symbol
+2721 FE0F                                              ; fully-qualified     # ✡️ E0.7 star of David
+2638 FE0F                                              ; fully-qualified     # ☸️ E0.7 wheel of dharma
+262F FE0F                                              ; fully-qualified     # ☯️ E0.7 yin yang
+271D FE0F                                              ; fully-qualified     # ✝️ E0.7 latin cross
+2626 FE0F                                              ; fully-qualified     # ☦️ E1.0 orthodox cross
+262A FE0F                                              ; fully-qualified     # ☪️ E0.7 star and crescent
+262E FE0F                                              ; fully-qualified     # ☮️ E1.0 peace symbol
+2648                                                   ; fully-qualified     # ♈ E0.6 Aries
+2649                                                   ; fully-qualified     # ♉ E0.6 Taurus
+264A                                                   ; fully-qualified     # ♊ E0.6 Gemini
+264B                                                   ; fully-qualified     # ♋ E0.6 Cancer
+264C                                                   ; fully-qualified     # ♌ E0.6 Leo
+264D                                                   ; fully-qualified     # ♍ E0.6 Virgo
+264E                                                   ; fully-qualified     # ♎ E0.6 Libra
+264F                                                   ; fully-qualified     # ♏ E0.6 Scorpio
+2650                                                   ; fully-qualified     # ♐ E0.6 Sagittarius
+2651                                                   ; fully-qualified     # ♑ E0.6 Capricorn
+2652                                                   ; fully-qualified     # ♒ E0.6 Aquarius
+2653                                                   ; fully-qualified     # ♓ E0.6 Pisces
+26CE                                                   ; fully-qualified     # ⛎ E0.6 Ophiuchus
+25B6 FE0F                                              ; fully-qualified     # ▶️ E0.6 play button
+23E9                                                   ; fully-qualified     # ⏩ E0.6 fast-forward button
+23ED FE0F                                              ; fully-qualified     # ⏭️ E0.7 next track button
+23EF FE0F                                              ; fully-qualified     # ⏯️ E1.0 play or pause button
+25C0 FE0F                                              ; fully-qualified     # ◀️ E0.6 reverse button
+23EA                                                   ; fully-qualified     # ⏪ E0.6 fast reverse button
+23EE FE0F                                              ; fully-qualified     # ⏮️ E0.7 last track button
+23EB                                                   ; fully-qualified     # ⏫ E0.6 fast up button
+23EC                                                   ; fully-qualified     # ⏬ E0.6 fast down button
+23F8 FE0F                                              ; fully-qualified     # ⏸️ E0.7 pause button
+23F9 FE0F                                              ; fully-qualified     # ⏹️ E0.7 stop button
+23FA FE0F                                              ; fully-qualified     # ⏺️ E0.7 record button
+23CF FE0F                                              ; fully-qualified     # ⏏️ E1.0 eject button
+2640 FE0F                                              ; fully-qualified     # ♀️ E4.0 female sign
+2642 FE0F                                              ; fully-qualified     # ♂️ E4.0 male sign
+26A7 FE0F                                              ; fully-qualified     # ⚧️ E13.0 transgender symbol
+2716 FE0F                                              ; fully-qualified     # ✖️ E0.6 multiply
+2795                                                   ; fully-qualified     # ➕ E0.6 plus
+2796                                                   ; fully-qualified     # ➖ E0.6 minus
+2797                                                   ; fully-qualified     # ➗ E0.6 divide
+267E FE0F                                              ; fully-qualified     # ♾️ E11.0 infinity
+203C FE0F                                              ; fully-qualified     # ‼️ E0.6 double exclamation mark
+2049 FE0F                                              ; fully-qualified     # ⁉️ E0.6 exclamation question mark
+2753                                                   ; fully-qualified     # ❓ E0.6 red question mark
+2754                                                   ; fully-qualified     # ❔ E0.6 white question mark
+2755                                                   ; fully-qualified     # ❕ E0.6 white exclamation mark
+2757                                                   ; fully-qualified     # ❗ E0.6 red exclamation mark
+3030 FE0F                                              ; fully-qualified     # 〰️ E0.6 wavy dash
+2695 FE0F                                              ; fully-qualified     # ⚕️ E4.0 medical symbol
+267B FE0F                                              ; fully-qualified     # ♻️ E0.6 recycling symbol
+269C FE0F                                              ; fully-qualified     # ⚜️ E1.0 fleur-de-lis
+2B55                                                   ; fully-qualified     # ⭕ E0.6 hollow red circle
+2705                                                   ; fully-qualified     # ✅ E0.6 check mark button
+2611 FE0F                                              ; fully-qualified     # ☑️ E0.6 check box with check
+2714 FE0F                                              ; fully-qualified     # ✔️ E0.6 check mark
+274C                                                   ; fully-qualified     # ❌ E0.6 cross mark
+274E                                                   ; fully-qualified     # ❎ E0.6 cross mark button
+27B0                                                   ; fully-qualified     # ➰ E0.6 curly loop
+27BF                                                   ; fully-qualified     # ➿ E1.0 double curly loop
+303D FE0F                                              ; fully-qualified     # 〽️ E0.6 part alternation mark
+2733 FE0F                                              ; fully-qualified     # ✳️ E0.6 eight-spoked asterisk
+2734 FE0F                                              ; fully-qualified     # ✴️ E0.6 eight-pointed star
+2747 FE0F                                              ; fully-qualified     # ❇️ E0.6 sparkle
+00A9 FE0F                                              ; fully-qualified     # ©️ E0.6 copyright
+00AE FE0F                                              ; fully-qualified     # ®️ E0.6 registered
+2122 FE0F                                              ; fully-qualified     # ™️ E0.6 trade mark
+0023 FE0F 20E3                                         ; fully-qualified     # #️⃣ E0.6 keycap: #
+002A FE0F 20E3                                         ; fully-qualified     # *️⃣ E2.0 keycap: *
+0030 FE0F 20E3                                         ; fully-qualified     # 0️⃣ E0.6 keycap: 0
+0031 FE0F 20E3                                         ; fully-qualified     # 1️⃣ E0.6 keycap: 1
+0032 FE0F 20E3                                         ; fully-qualified     # 2️⃣ E0.6 keycap: 2
+0033 FE0F 20E3                                         ; fully-qualified     # 3️⃣ E0.6 keycap: 3
+0034 FE0F 20E3                                         ; fully-qualified     # 4️⃣ E0.6 keycap: 4
+0035 FE0F 20E3                                         ; fully-qualified     # 5️⃣ E0.6 keycap: 5
+0036 FE0F 20E3                                         ; fully-qualified     # 6️⃣ E0.6 keycap: 6
+0037 FE0F 20E3                                         ; fully-qualified     # 7️⃣ E0.6 keycap: 7
+0038 FE0F 20E3                                         ; fully-qualified     # 8️⃣ E0.6 keycap: 8
+0039 FE0F 20E3                                         ; fully-qualified     # 9️⃣ E0.6 keycap: 9
+2139 FE0F                                              ; fully-qualified     # ℹ️ E0.6 information
+24C2 FE0F                                              ; fully-qualified     # Ⓜ️ E0.6 circled M
+3297 FE0F                                              ; fully-qualified     # ㊗️ E0.6 Japanese “congratulations” button
+3299 FE0F                                              ; fully-qualified     # ㊙️ E0.6 Japanese “secret” button
+26AB                                                   ; fully-qualified     # ⚫ E0.6 black circle
+26AA                                                   ; fully-qualified     # ⚪ E0.6 white circle
+2B1B                                                   ; fully-qualified     # ⬛ E0.6 black large square
+2B1C                                                   ; fully-qualified     # ⬜ E0.6 white large square
+25FC FE0F                                              ; fully-qualified     # ◼️ E0.6 black medium square
+25FB FE0F                                              ; fully-qualified     # ◻️ E0.6 white medium square
+25FE                                                   ; fully-qualified     # ◾ E0.6 black medium-small square
+25FD                                                   ; fully-qualified     # ◽ E0.6 white medium-small square
+25AA FE0F                                              ; fully-qualified     # ▪️ E0.6 black small square
+25AB FE0F                                              ; fully-qualified     # ▫️ E0.6 white small square

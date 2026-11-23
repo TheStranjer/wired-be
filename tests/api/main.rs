@@ -86,8 +86,8 @@ mod admin_federation;
 /// frontend catalogue and installer, and the admin backup trigger.
 mod admin_ops;
 
-/// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`
-/// and the legacy `/api/v0/pleroma/reports`, WBE-200): the filtered,
+/// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`,
+/// WBE-200): the filtered,
 /// paged entity list, the entity show with its visibility-free statuses
 /// and notes, the bulk assignment, the note lifecycle with its
 /// moderation-log entries, and the staff-and-scope gate on every route.
@@ -116,6 +116,10 @@ mod ap_activities;
 /// The object reads over HTTP: `GET /objects/{uuid}`, its nickname-scoped
 /// twin `GET /users/{nickname}/statuses/{uuid}` and `GET /notice/{id}`.
 mod ap_objects;
+
+/// Public-post reads of `/objects/{uuid}` and `/activities/{uuid}` are
+/// decided by `can_view` for the signer: blocked signers get the 404.
+mod ap_public_reads;
 
 /// Announcements over HTTP (`/api/v1/announcements`).
 mod announcements;
@@ -199,7 +203,7 @@ mod e2e_admin;
 
 /// The end-to-end discovery and federation scenarios (WBE-223): the
 /// search trio over the visibility matrix, the v1 phrase filters applied
-/// to the timelines, the Atom/RSS feeds and the link card through the job
+/// to the timelines, and the link card through the job
 /// queue, and a remote mention resolved and delivered against a loopback
 /// mock peer.
 mod e2e_discovery;
@@ -310,9 +314,6 @@ mod endorsements;
 /// its lack of any auth gate, and its database failure.
 mod federation_status;
 
-/// Atom and RSS feeds (`/users/{nickname}/feed*`, `/tags/{tag}`).
-mod feeds;
-
 /// Filters over HTTP (`/api/v1/filters`).
 mod filters;
 
@@ -387,7 +388,7 @@ mod markers;
 /// entity with its role object, the v1 boolean and v2 word spellings of the
 /// same criteria, the criteria this schema cannot weigh and accepts anyway,
 /// the page under a `Link` header keyed on the account ids, the show route's
-/// two misses, and the staff-and-`admin:read:accounts` gate.
+/// two misses, and the admin-and-`admin:read:accounts` gate.
 mod mastodon_admin;
 
 /// The Mastodon admin reports surface over HTTP (`/api/v1/admin/reports` and
@@ -504,6 +505,9 @@ mod push;
 
 /// The per-route rate limiter: mounted buckets, headers, and 429s.
 mod rate_limit;
+
+/// `…/reblogged_by` lists only distributable (public / unlisted) boosts.
+mod reblogged_by_visibility;
 
 /// Reblogs over HTTP (`/api/v1/statuses/{id}/reblog`, its `…/unreblog`
 /// twin and the `…/reblogged_by` listing).

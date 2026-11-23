@@ -2,7 +2,7 @@
 //! configuration writes, the chain-building shorthands and the test
 //! [`AppState`]s several of them run on.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use serde_json::{Map, Value, json};
@@ -15,10 +15,8 @@ use super::{
 };
 use crate::{
     config::Config,
-    http_client::HttpClient,
     services::{config_registry, runtime_config},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// Writes a `:mrf*` entry into the admin config store: the source the
@@ -56,19 +54,7 @@ pub(super) fn after(secs: i64) -> DateTime<Utc> {
 
 /// Test state over `pool` and `config`.
 pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        hub: crate::streaming::hub::Hub::new(pool),
-        db: pool.clone(),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// Test state on the default test config over `pool`.

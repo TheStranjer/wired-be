@@ -174,11 +174,28 @@ async fn the_mfa_page_refuses_a_wrong_code_and_delivers_the_right_one() {
         "the passed challenge retires"
     );
 
-    let parked = authorization_by_id(&pool, authorization_id).await;
+    assert_parked_code_redeems(&pool, authorization_id, &code, &app).await;
+}
+
+/// The parked authorization behind `authorization_id` is exactly the
+/// delivered `code`: unused, with the approved scopes, bound to the
+/// [`REDIRECT`] the detour carried, and redeemable by `app` with it.
+async fn assert_parked_code_redeems(
+    pool: &PgPool,
+    authorization_id: Uuid,
+    code: &str,
+    app: &OauthApp,
+) {
+    let parked = authorization_by_id(pool, authorization_id).await;
     assert_eq!(parked.token, code, "the delivered code is the parked one");
     assert_eq!(parked.scopes, "read", "with the approved scopes");
     assert!(!parked.used, "and still fresh for the client to redeem");
-    let redeemed = oauth_token::consume_authorization(&pool, &code, app.id)
+    assert_eq!(
+        parked.redirect_uri.as_deref(),
+        Some(REDIRECT),
+        "the parked code is bound to the URI the detour carried"
+    );
+    let redeemed = oauth_token::consume_authorization(pool, code, app.id, Some(REDIRECT))
         .await
         .expect("the exchange reaches the database");
     assert!(redeemed.is_some(), "the code is a real authorization code");

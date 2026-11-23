@@ -4,8 +4,14 @@ on:
   push:
   pull_request:
 
+# The job only reads the repository; nothing here needs to write with GITHUB_TOKEN.
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Every push to master gets its own run, so each landing gets a verdict;
+  # other branches still cancel a run a newer push superseded.
+  group: ci-${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -36,7 +42,7 @@ jobs:
           --health-retries 5
     steps:
       - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+        uses: jlumbroso/free-disk-space@cf1e78c50ca91e757bab3edc229027eebfc07871 # main, 2026-11-04
         with:
           android: true
           dotnet: true
@@ -44,7 +50,7 @@ jobs:
           large-packages: true
           docker-images: true
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
@@ -52,14 +58,14 @@ jobs:
       # Pinned, not `stable`: a new stable release changes rust-cache's key
       # (a cold dependency build, ~10 min) and can bring new denied Clippy
       # lints. Bump this deliberately, fixing any new lints in the same change.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
         with:
           toolchain: 1.100.0
           components: clippy, rustfmt
 
       # Save the dependency build even when a check fails; otherwise a red run
       # leaves the next run as cold as this one.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
 

@@ -34,14 +34,14 @@
 //! whichever ticket gives `/oauth` sessions). `lang` sets the page's
 //! language attribute.
 //!
-//! Trusted apps and the consent form (WBE-205): admins set the
-//! `oauth_apps.trusted` flag through
-//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`, and Pleroma's
-//! `OAuthController.authorize` skips the confirmation screen for an app
-//! carrying it. This endpoint does not act on the flag yet — every
-//! visit renders the form; skipping the consent for trusted apps is
-//! left to the ticket that reworks this flow, and until then the flag
-//! is stored, listed and answered but inert here.
+//! Trusted apps (WBE-205, WBE-666): admins set the `oauth_apps.trusted`
+//! flag through `PATCH /api/v1/pleroma/admin/oauth_app/{id}`. The HTML
+//! consent form does not act on it. The JSON half (`authorize/json.rs`, for a
+//! frontend that renders the consent page itself) does: `GET` with
+//! `Accept: application/json` describes the request, and `POST` with a
+//! bearer token and a JSON body approves or denies it, but only for a
+//! token whose own app is trusted. **`WiredFE`'s own app must therefore
+//! be marked `trusted`.**
 
 use std::fmt;
 
@@ -49,7 +49,7 @@ use axum::{
     Router,
     extract::State,
     http::{
-        HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{CACHE_CONTROL, LOCATION},
     },
     response::{Html, IntoResponse, Response},
@@ -64,7 +64,7 @@ use super::{NO_STORE, mfa};
 use crate::{
     api::oauth::check_account_ready,
     error::{AppError, AppResult},
-    extract::{ApiBody, ApiParams},
+    extract::{ApiBody, ApiParams, into_params},
     models::{
         oauth_app::{self, OauthApp},
         oauth_token::{self, OauthAuthorization},
@@ -76,6 +76,8 @@ use crate::{
     },
     state::AppState,
 };
+
+mod json;
 
 /// The only response type this endpoint speaks (RFC 6749 §4.1.2).
 pub(crate) const RESPONSE_TYPE_CODE: &str = "code";
@@ -132,24 +134,43 @@ pub(crate) struct Delivery<'a> {
 
 /// `GET /oauth/authorize` — validate the request and render the
 /// login-and-consent page. No authentication: this is where it comes
-/// from. Every answer gets the no-store header.
+/// from. `Accept: application/json` gets [`json::describe`]'s JSON
+/// instead of the page. Every answer gets the no-store header.
 async fn show(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ApiParams(query): ApiParams<AuthorizeQuery>,
 ) -> Response {
-    let response = match consent(&state, query).await {
-        Ok(page) => Html(page).into_response(),
-        Err(err) => err.into_response(),
+    let response = if json::wants_json(&headers) {
+        json::describe(&state, &query).await
+    } else {
+        match consent(&state, query).await {
+            Ok(page) => Html(page).into_response(),
+            Err(err) => err.into_response(),
+        }
     };
     no_store(response)
 }
 
-/// `POST /oauth/authorize` — the consent form submission; same answer
-/// header treatment as [`show`].
-async fn create(State(state): State<AppState>, ApiBody(form): ApiBody<AuthorizeForm>) -> Response {
-    let response = match authorize_submission(&state, form).await {
-        Ok(reply) => reply.into_response(),
-        Err(err) => err.into_response(),
+/// `POST /oauth/authorize` — the consent form submission, or, with a
+/// bearer token or a JSON body, the frontend's verdict ([`json::approve`]);
+/// same answer header treatment as [`show`].
+async fn create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiBody(body): ApiBody<Value>,
+) -> Response {
+    let response = if json::is_json_approval(&headers, &body) {
+        json::approve(&state, &headers, body).await
+    } else {
+        let submitted = match into_params::<AuthorizeForm>(body) {
+            Ok(form) => authorize_submission(&state, form).await,
+            Err(err) => Err(err),
+        };
+        match submitted {
+            Ok(reply) => reply.into_response(),
+            Err(err) => err.into_response(),
+        }
     };
     no_store(response)
 }
@@ -236,7 +257,7 @@ pub(crate) async fn mfa_detour(
     scopes: &Scopes,
     delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
-    let challenge = mfa::start_challenge(state, user, app, scopes).await?;
+    let challenge = mfa::start_challenge(state, user, app, scopes, delivery.redirect_uri).await?;
     let scope_text = scopes.to_string();
     let mut params: Vec<(&str, &str)> = vec![
         ("mfa_token", challenge.as_str()),
@@ -495,8 +516,14 @@ pub(crate) async fn grant_code(
     scopes: &Scopes,
     delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
-    let authorization =
-        oauth_token::create_authorization(&state.db, user.id, app.id, &scopes.to_string()).await?;
+    let authorization = oauth_token::create_authorization(
+        &state.db,
+        user.id,
+        app.id,
+        &scopes.to_string(),
+        delivery.redirect_uri,
+    )
+    .await?;
     deliver_code(&authorization, delivery)
 }
 
@@ -625,12 +652,11 @@ mod tests {
     use axum::http::{Request, header::CONTENT_TYPE};
     use chrono::Utc;
     use serde_json::json;
-    use std::sync::Arc;
     use tower::ServiceExt as _;
     use uuid::Uuid;
 
     use super::*;
-    use crate::{config::Config, http_client::HttpClient, uploads::UploaderBackend};
+    use crate::config::Config;
 
     /// The redirect URI the [`app_row`] fixture registers.
     const REGISTERED: &str = "https://client.example/callback";
@@ -753,7 +779,7 @@ mod tests {
 
     #[test]
     fn query_deserializes_every_wire_field() {
-        let query: AuthorizeQuery = crate::extract::into_params(json!({
+        let query: AuthorizeQuery = into_params(json!({
             "response_type": "code",
             "client_id": "client-id",
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
@@ -779,7 +805,7 @@ mod tests {
         // `extract::parse_form` turns the posted `authorization[name]`
         // keys into exactly this shape (its own tests cover that step);
         // this test covers the struct reading it back.
-        let form: AuthorizeForm = crate::extract::into_params(json!({
+        let form: AuthorizeForm = into_params(json!({
             "authorization": {
                 "name": "alice",
                 "password": "pw",
@@ -802,7 +828,7 @@ mod tests {
         );
         assert!(attrs.deny.is_some(), "the deny marker survives");
 
-        let empty: AuthorizeForm = crate::extract::into_params(json!({})).unwrap();
+        let empty: AuthorizeForm = into_params(json!({})).unwrap();
         assert_eq!(
             empty.authorization.client_id, None,
             "an absent form reads as all-absent fields"
@@ -811,7 +837,7 @@ mod tests {
 
     #[test]
     fn form_debug_redacts_the_password() {
-        let form: AuthorizeForm = crate::extract::into_params(json!({
+        let form: AuthorizeForm = into_params(json!({
             "authorization": { "name": "alice", "password": "s3cr3t" }
         }))
         .unwrap();
@@ -904,21 +930,7 @@ mod tests {
     /// lazy pool is never consulted (the validation gates that fail here
     /// run before any query).
     fn test_state() -> AppState {
-        let config = Arc::new(Config::for_tests());
-        let db = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
-        let hub = crate::streaming::hub::Hub::new(&db);
-        AppState {
-            db,
-            hub,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::lazy_for_tests(Config::for_tests())
     }
 
     #[tokio::test]

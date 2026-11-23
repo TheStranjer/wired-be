@@ -1,8 +1,6 @@
 //! Fixtures the account-deletion job tests share: test state, local and
 //! mirrored accounts, the data a sweep clears and the counting helpers.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -12,7 +10,6 @@ use uuid::Uuid;
 use super::{handle_delete, handle_delete_remote, job_args};
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     jobs::{AttemptInfo, JobError, scheduled_statuses},
     models::{
         backup, bookmark,
@@ -38,19 +35,7 @@ pub(super) const BATCH_OVERSHOOT: i64 = 120;
 
 /// Test state over `pool` with the fixed test config.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Test state over a pool that cannot answer: closed before it ever
@@ -61,6 +46,20 @@ pub(super) async fn broken_state() -> AppState {
         .expect("a lazy pool needs no database");
     pool.close().await;
     app_state(&pool)
+}
+
+/// Inserts a locked local user named `nickname`, so a follow of it waits
+/// in `pending` until the user answers.
+pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
+    insert(
+        pool,
+        &NewUser {
+            locked: Flag::new(true),
+            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+        },
+    )
+    .await
+    .expect("the locked fixture inserts")
 }
 
 /// Inserts a local user named `nickname` carrying the personal data the

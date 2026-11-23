@@ -51,7 +51,8 @@
 //!    its body.
 //!
 //! The args also carry the `inbox_owner` of a personal-inbox delivery; it
-//! stays unread until the handler tickets need it. The sibling
+//! rides on [`ActivityView::inbox_owner`] so a `Create` can silently mention
+//! the owner of a bcc-addressed post. The sibling
 //! [`KIND_CLEANUP_RECEIVED`] job prunes ledger rows older than 14 days;
 //! the periodic scheduler enqueues it daily.
 //!
@@ -106,8 +107,8 @@ pub const KIND_CLEANUP_RECEIVED: &str = "federation.cleanup_received";
 /// `args` is the object the inbox route wrote:
 /// `{"activity": <the received JSON>, "signer_id": <users.id of the
 /// authenticated actor>, "inbox_owner": <users.id of the local owner, or
-/// null for the shared inboxes>}`. `inbox_owner` is carried along unread
-/// until the handler tickets need it.
+/// null for the shared inboxes>}`. `inbox_owner` is carried on the
+/// [`ActivityView`] for the handlers that need it.
 ///
 /// # Errors
 ///
@@ -161,10 +162,11 @@ async fn dispatch_activity(
     mrf_filter: MrfFn,
 ) -> Result<(), JobError> {
     let incoming = extract_incoming(&args)?;
-    let Some(view) = ActivityView::parse(&incoming.activity) else {
+    let Some(mut view) = ActivityView::parse(&incoming.activity) else {
         debug!("discarding a delivery whose id, type, actor or object cannot be normalized");
         return Ok(());
     };
+    view.inbox_owner = incoming.inbox_owner;
     let span = tracing::debug_span!("incoming_activity", ap_id = %view.id, kind = %view.kind);
     async move {
         let signer = load_signer(state, incoming.signer_id).await?;

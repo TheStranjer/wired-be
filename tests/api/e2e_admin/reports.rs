@@ -1,7 +1,7 @@
 //! Scenario 1: the moderation flow walked through both admin report APIs.
 //! A report filed over `POST /api/v1/reports` is read back through the
-//! Pleroma admin surface, the Mastodon admin surface and the legacy
-//! `/api/v0` twin; the notes, the assignment through both APIs and the
+//! Pleroma admin surface, the Mastodon admin surface and the reporter's own
+//! `/api/v0` view; the notes, the assignment through both APIs and the
 //! unassign through both are walked with their exact moderation sentences
 //! — the resolve/reopen/resolve trio, the admin status edit and delete and
 //! the deactivation leg live in
@@ -60,7 +60,7 @@ async fn a_report_walks_both_admin_apis_and_the_staff_actions() {
 }
 
 /// The one filing, told three ways: the Pleroma admin list entity, the
-/// Mastodon admin list entity, and the legacy `/api/v0` twin's total.
+/// Mastodon admin list entity, and the reporter's own `/api/v0` total.
 async fn report_tellings(world: &World, report_id: &str, reporter: &Account, target: &Account) {
     let pleroma = listed_pleroma_report(&world.app, &world.moderator, report_id).await;
     assert_eq!(
@@ -106,11 +106,17 @@ async fn report_tellings(world: &World, report_id: &str, reporter: &Account, tar
         "the Mastodon entity cites the status too"
     );
 
-    let legacy = common::api_get(&world.app, Some(&world.admin), V0_REPORTS).await;
-    common::assert_answer(&legacy, StatusCode::OK, "the legacy admin listing");
+    let own = common::api_get(&world.app, Some(&reporter.token), V0_REPORTS).await;
+    common::assert_answer(&own, StatusCode::OK, "the reporter's own listing");
     assert!(
-        legacy.json_value()["total"].as_i64() >= Some(1),
-        "the legacy twin counts it"
+        own.json_value()["total"].as_i64() >= Some(1),
+        "the reporter's own view counts the filing"
+    );
+    let not_mine = common::api_get(&world.app, Some(&target.token), V0_REPORTS).await;
+    assert_eq!(
+        not_mine.json_value()["total"],
+        json!(0),
+        "the reported account sees no filing of its own"
     );
 }
 

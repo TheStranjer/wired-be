@@ -17,7 +17,9 @@
 //!   a stored **active local** object can be followed (anything else is
 //!   ignored), a pair blocked either way ([`block::blocked_between`]) is
 //!   answered with a [`reject_follow`] published back and *nothing stored*,
-//!   and every other delivery runs [`follow::follow`] with the delivered
+//!   as is a follow from a domain the target blocks
+//!   ([`domain_block::is_domain_blocked`]) or of an account that has moved
+//!   (Mastodon's `follow.rb` refusal), and every other delivery runs [`follow::follow`] with the delivered
 //!   activity id landed on the row as its `ap_id` (decision 6). The
 //!   followee's own telling ([`notify::on_follow`]) rides every stored
 //!   fold: its type is the relationship's state. An accepted answer — this
@@ -53,6 +55,7 @@
 use futures::future::BoxFuture;
 use sqlx::PgPool;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
@@ -61,7 +64,7 @@ use crate::{
         json,
     },
     models::{
-        block,
+        block, domain_block,
         follow::{self, Follow, FollowState},
         notification::{self, TYPE_FOLLOW, TYPE_FOLLOW_REQUEST},
         relay,
@@ -199,6 +202,24 @@ async fn apply_follow(
         );
         return Ok(Outcome::Handled);
     }
+    let blocked_domain = match json::http_host(&signer.ap_id) {
+        Some(host) => domain_block::is_domain_blocked(&state.db, target.id, &host)
+            .await
+            .map_err(|err| transient("domain block check", &err))?,
+        None => false,
+    };
+    if blocked_domain || target.moved_to_ap_id.is_some() {
+        let _deliveries = federation_out::reject_follow(&state, &target, &answer)
+            .await
+            .map_err(|err| transient("follow reject", &err))?;
+        debug!(
+            follower = %signer.nickname,
+            followee = %target.nickname,
+            blocked_domain,
+            "an inbound Follow met a domain block or a moved target and was answered with a Reject"
+        );
+        return Ok(Outcome::Handled);
+    }
     let row = follow::follow(&state.db, &state.config.base_url, &signer, &target)
         .await
         .map_err(|err| transient("follow", &err))?;
@@ -251,18 +272,24 @@ async fn apply_accept(
     let _granted = follow::accept(&state.db, row.id)
         .await
         .map_err(|err| transient("follow acceptance", &err))?;
-    // The relay arm (see `crate::services::relay`): when the followee is a
-    // relay this instance follows, granting the follow also turns the
-    // subscription accepted, opening its inbox to the publisher's fan-out.
-    // For every other followee this writes nothing.
-    let relay_granted = relay::mark_accepted(&state.db, &signer.ap_id)
+    // The relay arm (see `crate::services::relay`): when the granted follow
+    // is the instance actor's own follow of a relay, the subscription turns
+    // accepted, opening the relay's inbox to the publisher's fan-out. A
+    // local user's follow of the relay actor is no subscription and writes
+    // nothing here.
+    if follower_is_instance_actor(&state.db, row.follower_id)
         .await
-        .map_err(|err| transient("relay acceptance", &err))?;
-    if relay_granted {
-        debug!(
-            relay = %signer.ap_id,
-            "an inbound Accept granted a relay follow: the subscription stands accepted"
-        );
+        .map_err(|err| transient("instance actor lookup", &err))?
+    {
+        let relay_granted = relay::mark_accepted(&state.db, &signer.ap_id)
+            .await
+            .map_err(|err| transient("relay acceptance", &err))?;
+        if relay_granted {
+            debug!(
+                relay = %signer.ap_id,
+                "an inbound Accept granted a relay follow: the subscription stands accepted"
+            );
+        }
     }
     debug!(
         follower = %row.follower_id,
@@ -302,12 +329,39 @@ async fn apply_reject(
     let _removed = follow::reject(&state.db, row.id)
         .await
         .map_err(|err| transient("follow rejection", &err))?;
+    // The relay arm: a relay revokes (or refuses) a subscription with a
+    // `Reject` of the instance actor's follow. The `follows` row is gone, so
+    // the subscription goes back to pending and the relay's inbox leaves
+    // the fan-out. A local user's follow of the relay actor changes nothing.
+    if follower_is_instance_actor(&state.db, row.follower_id)
+        .await
+        .map_err(|err| transient("instance actor lookup", &err))?
+    {
+        let relay_revoked = relay::mark_pending(&state.db, &signer.ap_id)
+            .await
+            .map_err(|err| transient("relay revocation", &err))?;
+        if relay_revoked {
+            debug!(
+                relay = %signer.ap_id,
+                "an inbound Reject revoked a relay follow: the subscription is pending again"
+            );
+        }
+    }
     debug!(
         follower = %row.follower_id,
         followee = %signer.nickname,
         "an inbound Reject removed a follow this instance made"
     );
     Ok(Outcome::Handled)
+}
+
+/// Whether `follower_id` is the instance actor — the account whose follows
+/// are relay subscriptions. A missing instance actor (never provisioned)
+/// means no relay follow can exist, so it answers `false` without creating
+/// one.
+async fn follower_is_instance_actor(pool: &PgPool, follower_id: Uuid) -> AppResult<bool> {
+    let instance = user::get_by_nickname(pool, user::INSTANCE_ACTOR_NICKNAME).await?;
+    Ok(instance.is_some_and(|actor| actor.id == follower_id))
 }
 
 /// The body of [`handle_undo_follow`]: the inner actor's belt, the signer's
@@ -437,283 +491,4 @@ fn transient(what: &str, err: &AppError) -> FederationError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use serde_json::{Value, json};
-    use sqlx::PgPool;
-    use sqlx::postgres::PgPoolOptions;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::{
-        config::{Config, TEST_BASE_URL},
-        http_client::HttpClient,
-        models::user::{NewUser, insert},
-        uploads::UploaderBackend,
-    };
-
-    /// The mirror every direct-call fixture here is sent by: alice on
-    /// `peer.example`.
-    const ALICE: &str = "https://peer.example/users/alice";
-    /// MALLORY, the other `peer.example` mirror — the wrong-actor fixture.
-    const MALLORY: &str = "https://peer.example/users/mallory";
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
-    }
-
-    /// Test state over a pool that cannot answer: the database having gone
-    /// away, as the handlers see it.
-    async fn broken_state() -> AppState {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("a lazy pool needs no database");
-        pool.close().await;
-        app_state(&pool)
-    }
-
-    /// A local account named `nickname`.
-    async fn local(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
-
-    /// The remote mirror fixture: `nickname` on `peer.example`.
-    async fn mirror(pool: &PgPool, nickname: &str, ap_id: &str) -> User {
-        insert(
-            pool,
-            &NewUser {
-                nickname: format!("{nickname}@peer.example"),
-                ap_id: ap_id.to_owned(),
-                domain: Some("peer.example".to_owned()),
-                ..NewUser::default()
-            },
-        )
-        .await
-        .expect("the remote fixture inserts")
-    }
-
-    /// The row of user `id` as it stands now, for the next handler call
-    /// that needs its own `User` (they are moved into the handler).
-    async fn fresh(pool: &PgPool, id: Uuid) -> User {
-        user::get_by_id(pool, id)
-            .await
-            .expect("the user reads")
-            .expect("the user exists")
-    }
-
-    /// The normalized view of `kind`, named `n` on `peer.example`, sent by
-    /// `actor`, carrying `object`.
-    fn view(kind: &str, n: &str, actor: &str, object: &Value) -> ActivityView {
-        ActivityView::parse(&json!({
-            "id": format!("https://peer.example/activities/{n}"),
-            "type": kind,
-            "actor": actor,
-            "object": object,
-        }))
-        .expect("the fixture activity parses")
-    }
-
-    /// `Follow`, `Accept` and `Reject` route by their own names, and the
-    /// `Undo` table claims `Follow` — and nothing else of the family.
-    #[test]
-    fn register_binds_the_follow_handshake_and_its_withdrawal() {
-        let mut handlers = Handlers::new();
-        register(&mut handlers);
-        for kind in ["Follow", "Accept", "Reject"] {
-            assert!(handlers.handles(kind), "a {kind} routes here");
-        }
-        assert!(
-            handlers.handles_undo("Follow"),
-            "the withdrawal of a Follow routes here"
-        );
-        assert!(
-            !handlers.handles_undo("Block"),
-            "the withdrawal of a Block stays the misc module's key"
-        );
-    }
-
-    /// The belt on the embedded inner activity: an inner naming the
-    /// signer's own actor — or no actor at all — passes; an inner naming a
-    /// different actor does not. A bare-id delivery has no inner and
-    /// passes.
-    #[test]
-    fn an_inner_follow_passes_the_belt_for_its_own_maker_only() {
-        let mine = view(
-            "Undo",
-            "undo-belt-1",
-            ALICE,
-            &json!({"type": "Follow", "actor": ALICE, "object": "https://test.example/users/bob"}),
-        );
-        assert!(
-            inner_follow_is_the_signers(&mine, ALICE),
-            "the signer's own inner passes"
-        );
-        let theirs = view(
-            "Undo",
-            "undo-belt-2",
-            ALICE,
-            &json!({"type": "Follow", "actor": MALLORY, "object": "https://test.example/users/bob"}),
-        );
-        assert!(
-            !inner_follow_is_the_signers(&theirs, ALICE),
-            "an inner made by somebody else does not"
-        );
-        let actorless = view(
-            "Undo",
-            "undo-belt-3",
-            ALICE,
-            &json!({"type": "Follow", "object": "https://test.example/users/bob"}),
-        );
-        assert!(
-            inner_follow_is_the_signers(&actorless, ALICE),
-            "an inner naming no actor is the dispatcher's own fallback"
-        );
-        let bare = view(
-            "Undo",
-            "undo-belt-4",
-            ALICE,
-            &json!("https://peer.example/activities/follow-1"),
-        );
-        assert!(
-            inner_follow_is_the_signers(&bare, ALICE),
-            "and a bare-id Undo has no inner to check"
-        );
-    }
-
-    /// The local-signer guard of all four routes: an activity whose actor
-    /// this instance owns folds nothing — the federation door is for
-    /// remote peers, and every local write has its own endpoint.
-    #[tokio::test]
-    async fn every_route_refuses_a_locally_signed_activity() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let state = app_state(&pool);
-        let alice = local(&pool, "follow-self-alice").await;
-        let alice_id = alice.id;
-        let alice_ap = alice.ap_id.clone();
-        let bob = local(&pool, "follow-self-bob").await;
-
-        let followed = handle_follow(
-            state.clone(),
-            view("Follow", "self-1", &alice_ap, &json!(bob.ap_id.clone())),
-            alice,
-        )
-        .await;
-        let accepted = handle_accept(
-            state.clone(),
-            view("Accept", "self-2", &alice_ap, &json!(bob.ap_id.clone())),
-            fresh(&pool, alice_id).await,
-        )
-        .await;
-        let rejected = handle_reject(
-            state.clone(),
-            view("Reject", "self-3", &alice_ap, &json!(bob.ap_id.clone())),
-            fresh(&pool, alice_id).await,
-        )
-        .await;
-        let undone = handle_undo_follow(
-            state,
-            view(
-                "Undo",
-                "self-4",
-                &alice_ap,
-                &json!({"type": "Follow", "actor": &alice_ap, "object": bob.ap_id.clone()}),
-            ),
-            fresh(&pool, alice_id).await,
-        )
-        .await;
-        for outcome in [followed, accepted, rejected, undone] {
-            assert!(
-                matches!(&outcome, Ok(Outcome::Ignored(reason)) if reason.contains("this instance owns")),
-                "the local signer is every route's own refusal: {outcome:?}"
-            );
-        }
-        assert!(
-            follow::get(&pool, alice_id, bob.id)
-                .await
-                .unwrap()
-                .is_none(),
-            "and nothing was folded"
-        );
-    }
-
-    /// Every route against a database that cannot answer: the first read
-    /// fails, the failure is transient, and the queue's retry finds the
-    /// same idempotent writes waiting for it.
-    #[tokio::test]
-    async fn a_dead_database_sends_every_route_back_for_a_retry() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = mirror(&pool, "dead-alice", ALICE).await;
-        let alice_id = alice.id;
-        let bob = local(&pool, "dead-bob").await;
-        let state = broken_state().await;
-
-        let outcomes = [
-            handle_follow(
-                state.clone(),
-                view("Follow", "dead-1", ALICE, &json!(bob.ap_id.clone())),
-                alice,
-            )
-            .await,
-            handle_accept(
-                state.clone(),
-                view(
-                    "Accept",
-                    "dead-2",
-                    ALICE,
-                    &json!("https://peer.example/activities/none"),
-                ),
-                fresh(&pool, alice_id).await,
-            )
-            .await,
-            handle_reject(
-                state.clone(),
-                view(
-                    "Reject",
-                    "dead-3",
-                    ALICE,
-                    &json!("https://peer.example/activities/none"),
-                ),
-                fresh(&pool, alice_id).await,
-            )
-            .await,
-            handle_undo_follow(
-                state,
-                view(
-                    "Undo",
-                    "dead-4",
-                    ALICE,
-                    &json!("https://peer.example/activities/none"),
-                ),
-                fresh(&pool, alice_id).await,
-            )
-            .await,
-        ];
-        for outcome in outcomes {
-            assert!(
-                matches!(outcome, Err(FederationError::Transient(_))),
-                "the dead database is a retry, not a verdict: {outcome:?}"
-            );
-        }
-    }
-}
+mod tests;

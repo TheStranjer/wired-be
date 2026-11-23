@@ -107,10 +107,14 @@ mod tests {
             .await
             .unwrap()
             .expect("rust stores");
-        let _pct = find_or_create(&pool, "50%off")
+        let _snake = find_or_create(&pool, "snake_case")
             .await
             .unwrap()
-            .expect("the percent name stores");
+            .expect("the underscore name stores");
+        let _other = find_or_create(&pool, "snakexcase")
+            .await
+            .unwrap()
+            .expect("the look-alike name stores");
         let _uni = find_or_create(&pool, "日本語")
             .await
             .unwrap()
@@ -122,9 +126,13 @@ mod tests {
             "trim, `#`-strip and the case fold before the match"
         );
         assert_eq!(
-            names(&search_prefix(&pool, "50%", 20).await.unwrap()),
-            vec!["50%off"],
-            "a literal percent in the needle does not act as a wildcard"
+            names(&search_prefix(&pool, "snake_", 20).await.unwrap()),
+            vec!["snake_case"],
+            "a literal underscore in the needle does not act as a wildcard"
+        );
+        assert!(
+            search_prefix(&pool, "50%", 20).await.unwrap().is_empty(),
+            "a needle outside the tag character set searches nothing"
         );
         assert_eq!(
             names(&search_prefix(&pool, "日本", 20).await.unwrap()),

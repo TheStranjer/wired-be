@@ -409,11 +409,22 @@ mod tests {
 
         assert_eq!(usable_name("#Foo").expect("a plain name"), "foo");
         assert_eq!(
-            usable_name(" #Foo Bar ").expect("spaces are content"),
-            "foo bar"
+            usable_name(" #Foo_Bar ").expect("the ends are trimmed"),
+            "foo_bar"
         );
         let long = "t".repeat(MAX_HASHTAG_LEN + 1);
-        for rejected in ["", "   ", "#", "##", long.as_str()] {
+        for rejected in [
+            "",
+            "   ",
+            "#",
+            "##",
+            "foo bar",
+            "a/b",
+            "x?y",
+            "<b>",
+            "123",
+            long.as_str(),
+        ] {
             let err = usable_name(rejected).expect_err("the name is unusable");
             assert_eq!(
                 err.to_string(),

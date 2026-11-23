@@ -23,10 +23,18 @@
 //! Optional fields that are present but malformed — a non-http `outbox`, an
 //! unparseable `published`, an `icon` without a usable `url` — are dropped
 //! rather than rejected, so one broken field cannot lose the whole profile.
-//! Fields that the `users` table has no column for (`alsoKnownAs`,
-//! `movedTo`, `capabilities.acceptsChatMessages`, `published`) are still
+//! Fields that the upsert does not store (`movedTo`,
+//! `capabilities.acceptsChatMessages`, `published`) are still
 //! extracted onto [`NewRemoteUser`]: the fetch and move tickets consume
 //! them, and parsing them here is what validates their shape.
+//!
+//! A remote actor recreated under a new id (an origin that reinstalled,
+//! moved its actor paths, or deleted and recreated the account) keeps its
+//! `preferredUsername@host` handle. [`upsert_remote_user`] frees the handle
+//! by renaming the stale mirror of the same domain to `<old id>.<nickname>`
+//! and stores the new actor, as Pleroma's `maybe_handle_clashing_nickname`
+//! does; [`ActorError::NicknameConflict`] is kept for a holder that is not
+//! such a mirror (a local row, or another domain).
 //!
 //! Network access is out of scope for this module on purpose: documents
 //! arrive already fetched; retrieving them is the next ticket.
@@ -55,16 +63,42 @@ const ACTOR_TYPES: [&str; 5] = ["Person", "Service", "Group", "Organization", "A
 /// `Enum.filter(..., & &1["type"] == "PropertyValue")`).
 const PROPERTY_VALUE_TYPE: &str = "PropertyValue";
 
+/// Longest display name kept, in characters (Mastodon's `name` cap).
+const MAX_REMOTE_NAME_CHARS: usize = 2048;
+/// Longest raw `summary` kept, in characters, applied before sanitizing.
+const MAX_REMOTE_BIO_CHARS: usize = 20_000;
+/// Most profile fields kept; later `PropertyValue` entries are dropped.
+const MAX_REMOTE_FIELDS: usize = 50;
+/// Longest profile-field name kept, in characters.
+const MAX_FIELD_NAME_CHARS: usize = 512;
+/// Longest profile-field value kept, in characters.
+const MAX_FIELD_VALUE_CHARS: usize = 2048;
+/// Most `alsoKnownAs` aliases kept; later entries are dropped.
+const MAX_ALIASES: usize = 256;
+/// Longest `preferredUsername` accepted, in characters; longer is rejected.
+const MAX_USERNAME_CHARS: usize = 2048;
+
+/// The longest prefix of `text` of at most `max` characters, cut on a char
+/// boundary.
+fn truncate_chars(text: &str, max: usize) -> &str {
+    text.char_indices()
+        .nth(max)
+        .and_then(|(end, _)| text.get(..end))
+        .unwrap_or(text)
+}
+
 /// A remote actor document parsed into upsert-ready data.
 ///
 /// The field set is what [`parse_actor`] validates and extracts: the
 /// [`User`](crate::models::user::User) columns a document can fill, plus the
-/// four fields [`upsert_remote_user`] does not store yet ([`also_known_as`](Self::also_known_as),
-/// [`moved_to`](Self::moved_to),
+/// three fields [`upsert_remote_user`] does not store yet
+/// ([`moved_to`](Self::moved_to),
 /// [`accepts_chat_messages`](Self::accepts_chat_messages),
-/// [`published`](Self::published)). The first three have `users` columns
+/// [`published`](Self::published)). The first two have `users` columns
 /// since the Pleroma extension migration, `published` has none at all;
-/// storing any of them belongs to the alias, move and chat tickets.
+/// storing any of them belongs to the move and chat tickets.
+/// [`also_known_as`](Self::also_known_as) is stored: the `Move` handler
+/// reads it off the mirror.
 #[derive(Clone, Debug)]
 pub struct NewRemoteUser {
     /// `{preferredUsername}@{host of ap_id}`, decision 7.
@@ -112,7 +146,7 @@ pub struct NewRemoteUser {
     pub featured_url: Option<String>,
     /// The required `publicKey.publicKeyPem` signing key.
     pub public_key: String,
-    /// The `alsoKnownAs` entries (the column exists; the upsert does not write it).
+    /// The `alsoKnownAs` entries, stored by the upsert on every fetch.
     pub also_known_as: Vec<String>,
     /// The `movedTo` actor id (the column exists; the upsert does not write it).
     pub moved_to: Option<String>,

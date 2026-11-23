@@ -6,15 +6,12 @@
 //! A fixture lives here as soon as a second child needs it; the ones that
 //! belong to a single arm stand in that child's own tests.
 
-use std::sync::Arc;
-
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
     config::{Config, TEST_BASE_URL, Toggle},
     federation::publisher,
-    http_client::HttpClient,
     models::{
         chat::{self, ChatMessageReference, NewChatMessage},
         follow,
@@ -24,7 +21,6 @@ use crate::{
         user::{Flag, NewUser, User, insert, local_ap_id},
     },
     state::AppState,
-    uploads::UploaderBackend,
 };
 use serde_json::Value;
 
@@ -35,19 +31,7 @@ pub(super) fn app_state(pool: &PgPool) -> AppState {
 
 /// The test state over `pool` with an injected config.
 pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// The config with federation switched off.

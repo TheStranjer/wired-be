@@ -37,11 +37,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/users/:nickname/feed",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/users/:nickname/inbox",
         auth: AuthClass::User,
     },
@@ -118,11 +113,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
         path: "/embed/:id",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
-        path: "/tags/:tag",
         auth: AuthClass::Public,
     },
     RouteSpec {

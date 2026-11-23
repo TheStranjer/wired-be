@@ -130,7 +130,7 @@ below.
 | `VAPID_PRIVATE_KEY` | no | | The instance's Web Push signing key (ES256, PKCS#8 PEM), redacted in logs; when set it overwrites the pair generated into `instance_secrets` at startup, and the public half is derived from it unless `VAPID_PUBLIC_KEY` pins one |
 | `VAPID_PUBLIC_KEY` | no | | The instance's Web Push public key (URL-safe base64 of the uncompressed P-256 point); the `server_key` the push endpoints and the `Application` entity advertise, and the `vapid_key` / `vapid_public_key` of the app and instance responses |
 | `RATE_LIMITS_ENABLED` | no | `true` | Whether routes that mount a rate-limit bucket throttle their requests; while off they answer uncounted and without `x-ratelimit-*` headers (`true`/`false`, or `1`/`0`) |
-| `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60`; a bucket off the table is unlimited |
+| `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60, imports=1:3600`; a bucket off the table is unlimited |
 | `TRUST_PROXY_HEADERS` | no | `false` | Let the leftmost `X-Forwarded-For` entry name the client a rate-limit window counts against; while off the socket peer always does (`true`/`false`, or `1`/`0`) |
 
 ### Default assets
@@ -181,7 +181,7 @@ The module layout (the binding decisions it follows are numbered in
 | `src/config.rs` | The environment-only configuration (decision 12), documented in the table above |
 | `src/state.rs` | `AppState`: the one cheap-to-clone value every handler shares (pool, config, HTTP client, rate limiter, mailer, streaming hub) |
 | `src/error.rs` | The one `AppError` and its JSON rendering (decision 8) |
-| `src/http_client/`, `src/mailer/`, `src/oauth/`, `src/util/`, `src/uploads.rs`, `src/feeds.rs`, `src/middleware.rs`, `src/pagination.rs`, `src/rate_limit.rs` | The helpers around them: the SSRF-guarded outbound client, the SMTP transport, scope parsing, formatting/sanitizing/passwords/keys, upload storage, Atom/RSS feeds, the tower layers, UUIDv7 cursor pagination, the rate limiter |
+| `src/http_client/`, `src/mailer/`, `src/oauth/`, `src/util/`, `src/uploads.rs`, `src/middleware.rs`, `src/pagination.rs`, `src/rate_limit.rs` | The helpers around them: the SSRF-guarded outbound client, the SMTP transport, scope parsing, formatting/sanitizing/passwords/keys, upload storage, the tower layers, UUIDv7 cursor pagination, the rate limiter |
 
 The shape that falls out: every primary key is a `uuid` column holding a
 `UUIDv7` minted in Rust, so `max_id`/`min_id` pagination is plain text
@@ -434,6 +434,29 @@ published, never what is enforced: an excluded host is still refused its
 traffic, still absent from the domain-block listing, and still out of the
 peer list.
 
+## OAuth
+
+Third-party clients use the authorization-code flow at `/oauth/authorize`
+and `POST /oauth/token`. A browser `GET`/`POST` of `/oauth/authorize` still
+gets the server-rendered login and consent page. A frontend that renders the
+consent page itself uses the JSON half of the same path instead:
+
+- `GET /oauth/authorize?response_type=code&client_id=…&redirect_uri=…&scope=…&state=…`
+  with `Accept: application/json` answers
+  `{"app":{"name","website"},"scopes":[…],"redirect_uri","state"}`, or a 400
+  `{"error":"invalid_request"|"invalid_client"|"invalid_scope","error_description"}`.
+- `POST /oauth/authorize` with `Authorization: Bearer <token>` and a JSON body
+  `{client_id, redirect_uri, scope, state, approve}` mints the code for the
+  token's user and answers `{"redirect_uri":"…?code=…&state=…"}` (or
+  `{"code"}` for `urn:ietf:wg:oauth:2.0:oob`); `approve: false` answers the
+  redirect with `error=access_denied`. A missing or dead token is a 401, and a
+  token whose scopes do not cover the request a 403 `invalid_scope`.
+
+**The frontend's own OAuth app must be marked trusted**
+(`PATCH /api/v1/pleroma/admin/oauth_app/{id}` with `trusted`): the JSON `POST`
+answers 403 `unauthorized_client` for a token issued to any other app, so an
+app holding a user token cannot mint codes for other apps.
+
 ## API coverage
 
 Wired replicates the HTTP interface of **Pleroma 2.10**: paths, parameters,
@@ -455,12 +478,13 @@ changed. Four families make it up:
   groups, invites, statuses, chats, instances, reports, relays, rules,
   announcements, webhooks, config, frontends, media-proxy caches, the
   moderation log and stats) and Mastodon's `/api/v1/admin` and
-  `/api/v2/admin` (accounts and the report queue), plus the legacy
-  `/api/v0/pleroma/reports` ledger;
+  `/api/v2/admin` (accounts and the report queue); the reporter's own
+  `/api/v0/pleroma/reports` reads (`read:reports`) are a user endpoint, not
+  an admin one;
 - **federation and discovery** — the `ActivityPub` actors, objects, activities,
   inboxes and outboxes (`/users/…`, `/objects/…`, `/activities/…`, `/inbox`,
-  `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the Atom and
-  RSS feeds, the media and emoji files, the proxy, the OAuth endpoints, the
+  `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the media and
+  emoji files, the proxy, the OAuth endpoints, the
   remote-interaction pages and the streaming WebSocket.
 
 `src/api/route_inventory.rs` is the table of that surface: one row per route,
@@ -480,6 +504,7 @@ Routes Pleroma has and Wired deliberately does not:
 | Phoenix's dev and test routes — `forward /dev/mailbox`, and the `/test/api/:action` and `/test/authenticated_api/:action` reads of `AuthTestController` | The reference mounts them only when its environment is `:dev` or `:test`: a mailbox preview for sent mail and plugs that exercise its own router. Wired's tests drive the real router. |
 | `/phoenix/live_dashboard/*path`, and the `/pleroma/live_dashboard` and `/pleroma/oban` pages it redirects to | `Phoenix.LiveDashboard` and `Oban.Web.Router`: HTML UIs over BEAM process and job metrics, with no meaning outside that runtime. |
 | The SPA fallbacks `GET /:maybe_nickname_or_id` and `GET /*path` (and the `OPTIONS /*path` pair) | They hand an unknown path to the frontend's JavaScript router, or answer its preflight. Wired is API-only (see the top of this file), so an unmatched path is the JSON 404 — under `/api` Pleroma's own `api_not_implemented`, elsewhere its plain "Not found". |
+| `GET /users/:nickname/feed` (and its `.atom`/`.rss` forms) and `GET /tags/:tag` | Atom/RSS syndication, not API. Pleroma serves them from its HTML/XML pipeline; Wired is API-only, so the frontend owns HTML and feeds and these paths fall through to the JSON 404. `GET /users/:nickname` still negotiates the `ActivityPub` actor JSON. |
 | The Shout channels socket (`GET /socket`) | Pleroma's browser-notification WebSocket. Wired delivers the same events on `/api/v1/streaming` and over Web Push. |
 
 ## Development

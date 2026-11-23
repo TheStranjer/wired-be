@@ -1,40 +1,21 @@
 //! Tests for the post-filing hook: the letters to the staff.
 
-use std::sync::Arc;
-
 use sqlx::PgPool;
 
 use super::*;
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
-    mailer::MemoryTransport,
     models::{
         job::Job,
         report::{self, Category},
         user::User,
     },
-    rate_limit::RateLimiter,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
 };
 
 /// Test state over `pool` on `config`, with the recording transport: the
 /// shape both helpers below build.
 fn state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        db: pool.clone(),
-        hub: Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// The mail-enabled state: [`email_staff`] queues a letter only when a

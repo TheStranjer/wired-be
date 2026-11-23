@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
-        fetch_actor::{FetchError, get_or_fetch_by_ap_id},
+        fetch_actor::{FetchError, get_or_fetch_by_ap_id, refresh_user},
     },
     models::{
         block, follow,
@@ -59,20 +59,18 @@ async fn apply_move(
     let Some(target_id) = view.target.as_deref() else {
         return Ok(Outcome::Ignored("a Move with no target actor"));
     };
-    let target = match get_or_fetch_by_ap_id(&state, target_id).await {
-        Ok(target) => target,
-        Err(FetchError::NotFound | FetchError::Gone) => {
-            debug!(target_id, "a Move to an actor that is not there; ignoring");
-            return Ok(Outcome::Ignored(
-                "a Move whose target actor cannot be resolved",
-            ));
-        }
-        Err(err) => {
-            return Err(FederationError::Transient(format!(
-                "the move target could not be fetched: {err}"
-            )));
-        }
+    let Some(mut target) = resolve_target(get_or_fetch_by_ap_id(&state, target_id).await)? else {
+        return Ok(Outcome::Ignored(UNRESOLVED_TARGET));
     };
+    // A mirror inside the 24-hour window is served as stored, so its alias
+    // list may predate the claim the move relies on: refetch it once
+    // before refusing (Mastodon always fetches the target fresh).
+    if !target.local.get() && !target.also_known_as.contains(&view.actor) {
+        let Some(refreshed) = resolve_target(refresh_user(&state, &target).await)? else {
+            return Ok(Outcome::Ignored(UNRESOLVED_TARGET));
+        };
+        target = refreshed;
+    }
     if !target.also_known_as.contains(&view.actor) {
         debug!(
             target = %target.nickname,
@@ -92,6 +90,29 @@ async fn apply_move(
         "an inbound Move mirrored the account's new home and migrated its local followers"
     );
     Ok(Outcome::Handled)
+}
+
+/// Why a `Move` whose target is not there is ignored.
+const UNRESOLVED_TARGET: &str = "a Move whose target actor cannot be resolved";
+
+/// Reads a target fetch's answer: `Some` target, `None` for an actor that
+/// is not there ([`FetchError::NotFound`], [`FetchError::Gone`]; the caller
+/// ignores the `Move`).
+///
+/// # Errors
+///
+/// [`FederationError::Transient`] for any other fetch failure.
+fn resolve_target(fetched: Result<User, FetchError>) -> Result<Option<User>, FederationError> {
+    match fetched {
+        Ok(target) => Ok(Some(target)),
+        Err(FetchError::NotFound | FetchError::Gone) => {
+            debug!("a Move to an actor that is not there; ignoring");
+            Ok(None)
+        }
+        Err(err) => Err(FederationError::Transient(format!(
+            "the move target could not be fetched: {err}"
+        ))),
+    }
 }
 
 /// The follower migration [`apply_move`] runs: every candidate from
@@ -373,7 +394,9 @@ mod tests {
 
     /// The alias validator: a target that has not claimed the old actor in
     /// its `alsoKnownAs` moves nothing — no `moved_to_ap_id`, no migrated
-    /// follower, no telling.
+    /// follower, no telling. The target is a local account, which is never
+    /// refetched, so the refusal needs no network (the remote refetch is
+    /// covered by the loopback tests in the parent module).
     #[tokio::test]
     async fn a_move_the_target_has_not_claimed_is_ignored() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -381,7 +404,14 @@ mod tests {
         let state = app_state(&pool);
         let alice = remote_signer(&pool).await;
         let alice_id = alice.id;
-        let _carol = move_target(&pool, &["https://other.example/users/someone"]).await;
+        let carol = local_user(&pool, "alias-carol").await;
+        user::set_also_known_as(
+            &pool,
+            carol.id,
+            &["https://other.example/users/someone".to_owned()],
+        )
+        .await
+        .expect("the alias fixture stores");
         let bob = local_user(&pool, "alias-bob").await;
         accepted_follow(&pool, &bob, &alice).await;
 
@@ -391,7 +421,7 @@ mod tests {
                 "Move",
                 "move-3",
                 ALICE,
-                json!({"object": ALICE, "target": CAROL}),
+                json!({"object": ALICE, "target": carol.ap_id.clone()}),
             ),
             alice,
         )

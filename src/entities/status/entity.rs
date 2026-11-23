@@ -232,7 +232,7 @@ impl Status {
             in_reply_to_id: row.in_reply_to_id.map(|id| id.to_string()),
             in_reply_to_account_id: row.in_reply_to_account_id.map(|id| id.to_string()),
             language: row.language.clone(),
-            card: card.and_then(stored_card_json),
+            card: card.and_then(|card| stored_card_json(card, config)),
             poll,
             edited_at: row.edited_at,
             favourited: JsonBool(favourited),

@@ -550,23 +550,7 @@ mod tests {
 
     /// The [`AppState`] the credential lookups run on, over a slot's pool.
     fn app_state(pool: &sqlx::PgPool) -> AppState {
-        use std::sync::Arc;
-
-        use crate::{config::Config, http_client::HttpClient, uploads::UploaderBackend};
-
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
     }
 
     /// A fresh local user named `nickname`, active unless `active` says so.

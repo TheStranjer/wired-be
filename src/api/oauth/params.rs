@@ -65,6 +65,11 @@ pub(super) struct TokenParams {
     /// output: it is a one-time credential.
     #[serde(default)]
     pub(super) code: Option<String>,
+    /// The redirect URI the code was issued for. The `authorization_code`
+    /// grant must present it when the code is bound to one (RFC 6749
+    /// §4.1.3).
+    #[serde(default)]
+    pub(super) redirect_uri: Option<String>,
 }
 
 /// [`password`](Self::password), [`client_secret`](Self::client_secret),
@@ -81,6 +86,7 @@ impl fmt::Debug for TokenParams {
             .field("client_secret", &"<redacted>")
             .field("refresh_token", &"<redacted>")
             .field("code", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
             .finish()
     }
 }

@@ -326,8 +326,6 @@ mod tests {
             status::NewStatus,
             user::{NewUser, User, insert, local_ap_id},
         },
-        streaming::hub::Hub,
-        uploads::UploaderBackend,
         util::format::text_to_html,
     };
 
@@ -348,18 +346,9 @@ mod tests {
     /// Test state over `pool` with `config` and the loopback-tolerant
     /// client the mock servers answer.
     fn state_with(pool: &PgPool, config: Config) -> AppState {
-        let config = Arc::new(config);
         AppState {
-            db: pool.clone(),
-            hub: Hub::new(pool),
-            config: Arc::clone(&config),
             http_client: HttpClient::new_for_tests(TEST_UA),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+            ..AppState::for_tests(pool.clone(), config)
         }
     }
 

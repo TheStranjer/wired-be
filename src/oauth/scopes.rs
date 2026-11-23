@@ -147,6 +147,12 @@ pub const READ_BOOKMARKS: &str = "read:bookmarks";
 /// on the `bookmark` and `unbookmark` actions).
 pub const WRITE_BOOKMARKS: &str = "write:bookmarks";
 
+/// The read side of reports: `GET /api/v0/pleroma/reports` and its `{id}`
+/// twin, the reporter's own filed reports.
+///
+/// Pleroma's `read:reports` on `PleromaAPI.ReportController`
+/// (`lib/pleroma/web/pleroma_api/controllers/report_controller.ex`).
+pub const READ_REPORTS: &str = "read:reports";
 /// The write side of reports: `POST /api/v1/reports`.
 ///
 /// Mastodon's `write:reports`, the scope Pleroma's `ReportController`

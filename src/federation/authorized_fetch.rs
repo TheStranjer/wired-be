@@ -203,7 +203,7 @@ fn key_material(user: &User) -> AppResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, OnceLock};
+    use std::sync::OnceLock;
 
     use axum::{
         Router,
@@ -224,7 +224,6 @@ mod tests {
         http_client::HttpClient,
         models::user::{NewUser, insert},
         services::instance_actor::{ensure_instance_actor, instance_actor_ap_id},
-        uploads::UploaderBackend,
         util::keys::{KeyPair, generate_keypair},
     };
 
@@ -236,19 +235,9 @@ mod tests {
     /// The state under test: `pool` on top of `config`, with the client's
     /// SSRF guard off so the unknown-`keyId` test can reach its mock.
     fn state_with(pool: PgPool, config: Config) -> AppState {
-        let config = Arc::new(config);
-        let hub = crate::streaming::hub::Hub::new(&pool);
         AppState {
-            db: pool,
-            hub,
-            config: Arc::clone(&config),
             http_client: HttpClient::new_for_tests(TEST_UA),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+            ..AppState::for_tests(pool, config)
         }
     }
 

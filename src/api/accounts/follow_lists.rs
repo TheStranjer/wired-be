@@ -32,7 +32,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::visible_account_or_404,
     auth::MaybeAuthUser,
     config::Config,
     entities::{
@@ -54,7 +54,7 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// The 403 body `GET /api/v1/accounts/{id}/statuses` answers an anonymous
 /// request while the instance keeps the account's profile area restricted
 /// (Pleroma's `EnsureAuthenticatedPlug` wording, the one [`crate::auth`]
-/// renders for an app-only token and [`crate::api::feeds`] for its feeds).
+/// renders for an app-only token).
 const USER_REQUIRED: &str = "This API requires an authenticated user";
 
 /// The `RESTRICT_UNAUTHENTICATED` area of this instance's own accounts'
@@ -102,7 +102,7 @@ pub(super) async fn list_followers(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require_user_scope(READ_ACCOUNTS)?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0.as_ref();
     if target.hide_followers.get() && !viewer_is(viewer, &target) {
         return Ok(empty_page());
@@ -130,7 +130,7 @@ pub(super) async fn list_following(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require_user_scope(READ_ACCOUNTS)?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0.as_ref();
     if target.hide_follows.get() && !viewer_is(viewer, &target) {
         return Ok(empty_page());

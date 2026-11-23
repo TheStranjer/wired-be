@@ -1,14 +1,17 @@
 //! Removing a relationship from the followed account's side:
 //! [`remove_follower`] takes one follower back, [`sever_between`] takes the
-//! open rows of a newly blocked pair, and [`uncount_removed_follower`] steps
-//! down the counters every removed accepted row fed.
+//! open rows of a newly blocked pair, [`sever_with_domain`] takes every row
+//! between one account and a blocked domain, and [`uncount_removed_follower`]
+//! steps down the counters every removed accepted row fed.
+
+use std::collections::HashMap;
 
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::user::{CountDelta, update_counts},
+    models::user::{CountDelta, User, update_counts},
 };
 
 use super::types::{Follow, FollowState};
@@ -31,6 +34,50 @@ const SEVER_BETWEEN_SQL: &str = "DELETE FROM follows
         AND ((follower_id = $1 AND followee_id = $2)
           OR (follower_id = $2 AND followee_id = $1))
    RETURNING *";
+
+/// [`sever_with_domain`]'s incoming side: every follow of `$1` by a remote
+/// account on the domain `$2`, in any state, so a domain block leaves no row
+/// between the pair of sides behind.
+const SEVER_INCOMING_BY_DOMAIN_SQL: &str = "DELETE FROM follows AS f
+       USING users AS u
+       WHERE f.followee_id = $1 AND u.id = f.follower_id
+         AND NOT u.local AND u.domain = $2
+   RETURNING f.*";
+
+/// [`sever_with_domain`]'s outgoing side: every follow by `$1` of a remote
+/// account on the domain `$2`, in any state.
+const SEVER_OUTGOING_BY_DOMAIN_SQL: &str = "DELETE FROM follows AS f
+       USING users AS u
+       WHERE f.follower_id = $1 AND u.id = f.followee_id
+         AND NOT u.local AND u.domain = $2
+   RETURNING f.*";
+
+/// [`sever_with_domain`]: the memberships of the severed accounts in `$1`'s
+/// own lists — a list member is a followed account, the same rule
+/// [`unfollow`](super::unfollow) keeps.
+const SEVER_LIST_MEMBERSHIPS_SQL: &str = "DELETE FROM list_members AS lm
+     USING lists AS l
+     WHERE l.id = lm.list_id AND l.user_id = $1 AND lm.user_id = ANY($2)";
+
+/// [`sever_with_domain`]: the endorsements `$1` gave the severed accounts.
+const SEVER_ENDORSEMENTS_SQL: &str =
+    "DELETE FROM endorsements WHERE user_id = $1 AND target_id = ANY($2)";
+
+/// [`sever_with_domain`]: the accounts on the other end of the removed rows.
+const SEVERED_USERS_SQL: &str = "SELECT * FROM users WHERE id = ANY($1)";
+
+/// What [`sever_with_domain`] took out of the table: each open (`pending` or
+/// `accepted`) row it deleted next to the account on the other end, which is
+/// what the federation hooks need to answer or withdraw it.
+#[derive(Debug)]
+pub struct SeveredByDomain {
+    /// Follows *of* the blocking account by remote accounts on the domain,
+    /// each with its follower — the rows a `Reject` is owed for.
+    pub followers: Vec<(Follow, User)>,
+    /// Follows *by* the blocking account of remote accounts on the domain,
+    /// each with its followee — the rows an `Undo Follow` is owed for.
+    pub followees: Vec<(Follow, User)>,
+}
 
 /// Removes `follower_id`'s accepted follow of `user_id` — the followed
 /// account, the row's [`Follow::followee_id`] — and returns the removed
@@ -106,12 +153,109 @@ pub async fn sever_between(conn: &mut PgConnection, first: Uuid, second: Uuid) -
     Ok(())
 }
 
+/// Severs every follow between `user_id` and the remote accounts on `domain`
+/// — both directions, every state — in one transaction, and returns the open
+/// rows it removed with the accounts at their other ends.
+///
+/// This is the follow-side half of a domain block (Mastodon's
+/// `AfterBlockDomainFromAccountService`): followers on the domain are removed
+/// (`accepted`) or refused (`pending`), and the account's own follows of
+/// accounts there are withdrawn. `domain` is the canonical spelling
+/// [`normalize_domain`](crate::models::domain_block::normalize_domain)
+/// writes, compared with `users.domain`; local accounts never match. Every
+/// accepted row steps both counters down like [`remove_follower`] does, an
+/// outgoing row also takes the list memberships and endorsements that ride on
+/// it, and a mirrored `rejected` row is deleted but not returned (there is
+/// nothing left to answer). A domain with no relationships changes nothing
+/// and returns two empty lists.
+///
+/// # Errors
+///
+/// Any database failure (connection, constraint, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn sever_with_domain(
+    pool: &PgPool,
+    user_id: Uuid,
+    domain: &str,
+) -> AppResult<SeveredByDomain> {
+    let mut tx = pool.begin().await?;
+    let incoming = sqlx::query_as::<_, Follow>(SEVER_INCOMING_BY_DOMAIN_SQL)
+        .bind(user_id)
+        .bind(domain)
+        .fetch_all(&mut *tx)
+        .await?;
+    let outgoing = sqlx::query_as::<_, Follow>(SEVER_OUTGOING_BY_DOMAIN_SQL)
+        .bind(user_id)
+        .bind(domain)
+        .fetch_all(&mut *tx)
+        .await?;
+    if incoming.is_empty() && outgoing.is_empty() {
+        return Ok(SeveredByDomain {
+            followers: Vec::new(),
+            followees: Vec::new(),
+        });
+    }
+    for follow in incoming
+        .iter()
+        .chain(&outgoing)
+        .filter(|row| row.state == FollowState::Accepted)
+    {
+        uncount_removed_follower(&mut tx, follow).await?;
+    }
+    let outgoing_ids: Vec<Uuid> = outgoing.iter().map(|row| row.followee_id).collect();
+    sqlx::query(SEVER_LIST_MEMBERSHIPS_SQL)
+        .bind(user_id)
+        .bind(&outgoing_ids)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    sqlx::query(SEVER_ENDORSEMENTS_SQL)
+        .bind(user_id)
+        .bind(&outgoing_ids)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    let incoming_ids: Vec<Uuid> = incoming.iter().map(|row| row.follower_id).collect();
+    let mut incoming_peers = load_peers(&mut tx, &incoming_ids).await?;
+    let mut outgoing_peers = load_peers(&mut tx, &outgoing_ids).await?;
+    tx.commit().await?;
+    Ok(SeveredByDomain {
+        followers: open_with_peers(incoming, &mut incoming_peers, |row| row.follower_id),
+        followees: open_with_peers(outgoing, &mut outgoing_peers, |row| row.followee_id),
+    })
+}
+
+/// The accounts `ids` name, keyed by id, read on the open transaction `conn`.
+async fn load_peers(conn: &mut PgConnection, ids: &[Uuid]) -> AppResult<HashMap<Uuid, User>> {
+    let peers = sqlx::query_as::<_, User>(SEVERED_USERS_SQL)
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(peers.into_iter().map(|peer| (peer.id, peer)).collect())
+}
+
+/// The open rows of `rows`, each paired with the account `peer_of` names and
+/// taken out of `peers`; a row whose account is gone is dropped.
+fn open_with_peers(
+    rows: Vec<Follow>,
+    peers: &mut HashMap<Uuid, User>,
+    peer_of: fn(&Follow) -> Uuid,
+) -> Vec<(Follow, User)> {
+    rows.into_iter()
+        .filter(|row| row.state != FollowState::Rejected)
+        .filter_map(|row| {
+            let peer = peers.remove(&peer_of(&row))?;
+            Some((row, peer))
+        })
+        .collect()
+}
+
 /// Steps the two counters an accepted relationship fed back down on `conn`,
 /// inside an open transaction: the same pair [`step_counters`] writes, one
 /// step of `-1` each, committed together with the row's `DELETE` so a crash
 /// never leaves a counted relationship without its row (or the other way
-/// round). Both [`remove_follower`] and [`sever_between`] run every row they
-/// deleted through it.
+/// round). [`remove_follower`], [`sever_between`] and [`sever_with_domain`]
+/// run every accepted row they deleted through it.
 async fn uncount_removed_follower(conn: &mut PgConnection, follow: &Follow) -> AppResult<()> {
     update_counts(
         &mut *conn,
@@ -258,5 +402,54 @@ mod tests {
             1,
             "and the one accepted relationship that exists is still on the books"
         );
+    }
+
+    #[tokio::test]
+    async fn sever_with_domain_takes_both_directions_on_that_domain_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = locked_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let remote = remote_user(&pool, "zed").await;
+        let other = remote_user(&pool, "yan").await;
+        sqlx::query("UPDATE users SET domain = 'other.example' WHERE id = $1")
+            .bind(other.id)
+            .execute(&pool)
+            .await
+            .map(drop)
+            .unwrap();
+
+        let incoming = follow(&pool, TEST_BASE_URL, &remote, &alice).await.unwrap();
+        let _granted = crate::models::follow::accept(&pool, incoming.id)
+            .await
+            .unwrap();
+        let outgoing = follow(&pool, TEST_BASE_URL, &alice, &remote).await.unwrap();
+        let _kept_remote = follow(&pool, TEST_BASE_URL, &other, &alice).await.unwrap();
+        let _kept_local = follow(&pool, TEST_BASE_URL, &bob, &alice).await.unwrap();
+
+        let severed = sever_with_domain(&pool, alice.id, "remote.example")
+            .await
+            .unwrap();
+        assert_eq!(severed.followers.len(), 1, "the accepted follower");
+        assert_eq!(severed.followers[0].0.id, incoming.id);
+        assert_eq!(severed.followers[0].1.id, remote.id);
+        assert_eq!(severed.followees.len(), 1, "the pending outgoing request");
+        assert_eq!(severed.followees[0].0.id, outgoing.id);
+        assert_eq!(severed.followees[0].1.id, remote.id);
+        assert_eq!(follow_count(&pool).await, 2, "the other two rows stay");
+        assert_eq!(
+            fresh_user(&pool, alice.id).await.followers_count,
+            0,
+            "the removed follower stopped counting"
+        );
+
+        let again = sever_with_domain(&pool, alice.id, "remote.example")
+            .await
+            .unwrap();
+        assert!(again.followers.is_empty() && again.followees.is_empty());
+        let none = sever_with_domain(&pool, alice.id, "nothing.example")
+            .await
+            .unwrap();
+        assert!(none.followers.is_empty() && none.followees.is_empty());
     }
 }

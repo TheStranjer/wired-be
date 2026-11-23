@@ -22,15 +22,12 @@ use super::{
 };
 use crate::{
     config::Config,
-    http_client::HttpClient,
     models::{
         oauth_app::{NewOauthApp, create as create_app},
         oauth_token::{NewToken, create_token},
         user::{NewUser, insert},
     },
     state::AppState,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
 };
 
 /// The one-bucket table: `max` requests per `secs` in `name`.
@@ -96,20 +93,11 @@ pub(super) fn app_on_pool(
     config.rate_limit.limits = limits.clone();
     config.rate_limit.enabled = crate::config::Toggle::new(flags.enabled);
     config.rate_limit.trust_proxy_headers = crate::config::Toggle::new(flags.trust);
-    let config = Arc::new(config);
     let owned = Arc::clone(clock);
     let time: Arc<dyn Clock> = owned;
     let state = AppState {
-        hub: Hub::new(&db),
-        db,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
         rate_limiter: Arc::new(RateLimiter::with_clock(limits, time)),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        ..AppState::for_tests(db, config)
     };
     let layer = rate_limit(&state, "authentication");
     Router::new()

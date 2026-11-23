@@ -9,15 +9,34 @@ use crate::{error::AppResult, pagination::PageParams};
 use super::{Chat, ChatFilter};
 
 /// [`page_for_user`]: one participant's chats. The text stops where its one
-/// placeholder belongs, the way [`REFERENCE_SELECT_SQL`] does; the pinned
-/// restriction and the keyset [`PageParams::apply_keyset`] appends follow, the
-/// latter running on the chat id `c.id`.
+/// placeholder belongs, the way [`REFERENCE_SELECT_SQL`] does; the block and
+/// mute exclusions, the pinned restriction and the keyset
+/// [`PageParams::apply_keyset`] appends follow, the latter running on the chat
+/// id `c.id`.
 ///
 /// [`REFERENCE_SELECT_SQL`]: super::references::REFERENCE_SELECT_SQL
 const CHATS_PAGE_SQL: &str = "SELECT c.* FROM chats c WHERE c.user_id = ";
 
+/// What the list never shows: a chat whose counterpart the owner has blocked
+/// (Pleroma's `cached_blocked_users_ap_ids`).
+///
+/// Only the owner's own blocks count; a counterpart who blocked the owner stays
+/// listed.
+const EXCLUDE_BLOCKED_SQL: &str = " AND NOT EXISTS (SELECT 1 FROM blocks b \
+     WHERE b.blocker_id = c.user_id AND b.blocked_id = c.recipient_id)";
+
+/// What the list hides unless `with_muted`: a chat whose counterpart the owner
+/// has a live mute on, the same live-mute test as `MUTE_LIVE_ARMS` in
+/// `status_search.rs` (no expiry, or one still ahead).
+const EXCLUDE_MUTED_SQL: &str = " AND NOT EXISTS (SELECT 1 FROM mutes m \
+     WHERE m.muter_id = c.user_id AND m.muted_id = c.recipient_id \
+     AND (m.expires_at IS NULL OR m.expires_at > now()))";
+
 /// The chats of `user_id`, newest activity first, `page`'s `limit` at a time,
 /// `filter`'s restrictions applied.
+///
+/// Chats with accounts `user_id` has blocked are never listed, and those with
+/// accounts it has muted only when [`ChatFilter::with_muted`] is set.
 ///
 /// The list order is [`updated_at`](Chat::updated_at), which is what Pleroma's
 /// `Chat.for_user_query` orders by, while the cursors are ids, which is what
@@ -41,6 +60,10 @@ pub async fn page_for_user(
     // The builder's push methods hand back `&mut Self` for chaining; binding
     // the result keeps these statements from being unused (decision 14).
     let _bound: &mut _ = builder.push_bind(user_id);
+    let _blocked: &mut _ = builder.push(EXCLUDE_BLOCKED_SQL);
+    if !filter.with_muted {
+        let _muted: &mut _ = builder.push(EXCLUDE_MUTED_SQL);
+    }
     if let Some(pinned) = filter.pinned {
         let _pinned: &mut _ = builder.push(" AND c.pinned = ").push_bind(pinned);
     }
@@ -65,7 +88,11 @@ fn sort_by_activity(chats: &mut [Chat]) {
 mod tests {
     use super::*;
     use crate::{
-        models::chat::test_support::{ALL, chat_ids, local, page, send},
+        models::{
+            chat::test_support::{ALL, chat_ids, local, page, send},
+            mute::MuteOptions,
+            user::User,
+        },
         util::id::new_id,
     };
 
@@ -146,6 +173,114 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "and a user with no chats gets no rows"
+        );
+    }
+
+    /// The ids of `owner`'s chats under `with_muted`.
+    async fn listed(pool: &PgPool, owner: &User, with_muted: bool) -> Vec<Uuid> {
+        let filter = ChatFilter {
+            pinned: None,
+            with_muted,
+        };
+        chat_ids(
+            &page_for_user(pool, owner.id, page(ALL), filter)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Opens a chat of `owner` with `partner` and returns its id.
+    async fn open(pool: &PgPool, owner: &User, partner: &User) -> Uuid {
+        send(pool, owner, partner, "hello").await.1.chat_id
+    }
+
+    #[tokio::test]
+    async fn a_blocked_counterpart_is_never_listed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let _bobs = open(&pool, &alice, &bob).await;
+        let with_carol = open(&pool, &alice, &carol).await;
+        let _row = crate::models::block::block(&pool, crate::config::TEST_BASE_URL, &alice, &bob)
+            .await
+            .unwrap();
+
+        for with_muted in [false, true] {
+            assert_eq!(
+                listed(&pool, &alice, with_muted).await,
+                vec![with_carol],
+                "the blocked chat is absent with with_muted={with_muted}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_counterpart_who_blocked_the_owner_stays_listed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let with_bob = open(&pool, &alice, &bob).await;
+        let _row = crate::models::block::block(&pool, crate::config::TEST_BASE_URL, &bob, &alice)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            listed(&pool, &alice, false).await,
+            vec![with_bob],
+            "only the owner's own blocks hide a chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_muted_counterpart_is_listed_only_with_muted() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = local(&pool, "carol").await;
+        let with_bob = open(&pool, &alice, &bob).await;
+        let with_carol = open(&pool, &alice, &carol).await;
+        let _row = crate::models::mute::mute(&pool, &alice, &bob, MuteOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            listed(&pool, &alice, false).await,
+            vec![with_carol],
+            "the muted chat is hidden by default"
+        );
+        let mut both = listed(&pool, &alice, true).await;
+        both.sort_unstable();
+        let mut want = vec![with_bob, with_carol];
+        want.sort_unstable();
+        assert_eq!(both, want, "with_muted brings it back");
+    }
+
+    #[tokio::test]
+    async fn an_expired_mute_hides_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let with_bob = open(&pool, &alice, &bob).await;
+        let _written: sqlx::postgres::PgQueryResult = sqlx::query(
+            "INSERT INTO mutes (id, muter_id, muted_id, expires_at)
+             VALUES ($1, $2, $3, now() - interval '1 hour')",
+        )
+        .bind(new_id())
+        .bind(alice.id)
+        .bind(bob.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            listed(&pool, &alice, false).await,
+            vec![with_bob],
+            "a lapsed mute is absent to the list"
         );
     }
 }
