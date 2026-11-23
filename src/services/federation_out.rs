@@ -52,11 +52,6 @@
 //!   its author's `featured` collection or withdraws it — Pleroma's
 //!   `Builder.pin` and `Builder.unpin`, `to` the public with the author's
 //!   followers collection in `cc`, delivered to the remote followers;
-//! - [`after_list_member_changed`]: the `Add` / `Remove` that announces a
-//!   REMOTE account's joining or leaving one of the caller's lists —
-//!   `actor` the list's owner, `object` the member's actor id and `target`
-//!   the list's curated inbox url, addressed to the member alone so the
-//!   publication reaches their inbox and no follower fan-out happens;
 //! - [`after_account_deleted`]: a `Delete` of the actor, run as the first
 //!   act of the `users.delete` sweep (before it clears the relationship
 //!   rows the fan-out reads), delivered to the union of the account's
@@ -192,7 +187,7 @@ pub use blocks::after_block_changed;
 pub use boosts::after_reblog_changed;
 pub use chat_admin_deletes::after_chat_message_deleted_by_admin;
 pub use chats::{after_chat_message_created, after_chat_message_deleted};
-pub use collections::{after_list_member_changed, after_pin_changed};
+pub use collections::after_pin_changed;
 pub use follow_requests::{after_follow_request_resolved, after_follower_removed};
 pub use follows::{FollowAnswer, accept_follow, after_follow_changed, reject_follow};
 pub use likes::after_favourite_changed;

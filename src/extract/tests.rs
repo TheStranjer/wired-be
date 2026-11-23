@@ -320,3 +320,46 @@ async fn api_params_body_rules_apply() {
         "an empty body keeps the query parameters"
     );
 }
+
+/// Echoes the parameters an `ApiParams` request carried.
+async fn echo_params(ApiParams(params): ApiParams<Value>) -> axum::Json<Value> {
+    axum::Json(params)
+}
+
+/// GETs `uri` from a one-route router echoing its `ApiParams`.
+async fn get_echo(uri: &str) -> axum::response::Response {
+    use tower::ServiceExt as _;
+
+    axum::Router::new()
+        .route("/x", axum::routing::get(echo_params))
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_too_deeply_nested_query_key_is_a_400() {
+    let uri = format!("/x?a{}=1", "[x]".repeat(5000));
+    let response = get_echo(&uri).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "deep query keys are refused, not recursed into"
+    );
+
+    let ok = get_echo("/x?authorization[scope][]=read&ids[]=1&ids[]=2").await;
+    assert_eq!(ok.status(), StatusCode::OK, "ordinary keys still parse");
+}
+
+#[tokio::test]
+async fn a_too_deeply_nested_form_body_key_is_a_400() {
+    let body = format!("a{}=1", "[]".repeat(100_000));
+    let err = body_of::<Value>(Some(FORM_MIME), &body)
+        .await
+        .expect_err("a 100k-deep key");
+    assert_eq!(
+        status_of(err),
+        StatusCode::BAD_REQUEST,
+        "400 through ApiBody"
+    );
+}

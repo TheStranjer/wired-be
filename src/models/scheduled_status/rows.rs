@@ -121,6 +121,27 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<bool> {
     Ok(deleted.rows_affected() > 0)
 }
 
+/// Deletes every schedule of `user_id` and returns the ids that went, so
+/// the caller can cancel each one's pending publish job.
+///
+/// The account-deletion sweep's writer: the user row is kept, so no
+/// cascade takes these rows. Nothing to delete answers the empty vector,
+/// which makes a rerun a no-op.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "DELETE FROM scheduled_statuses WHERE user_id = $1 RETURNING id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
 /// Moves schedule `id` of `user_id` to fire at `scheduled_at`, returning the
 /// moved row.
 ///

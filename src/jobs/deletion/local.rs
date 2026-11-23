@@ -9,8 +9,11 @@ use uuid::Uuid;
 use super::{KIND_DELETE, KIND_DELETE_REMOTE};
 use super::{parse_args, retry};
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
-    models::{bookmark, favourite, follow, list, media_attachment, notification, status, user},
+    jobs::{AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, scheduled_statuses},
+    models::{
+        backup, bookmark, favourite, follow, job, list, media_attachment, notification,
+        scheduled_status, status, user, web_push_subscription,
+    },
     state::AppState,
 };
 
@@ -53,8 +56,9 @@ pub(super) async fn load_account(state: &AppState, user_id: Uuid) -> Result<user
     }
 }
 
-/// Steps 1 and 2: the account's posts tombstone, its relationships, likes,
-/// marks, notifications, lists and media rows go. Each statement is a
+/// Steps 1 to 5: the account's posts tombstone, its relationships, likes,
+/// marks, notifications, lists and media rows go, then its scheduled
+/// statuses, backups and push subscriptions. Each statement is a
 /// whole step on its own — a retry after a mid-way failure re-runs the
 /// earlier ones as no-ops and picks up where they stopped.
 ///
@@ -85,12 +89,64 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
     let media = media_attachment::delete_all_for_user(db, id)
         .await
         .map_err(|err| retry(&err))?;
+    let scheduled = clear_scheduled(state, id).await?;
+    let backups = clear_backups(state, id).await?;
+    let push_subscriptions = web_push_subscription::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
     debug!(
         account = %account.nickname,
         statuses, follows, favourites, bookmarks, notifications, lists, media,
+        scheduled, backups, push_subscriptions,
         "account deletion cleared"
     );
     Ok(())
+}
+
+/// Step 3: the account's scheduled statuses go and each one's pending
+/// `scheduled_statuses.publish` job is cancelled, so nothing fires as the
+/// deleted actor. Answers how many schedules went.
+///
+/// # Errors
+///
+/// [`JobError::Retry`] on any database failure (see [`retry`]).
+async fn clear_scheduled(state: &AppState, user_id: Uuid) -> Result<usize, JobError> {
+    let ids = scheduled_status::delete_all_for_user(&state.db, user_id)
+        .await
+        .map_err(|err| retry(&err))?;
+    for id in &ids {
+        let _cancelled = job::cancel_pending(&state.db, &scheduled_statuses::unique_key(*id))
+            .await
+            .map_err(|err| retry(&err))?;
+    }
+    Ok(ids.len())
+}
+
+/// Step 4: the account's backup archives leave storage, then their rows.
+/// A file that is already gone counts as removed; any other storage
+/// failure retries the pass with the row kept, so no archive is left
+/// without a database pointer. Answers how many rows went.
+///
+/// # Errors
+///
+/// [`JobError::Retry`] on a database failure or a failed file delete.
+async fn clear_backups(state: &AppState, user_id: Uuid) -> Result<usize, JobError> {
+    let rows = backup::list_for_user(&state.db, user_id)
+        .await
+        .map_err(|err| retry(&err))?;
+    for row in &rows {
+        if let Some(key) = row.storage_key.as_deref()
+            && !sweep_archive_file(state, row, key).await
+        {
+            return Err(JobError::Retry(format!(
+                "account delete pass failed: backup file {key} could not be deleted"
+            )));
+        }
+        let _swept = backup::delete(&state.db, row.id)
+            .await
+            .map_err(|err| retry(&err))?;
+    }
+    Ok(rows.len())
 }
 
 #[cfg(test)]
@@ -98,9 +154,10 @@ mod tests {
     use serde_json::json;
 
     use super::super::test_support::{
-        BATCH_OVERSHOOT, accepted_follow, app_state, broken_state, count_where, follows,
-        has_follow, likes, list_of, live_statuses, local_user, marks, media_row, notify, post,
-        post_many, run, status_deleted_at,
+        BATCH_OVERSHOOT, accepted_follow, app_state, available_jobs_keyed, broken_state,
+        count_where, follows, has_follow, likes, list_of, live_statuses, local_user, marks,
+        media_row, notify, post, post_many, processed_backup, push_subscription, run,
+        scheduled_with_job, status_deleted_at, uploads_state,
     };
     use super::super::{KIND_DELETE, job_args};
     use super::*;
@@ -443,6 +500,188 @@ mod tests {
             live_statuses(&pool, alice.id).await,
             0,
             "and it is this module's sweep: the post is a tombstone"
+        );
+    }
+
+    /// The sweep takes the account's scheduled statuses and cancels each
+    /// one's pending publish job, leaving another account's schedule and
+    /// job alone.
+    #[tokio::test]
+    async fn the_handler_deletes_schedules_and_cancels_their_jobs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let state = app_state(&pool);
+        let first = scheduled_with_job(&state, &alice).await;
+        let second = scheduled_with_job(&state, &alice).await;
+        let bobs = scheduled_with_job(&state, &bob).await;
+        let key = scheduled_statuses::unique_key;
+        assert_eq!(available_jobs_keyed(&pool, &key(first.id)).await, 1);
+
+        run(&state, alice.id).await.expect("the delete job runs");
+
+        assert_eq!(
+            count_where(&pool, "scheduled_statuses", "user_id", alice.id).await,
+            0,
+            "alice has no schedule left"
+        );
+        for gone in [first.id, second.id] {
+            assert_eq!(
+                available_jobs_keyed(&pool, &key(gone)).await,
+                0,
+                "the publish job of schedule {gone} is cancelled"
+            );
+        }
+        assert_eq!(
+            count_where(&pool, "scheduled_statuses", "id", bobs.id).await,
+            1,
+            "bob's schedule stays"
+        );
+        assert_eq!(
+            available_jobs_keyed(&pool, &key(bobs.id)).await,
+            1,
+            "and so does its job"
+        );
+    }
+
+    /// A processed backup's file leaves the uploader and its row goes; a
+    /// backup whose file is already missing, and one that never got a file,
+    /// lose their rows too; another account's backup and file stay.
+    #[tokio::test]
+    async fn the_handler_deletes_backups_rows_and_files() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state) = uploads_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let (stored, stored_key) = processed_backup(&state, &alice, b"alice's dms").await;
+        let (lapsed, lapsed_key) = processed_backup(&state, &alice, b"already gone").await;
+        state
+            .uploader
+            .delete(&lapsed_key)
+            .await
+            .expect("the fixture file goes first");
+        let requested = backup::create(&pool, &alice)
+            .await
+            .expect("the unprocessed fixture creates");
+        let (bobs, bobs_key) = processed_backup(&state, &bob, b"bob's dms").await;
+
+        run(&state, alice.id).await.expect("the delete job runs");
+
+        for gone in [stored.id, lapsed.id, requested.id] {
+            assert_eq!(
+                count_where(&pool, "backups", "id", gone).await,
+                0,
+                "backup row {gone} is gone"
+            );
+        }
+        assert!(
+            !dir.path().join(&stored_key).exists(),
+            "the archive's file is gone from the uploader"
+        );
+        assert_eq!(count_where(&pool, "backups", "id", bobs.id).await, 1);
+        assert!(
+            dir.path().join(&bobs_key).is_file(),
+            "bob's archive is not alice's to delete"
+        );
+    }
+
+    /// A file delete that fails for any reason but "already gone" retries
+    /// the pass and keeps the row, so the archive is never orphaned.
+    #[tokio::test]
+    async fn a_failing_archive_delete_retries_and_keeps_the_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (dir, state) = uploads_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let (stuck, key) = processed_backup(&state, &alice, b"stuck").await;
+        state
+            .uploader
+            .delete(&key)
+            .await
+            .expect("the fixture file goes first");
+        std::fs::create_dir_all(dir.path().join(&key)).expect("a directory takes the file's path");
+
+        match run(&state, alice.id).await {
+            Err(JobError::Retry(detail)) => assert!(
+                detail.contains(&key),
+                "the retry names the file that stuck: {detail}"
+            ),
+            other => panic!("a failed file delete must retry, not {other:?}"),
+        }
+        assert_eq!(
+            count_where(&pool, "backups", "id", stuck.id).await,
+            1,
+            "the row stays for the next pass"
+        );
+        assert_eq!(
+            user::get_by_id(&pool, alice.id)
+                .await
+                .unwrap()
+                .expect("the row is there")
+                .email
+                .as_deref(),
+            Some("alice@example.org"),
+            "and the personal data is not purged before the retry"
+        );
+    }
+
+    /// The account's push subscriptions go; another account's stay.
+    #[tokio::test]
+    async fn the_handler_deletes_push_subscriptions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        push_subscription(&pool, &alice, "https://push.example/alice-1").await;
+        push_subscription(&pool, &alice, "https://push.example/alice-2").await;
+        push_subscription(&pool, &bob, "https://push.example/bob").await;
+
+        run(&app_state(&pool), alice.id)
+            .await
+            .expect("the delete job runs");
+
+        assert_eq!(
+            count_where(&pool, "web_push_subscriptions", "user_id", alice.id).await,
+            0,
+            "alice has no subscription left"
+        );
+        assert_eq!(
+            count_where(&pool, "web_push_subscriptions", "user_id", bob.id).await,
+            1,
+            "bob's subscription stays"
+        );
+    }
+
+    /// A second pass over an account whose schedules, backups and
+    /// subscriptions are gone succeeds and changes nothing.
+    #[tokio::test]
+    async fn a_second_pass_over_the_new_steps_is_a_no_op() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (_dir, state) = uploads_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let _row = scheduled_with_job(&state, &alice).await;
+        let _backup = processed_backup(&state, &alice, b"dms").await;
+        push_subscription(&pool, &alice, "https://push.example/alice").await;
+        let _bobs = processed_backup(&state, &bob, b"bob").await;
+
+        run(&state, alice.id).await.expect("the first pass runs");
+        run(&state, alice.id).await.expect("the second pass runs");
+
+        for table in ["scheduled_statuses", "backups", "web_push_subscriptions"] {
+            assert_eq!(
+                count_where(&pool, table, "user_id", alice.id).await,
+                0,
+                "{table} stays empty for alice"
+            );
+        }
+        assert_eq!(
+            count_where(&pool, "backups", "user_id", bob.id).await,
+            1,
+            "the rerun touched nobody else"
         );
     }
 }

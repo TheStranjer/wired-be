@@ -242,7 +242,7 @@ mod tests {
         );
         assert!(
             limiter
-                .check("authentication", "ip:203.0.113.7:51234")
+                .check("authentication", "ip:203.0.113.7")
                 .is_some_and(|decision| decision.allowed),
             "an anonymous client starts its own window"
         );

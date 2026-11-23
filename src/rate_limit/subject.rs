@@ -1,7 +1,7 @@
 //! Who a limited request is counted against: the user behind a valid
 //! bearer token, else the client address.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::{
     extract::{ConnectInfo, Request},
@@ -45,21 +45,36 @@ pub(super) async fn authenticated_subject(
 
 /// The client an anonymous request is counted against: the leftmost
 /// `X-Forwarded-For` entry while `TRUST_PROXY_HEADERS` is on, else (or
-/// when the header says nothing usable) the socket peer; [`UNKNOWN_SUBJECT`]
-/// when even that is absent.
+/// when the header says nothing usable) the socket peer's address;
+/// [`UNKNOWN_SUBJECT`] when even that is absent. The source port is never
+/// part of the key (every connection draws a fresh one), and an IPv6
+/// address is keyed by its /64 prefix (see [`ip_key`]).
 pub(super) fn client(app: &AppState, request: &Request) -> String {
     if app.config.rate_limit.trust_proxy_headers.get()
         && let Some(forwarded) = forwarded_for(request)
     {
-        return forwarded;
+        return forwarded.parse::<IpAddr>().map_or(forwarded, ip_key);
     }
     request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map_or_else(
             || UNKNOWN_SUBJECT.to_owned(),
-            |ConnectInfo(addr)| addr.to_string(),
+            |ConnectInfo(addr)| ip_key(addr.ip()),
         )
+}
+
+/// The window key of an address: IPv4 (and IPv4-mapped IPv6) as the bare
+/// address, any other IPv6 as its /64 prefix, so a host cannot rotate
+/// through the addresses of its own /64 to dodge a window.
+fn ip_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            format!("{a:x}:{b:x}:{c:x}:{d:x}::/64")
+        }
+    }
 }
 
 /// The leftmost, trimmed, non-empty `X-Forwarded-For` entry — the first hop
@@ -126,6 +141,114 @@ mod tests {
             sibling.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "the first client is spent even on the sibling route of the same bucket"
+        );
+    }
+
+    /// Two requests from one address over different source ports are one
+    /// client; a different address is another.
+    #[tokio::test]
+    async fn source_port_is_not_part_of_the_key() {
+        let clock = Arc::new(ManualClock::new());
+        let app = auth_app(&clock, 1, FLAGS_ON);
+        let first = app
+            .clone()
+            .oneshot(limited_post("203.0.113.1:1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "first connection passes");
+        let reconnect = app
+            .clone()
+            .oneshot(limited_post("203.0.113.1:2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reconnect.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a new source port from the same address shares the window"
+        );
+        let other = app.oneshot(limited_post("203.0.113.2:1")).await.unwrap();
+        assert_eq!(
+            other.status(),
+            StatusCode::OK,
+            "a different address has its own window"
+        );
+    }
+
+    /// An IPv6 client is keyed by its /64: addresses inside one prefix share
+    /// a window, another prefix does not.
+    #[tokio::test]
+    async fn ipv6_clients_share_a_window_per_64_prefix() {
+        let clock = Arc::new(ManualClock::new());
+        let app = auth_app(&clock, 1, FLAGS_ON);
+        let first = app
+            .clone()
+            .oneshot(limited_post("[2001:db8::1]:1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "first address passes");
+        let same_prefix = app
+            .clone()
+            .oneshot(limited_post("[2001:db8::2]:2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            same_prefix.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "another address in the same /64 shares the window"
+        );
+        let other_prefix = app
+            .oneshot(limited_post("[2001:db8:0:1::1]:1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            other_prefix.status(),
+            StatusCode::OK,
+            "another /64 has its own window"
+        );
+    }
+
+    /// The key is the bare address for IPv4 and IPv4-mapped IPv6, the /64
+    /// prefix for other IPv6.
+    #[test]
+    fn ip_key_shapes() {
+        let key = |text: &str| ip_key(text.parse::<IpAddr>().unwrap());
+        assert_eq!(key("203.0.113.1"), "203.0.113.1", "IPv4 is bare");
+        assert_eq!(key("::ffff:203.0.113.1"), "203.0.113.1", "mapped IPv4");
+        assert_eq!(key("2001:db8::1"), "2001:db8:0:0::/64", "IPv6 prefix");
+        assert_eq!(
+            key("2001:db8:0:1:ffff::1"),
+            "2001:db8:0:1::/64",
+            "IPv6 low bits dropped"
+        );
+    }
+
+    /// A trusted `X-Forwarded-For` address is keyed the same way, so a
+    /// forwarded IPv6 client cannot rotate through its /64 either.
+    #[tokio::test]
+    async fn forwarded_ipv6_is_keyed_by_prefix() {
+        let clock = Arc::new(ManualClock::new());
+        let app = auth_app(
+            &clock,
+            1,
+            Flags {
+                enabled: true,
+                trust: true,
+            },
+        );
+        let first = app
+            .clone()
+            .oneshot(forwarded_post("10.0.0.1:1", "2001:db8::1"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "first passes");
+        let second = app
+            .oneshot(forwarded_post("10.0.0.1:2", "2001:db8::2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "same forwarded /64, same window"
         );
     }
 

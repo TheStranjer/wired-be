@@ -76,6 +76,8 @@
 //! [`crate::api::reports`] lands `after_report_created`), and a vote on a
 //! local poll sends nothing.
 
+use std::collections::HashSet;
+
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -123,6 +125,10 @@ const INVALID_INDICES: &str = "Invalid indices";
 /// 422 body for a second distinct choice on a single-choice poll
 /// (Pleroma's `count_check` arm).
 const TOO_MANY_CHOICES: &str = "Too many choices";
+/// The most choices a vote body may list, duplicates included. No poll
+/// has this many options, so a longer list is refused as
+/// [`INVALID_INDICES`] before any per-choice work runs.
+const MAX_VOTE_CHOICES: usize = 1000;
 
 /// The `/api/v1` polls router, merged into [`crate::api::v1`].
 ///
@@ -314,6 +320,9 @@ async fn accepted_marks(
     if requested.is_empty() {
         return Err(AppError::Unprocessable(MISSING_CHOICES.to_owned()));
     }
+    if requested.len() > MAX_VOTE_CHOICES {
+        return Err(AppError::Unprocessable(INVALID_INDICES.to_owned()));
+    }
     let options = poll::options(&state.db, poll.id).await?;
     chosen_option_ids(poll, &options, requested)
 }
@@ -348,12 +357,12 @@ fn chosen_option_ids(
     options: &[PollOptionRow],
     requested: &[i32],
 ) -> AppResult<Vec<Uuid>> {
-    let mut indices: Vec<i32> = Vec::with_capacity(requested.len());
-    for index in requested {
-        if !indices.contains(index) {
-            indices.push(*index);
-        }
-    }
+    let mut seen: HashSet<i32> = HashSet::with_capacity(requested.len());
+    let indices: Vec<i32> = requested
+        .iter()
+        .copied()
+        .filter(|index| seen.insert(*index))
+        .collect();
     let mut chosen: Vec<Uuid> = Vec::with_capacity(indices.len());
     for index in indices {
         let Some(option) = options.iter().find(|option| option.position == index) else {
@@ -397,8 +406,11 @@ where
 {
     let value = Option::<Value>::deserialize(deserializer)?;
     let items = value.map_or_else(Vec::new, index_map_to_vec);
+    // Read one element past the cap: enough for `accepted_marks` to refuse
+    // the ballot as oversized, without building a huge `Vec<i32>`.
     items
         .iter()
+        .take(MAX_VOTE_CHOICES + 1)
         .map(choice_index)
         .collect::<Option<Vec<i32>>>()
         .ok_or_else(|| SerdeError::custom("expected the index of a poll option"))
@@ -563,6 +575,30 @@ mod tests {
         assert_eq!(chosen.len(), 2, "two distinct marks from four values");
         assert_eq!(chosen[0], options[1].id, "in first-requested order");
         assert_eq!(chosen[1], options[0].id);
+    }
+
+    #[test]
+    fn a_huge_list_of_out_of_range_indexes_is_refused() {
+        let stand = poll_row(true, None);
+        let options = vec![option_row(stand.id, 0)];
+        let requested: Vec<i32> = (1..=10_000).collect();
+        let err = chosen_option_ids(&stand, &options, &requested)
+            .expect_err("every index is out of range");
+        assert!(
+            matches!(&err, AppError::Unprocessable(message) if message == INVALID_INDICES),
+            "ten thousand distinct bad indexes are Invalid indices: {err}"
+        );
+    }
+
+    #[test]
+    fn flex_choices_stops_one_past_the_cap() {
+        let many: Vec<i32> = (0..5000).collect();
+        let parsed = params_of(json!({"choices": many})).expect("the list parses");
+        assert_eq!(
+            parsed.choices.len(),
+            MAX_VOTE_CHOICES + 1,
+            "one element past the cap is read, so the ballot is refused"
+        );
     }
 
     #[test]

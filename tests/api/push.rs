@@ -651,8 +651,11 @@ async fn the_vapid_key_is_stable_and_surfaced_everywhere() {
         "GET /api/v1/apps/verify_credentials advertises it"
     );
 
+    let owner = common::create_local_user(&pool, "push-vapid-owner").await;
+    let owned_app = common::create_app_named(&pool, "Owned", Some(&owner)).await;
+    let reader = common::create_token(&pool, &owner, &owned_app, "read").await;
     let listed = common::TestRequest::get("/api/v1/pleroma/apps")
-        .bearer(&bearer)
+        .bearer(&reader.token)
         .send(&app)
         .await;
     assert_eq!(

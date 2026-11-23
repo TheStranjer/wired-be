@@ -81,6 +81,7 @@ pub(super) async fn read_body(
 ) -> Result<HttpResponse, HttpError> {
     let status = response.status().as_u16();
     let headers = response.headers().clone();
+    let url = response.url().clone();
     let mut body = BytesMut::new();
     while let Some(chunk) = response.chunk().await? {
         body.extend_from_slice(&chunk);
@@ -91,6 +92,7 @@ pub(super) async fn read_body(
     Ok(HttpResponse {
         status,
         headers,
+        url,
         body: body.freeze(),
     })
 }

@@ -19,12 +19,13 @@
 //! instance's mouth (Mastodon's round trip, Pleroma's
 //! `Containment.contain_origin_from_id/2`):
 //!
-//! - A fetched document's `id` must name the URL it was fetched from. The
-//!   shared [`HttpClient`](crate::http_client::HttpClient) follows
-//!   redirects internally and does not report the final URL, so a document
-//!   naming anything else is dereferenced exactly once at its own `id` and
-//!   accepted only if it names *that* URL — a moved document is re-anchored
-//!   to its canonical id, a document that keeps moving is
+//! - A fetched document's `id` must name the URL that actually served it.
+//!   The shared [`HttpClient`](crate::http_client::HttpClient) follows
+//!   redirects and reports the final URL: a redirect to another host is
+//!   [`FetchError::Invalid`], and a document naming anything but the final
+//!   URL is dereferenced exactly once at its own `id` — without a redirect
+//!   allowed — and accepted only if it names *that* URL. A moved document
+//!   is re-anchored to its canonical id, a document that keeps moving is
 //!   [`FetchError::Invalid`].
 //! - A handle resolved through `WebFinger` must be vouched for by the actor
 //!   itself: the fetched document's `preferredUsername@host` has to equal
@@ -33,6 +34,7 @@
 
 use chrono::Duration;
 
+pub mod containment;
 mod error;
 pub mod fetch;
 pub mod lookup;
@@ -45,7 +47,12 @@ pub use fetch::fetch_actor_json;
 pub use lookup::{get_or_fetch_by_acct, get_or_fetch_by_ap_id, refresh_user};
 pub use signer::Signer;
 
-pub(crate) use self::{fetch::fetch_document, lookup::is_local_ap_id, signer::fetch_signer};
+pub(crate) use self::{
+    containment::{ensure_not_redirected, ensure_same_host, names_served_url},
+    fetch::fetch_document,
+    lookup::is_local_ap_id,
+    signer::fetch_signer,
+};
 
 /// Cap on one fetched actor document: 1 MiB. Actor documents are profiles;
 /// anything larger is an attack or a mistake.

@@ -204,6 +204,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_response_url_is_the_post_redirect_url() {
+        let listener = bind().await;
+        let hop_url = url_for(&listener, "/hop");
+        let target = url_for(&listener, "/final");
+        let app = Router::new()
+            .route("/hop", get(hop).with_state(target.clone()))
+            .route("/final", get(redirect_target));
+        let server = spawn_server(listener, app);
+        let client = HttpClient::new_for_tests(TEST_UA);
+
+        let redirected = client.get_limited(&hop_url, &[], 1024).await.unwrap();
+        assert_eq!(
+            redirected.url.as_str(),
+            target,
+            "the URL that served the body, not the one requested"
+        );
+
+        let direct = client.get_limited(&target, &[], 1024).await.unwrap();
+        assert_eq!(
+            direct.url.as_str(),
+            target,
+            "without a redirect the URL is the requested one"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_redirect_chain_past_five_fails_as_connect() {
         let listener = bind().await;
         let loop_url = url_for(&listener, "/hop");

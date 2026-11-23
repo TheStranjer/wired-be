@@ -166,23 +166,18 @@ pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<OauthApp>> {
 }
 
 /// The `SELECT` behind [`list_for_user`]: the whole `oauth_apps` row,
-/// kept when the user owns the app or holds any token issued for it —
-/// the `EXISTS` subquery deduplicates multi-token apps to one row —
-/// newest app first (`UUIDv7` text sorts by mint time, decision 4).
-const LIST_FOR_USER_SQL: &str = "SELECT * FROM oauth_apps a
-  WHERE a.user_id = $1
-     OR EXISTS (
-            SELECT 1 FROM oauth_tokens t
-             WHERE t.app_id = a.id AND t.user_id = $1
-        )
-  ORDER BY a.id DESC";
+/// kept only when the user registered the app (Pleroma's
+/// `App.get_user_apps/1`), newest app first (`UUIDv7` text sorts by mint
+/// time, decision 4). Holding a token for an app is deliberately not
+/// enough: the row carries the app's `client_secret`.
+const LIST_FOR_USER_SQL: &str = "SELECT * FROM oauth_apps WHERE user_id = $1 ORDER BY id DESC";
 
-/// Fetches the apps visible to `GET /api/v1/pleroma/apps` for `user_id`:
-/// the ones they registered ([`OauthApp::user_id`]) plus the ones they
-/// hold a token for, deduplicated and newest first.
+/// Fetches the apps `user_id` registered ([`OauthApp::user_id`]), newest
+/// first, for `GET /api/v1/pleroma/apps`.
 ///
-/// Expiry is not considered: holding a (even lapsed) token still names
-/// the app. An unknown user yields an empty `Vec`.
+/// Apps the user merely holds a token for are not included, since the
+/// listing exposes their client secret. An unknown user yields an empty
+/// `Vec`.
 ///
 /// # Errors
 ///
@@ -581,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_for_user_covers_owned_and_tokened_apps_deduped() {
+    async fn list_for_user_lists_only_apps_the_user_owns() {
         use crate::models::oauth_token;
 
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -593,6 +588,15 @@ mod tests {
             &NewOauthApp {
                 user_id: Some(alice),
                 ..new_app("Owned")
+            },
+        )
+        .await
+        .unwrap();
+        let newer_owned = create(
+            &pool,
+            &NewOauthApp {
+                user_id: Some(alice),
+                ..new_app("Owned Too")
             },
         )
         .await
@@ -616,8 +620,12 @@ mod tests {
         let ids: Vec<Uuid> = listed.iter().map(|app| app.id).collect();
         assert_eq!(
             ids,
-            vec![tokened.id, owned.id],
-            "owned plus tokened apps, deduplicated, newest first"
+            vec![newer_owned.id, owned.id],
+            "only the owned apps, newest first"
+        );
+        assert!(
+            !ids.contains(&tokened.id),
+            "an app the user merely holds tokens for stays out (its secret is not theirs)"
         );
         assert!(
             !ids.contains(&foreign.id),
