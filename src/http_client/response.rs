@@ -5,6 +5,7 @@
 use bytes::Bytes;
 use reqwest::header::HeaderMap;
 use serde::de::DeserializeOwned;
+use url::Url;
 
 use super::{ERROR_STATUS_MIN, HttpError};
 
@@ -15,6 +16,9 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response headers.
     pub headers: HeaderMap,
+    /// The URL that actually served the response: the requested URL after
+    /// every redirect the client followed.
+    pub url: Url,
     /// The buffered response body.
     pub body: Bytes,
 }
@@ -58,6 +62,7 @@ mod tests {
         let base = HttpResponse {
             status: 0,
             headers: HeaderMap::new(),
+            url: Url::parse("http://test.example/").unwrap(),
             body: Bytes::new(),
         };
         for (status, failed) in [
@@ -94,6 +99,7 @@ mod tests {
         let response = HttpResponse {
             status: 200,
             headers: HeaderMap::new(),
+            url: Url::parse("http://test.example/").unwrap(),
             body: Bytes::from_static(br#"{"name":"wired"}"#),
         };
         let value: Value = response.json().unwrap();

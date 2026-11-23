@@ -7,7 +7,10 @@ use url::Url;
 use super::{FetchBudget, FetchError};
 use crate::{
     config::Config,
-    federation::fetch_actor::{Signer, fetch_document, fetch_signer},
+    federation::fetch_actor::{
+        Signer, ensure_not_redirected, ensure_same_host, fetch_document, fetch_signer,
+        names_served_url,
+    },
     http_client::{HttpClient, user_agent},
     state::AppState,
 };
@@ -45,9 +48,10 @@ pub async fn fetch_object_json(state: &AppState, url: &str) -> Result<Value, Fet
 }
 
 /// Dereferences `url` under `budget` and returns the contained document
-/// (see the [module docs](super)): the `id` must name the fetched URL, or
-/// a URL on the same origin that is dereferenced once more and names
-/// itself.
+/// (see the [module docs](super)): the fetch may not be redirected to
+/// another host, and the `id` must name the URL that served it, or a URL
+/// on the same origin that is dereferenced once more, without a redirect,
+/// and names itself.
 pub(super) async fn fetch_contained(
     state: &AppState,
     url: &str,
@@ -55,9 +59,10 @@ pub(super) async fn fetch_contained(
 ) -> Result<Value, FetchError> {
     let http = object_client(&state.config);
     let signer = fetch_signer(state).await?;
-    let document = fetch_bounded(&http, url, signer.as_ref(), budget).await?;
+    let (document, served) = fetch_bounded(&http, url, signer.as_ref(), budget).await?;
+    ensure_same_host(url, &served)?;
     let claimed = declared_id(&document)?;
-    if claimed == url {
+    if names_served_url(url, &served, claimed) {
         return Ok(document);
     }
     if !same_authority(url, claimed) {
@@ -65,10 +70,12 @@ pub(super) async fn fetch_contained(
             "the object fetched from `{url}` names `{claimed}`, a different origin"
         )));
     }
-    // Same origin but a different id (the peer redirected, or the id the
-    // URL serves differs from the document's own): follow the claim
-    // exactly once and accept only a document that names itself.
-    let refetched = fetch_bounded(&http, claimed, signer.as_ref(), budget).await?;
+    // Same origin but a different id than the URL that served it: follow
+    // the claim exactly once, without a redirect, and accept only a
+    // document that names itself.
+    let (refetched, refetched_from) =
+        fetch_bounded(&http, claimed, signer.as_ref(), budget).await?;
+    ensure_not_redirected(claimed, &refetched_from)?;
     let refetched_id = declared_id(&refetched)?;
     if refetched_id != claimed {
         return Err(FetchError::Invalid(format!(
@@ -85,7 +92,7 @@ async fn fetch_bounded(
     url: &str,
     signer: Option<&Signer>,
     budget: &FetchBudget,
-) -> Result<Value, FetchError> {
+) -> Result<(Value, Url), FetchError> {
     if !budget.take() {
         return Err(FetchError::Invalid(format!(
             "the per-activity object fetch budget is spent (`{url}` not fetched)"

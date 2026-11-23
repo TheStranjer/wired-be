@@ -344,6 +344,7 @@ mod tests {
         let headerless = HttpResponse {
             status: 200,
             headers: axum::http::HeaderMap::new(),
+            url: url::Url::parse("http://test.example/").unwrap(),
             body: bytes::Bytes::new(),
         };
         assert!(
@@ -362,6 +363,7 @@ mod tests {
         HttpResponse {
             status: 200,
             headers,
+            url: url::Url::parse("http://test.example/").unwrap(),
             body: bytes::Bytes::from_static(b"<html></html>"),
         }
     }
