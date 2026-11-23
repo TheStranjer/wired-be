@@ -571,13 +571,10 @@ impl MfaAttrs {
 mod tests {
     use axum::http::{Request, header::CACHE_CONTROL};
     use serde_json::{Value, json};
-    use std::sync::Arc;
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::{
-        api::oauth::NO_STORE, config::Config, http_client::HttpClient, uploads::UploaderBackend,
-    };
+    use crate::{api::oauth::NO_STORE, config::Config};
 
     /// A minimal stored-looking local user row.
     fn user_row() -> User {
@@ -856,21 +853,7 @@ mod tests {
     /// lazy pool is never consulted (every refusal these tests send
     /// fails before the first query).
     fn test_state() -> AppState {
-        let config = Arc::new(Config::for_tests());
-        let db = sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap();
-        let hub = crate::streaming::hub::Hub::new(&db);
-        AppState {
-            db,
-            hub,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::lazy_for_tests(Config::for_tests())
     }
 
     #[tokio::test]

@@ -208,8 +208,6 @@ fn own_text(status: &StatusEntity) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use chrono::{DateTime, Duration};
     use serde_json::{Value, json};
     use sqlx::PgPool;
@@ -217,8 +215,6 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
-        http_client::HttpClient,
-        mailer::MemoryTransport,
         models::{
             filter::NewFilter,
             media_attachment::{self, NewMediaAttachment},
@@ -226,7 +222,6 @@ mod tests {
             user::{self, NewUser, local_ap_id},
         },
         services::render_status::{ViewerMode, render_statuses},
-        uploads::UploaderBackend,
     };
 
     /// The instance origin the fixtures post under.
@@ -245,19 +240,7 @@ mod tests {
     /// The state under test: `pool` and the test config, with the
     /// collaborators the renderer behind these fixtures never touches.
     fn state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// Inserts a local user named `nickname`.
