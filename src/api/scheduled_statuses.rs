@@ -375,13 +375,10 @@ mod tests {
     use super::*;
     use crate::{
         config::TEST_BASE_URL,
-        http_client::HttpClient,
         models::{
             media_attachment::NewMediaAttachment,
             user::{NewUser, User, insert as insert_user, local_ap_id},
         },
-        streaming::hub::Hub,
-        uploads::UploaderBackend,
         util::time::mastodon_time,
     };
 
@@ -425,21 +422,7 @@ mod tests {
 
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
-        let config = std::sync::Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: Hub::new(pool),
-            config: std::sync::Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: std::sync::Arc::default(),
-            mrf_config_cache: std::sync::Arc::default(),
-            translation_languages_cache: std::sync::Arc::default(),
-            rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::from_config(
-                config.as_ref(),
-            )),
-            mailer: std::sync::Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// A local user named `nickname`, to own fixture uploads.

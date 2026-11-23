@@ -11,17 +11,15 @@ use std::{
 
 use chrono::Utc;
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use super::{AttemptInfo, HandlerFuture, JobError, JobRegistry, Worker};
 use crate::{
     config::Config,
-    http_client::HttpClient,
     models::job::{Job, NewJob},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// Set once by [`marking_handler`] when its body runs.
@@ -33,26 +31,7 @@ pub(super) static LAST_ATTEMPT: Mutex<Option<AttemptInfo>> = Mutex::new(None);
 
 /// Test state over `pool` with the fixed test config.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
-}
-
-/// A lazy pool for handler tests that never touch the database.
-pub(super) fn lazy_pool() -> PgPool {
-    PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .unwrap()
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Idle-poll interval for worker tests: short enough that a claim round

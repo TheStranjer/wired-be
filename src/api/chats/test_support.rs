@@ -3,19 +3,14 @@
 //! hooks publish through, and the message write both create paths stand
 //! on.
 
-use std::sync::Arc;
-
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     models::{
         chat,
         chat::{ChatMessageReference, NewChatMessage},
         user::{self, User},
     },
     state::AppState,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
 };
 
 /// Inserts a local [`User`] named `nickname` that accepts chats.
@@ -77,19 +72,7 @@ pub(super) async fn remote_chatter(pool: &sqlx::PgPool, nickname: &str) -> User 
 /// Test state over `pool` with the fixed test config: the hooks under
 /// test publish through the hub it owns, which the tests subscribe to.
 pub(super) fn app_state(pool: &sqlx::PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Writes `sender`'s message to `recipient` the way both create paths

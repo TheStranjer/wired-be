@@ -181,8 +181,6 @@ pub(crate) fn names_actor(object: &Value, actor: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::{
         Router,
         extract::State,
@@ -197,12 +195,10 @@ mod tests {
     use super::*;
     use crate::{
         config::Config,
-        http_client::HttpClient,
         models::{
             status,
             user::{self, Flag, NewUser, User},
         },
-        uploads::UploaderBackend,
     };
 
     /// The actor every fixture here is delivered by.
@@ -210,19 +206,7 @@ mod tests {
 
     /// Test state: `pool` and the fixed test config, collaborators inert.
     fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// The stored mirror of the fixture author.

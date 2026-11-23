@@ -631,12 +631,11 @@ mod tests {
     use axum::http::{Request, header::CONTENT_TYPE};
     use chrono::Utc;
     use serde_json::json;
-    use std::sync::Arc;
     use tower::ServiceExt as _;
     use uuid::Uuid;
 
     use super::*;
-    use crate::{config::Config, http_client::HttpClient, uploads::UploaderBackend};
+    use crate::config::Config;
 
     /// The redirect URI the [`app_row`] fixture registers.
     const REGISTERED: &str = "https://client.example/callback";
@@ -910,21 +909,7 @@ mod tests {
     /// lazy pool is never consulted (the validation gates that fail here
     /// run before any query).
     fn test_state() -> AppState {
-        let config = Arc::new(Config::for_tests());
-        let db = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
-        let hub = crate::streaming::hub::Hub::new(&db);
-        AppState {
-            db,
-            hub,
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::lazy_for_tests(Config::for_tests())
     }
 
     #[tokio::test]

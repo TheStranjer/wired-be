@@ -388,8 +388,6 @@ async fn enqueue_next_chunk(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use serde_json::json;
     use sqlx::PgPool;
     use sqlx::postgres::PgPoolOptions;
@@ -397,11 +395,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
-        http_client::HttpClient,
         models::job::Job,
         models::user::{NewUser, insert, local_ap_id},
-        streaming::hub::Hub,
-        uploads::UploaderBackend,
     };
 
     /// A handle that neither the database nor a fast-failing `WebFinger`
@@ -410,19 +405,7 @@ mod tests {
 
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// Test state over a pool that cannot answer: closed before it ever

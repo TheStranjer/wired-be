@@ -8,19 +8,14 @@
 
 #![cfg(test)]
 
-use std::sync::Arc;
-
 use axum::{Json, Router, http::StatusCode, routing::get};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use wired_be::{
     auth::{AppAuth, AuthContext, AuthUser, MaybeAuthUser},
     error::AppError,
-    http_client::HttpClient,
-    mailer::MemoryTransport,
     models::user::{Flag, NewUser},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 use crate::common::{self, TestRequest};
@@ -31,22 +26,7 @@ const TEST_CLIENT: &str = "Test Client";
 /// The router under test: each route runs one extractor (and, on the
 /// `/scope/…` routes, one scope guard) and reports what it resolved.
 fn auth_test_app(pool: PgPool) -> Router {
-    let config = Arc::new(common::test_config());
-    let hub = wired_be::streaming::hub::Hub::new(&pool);
-    let state = AppState {
-        db: pool,
-        hub,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(wired_be::rate_limit::RateLimiter::from_config(
-            config.as_ref(),
-        )),
-        mailer: Arc::new(MemoryTransport::new()),
-    };
+    let state = AppState::for_tests(pool, common::test_config());
     Router::new()
         .route("/auth-user", get(auth_user_view))
         .route("/maybe-auth-user", get(maybe_auth_user_view))
