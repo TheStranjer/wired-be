@@ -168,7 +168,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         )
         .route("/oauth/revoke", post(revoke))
         .merge(authorize::router(state))
-        .merge(mfa::router())
+        .merge(mfa::router(state))
 }
 
 /// `POST /oauth/token` — exchange credentials for a bearer token pair.

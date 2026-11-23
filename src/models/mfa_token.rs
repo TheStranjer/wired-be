@@ -32,6 +32,15 @@ use crate::{
 /// 300 seconds).
 pub const MFA_TOKEN_TTL: Duration = Duration::from_mins(5);
 
+/// How many wrong second-factor codes one challenge tolerates (WBE-668).
+///
+/// [`get_valid`] refuses a challenge whose
+/// [`failed_attempts`](MfaToken::failed_attempts) has reached this, and
+/// the endpoints delete it at that point, so a TOTP code cannot be
+/// brute-forced inside the five-minute window; the client must restart
+/// from the password.
+pub const MAX_MFA_ATTEMPTS: i32 = 5;
+
 /// One row of `mfa_tokens`: a pending second-factor challenge.
 #[derive(sqlx::FromRow)]
 pub struct MfaToken {
@@ -50,6 +59,9 @@ pub struct MfaToken {
     pub valid_until: DateTime<Utc>,
     /// When the row was inserted.
     pub inserted_at: DateTime<Utc>,
+    /// Wrong second-factor codes presented so far; [`get_valid`] refuses
+    /// the row once this reaches [`MAX_MFA_ATTEMPTS`].
+    pub failed_attempts: i32,
 }
 
 /// [`token`](Self::token) is secret material and renders as
@@ -63,6 +75,7 @@ impl fmt::Debug for MfaToken {
             .field("authorization_id", &self.authorization_id)
             .field("valid_until", &self.valid_until)
             .field("inserted_at", &self.inserted_at)
+            .field("failed_attempts", &self.failed_attempts)
             .finish()
     }
 }
@@ -105,8 +118,10 @@ pub async fn create(
     Ok(token)
 }
 
-/// Fetches the challenge `token` while it is still valid: `None` for an
-/// unknown token and for one at or past `valid_until`, the two cases the
+/// Fetches the challenge `token` while it is still valid.
+///
+/// `None` for an unknown token, for one at or past `valid_until` and for
+/// one that has taken [`MAX_MFA_ATTEMPTS`] wrong codes, the cases the
 /// endpoints are told not to distinguish.
 ///
 /// # Errors
@@ -115,12 +130,34 @@ pub async fn create(
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_valid(pool: &PgPool, token: &str) -> AppResult<Option<MfaToken>> {
     let found = sqlx::query_as::<_, MfaToken>(
-        "SELECT * FROM mfa_tokens WHERE token = $1 AND valid_until > now()",
+        "SELECT * FROM mfa_tokens
+         WHERE token = $1 AND valid_until > now() AND failed_attempts < $2",
     )
     .bind(token)
+    .bind(MAX_MFA_ATTEMPTS)
     .fetch_optional(pool)
     .await?;
     Ok(found)
+}
+
+/// Counts one wrong code against challenge `id`; returns the new total.
+///
+/// An unknown `id` (a challenge retired in the meantime) counts as
+/// already at the cap.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn record_failure(pool: &PgPool, id: Uuid) -> AppResult<i32> {
+    let attempts: Option<(i32,)> = sqlx::query_as(
+        "UPDATE mfa_tokens SET failed_attempts = failed_attempts + 1
+         WHERE id = $1 RETURNING failed_attempts",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(attempts.map_or(MAX_MFA_ATTEMPTS, |(count,)| count))
 }
 
 /// Deletes the challenge with primary key `id`, retiring it whatever its
@@ -257,6 +294,50 @@ mod tests {
         assert!(
             get_valid(&pool, &token.token).await.unwrap().is_none(),
             "a challenge past valid_until is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_failure_counts_and_the_cap_refuses_the_challenge() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let frank = insert_user(&pool, "frank").await;
+        let token = create(&pool, frank.id, None).await.unwrap();
+        let other = create(&pool, frank.id, None).await.unwrap();
+        assert_eq!(
+            token.failed_attempts, 0,
+            "a fresh challenge has no failures"
+        );
+
+        for expected in 1..MAX_MFA_ATTEMPTS {
+            assert_eq!(
+                record_failure(&pool, token.id).await.unwrap(),
+                expected,
+                "each failure bumps the count"
+            );
+            let found = get_valid(&pool, &token.token)
+                .await
+                .unwrap()
+                .expect("under the cap the challenge is still valid");
+            assert_eq!(found.failed_attempts, expected, "the count is stored");
+        }
+        assert_eq!(
+            record_failure(&pool, token.id).await.unwrap(),
+            MAX_MFA_ATTEMPTS,
+            "the last allowed failure reaches the cap"
+        );
+        assert!(
+            get_valid(&pool, &token.token).await.unwrap().is_none(),
+            "at the cap the challenge is refused"
+        );
+        assert!(
+            get_valid(&pool, &other.token).await.unwrap().is_some(),
+            "another challenge is not affected"
+        );
+        assert_eq!(
+            record_failure(&pool, new_id()).await.unwrap(),
+            MAX_MFA_ATTEMPTS,
+            "an unknown challenge counts as spent"
         );
     }
 
