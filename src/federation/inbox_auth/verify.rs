@@ -6,7 +6,6 @@
 use chrono::Utc;
 use serde_json::Value;
 use tracing::debug;
-use url::Url;
 
 use super::{
     Inbound, InboxAuthError,
@@ -16,10 +15,10 @@ use crate::{
     federation::{
         fetch_actor::{FetchError, refresh_user},
         json::value_or_id,
-        mrf,
+        policy::{host_refused, signer_host},
         signature::verify::{SignedRequestParts, verify},
     },
-    models::{instance_policy_domain, user::User},
+    models::user::User,
     state::AppState,
 };
 
@@ -109,25 +108,11 @@ pub(super) async fn require_unblocked(
     let Some(host) = signer_host(key_id) else {
         return Ok(());
     };
-    let listed = instance_policy_domain::is_rejected(&state.db, &host).await?;
-    let refused = listed || mrf::load_config(state).await.rejected(&host);
-    if refused {
+    if host_refused(state, &host).await? {
         debug!(key_id, "inbox delivery from a rejected instance");
         return Err(InboxAuthError::blocked());
     }
     Ok(())
-}
-
-/// The host of a signer's key URL, lowercase and without the port.
-///
-/// It is the authority of its `keyId` (or, equivalently, of the actor URL
-/// it points at) — the canonical spelling `instance_policy_domains` rows
-/// keep. `None` when the URL cannot be parsed.
-#[must_use]
-pub fn signer_host(key_id: &str) -> Option<String> {
-    let parsed = Url::parse(key_id).ok()?;
-    let host = parsed.host_str()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -137,7 +122,6 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::*;
     use crate::{
         federation::inbox_auth::{
             ACTOR_MISMATCH, INVALID_SIGNATURE, REJECTED,
@@ -151,25 +135,6 @@ mod tests {
         services::runtime_config,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
-
-    #[test]
-    fn signer_host_reads_the_lowercase_authority_host() {
-        assert_eq!(
-            signer_host("https://Peer.Example/users/alice#main-key").as_deref(),
-            Some("peer.example"),
-            "host only, portless, case-folded"
-        );
-        assert_eq!(
-            signer_host("http://127.0.0.1:4000/users/alice#main-key").as_deref(),
-            Some("127.0.0.1"),
-            "the port is not part of the host"
-        );
-        assert_eq!(
-            signer_host("not a url"),
-            None,
-            "an unparsable keyId names no host"
-        );
-    }
 
     /// A rotated key: the stored public key rejects the signature, the
     /// one forced refetch replaces it, and the retry succeeds. The next

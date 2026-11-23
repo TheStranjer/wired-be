@@ -71,6 +71,7 @@ pub mod json;
 pub mod mrf;
 pub mod note;
 pub mod note_parser;
+pub mod policy;
 pub mod publisher;
 pub mod remote_actor;
 pub mod signature;
