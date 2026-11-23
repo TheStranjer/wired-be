@@ -20,7 +20,14 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::models::user::User;
+use wired_be::{
+    config::TEST_BASE_URL,
+    federation::delivery::KIND_DELIVER,
+    models::{
+        follow,
+        user::{Flag, User, get_by_id},
+    },
+};
 
 use crate::common;
 
@@ -639,5 +646,183 @@ async fn relationships_carry_the_domain_blocking_flag() {
     assert!(
         !flag(2),
         "and a local account never, not even under its own instance's domain"
+    );
+}
+
+/// The args of every queued `federator.deliver` job, in insertion order.
+async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
+    sqlx::query_scalar::<_, Value>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
+        .bind(KIND_DELIVER)
+        .fetch_all(pool)
+        .await
+        .expect("the delivery jobs read")
+}
+
+/// Whether a follow row of the pair is stored.
+async fn related(pool: &PgPool, follower: &User, target: &User) -> bool {
+    follow::get(pool, follower.id, target.id)
+        .await
+        .expect("the follow reads")
+        .is_some()
+}
+
+/// Makes `follower` (remote) follow the locked `target`, stamps the id the
+/// remote `Follow` arrived under, and grants the request when `grant`.
+async fn remote_follower(
+    pool: &PgPool,
+    follower: &User,
+    target: &User,
+    activity: &str,
+    grant: bool,
+) -> follow::Follow {
+    let row = follow::follow(pool, TEST_BASE_URL, follower, target)
+        .await
+        .expect("the follower fixture writes");
+    follow::set_ap_id(pool, row.id, activity)
+        .await
+        .expect("the delivered id lands");
+    if grant {
+        let _granted = follow::accept(pool, row.id)
+            .await
+            .expect("the fixture grants the request");
+    }
+    follow::get(pool, follower.id, target.id)
+        .await
+        .expect("the row reads")
+        .expect("the row exists")
+}
+
+/// Asserts every relationship between `alice` and the `severed` accounts is
+/// gone in both directions, `kept`'s follow stands, and the counters follow.
+async fn assert_rows_severed(pool: &PgPool, alice: &User, severed: [&User; 3], kept: &User) {
+    for peer in severed {
+        assert!(
+            !related(pool, peer, alice).await && !related(pool, alice, peer).await,
+            "{} is severed from alice",
+            peer.nickname
+        );
+    }
+    assert!(related(pool, kept, alice).await, "the other domain stays");
+    let fresh = get_by_id(pool, alice.id).await.unwrap().unwrap();
+    assert_eq!(fresh.followers_count, 1, "only the kept follower counts");
+    assert_eq!(fresh.following_count, 0, "the follow stopped counting");
+}
+
+/// Blocking a domain severs every relationship between the caller and its
+/// remote accounts: accepted and pending followers are removed (and each
+/// gets a `Reject` of its stored `Follow`), the caller's own follow of an
+/// account there is withdrawn (an `Undo` to that inbox), the counters follow,
+/// accounts on other domains are untouched, and repeating the block queues
+/// nothing more.
+#[tokio::test]
+async fn blocking_a_domain_severs_follows_and_federates_the_withdrawals() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
+        new.locked = Flag::new(true);
+        new
+    })
+    .await;
+    let token = common::create_app_and_token(&pool, &alice, "write:blocks").await;
+    let bob = common::create_remote_user(&pool, "bob", "evil.example").await;
+    let carol = common::create_remote_user(&pool, "carol", "evil.example").await;
+    let dave = common::create_remote_user(&pool, "dave", "evil.example").await;
+    let erin = common::create_remote_user(&pool, "erin", "good.example").await;
+    let bob_follow = remote_follower(&pool, &bob, &alice, "https://evil.example/f/bob", true).await;
+    let carol_follow =
+        remote_follower(&pool, &carol, &alice, "https://evil.example/f/carol", false).await;
+    let _kept = remote_follower(&pool, &erin, &alice, "https://good.example/f/erin", true).await;
+    let outgoing = follow::follow(&pool, TEST_BASE_URL, &alice, &dave)
+        .await
+        .expect("alice follows dave");
+    let _granted = follow::accept(&pool, outgoing.id)
+        .await
+        .expect("dave grants the follow");
+    let outgoing_id = outgoing
+        .ap_id
+        .clone()
+        .expect("a local follow carries its id");
+    assert_eq!(
+        delivery_jobs(&pool).await.len(),
+        0,
+        "the fixtures queue nothing"
+    );
+
+    let response = post_form(&app, &token, "evil.example").await;
+    expect_empty_object(&response, "the block");
+
+    assert_rows_severed(&pool, &alice, [&bob, &carol, &dave], &erin).await;
+
+    let jobs = delivery_jobs(&pool).await;
+    assert_eq!(jobs.len(), 3, "two Rejects and one Undo");
+    let to = |inbox: &str| {
+        jobs.iter()
+            .find(|job| job["inbox"] == json!(inbox))
+            .unwrap_or_else(|| panic!("a delivery to {inbox}: {jobs:?}"))
+    };
+    for (who, row) in [(&bob, &bob_follow), (&carol, &carol_follow)] {
+        let body = &to(&format!("{}/inbox", who.ap_id))["body"];
+        assert_eq!(body["type"], json!("Reject"), "{} is refused", who.nickname);
+        assert_eq!(body["actor"], json!(alice.ap_id));
+        assert_eq!(
+            body["object"]["id"],
+            json!(row.ap_id),
+            "the Reject answers the stored Follow id"
+        );
+    }
+    let undo = &to(&format!("{}/inbox", dave.ap_id))["body"];
+    assert_eq!(undo["type"], json!("Undo"));
+    assert_eq!(undo["actor"], json!(alice.ap_id));
+    assert_eq!(undo["object"]["id"], json!(outgoing_id));
+
+    expect_empty_object(&post_form(&app, &token, "evil.example").await, "the repeat");
+    assert_eq!(
+        delivery_jobs(&pool).await.len(),
+        3,
+        "a repeated block federates nothing more"
+    );
+    let repeated = get_by_id(&pool, alice.id).await.unwrap().unwrap();
+    assert_eq!(repeated.followers_count, 1, "and moves no counter");
+}
+
+/// Unblocking restores nothing, and blocking a domain with no relationships
+/// changes nothing and still answers `{}`.
+#[tokio::test]
+async fn blocking_an_unrelated_domain_changes_nothing_and_unblocking_restores_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "write:blocks").await;
+    let bob = common::create_remote_user(&pool, "bob", "evil.example").await;
+    let erin = common::create_remote_user(&pool, "erin", "good.example").await;
+    let _erin_row =
+        remote_follower(&pool, &erin, &alice, "https://good.example/f/erin", true).await;
+
+    expect_empty_object(
+        &post_form(&app, &token, "nobody.example").await,
+        "the block",
+    );
+    assert!(related(&pool, &erin, &alice).await, "the follower stays");
+    assert_eq!(delivery_jobs(&pool).await.len(), 0, "nothing is delivered");
+    assert_eq!(
+        get_by_id(&pool, alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .followers_count,
+        1,
+        "the count is unchanged"
+    );
+
+    let _bob_row = remote_follower(&pool, &bob, &alice, "https://evil.example/f/bob", true).await;
+    expect_empty_object(&post_form(&app, &token, "evil.example").await, "the block");
+    assert!(!related(&pool, &bob, &alice).await, "bob is severed");
+    let unblocked = delete_query(&app, &token, "?domain=evil.example").await;
+    expect_empty_object(&unblocked, "the unblock");
+    assert!(
+        !related(&pool, &bob, &alice).await,
+        "unblocking restores nothing"
     );
 }
