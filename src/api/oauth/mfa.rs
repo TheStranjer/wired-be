@@ -92,7 +92,9 @@ pub(crate) fn required(user: &User) -> bool {
 /// challenge, its code is what the browser verification delivers), and a
 /// five-minute [`MfaToken`] row links it (Pleroma's
 /// `MFA.Token.create(user, auth)` on both `{:mfa_required, …}` error
-/// paths). Returns the challenge token text.
+/// paths). `redirect_uri` is the URI the browser flow will deliver the
+/// code to, which binds the parked code to it; the password grant never
+/// delivers a code and passes `""`. Returns the challenge token text.
 ///
 /// # Errors
 ///
@@ -102,9 +104,16 @@ pub(crate) async fn start_challenge(
     user: &User,
     app: &OauthApp,
     scopes: &Scopes,
+    redirect_uri: &str,
 ) -> AppResult<String> {
-    let authorization =
-        oauth_token::create_authorization(&state.db, user.id, app.id, &scopes.to_string()).await?;
+    let authorization = oauth_token::create_authorization(
+        &state.db,
+        user.id,
+        app.id,
+        &scopes.to_string(),
+        redirect_uri,
+    )
+    .await?;
     let challenge = mfa_token::create(&state.db, user.id, Some(authorization.id)).await?;
     Ok(challenge.token)
 }
@@ -192,8 +201,13 @@ async fn finish_challenge(
         return Err(invalid_code());
     }
     mfa_token::delete(&state.db, stored.id).await?;
-    let consumed =
-        oauth_token::consume_authorization(&state.db, &authorization.token, app.id).await?;
+    let consumed = oauth_token::consume_authorization(
+        &state.db,
+        &authorization.token,
+        app.id,
+        authorization.redirect_uri.as_deref(),
+    )
+    .await?;
     if consumed.is_none() {
         return Err(invalid_code());
     }
@@ -283,7 +297,8 @@ fn retry(attrs: &MfaAttrs) -> VerifyReply {
 /// Whether the form's delivery target is registered with the application
 /// the parked authorization belongs to. The `POST /oauth/authorize`
 /// detour validated it once; the form only round-trips it, and a
-/// tampered target never sees the code.
+/// tampered target never sees the code. A code bound to a redirect URI is
+/// delivered only to that one.
 async fn delivers_to_the_app(
     state: &AppState,
     authorization: &OauthAuthorization,
@@ -293,7 +308,11 @@ async fn delivers_to_the_app(
     let registered = app.is_some_and(|found| {
         authorize::require_registered_redirect(&found, delivery.redirect_uri).is_ok()
     });
-    Ok(registered)
+    let bound = authorization
+        .redirect_uri
+        .as_deref()
+        .is_none_or(|stored| stored == delivery.redirect_uri);
+    Ok(registered && bound)
 }
 
 /// The stored challenge `presented` names, while it is still within its

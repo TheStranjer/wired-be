@@ -71,13 +71,13 @@ async fn the_callback_logs_in_a_linked_user_with_a_code() {
     assert_eq!(stored.scopes, "read write", "the scopes prepared with");
     assert!(!stored.used, "a fresh code is unused");
 
-    let redeemed = oauth_token::consume_authorization(&pool, &code, site.app.id)
+    let redeemed = oauth_token::consume_authorization(&pool, &code, site.app.id, Some(REDIRECT))
         .await
         .expect("the redemption reaches the database")
         .expect("the owning app can redeem the code");
     assert_eq!(redeemed.user_id, site.user.id, "and it names the login");
     assert!(
-        oauth_token::consume_authorization(&pool, &code, site.app.id)
+        oauth_token::consume_authorization(&pool, &code, site.app.id, Some(REDIRECT))
             .await
             .expect("the second attempt reaches the database")
             .is_none(),

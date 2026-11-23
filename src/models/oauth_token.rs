@@ -161,7 +161,7 @@ mod tests {
             "an unknown refresh token finds nothing"
         );
         assert!(
-            consume_authorization(&pool, "no-such-code", new_id())
+            consume_authorization(&pool, "no-such-code", new_id(), None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -199,7 +199,7 @@ mod tests {
             "the rest of the row is visible"
         );
 
-        let authorization = create_authorization(&pool, mia.id, app.id, "read")
+        let authorization = create_authorization(&pool, mia.id, app.id, "read", "")
             .await
             .unwrap();
         let auth_debug = format!("{authorization:?}");

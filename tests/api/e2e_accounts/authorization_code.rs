@@ -40,11 +40,7 @@ async fn the_authorization_code_flow_issues_rotates_and_retires_a_token() {
 
     // Step 3: the code is redeemed for a pair acting as its authorizer,
     // with the *approved* scopes and nothing else.
-    let exchanged = grant(
-        &world,
-        &json!({"grant_type": "authorization_code", "code": code}),
-    )
-    .await;
+    let exchanged = exchange_code(&world, &code).await;
     common::assert_answer(&exchanged, StatusCode::OK, "the code exchange");
     let pair = exchanged.json_value();
     assert_eq!(pair["scope"], "read", "only the box that was checked");
@@ -79,11 +75,7 @@ async fn the_authorization_code_flow_issues_rotates_and_retires_a_token() {
     );
 
     // Step 6: the same code is spent.
-    let replay = grant(
-        &world,
-        &json!({"grant_type": "authorization_code", "code": code}),
-    )
-    .await;
+    let replay = exchange_code(&world, &code).await;
     assert_refused(
         &replay,
         StatusCode::BAD_REQUEST,
@@ -130,6 +122,20 @@ fn consent_url(client: &TestClient, scope: &str) -> String {
         "{AUTHORIZE}?response_type=code&client_id={}&redirect_uri={redirect}&scope={scope}",
         client.client_id
     )
+}
+
+/// The `authorization_code` exchange of `code`, presenting the redirect URI
+/// the code was issued for (RFC 6749 §4.1.3).
+async fn exchange_code(world: &World, code: &str) -> TestResponse {
+    grant(
+        world,
+        &json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": common::TEST_REDIRECT_URI,
+        }),
+    )
+    .await
 }
 
 /// `POST /oauth/token` (or [`REVOKE`]) with `body` and the client's own
