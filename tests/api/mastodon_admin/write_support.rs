@@ -33,7 +33,7 @@ pub(super) const MISSING_TYPE: &str = "Validation failed: Type is required";
 /// The 400 body of a `report_id` whose report is about another account.
 pub(super) const WRONG_TARGET: &str = "Report does not target this account";
 /// The 403 body for a valid user token whose account is not an admin: the
-/// writes are the admin's, where the reads are staff's.
+/// reads and the writes are both the admin's.
 pub(super) const NOT_ADMIN: &str = "User is not an admin.";
 /// The 403 body of a token that grants neither `admin:write` nor
 /// `admin:write:accounts`.
