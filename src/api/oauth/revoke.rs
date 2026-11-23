@@ -22,7 +22,7 @@ use sqlx::PgPool;
 
 use super::{
     MISSING_TOKEN, NO_CACHE, NO_STORE,
-    params::{invalid_credentials, validate_app},
+    params::{ClientCredentials, invalid_credentials, validate_app},
 };
 use crate::{
     error::{AppError, AppResult},
@@ -73,7 +73,7 @@ async fn revoke_token(
     let Some(token) = params.token.as_deref() else {
         return Err(AppError::BadRequest(MISSING_TOKEN.to_owned()));
     };
-    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let app = validate_app(state, headers, params.client.pair()).await?;
     let hint_is_refresh = params.token_type_hint.as_deref() == Some(REFRESH_TOKEN_HINT);
     if let Some((found, owner)) = find_pair(&state.db, token, hint_is_refresh).await? {
         if owner.id != app.id {
@@ -123,33 +123,20 @@ pub(super) struct RevokeParams {
     /// none) tries the access token first. It never narrows the search.
     #[serde(default)]
     token_type_hint: Option<String>,
-    /// The public OAuth client id, when not presented through HTTP Basic.
-    #[serde(default)]
-    client_id: Option<String>,
-    /// The OAuth client secret, when not presented through HTTP Basic.
-    /// Never in `Debug` output.
-    #[serde(default)]
-    client_secret: Option<String>,
+    /// The client credentials, when not presented through HTTP Basic.
+    #[serde(flatten)]
+    client: ClientCredentials,
 }
 
-/// [`token`](Self::token) and [`client_secret`](Self::client_secret) are
+/// [`token`](Self::token) and the [`client`](Self::client) secret are
 /// secret material and render as `<redacted>`; the client id shows.
 impl fmt::Debug for RevokeParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RevokeParams")
             .field("token", &"<redacted>")
             .field("token_type_hint", &self.token_type_hint)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
+            .field("client", &self.client)
             .finish()
-    }
-}
-
-impl RevokeParams {
-    /// The `client_id`/`client_secret` body fields as a pair, `None`
-    /// unless both are present.
-    fn body_credentials(&self) -> Option<(&str, &str)> {
-        Some((self.client_id.as_deref()?, self.client_secret.as_deref()?))
     }
 }
 
@@ -205,28 +192,12 @@ mod tests {
         RevokeParams {
             token: token.map(str::to_owned),
             token_type_hint: None,
-            client_id: client_id.map(str::to_owned),
-            client_secret: secret.map(str::to_owned),
+            client: crate::extract::into_params(json!({
+                "client_id": client_id,
+                "client_secret": secret,
+            }))
+            .unwrap(),
         }
-    }
-
-    #[test]
-    fn revoke_body_credentials_need_both_fields() {
-        assert_eq!(
-            revoke_params(Some("tok"), None, None).body_credentials(),
-            None,
-            "nothing sent"
-        );
-        assert_eq!(
-            revoke_params(Some("tok"), Some("id"), None).body_credentials(),
-            None,
-            "an id without a secret"
-        );
-        assert_eq!(
-            revoke_params(Some("tok"), Some("id"), Some("secret")).body_credentials(),
-            Some(("id", "secret")),
-            "the pair completes"
-        );
     }
 
     #[test]
@@ -258,7 +229,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(full.token.as_deref(), Some("a-token"), "the token");
-        assert_eq!(full.client_id.as_deref(), Some("id"), "the client id");
+        assert_eq!(
+            full.client.pair(),
+            Some(("id", "secret")),
+            "the credentials"
+        );
         // A form body parses to the same string-shaped map (the form
         // keys themselves are covered by `crate::extract`'s tests).
         let form: RevokeParams = crate::extract::into_params(json!({
@@ -267,7 +242,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(form.token.as_deref(), Some("a-token"), "same token");
-        assert_eq!(form.client_secret, None, "an absent field stays absent");
+        assert_eq!(form.client.pair(), None, "an absent secret stays absent");
+
+        let from_json: RevokeParams =
+            serde_json::from_str(r#"{"token":"t","client_id":"id","client_secret":"s"}"#).unwrap();
+        assert_eq!(from_json.client.pair(), Some(("id", "s")), "a JSON body");
+        let from_form: RevokeParams = crate::extract::into_params(json!({
+            "token": "t",
+            "client_id": "id",
+            "client_secret": "s",
+        }))
+        .unwrap();
+        assert_eq!(from_form.client.pair(), Some(("id", "s")), "a form body");
     }
 
     #[test]

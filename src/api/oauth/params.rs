@@ -49,13 +49,9 @@ pub(super) struct TokenParams {
     /// [`Scopes::default`] (`read`).
     #[serde(default)]
     pub(super) scope: Option<String>,
-    /// The public OAuth client id, when not presented through HTTP Basic.
-    #[serde(default)]
-    pub(super) client_id: Option<String>,
-    /// The OAuth client secret, when not presented through HTTP Basic.
-    /// Never in `Debug` output.
-    #[serde(default)]
-    pub(super) client_secret: Option<String>,
+    /// The client credentials, when not presented through HTTP Basic.
+    #[serde(flatten)]
+    pub(super) client: ClientCredentials,
     /// The refresh token to rotate. Required by the `refresh_token`
     /// grant. Renders as `<redacted>` in `Debug` output.
     #[serde(default)]
@@ -72,7 +68,7 @@ pub(super) struct TokenParams {
     pub(super) redirect_uri: Option<String>,
 }
 
-/// [`password`](Self::password), [`client_secret`](Self::client_secret),
+/// [`password`](Self::password), the [`client`](Self::client) secret,
 /// [`refresh_token`](Self::refresh_token) and [`code`](Self::code) are
 /// secret material and render as `<redacted>`; everything else shows.
 impl fmt::Debug for TokenParams {
@@ -82,8 +78,7 @@ impl fmt::Debug for TokenParams {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("scope", &self.scope)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
+            .field("client", &self.client)
             .field("refresh_token", &"<redacted>")
             .field("code", &"<redacted>")
             .field("redirect_uri", &self.redirect_uri)
@@ -91,10 +86,36 @@ impl fmt::Debug for TokenParams {
     }
 }
 
-impl TokenParams {
+/// The `client_id`/`client_secret` body fields the token, revocation and
+/// MFA challenge endpoints share, embedded in each parameter bag with
+/// `#[serde(flatten)]`. Both are optional at the shape level: the
+/// credentials may arrive through HTTP Basic instead.
+#[derive(Default, Deserialize)]
+pub(super) struct ClientCredentials {
+    /// The public OAuth client id, when not presented through HTTP Basic.
+    #[serde(default)]
+    client_id: Option<String>,
+    /// The OAuth client secret, when not presented through HTTP Basic.
+    /// Never in `Debug` output.
+    #[serde(default)]
+    client_secret: Option<String>,
+}
+
+/// [`client_secret`](Self::client_secret) is secret material and renders
+/// as `<redacted>`; the client id shows.
+impl fmt::Debug for ClientCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientCredentials")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ClientCredentials {
     /// The `client_id`/`client_secret` body fields as a pair, `None`
     /// unless both are present.
-    pub(super) fn body_credentials(&self) -> Option<(&str, &str)> {
+    pub(super) fn pair(&self) -> Option<(&str, &str)> {
         Some((self.client_id.as_deref()?, self.client_secret.as_deref()?))
     }
 }
@@ -123,7 +144,7 @@ pub(super) fn require_grant(params: &TokenParams) -> AppResult<Grant> {
 }
 
 /// The registered application behind the presented client credentials,
-/// the `Authorization: Basic` header winning over the `body_credentials`
+/// the `Authorization: Basic` header winning over the body credentials
 /// pair (Pleroma's `Token.Utils.fetch_client_credentials`: "Per RFC 6749,
 /// HTTP Basic is preferred to body params"). Both `/oauth/token` and
 /// `/oauth/revoke` authenticate their application through here.
@@ -334,15 +355,30 @@ mod tests {
 
     #[test]
     fn body_credentials_need_both_fields() {
-        let mut params = params_with_grant(Some(GRANT_TYPE_PASSWORD));
-        assert_eq!(params.body_credentials(), None, "nothing sent");
-        params.client_id = Some("id".to_owned());
-        assert_eq!(params.body_credentials(), None, "an id without a secret");
-        params.client_secret = Some("secret".to_owned());
-        assert_eq!(
-            params.body_credentials(),
-            Some(("id", "secret")),
-            "the pair completes"
+        let mut client = ClientCredentials::default();
+        assert_eq!(client.pair(), None, "nothing sent");
+        client.client_id = Some("id".to_owned());
+        assert_eq!(client.pair(), None, "an id without a secret");
+        client.client_secret = Some("secret".to_owned());
+        assert_eq!(client.pair(), Some(("id", "secret")), "the pair completes");
+        client.client_id = None;
+        assert_eq!(client.pair(), None, "a secret without an id");
+    }
+
+    #[test]
+    fn client_credentials_debug_redacts_the_secret() {
+        let client = ClientCredentials {
+            client_id: Some("client-id".to_owned()),
+            client_secret: Some("client-secret".to_owned()),
+        };
+        let debug = format!("{client:?}");
+        assert!(
+            !debug.contains("client-secret"),
+            "the secret leaks: {debug}"
+        );
+        assert!(
+            debug.contains(r#"client_secret: "<redacted>""#) && debug.contains("client-id"),
+            "the marker names its field and the id shows: {debug}"
         );
     }
 
@@ -397,8 +433,10 @@ mod tests {
         let mut params = params_with_grant(Some(GRANT_TYPE_PASSWORD));
         params.username = Some("alice".to_owned());
         params.password = Some("correct horse battery staple".to_owned());
-        params.client_id = Some("client-id".to_owned());
-        params.client_secret = Some("client-secret".to_owned());
+        params.client = ClientCredentials {
+            client_id: Some("client-id".to_owned()),
+            client_secret: Some("client-secret".to_owned()),
+        };
         params.refresh_token = Some("refresh-secret".to_owned());
         params.code = Some("authorization-code".to_owned());
         let debug = format!("{params:?}");
@@ -419,6 +457,29 @@ mod tests {
         assert!(
             debug.contains("alice") && debug.contains("client-id"),
             "the rest shows"
+        );
+    }
+
+    #[test]
+    fn json_and_form_bodies_fill_the_flattened_credentials() {
+        let from_json: TokenParams = serde_json::from_str(
+            r#"{"grant_type":"password","client_id":"id","client_secret":"s"}"#,
+        )
+        .unwrap();
+        assert_eq!(from_json.client.pair(), Some(("id", "s")), "a JSON body");
+        // A form body parses to a string-valued map before it reaches
+        // `into_params` (the form keys are covered by `crate::extract`).
+        let from_form: TokenParams = crate::extract::into_params(json!({
+            "grant_type": "password",
+            "client_id": "id",
+            "client_secret": "s",
+        }))
+        .unwrap();
+        assert_eq!(from_form.client.pair(), Some(("id", "s")), "a form body");
+        assert_eq!(
+            from_form.grant_type.as_deref(),
+            Some(GRANT_TYPE_PASSWORD),
+            "the sibling fields still fill"
         );
     }
 
@@ -445,7 +506,11 @@ mod tests {
             Some("read write"),
             "the scope string"
         );
-        assert_eq!(full.client_id.as_deref(), Some("id"), "the client id");
+        assert_eq!(
+            full.client.pair(),
+            Some(("id", "secret")),
+            "the credentials"
+        );
         assert_eq!(
             full.refresh_token.as_deref(),
             Some("a-refresh-token"),

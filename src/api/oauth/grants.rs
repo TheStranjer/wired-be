@@ -39,7 +39,7 @@ pub(super) async fn password_grant(
     headers: &HeaderMap,
     params: &TokenParams,
 ) -> AppResult<TokenReply> {
-    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let app = validate_app(state, headers, params.client.pair()).await?;
     let scopes = requested_scopes(params, &app)?;
     let user = authenticate_user(&state.db, params).await?;
     check_account_ready(&user)?;
@@ -66,7 +66,7 @@ pub(super) async fn client_credentials_grant(
     headers: &HeaderMap,
     params: &TokenParams,
 ) -> AppResult<TokenReply> {
-    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let app = validate_app(state, headers, params.client.pair()).await?;
     let scopes = requested_scopes(params, &app)?;
     let token = issue_token(state, None, &app, scopes).await?;
     Ok(TokenReply::Issued(Json(TokenResponse::new(token, None))))
@@ -104,7 +104,7 @@ pub(super) async fn authorization_code_grant(
     let Some(code) = params.code.as_deref() else {
         return Err(AppError::BadRequest(MISSING_CODE.to_owned()));
     };
-    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let app = validate_app(state, headers, params.client.pair()).await?;
     let authorized =
         oauth_token::consume_authorization(&state.db, code, app.id, params.redirect_uri.as_deref())
             .await?
@@ -174,7 +174,7 @@ pub(super) async fn refresh_token_grant(
     let Some(refresh_token) = params.refresh_token.as_deref() else {
         return Err(AppError::BadRequest(MISSING_REFRESH_TOKEN.to_owned()));
     };
-    let app = validate_app(state, headers, params.body_credentials()).await?;
+    let app = validate_app(state, headers, params.client.pair()).await?;
     let mut tx = state.db.begin().await?;
     match rotate_pair(state, &mut tx, &app, refresh_token).await {
         Ok((fresh, owner)) => {
