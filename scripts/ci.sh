@@ -8,10 +8,10 @@
 # reports everything that is broken at once.
 #
 # Within a check, Cargo is told not to stop at the first failure either:
-# `--keep-going` keeps building every crate and target that does not depend on
-# the broken one (so a compile error in one target does not hide errors in the
-# others; `cargo test` has no such flag), and `--no-fail-fast` runs every test
-# binary even after one fails.
+# `--keep-going` (Clippy and rustdoc) keeps building every crate and target
+# that does not depend on the broken one (so a compile error in one target does
+# not hide errors in the others), and `--no-fail-fast` (`cargo test` has no
+# `--keep-going`) runs every test binary even after one fails.
 #
 # The exit status is explicit: 0 when every check ran clean, 1 when any of
 # them failed — never some other code, and never merely the last step's
