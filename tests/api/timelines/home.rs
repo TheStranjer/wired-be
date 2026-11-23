@@ -310,8 +310,8 @@ async fn home_only_media_keeps_the_posts_with_attachments() {
 
 /// The viewer's own exclusions clear a home page: a blocked account's
 /// status disappears from a followed booster's reblog, muting the followed
-/// author empties the page, and `with_muted=true` lifts both — Pleroma's
-/// toggle over the home read.
+/// author empties the page, and `with_muted=true` lifts the mute only —
+/// Pleroma's toggle over the home read.
 #[tokio::test]
 async fn home_hides_muted_and_blocked_accounts_unless_with_muted() {
     let db = common::test_db().await;
@@ -350,9 +350,14 @@ async fn home_hides_muted_and_blocked_accounts_unless_with_muted() {
     );
 
     let shown = get(&app, Some(&token), &format!("{HOME}?with_muted=true")).await;
+    let shown_ids = ids(&shown.json_value());
     assert_eq!(
-        ids(&shown.json_value()),
-        newest_first(&[&bob_plain, &bob_reblog]),
-        "`with_muted=true` lifts the viewer's own block and mute exclusions"
+        shown_ids,
+        newest_first(&[&bob_plain]),
+        "`with_muted=true` lifts the mute, but the boost of the blocked original stays out"
+    );
+    assert!(
+        !shown_ids.contains(&bob_reblog.id.to_string()),
+        "the boost of the blocked account's original stays off the page"
     );
 }
