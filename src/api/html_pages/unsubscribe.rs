@@ -120,7 +120,7 @@ fn invalid_token_page() -> Response {
 mod tests {
     use super::*;
     use crate::api::html_pages::{
-        CSP_HEADER, FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP, test_support::headers_of,
+        FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP, test_support::headers_of,
     };
     use axum::http::header;
 
@@ -252,7 +252,11 @@ mod tests {
             PAGE_CONTENT_TYPE,
             "the refusal is an HTML page"
         );
-        assert_eq!(headers[CSP_HEADER.clone()], PAGE_CSP, "with the CSP");
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            PAGE_CSP,
+            "with the CSP"
+        );
         assert_eq!(
             headers[FRAME_OPTIONS_HEADER.clone()],
             "DENY",

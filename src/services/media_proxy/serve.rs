@@ -17,14 +17,13 @@ use crate::{
     http_client::{HttpError, HttpResponse},
     models::media_proxy_cache,
     state::AppState,
+    util::headers::NOSNIFF,
 };
 
 /// `cache-control` for proxied media: a day, per the ticket (Pleroma's
 /// proxy default is a fortnight, `@default_cache_control_header` in
 /// `lib/pleroma/reverse_proxy.ex`).
 const CACHE_CONTROL: &str = "public, max-age=86400";
-/// `x-content-type-options`: the type served here is the type to use.
-const NOSNIFF: &str = "nosniff";
 /// Proxied media renders in the browser; nothing downloads as an
 /// attachment from this route.
 const INLINE: &str = "inline";
@@ -53,8 +52,6 @@ static VALIDATOR_HEADERS: [HeaderName; 3] = [
     HeaderName::from_static("last-modified"),
     HeaderName::from_static("content-range"),
 ];
-/// The `content-security-policy` header name.
-static CSP_HEADER: HeaderName = HeaderName::from_static("content-security-policy");
 
 /// The `/proxy` router, merged at the top level by [`crate::app`]: the
 /// signature path serves the media, and the preview path
@@ -183,8 +180,8 @@ fn media_response(upstream: &HttpResponse) -> Result<Response, AppError> {
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_DISPOSITION, INLINE)
         .header(header::CACHE_CONTROL, CACHE_CONTROL)
-        .header(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF)
-        .header(CSP_HEADER.clone(), CSP);
+        .header(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF.clone())
+        .header(header::CONTENT_SECURITY_POLICY, CSP);
     let response = copy_validator_headers(response, &upstream.headers);
     response
         .body(Body::from(upstream.body.clone()))
@@ -198,8 +195,8 @@ fn not_modified_response(upstream: &HttpResponse) -> Result<Response, AppError> 
     let response = Response::builder()
         .status(StatusCode::NOT_MODIFIED)
         .header(header::CACHE_CONTROL, CACHE_CONTROL)
-        .header(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF)
-        .header(CSP_HEADER.clone(), CSP);
+        .header(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF.clone())
+        .header(header::CONTENT_SECURITY_POLICY, CSP);
     let response = copy_validator_headers(response, &upstream.headers);
     response
         .body(Body::empty())

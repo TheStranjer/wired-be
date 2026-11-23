@@ -86,8 +86,6 @@ const PAGE_STYLE: &str = "body{margin:0;min-height:100vh;display:flex;\
     div.frontend label{display:block}\
     input[type=submit]{padding:0.5rem 1rem;border-radius:4px;\
     border:1px solid #7c8a52;background:#7c8a52;color:#fff;cursor:pointer}";
-/// The `Content-Security-Policy` header [`PAGE_CSP`] rides on.
-static CSP_HEADER: HeaderName = HeaderName::from_static("content-security-policy");
 /// The `X-Frame-Options` header [`Framing::Deny`] puts up.
 static FRAME_OPTIONS_HEADER: HeaderName = HeaderName::from_static("x-frame-options");
 /// The path of the switcher, `GET` to list and `POST` to pick.
@@ -221,7 +219,7 @@ pub fn embed_page(status: StatusCode, title: &str, body: &str) -> Response {
 /// left off entirely rather than sent with another value.
 fn secure(response: &mut Response, framing: Framing) {
     put_header(response, header::CONTENT_TYPE, PAGE_CONTENT_TYPE);
-    put_header(response, CSP_HEADER.clone(), PAGE_CSP);
+    put_header(response, header::CONTENT_SECURITY_POLICY, PAGE_CSP);
     if matches!(framing, Framing::Deny) {
         put_header(response, FRAME_OPTIONS_HEADER.clone(), "DENY");
     }
@@ -284,7 +282,7 @@ mod tests {
             "every page answers as HTML"
         );
         assert_eq!(
-            headers[CSP_HEADER.clone()],
+            headers[header::CONTENT_SECURITY_POLICY],
             PAGE_CSP,
             "every page sends the CSP"
         );
@@ -299,7 +297,7 @@ mod tests {
         secure(&mut allowed, Framing::Allow);
         let embed_headers = headers_of(&allowed);
         assert_eq!(
-            embed_headers[CSP_HEADER.clone()],
+            embed_headers[header::CONTENT_SECURITY_POLICY],
             PAGE_CSP,
             "embed pages get the CSP too"
         );
@@ -328,7 +326,7 @@ mod tests {
             "the given status"
         );
         assert_eq!(
-            response.headers()[CSP_HEADER.clone()],
+            response.headers()[header::CONTENT_SECURITY_POLICY],
             PAGE_CSP,
             "the module headers"
         );

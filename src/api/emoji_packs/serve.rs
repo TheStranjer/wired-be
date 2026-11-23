@@ -10,12 +10,13 @@ use axum::{
     response::{IntoResponse as _, Response},
 };
 
-use super::{CACHE_CONTROL, INLINE, NOSNIFF};
+use super::{CACHE_CONTROL, INLINE};
 use crate::{
     error::{AppError, AppResult},
     services::emoji_packs,
     state::AppState,
     uploads,
+    util::headers::NOSNIFF,
 };
 
 /// `GET /emoji/{pack}/{file}` — one image file of a pack, served with the
@@ -66,10 +67,7 @@ fn emoji_response(content_type: &'static str, bytes: Vec<u8>) -> Response {
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(CACHE_CONTROL),
             ),
-            (
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static(NOSNIFF),
-            ),
+            (header::X_CONTENT_TYPE_OPTIONS, NOSNIFF.clone()),
             (CONTENT_DISPOSITION, HeaderValue::from_static(INLINE)),
         ],
         bytes,

@@ -280,7 +280,7 @@ pub(super) fn not_found_page() -> Response {
 mod tests {
     use super::*;
     use crate::api::html_pages::{
-        CSP_HEADER, FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP,
+        FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP,
         test_support::{attachment, headers_of, published},
     };
     use axum::http::header;
@@ -461,7 +461,11 @@ mod tests {
             PAGE_CONTENT_TYPE,
             "the refusal is an HTML page"
         );
-        assert_eq!(headers[CSP_HEADER.clone()], PAGE_CSP, "with the CSP");
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            PAGE_CSP,
+            "with the CSP"
+        );
         assert!(
             !headers.contains_key(FRAME_OPTIONS_HEADER.clone()),
             "and framable like a card, so it tells nothing away"

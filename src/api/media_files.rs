@@ -36,14 +36,12 @@ use crate::{
     error::{AppError, AppResult},
     state::AppState,
     uploads,
+    util::headers::NOSNIFF,
 };
 
 /// `cache-control` for stored media: keys are random and never reused, so a
 /// cached copy never goes stale.
 const CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
-/// `x-content-type-options`, as in Pleroma's `HttpSecurityPlug`: the type sent
-/// here is the type to use, browsers must not guess another one.
-const NOSNIFF: &str = "nosniff";
 /// How a browser shows a file it renders by itself.
 const INLINE: &str = "inline";
 /// How a browser downloads anything else instead of rendering it.
@@ -89,10 +87,7 @@ fn media_response(key: &str, bytes: Bytes) -> Response {
                 header::CONTENT_DISPOSITION,
                 HeaderValue::from_static(disposition_for(content_type)),
             ),
-            (
-                header::X_CONTENT_TYPE_OPTIONS,
-                HeaderValue::from_static(NOSNIFF),
-            ),
+            (header::X_CONTENT_TYPE_OPTIONS, NOSNIFF.clone()),
         ],
         bytes,
     )
@@ -141,7 +136,7 @@ mod tests {
             );
             assert_eq!(
                 header_of(key, "x-content-type-options"),
-                NOSNIFF,
+                NOSNIFF.to_str().unwrap(),
                 "{key} is fixed"
             );
         }

@@ -141,8 +141,6 @@ const PAGE_STYLE: &str = "body{margin:0;min-height:100vh;display:flex;\
     input[type=submit]{padding:0.5rem 1rem;border-radius:4px;\
     border:1px solid #7c8a52;background:#7c8a52;color:#fff;cursor:pointer;width:auto}\
     p.error{color:#a1282c}";
-/// The `Content-Security-Policy` header [`PAGE_CSP`] rides on.
-static CSP_HEADER: HeaderName = HeaderName::from_static("content-security-policy");
 /// The `X-Frame-Options` header every page puts up: these pages carry
 /// login forms, and no other site may frame them.
 static FRAME_OPTIONS_HEADER: HeaderName = HeaderName::from_static("x-frame-options");

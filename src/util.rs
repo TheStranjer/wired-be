@@ -1,6 +1,7 @@
 //! Small helpers shared by the rest of the crate.
 //!
-//! Nothing in here knows about HTTP or the database: these are the primitives
+//! Little in here knows about HTTP (only the shared response header values
+//! in [`headers`]) or the database: these are the primitives
 //! the layers above are built on, following `docs/ARCHITECTURE.md` — ids from
 //! [`id`] (decision 4), timestamps from [`time`] (decision 5), password
 //! hashes from [`password`], random OAuth tokens from [`token`], the RSA key
@@ -15,6 +16,7 @@ pub mod cache;
 pub mod emoji;
 pub mod entities;
 pub mod format;
+pub mod headers;
 pub mod id;
 pub mod keys;
 pub mod password;

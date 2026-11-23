@@ -11,8 +11,8 @@ use axum::{
 use crate::util::sanitize::escape_html;
 
 use super::{
-    CSP_HEADER, FOLLOW_TITLE, FOLLOWED_MESSAGE, FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP,
-    PAGE_STYLE, REMOTE_SUBSCRIBE_PATH, REMOTE_SUBSCRIBE_TITLE, SUBSCRIBE_PATH,
+    FOLLOW_TITLE, FOLLOWED_MESSAGE, FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP, PAGE_STYLE,
+    REMOTE_SUBSCRIBE_PATH, REMOTE_SUBSCRIBE_TITLE, SUBSCRIBE_PATH,
 };
 
 /// The `GET/POST /ostatus_subscribe` page: [`subscribe_body`] under the
@@ -104,7 +104,7 @@ fn error_line(error: Option<&str>) -> String {
 fn page(title: &str, body: &str) -> Response {
     let mut response = (StatusCode::OK, page_document(title, body)).into_response();
     put_header(&mut response, header::CONTENT_TYPE, PAGE_CONTENT_TYPE);
-    put_header(&mut response, CSP_HEADER.clone(), PAGE_CSP);
+    put_header(&mut response, header::CONTENT_SECURITY_POLICY, PAGE_CSP);
     put_header(&mut response, FRAME_OPTIONS_HEADER.clone(), "DENY");
     response
 }
@@ -259,7 +259,7 @@ mod tests {
                 "answered as HTML"
             );
             assert_eq!(
-                headers[CSP_HEADER.clone()],
+                headers[header::CONTENT_SECURITY_POLICY],
                 PAGE_CSP,
                 "the CSP allows the form's own submit"
             );

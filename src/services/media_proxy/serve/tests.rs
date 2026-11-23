@@ -77,7 +77,11 @@ fn media_response_forces_inline_and_the_safety_headers() {
         NOSNIFF,
         "no sniffing"
     );
-    assert_eq!(headers[&CSP_HEADER], CSP, "the locked-down CSP");
+    assert_eq!(
+        headers[header::CONTENT_SECURITY_POLICY],
+        CSP,
+        "the locked-down CSP"
+    );
     assert_eq!(headers[header::ETAG], "\"v1\"", "validators ride along");
     assert_eq!(
         headers[header::LAST_MODIFIED],
