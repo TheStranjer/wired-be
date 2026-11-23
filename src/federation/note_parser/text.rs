@@ -1,5 +1,5 @@
 //! The document's words: the rendered `content` with its `source` and the
-//! `Article`/`Page` header, the `published`/`updated` timestamps, the
+//! title/link header of the converted kinds, the `published`/`updated` timestamps, the
 //! `sensitive` flag and the shared reference reader.
 
 use chrono::{DateTime, Utc};
@@ -15,19 +15,25 @@ use crate::{
 };
 
 use super::{
-    CLOCK_SKEW, DEFAULT_HTML_CONTENT_TYPE, MAX_CONTENT_CHARS, TYPE_ARTICLE, TYPE_PAGE,
+    CLOCK_SKEW, DEFAULT_HTML_CONTENT_TYPE, MAX_CONTENT_CHARS, TYPE_ARTICLE, TYPE_AUDIO, TYPE_EVENT,
+    TYPE_IMAGE, TYPE_PAGE, TYPE_VIDEO,
     types::{NoteText, NoteTimes},
 };
 
 /// The document's rendered text: `content`, or the first value of
-/// `contentMap` when `content` is absent; `Article` and `Page` get the
-/// title/link header Pleroma's clients render for them (the ticket's shape).
+/// `contentMap` when `content` is absent; the converted kinds (`Article`,
+/// `Page`, `Video`, `Audio`, `Image`, `Event`, Mastodon's `CONVERTED_TYPES`) get
+/// the title/link header, the title read from `name`/`nameMap`.
 /// The result is sanitized and capped; the source text and its MIME type
 /// come from `source` when it is an object stating them.
 pub(super) fn parse_text(json: &Value, kind: &str, url: &str) -> NoteText {
     let body = document_body(json);
-    let markup = if matches!(kind, TYPE_ARTICLE | TYPE_PAGE) {
-        format!("{}{body}", article_header(json.get("title"), url))
+    let converted = matches!(
+        kind,
+        TYPE_ARTICLE | TYPE_PAGE | TYPE_VIDEO | TYPE_AUDIO | TYPE_IMAGE | TYPE_EVENT
+    );
+    let markup = if converted {
+        format!("{}{body}", article_header(title_of(json).as_deref(), url))
     } else {
         body
     };
@@ -65,13 +71,28 @@ fn document_body(json: &Value) -> String {
         .to_owned()
 }
 
-/// The header `Article` and `Page` documents render in front of their body:
+/// The document's title: the string under `name`, else the first string
+/// value of `nameMap`. `title` is not an `ActivityStreams` property and is not
+/// read.
+fn title_of(json: &Value) -> Option<String> {
+    json.get("name")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            json.get("nameMap")
+                .and_then(Value::as_object)
+                .and_then(|entries| entries.values().next())
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+}
+
+/// The header converted documents render in front of their body:
 /// the title as a bold first paragraph, then the post's url as a link. A
 /// titleless article gets only the link paragraph. The result goes through
 /// [`sanitize_html`] with the body, so the link gains the forced `rel` and
 /// any hostile url loses its `href`.
-fn article_header(title: Option<&Value>, url: &str) -> String {
-    match title.and_then(Value::as_str) {
+fn article_header(title: Option<&str>, url: &str) -> String {
+    match title {
         Some(title) if !title.trim().is_empty() => format!(
             r#"<p><strong>{}</strong></p><p><a href="{url}">{url}</a></p>"#,
             escape_html(title)
@@ -171,6 +192,77 @@ mod tests {
             "On Parsing\nhttps://remote.example/@bob/article/1\nBody text with an external reference.\n",
             "the rendered form as text"
         );
+    }
+
+    /// A document of `kind` with the given extra fields and a fixed url.
+    fn titled(kind: &str, extra: &Value) -> Value {
+        let mut document = minimal_note();
+        document["type"] = json!(kind);
+        document["url"] = json!("https://remote.example/@bob/doc/1");
+        remove(&mut document, "content");
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            document[key] = value.clone();
+        }
+        document
+    }
+
+    const DOC_LINK: &str = r#"<p><a href="https://remote.example/@bob/doc/1" rel="ugc nofollow noopener noreferrer">https://remote.example/@bob/doc/1</a></p>"#;
+
+    #[test]
+    fn an_article_titles_itself_from_name() {
+        let parsed = parse(&titled(
+            "Article",
+            &json!({"name": "Hello <b>", "content": "<p>Body</p>"}),
+        ));
+        let content = parsed.status.content;
+        assert!(
+            content.starts_with("<p><strong>Hello &lt;b&gt;</strong></p>"),
+            "escaped bold title first, got {content}"
+        );
+        assert!(
+            content.contains(DOC_LINK),
+            "the url link follows, got {content}"
+        );
+        assert!(
+            content.ends_with("<p>Body</p>"),
+            "the body is kept, got {content}"
+        );
+    }
+
+    #[test]
+    fn a_page_titles_itself_from_name_map() {
+        let parsed = parse(&titled("Page", &json!({"nameMap": {"en": "Hi"}})));
+        assert_eq!(
+            parsed.status.content,
+            format!("<p><strong>Hi</strong></p>{DOC_LINK}")
+        );
+    }
+
+    #[test]
+    fn every_converted_kind_gets_the_header() {
+        for kind in ["Video", "Audio", "Image", "Event"] {
+            let parsed = parse(&titled(kind, &json!({"name": "Clip"})));
+            assert_eq!(
+                parsed.status.content,
+                format!("<p><strong>Clip</strong></p>{DOC_LINK}"),
+                "{kind} with no content"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_key_is_not_a_title() {
+        let parsed = parse(&titled("Article", &json!({"title": "Nope"})));
+        assert_eq!(parsed.status.content, DOC_LINK, "link-only header");
+    }
+
+    #[test]
+    fn a_named_note_has_no_header() {
+        let parsed = parse(&titled(
+            "Note",
+            &json!({"name": "Option A", "content": "<p>x</p>"}),
+        ));
+        assert_eq!(parsed.status.content, "<p>x</p>", "poll answers stay bare");
     }
 
     /// One timestamp case: the `published`/`updated` pair to try.
