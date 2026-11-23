@@ -223,6 +223,36 @@ async fn both_listings_answer_newest_follow_first() {
     }
 }
 
+/// An anonymous reader never sees an account that was deactivated after it
+/// followed, on either side of the relationship.
+#[tokio::test]
+async fn deactivated_accounts_are_not_listed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let _in_bob: Follow = granted(&pool, &bob, &alice).await;
+    let in_carol = granted(&pool, &carol, &alice).await;
+    let _out_bob: Follow = granted(&pool, &alice, &bob).await;
+    let out_carol = granted(&pool, &alice, &carol).await;
+
+    wired_be::models::user::set_activation(&pool, bob.id, false)
+        .await
+        .expect("bob is suspended");
+
+    let app = common::test_app(pool);
+    for (side, row) in [(FOLLOWERS, &in_carol), (FOLLOWING, &out_carol)] {
+        let response = list(&app, None, &alice.id, side, "").await;
+        assert_eq!(response.status, StatusCode::OK, "auth is optional");
+        assert_eq!(
+            listed_ids(&response.json_value()),
+            wanted_accounts(&[pair(&carol, row)]),
+            "only the active account is in the {side} list"
+        );
+    }
+}
+
 /// An entry is a full `Account` entity, not an id stub: the remote
 /// follower keeps the handle and actor id federation stored, and an
 /// anonymous listing embeds no relationship.
