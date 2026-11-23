@@ -1,9 +1,10 @@
-//! The prune pass's tests: which terminal job rows and which ledger rows a
-//! daily run reclaims, the batching loop that drains a backlog larger than one
-//! batch, the existence guard on the ledger table, the retry a database it
+//! The prune pass's tests: which terminal job rows a daily run reclaims, the
+//! batching loop that drains a backlog larger than one batch, that the
+//! `received_activities` ledger is left untouched, the retry a database it
 //! cannot reach buys it, and the two registries its kind is wired into.
 
 use serde_json::json;
+use sqlx::query_scalar;
 use uuid::Uuid;
 
 use super::*;
@@ -168,32 +169,24 @@ async fn ledger_rows(pool: &PgPool, ap_id: &str) -> i64 {
         .expect("the ledger reads")
 }
 
-/// The dispatcher ticket's table lit this step up: the guarded pass
-/// now deletes the `received_activities` rows past the retention and
-/// leaves the fresh ones, beside its `jobs` work.
+/// The jobs prune does not touch the replay ledger: `received_activities`
+/// rows of any age survive the pass, whose retention belongs to the
+/// dispatcher's `federation.cleanup_received`, while the stale terminal
+/// job beside them is still deleted.
 #[tokio::test]
-async fn the_jobs_prune_cleans_the_received_activities_ledger() {
+async fn the_jobs_prune_leaves_the_received_activities_ledger_alone() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let table = query_scalar::<_, Option<String>>(RECEIVED_ACTIVITIES_EXISTS_SQL)
-        .fetch_one(&pool)
-        .await
-        .expect("the probe reads");
-    assert_eq!(
-        table.as_deref(),
-        Some("received_activities"),
-        "the schema has the ledger this step guards on"
-    );
     let _aged = query(
         "INSERT INTO received_activities (ap_id, inserted_at)
-             VALUES ('https://peer.example/activities/pruned', now() - make_interval(days => 15))",
+             VALUES ('https://peer.example/activities/old', now() - make_interval(days => 400))",
     )
     .execute(&pool)
     .await
     .expect("the old ledger row inserts");
     let _fresh = query(
         "INSERT INTO received_activities (ap_id, inserted_at)
-             VALUES ('https://peer.example/activities/kept', now() - make_interval(days => 13))",
+             VALUES ('https://peer.example/activities/new', now() - make_interval(days => 1))",
     )
     .execute(&pool)
     .await
@@ -203,24 +196,24 @@ async fn the_jobs_prune_cleans_the_received_activities_ledger() {
 
     let outcome = handle_jobs(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
-    assert_eq!(outcome, Ok(()), "the guarded pass runs");
+    assert_eq!(outcome, Ok(()), "the pass runs");
     assert_eq!(
-        ledger_rows(&pool, "https://peer.example/activities/pruned").await,
-        0,
-        "the 15-day ledger row is reclaimed"
+        ledger_rows(&pool, "https://peer.example/activities/old").await,
+        1,
+        "a 400-day-old ledger row is not this job's to reclaim"
     );
     assert_eq!(
-        ledger_rows(&pool, "https://peer.example/activities/kept").await,
+        ledger_rows(&pool, "https://peer.example/activities/new").await,
         1,
-        "the 13-day ledger row stays"
+        "a fresh ledger row stays"
     );
     assert!(
         !row_exists(&pool, "jobs", stale).await,
-        "the pass still prunes the jobs table"
+        "the pass still prunes the stale terminal job"
     );
     assert!(
         row_exists(&pool, "jobs", live).await,
-        "pruning only reaches past the retentions"
+        "a live-state job stays however old"
     );
 }
 
