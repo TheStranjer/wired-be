@@ -9,21 +9,22 @@ use crate::{error::AppResult, pagination::PageParams};
 
 use super::types::FollowPageEntry;
 
-/// The incoming side of [`followers_page`]: the users whose follow of the
-/// bound account was accepted, each entry led by the `follow_id` of the
+/// The incoming side of [`followers_page`]: the active users whose follow of
+/// the bound account was accepted (a suspended or deleted account is left
+/// out, as Pleroma's `deactivated: false` does), each entry led by the `follow_id` of the
 /// relationship row behind it — the id the page keys on. The text stops
 /// where its one placeholder belongs, because that is where [`page_rows`]
 /// pushes its bind and the builder is what numbers it `$1`; the keyset it
 /// then appends runs on the relationship id `f.id`.
 pub(super) const FOLLOWERS_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.follower_id
-     WHERE f.state = 'accepted' AND f.followee_id = ";
+     WHERE f.state = 'accepted' AND u.is_active AND f.followee_id = ";
 
 /// The outgoing side of [`following_page`]: the users the bound account
 /// follows, same shape as [`FOLLOWERS_PAGE_SQL`].
 const FOLLOWING_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.followee_id
-     WHERE f.state = 'accepted' AND f.follower_id = ";
+     WHERE f.state = 'accepted' AND u.is_active AND f.follower_id = ";
 
 /// The users who follow `user_id`, accepted relationships only, newest
 /// relationship first and `page`'s `limit` at a time, each entry carrying
@@ -89,9 +90,48 @@ mod tests {
         config::TEST_BASE_URL,
         models::{
             follow::{Follow, FollowState, follow, test_support::*},
-            user::User,
+            user::{User, set_activation},
         },
     };
+
+    /// A deactivated follower drops out of the followers page and a
+    /// deactivated followee out of the following page; active ones stay.
+    #[tokio::test]
+    async fn deactivated_accounts_are_left_out_of_both_lists() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let owner = local_user(&pool, "owner").await;
+        let active = local_user(&pool, "active").await;
+        let gone = local_user(&pool, "gone").await;
+        for other in [&active, &gone] {
+            let _row: Follow = follow(&pool, TEST_BASE_URL, other, &owner).await.unwrap();
+            let _back: Follow = follow(&pool, TEST_BASE_URL, &owner, other).await.unwrap();
+        }
+        assert_eq!(
+            followers_of(&pool, &owner, "").await.len(),
+            2,
+            "both followers are listed while active"
+        );
+
+        set_activation(&pool, gone.id, false).await.unwrap();
+        assert_eq!(
+            entry_ids(&followers_of(&pool, &owner, "").await),
+            vec![active.id],
+            "the deactivated follower is absent"
+        );
+        assert_eq!(
+            entry_ids(&following_of(&pool, &owner, "").await),
+            vec![active.id],
+            "the deactivated followee is absent"
+        );
+
+        set_activation(&pool, gone.id, true).await.unwrap();
+        assert_eq!(
+            followers_of(&pool, &owner, "").await.len(),
+            2,
+            "reactivating restores the entry"
+        );
+    }
 
     /// Three accounts that each follow `target`, accepted at once, and the
     /// stored rows of those three relationships.
