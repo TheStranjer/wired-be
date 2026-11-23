@@ -27,8 +27,6 @@ pub(super) const NO_TOKEN: &str = "Invalid credentials";
 pub(super) const INVALID_TOKEN: &str = "The access token is invalid";
 /// The 403 body for an app-only (user-unbound) token.
 pub(super) const USER_REQUIRED: &str = "This API requires an authenticated user";
-/// The 403 body for a valid token whose user is neither admin nor moderator.
-pub(super) const NOT_STAFF: &str = "User is not a staff member.";
 /// The 403 body of a token that grants neither `admin:read` nor
 /// `admin:read:accounts`.
 pub(super) const NO_ADMIN_READ: &str = "Insufficient permissions: admin:read.";
@@ -119,7 +117,7 @@ pub(super) struct Seeded {
     pub(super) app: Router,
     /// The admin account, whose tokens the scope tests mint.
     pub(super) root: User,
-    /// The moderator, whose token the staff gate is checked with.
+    /// The moderator, whose token the admin gate refuses.
     pub(super) moddy: User,
     /// The plain account a stranger's token is minted from.
     pub(super) plain: User,
@@ -210,11 +208,11 @@ where
     let _row: User = create(pool, nickname, customize).await;
 }
 
-/// `GET`s `path` as `token` and returns the parsed body, asserting the 200 a
-/// staff read answers with.
+/// `GET`s `path` as `token` and returns the parsed body, asserting the 200 an
+/// admin read answers with.
 pub(super) async fn read(app: &Router, token: &str, path: &str) -> Value {
     let response = TestRequest::get(path).bearer(token).send(app).await;
-    common::assert_answer(&response, StatusCode::OK, "a staff read");
+    common::assert_answer(&response, StatusCode::OK, "an admin read");
     response.json_value()
 }
 

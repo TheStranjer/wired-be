@@ -387,7 +387,7 @@ mod markers;
 /// entity with its role object, the v1 boolean and v2 word spellings of the
 /// same criteria, the criteria this schema cannot weigh and accepts anyway,
 /// the page under a `Link` header keyed on the account ids, the show route's
-/// two misses, and the staff-and-`admin:read:accounts` gate.
+/// two misses, and the admin-and-`admin:read:accounts` gate.
 mod mastodon_admin;
 
 /// The Mastodon admin reports surface over HTTP (`/api/v1/admin/reports` and

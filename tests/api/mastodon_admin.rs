@@ -6,7 +6,7 @@
 //! `index2` and `show` — the sixteen-key entity with its role object, the v1
 //! boolean and v2 word spellings of the same criteria, the criteria this
 //! schema cannot weigh and accepts anyway, the page under a `Link` header
-//! keyed on the account ids, the show route's two misses, and the staff-and-
+//! keyed on the account ids, the show route's two misses, and the admin-and-
 //! `admin:read:accounts` gate in front of all of it.
 //!
 //! The shared fixture seeds one account per state a filter weighs — an admin, a
@@ -32,7 +32,7 @@ mod actions;
 mod approve_reject;
 /// The delete and enable writes and their misses.
 mod delete_enable;
-/// The two read gates: the staff user and the accounts read scope.
+/// The two read gates: the admin user and the accounts read scope.
 mod read_gates;
 /// The listings, the pinned entity, the page and the show route.
 mod reads;
