@@ -5,13 +5,14 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 
 use super::super::IMF_FIXDATE;
 use super::{
-    DATE_HEADER, DATE_TOLERANCE, MALFORMED_DATE, MALFORMED_TIMESTAMP, SignatureError,
-    SignedRequestParts, checks::header_value, parse::ParsedSignature,
+    CLOCK_SKEW_MARGIN, DATE_HEADER, DATE_TOLERANCE, MALFORMED_DATE, MALFORMED_TIMESTAMP,
+    SignatureError, SignedRequestParts, checks::header_value, parse::ParsedSignature,
 };
 
 /// A past `(expires)` parameter is [`SignatureError::Expired`], and the
 /// signed moment — the `Date` header when it is signed, else the `created`
-/// parameter — must sit within [`DATE_TOLERANCE`] of `now`.
+/// parameter — must be at most [`DATE_TOLERANCE`] before `now` and at most
+/// [`CLOCK_SKEW_MARGIN`] after it.
 pub(super) fn check_freshness(
     parsed: &ParsedSignature,
     request: &SignedRequestParts<'_>,
@@ -24,7 +25,7 @@ pub(super) fn check_freshness(
         return Err(SignatureError::Expired);
     }
     let signed_at = signed_moment(parsed, request)?;
-    if (signed_at - now).abs() > DATE_TOLERANCE {
+    if signed_at > now + CLOCK_SKEW_MARGIN || now - signed_at > DATE_TOLERANCE {
         return Err(SignatureError::Expired);
     }
     Ok(())
@@ -73,42 +74,59 @@ mod tests {
     };
     use super::*;
 
+    /// The verdict for a signature dated `offset` from [`now`].
+    fn verdict_at(offset: TimeDelta) -> Result<(), SignatureError> {
+        let (parsed, request) = round_trip(
+            "GET",
+            "https://peer.example/users/alice",
+            "/users/alice",
+            None,
+            now() + offset,
+        );
+        verify_now(&parsed, &request)
+    }
+
     #[test]
-    fn date_skew_beyond_twelve_hours_is_expired() {
-        for skew in [13_i64, -13] {
-            let then = now() + TimeDelta::hours(skew);
-            let (parsed, request) = round_trip(
-                "GET",
-                "https://peer.example/users/alice",
-                "/users/alice",
-                None,
-                then,
-            );
+    fn a_signature_two_hours_ahead_is_expired() {
+        assert_eq!(
+            verdict_at(TimeDelta::hours(2)),
+            Err(SignatureError::Expired),
+            "future dates get only the clock-skew margin"
+        );
+        assert_eq!(
+            verdict_at(TimeDelta::hours(12)),
+            Err(SignatureError::Expired),
+            "the past window does not apply to the future"
+        );
+    }
+
+    #[test]
+    fn a_signature_thirty_minutes_ahead_passes() {
+        for offset in [
+            TimeDelta::minutes(30),
+            TimeDelta::hours(1),
+            TimeDelta::zero(),
+        ] {
             assert_eq!(
-                verify_now(&parsed, &request),
-                Err(SignatureError::Expired),
-                "{skew}h of skew is past the window"
+                verdict_at(offset),
+                Ok(()),
+                "{offset} ahead is inside the skew margin"
             );
         }
     }
 
     #[test]
-    fn date_skew_inside_twelve_hours_passes() {
-        for skew in [11_i64, -11, 0] {
-            let then = now() + TimeDelta::hours(skew);
-            let (parsed, request) = round_trip(
-                "GET",
-                "https://peer.example/users/alice",
-                "/users/alice",
-                None,
-                then,
-            );
-            assert_eq!(
-                verify_now(&parsed, &request),
-                Ok(()),
-                "{skew}h of skew is inside the window"
-            );
-        }
+    fn a_signature_eleven_hours_old_passes() {
+        assert_eq!(verdict_at(-TimeDelta::hours(11)), Ok(()));
+        assert_eq!(verdict_at(-TimeDelta::hours(12)), Ok(()), "the edge");
+    }
+
+    #[test]
+    fn a_signature_thirteen_hours_old_is_expired() {
+        assert_eq!(
+            verdict_at(-TimeDelta::hours(13)),
+            Err(SignatureError::Expired)
+        );
     }
 
     #[test]

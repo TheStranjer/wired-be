@@ -73,8 +73,11 @@ const POST_METHOD: &str = "POST";
 ///
 /// [`hs2019`]: https://datatracker.ietf.org/doc/html/draft-cavage-http-signatures-12#section-2.1.6
 const HS2019: &str = "hs2019";
-/// Mastodon's clock-skew tolerance for the signed moment: ±12 hours.
+/// How far in the past the signed moment may lie: 12 hours, as in Mastodon.
 const DATE_TOLERANCE: TimeDelta = TimeDelta::hours(12);
+/// How far in the future the signed moment may lie: one hour of clock skew,
+/// as in Mastodon's `CLOCK_SKEW_MARGIN`.
+const CLOCK_SKEW_MARGIN: TimeDelta = TimeDelta::hours(1);
 
 /// [`SignatureError::Malformed`] for a parameter that has no `=`.
 const MALFORMED_PAIR: SignatureError = SignatureError::Malformed("a parameter without `=`");
