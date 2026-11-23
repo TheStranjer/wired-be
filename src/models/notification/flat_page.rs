@@ -1,6 +1,6 @@
 //! The flat (ungrouped) reads: [`NotificationFilters`] and the scope
-//! every notification read shares ([`push_scope`] with
-//! [`BLOCKED_CAUSES`] and [`MUTED_CAUSES`]), [`FlatPageParams`] and
+//! every notification read shares ([`push_scope`], and [`push_visible_scope`]
+//! with [`BLOCKED_CAUSES`] and [`MUTED_CAUSES`]), [`FlatPageParams`] and
 //! [`page_for_user`], and [`get_visible`] — one row as the listings
 //! show it.
 
@@ -57,6 +57,19 @@ pub(super) fn push_scope(qb: &mut QueryBuilder<Postgres>, user_id: Uuid) {
     );
 }
 
+/// [`push_scope`] plus what the recipient refused: [`BLOCKED_CAUSES`] always
+/// and [`MUTED_CAUSES`] unless `with_muted` (Pleroma's `for_user_query` with
+/// `exclude_blocked` and `exclude_notification_muted`). Every read a client
+/// sees goes through this one helper; only the dismissals stay on the plain
+/// scope, so they still reach hidden rows.
+pub(super) fn push_visible_scope(qb: &mut QueryBuilder<Postgres>, user_id: Uuid, with_muted: bool) {
+    push_scope(qb, user_id);
+    let _blocked: &mut _ = qb.push(BLOCKED_CAUSES);
+    if !with_muted {
+        let _muted: &mut _ = qb.push(MUTED_CAUSES);
+    }
+}
+
 /// Everything [`page_for_user`] needs: whose notifications, filtered how,
 /// whether the recipient's own mutes hide them, and which page of rows.
 #[derive(Clone, Debug)]
@@ -97,24 +110,24 @@ pub async fn page_for_user(
     params: &FlatPageParams<'_>,
 ) -> AppResult<Vec<Notification>> {
     let mut qb = QueryBuilder::<Postgres>::new("SELECT n.* FROM notifications n");
-    push_scope(&mut qb, params.user_id);
+    push_visible_scope(&mut qb, params.user_id, params.with_muted);
     params.filters.push(&mut qb);
-    let _blocked: &mut _ = qb.push(BLOCKED_CAUSES);
-    if !params.with_muted {
-        let _muted: &mut _ = qb.push(MUTED_CAUSES);
-    }
     params.page.apply_keyset(&mut qb, "n.id");
     let rows = qb.build_query_as::<Notification>().fetch_all(pool).await?;
     Ok(params.page.finish(rows))
 }
 
-/// The notification `id` of `user_id` as the listings show it: the owner's,
-/// undismissed, from a still-active actor — `push_scope` narrowed to one
-/// row.
+/// One notification of `user_id` as the listings show it.
 ///
-/// `None` says the caller owns no such live row (the unknown, the dismissed
-/// and the invisible-actor id all answer the shared 404), where [`get`](super::get)
-/// reports the row whatever its state.
+/// The owner's, undismissed, from a still-active actor the owner has not
+/// blocked (nor whose domain they blocked): `push_visible_scope` narrowed to
+/// one row.
+///
+/// Muted causes stay readable, like v1's `show` (`with_muted` is on).
+///
+/// `None` says the caller owns no such live row (the unknown, the dismissed,
+/// the blocked and the invisible-actor id all answer the shared 404), where
+/// [`get`](super::get) reports the row whatever its state.
 ///
 /// # Errors
 ///
@@ -125,7 +138,7 @@ pub async fn get_visible(
     id: Uuid,
 ) -> AppResult<Option<Notification>> {
     let mut qb = QueryBuilder::<Postgres>::new("SELECT n.* FROM notifications n");
-    push_scope(&mut qb, user_id);
+    push_visible_scope(&mut qb, user_id, true);
     let _one: &mut _ = qb.push(" AND n.id = ").push_bind(id);
     let row = qb
         .build_query_as::<Notification>()
@@ -438,6 +451,45 @@ mod tests {
                 .expect("the read runs")
                 .is_none(),
             "a dismissed row hides"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_visible_hides_blocked_actors_but_keeps_muted_ones() {
+        use crate::{
+            config::TEST_BASE_URL,
+            models::{
+                block,
+                mute::{self, MuteOptions},
+            },
+        };
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = solo(pool, "visible-alice").await;
+        let blocked = solo(pool, "visible-blocked").await;
+        let muted = solo(pool, "visible-muted").await;
+        let from_blocked = note(pool, alice.id, blocked.id, "follow", None).await;
+        let from_muted = note(pool, alice.id, muted.id, "follow", None).await;
+        let _edge = block::block(pool, TEST_BASE_URL, &alice, &blocked)
+            .await
+            .expect("the block lands");
+        let _mute = mute::mute(pool, &alice, &muted, MuteOptions::default())
+            .await
+            .expect("the mute lands");
+
+        assert!(
+            get_visible(pool, alice.id, from_blocked.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "a blocked actor's row hides"
+        );
+        assert!(
+            get_visible(pool, alice.id, from_muted.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "a muted actor's row still shows, like v1's show"
         );
     }
 }

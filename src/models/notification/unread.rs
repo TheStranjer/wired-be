@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::error::AppResult;
 
-use super::flat_page::{NotificationFilters, push_scope};
+use super::flat_page::{NotificationFilters, push_visible_scope};
 
 /// Everything [`unread_count`] needs: whose, filtered how, where the
 /// caller's `notifications` marker stands, and the cap.
@@ -17,6 +17,9 @@ pub struct UnreadParams<'a> {
     pub user_id: Uuid,
     /// The client's `types[]` / `exclude_types[]` / `account_id` filters.
     pub filters: NotificationFilters<'a>,
+    /// Whether notifications whose cause the recipient muted are counted
+    /// (`with_muted`); blocked actors and domains never are.
+    pub with_muted: bool,
     /// The id the `notifications` marker holds; `None` (no marker, or one
     /// that names no id) counts from the beginning of time.
     pub marker: Option<Uuid>,
@@ -27,6 +30,9 @@ pub struct UnreadParams<'a> {
 /// How many unseen undismissed notifications of `params.user_id` sit past
 /// the marker — the `{"count": N}` of `GET /api/v2/notifications/unread_count`.
 ///
+/// Rows the recipient blocked, or muted unless `params.with_muted`, are not
+/// counted.
+///
 /// The cap is applied inside the count, so a caller asking for at most
 /// `limit` gets exactly that when more would match.
 ///
@@ -36,7 +42,7 @@ pub struct UnreadParams<'a> {
 pub async fn unread_count(pool: &PgPool, params: &UnreadParams<'_>) -> AppResult<i64> {
     let mut qb =
         QueryBuilder::<Postgres>::new("SELECT count(*) FROM (SELECT 1 FROM notifications n");
-    push_scope(&mut qb, params.user_id);
+    push_visible_scope(&mut qb, params.user_id, params.with_muted);
     let _unseen: &mut _ = qb.push(" AND NOT n.seen");
     if let Some(marker) = params.marker {
         let _past: &mut _ = qb.push(" AND n.id > ").push_bind(marker);

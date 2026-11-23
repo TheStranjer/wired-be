@@ -19,6 +19,8 @@ mod filters_and_gates;
 mod grouping;
 /// The single-group show, its accounts and the dismissal.
 mod groups;
+/// The block, domain-block and mute exclusions of every grouped read.
+mod hidden_causes;
 /// The group page cursors and the marker-based unread count.
 mod paging_unread;
 /// Shared consts, fixtures, seeds and callers every submodule draws on.
