@@ -181,7 +181,7 @@ The module layout (the binding decisions it follows are numbered in
 | `src/config.rs` | The environment-only configuration (decision 12), documented in the table above |
 | `src/state.rs` | `AppState`: the one cheap-to-clone value every handler shares (pool, config, HTTP client, rate limiter, mailer, streaming hub) |
 | `src/error.rs` | The one `AppError` and its JSON rendering (decision 8) |
-| `src/http_client/`, `src/mailer/`, `src/oauth/`, `src/util/`, `src/uploads.rs`, `src/feeds.rs`, `src/middleware.rs`, `src/pagination.rs`, `src/rate_limit.rs` | The helpers around them: the SSRF-guarded outbound client, the SMTP transport, scope parsing, formatting/sanitizing/passwords/keys, upload storage, Atom/RSS feeds, the tower layers, UUIDv7 cursor pagination, the rate limiter |
+| `src/http_client/`, `src/mailer/`, `src/oauth/`, `src/util/`, `src/uploads.rs`, `src/middleware.rs`, `src/pagination.rs`, `src/rate_limit.rs` | The helpers around them: the SSRF-guarded outbound client, the SMTP transport, scope parsing, formatting/sanitizing/passwords/keys, upload storage, the tower layers, UUIDv7 cursor pagination, the rate limiter |
 
 The shape that falls out: every primary key is a `uuid` column holding a
 `UUIDv7` minted in Rust, so `max_id`/`min_id` pagination is plain text
@@ -483,8 +483,8 @@ changed. Four families make it up:
   an admin one;
 - **federation and discovery** — the `ActivityPub` actors, objects, activities,
   inboxes and outboxes (`/users/…`, `/objects/…`, `/activities/…`, `/inbox`,
-  `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the Atom and
-  RSS feeds, the media and emoji files, the proxy, the OAuth endpoints, the
+  `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the media and
+  emoji files, the proxy, the OAuth endpoints, the
   remote-interaction pages and the streaming WebSocket.
 
 `src/api/route_inventory.rs` is the table of that surface: one row per route,
@@ -504,6 +504,7 @@ Routes Pleroma has and Wired deliberately does not:
 | Phoenix's dev and test routes — `forward /dev/mailbox`, and the `/test/api/:action` and `/test/authenticated_api/:action` reads of `AuthTestController` | The reference mounts them only when its environment is `:dev` or `:test`: a mailbox preview for sent mail and plugs that exercise its own router. Wired's tests drive the real router. |
 | `/phoenix/live_dashboard/*path`, and the `/pleroma/live_dashboard` and `/pleroma/oban` pages it redirects to | `Phoenix.LiveDashboard` and `Oban.Web.Router`: HTML UIs over BEAM process and job metrics, with no meaning outside that runtime. |
 | The SPA fallbacks `GET /:maybe_nickname_or_id` and `GET /*path` (and the `OPTIONS /*path` pair) | They hand an unknown path to the frontend's JavaScript router, or answer its preflight. Wired is API-only (see the top of this file), so an unmatched path is the JSON 404 — under `/api` Pleroma's own `api_not_implemented`, elsewhere its plain "Not found". |
+| `GET /users/:nickname/feed` (and its `.atom`/`.rss` forms) and `GET /tags/:tag` | Atom/RSS syndication, not API. Pleroma serves them from its HTML/XML pipeline; Wired is API-only, so the frontend owns HTML and feeds and these paths fall through to the JSON 404. `GET /users/:nickname` still negotiates the `ActivityPub` actor JSON. |
 | The Shout channels socket (`GET /socket`) | Pleroma's browser-notification WebSocket. Wired delivers the same events on `/api/v1/streaming` and over Web Push. |
 
 ## Development

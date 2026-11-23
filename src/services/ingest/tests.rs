@@ -165,7 +165,7 @@ async fn an_unparseable_object_is_a_permanent_failure() {
 }
 
 #[tokio::test]
-async fn the_unsolicited_gate_drops_public_posts_from_unfollowed_authors() {
+async fn the_unsolicited_gate_drops_public_notes_from_unfollowed_authors() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = gating_state(&pool);
