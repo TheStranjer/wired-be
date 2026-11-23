@@ -120,14 +120,17 @@ pub async fn page_for_user(
 /// One notification of `user_id` as the listings show it.
 ///
 /// The owner's, undismissed, from a still-active actor the owner has not
-/// blocked (nor whose domain they blocked): `push_visible_scope` narrowed to
-/// one row.
+/// blocked (nor whose domain they blocked) nor muted: `push_visible_scope`
+/// narrowed to one row.
 ///
-/// Muted causes stay readable, like v1's `show` (`with_muted` is on).
+/// Muted causes — a muted actor, a muted thread — hide too, like the
+/// default listing (`with_muted` is off): the web push job and the streaming
+/// hint read through this, so a mute or block laid after the event still
+/// keeps the row from the recipient's devices.
 ///
 /// `None` says the caller owns no such live row (the unknown, the dismissed,
-/// the blocked and the invisible-actor id all answer the shared 404), where
-/// [`get`](super::get) reports the row whatever its state.
+/// the blocked, the muted and the invisible-actor id all answer the shared
+/// 404), where [`get`](super::get) reports the row whatever its state.
 ///
 /// # Errors
 ///
@@ -138,7 +141,7 @@ pub async fn get_visible(
     id: Uuid,
 ) -> AppResult<Option<Notification>> {
     let mut qb = QueryBuilder::<Postgres>::new("SELECT n.* FROM notifications n");
-    push_visible_scope(&mut qb, user_id, true);
+    push_visible_scope(&mut qb, user_id, false);
     let _one: &mut _ = qb.push(" AND n.id = ").push_bind(id);
     let row = qb
         .build_query_as::<Notification>()
@@ -455,11 +458,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_visible_hides_blocked_actors_but_keeps_muted_ones() {
+    async fn get_visible_hides_blocked_and_muted_causes_but_keeps_other_pairs() {
         use crate::{
             config::TEST_BASE_URL,
             models::{
-                block,
+                block, conversation_mute, domain_block,
                 mute::{self, MuteOptions},
             },
         };
@@ -468,28 +471,67 @@ mod tests {
         let alice = solo(pool, "visible-alice").await;
         let blocked = solo(pool, "visible-blocked").await;
         let muted = solo(pool, "visible-muted").await;
+        let timeline_only = solo(pool, "visible-timeline").await;
+        let unrelated = solo(pool, "visible-unrelated").await;
+        let mallory = remote(pool, "mallory", "visible-evil.example").await;
+        let erin = solo(pool, "visible-erin").await;
+        let thread = post(pool, &erin).await;
         let from_blocked = note(pool, alice.id, blocked.id, "follow", None).await;
         let from_muted = note(pool, alice.id, muted.id, "follow", None).await;
+        let from_timeline = note(pool, alice.id, timeline_only.id, "mention", None).await;
+        let from_domain = note(pool, alice.id, mallory.id, "follow", None).await;
+        let in_thread = note(pool, alice.id, erin.id, "favourite", Some(thread)).await;
+        let from_unrelated = note(pool, alice.id, unrelated.id, "follow", None).await;
         let _edge = block::block(pool, TEST_BASE_URL, &alice, &blocked)
             .await
             .expect("the block lands");
         let _mute = mute::mute(pool, &alice, &muted, MuteOptions::default())
             .await
             .expect("the mute lands");
+        let _timeline = mute::mute(
+            pool,
+            &alice,
+            &timeline_only,
+            MuteOptions {
+                notifications: false,
+                expires_in: None,
+            },
+        )
+        .await
+        .expect("the timeline-only mute lands");
+        domain_block::block_domain(pool, alice.id, "visible-evil.example")
+            .await
+            .expect("the domain block lands");
+        conversation_mute::mute(pool, alice.id, thread)
+            .await
+            .expect("the thread mute lands");
 
-        assert!(
-            get_visible(pool, alice.id, from_blocked.id)
-                .await
-                .expect("the read runs")
-                .is_none(),
-            "a blocked actor's row hides"
-        );
-        assert!(
-            get_visible(pool, alice.id, from_muted.id)
-                .await
-                .expect("the read runs")
-                .is_some(),
-            "a muted actor's row still shows, like v1's show"
-        );
+        for (hidden, why) in [
+            (&from_blocked, "a blocked actor's row hides"),
+            (&from_domain, "a blocked domain's row hides"),
+            (&from_muted, "a hide_notifications mute hides the row"),
+            (&in_thread, "a muted thread hides the row"),
+        ] {
+            assert!(
+                get_visible(pool, alice.id, hidden.id)
+                    .await
+                    .expect("the read runs")
+                    .is_none(),
+                "{why}"
+            );
+        }
+        for (shown, why) in [
+            (&from_unrelated, "an unrelated pair's row reads back"),
+            (&from_timeline, "a timeline-only mute hides nothing here"),
+        ] {
+            assert_eq!(
+                get_visible(pool, alice.id, shown.id)
+                    .await
+                    .expect("the read runs")
+                    .map(|row| row.id),
+                Some(shown.id),
+                "{why}"
+            );
+        }
     }
 }
