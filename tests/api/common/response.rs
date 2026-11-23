@@ -137,3 +137,17 @@ pub fn assert_all_refused(refused: &[TestResponse], status: StatusCode, message:
         assert_error(response, message, who);
     }
 }
+
+/// A mock peer's federation answer: `document` served as
+/// `application/activity+json`, the media type the fetchers require
+/// (axum's own `Json` answers `application/json`, which they refuse).
+#[must_use]
+pub fn activity_json(document: &Value) -> Response {
+    use axum::{http::header::CONTENT_TYPE, response::IntoResponse as _};
+
+    (
+        [(CONTENT_TYPE, "application/activity+json")],
+        document.to_string(),
+    )
+        .into_response()
+}
