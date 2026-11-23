@@ -11,10 +11,15 @@ use std::{sync::Arc, time::Duration};
 
 use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
+use chrono::Utc;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use crate::{state::AppState, streaming::hub::StreamEvent};
+use crate::{
+    models::{oauth_token, user},
+    state::AppState,
+    streaming::hub::StreamEvent,
+};
 
 use super::{
     connection::{Connection, Flow, Input},
@@ -72,7 +77,14 @@ async fn serve_one(socket: &mut WebSocket, connection: &mut Connection, input: I
         Input::Client(received) => from_client(socket, connection, received).await,
         Input::Bus(received) => from_hub(socket, connection, received).await,
         Input::Ping => heartbeat(socket, connection).await,
-        Input::Refresh => refresh_filters(connection).await,
+        Input::Refresh => {
+            let flow = refresh(connection).await;
+            if flow == Flow::Stop {
+                debug!("closing a streaming socket whose credential is no longer valid");
+                let _closed = socket.send(Message::Close(None)).await;
+            }
+            flow
+        }
     }
 }
 
@@ -142,8 +154,46 @@ async fn heartbeat(socket: &mut WebSocket, connection: &mut Connection) -> Flow 
     write(socket, Message::Ping(Bytes::new())).await
 }
 
-/// Reads the reader's suppression sets again.
-async fn refresh_filters(connection: &mut Connection) -> Flow {
+/// Whether the credential the socket authenticated with still stands: its
+/// token row exists and has not expired, and its user exists and is active.
+/// An anonymous socket holds no credential and always stands. A database
+/// failure is not proof of revocation: the socket is kept and the next
+/// refresh asks again.
+async fn credential_stands(connection: &Connection) -> bool {
+    let Some(token_id) = connection.token_id else {
+        return true;
+    };
+    let db = &connection.state.db;
+    let token = match oauth_token::get_by_id(db, token_id).await {
+        Ok(found) => found,
+        Err(err) => {
+            warn!(%err, "streaming token could not be re-checked; the socket stays");
+            return true;
+        }
+    };
+    let Some(token) = token.filter(|row| row.valid_until > Utc::now()) else {
+        return false;
+    };
+    let Some(user_id) = token.user_id else {
+        return false;
+    };
+    match user::get_by_id(db, user_id).await {
+        Ok(found) => found.is_some_and(|row| row.is_active.get()),
+        Err(err) => {
+            warn!(%err, "streaming user could not be re-checked; the socket stays");
+            true
+        }
+    }
+}
+
+/// The refresh tick: a socket whose token was revoked or has expired, or
+/// whose account was deactivated or deleted, is over ([`Flow::Stop`]; the
+/// caller sends the close frame). Every other socket reads its reader's
+/// suppression sets again.
+async fn refresh(connection: &mut Connection) -> Flow {
+    if !credential_stands(connection).await {
+        return Flow::Stop;
+    }
     let Some(reader) = connection.reader_id() else {
         return Flow::Keep;
     };
@@ -167,10 +217,132 @@ async fn write(socket: &mut WebSocket, message: Message) -> Flow {
 
 #[cfg(test)]
 mod tests {
-    use crate::api::streaming::test_support::app_state_with;
+    use crate::api::streaming::test_support::{account, app_state_with, state, token_for};
     use crate::config::Config;
+    use crate::{auth, oauth::scopes::READ};
 
     use super::*;
+
+    /// A connection authenticated the way the handshake does it: the raw
+    /// bearer string resolved to its credential.
+    async fn connected(state: &AppState, raw: &str) -> Connection {
+        let credential = auth::credential(state, raw)
+            .await
+            .expect("the token lookup runs")
+            .expect("the fixture token is live");
+        Connection::new(state.clone(), Some(credential))
+            .await
+            .expect("the connection opens")
+    }
+
+    #[tokio::test]
+    async fn a_live_token_keeps_the_socket_and_an_anonymous_socket_always_stays() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "refresh-live").await;
+        let raw = token_for(&state, &reader, READ).await;
+        let mut connection = connected(&state, &raw).await;
+        let mut anonymous = Connection::new(state.clone(), None).await.unwrap();
+
+        assert!(connection.token_id.is_some(), "the token's id is held");
+        assert_eq!(
+            refresh(&mut connection).await,
+            Flow::Keep,
+            "a live token and an active user keep the socket open"
+        );
+        assert!(anonymous.token_id.is_none(), "an anonymous socket has none");
+        assert_eq!(
+            refresh(&mut anonymous).await,
+            Flow::Keep,
+            "an anonymous socket has no credential to lose"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_token_stops_the_socket_on_the_next_refresh() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "refresh-revoked").await;
+        let raw = token_for(&state, &reader, READ).await;
+        let mut connection = connected(&state, &raw).await;
+        let token_id = connection.token_id.expect("the token's id is held");
+
+        oauth_token::delete_token(&state.db, token_id)
+            .await
+            .expect("the token is revoked");
+
+        assert_eq!(
+            refresh(&mut connection).await,
+            Flow::Stop,
+            "a token whose row is gone closes the socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_stops_the_socket_on_the_next_refresh() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "refresh-expired").await;
+        let raw = token_for(&state, &reader, READ).await;
+        let mut connection = connected(&state, &raw).await;
+        let _aged = sqlx::query(
+            "UPDATE oauth_tokens SET valid_until = now() - interval '1 hour' WHERE id = $1",
+        )
+        .bind(connection.token_id)
+        .execute(&state.db)
+        .await
+        .expect("the token is back-dated");
+
+        assert_eq!(
+            refresh(&mut connection).await,
+            Flow::Stop,
+            "a token past its expiry closes the socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_account_stops_the_socket_on_the_next_refresh() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "refresh-deactivated").await;
+        let raw = token_for(&state, &reader, READ).await;
+        let mut connection = connected(&state, &raw).await;
+        let _deactivated = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(reader.id)
+            .execute(&state.db)
+            .await
+            .expect("the account is deactivated");
+
+        assert_eq!(
+            refresh(&mut connection).await,
+            Flow::Stop,
+            "a token of a deactivated user closes the socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_authenticated_late_is_checked_too() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "refresh-late").await;
+        let raw = token_for(&state, &reader, READ).await;
+        let mut connection = Connection::new(state.clone(), None).await.unwrap();
+        let replies = connection
+            .on_client_text(&format!(
+                r#"{{"type":"pleroma:authenticate","token":"{raw}"}}"#
+            ))
+            .await;
+        assert!(replies.is_empty(), "the token is taken up");
+        let token_id = connection
+            .token_id
+            .expect("authenticate holds the token id");
+
+        assert_eq!(refresh(&mut connection).await, Flow::Keep, "still live");
+        oauth_token::delete_token(&state.db, token_id)
+            .await
+            .expect("the token is revoked");
+
+        assert_eq!(
+            refresh(&mut connection).await,
+            Flow::Stop,
+            "a late-authenticated socket closes on revoke as well"
+        );
+    }
 
     #[tokio::test]
     async fn a_configured_heartbeat_is_the_socket_loops_period() {

@@ -9,18 +9,19 @@
 
 use axum::{Json, http::HeaderMap};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::PgConnection;
 
 use super::{
     MISSING_CODE, MISSING_REFRESH_TOKEN, TokenReply,
-    issue::{TokenResponse, authenticate_user, check_account_ready, issue_token},
+    issue::{TokenResponse, authenticate_user, check_account_ready, issue_token, issue_token_on},
     mfa,
     params::{TokenParams, invalid_credentials, requested_scopes, validate_app},
 };
 use crate::{
     error::{AppError, AppResult},
     models::{
-        oauth_token::{self, OauthToken},
+        oauth_app::OauthApp,
+        oauth_token::{self, OauthToken, REFRESH_GRACE},
         user::{self, User},
     },
     oauth::scopes::Scopes,
@@ -152,9 +153,19 @@ pub(super) struct MfaRequiredResponse {
 /// [`check_account_ready`]'s 403 with its identifier instead: rotating a
 /// pair is a login, and the registration modes gate it like the password
 /// grant. The replacement carries the same user and scopes and is minted
-/// before the old row goes, so the old access and refresh tokens stop
-/// working at the answer. No expiry is applied to the old row: refreshing
-/// is precisely what a client does after its access token has lapsed.
+/// in the transaction that deletes the old row, so the old access and
+/// refresh tokens stop working at the answer.
+///
+/// A refresh token works exactly once, and only within [`REFRESH_GRACE`] of
+/// the pair's `valid_until` (refreshing is precisely what a client does after
+/// its access token has lapsed, but not forever): one transaction deletes the
+/// old row with [`consume_refresh_token`], checks the owner and mints the
+/// replacement, so two concurrent requests with one token cannot both get a
+/// pair. A refusal — unknown, foreign or lapsed token, deactivated owner, or
+/// an account not ready to log in — rolls the transaction back, so the old
+/// pair survives it.
+///
+/// [`consume_refresh_token`]: oauth_token::consume_refresh_token
 pub(super) async fn refresh_token_grant(
     state: &AppState,
     headers: &HeaderMap,
@@ -164,23 +175,60 @@ pub(super) async fn refresh_token_grant(
         return Err(AppError::BadRequest(MISSING_REFRESH_TOKEN.to_owned()));
     };
     let app = validate_app(state, headers, params.body_credentials()).await?;
-    let old = oauth_token::get_by_refresh_token(&state.db, refresh_token)
+    let mut tx = state.db.begin().await?;
+    match rotate_pair(state, &mut tx, &app, refresh_token).await {
+        Ok((fresh, owner)) => {
+            tx.commit().await?;
+            Ok(TokenReply::Issued(Json(TokenResponse::new(
+                fresh,
+                Some(&owner),
+            ))))
+        }
+        Err(refusal) => {
+            tx.rollback().await?;
+            Err(refusal)
+        }
+    }
+}
+
+/// The body of [`refresh_token_grant`] on its transaction's connection:
+/// consumes the refresh token of `app`, checks the owner and mints the pair
+/// that replaces the consumed one. Nothing is durable until the caller
+/// commits, so any error here leaves the old pair in place once it rolls
+/// back.
+///
+/// # Errors
+///
+/// 400 [`INVALID_CREDENTIALS`](super::INVALID_CREDENTIALS) for an unknown,
+/// foreign or lapsed refresh token and for an owner that is gone or
+/// deactivated, [`check_account_ready`]'s 403 for an account that is not
+/// ready to log in, and [`AppError::Database`] for a database failure.
+async fn rotate_pair(
+    state: &AppState,
+    conn: &mut PgConnection,
+    app: &OauthApp,
+    refresh_token: &str,
+) -> AppResult<(OauthToken, User)> {
+    let old = oauth_token::consume_refresh_token(&mut *conn, refresh_token, app.id, REFRESH_GRACE)
         .await?
-        .filter(|found| found.app_id == app.id)
         .ok_or_else(invalid_credentials)?;
-    let owner = active_owner(&state.db, &old)
+    let owner = active_owner(&mut *conn, &old)
         .await?
         .ok_or_else(invalid_credentials)?;
     check_account_ready(&owner)?;
-    let fresh = issue_token(state, Some(&owner), &app, Scopes::parse(&old.scopes)).await?;
-    oauth_token::delete_token(&state.db, old.id).await?;
-    Ok(TokenReply::Issued(Json(TokenResponse::new(
-        fresh,
+    let fresh = issue_token_on(
+        &mut *conn,
+        state,
         Some(&owner),
-    ))))
+        app,
+        Scopes::parse(&old.scopes),
+    )
+    .await?;
+    Ok((fresh, owner))
 }
 
-/// The active user behind `token`: `None` when the row is app-only
+/// The active user behind `token`, read on the caller's connection so the
+/// refresh transaction needs no second one: `None` when the row is app-only
 /// (`user_id = NULL`, so it never had a refreshable pair), its user was
 /// deleted out from under it, or the account is deactivated — a
 /// suspended account cannot rotate its tokens. The readiness the
@@ -191,11 +239,14 @@ pub(super) async fn refresh_token_grant(
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
-async fn active_owner(pool: &PgPool, token: &OauthToken) -> AppResult<Option<User>> {
-    let owner = match token.user_id {
-        Some(user_id) => user::get_by_id(pool, user_id).await?,
-        None => None,
+async fn active_owner(conn: &mut PgConnection, token: &OauthToken) -> AppResult<Option<User>> {
+    let Some(user_id) = token.user_id else {
+        return Ok(None);
     };
+    let owner = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(conn)
+        .await?;
     Ok(owner.filter(|user| user.is_active.get()))
 }
 

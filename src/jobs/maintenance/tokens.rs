@@ -13,6 +13,7 @@ use tracing::info;
 
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError},
+    models::oauth_token::REFRESH_GRACE,
     state::AppState,
 };
 
@@ -22,18 +23,13 @@ use crate::{
 /// [`QUEUE_BACKGROUND`](crate::jobs::QUEUE_BACKGROUND).
 pub const KIND_TOKENS: &str = "maintenance.tokens";
 
-/// How long an expired `oauth_tokens` row stays in the table before the
-/// sweep reclaims it: seven days. The pair's refresh token remains a
-/// usable credential for exactly this long past `valid_until` — the token
-/// endpoint, not a retention job, decides when a refresh stops working —
-/// so deleting earlier would break clients entitled to refresh.
-const OAUTH_TOKEN_GRACE_DAYS: i32 = 7;
-
 /// The `DELETE` behind [`delete_long_expired_oauth_tokens`]: every token
-/// row whose `valid_until` is more than [`OAUTH_TOKEN_GRACE_DAYS`] days in
-/// the past.
+/// row whose `valid_until` is more than [`REFRESH_GRACE`] in the past — the
+/// window [`consume_refresh_token`](crate::models::oauth_token::consume_refresh_token)
+/// enforces in its own query, so a row the sweep keeps is one a refresh may
+/// still redeem, and one it deletes is one no refresh accepts any more.
 const DELETE_OAUTH_TOKENS_SQL: &str = "DELETE FROM oauth_tokens
-         WHERE valid_until < now() - make_interval(days => $1)";
+         WHERE valid_until < now() - $1::interval";
 
 /// The `DELETE` behind [`delete_dead_authorizations`]: every code that has
 /// been exchanged (`used = true`) or has reached `valid_until`. Codes are
@@ -58,11 +54,11 @@ const DELETE_MFA_TOKENS_SQL: &str = "DELETE FROM mfa_tokens WHERE valid_until <=
 const DELETE_PASSWORD_RESET_TOKENS_SQL: &str = "DELETE FROM password_reset_tokens
          WHERE used = true OR inserted_at <= now() - $1::interval";
 
-/// Deletes the `oauth_tokens` expired beyond [`OAUTH_TOKEN_GRACE_DAYS`]
-/// days, reporting how many rows went.
+/// Deletes the `oauth_tokens` expired beyond [`REFRESH_GRACE`], reporting
+/// how many rows went.
 async fn delete_long_expired_oauth_tokens(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let deleted = query(DELETE_OAUTH_TOKENS_SQL)
-        .bind(OAUTH_TOKEN_GRACE_DAYS)
+        .bind(REFRESH_GRACE)
         .execute(pool)
         .await?;
     Ok(deleted.rows_affected())
@@ -139,7 +135,7 @@ async fn sweep_tokens(state: &AppState) -> Result<u64, sqlx::Error> {
 /// sweep of the dead credential rows, logging how many it deleted.
 ///
 /// The five deletes cover `oauth_tokens` expired beyond the
-/// `OAUTH_TOKEN_GRACE_DAYS`-day refresh grace, `oauth_authorizations`
+/// [`REFRESH_GRACE`] refresh grace, `oauth_authorizations`
 /// spent or expired, `mfa_tokens` expired, `password_reset_tokens` spent
 /// or outside the configured ttl window, and `oauth_login_states` past
 /// their ten minutes. Every row they match is one no read path accepts any

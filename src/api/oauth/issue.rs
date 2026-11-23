@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 
 use super::{
     ACCOUNT_DISABLED, ACCOUNT_IS_DISABLED, TOKEN_TYPE_BEARER,
@@ -111,12 +111,31 @@ pub(super) async fn issue_token(
     app: &OauthApp,
     scopes: Scopes,
 ) -> AppResult<OauthToken> {
+    issue_token_on(&state.db, state, user, app, scopes).await
+}
+
+/// [`issue_token`] on the caller's executor: the refresh grant mints the
+/// replacement pair in the transaction that consumed the old one.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+pub(super) async fn issue_token_on<'e, E>(
+    executor: E,
+    state: &AppState,
+    user: Option<&User>,
+    app: &OauthApp,
+    scopes: Scopes,
+) -> AppResult<OauthToken>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     // `OAUTH_TOKEN_TTL_SECS` is a `usize`; on any target where it could
     // exceed `u64::MAX` the absurd upper bound fails the insert instead
     // of silently shortening the lifetime.
     let ttl_secs = u64::try_from(state.config.oauth_token_ttl_secs).unwrap_or(u64::MAX);
     oauth_token::create_token(
-        &state.db,
+        executor,
         &NewToken {
             user_id: user.map(|user| user.id),
             app_id: app.id,

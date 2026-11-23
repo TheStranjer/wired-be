@@ -134,15 +134,273 @@ fn transient(what: &str, err: &AppError) -> FederationError {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Router,
+        extract::State,
+        http::{StatusCode, header::CONTENT_TYPE},
+        response::{IntoResponse as _, Response},
+        routing::get,
+    };
+    use serde_json::{Value, json};
     use sqlx::postgres::PgPoolOptions;
+    use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
     use crate::{
         federation::handlers::misc::test_support::*,
-        models::{block, pinned_status},
+        http_client::HttpClient,
+        models::{
+            block, pinned_status,
+            user::{NewUser, insert},
+        },
         state::AppState,
     };
+
+    /// What the loopback peer answers a request for the move target with.
+    #[derive(Clone, Debug)]
+    struct TargetPeer {
+        /// The actor document served on a 200.
+        document: Value,
+        /// The status the peer answers with.
+        status: StatusCode,
+        /// The requests the peer has answered.
+        hits: Arc<AtomicUsize>,
+    }
+
+    /// Counts the hit and answers the configured status, with the document
+    /// on a 200.
+    async fn serve_target(State(peer): State<TargetPeer>) -> Response {
+        let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
+        if peer.status != StatusCode::OK {
+            return peer.status.into_response();
+        }
+        (
+            [(CONTENT_TYPE, "application/activity+json")],
+            peer.document.to_string(),
+        )
+            .into_response()
+    }
+
+    /// The running loopback peer of one refetch test.
+    #[derive(Debug)]
+    struct Loopback {
+        /// The target actor's id on the peer.
+        target_id: String,
+        /// The requests the peer has answered.
+        hits: Arc<AtomicUsize>,
+        /// The server task, aborted when the test ends.
+        server: JoinHandle<()>,
+    }
+
+    /// Serves carol on a fresh loopback port: her document claims `aliases`
+    /// and the peer answers `status`.
+    async fn loopback_target(aliases: &[&str], status: StatusCode) -> Loopback {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port binds");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let target_id = format!("{base}/users/carol");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let peer = TargetPeer {
+            document: json!({
+                "@context": "https://www.w3.org/ns/activitystreams",
+                "type": "Person",
+                "id": target_id,
+                "preferredUsername": "carol",
+                "name": "Carol",
+                "inbox": format!("{target_id}/inbox"),
+                "alsoKnownAs": aliases,
+                "publicKey": {
+                    "id": format!("{target_id}#main-key"),
+                    "owner": target_id,
+                    "publicKeyPem":
+                        "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n",
+                },
+            }),
+            status,
+            hits: Arc::clone(&hits),
+        };
+        let app = Router::new()
+            .route("/users/carol", get(serve_target))
+            .with_state(peer);
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                tracing::debug!("test server stopped: {err}");
+            }
+        });
+        Loopback {
+            target_id,
+            hits,
+            server,
+        }
+    }
+
+    /// The target's stored mirror as a day-old-or-less cache holds it: no
+    /// aliases yet, and a fetch stamp of now, so a plain lookup serves it
+    /// without the network.
+    async fn cached_target(pool: &PgPool, target_id: &str) -> User {
+        let authority = target_id
+            .strip_prefix("http://")
+            .and_then(|rest| rest.split('/').next())
+            .expect("the loopback id is an http url");
+        let stored = insert(
+            pool,
+            &NewUser {
+                nickname: format!("carol@{authority}"),
+                ap_id: target_id.to_owned(),
+                domain: Some(authority.to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the cached target inserts");
+        let _stamped = sqlx::query("UPDATE users SET last_fetched_at = now() WHERE id = $1")
+            .bind(stored.id)
+            .execute(pool)
+            .await
+            .expect("the fixture stamps the fetch");
+        stored
+    }
+
+    /// Test state whose client may reach the loopback peer.
+    fn loopback_state(pool: &PgPool) -> AppState {
+        let mut state = app_state(pool);
+        state.http_client = HttpClient::new_for_tests("Wired (https://test.example)");
+        state
+    }
+
+    /// A `Move` of [`ALICE`] to `target_id`.
+    fn move_to(target_id: &str) -> ActivityView {
+        view(
+            "Move",
+            "refetch-move",
+            ALICE,
+            json!({"object": ALICE, "target": target_id}),
+        )
+    }
+
+    /// A cached target without the alias is refetched once; the peer's
+    /// fresh document carries it, so the `Move` is folded.
+    #[tokio::test]
+    async fn a_move_whose_cached_target_lacks_the_alias_refetches_and_succeeds() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = loopback_target(&[ALICE], StatusCode::OK).await;
+        let _cached = cached_target(&pool, &peer.target_id).await;
+        let alice = remote_signer(&pool).await;
+        let alice_id = alice.id;
+
+        let moved = handle_move(loopback_state(&pool), move_to(&peer.target_id), alice).await;
+
+        assert_handled(&moved);
+        assert_eq!(
+            peer.hits.load(Ordering::SeqCst),
+            1,
+            "refetched exactly once"
+        );
+        assert_eq!(
+            fresh_user(&pool, alice_id).await.moved_to_ap_id.as_deref(),
+            Some(peer.target_id.as_str()),
+            "the old account points at the new one"
+        );
+        let stored = user::get_by_ap_id(&pool, &peer.target_id)
+            .await
+            .unwrap()
+            .expect("the target stays mirrored");
+        assert_eq!(stored.also_known_as, vec![ALICE.to_owned()], "alias stored");
+        peer.server.abort();
+    }
+
+    /// A refetch that still does not list the origin is refused, after one
+    /// refetch and no more.
+    #[tokio::test]
+    async fn a_move_whose_refetched_target_still_lacks_the_alias_is_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = loopback_target(&[MALLORY], StatusCode::OK).await;
+        let _cached = cached_target(&pool, &peer.target_id).await;
+        let alice = remote_signer(&pool).await;
+        let alice_id = alice.id;
+
+        let refused = handle_move(loopback_state(&pool), move_to(&peer.target_id), alice).await;
+
+        assert!(ignored(refused).contains("aliases"), "no claim, no move");
+        assert_eq!(
+            peer.hits.load(Ordering::SeqCst),
+            1,
+            "refetched exactly once"
+        );
+        assert!(
+            fresh_user(&pool, alice_id).await.moved_to_ap_id.is_none(),
+            "the account is not marked moved"
+        );
+        peer.server.abort();
+    }
+
+    /// A target the peer reports gone on the refetch is ignored.
+    #[tokio::test]
+    async fn a_move_whose_target_refetch_is_gone_is_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = loopback_target(&[ALICE], StatusCode::GONE).await;
+        let _cached = cached_target(&pool, &peer.target_id).await;
+        let alice = remote_signer(&pool).await;
+        let alice_id = alice.id;
+
+        let refused = handle_move(loopback_state(&pool), move_to(&peer.target_id), alice).await;
+
+        assert!(
+            ignored(refused).contains("cannot be resolved"),
+            "a gone target moves nobody"
+        );
+        assert_eq!(peer.hits.load(Ordering::SeqCst), 1, "the refetch was tried");
+        assert!(
+            fresh_user(&pool, alice_id).await.moved_to_ap_id.is_none(),
+            "the account is not marked moved"
+        );
+        peer.server.abort();
+    }
+
+    /// A target that is not found on the refetch is ignored too.
+    #[tokio::test]
+    async fn a_move_whose_target_refetch_is_not_found_is_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = loopback_target(&[ALICE], StatusCode::NOT_FOUND).await;
+        let _cached = cached_target(&pool, &peer.target_id).await;
+        let alice = remote_signer(&pool).await;
+
+        let refused = handle_move(loopback_state(&pool), move_to(&peer.target_id), alice).await;
+
+        assert!(ignored(refused).contains("cannot be resolved"));
+        peer.server.abort();
+    }
+
+    /// Any other refetch failure is the queue's to retry.
+    #[tokio::test]
+    async fn a_move_whose_target_refetch_fails_is_retried() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = loopback_target(&[ALICE], StatusCode::INTERNAL_SERVER_ERROR).await;
+        let _cached = cached_target(&pool, &peer.target_id).await;
+        let alice = remote_signer(&pool).await;
+
+        let failed = handle_move(loopback_state(&pool), move_to(&peer.target_id), alice).await;
+
+        assert!(
+            matches!(failed, Err(FederationError::Transient(_))),
+            "a failing peer is a retry, not a verdict: {failed:?}"
+        );
+        peer.server.abort();
+    }
 
     /// Test state over a pool that cannot answer: the database having gone
     /// away, as the handlers see it.

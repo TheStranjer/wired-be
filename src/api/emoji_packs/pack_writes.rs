@@ -288,6 +288,7 @@ mod tests {
             description: Some("keep me".to_owned()),
             fallback_src: Some("https://old.example/old.zip".to_owned()),
             fallback_src_sha256: Some("dead".to_owned()),
+            download_sha256: None,
             share_files: true,
         };
         let patch: MetadataPatch = serde_json::from_value(json!({

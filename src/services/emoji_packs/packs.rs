@@ -165,6 +165,7 @@ mod tests {
                 description: Some("Test pack".to_owned()),
                 fallback_src: Some("https://emoji.example/pack.zip".to_owned()),
                 fallback_src_sha256: Some("beef".to_owned()),
+                download_sha256: None,
                 share_files: true,
             },
             files: BTreeMap::from([("cat".to_owned(), "cat.png".to_owned())]),

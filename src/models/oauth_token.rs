@@ -38,7 +38,8 @@ mod listing;
 /// The fixtures the children's tests share.
 #[cfg(test)]
 mod test_support;
-/// Issuing tokens and the lookups by credential, id and refresh token.
+/// Issuing tokens, the lookups by credential and id, and the single-use
+/// refresh-token redemption.
 mod tokens;
 /// The token lookup that joins the issuing application.
 mod with_app;
@@ -50,8 +51,16 @@ pub use deletes::{
     delete_all_for_user, delete_all_for_user_except, delete_expired, delete_for_user, delete_token,
 };
 pub use listing::{TokenWithAppName, list_for_user, list_valid_with_app_names};
-pub use tokens::{create_token, get_by_id, get_by_refresh_token, get_valid_token};
+pub use tokens::{consume_refresh_token, create_token, get_by_id, get_valid_token};
 pub use with_app::get_with_app;
+
+/// How long past its `valid_until` a pair's refresh token stays redeemable.
+///
+/// Seven days. [`consume_refresh_token`] takes it as the bound of its
+/// `DELETE`, and the hourly credential sweep reclaims rows lapsed beyond it,
+/// so the token endpoint and the retention job share one definition and
+/// cannot drift.
+pub const REFRESH_GRACE: Duration = Duration::from_hours(168);
 
 /// Default lifetime of a newly created access token: 30 days, the same
 /// span [`DEFAULT_OAUTH_TOKEN_TTL_SECS`] spells in seconds (a test keeps
@@ -154,7 +163,7 @@ mod tests {
             "an unknown access token finds nothing"
         );
         assert!(
-            get_by_refresh_token(&pool, "no-such-refresh")
+            consume_refresh_token(&pool, "no-such-refresh", new_id(), REFRESH_GRACE)
                 .await
                 .unwrap()
                 .is_none(),

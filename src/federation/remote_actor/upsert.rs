@@ -12,7 +12,8 @@ use crate::{
 
 /// The upsert behind [`upsert_remote_user`]: insert keyed by a fresh
 /// `UUIDv7`, or, when `ap_id` already has a row, overwrite exactly the
-/// profile, key and endpoint columns the actor document describes plus
+/// profile, key, endpoint and `alsoKnownAs` columns the actor document
+/// describes plus
 /// `last_fetched_at` and `updated_at`. `local`, `bot`, the login columns,
 /// the moderation roles and the denormalised counters are deliberately not
 /// touched: re-fetching a remote actor must not undo anything this instance
@@ -21,10 +22,10 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      id, nickname, ap_id, local, domain, actor_type, name, bio, raw_bio,
      avatar_url, banner_url, profile_url, locked, discoverable, fields,
      inbox, shared_inbox, outbox, followers_url, following_url,
-     featured_url, public_key, last_fetched_at
+     featured_url, public_key, also_known_as, last_fetched_at
  ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18, $19, $20, $21, $22, now()
+     $16, $17, $18, $19, $20, $21, $22, $23, now()
  ) ON CONFLICT (ap_id) DO UPDATE SET
      nickname = EXCLUDED.nickname,
      domain = EXCLUDED.domain,
@@ -45,6 +46,7 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      following_url = EXCLUDED.following_url,
      featured_url = EXCLUDED.featured_url,
      public_key = EXCLUDED.public_key,
+     also_known_as = EXCLUDED.also_known_as,
      last_fetched_at = now(),
      updated_at = now()
  RETURNING *";
@@ -139,6 +141,7 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.following_url.as_deref())
         .bind(new.featured_url.as_deref())
         .bind(new.public_key.as_str())
+        .bind(&new.also_known_as)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;

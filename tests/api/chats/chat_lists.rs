@@ -7,7 +7,10 @@ use axum::{Router, http::StatusCode};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::models::{chat, user::User};
+use wired_be::{
+    config::TEST_BASE_URL,
+    models::{block, chat, mute, user::User},
+};
 
 use super::support::{
     CHAT_KEYS, READ_SCOPE, ROOT, V2_ROOT, error_message, expected_link, fixture, get_as, json_keys,
@@ -155,7 +158,7 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
 
 /// Both lists take the same filters: `pinned=true`/`false` split the chats
 /// (through Pleroma's boolean spellings, and on v2 alike), `with_muted` is
-/// accepted and hides nothing while the mutes table waits for its ticket, a
+/// accepted and is the switch for muted chats (see below), a
 /// non-boolean filter fails validation, and a chatless account gets the bare
 /// empty array with no `Link` header.
 #[tokio::test]
@@ -206,7 +209,7 @@ async fn the_lists_filter_by_pinned_and_tolerate_with_muted() {
     got.sort();
     assert_eq!(
         got, want,
-        "with_muted lists every chat: there are no mutes to hide yet"
+        "with_muted lists every chat when nobody is muted"
     );
 
     let junk = get_as(&app, &token, &format!("{ROOT}?pinned=maybe")).await;
@@ -344,4 +347,68 @@ async fn the_lists_default_to_twenty_and_v1_caps_at_thirty() {
         32,
         "v2 lets a page of 35 through — every chat fits under its cap"
     );
+}
+
+/// Both lists leave out chats with accounts the caller blocked, whatever
+/// `with_muted` says; chats with muted accounts are left out unless
+/// `with_muted=true` (an expired mute hides nothing), and an account that
+/// blocked the caller keeps its chat in the list.
+#[tokio::test]
+async fn the_lists_hide_blocked_and_muted_counterparts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = fixture(&pool, "alice", READ_SCOPE).await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = common::create_local_user(&pool, "carol").await;
+    let dave = common::create_local_user(&pool, "dave").await;
+    let erin = common::create_local_user(&pool, "erin").await;
+    let _with_bob = open_chat(&pool, &alice, &bob).await;
+    let with_carol = open_chat(&pool, &alice, &carol).await;
+    let with_dave = open_chat(&pool, &alice, &dave).await;
+    let with_erin = open_chat(&pool, &alice, &erin).await;
+    let _blocked = block::block(&pool, TEST_BASE_URL, &alice, &bob)
+        .await
+        .expect("alice's block is written");
+    let _mute = mute::mute(&pool, &alice, &carol, mute::MuteOptions::default())
+        .await
+        .expect("alice's mute is written");
+    let _lapsed: sqlx::postgres::PgQueryResult = sqlx::query(
+        "INSERT INTO mutes (id, muter_id, muted_id, expires_at)
+         VALUES ($1, $2, $3, now() - interval '1 hour')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(alice.id)
+    .bind(dave.id)
+    .execute(&pool)
+    .await
+    .expect("the lapsed mute inserts");
+    let _blocked_by = block::block(&pool, TEST_BASE_URL, &erin, &alice)
+        .await
+        .expect("erin's block is written");
+    let app = common::test_app(pool.clone());
+
+    for root in [ROOT, V2_ROOT] {
+        let default = get_as(&app, &token, root).await.json_value();
+        let mut want = vec![with_dave.id.to_string(), with_erin.id.to_string()];
+        let mut got = listed_ids(&default);
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "{root}: blocked and live-muted chats are hidden");
+
+        let with_muted = get_as(&app, &token, &format!("{root}?with_muted=true"))
+            .await
+            .json_value();
+        let mut want_all = vec![
+            with_carol.id.to_string(),
+            with_dave.id.to_string(),
+            with_erin.id.to_string(),
+        ];
+        let mut got_all = listed_ids(&with_muted);
+        want_all.sort();
+        got_all.sort();
+        assert_eq!(
+            got_all, want_all,
+            "{root}: with_muted brings back only the muted"
+        );
+    }
 }
