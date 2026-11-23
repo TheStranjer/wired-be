@@ -28,6 +28,14 @@
 //! extracted onto [`NewRemoteUser`]: the fetch and move tickets consume
 //! them, and parsing them here is what validates their shape.
 //!
+//! A remote actor recreated under a new id (an origin that reinstalled,
+//! moved its actor paths, or deleted and recreated the account) keeps its
+//! `preferredUsername@host` handle. [`upsert_remote_user`] frees the handle
+//! by renaming the stale mirror of the same domain to `<old id>.<nickname>`
+//! and stores the new actor, as Pleroma's `maybe_handle_clashing_nickname`
+//! does; [`ActorError::NicknameConflict`] is kept for a holder that is not
+//! such a mirror (a local row, or another domain).
+//!
 //! Network access is out of scope for this module on purpose: documents
 //! arrive already fetched; retrieving them is the next ticket.
 
