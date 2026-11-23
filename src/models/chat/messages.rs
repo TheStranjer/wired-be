@@ -2,7 +2,7 @@
 //! list of a chat's messages, the lookup by `ActivityPub` id and the
 //! withdrawal that turns a message into a tombstone.
 
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{error::AppResult, pagination::PageParams, util::format::text_to_html};
@@ -97,30 +97,24 @@ pub async fn message_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<Ch
 /// participants' references survive and read the absence through
 /// [`messages_page`]'s live filter.
 ///
+/// Runs on the caller's executor (a pool, or a transaction's connection), so
+/// [`delete_message_for`] can strike inside its own transaction.
+///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 ///
 /// [`delete_message_for`]: super::delete_message_for
-pub async fn withdraw(pool: &PgPool, message_id: Uuid) -> AppResult<bool> {
+pub async fn withdraw<'e, E>(executor: E, message_id: Uuid) -> AppResult<bool>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let stamped = sqlx::query(SOFT_DELETE_MESSAGE_SQL)
         .bind(message_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(stamped.rows_affected() > 0)
-}
-
-/// Turns message `message_id` into a tombstone, once: a message that is already
-/// one matches no row and is left as it is, which is what keeps a second
-/// withdrawal from rewriting anything.
-pub(super) async fn withdraw_message(conn: &mut PgConnection, message_id: Uuid) -> AppResult<()> {
-    sqlx::query(SOFT_DELETE_MESSAGE_SQL)
-        .bind(message_id)
-        .execute(&mut *conn)
-        .await
-        .map(drop)?;
-    Ok(())
 }
 
 #[cfg(test)]

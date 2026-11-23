@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::new_id};
 
-use super::{ChatMessage, ChatMessageReference, messages::withdraw_message};
+use super::{ChatMessage, ChatMessageReference, messages::withdraw};
 
 /// The joined shape of a reference and its message: the reference's own
 /// columns first — its `id` is what a client pages a chat by, and what the
@@ -124,7 +124,7 @@ pub async fn delete_message_for(pool: &PgPool, user_id: Uuid, ref_id: Uuid) -> A
     }
     remove_reference(&mut tx, ref_id).await?;
     if owner.sender_id == user_id {
-        withdraw_message(&mut tx, owner.message_id).await?;
+        let _struck = withdraw(&mut *tx, owner.message_id).await?;
     }
     tx.commit().await?;
     Ok(true)
