@@ -11,8 +11,8 @@ Rules for anyone (human or AI) changing this codebase.
 Your job is to make that run pass the first time, with the least work:
 
 1. **Run only the tests you reason will matter.** Name the code you changed and the behaviour that could break around it: its own unit tests, the `tests/api/<area>.rs` module for any endpoint it serves, and any test that exercises a function you changed or a caller of it. Run those with filters (see "Running checks" below). Err toward a few more related tests, not the whole suite. If a change is wide (a shared helper, `AppState`, the router, a migration), widen the filter to the areas that depend on it.
-2. **Run the linter once, after your last edit,** and fix what it reports in the files you added or changed (see "Linting").
-3. **Check the file-length limit yourself** with `wc -l` on every file you added or changed: no tracked file may exceed 1,000 lines (`Cargo.lock` is exempt as generated); new code should aim for ≤500. When a file is too long, the fix is to split it into submodules, never to add an exemption.
+2. **Do not run Clippy.** The harness runs it as part of the gate. Write code that satisfies the lints (see "Linting"); if the gate hands you diagnostics, fix them.
+3. **Keep files within the length limit, but do not measure it.** The harness runs `wc -l` on every tracked file as part of the gate, and you must not run it yourself. No tracked file may exceed 1,000 lines (`Cargo.lock` is exempt as generated); new code should aim for ≤500. If a file you changed is getting long, split it into submodules, never add an exemption.
 4. **Run `cargo fmt` once** before you finish.
 
 These runs also compile the code, so the gate's later build mostly reuses it. They don't replace the gate: a failure you didn't predict is expected to turn up there. If the harness hands you a failing gate output, fix what it reports, then re-run only the tests that failed and the ones around your fix.
@@ -27,10 +27,10 @@ You may run only the commands in the allowlist below, from the repository root. 
 |---|---|
 | Build and check | `cargo check`, `cargo build` (add `--locked`) |
 | Tests (always filtered) | `cargo test --locked --all-features <filter>`, `cargo test --locked --all-features --lib <filter>`, `cargo test --locked --all-features --test api <filter>`, `cargo test --locked --all-features --test config_docs` |
-| Lint, format, docs | `cargo clippy --locked --all-targets --all-features`, `cargo fmt`, `cargo fmt --check`, `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` (docs: only if you added or changed intra-doc links) |
+| Format, docs | `cargo fmt`, `cargo fmt --check`, `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` (docs: only if you added or changed intra-doc links) |
 | Dependencies | `cargo add <crate>` |
 | Migrations | `sqlx migrate add <name>` |
-| Read files (if no tool exists) | `ls`, `cat`, `head`, `tail` (never `-f`), `wc`, `diff`, `find` (read-only), `grep`/`rg` |
+| Read files (if no tool exists) | `ls`, `cat`, `head`, `tail` (never `-f`), `diff`, `find` (read-only), `grep`/`rg` |
 | Git, read-only | `git status`, `git diff`, `git log`, `git show`, `git branch` |
 | Git, write | `git switch -c <branch>`, `git add <paths>`, `git commit` |
 | Inspect the dev database | `psql "$DATABASE_URL" -c '<single SELECT>'`, read-only |
@@ -80,7 +80,7 @@ Everything else is forbidden. The whole gate (`scripts/ci.sh`) and the unfiltere
 
 ## Linting
 
-- `cargo clippy --locked --all-targets --all-features` must pass with zero warnings or errors; the gate enforces it. Clippy lints the whole crate and cannot be limited to a file, so run it once after your last edit and read the whole output. Fix every diagnostic in a file you added or changed. A diagnostic in a file you didn't touch is either caused by your change (fix it) or already there (don't chase it; name it in your final report).
+- `cargo clippy --locked --all-targets --all-features` must pass with zero warnings or errors; the gate enforces it. **You never run Clippy**; the harness does. If the gate hands you diagnostics, fix every one in a file you added or changed. A diagnostic in a file you didn't touch is either caused by your change (fix it) or already there (don't chase it; name it in your final report).
 - Fix the code, never the linter. Do not loosen lint settings:
   - no `#[allow(...)]` / `#[expect(...)]` to silence a lint,
   - no removing or downgrading lints in `Cargo.toml` `[lints]`,
