@@ -71,6 +71,10 @@ const FOR_STATUSES_SQL: &str = "SELECT sm.status_id, u.* FROM status_mentions sm
 /// [`PageParams::apply_keyset`] then appends runs on `sm.status_id`.
 const MENTIONED_SQL: &str = "SELECT sm.status_id FROM status_mentions sm WHERE sm.user_id = ";
 
+/// [`is_mentioned`]: whether one account is among a status's @-mentions.
+const IS_MENTIONED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM status_mentions \
+     WHERE user_id = $1 AND status_id = $2)";
+
 /// The joined row of [`for_statuses`]: one mention link with the [`User`]
 /// its `user_id` names, flattened.
 #[derive(Debug, sqlx::FromRow)]
@@ -217,6 +221,24 @@ pub async fn mentioned_status_ids(
     Ok(page.finish(rows.into_iter().map(|(status_id,)| status_id).collect()))
 }
 
+/// Whether `user_id` is among the @-mentions of status `status_id`.
+///
+/// The `direct` audience of the visibility rules and the mentionee arm of
+/// `private`.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn is_mentioned(pool: &PgPool, user_id: Uuid, status_id: Uuid) -> AppResult<bool> {
+    let row = sqlx::query_scalar::<_, bool>(IS_MENTIONED_SQL)
+        .bind(user_id)
+        .bind(status_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
 /// `user_ids` with repeats folded to their first occurrence, in order:
 /// what [`LINK_SQL`] inserts, so a doubled id never consumes a `position`
 /// the batch does not store.
@@ -296,6 +318,31 @@ mod tests {
             return db_err.code().unwrap_or_default().into_owned();
         }
         String::new()
+    }
+
+    #[tokio::test]
+    async fn is_mentioned_is_true_only_for_a_linked_account_of_that_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let carol = user(&pool, "carol").await;
+        let status = post(&pool, &alice).await;
+        let other = post(&pool, &alice).await;
+        link(&pool, status.id, &[bob.id]).await.unwrap();
+
+        assert!(
+            is_mentioned(&pool, bob.id, status.id).await.unwrap(),
+            "a linked account is mentioned"
+        );
+        assert!(
+            !is_mentioned(&pool, carol.id, status.id).await.unwrap(),
+            "an unlinked account is not"
+        );
+        assert!(
+            !is_mentioned(&pool, bob.id, other.id).await.unwrap(),
+            "the link belongs to its own status only"
+        );
     }
 
     #[tokio::test]
