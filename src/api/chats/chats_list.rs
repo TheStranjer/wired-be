@@ -234,8 +234,7 @@ pub(super) async fn show_chat(
 #[derive(Debug, Deserialize)]
 pub(super) struct ChatListParams {
     /// Whether chats with muted accounts are listed (Pleroma's
-    /// `with_muted`); absent means `false`. The exclusion itself waits for
-    /// the mutes table — see [`ChatFilter::with_muted`].
+    /// `with_muted`); absent means `false`. See [`ChatFilter::with_muted`].
     #[serde(default, deserialize_with = "flex::opt_bool")]
     with_muted: Option<bool>,
     /// `Some(true)` lists only pinned chats, `Some(false)` only unpinned
