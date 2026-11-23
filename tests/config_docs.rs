@@ -161,12 +161,25 @@ fn documented_in_readme(document: &str, name: &str) -> bool {
     document.contains(&format!("| `{name}` |"))
 }
 
+/// The directory of the package under test, read when the test runs.
+///
+/// Cargo sets `CARGO_MANIFEST_DIR` for the test process, so this follows the
+/// checkout the suite was started in. The compile-time `env!` spelling bakes
+/// the path of whichever checkout built the binary into it, and checkouts that
+/// share a build directory then scan each other's (possibly deleted) files.
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo sets CARGO_MANIFEST_DIR for the test process"),
+    )
+}
+
 /// The configuration module is the one place an environment variable name
 /// is spelled: `src/config.rs` or a `src/config/` submodule. A straggler
 /// declared elsewhere must be moved there (and re-exported if needed).
 #[test]
 fn env_var_names_are_declared_in_the_config_module() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = manifest_dir().join("src");
     let mut strays: Vec<String> = Vec::new();
     for declarations in scan_declarations(&src).values() {
         for declaration in declarations {
@@ -200,7 +213,7 @@ fn declared_in_config_module(home: &str) -> bool {
 /// two spellings never drift apart.
 #[test]
 fn env_var_constants_follow_the_naming_convention() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = manifest_dir().join("src");
     let mut misnamed: Vec<String> = Vec::new();
     for declarations in scan_declarations(&src).values() {
         for declaration in declarations {
@@ -225,7 +238,7 @@ fn env_var_constants_follow_the_naming_convention() {
 /// the scan actually sees the settings the server cannot boot without.
 #[test]
 fn every_env_var_is_documented() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir();
     let declarations = scan_declarations(&root.join("src"));
     for core in ["DATABASE_URL", "BASE_URL", "BIND_ADDR", "SECRET_KEY_BASE"] {
         assert!(
