@@ -7,12 +7,14 @@
 //! ([`lib/pleroma/web/mastodon_api/views/status_view.ex`]) renders the
 //! `meta.original` / `meta.small` dimension objects these functions feed.
 //! Pleroma computes the `Blurhash` string over a downscaled copy of the
-//! image with its `blurhash` dependency; [`compute_blurhash`] does the
-//! same with the Rust `blurhash` crate.
+//! image with its `blurhash` dependency; [`process_image`] does the same
+//! with the Rust `blurhash` crate, over the already-scaled thumbnail so the
+//! original is decoded once.
 //!
 //! These functions are pure CPU work over the bytes an upload carried;
-//! callers run them through [`tokio::task::spawn_blocking`] (see
-//! [`crate::api::media`]) and decide what a failure costs: an undecodable
+//! callers take a permit from [`decode_semaphore`] (bounding how many
+//! decodes run at once) and run them through
+//! [`tokio::task::spawn_blocking`] (see [`crate::api::media`]) and decide what a failure costs: an undecodable
 //! or oversized image rejects the upload (their errors are the ticket's
 //! fixed 422 bodies), while a thumbnail or `Blurhash` that cannot be
 //! produced only costs the attachment that extra.
@@ -24,12 +26,19 @@
 //! [`lib/pleroma/upload/filter/mogrify.ex`]: https://github.com/pleroma/pleroma
 //! [`lib/pleroma/web/mastodon_api/views/status_view.ex`]: https://github.com/pleroma/pleroma
 
-use std::{fmt, io::Cursor};
+use std::{
+    fmt,
+    io::Cursor,
+    num::NonZeroUsize,
+    sync::{Arc, OnceLock},
+    thread::available_parallelism,
+};
 
 use image::{
-    DynamicImage, ExtendedColorType, ImageFormat, ImageReader, codecs::jpeg::JpegEncoder,
+    DynamicImage, ExtendedColorType, ImageFormat, ImageReader, Limits, codecs::jpeg::JpegEncoder,
     imageops::FilterType,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 // The resize/query/encode helpers below reach these traits' methods only.
@@ -47,6 +56,10 @@ pub const IMAGE_TOO_LARGE: &str = "Image too large";
 const THUMBNAIL_JPEG_QUALITY: u8 = 80;
 /// Edge the copy fed to the `Blurhash` encoder is downscaled to, in pixels.
 const BLURHASH_EDGE: u32 = 32;
+/// Most memory, in bytes, a decoder may allocate at once for one image:
+/// 256 MiB, which holds a 40-megapixel `RGBA8` frame (160 MB) with room to
+/// spare while refusing a lying header that asks for more.
+const DECODE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
 /// Horizontal `Blurhash` components of the 4x3 the ticket fixes.
 const BLURHASH_COMPONENTS_X: u32 = 4;
 /// Vertical `Blurhash` components of the 4x3 the ticket fixes.
@@ -117,25 +130,69 @@ pub fn analyze_image(bytes: &[u8], max_pixels: u64) -> AppResult<ImageInfo> {
     Ok(ImageInfo { width, height })
 }
 
-/// Scales an image down to a thumbnail that fits within `max_edge` pixels
-/// on both edges, keeping the aspect ratio, and encodes it.
+/// Everything one upload's image pass produces: the dimensions are
+/// required, the thumbnail and the `Blurhash` are the extras whose failure
+/// must not cost the upload.
+#[derive(Debug)]
+pub struct ProcessedImage {
+    /// Dimensions read from the file's header.
+    pub info: ImageInfo,
+    /// The encoded thumbnail, or why producing it failed.
+    pub thumbnail: AppResult<Thumbnail>,
+    /// `Blurhash` string; `None` when the image cannot be hashed.
+    pub blurhash: Option<String>,
+}
+
+/// Analyzes an image, then decodes it exactly once to build its thumbnail
+/// and its `Blurhash`.
 ///
-/// The resize is Lanczos3 ([`image::imageops::resize`], reached through
-/// [`DynamicImage::resize`]), which only ever scales down: an image
-/// already inside `max_edge` comes back at its own size rather than blown
-/// up. The encoding is `JPEG` at quality 80 unless any pixel of the
-/// (first frame of the) image is less than fully opaque, in which case it
-/// is `PNG`, because `JPEG` has no room for transparency.
+/// The header gate [`analyze_image`] runs first, so an image over
+/// `max_pixels` is rejected before any pixel is decoded. The thumbnail is
+/// the decoded image scaled down to fit within `max_edge` pixels on both
+/// edges, keeping the aspect ratio and never upscaling, encoded as `JPEG`
+/// at quality 80 — or `PNG` when any pixel of the (first frame of the)
+/// image is less than fully opaque, because `JPEG` has no room for
+/// transparency. The `Blurhash` (4x3 components) is computed over that
+/// already-scaled image, scaled further to at most 32 pixels per edge, so
+/// the full-size original is never decoded or resized a second time and is
+/// dropped as soon as the thumbnail-sized copy exists.
+///
+/// A failure after the gate is not an error: an image that analyzes but
+/// cannot be decoded or encoded yields `Err` in
+/// [`thumbnail`](ProcessedImage::thumbnail) and no hash, and a hash the
+/// encoder rejects (an image too small for the component grid) is `None`.
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with [`INVALID_IMAGE`] for undecodable
-/// bytes, and [`AppError::Internal`] when the encoder itself fails.
-pub fn make_thumbnail(bytes: &[u8], max_edge: u32) -> AppResult<Thumbnail> {
-    let image = decode(bytes, "thumbnailing")?;
-    let resized = downscale(&image, max_edge);
+/// [`AppError::Unprocessable`] with [`INVALID_IMAGE`] when the bytes name
+/// no readable image format or report a zero edge, and with
+/// [`IMAGE_TOO_LARGE`] when `width * height` exceeds `max_pixels`.
+pub fn process_image(bytes: &[u8], max_pixels: u64, max_edge: u32) -> AppResult<ProcessedImage> {
+    let info = analyze_image(bytes, max_pixels)?;
+    let image = match decode(bytes, max_pixels, "processing") {
+        Ok(image) => image,
+        Err(err) => {
+            return Ok(ProcessedImage {
+                info,
+                thumbnail: Err(err),
+                blurhash: None,
+            });
+        }
+    };
+    let resized = downscale(image, max_edge);
+    let thumbnail = thumbnail_of(&resized);
+    let blurhash = blurhash_of(&downscale(resized, BLURHASH_EDGE));
+    Ok(ProcessedImage {
+        info,
+        thumbnail,
+        blurhash,
+    })
+}
+
+/// Encodes an already-scaled image as the thumbnail record.
+fn thumbnail_of(resized: &DynamicImage) -> AppResult<Thumbnail> {
     let (width, height) = resized.dimensions();
-    let (encoded, content_type) = encode_thumbnail(&resized)?;
+    let (encoded, content_type) = encode_thumbnail(resized)?;
     Ok(Thumbnail {
         bytes: encoded,
         content_type,
@@ -146,30 +203,21 @@ pub fn make_thumbnail(bytes: &[u8], max_edge: u32) -> AppResult<Thumbnail> {
 
 /// Scales `image` down to fit within `max_edge` on both edges, keeping the
 /// aspect ratio — or hands back the original when it already fits, so a
-/// thumbnail is never an upscale.
-fn downscale(image: &DynamicImage, max_edge: u32) -> DynamicImage {
+/// thumbnail is never an upscale. Consumes the input so a large original is
+/// freed as soon as its scaled copy exists.
+fn downscale(image: DynamicImage, max_edge: u32) -> DynamicImage {
     if image.width() <= max_edge && image.height() <= max_edge {
-        image.clone()
+        image
     } else {
         image.resize(max_edge, max_edge, FilterType::Lanczos3)
     }
 }
 
-/// Computes the [`Blurhash`] string of an image's placeholder preview:
-/// 4x3 components over a copy downscaled to at most 32 pixels per edge.
-///
-/// This is an infallible helper for the upload path: any byte that cannot
-/// produce a hash — undecodable input, an image too small for the
-/// component grid, an encoder rejection — yields `None` and the
-/// attachment simply goes without one. Callers usually run this after
-/// [`analyze_image`] on the same bytes, so `None` here means "no hash",
-/// not "bad image".
+/// The [`Blurhash`] string of a small image: 4x3 components. `None` when the
+/// encoder rejects it (an image too small for the component grid).
 ///
 /// [`Blurhash`]: https://blurha.sh
-#[must_use]
-pub fn compute_blurhash(bytes: &[u8]) -> Option<String> {
-    let image = decode(bytes, "hashing").ok()?;
-    let small = downscale(&image, BLURHASH_EDGE);
+fn blurhash_of(small: &DynamicImage) -> Option<String> {
     let rgba = small.to_rgba8();
     let (width, height) = rgba.dimensions();
     blurhash::encode(
@@ -182,6 +230,34 @@ pub fn compute_blurhash(bytes: &[u8]) -> Option<String> {
     .ok()
 }
 
+/// The process-wide gate on concurrent image decoding: one permit per
+/// available CPU (at least one), created on first use.
+///
+/// Every decode holds a full-size frame in memory, and the blocking pool
+/// would otherwise run as many at once as there are uploads.
+#[must_use]
+pub fn decode_semaphore() -> &'static Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let permits = available_parallelism().map_or(1, NonZeroUsize::get);
+        Arc::new(Semaphore::new(permits))
+    })
+}
+
+/// Waits for a permit from `semaphore` and returns it; the caller holds it
+/// for as long as its decode runs and releases it by dropping it.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] when the semaphore has been closed, which the
+/// process-wide [`decode_semaphore`] never is.
+pub async fn acquire_decode_permit(semaphore: &Arc<Semaphore>) -> AppResult<OwnedSemaphorePermit> {
+    Arc::clone(semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|err| AppError::Internal(format!("image decode gate closed: {err}")))
+}
+
 /// Reads an image's `(width, height)` from its header alone.
 fn read_dimensions(bytes: &[u8], context: &str) -> AppResult<(u32, u32)> {
     let reader = ImageReader::new(Cursor::new(bytes))
@@ -192,12 +268,28 @@ fn read_dimensions(bytes: &[u8], context: &str) -> AppResult<(u32, u32)> {
         .map_err(|err| undecodable(context, "reading the dimensions", &err))
 }
 
+/// Decoder limits for an image the pixel gate let through: no edge longer
+/// than `max_pixels` and at most [`DECODE_MAX_ALLOC`] bytes allocated, so a
+/// header that lies about its size cannot make the decoder allocate more
+/// than the gate allowed.
+fn decode_limits(max_pixels: u64) -> Limits {
+    let max_edge = u32::try_from(max_pixels).unwrap_or(u32::MAX);
+    let mut limits = Limits::no_limits();
+    limits.max_image_width = Some(max_edge);
+    limits.max_image_height = Some(max_edge);
+    limits.max_alloc = Some(DECODE_MAX_ALLOC);
+    limits
+}
+
 /// Decodes an image's full pixel data — its first frame, for animated
-/// formats — after guessing the format from the bytes.
-fn decode(bytes: &[u8], context: &str) -> AppResult<DynamicImage> {
-    let image = ImageReader::new(Cursor::new(bytes))
+/// formats — after guessing the format from the bytes, under
+/// [`decode_limits`] for `max_pixels`.
+fn decode(bytes: &[u8], max_pixels: u64, context: &str) -> AppResult<DynamicImage> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|err| undecodable(context, "guessing the format", &err))?
+        .map_err(|err| undecodable(context, "guessing the format", &err))?;
+    reader.limits(decode_limits(max_pixels));
+    let image = reader
         .decode()
         .map_err(|err| undecodable(context, "decoding", &err))?;
     if image.width() == 0 || image.height() == 0 {
@@ -323,6 +415,16 @@ mod tests {
                 .expect("the second frame encodes");
         }
         out
+    }
+
+    /// The thumbnail `process_image` builds for `bytes` under `max_edge`.
+    fn make_thumbnail(bytes: &[u8], max_edge: u32) -> AppResult<Thumbnail> {
+        process_image(bytes, ANY_SIZE, max_edge)?.thumbnail
+    }
+
+    /// The `Blurhash` `process_image` computes for `bytes`.
+    fn compute_blurhash(bytes: &[u8]) -> Option<String> {
+        process_image(bytes, ANY_SIZE, 400).ok()?.blurhash
     }
 
     /// The dimensions `bytes` analyze as, panicking on any rejection.
@@ -494,5 +596,132 @@ mod tests {
     fn thumbnailing_undecodable_bytes_fails_like_analysis() {
         let err = make_thumbnail(b"definitely not a png", 400).expect_err("no image in there");
         assert_eq!(err.to_string(), INVALID_IMAGE);
+    }
+
+    #[test]
+    fn process_image_matches_the_separate_passes() {
+        let bytes = encode(&opaque_raster(64, 48), ImageFormat::Png);
+        let processed = process_image(&bytes, ANY_SIZE, 400).expect("the fixture processes");
+        assert_eq!(
+            processed.info,
+            ImageInfo {
+                width: 64,
+                height: 48
+            },
+            "the dimensions are the header's"
+        );
+        let thumb = processed.thumbnail.expect("the fixture thumbnails");
+        assert_eq!(
+            (thumb.width, thumb.height),
+            (64, 48),
+            "an image inside the bound keeps its size"
+        );
+        assert_eq!(thumb.content_type, "image/jpeg", "opaque is jpeg");
+        let old_path = decode(&bytes, ANY_SIZE, "test")
+            .ok()
+            .and_then(|image| blurhash_of(&downscale(image, BLURHASH_EDGE)));
+        let hash = processed.blurhash.expect("a decodable image hashes");
+        assert_eq!(hash.len(), 28, "a 4x3 hash is 28 characters");
+        assert_eq!(
+            Some(hash),
+            old_path,
+            "a small image hashes as the old decode-and-downscale path did"
+        );
+    }
+
+    #[test]
+    fn process_image_hashes_the_scaled_thumbnail() {
+        let bytes = encode(&opaque_raster(900, 600), ImageFormat::Png);
+        let processed = process_image(&bytes, ANY_SIZE, 400).expect("the fixture processes");
+        let thumb = processed.thumbnail.expect("the fixture thumbnails");
+        assert_eq!((thumb.width, thumb.height), (400, 267), "aspect kept");
+        assert_eq!(
+            processed.blurhash.as_deref().map(str::len),
+            Some(28),
+            "the hash is the same fixed 4x3 length"
+        );
+    }
+
+    #[test]
+    fn process_image_rejects_an_image_over_the_pixel_limit() {
+        let bytes = encode(&opaque_raster(300, 200), ImageFormat::Png);
+        let err = process_image(&bytes, 59_999, 400).expect_err("one pixel over the limit");
+        assert_eq!(err.to_string(), IMAGE_TOO_LARGE);
+    }
+
+    #[test]
+    fn process_image_rejects_undecodable_bytes() {
+        let err =
+            process_image(b"definitely not a png", ANY_SIZE, 400).expect_err("no image in there");
+        assert_eq!(err.to_string(), INVALID_IMAGE);
+    }
+
+    #[test]
+    fn decode_refuses_an_image_over_the_limits() {
+        let bytes = encode(&opaque_raster(300, 200), ImageFormat::Png);
+        let decoded = decode(&bytes, ANY_SIZE, "test").expect("no limit in the way");
+        assert_eq!(decoded.width(), 300, "inside the limits it decodes");
+        let err = decode(&bytes, 100, "test").expect_err("300 wide is past a 100 edge limit");
+        assert_eq!(err.to_string(), INVALID_IMAGE);
+    }
+
+    #[test]
+    fn the_decode_limits_follow_the_pixel_budget() {
+        let limits = decode_limits(40_000_000);
+        assert_eq!(limits.max_image_width, Some(40_000_000), "width budget");
+        assert_eq!(limits.max_image_height, Some(40_000_000), "height budget");
+        assert_eq!(limits.max_alloc, Some(DECODE_MAX_ALLOC), "alloc cap");
+        assert_eq!(
+            decode_limits(u64::MAX).max_image_width,
+            Some(u32::MAX),
+            "a budget past u32 saturates"
+        );
+    }
+
+    #[test]
+    fn the_process_wide_gate_has_a_permit() {
+        assert!(
+            decode_semaphore().available_permits() >= 1,
+            "at least one decode may run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_permit_waits_for_the_first_to_drop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let first = acquire_decode_permit(&semaphore)
+            .await
+            .expect("the first permit is free");
+        assert!(
+            semaphore.try_acquire().is_err(),
+            "no permit is left while the first is held"
+        );
+        let completed =
+            tokio::time::timeout(std::time::Duration::ZERO, acquire_decode_permit(&semaphore))
+                .await
+                .is_ok();
+        assert!(!completed, "the second acquire does not complete");
+        drop(first);
+        let second = acquire_decode_permit(&semaphore)
+            .await
+            .expect("the permit is back once the first drops");
+        assert!(
+            semaphore.try_acquire().is_err(),
+            "the second holder has taken the only permit"
+        );
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn acquiring_from_a_closed_gate_is_an_internal_error() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        semaphore.close();
+        let err = acquire_decode_permit(&semaphore)
+            .await
+            .expect_err("a closed gate hands out nothing");
+        assert!(
+            matches!(err, AppError::Internal(_)),
+            "a closed gate is a server-side problem"
+        );
     }
 }
