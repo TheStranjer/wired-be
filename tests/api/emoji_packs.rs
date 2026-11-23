@@ -32,6 +32,7 @@ mod install_gates;
 mod pack_deletes;
 mod pack_writes;
 mod reads;
+mod remote_checksums;
 mod remote_download;
 mod remote_mocks;
 mod support;
