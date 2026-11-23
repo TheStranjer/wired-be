@@ -28,6 +28,19 @@ const TOKEN_WITH_APP_SQL: &str = "SELECT t.*,
    JOIN oauth_apps a ON a.id = t.app_id
   WHERE t.token = $1";
 
+/// The `SELECT` behind [`get_by_refresh_token`]: the same projection and
+/// join as [`TOKEN_WITH_APP_SQL`], matched on the refresh token column.
+const TOKEN_BY_REFRESH_WITH_APP_SQL: &str = "SELECT t.*,
+        a.client_name AS app_client_name,
+        a.redirect_uris AS app_redirect_uris, a.scopes AS app_scopes,
+        a.website AS app_website, a.client_id AS app_client_id,
+        a.client_secret AS app_client_secret, a.trusted AS app_trusted,
+        a.user_id AS app_user_id, a.inserted_at AS app_inserted_at,
+        a.updated_at AS app_updated_at
+   FROM oauth_tokens t
+   JOIN oauth_apps a ON a.id = t.app_id
+  WHERE t.refresh_token = $1";
+
 /// Join row for [`get_with_app`]: the [`OauthToken`] flattened from the
 /// leading `t.*` columns (the first match wins every shared name) and
 /// the [`OauthApp`]'s columns read through their `app_` aliases.
@@ -94,6 +107,27 @@ impl TokenWithAppRow {
 pub async fn get_with_app(pool: &PgPool, token: &str) -> AppResult<Option<(OauthToken, OauthApp)>> {
     let row = sqlx::query_as::<_, TokenWithAppRow>(TOKEN_WITH_APP_SQL)
         .bind(token)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(TokenWithAppRow::into_parts))
+}
+
+/// Fetches the pair whose refresh token is `refresh_token` together with
+/// the application that issued it, exactly as stored.
+///
+/// Like [`get_with_app`] it applies **no validity filter**: a lapsed pair
+/// is still returned, since revoking it is harmless and wanted.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_refresh_token(
+    pool: &PgPool,
+    refresh_token: &str,
+) -> AppResult<Option<(OauthToken, OauthApp)>> {
+    let row = sqlx::query_as::<_, TokenWithAppRow>(TOKEN_BY_REFRESH_WITH_APP_SQL)
+        .bind(refresh_token)
         .fetch_optional(pool)
         .await?;
     Ok(row.map(TokenWithAppRow::into_parts))
@@ -168,6 +202,48 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "an unknown access token finds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_refresh_token_finds_the_pair_and_its_app() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let paul = insert_user(&pool, "paul").await;
+        let app = insert_app(&pool, "Refresher").await;
+        let token = create_token(&pool, &new_token(Some(paul.id), app.id))
+            .await
+            .unwrap();
+
+        let (found, found_app) = get_by_refresh_token(&pool, &token.refresh_token)
+            .await
+            .unwrap()
+            .expect("a stored refresh token is found with its app");
+        assert_eq!(found.id, token.id, "the pair's row comes back");
+        assert_eq!(found_app.id, app.id, "joined to the issuing app");
+        assert_eq!(found_app.client_id, app.client_id, "the whole app arrives");
+
+        assert!(
+            get_by_refresh_token(&pool, &token.token)
+                .await
+                .unwrap()
+                .is_none(),
+            "the access token is not a refresh token"
+        );
+        expire_token(&pool, token.id).await;
+        assert!(
+            get_by_refresh_token(&pool, &token.refresh_token)
+                .await
+                .unwrap()
+                .is_some(),
+            "no validity filter: a lapsed pair is still found"
+        );
+        assert!(
+            get_by_refresh_token(&pool, "no-such-refresh")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown refresh token finds nothing"
         );
     }
 
