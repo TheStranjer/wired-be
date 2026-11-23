@@ -49,13 +49,23 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      updated_at = now()
  RETURNING *";
 
-/// The ownership probe behind [`upsert_remote_user`]'s
-/// [`ActorError::NicknameConflict`]: the actor id (if any) of a row whose
-/// citext nickname is the one the document claims but which is keyed by a
-/// *different* `ap_id`. Matching the same row's own id is the ordinary
-/// update path, including when the remote renamed `preferredUsername`.
-const NICKNAME_HOLDER_SQL: &str =
-    "SELECT ap_id FROM users WHERE nickname = $1::citext AND ap_id <> $2";
+/// The ownership probe behind [`upsert_remote_user`]: the actor id (if any)
+/// of a row whose citext nickname is the one the document claims but which
+/// is keyed by a *different* `ap_id`, and whether that row is a stale mirror
+/// of the same origin (`local = false` and the same `domain` as `$3`).
+/// Matching the same row's own id is the ordinary update path, including
+/// when the remote renamed `preferredUsername`. The row is locked so two
+/// concurrent upserts cannot both rename and claim the handle.
+const NICKNAME_HOLDER_SQL: &str = "SELECT ap_id, COALESCE(NOT local AND domain = $3, false)
+     FROM users WHERE nickname = $1::citext AND ap_id <> $2 FOR UPDATE";
+
+/// Frees a nickname held by a stale mirror: prefixes it with the row's id,
+/// `<old id>.<nickname>`, the way Pleroma's `maybe_handle_clashing_nickname`
+/// does, so the old row keeps existing (its statuses and relationships stay
+/// attached) without holding the handle.
+const RENAME_HOLDER_SQL: &str = "UPDATE users
+     SET nickname = (id::text || '.' || nickname::text)::citext, updated_at = now()
+     WHERE ap_id = $1";
 
 /// Stores `new` as this instance's mirror of the actor, exactly once per
 /// actor id (decision 7).
@@ -66,8 +76,14 @@ const NICKNAME_HOLDER_SQL: &str =
 /// `last_fetched_at = now()`.
 ///
 /// Before writing, the probe `NICKNAME_HOLDER_SQL` checks who owns the
-/// nickname: a row other than this actor's own wins
-/// [`ActorError::NicknameConflict`] instead of being renamed or overwritten.
+/// nickname. A remote row of the same `domain` under a different `ap_id` is
+/// a stale mirror (the origin reinstalled, moved its actor paths or
+/// recreated the account): within one transaction it is renamed to
+/// `<its id>.<nickname>` and the actor is stored under the handle, as
+/// Pleroma does. Any other holder (a local row, or a different domain)
+/// keeps the handle and the upsert fails with
+/// [`ActorError::NicknameConflict`]. When two actor ids of one origin claim
+/// one handle, the document fetched last holds it.
 ///
 /// After the row is stored, [`instance::touch`] records first sight of the
 /// host of [`ap_id`](NewRemoteUser::ap_id) (or notes that a known host was
@@ -79,17 +95,26 @@ const NICKNAME_HOLDER_SQL: &str =
 ///
 /// # Errors
 ///
-/// [`ActorError::NicknameConflict`] when another `ap_id` already holds this
-/// nickname; [`ActorError::Failed`] for any database failure, including the
-/// instance record.
+/// [`ActorError::NicknameConflict`] when another `ap_id` holds this
+/// nickname and is not a remote row of the same domain;
+/// [`ActorError::Failed`] for any database failure, including the instance
+/// record.
 pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<User, ActorError> {
-    let holder: Option<String> = sqlx::query_scalar(NICKNAME_HOLDER_SQL)
+    let mut tx = pool.begin().await?;
+    let holder: Option<(String, bool)> = sqlx::query_as(NICKNAME_HOLDER_SQL)
         .bind(new.nickname.as_str())
         .bind(new.ap_id.as_str())
-        .fetch_optional(pool)
+        .bind(new.domain.as_str())
+        .fetch_optional(&mut *tx)
         .await?;
-    if holder.is_some() {
-        return Err(ActorError::NicknameConflict);
+    if let Some((holder_ap_id, stale_mirror)) = holder {
+        if !stale_mirror {
+            return Err(ActorError::NicknameConflict);
+        }
+        let _renamed = sqlx::query(RENAME_HOLDER_SQL)
+            .bind(holder_ap_id.as_str())
+            .execute(&mut *tx)
+            .await?;
     }
     let user = sqlx::query_as::<_, User>(UPSERT_SQL)
         .bind(new_id())
@@ -114,8 +139,9 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.following_url.as_deref())
         .bind(new.featured_url.as_deref())
         .bind(new.public_key.as_str())
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
+    tx.commit().await?;
     // First sight of the mirrored user touches its instance; an `ap_id`
     // [`http_host`] cannot read names no host, and the record is skipped
     // (see the function docs).
@@ -137,7 +163,8 @@ mod tests {
             test_support::{MASTODON, PLEROMA, fixture},
         },
         models::user::{
-            CountDelta, NewUser, get_by_ap_id, get_by_id, get_by_nickname, insert, update_counts,
+            CountDelta, Flag, NewUser, get_by_ap_id, get_by_id, get_by_nickname, insert,
+            update_counts,
         },
     };
 
@@ -266,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_reports_a_nickname_conflict() {
+    async fn upsert_reports_a_nickname_conflict_with_a_local_holder() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let squatter = insert(
@@ -299,6 +326,135 @@ mod tests {
         assert_eq!(
             still.ap_id, "https://other.example/users/alice",
             "and was not renamed"
+        );
+    }
+
+    /// A remote actor recreated under a new id (same origin, same handle)
+    /// is mirrored: the stale row gives up the handle, renamed to
+    /// `<its id>.<handle>`, and keeps existing.
+    #[tokio::test]
+    async fn upsert_renames_a_stale_mirror_of_the_same_origin() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let old = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+        let mut moved = parse_actor(&fixture(MASTODON)).unwrap();
+        moved.ap_id = "https://mastodon.example/u/alice".to_owned();
+
+        let new = upsert_remote_user(&pool, moved).await.unwrap();
+
+        assert_ne!(new.id, old.id, "the recreated actor is a new row");
+        assert_eq!(
+            new.nickname, "alice@mastodon.example",
+            "the new actor holds the handle"
+        );
+        let holder = get_by_nickname(&pool, "alice@mastodon.example")
+            .await
+            .unwrap()
+            .expect("the handle resolves");
+        assert_eq!(holder.ap_id, new.ap_id, "to the new actor id");
+        let stale = get_by_id(&pool, old.id)
+            .await
+            .unwrap()
+            .expect("the stale row stands");
+        assert_eq!(
+            stale.nickname,
+            format!("{}.alice@mastodon.example", old.id),
+            "the old row is renamed with its id"
+        );
+        assert_eq!(
+            stale.ap_id, "https://mastodon.example/users/alice",
+            "and keeps its actor id"
+        );
+        assert_eq!(
+            stale.domain.as_deref(),
+            Some("mastodon.example"),
+            "and its domain"
+        );
+    }
+
+    /// Re-fetching the old actor's document after the recreation is the
+    /// flip-flop of two live ids on one handle: the document fetched last
+    /// holds it, the other row is renamed, and nothing fails.
+    #[tokio::test]
+    async fn upsert_of_the_old_id_after_a_recreation_swaps_the_handle_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let old = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+        let mut moved = parse_actor(&fixture(MASTODON)).unwrap();
+        moved.ap_id = "https://mastodon.example/u/alice".to_owned();
+        let new = upsert_remote_user(&pool, moved).await.unwrap();
+
+        let again = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(again.id, old.id, "the old row is updated in place");
+        assert_eq!(
+            again.nickname, "alice@mastodon.example",
+            "the last fetched document holds the handle"
+        );
+        let displaced = get_by_id(&pool, new.id)
+            .await
+            .unwrap()
+            .expect("the other row stands");
+        assert_eq!(
+            displaced.nickname,
+            format!("{}.alice@mastodon.example", new.id),
+            "and the other row is renamed"
+        );
+        let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 2, "no row was lost or duplicated");
+    }
+
+    /// A remote row of a *different* domain holding the handle is not a
+    /// stale mirror of this origin: it keeps the handle and the upsert is
+    /// refused, with nothing renamed or stored.
+    #[tokio::test]
+    async fn upsert_refuses_a_handle_held_by_a_remote_of_another_domain() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let holder = insert(
+            &pool,
+            &NewUser {
+                nickname: "alice@mastodon.example".to_owned(),
+                ap_id: "https://other.example/users/alice".to_owned(),
+                local: Flag::new(false),
+                domain: Some("other.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ActorError::NicknameConflict),
+            "a foreign holder is a conflict: {error:?}"
+        );
+        let still = get_by_id(&pool, holder.id)
+            .await
+            .unwrap()
+            .expect("the holder stands");
+        assert_eq!(
+            still.nickname, "alice@mastodon.example",
+            "the holder keeps the handle"
+        );
+        assert!(
+            get_by_ap_id(&pool, "https://mastodon.example/users/alice")
+                .await
+                .unwrap()
+                .is_none(),
+            "the mirror was not stored"
         );
     }
 

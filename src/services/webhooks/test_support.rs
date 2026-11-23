@@ -21,7 +21,6 @@ use super::{
 };
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     jobs::{AttemptInfo, JobError},
     models::{
         job::Job,
@@ -30,36 +29,19 @@ use crate::{
         webhook::{self, Webhook},
     },
     state::AppState,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
     util::{id::new_id, token::to_hex},
 };
 
 /// Test state over `pool` on the fixed test config, whose HTTP client
 /// reaches the loopback mocks these tests bind.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// The lazy pool the payload tests build state on: nothing they call
 /// reaches a database, and a state that does must fail.
 pub(super) fn dead_state() -> AppState {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no server");
-    app_state(&pool)
+    AppState::lazy_for_tests(Config::for_tests())
 }
 
 /// The first of the [`MAX_ATTEMPTS`] tries the queue hands a delivery.

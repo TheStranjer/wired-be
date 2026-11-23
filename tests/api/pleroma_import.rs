@@ -398,3 +398,134 @@ async fn the_follow_scope_opens_every_import() {
         assert_eq!(jobs(&pool, kind).await.len(), 1, "`{kind}` was enqueued");
     }
 }
+
+/// With the limiter on, the default `imports` budget (one per hour) lets
+/// a user's first import through and refuses the second with the
+/// limiter's 429, on the same route and across the other two routes; the
+/// refused request enqueues nothing. The window is an hour wide, so no
+/// test waits for it.
+#[tokio::test]
+async fn a_second_import_inside_the_window_is_throttled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = fixture(&pool, "follow").await;
+    let app = common::test_app_with_config(
+        pool.clone(),
+        common::test_config_with_rate_limits("imports=1:3600"),
+    );
+    let body = json!({"list": "Account address\nbob@remote.example\n"});
+
+    let first = common::TestRequest::post(FOLLOW)
+        .bearer(&token)
+        .json(&body)
+        .send(&app)
+        .await;
+    assert_started(&first, "the first import");
+    assert_eq!(first.header("x-ratelimit-limit"), Some("1"), "the budget");
+    assert_eq!(
+        first.header("x-ratelimit-remaining"),
+        Some("0"),
+        "the budget is spent"
+    );
+
+    for path in [FOLLOW, BLOCKS, MUTES] {
+        let again = common::TestRequest::post(path)
+            .bearer(&token)
+            .json(&body)
+            .send(&app)
+            .await;
+        common::assert_answer(&again, StatusCode::TOO_MANY_REQUESTS, path);
+        common::assert_error(&again, "Throttled", path);
+    }
+    assert_eq!(
+        jobs(&pool, "imports.follows").await.len(),
+        1,
+        "only the first import was enqueued"
+    );
+    assert!(
+        jobs(&pool, "imports.blocks").await.is_empty()
+            && jobs(&pool, "imports.mutes").await.is_empty(),
+        "the throttled requests never reached a handler"
+    );
+}
+
+/// The shipped default table carries the `imports` bucket: with the
+/// limiter on and `RATE_LIMITS` unset, the second import is refused.
+#[tokio::test]
+async fn the_default_table_throttles_imports() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = fixture(&pool, "follow").await;
+    let app = common::test_app_with_config(
+        pool.clone(),
+        common::test_config_with_rate_limits("search=30:60"),
+    );
+    let body = json!({"list": "bob@remote.example"});
+
+    let first = common::TestRequest::post(MUTES)
+        .bearer(&token)
+        .json(&body)
+        .send(&app)
+        .await;
+    assert_started(&first, "the first import");
+    let second = common::TestRequest::post(MUTES)
+        .bearer(&token)
+        .json(&body)
+        .send(&app)
+        .await;
+    common::assert_answer(&second, StatusCode::TOO_MANY_REQUESTS, "the second import");
+}
+
+/// The limiter is per user: another user's import is not affected by
+/// alice having spent her budget.
+#[tokio::test]
+async fn the_import_budget_is_per_user() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, alice_token) = fixture(&pool, "follow").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let bob_token = common::create_app_and_token(&pool, &bob, "follow").await;
+    let app = common::test_app_with_config(
+        pool.clone(),
+        common::test_config_with_rate_limits("imports=1:3600"),
+    );
+    let body = json!({"list": "carol@remote.example"});
+
+    for token in [&alice_token, &bob_token] {
+        let response = common::TestRequest::post(BLOCKS)
+            .bearer(token)
+            .json(&body)
+            .send(&app)
+            .await;
+        assert_started(&response, "each user's first import");
+    }
+}
+
+/// With rate limits disabled (the test config's default) repeated imports
+/// all succeed and carry no `x-ratelimit-*` headers.
+#[tokio::test]
+async fn imports_are_not_throttled_when_limits_are_disabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = fixture(&pool, "follow").await;
+    let app = common::test_app(pool.clone());
+
+    for round in 0..2 {
+        let response = common::TestRequest::post(FOLLOW)
+            .bearer(&token)
+            .json(&json!({"list": "bob@remote.example"}))
+            .send(&app)
+            .await;
+        assert_started(&response, &format!("import {round}"));
+        assert_eq!(
+            response.header("x-ratelimit-limit"),
+            None,
+            "a disabled limiter adds no headers"
+        );
+    }
+    assert_eq!(
+        jobs(&pool, "imports.follows").await.len(),
+        2,
+        "both imports were enqueued"
+    );
+}

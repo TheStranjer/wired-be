@@ -9,8 +9,8 @@ use wired_be::models::oauth_token;
 
 use super::provider::{LINKED_UID, OOB, PROVIDER, REDIRECT, UNLINKED_UID};
 use super::support::{
-    assert_no_store, count_codes, fixture, link, location, oob_app, prepare, prepare_to,
-    query_pairs, query_param, stored_params,
+    assert_no_store, count_codes, count_states, error_text, fixture, link, location, oob_app,
+    prepare, prepare_to, query_pairs, query_param, stored_params,
 };
 use crate::common;
 
@@ -71,13 +71,13 @@ async fn the_callback_logs_in_a_linked_user_with_a_code() {
     assert_eq!(stored.scopes, "read write", "the scopes prepared with");
     assert!(!stored.used, "a fresh code is unused");
 
-    let redeemed = oauth_token::consume_authorization(&pool, &code, site.app.id)
+    let redeemed = oauth_token::consume_authorization(&pool, &code, site.app.id, Some(REDIRECT))
         .await
         .expect("the redemption reaches the database")
         .expect("the owning app can redeem the code");
     assert_eq!(redeemed.user_id, site.user.id, "and it names the login");
     assert!(
-        oauth_token::consume_authorization(&pool, &code, site.app.id)
+        oauth_token::consume_authorization(&pool, &code, site.app.id, Some(REDIRECT))
             .await
             .expect("the second attempt reaches the database")
             .is_none(),
@@ -232,5 +232,93 @@ async fn the_callback_hands_an_unlinked_account_to_registration() {
         4,
         "authorize parameters and `pending`, no other keys: {params}"
     );
+    site.provider.stop();
+}
+
+/// A state is a one-time token: a linked callback burns it, so a second
+/// callback on the same state — even with a fresh provider code — is
+/// `Invalid state` and mints no second authorization code.
+#[tokio::test]
+async fn a_linked_callback_burns_its_state() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let site = fixture(pool.clone(), "nora", "read").await;
+    link(&pool, &site.user, LINKED_UID).await;
+    let state = prepare(&site.http, &site.app, "").await;
+    let callback = format!("/oauth/{PROVIDER}/callback?code={LINKED_UID}&state={state}");
+
+    let first = common::TestRequest::get(&callback).send(&site.http).await;
+    assert_eq!(
+        first.status,
+        StatusCode::FOUND,
+        "the first callback logs in"
+    );
+    assert_eq!(count_codes(&pool).await, 1, "one code was minted");
+    assert_eq!(count_states(&pool).await, 0, "the state is gone");
+
+    let replay = common::TestRequest::get(&callback).send(&site.http).await;
+    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "the replay");
+    assert_eq!(error_text(&replay), "Invalid state", "is an invalid state");
+    let redirect = common::TestRequest::get(&format!("/oauth/{PROVIDER}?state={state}"))
+        .send(&site.http)
+        .await;
+    assert_eq!(
+        redirect.status,
+        StatusCode::BAD_REQUEST,
+        "the provider leg cannot reuse it either"
+    );
+    assert_eq!(count_codes(&pool).await, 1, "no second code was minted");
+    site.provider.stop();
+}
+
+/// A denied callback burns the state as well: the same state cannot be
+/// replayed afterwards, not even with a good provider code.
+#[tokio::test]
+async fn a_denied_callback_burns_its_state() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let site = fixture(pool.clone(), "owen", "read").await;
+    link(&pool, &site.user, LINKED_UID).await;
+    let state = prepare(&site.http, &site.app, "").await;
+
+    let denied = common::TestRequest::get(&format!(
+        "/oauth/{PROVIDER}/callback?error=access_denied&state={state}"
+    ))
+    .send(&site.http)
+    .await;
+    assert_eq!(denied.status, StatusCode::FOUND, "the refusal redirects");
+    assert_eq!(count_states(&pool).await, 0, "the state is gone");
+
+    let replay = common::TestRequest::get(&format!(
+        "/oauth/{PROVIDER}/callback?code={LINKED_UID}&state={state}"
+    ))
+    .send(&site.http)
+    .await;
+    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "the replay");
+    assert_eq!(error_text(&replay), "Invalid state", "is an invalid state");
+    assert_eq!(count_codes(&pool).await, 0, "no code was minted");
+    site.provider.stop();
+}
+
+/// An unlinked callback leaves the state for the registration form, which
+/// still reads it afterwards.
+#[tokio::test]
+async fn an_unlinked_callback_keeps_its_state_for_registration() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let site = fixture(pool.clone(), "piper", "read").await;
+    let state = prepare(&site.http, &site.app, "").await;
+    let handoff = common::TestRequest::get(&format!(
+        "/oauth/{PROVIDER}/callback?code={UNLINKED_UID}&state={state}"
+    ))
+    .send(&site.http)
+    .await;
+    assert_eq!(handoff.status, StatusCode::FOUND, "the hand-off redirects");
+    assert_eq!(count_states(&pool).await, 1, "the state is kept");
+
+    let form = common::TestRequest::get(&format!("/oauth/registration_details?state={state}"))
+        .send(&site.http)
+        .await;
+    assert_eq!(form.status, StatusCode::OK, "the form still reads it");
     site.provider.stop();
 }

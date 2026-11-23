@@ -7,6 +7,12 @@
 # Every check runs even after another has already failed, so one pass
 # reports everything that is broken at once.
 #
+# Within a check, Cargo is told not to stop at the first failure either:
+# `--keep-going` (Clippy and rustdoc) keeps building every crate and target
+# that does not depend on the broken one (so a compile error in one target does
+# not hide errors in the others), and `--no-fail-fast` (`cargo test` has no
+# `--keep-going`) runs every test binary even after one fails.
+#
 # The exit status is explicit: 0 when every check ran clean, 1 when any of
 # them failed — never some other code, and never merely the last step's
 # status leaking out.
@@ -111,9 +117,9 @@ check_file_lengths() {
 
 step 'file length' check_file_lengths
 step 'rustfmt' cargo fmt --all --check
-step 'Clippy' cargo clippy --locked --all-targets --all-features
-step 'tests' cargo test --locked --all-targets --all-features
-step 'rustdoc' env RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features
+step 'Clippy' cargo clippy --locked --keep-going --all-targets --all-features
+step 'tests' cargo test --locked --no-fail-fast --all-targets --all-features
+step 'rustdoc' env RUSTDOCFLAGS='-D warnings' cargo doc --locked --keep-going --no-deps --all-features
 
 # Exit explicitly: green means 0, anything else means 1.
 printf '\n'

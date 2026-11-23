@@ -3,8 +3,6 @@
 //! policy rows fan-out reads, the fixture activity and the readers of the
 //! jobs a publish queued. Test-only.
 
-use std::sync::Arc;
-
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -13,13 +11,11 @@ use super::{PublishOpts, publish};
 use crate::{
     config::{Config, TEST_BASE_URL},
     federation::delivery::KIND_DELIVER,
-    http_client::HttpClient,
     models::{
         follow::{self, FollowState},
         user::{NewUser, User, insert, local_ap_id},
     },
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The full spelling of the public address.
@@ -29,19 +25,7 @@ pub(super) const ACTIVITY_ID: &str = "https://test.example/activities/1";
 
 /// The state under test over `pool` and `config`.
 pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// The default test state: federation on, the standard test config.

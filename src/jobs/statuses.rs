@@ -251,8 +251,6 @@ async fn delete_batch(state: &AppState, batch: &[Status]) -> Result<(), JobError
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use chrono::{TimeDelta, Utc};
     use serde_json::json;
     use sqlx::PgPool;
@@ -260,32 +258,17 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
-        http_client::HttpClient,
         jobs::QUEUE_BACKGROUND,
         models::{
             notification::{self, NewNotification},
             status::NewStatus,
             user::{NewUser, User, insert, local_ap_id},
         },
-        streaming::hub::Hub,
-        uploads::UploaderBackend,
     };
 
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// Inserts a local user named `nickname`.

@@ -253,7 +253,13 @@ mod tests {
             (5, std::time::Duration::from_secs(8_600)),
             "account_confirmation_resend is 5 per 8600 seconds"
         );
-        assert_eq!(config.rate_limit.limits.len(), 9, "exactly nine buckets");
+        let imports = config.rate_limit.limits.get("imports").copied().unwrap();
+        assert_eq!(
+            (imports.max, imports.window),
+            (1, std::time::Duration::from_secs(3_600)),
+            "imports is 1 per 3600 seconds"
+        );
+        assert_eq!(config.rate_limit.limits.len(), 10, "exactly ten buckets");
     }
 
     /// `RATE_LIMITS` overrides entries of the default table and adds
@@ -266,7 +272,7 @@ mod tests {
         )]);
         assert_eq!(
             config.rate_limit.limits.len(),
-            9,
+            10,
             "no bucket left the table"
         );
         assert_eq!(

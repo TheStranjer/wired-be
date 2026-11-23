@@ -225,15 +225,25 @@ async fn dispatch_handler(
 /// failure, discarded on a fatal failure. Whether the attempt budget allows
 /// the retry is decided by [`fail`] (the models layer), atomically with the
 /// write.
+///
+/// `attempts` is the claim that ran the attempt and fences the write: when
+/// [`rescue_stuck`] gave the job to another claim meanwhile, the write
+/// matches no row and is dropped with a warning, not an error.
 async fn record_outcome(db: &PgPool, id: Uuid, attempts: i32, outcome: Result<(), JobError>) {
     let stored = match outcome {
-        Ok(()) => complete(db, id).await,
-        Err(JobError::Retry(detail)) => fail(db, id, &detail, Some(backoff(attempts))).await,
-        Err(JobError::RetryAfter(delay, detail)) => fail(db, id, &detail, Some(delay)).await,
-        Err(JobError::Discard(detail)) => fail(db, id, &detail, None).await,
+        Ok(()) => complete(db, id, attempts).await,
+        Err(JobError::Retry(detail)) => {
+            fail(db, id, attempts, &detail, Some(backoff(attempts))).await
+        }
+        Err(JobError::RetryAfter(delay, detail)) => {
+            fail(db, id, attempts, &detail, Some(delay)).await
+        }
+        Err(JobError::Discard(detail)) => fail(db, id, attempts, &detail, None).await,
     };
-    if let Err(err) = stored {
-        error!(%err, %id, "could not record job outcome");
+    match stored {
+        Ok(true) => {}
+        Ok(false) => warn!(%id, attempts, "job outcome dropped: the claim was rescued"),
+        Err(err) => error!(%err, %id, "could not record job outcome"),
     }
 }
 

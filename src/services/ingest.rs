@@ -192,6 +192,30 @@ pub async fn ingest_note(
     author: &User,
     object: &Value,
 ) -> Result<IngestOutcome, FederationError> {
+    ingest_note_delivered(state, author, object, None).await
+}
+
+/// [`ingest_note`] for a delivery to a personal inbox: `owner` is the local
+/// account whose inbox received the object, if any.
+///
+/// Senders strip `bto`/`bcc` before delivery, so a privately addressed post
+/// can arrive with nothing naming its recipient, and a `direct` status is
+/// only visible to its `status_mentions`. Like Mastodon's
+/// `delivered_to_account_id` handling, a local `owner` is therefore added
+/// to the mentioned accounts when the document did not mention them. Only
+/// `direct` posts get this: every other visibility already reaches the
+/// owner through follows, and a mention would notify them for each post a
+/// followed account delivers to their personal inbox.
+///
+/// # Errors
+///
+/// As [`ingest_note`].
+pub async fn ingest_note_delivered(
+    state: &AppState,
+    author: &User,
+    object: &Value,
+    owner: Option<&User>,
+) -> Result<IngestOutcome, FederationError> {
     let parsed = note_parser::parse_note(object, author, Utc::now()).map_err(|err| {
         FederationError::Permanent(format!("the object is not ingestable: {err}"))
     })?;
@@ -208,7 +232,14 @@ pub async fn ingest_note(
     }
     let reply = resolve_reply(state, &parsed).await?;
     let quote_of_id = resolve_quote(state, parsed.quote_uri.as_deref()).await?;
-    let mentioned = resolve_mentions(state, &parsed.mention_hrefs).await?;
+    let mut mentioned = resolve_mentions(state, &parsed.mention_hrefs).await?;
+    if let Some(owner) = owner
+        && parsed.status.visibility == Visibility::Direct
+        && owner.local.get()
+        && mentioned.iter().all(|account| account.id != owner.id)
+    {
+        mentioned.push(owner.clone());
+    }
     upsert_emojis(state, &parsed.emojis).await?;
     if drops_unsolicited(state, &parsed, author, &reply, &mentioned).await? {
         debug!(account = %author.ap_id, "an unsolicited public post from an unfollowed author is dropped");

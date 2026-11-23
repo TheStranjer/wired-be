@@ -4,17 +4,13 @@
 //! nickname, and the direct insert and reads the login and race tests need
 //! to set a row up without going through registration. Test-only.
 
-use std::sync::Arc;
-
 use sqlx::PgPool;
 
 use super::RegisterParams;
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     models::user::{NewUser, User, insert, local_ap_id},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The password every registration test submits (24 characters).
@@ -29,19 +25,7 @@ pub(super) fn test_state(pool: &PgPool) -> AppState {
 
 /// An [`AppState`] over `pool` with `config`.
 pub(super) fn test_state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), config)
 }
 
 /// Valid registration params for `nickname` at `nickname@example.org`.

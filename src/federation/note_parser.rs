@@ -136,9 +136,6 @@ const MAX_SPOILER_CHARS: usize = 1000;
 /// How many `tag` entries are examined at most (Pleroma caps the tag list
 /// before folding; extra entries are ignored, not an error).
 const MAX_TAGS: usize = 100;
-/// The longest hashtag name kept, `#` removed (Pleroma's
-/// `:max_hashtag_length` default of 100; longer names are not tags).
-const MAX_HASHTAG_CHARS: usize = 100;
 /// How many attachments are kept at most; the rest of the array is ignored.
 const MAX_ATTACHMENTS: usize = 20;
 /// The fewest poll options a `Question` may carry (Mastodon's client-side

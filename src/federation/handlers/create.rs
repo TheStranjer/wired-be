@@ -38,6 +38,7 @@
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     federation::{
@@ -45,7 +46,7 @@ use crate::{
         fetch_object, json,
         note_parser::OBJECT_TYPES,
     },
-    models::user::User,
+    models::user::{self, User},
     services::ingest::{self, IngestOutcome},
     state::AppState,
 };
@@ -106,7 +107,8 @@ async fn apply_create(
         );
         return Ok(Outcome::Ignored("attributedTo is not the activity actor"));
     }
-    match ingest::ingest_note(&state, &signer, object).await? {
+    let owner = load_inbox_owner(&state, view.inbox_owner).await?;
+    match ingest::ingest_note_delivered(&state, &signer, object, owner.as_ref()).await? {
         IngestOutcome::Created(row) => {
             debug!(status = %row.id, "a Create folded a new remote status");
             Ok(Outcome::Handled)
@@ -117,6 +119,21 @@ async fn apply_create(
         }
         IngestOutcome::Ignored(reason) => Ok(Outcome::Ignored(reason)),
     }
+}
+
+/// Loads the local account whose personal inbox received the delivery. A
+/// gone row means the account was deleted after the delivery was queued: the
+/// post is folded as a shared-inbox delivery would be.
+async fn load_inbox_owner(
+    state: &AppState,
+    owner_id: Option<Uuid>,
+) -> Result<Option<User>, FederationError> {
+    let Some(id) = owner_id else {
+        return Ok(None);
+    };
+    user::get_by_id(&state.db, id)
+        .await
+        .map_err(|err| FederationError::Transient(format!("the inbox owner read failed: {err}")))
 }
 
 /// The reference arm of [`apply_create`]: a `Create` whose object is only
@@ -164,8 +181,6 @@ pub(crate) fn names_actor(object: &Value, actor: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use axum::{
         Router,
         extract::State,
@@ -180,12 +195,10 @@ mod tests {
     use super::*;
     use crate::{
         config::Config,
-        http_client::HttpClient,
         models::{
             status,
             user::{self, Flag, NewUser, User},
         },
-        uploads::UploaderBackend,
     };
 
     /// The actor every fixture here is delivered by.
@@ -193,19 +206,7 @@ mod tests {
 
     /// Test state: `pool` and the fixed test config, collaborators inert.
     fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
-        AppState {
-            db: pool.clone(),
-            hub: crate::streaming::hub::Hub::new(pool),
-            config: Arc::clone(&config),
-            http_client: HttpClient::from(config.as_ref()),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-        }
+        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// The stored mirror of the fixture author.
