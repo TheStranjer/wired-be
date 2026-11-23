@@ -202,6 +202,58 @@ async fn the_card_endpoint_answers_the_stored_card() {
     }
 }
 
+/// With the media proxy on, the card endpoint and the status entity both
+/// answer the card image as a signed proxy link that decodes back to the
+/// image the page named, while the stored row keeps the original URL.
+#[tokio::test]
+async fn the_card_image_is_proxied_when_the_media_proxy_is_enabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let config = common::test_media_proxy_config(1024);
+    let app = common::test_app_with_config(pool.clone(), config.clone());
+    let (alice, _token) = user_with_token(&pool, "alice", SCOPES).await;
+    let post = common::create_status(
+        &pool,
+        &alice,
+        "look https://example.test/post",
+        Visibility::Public,
+    )
+    .await;
+    let mut card = card_entity();
+    card["image"] = json!("https://remote.example/og.png");
+    link_card::store(&pool, CARD_URL, "ok", Some(&card))
+        .await
+        .expect("the fixture card stores");
+    link_card::link_status(&pool, post.id, CARD_URL)
+        .await
+        .expect("the fixture status links its card");
+    let id = post.id.to_string();
+
+    let on_card = card_of(&app, None, &id).await;
+    common::assert_answer(&on_card, StatusCode::OK, "the card endpoint");
+    let on_status = show(&app, None, &id).await;
+    common::assert_answer(&on_status, StatusCode::OK, "the status endpoint");
+    for (value, who) in [
+        (on_card.json_value(), "the card endpoint"),
+        (on_status.json_value()["card"].clone(), "the status entity"),
+    ] {
+        let image = value["image"].as_str().expect("the image is a string");
+        assert!(
+            image.starts_with(&format!("{}/proxy/", config.base_url)),
+            "{who}: the image is a proxy link: {image}"
+        );
+        let (_, tail) = image.split_once("/proxy/").expect("a proxy path");
+        let mut segments = tail.split('/');
+        let sig = segments.next().expect("a signature segment");
+        let encoded = segments.next().expect("an encoded url segment");
+        assert_eq!(
+            wired_be::services::media_proxy::decode(&config, sig, encoded).as_deref(),
+            Ok("https://remote.example/og.png"),
+            "{who}: the link decodes to the stored image"
+        );
+    }
+}
+
 /// A public status with no card is an answer, not a miss: the endpoint
 /// returns JSON `null` with 200, and a linked-but-failed row the same.
 #[tokio::test]
