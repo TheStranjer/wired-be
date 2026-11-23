@@ -69,8 +69,8 @@ mod signer;
 mod test_support;
 mod verify;
 
+pub use crate::federation::policy::signer_host;
 pub use error::InboxAuthError;
-pub use verify::signer_host;
 
 use body::{declares_json_type, parse_json_body, present_signature, read_limited, request_target};
 use signer::resolve_signer;

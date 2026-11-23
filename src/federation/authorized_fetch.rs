@@ -28,11 +28,16 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         fetch_actor::get_or_fetch_by_ap_id,
+        policy::{host_refused, signer_host},
         signature::verify::{SignedRequestParts, parse_signature_header, verify},
     },
     models::user::{User, get_by_ap_id},
     state::AppState,
 };
+
+/// The 403 body for a signer whose instance is on a reject list, the same
+/// word the inbox gate answers with.
+const REJECTED: &str = "Rejected";
 
 /// The refusal every unsatisfied check answers with: the requester is
 /// unknown or unproven, which is an authentication failure (401).
@@ -115,7 +120,9 @@ pub async fn fetch_signer(
 ///
 /// `Ok(None)` is a request that offered no header at all while
 /// `AUTHORIZED_FETCH` is off; every other way of not proving the read is the
-/// 401 refusal, in both modes.
+/// 401 refusal, in both modes — except a signer whose instance is on a
+/// reject list, which is the 403 `Rejected` (checked on the `keyId` host
+/// before its actor is resolved, as the inbox does).
 async fn authenticated_reader(
     state: &AppState,
     method: &Method,
@@ -141,6 +148,15 @@ async fn authenticated_reader(
         tracing::debug!("the Signature header could not be parsed");
         return Err(refusal());
     };
+    // A rejected instance is turned away before its key is even resolved:
+    // no lookup and no dereference is spent on a host this instance refuses.
+    // An unparsable `keyId` names no host here and fails at resolution.
+    if let Some(host) = signer_host(&signature.key_id)
+        && host_refused(state, &host).await?
+    {
+        tracing::debug!(key_id = %signature.key_id, "fetch signed by a rejected instance");
+        return Err(AppError::Forbidden(REJECTED.to_owned()));
+    }
     let signer = signing_actor(state, actor_of_key_id(&signature.key_id)).await?;
     let public_pem = key_material(&signer)?;
     let target = request_target(uri);
@@ -203,7 +219,10 @@ fn key_material(user: &User) -> AppResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         Router,
@@ -470,6 +489,132 @@ mod tests {
             .to_string(),
         )
             .into_response()
+    }
+
+    /// The state of a peer that counts how often its actor document is read.
+    #[derive(Clone)]
+    struct CountingPeer {
+        /// The peer's origin.
+        base: String,
+        /// How many times the actor document was served.
+        hits: Arc<AtomicUsize>,
+    }
+
+    /// [`remote_actor_document`], counting each read.
+    async fn counting_actor_document(State(peer): State<CountingPeer>) -> Response {
+        let _previous = peer.hits.fetch_add(1, Ordering::SeqCst);
+        remote_actor_document(State(peer.base)).await
+    }
+
+    /// Serves a counting peer; returns its server task, its signed `GET` and
+    /// its hit counter.
+    async fn counting_peer() -> (tokio::task::JoinHandle<()>, SignedGet, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let peer = CountingPeer {
+            base: base.clone(),
+            hits: Arc::clone(&hits),
+        };
+        let server = spawn(
+            listener,
+            Router::new()
+                .route(TARGET_PATH, get(counting_actor_document))
+                .with_state(peer),
+        );
+        let get = sign_as(
+            &format!("{base}{TARGET_PATH}#main-key"),
+            &remote_keys().private_pem,
+        );
+        (server, get, hits)
+    }
+
+    /// Whether `outcome` is the 403 `Rejected` refusal.
+    fn forbidden<T>(outcome: &AppResult<T>) -> bool {
+        matches!(outcome, Err(AppError::Forbidden(message)) if message == REJECTED)
+    }
+
+    #[tokio::test]
+    async fn a_signed_fetch_from_a_rejected_domain_is_forbidden() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (server, get, hits) = counting_peer().await;
+        let state = state_with(db.pool().clone(), gate_on());
+        let inserted = sqlx::query(
+            "INSERT INTO instance_policy_domains (domain, action, reason) \
+             VALUES ('127.0.0.1', 'reject', '')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(inserted.rows_affected(), 1, "the policy row is there");
+
+        let gate = check(&state, &get).await;
+        let signer = ask_signer(&state, &get).await;
+
+        assert!(forbidden(&gate), "the gate answers 403: {gate:?}");
+        assert!(forbidden(&signer), "so does the signer read: {signer:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "the peer is never fetched");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_signed_fetch_from_an_mrf_rejected_domain_is_forbidden() {
+        for lists in [
+            json!({"reject": ["127.0.0.1"]}),
+            json!({"accept": ["friend.example"]}),
+        ] {
+            let db = crate::test_db::test_db().await.expect("test database slot");
+            let (server, get, hits) = counting_peer().await;
+            let state = state_with(db.pool().clone(), gate_on());
+            crate::services::runtime_config::write(
+                &state.db,
+                ":pleroma",
+                ":mrf",
+                &json!({"policies": ["simple"], "simple": lists}),
+            )
+            .await
+            .unwrap();
+
+            let outcome = check(&state, &get).await;
+
+            assert!(
+                forbidden(&outcome),
+                "the MRF lists refuse {lists}: {outcome:?}"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "the peer is never fetched");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signed_fetch_from_an_allowed_domain_still_passes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (server, get, hits) = counting_peer().await;
+        let state = state_with(db.pool().clone(), gate_on());
+        // Other hosts are listed everywhere; this peer's is on no list.
+        let inserted = sqlx::query(
+            "INSERT INTO instance_policy_domains (domain, action, reason) \
+             VALUES ('blocked.example', 'reject', '')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(inserted.rows_affected(), 1, "the policy row is there");
+        crate::services::runtime_config::write(
+            &state.db,
+            ":pleroma",
+            ":mrf",
+            &json!({"policies": ["simple"], "simple": {"reject": ["other.example"]}}),
+        )
+        .await
+        .unwrap();
+
+        check(&state, &get)
+            .await
+            .expect("a host on no reject list reads as before");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "its actor was fetched once");
+        server.abort();
     }
 
     #[tokio::test]
