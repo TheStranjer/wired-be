@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 use crate::{
     config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
     models::{
         follow::{self, FollowToggles},
         list::{self, NewList},
@@ -26,26 +25,13 @@ use crate::{
     },
     services::streaming::targets,
     state::AppState,
-    streaming::hub::{Audience, Hub, StreamEvent},
-    uploads::UploaderBackend,
+    streaming::hub::{Audience, StreamEvent},
     util::id::new_id,
 };
 
 /// Test state over `pool` with the fixed test config.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Inserts a local user named `nickname`.

@@ -37,7 +37,6 @@ use crate::{
     },
     services::ingest::{self, IngestOutcome},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// `User-Agent` for the test clients.
@@ -57,19 +56,9 @@ fn test_state(pool: PgPool) -> AppState {
 
 /// The state under test on `config` instead of the stock test one.
 fn state_with_config(pool: PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    let hub = crate::streaming::hub::Hub::new(&pool);
     AppState {
-        db: pool,
-        hub,
-        config: Arc::clone(&config),
         http_client: HttpClient::new_for_tests(TEST_UA),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        ..AppState::for_tests(pool, config)
     }
 }
 

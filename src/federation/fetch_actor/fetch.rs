@@ -1,7 +1,7 @@
 //! The wire half: fetching and containing an actor document.
 //!
 //! [`fetch_actor_json`] is the entry point; `fetch_document` is the `GET`
-//! it runs, `declares_json` and `document_id` the checks an answer must
+//! it runs, `is_activitypub_media_type` and `document_id` the checks an answer must
 //! pass, and `fetch_and_store` the run of a fetched document through the
 //! filters into the mirror row.
 
@@ -20,7 +20,8 @@ use crate::{
 };
 
 use super::{
-    ACTOR_ACCEPT, FetchError, JSON_MARKER, MAX_BODY_BYTES, STATUS_GONE, STATUS_NOT_FOUND,
+    ACTIVITY_JSON, ACTIVITYSTREAMS_PROFILE, ACTOR_ACCEPT, FetchError, LD_JSON, MAX_BODY_BYTES,
+    STATUS_GONE, STATUS_NOT_FOUND,
     containment::{ensure_not_redirected, ensure_same_host, names_served_url},
     signer::{Signer, fetch_signer, sign_get},
 };
@@ -29,7 +30,9 @@ use super::{
 ///
 /// The `GET` asks for both `ActivityPub` JSON media types, follows
 /// redirects under the shared client's policy, caps the body at 1 MiB and
-/// refuses an answer whose content type does not say `json`. With `signer`
+/// refuses an answer whose content type is not an `ActivityPub` one
+/// (`application/activity+json`, or `application/ld+json` with the
+/// `ActivityStreams` profile). With `signer`
 /// the request is additionally HTTP-signed (see
 /// [`sign_request`](crate::federation::signature::sign_request)), the shape of an authorized fetch.
 ///
@@ -43,7 +46,7 @@ use super::{
 /// [`FetchError::Gone`] for a 410, [`FetchError::NotFound`] for a 404,
 /// [`FetchError::Http`] for any other transport or status failure
 /// (including a body over the cap), and [`FetchError::Invalid`] for a
-/// non-JSON content type, a body that is not a JSON object with a string
+/// non-`ActivityPub` content type, a body that is not a JSON object with a string
 /// `id`, a document that moves its `id` on while being refetched, or a
 /// `signer` that cannot sign this URL.
 pub async fn fetch_actor_json(
@@ -100,9 +103,9 @@ pub(crate) async fn fetch_document(
         return Err(FetchError::NotFound);
     }
     let response = response.error_for_status()?;
-    if !declares_json(&response.headers) {
+    if !is_activitypub_media_type(&response.headers) {
         return Err(FetchError::Invalid(format!(
-            "the response from `{url}` does not declare a JSON content type"
+            "the response from `{url}` does not declare an ActivityPub content type"
         )));
     }
     let document: Value = response.json().map_err(|err| {
@@ -111,15 +114,40 @@ pub(crate) async fn fetch_document(
     Ok((document, response.url))
 }
 
-/// Whether a response declares a JSON body: its `Content-Type` mentions
-/// `json` anywhere, case-insensitively (`application/activity+json`,
-/// `application/ld+json; profile=...`, `application/json`, ...). An absent
-/// or unreadable header does not declare anything and fails.
-fn declares_json(headers: &HeaderMap) -> bool {
-    headers
+/// Whether a response declares an `ActivityPub` body, as Mastodon and
+/// Pleroma require: `application/activity+json`, or `application/ld+json`
+/// whose `profile` parameter lists the `ActivityStreams` namespace. The
+/// media type and parameter name compare case-insensitively and other
+/// parameters (`charset`) are ignored. Plain `application/json`, any other
+/// type, and an absent or unreadable header fail.
+fn is_activitypub_media_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains(JSON_MARKER))
+    else {
+        return false;
+    };
+    let mut parts = value.split(';');
+    let media_type = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    match media_type.as_str() {
+        ACTIVITY_JSON => true,
+        LD_JSON => parts.any(declares_activitystreams_profile),
+        _ => false,
+    }
+}
+
+/// Whether one `;`-separated media-type parameter is a `profile` whose
+/// (optionally quoted) space-separated list names `ActivityStreams`.
+fn declares_activitystreams_profile(parameter: &str) -> bool {
+    let Some((name, value)) = parameter.split_once('=') else {
+        return false;
+    };
+    name.trim().eq_ignore_ascii_case("profile")
+        && value
+            .trim()
+            .trim_matches('"')
+            .split_whitespace()
+            .any(|profile| profile == ACTIVITYSTREAMS_PROFILE)
 }
 
 /// The document's own `id`: every containment rule compares it against the
@@ -155,6 +183,7 @@ mod tests {
 
     use axum::{
         Router,
+        extract::State,
         http::StatusCode,
         response::{IntoResponse as _, Response},
         routing::get,
@@ -338,6 +367,92 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    /// Headers carrying `content_type`, or none at all.
+    fn typed(content_type: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_type {
+            let _previous =
+                headers.insert(CONTENT_TYPE, value.parse().expect("a valid header value"));
+        }
+        headers
+    }
+
+    #[test]
+    fn activitypub_media_types_are_accepted() {
+        for value in [
+            "application/activity+json",
+            "application/activity+json; charset=utf-8",
+            " Application/Activity+JSON ",
+            r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#,
+            "application/ld+json; profile=https://www.w3.org/ns/activitystreams",
+            r#"application/ld+json; charset=utf-8; profile="https://example.test/x https://www.w3.org/ns/activitystreams""#,
+            r#"APPLICATION/LD+JSON; Profile="https://www.w3.org/ns/activitystreams""#,
+        ] {
+            assert!(
+                is_activitypub_media_type(&typed(Some(value))),
+                "{value} is accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn other_media_types_are_refused() {
+        for value in [
+            "application/ld+json",
+            "application/ld+json; charset=utf-8",
+            r#"application/ld+json; profile="https://example.test/other""#,
+            r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams-extra""#,
+            "application/ld+json; profile",
+            "application/json",
+            "text/json",
+            "application/x-json-whatever",
+            "application/jrd+json",
+            "text/html",
+            "",
+        ] {
+            assert!(
+                !is_activitypub_media_type(&typed(Some(value))),
+                "{value:?} is refused"
+            );
+        }
+        assert!(
+            !is_activitypub_media_type(&typed(None)),
+            "a missing header is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_application_json_actor_answer_is_invalid() {
+        /// A well-formed, self-identifying actor under plain `application/json`.
+        async fn json_actor(State(peer): State<Peer>) -> Response {
+            (
+                [(CONTENT_TYPE, "application/json")],
+                json!({"id": format!("{}/users/alice", peer.base), "type": "Person"}).to_string(),
+            )
+                .into_response()
+        }
+
+        let listener = bind().await;
+        let base = origin(&listener);
+        let server = spawn(
+            listener,
+            Router::new()
+                .route("/users/alice", get(json_actor))
+                .with_state(peer_at(&base)),
+        );
+
+        let error = fetch_actor_json(&client(), &format!("{base}/users/alice"), None)
+            .await
+            .unwrap_err();
+
+        let detail = invalid_detail(error);
+        assert!(
+            detail.contains("does not declare an ActivityPub content type"),
+            "the plain JSON answer is refused for its type: {detail}"
+        );
+        server.abort();
     }
 
     #[tokio::test]

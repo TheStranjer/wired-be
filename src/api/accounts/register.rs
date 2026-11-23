@@ -98,7 +98,7 @@ const REGISTRATIONS_CLOSED: &str = "Registration is disabled";
 /// submitted invite `token` is absent, unknown, spent, expired or
 /// exhausted (Pleroma's `Registration.create_user_with_invite` wording;
 /// this endpoint's ticket pins the one message for every refusal).
-const INVALID_TOKEN: &str = "Invalid token";
+const INVALID_TOKEN: &str = invite_token::INVALID_INVITE_MESSAGE;
 
 /// The 422 body message `POST /api/v1/accounts` answers when `agreement`
 /// is present but not true (Mastodon's signup terms wording; Pleroma's

@@ -1,8 +1,6 @@
 //! Fixtures the inbound Note handler tests share: the delivering actor,
 //! accounts, mirrored posts and the `Update` and `Question` documents.
 
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -29,19 +27,7 @@ pub(super) const BOB: &str = "https://remote.example/users/bob";
 
 /// Test state: `pool` and the fixed test config, collaborators inert.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(crate::config::Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: crate::http_client::HttpClient::from(config.as_ref()),
-        uploader: crate::uploads::UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
 }
 
 /// The stored mirror of the fixture author.

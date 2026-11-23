@@ -90,7 +90,10 @@ fn column_dimension(pixels: u32) -> Option<i32> {
 /// Read the upload's image dimensions and, for an `image/*` type, render
 /// its preview and compute its `Blurhash` — all the CPU work in one
 /// [`tokio::task::spawn_blocking`] pass, so decoders never run on the
-/// async runtime. A non-image upload analyzes to `None`: there is nothing
+/// async runtime. The original is decoded once, and the pass starts only
+/// once it holds a permit from
+/// [`media_processing::decode_semaphore`], which bounds concurrent decodes
+/// process-wide. A non-image upload analyzes to `None`: there is nothing
 /// on the row for it to fill.
 ///
 /// # Errors
@@ -110,14 +113,17 @@ pub(super) async fn analyze_upload(
     }
     let bytes = upload.file.bytes.clone();
     let max_pixels = u64::try_from(state.config.max_image_pixels).unwrap_or(u64::MAX);
+    let permit =
+        media_processing::acquire_decode_permit(media_processing::decode_semaphore()).await?;
     let analyzed = tokio::task::spawn_blocking(move || -> AppResult<Analyzed> {
-        let info = media_processing::analyze_image(&bytes, max_pixels)?;
-        let thumbnail = media_processing::make_thumbnail(&bytes, THUMBNAIL_MAX_EDGE);
-        let blurhash = media_processing::compute_blurhash(&bytes);
+        // Held until the pass returns, even if the request is cancelled.
+        let processed = media_processing::process_image(&bytes, max_pixels, THUMBNAIL_MAX_EDGE);
+        drop(permit);
+        let processed = processed?;
         Ok(Analyzed {
-            info,
-            thumbnail,
-            blurhash,
+            info: processed.info,
+            thumbnail: processed.thumbnail,
+            blurhash: processed.blurhash,
         })
     })
     .await

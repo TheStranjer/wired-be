@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use super::ACTOR_ACCEPT;
-use crate::{config::Config, http_client::HttpClient, state::AppState, uploads::UploaderBackend};
+use crate::{config::Config, http_client::HttpClient, state::AppState};
 
 /// `User-Agent` for the test clients.
 const TEST_UA: &str = "Wired (https://test.example)";
@@ -34,19 +34,9 @@ pub(super) fn test_state(pool: PgPool) -> AppState {
 /// The state under test: `pool`, `config`, and a client whose SSRF
 /// guard is off, so it may reach the loopback mocks.
 pub(super) fn test_state_with_config(pool: PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
-    let hub = crate::streaming::hub::Hub::new(&pool);
     AppState {
-        db: pool,
-        hub,
-        config: Arc::clone(&config),
         http_client: HttpClient::new_for_tests(TEST_UA),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        ..AppState::for_tests(pool, config)
     }
 }
 

@@ -9,7 +9,7 @@ mod visibility;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Router, response::Response};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -218,9 +218,9 @@ async fn spawn_peer() -> (String, tokio::task::JoinHandle<()>) {
 /// verify).
 ///
 /// [`fetch_actor`]: wired_be::federation::fetch_actor
-async fn serve_actor(State(base): State<String>, Path(name): Path<String>) -> Json<Value> {
+async fn serve_actor(State(base): State<String>, Path(name): Path<String>) -> Response {
     let id = format!("{base}/users/{name}");
-    Json(json!({
+    common::activity_json(&json!({
         "type": "Person",
         "id": id,
         "preferredUsername": name,
@@ -232,8 +232,8 @@ async fn serve_actor(State(base): State<String>, Path(name): Path<String>) -> Js
 
 /// The note the interaction names: public, authored by `nobody` at this
 /// same base.
-async fn serve_object(State(base): State<String>, Path(name): Path<String>) -> Json<Value> {
-    Json(json!({
+async fn serve_object(State(base): State<String>, Path(name): Path<String>) -> Response {
+    common::activity_json(&json!({
         "id": format!("{base}/objects/{name}"),
         "type": "Note",
         "attributedTo": format!("{base}/users/nobody"),

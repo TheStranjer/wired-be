@@ -4,7 +4,10 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
-    federation::remote_actor::test_support::{MASTODON, PLEROMA, fixture, remove},
+    federation::remote_actor::{
+        MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_FIELDS,
+        test_support::{MASTODON, PLEROMA, fixture, remove},
+    },
     util::time::parse_time,
 };
 
@@ -461,4 +464,93 @@ fn non_object_documents_are_rejected() {
             "a document that is not an object fails Invalid, got {error:?}"
         );
     }
+}
+
+#[test]
+fn a_long_name_is_truncated_to_the_cap() {
+    let mut document = fixture(MASTODON);
+    document["name"] = json!("n".repeat(3000));
+    let parsed = parse_actor(&document).unwrap();
+    assert_eq!(parsed.name.chars().count(), MAX_REMOTE_NAME_CHARS);
+}
+
+#[test]
+fn a_long_summary_is_truncated_on_a_char_boundary() {
+    let mut document = fixture(MASTODON);
+    document["summary"] = json!("é".repeat(30_000));
+    let parsed = parse_actor(&document).unwrap();
+    assert!(parsed.raw_bio.chars().count() <= MAX_REMOTE_BIO_CHARS);
+    assert!(
+        parsed.raw_bio.chars().all(|c| c == 'é'),
+        "multibyte input is cut between characters"
+    );
+    assert!(parsed.bio.chars().count() <= MAX_REMOTE_BIO_CHARS * 6);
+    assert!(!parsed.bio.is_empty(), "the kept prefix is still sanitized");
+}
+
+#[test]
+fn truncate_chars_keeps_short_text_and_cuts_on_boundaries() {
+    assert_eq!(truncate_chars("abc", 3), "abc");
+    assert_eq!(truncate_chars("abc", 10), "abc");
+    assert_eq!(truncate_chars("ééé", 2), "éé");
+    assert_eq!(truncate_chars("abc", 0), "");
+}
+
+#[test]
+fn only_the_first_fifty_fields_are_kept() {
+    let mut document = fixture(MASTODON);
+    let attachment: Vec<Value> = (0..60)
+        .map(|i| json!({"type": "PropertyValue", "name": format!("k{i}"), "value": "v"}))
+        .collect();
+    document["attachment"] = json!(attachment);
+    let parsed = parse_actor(&document).unwrap();
+    let fields = parsed.fields.as_array().unwrap();
+    assert_eq!(fields.len(), MAX_REMOTE_FIELDS);
+    assert_eq!(fields[0]["name"], "k0", "the first entries win");
+    assert_eq!(fields[49]["name"], "k49");
+}
+
+#[test]
+fn over_long_field_names_and_values_are_truncated() {
+    let mut document = fixture(MASTODON);
+    document["attachment"] = json!([{
+        "type": "PropertyValue",
+        "name": "n".repeat(600),
+        "value": "v".repeat(3000),
+    }]);
+    let parsed = parse_actor(&document).unwrap();
+    let field = &parsed.fields[0];
+    assert_eq!(
+        field["name"].as_str().unwrap().chars().count(),
+        MAX_FIELD_NAME_CHARS
+    );
+    assert_eq!(
+        field["value"].as_str().unwrap().chars().count(),
+        MAX_FIELD_VALUE_CHARS
+    );
+}
+
+#[test]
+fn only_the_first_256_aliases_are_kept() {
+    let mut document = fixture(MASTODON);
+    let aliases: Vec<String> = (0..300)
+        .map(|i| format!("https://old.example/users/{i}"))
+        .collect();
+    document["alsoKnownAs"] = json!(aliases);
+    let parsed = parse_actor(&document).unwrap();
+    assert_eq!(parsed.also_known_as.len(), MAX_ALIASES);
+    assert_eq!(parsed.also_known_as[0], "https://old.example/users/0");
+}
+
+#[test]
+fn an_over_long_username_is_rejected_and_the_cap_itself_accepted() {
+    let mut document = fixture(MASTODON);
+    document["preferredUsername"] = json!("a".repeat(MAX_USERNAME_CHARS + 1));
+    let error = parse_actor(&document).unwrap_err();
+    assert!(
+        matches!(error, ActorError::Invalid(_)),
+        "2049 characters fail Invalid, got {error:?}"
+    );
+    document["preferredUsername"] = json!("a".repeat(MAX_USERNAME_CHARS));
+    assert!(parse_actor(&document).is_ok(), "2048 characters pass");
 }

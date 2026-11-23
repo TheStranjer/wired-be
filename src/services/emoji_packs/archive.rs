@@ -15,9 +15,9 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 use crate::error::{AppError, AppResult};
 
 use super::{
-    ACCEPTED_EMOJI_TYPES, ARCHIVE_ENTRY_TOO_LARGE, ARCHIVE_TOO_MANY_FILES, ARCHIVE_UNREADABLE,
-    ARCHIVE_UNSAFE_PATH, MAX_PACK_ARCHIVE_BYTES, MAX_PACK_ARCHIVE_ENTRIES, PACK_FILE,
-    file_name_valid,
+    ACCEPTED_EMOJI_TYPES, ARCHIVE_ENTRY_TOO_LARGE, ARCHIVE_TOO_LARGE, ARCHIVE_TOO_MANY_FILES,
+    ARCHIVE_UNREADABLE, ARCHIVE_UNSAFE_PATH, MAX_PACK_ARCHIVE_BYTES, MAX_PACK_ARCHIVE_ENTRIES,
+    MAX_PACK_EXTRACTED_BYTES, PACK_FILE, file_name_valid,
     files::create_parent,
     names::{io_error, not_shared, pack_dir},
     packs::load_pack,
@@ -123,7 +123,9 @@ fn is_emoji_image(bytes: &[u8]) -> bool {
 /// `..` segment) refuses the whole archive with [`ARCHIVE_UNSAFE_PATH`],
 /// as do more than [`MAX_PACK_ARCHIVE_ENTRIES`] entries
 /// ([`ARCHIVE_TOO_MANY_FILES`]) and one entry inflating past
-/// [`MAX_PACK_ARCHIVE_BYTES`] ([`ARCHIVE_ENTRY_TOO_LARGE`]); bytes that
+/// [`MAX_PACK_ARCHIVE_BYTES`] ([`ARCHIVE_ENTRY_TOO_LARGE`]) or all entries
+/// together inflating past [`MAX_PACK_EXTRACTED_BYTES`]
+/// ([`ARCHIVE_TOO_LARGE`]); bytes that
 /// are no readable zip fail with [`ARCHIVE_UNREADABLE`]. Beyond those
 /// rules only [`PACK_FILE`] and files whose magic bytes name an accepted
 /// image type are written — every other entry is skipped without
@@ -141,6 +143,30 @@ pub async fn extract_pack_archive(
     name: &str,
     bytes: &[u8],
 ) -> AppResult<BTreeSet<String>> {
+    let caps = SizeCaps {
+        entry: MAX_PACK_ARCHIVE_BYTES,
+        total: MAX_PACK_EXTRACTED_BYTES,
+    };
+    extract_with_caps(dir, name, bytes, caps).await
+}
+
+/// The inflated-size limits an extraction enforces.
+#[derive(Clone, Copy)]
+struct SizeCaps {
+    /// Most bytes one entry may inflate to.
+    entry: usize,
+    /// Most bytes all entries may inflate to together.
+    total: usize,
+}
+
+/// [`extract_pack_archive`] with explicit `caps`, so tests can use small
+/// budgets.
+async fn extract_with_caps(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    caps: SizeCaps,
+) -> AppResult<BTreeSet<String>> {
     let pack_root = pack_dir(dir, name)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|_err| archive_refused(ARCHIVE_UNREADABLE))?;
@@ -148,8 +174,11 @@ pub async fn extract_pack_archive(
         return Err(archive_refused(ARCHIVE_TOO_MANY_FILES));
     }
     let mut extracted = BTreeSet::new();
+    let mut total = 0_usize;
     for index in 0..archive.len() {
-        if let Some(file) = extract_archive_entry(&mut archive, &pack_root, index).await? {
+        if let Some(file) =
+            extract_archive_entry(&mut archive, &pack_root, index, caps, &mut total).await?
+        {
             let _fresh: bool = extracted.insert(file);
         }
     }
@@ -164,10 +193,16 @@ pub async fn extract_pack_archive(
 /// Unpacks entry `index` of `archive` into `pack_root`. `Ok(None)` is
 /// an entry there is nothing to write: a directory, a name
 /// [`file_name_valid`] refuses, or bytes no accepted image type names.
+///
+/// `total` is the running count of bytes inflated so far; the entry's
+/// bytes are added to it, and the entry is refused if that passes
+/// `caps.total`.
 async fn extract_archive_entry(
     archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
     pack_root: &Path,
     index: usize,
+    caps: SizeCaps,
+    total: &mut usize,
 ) -> AppResult<Option<String>> {
     let entry = archive
         .by_index(index)
@@ -185,7 +220,8 @@ async fn extract_archive_entry(
     if !file_name_valid(&file) {
         return Ok(None);
     }
-    let bytes = read_archive_entry_bytes(entry)?;
+    let bytes = read_archive_entry_bytes(entry, caps, *total)?;
+    *total = total.saturating_add(bytes.len());
     if file != PACK_FILE && !is_emoji_image(&bytes) {
         return Ok(None);
     }
@@ -197,18 +233,30 @@ async fn extract_archive_entry(
     Ok(Some(file))
 }
 
-/// The unpacked bytes of one entry, reading at most one byte past
-/// [`MAX_PACK_ARCHIVE_BYTES`] so an oversized entry fails without being
-/// given the whole budget; a read that breaks midway (a corrupt entry)
-/// is the unreadable archive it came from.
-fn read_archive_entry_bytes<R: io::Read>(entry: zip::read::ZipFile<'_, R>) -> AppResult<Vec<u8>> {
-    let limit = u64::try_from(MAX_PACK_ARCHIVE_BYTES).unwrap_or(u64::MAX);
+/// The unpacked bytes of one entry, reading at most one byte past the
+/// smaller of `caps.entry` and the budget left of `caps.total` after
+/// `used` bytes, so an oversized entry fails while inflating without
+/// being given the whole budget. An entry past `caps.entry` is
+/// [`ARCHIVE_ENTRY_TOO_LARGE`]; one that fits the entry cap but not the
+/// remaining budget is [`ARCHIVE_TOO_LARGE`]. A read that breaks midway
+/// (a corrupt entry) is the unreadable archive it came from.
+fn read_archive_entry_bytes<R: io::Read>(
+    entry: zip::read::ZipFile<'_, R>,
+    caps: SizeCaps,
+    used: usize,
+) -> AppResult<Vec<u8>> {
+    let remaining = caps.total.saturating_sub(used);
+    let allowed = caps.entry.min(remaining);
+    let limit = u64::try_from(allowed).unwrap_or(u64::MAX);
     let mut bytes = Vec::new();
     let mut capped = io::Read::take(entry, limit.saturating_add(1));
     let _read: usize = io::Read::read_to_end(&mut capped, &mut bytes)
         .map_err(|_err| archive_refused(ARCHIVE_UNREADABLE))?;
-    if bytes.len() > MAX_PACK_ARCHIVE_BYTES {
+    if bytes.len() > caps.entry {
         return Err(archive_refused(ARCHIVE_ENTRY_TOO_LARGE));
+    }
+    if bytes.len() > remaining {
+        return Err(archive_refused(ARCHIVE_TOO_LARGE));
     }
     Ok(bytes)
 }
@@ -436,6 +484,104 @@ mod tests {
         assert!(
             !dir.path().join("many").exists() && !dir.path().join("bomb").exists(),
             "the refused archives installed nothing"
+        );
+    }
+
+    /// A PNG of exactly `len` bytes: the real header, then zeros.
+    fn padded_png(len: usize) -> Vec<u8> {
+        let mut bytes = PNG_BYTES.to_vec();
+        bytes.resize(len, 0);
+        bytes
+    }
+
+    /// A deflate-compressed zip of `entries` (name, payload).
+    fn deflated_zip_of(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, payload) in entries {
+            zip_write(&mut writer, name, options, payload).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn extraction_caps_the_total_inflated_size() {
+        let dir = temp_dir();
+        let caps = SizeCaps {
+            entry: 500,
+            total: 1000,
+        };
+        let image = padded_png(400);
+
+        // Each entry is under the per-entry cap, together they pass 1000.
+        let over = deflated_zip_of(&[
+            ("a.png", image.clone()),
+            ("b.png", image.clone()),
+            ("c.png", image.clone()),
+        ]);
+        let err = extract_with_caps(dir.path(), "over", &over, caps)
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&err, ARCHIVE_TOO_LARGE),
+            "entries that sum past the total are refused: {err}"
+        );
+        assert!(
+            !dir.path().join("over").join("c.png").exists(),
+            "the entry that broke the budget was never written"
+        );
+
+        // Exactly the budget still extracts.
+        let exact = deflated_zip_of(&[
+            ("a.png", image.clone()),
+            ("b.png", image.clone()),
+            ("c.png", padded_png(200)),
+        ]);
+        let extracted = extract_with_caps(dir.path(), "exact", &exact, caps)
+            .await
+            .unwrap();
+        assert_eq!(extracted.len(), 3, "an archive at the total cap installs");
+
+        // One byte over the budget is refused.
+        let one_over = deflated_zip_of(&[
+            ("a.png", image.clone()),
+            ("b.png", image),
+            ("c.png", padded_png(201)),
+        ]);
+        let one_err = extract_with_caps(dir.path(), "one_over", &one_over, caps)
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&one_err, ARCHIVE_TOO_LARGE),
+            "one byte past the total is refused: {one_err}"
+        );
+
+        // A single entry past the per-entry cap keeps its own answer.
+        let single = deflated_zip_of(&[("big.png", padded_png(501))]);
+        let single_err = extract_with_caps(dir.path(), "single", &single, caps)
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&single_err, ARCHIVE_ENTRY_TOO_LARGE),
+            "an oversized entry is still the entry error: {single_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_entries_count_against_the_total_too() {
+        let dir = temp_dir();
+        let caps = SizeCaps {
+            entry: 800,
+            total: 1000,
+        };
+        let filler = vec![b'x'; 600];
+        let archive = deflated_zip_of(&[("a.txt", filler.clone()), ("b.txt", filler)]);
+        let err = extract_with_caps(dir.path(), "junk", &archive, caps)
+            .await
+            .unwrap_err();
+        assert!(
+            archive_error(&err, ARCHIVE_TOO_LARGE),
+            "inflated bytes count whether or not they are written: {err}"
         );
     }
 

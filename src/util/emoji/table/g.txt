@@ -1,0 +1,670 @@
+1F970                                                  ; fully-qualified     # 🥰 E11.0 smiling face with hearts
+1F972                                                  ; fully-qualified     # 🥲 E13.0 smiling face with tear
+1F975                                                  ; fully-qualified     # 🥵 E11.0 hot face
+1F976                                                  ; fully-qualified     # 🥶 E11.0 cold face
+1F974                                                  ; fully-qualified     # 🥴 E11.0 woozy face
+1F973                                                  ; fully-qualified     # 🥳 E11.0 partying face
+1F978                                                  ; fully-qualified     # 🥸 E13.0 disguised face
+1F9D0                                                  ; fully-qualified     # 🧐 E5.0 face with monocle
+1F97A                                                  ; fully-qualified     # 🥺 E11.0 pleading face
+1F979                                                  ; fully-qualified     # 🥹 E14.0 face holding back tears
+1F971                                                  ; fully-qualified     # 🥱 E12.0 yawning face
+1F9E1                                                  ; fully-qualified     # 🧡 E5.0 orange heart
+1F9BE                                                  ; fully-qualified     # 🦾 E12.0 mechanical arm
+1F9BF                                                  ; fully-qualified     # 🦿 E12.0 mechanical leg
+1F9B5                                                  ; fully-qualified     # 🦵 E11.0 leg
+1F9B5 1F3FB                                            ; fully-qualified     # 🦵🏻 E11.0 leg: light skin tone
+1F9B5 1F3FC                                            ; fully-qualified     # 🦵🏼 E11.0 leg: medium-light skin tone
+1F9B5 1F3FD                                            ; fully-qualified     # 🦵🏽 E11.0 leg: medium skin tone
+1F9B5 1F3FE                                            ; fully-qualified     # 🦵🏾 E11.0 leg: medium-dark skin tone
+1F9B5 1F3FF                                            ; fully-qualified     # 🦵🏿 E11.0 leg: dark skin tone
+1F9B6                                                  ; fully-qualified     # 🦶 E11.0 foot
+1F9B6 1F3FB                                            ; fully-qualified     # 🦶🏻 E11.0 foot: light skin tone
+1F9B6 1F3FC                                            ; fully-qualified     # 🦶🏼 E11.0 foot: medium-light skin tone
+1F9B6 1F3FD                                            ; fully-qualified     # 🦶🏽 E11.0 foot: medium skin tone
+1F9B6 1F3FE                                            ; fully-qualified     # 🦶🏾 E11.0 foot: medium-dark skin tone
+1F9B6 1F3FF                                            ; fully-qualified     # 🦶🏿 E11.0 foot: dark skin tone
+1F9BB                                                  ; fully-qualified     # 🦻 E12.0 ear with hearing aid
+1F9BB 1F3FB                                            ; fully-qualified     # 🦻🏻 E12.0 ear with hearing aid: light skin tone
+1F9BB 1F3FC                                            ; fully-qualified     # 🦻🏼 E12.0 ear with hearing aid: medium-light skin tone
+1F9BB 1F3FD                                            ; fully-qualified     # 🦻🏽 E12.0 ear with hearing aid: medium skin tone
+1F9BB 1F3FE                                            ; fully-qualified     # 🦻🏾 E12.0 ear with hearing aid: medium-dark skin tone
+1F9BB 1F3FF                                            ; fully-qualified     # 🦻🏿 E12.0 ear with hearing aid: dark skin tone
+1F9E0                                                  ; fully-qualified     # 🧠 E5.0 brain
+1F9B7                                                  ; fully-qualified     # 🦷 E11.0 tooth
+1F9B4                                                  ; fully-qualified     # 🦴 E11.0 bone
+1F9D2                                                  ; fully-qualified     # 🧒 E5.0 child
+1F9D2 1F3FB                                            ; fully-qualified     # 🧒🏻 E5.0 child: light skin tone
+1F9D2 1F3FC                                            ; fully-qualified     # 🧒🏼 E5.0 child: medium-light skin tone
+1F9D2 1F3FD                                            ; fully-qualified     # 🧒🏽 E5.0 child: medium skin tone
+1F9D2 1F3FE                                            ; fully-qualified     # 🧒🏾 E5.0 child: medium-dark skin tone
+1F9D2 1F3FF                                            ; fully-qualified     # 🧒🏿 E5.0 child: dark skin tone
+1F9D1                                                  ; fully-qualified     # 🧑 E5.0 person
+1F9D1 1F3FB                                            ; fully-qualified     # 🧑🏻 E5.0 person: light skin tone
+1F9D1 1F3FC                                            ; fully-qualified     # 🧑🏼 E5.0 person: medium-light skin tone
+1F9D1 1F3FD                                            ; fully-qualified     # 🧑🏽 E5.0 person: medium skin tone
+1F9D1 1F3FE                                            ; fully-qualified     # 🧑🏾 E5.0 person: medium-dark skin tone
+1F9D1 1F3FF                                            ; fully-qualified     # 🧑🏿 E5.0 person: dark skin tone
+1F9D4                                                  ; fully-qualified     # 🧔 E5.0 person: beard
+1F9D4 1F3FB                                            ; fully-qualified     # 🧔🏻 E5.0 person: light skin tone, beard
+1F9D4 1F3FC                                            ; fully-qualified     # 🧔🏼 E5.0 person: medium-light skin tone, beard
+1F9D4 1F3FD                                            ; fully-qualified     # 🧔🏽 E5.0 person: medium skin tone, beard
+1F9D4 1F3FE                                            ; fully-qualified     # 🧔🏾 E5.0 person: medium-dark skin tone, beard
+1F9D4 1F3FF                                            ; fully-qualified     # 🧔🏿 E5.0 person: dark skin tone, beard
+1F9D4 200D 2642 FE0F                                   ; fully-qualified     # 🧔‍♂️ E13.1 man: beard
+1F9D4 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧔🏻‍♂️ E13.1 man: light skin tone, beard
+1F9D4 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧔🏼‍♂️ E13.1 man: medium-light skin tone, beard
+1F9D4 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧔🏽‍♂️ E13.1 man: medium skin tone, beard
+1F9D4 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧔🏾‍♂️ E13.1 man: medium-dark skin tone, beard
+1F9D4 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧔🏿‍♂️ E13.1 man: dark skin tone, beard
+1F9D4 200D 2640 FE0F                                   ; fully-qualified     # 🧔‍♀️ E13.1 woman: beard
+1F9D4 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧔🏻‍♀️ E13.1 woman: light skin tone, beard
+1F9D4 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧔🏼‍♀️ E13.1 woman: medium-light skin tone, beard
+1F9D4 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧔🏽‍♀️ E13.1 woman: medium skin tone, beard
+1F9D4 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧔🏾‍♀️ E13.1 woman: medium-dark skin tone, beard
+1F9D4 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧔🏿‍♀️ E13.1 woman: dark skin tone, beard
+1F9D1 200D 1F9B0                                       ; fully-qualified     # 🧑‍🦰 E12.1 person: red hair
+1F9D1 1F3FB 200D 1F9B0                                 ; fully-qualified     # 🧑🏻‍🦰 E12.1 person: light skin tone, red hair
+1F9D1 1F3FC 200D 1F9B0                                 ; fully-qualified     # 🧑🏼‍🦰 E12.1 person: medium-light skin tone, red hair
+1F9D1 1F3FD 200D 1F9B0                                 ; fully-qualified     # 🧑🏽‍🦰 E12.1 person: medium skin tone, red hair
+1F9D1 1F3FE 200D 1F9B0                                 ; fully-qualified     # 🧑🏾‍🦰 E12.1 person: medium-dark skin tone, red hair
+1F9D1 1F3FF 200D 1F9B0                                 ; fully-qualified     # 🧑🏿‍🦰 E12.1 person: dark skin tone, red hair
+1F9D1 200D 1F9B1                                       ; fully-qualified     # 🧑‍🦱 E12.1 person: curly hair
+1F9D1 1F3FB 200D 1F9B1                                 ; fully-qualified     # 🧑🏻‍🦱 E12.1 person: light skin tone, curly hair
+1F9D1 1F3FC 200D 1F9B1                                 ; fully-qualified     # 🧑🏼‍🦱 E12.1 person: medium-light skin tone, curly hair
+1F9D1 1F3FD 200D 1F9B1                                 ; fully-qualified     # 🧑🏽‍🦱 E12.1 person: medium skin tone, curly hair
+1F9D1 1F3FE 200D 1F9B1                                 ; fully-qualified     # 🧑🏾‍🦱 E12.1 person: medium-dark skin tone, curly hair
+1F9D1 1F3FF 200D 1F9B1                                 ; fully-qualified     # 🧑🏿‍🦱 E12.1 person: dark skin tone, curly hair
+1F9D1 200D 1F9B3                                       ; fully-qualified     # 🧑‍🦳 E12.1 person: white hair
+1F9D1 1F3FB 200D 1F9B3                                 ; fully-qualified     # 🧑🏻‍🦳 E12.1 person: light skin tone, white hair
+1F9D1 1F3FC 200D 1F9B3                                 ; fully-qualified     # 🧑🏼‍🦳 E12.1 person: medium-light skin tone, white hair
+1F9D1 1F3FD 200D 1F9B3                                 ; fully-qualified     # 🧑🏽‍🦳 E12.1 person: medium skin tone, white hair
+1F9D1 1F3FE 200D 1F9B3                                 ; fully-qualified     # 🧑🏾‍🦳 E12.1 person: medium-dark skin tone, white hair
+1F9D1 1F3FF 200D 1F9B3                                 ; fully-qualified     # 🧑🏿‍🦳 E12.1 person: dark skin tone, white hair
+1F9D1 200D 1F9B2                                       ; fully-qualified     # 🧑‍🦲 E12.1 person: bald
+1F9D1 1F3FB 200D 1F9B2                                 ; fully-qualified     # 🧑🏻‍🦲 E12.1 person: light skin tone, bald
+1F9D1 1F3FC 200D 1F9B2                                 ; fully-qualified     # 🧑🏼‍🦲 E12.1 person: medium-light skin tone, bald
+1F9D1 1F3FD 200D 1F9B2                                 ; fully-qualified     # 🧑🏽‍🦲 E12.1 person: medium skin tone, bald
+1F9D1 1F3FE 200D 1F9B2                                 ; fully-qualified     # 🧑🏾‍🦲 E12.1 person: medium-dark skin tone, bald
+1F9D1 1F3FF 200D 1F9B2                                 ; fully-qualified     # 🧑🏿‍🦲 E12.1 person: dark skin tone, bald
+1F9D3                                                  ; fully-qualified     # 🧓 E5.0 older person
+1F9D3 1F3FB                                            ; fully-qualified     # 🧓🏻 E5.0 older person: light skin tone
+1F9D3 1F3FC                                            ; fully-qualified     # 🧓🏼 E5.0 older person: medium-light skin tone
+1F9D3 1F3FD                                            ; fully-qualified     # 🧓🏽 E5.0 older person: medium skin tone
+1F9D3 1F3FE                                            ; fully-qualified     # 🧓🏾 E5.0 older person: medium-dark skin tone
+1F9D3 1F3FF                                            ; fully-qualified     # 🧓🏿 E5.0 older person: dark skin tone
+1F9CF                                                  ; fully-qualified     # 🧏 E12.0 deaf person
+1F9CF 1F3FB                                            ; fully-qualified     # 🧏🏻 E12.0 deaf person: light skin tone
+1F9CF 1F3FC                                            ; fully-qualified     # 🧏🏼 E12.0 deaf person: medium-light skin tone
+1F9CF 1F3FD                                            ; fully-qualified     # 🧏🏽 E12.0 deaf person: medium skin tone
+1F9CF 1F3FE                                            ; fully-qualified     # 🧏🏾 E12.0 deaf person: medium-dark skin tone
+1F9CF 1F3FF                                            ; fully-qualified     # 🧏🏿 E12.0 deaf person: dark skin tone
+1F9CF 200D 2642 FE0F                                   ; fully-qualified     # 🧏‍♂️ E12.0 deaf man
+1F9CF 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧏🏻‍♂️ E12.0 deaf man: light skin tone
+1F9CF 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧏🏼‍♂️ E12.0 deaf man: medium-light skin tone
+1F9CF 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧏🏽‍♂️ E12.0 deaf man: medium skin tone
+1F9CF 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧏🏾‍♂️ E12.0 deaf man: medium-dark skin tone
+1F9CF 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧏🏿‍♂️ E12.0 deaf man: dark skin tone
+1F9CF 200D 2640 FE0F                                   ; fully-qualified     # 🧏‍♀️ E12.0 deaf woman
+1F9CF 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧏🏻‍♀️ E12.0 deaf woman: light skin tone
+1F9CF 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧏🏼‍♀️ E12.0 deaf woman: medium-light skin tone
+1F9CF 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧏🏽‍♀️ E12.0 deaf woman: medium skin tone
+1F9CF 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧏🏾‍♀️ E12.0 deaf woman: medium-dark skin tone
+1F9CF 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧏🏿‍♀️ E12.0 deaf woman: dark skin tone
+1F9D1 200D 2695 FE0F                                   ; fully-qualified     # 🧑‍⚕️ E12.1 health worker
+1F9D1 1F3FB 200D 2695 FE0F                             ; fully-qualified     # 🧑🏻‍⚕️ E12.1 health worker: light skin tone
+1F9D1 1F3FC 200D 2695 FE0F                             ; fully-qualified     # 🧑🏼‍⚕️ E12.1 health worker: medium-light skin tone
+1F9D1 1F3FD 200D 2695 FE0F                             ; fully-qualified     # 🧑🏽‍⚕️ E12.1 health worker: medium skin tone
+1F9D1 1F3FE 200D 2695 FE0F                             ; fully-qualified     # 🧑🏾‍⚕️ E12.1 health worker: medium-dark skin tone
+1F9D1 1F3FF 200D 2695 FE0F                             ; fully-qualified     # 🧑🏿‍⚕️ E12.1 health worker: dark skin tone
+1F9D1 200D 1F393                                       ; fully-qualified     # 🧑‍🎓 E12.1 student
+1F9D1 1F3FB 200D 1F393                                 ; fully-qualified     # 🧑🏻‍🎓 E12.1 student: light skin tone
+1F9D1 1F3FC 200D 1F393                                 ; fully-qualified     # 🧑🏼‍🎓 E12.1 student: medium-light skin tone
+1F9D1 1F3FD 200D 1F393                                 ; fully-qualified     # 🧑🏽‍🎓 E12.1 student: medium skin tone
+1F9D1 1F3FE 200D 1F393                                 ; fully-qualified     # 🧑🏾‍🎓 E12.1 student: medium-dark skin tone
+1F9D1 1F3FF 200D 1F393                                 ; fully-qualified     # 🧑🏿‍🎓 E12.1 student: dark skin tone
+1F9D1 200D 1F3EB                                       ; fully-qualified     # 🧑‍🏫 E12.1 teacher
+1F9D1 1F3FB 200D 1F3EB                                 ; fully-qualified     # 🧑🏻‍🏫 E12.1 teacher: light skin tone
+1F9D1 1F3FC 200D 1F3EB                                 ; fully-qualified     # 🧑🏼‍🏫 E12.1 teacher: medium-light skin tone
+1F9D1 1F3FD 200D 1F3EB                                 ; fully-qualified     # 🧑🏽‍🏫 E12.1 teacher: medium skin tone
+1F9D1 1F3FE 200D 1F3EB                                 ; fully-qualified     # 🧑🏾‍🏫 E12.1 teacher: medium-dark skin tone
+1F9D1 1F3FF 200D 1F3EB                                 ; fully-qualified     # 🧑🏿‍🏫 E12.1 teacher: dark skin tone
+1F9D1 200D 2696 FE0F                                   ; fully-qualified     # 🧑‍⚖️ E12.1 judge
+1F9D1 1F3FB 200D 2696 FE0F                             ; fully-qualified     # 🧑🏻‍⚖️ E12.1 judge: light skin tone
+1F9D1 1F3FC 200D 2696 FE0F                             ; fully-qualified     # 🧑🏼‍⚖️ E12.1 judge: medium-light skin tone
+1F9D1 1F3FD 200D 2696 FE0F                             ; fully-qualified     # 🧑🏽‍⚖️ E12.1 judge: medium skin tone
+1F9D1 1F3FE 200D 2696 FE0F                             ; fully-qualified     # 🧑🏾‍⚖️ E12.1 judge: medium-dark skin tone
+1F9D1 1F3FF 200D 2696 FE0F                             ; fully-qualified     # 🧑🏿‍⚖️ E12.1 judge: dark skin tone
+1F9D1 200D 1F33E                                       ; fully-qualified     # 🧑‍🌾 E12.1 farmer
+1F9D1 1F3FB 200D 1F33E                                 ; fully-qualified     # 🧑🏻‍🌾 E12.1 farmer: light skin tone
+1F9D1 1F3FC 200D 1F33E                                 ; fully-qualified     # 🧑🏼‍🌾 E12.1 farmer: medium-light skin tone
+1F9D1 1F3FD 200D 1F33E                                 ; fully-qualified     # 🧑🏽‍🌾 E12.1 farmer: medium skin tone
+1F9D1 1F3FE 200D 1F33E                                 ; fully-qualified     # 🧑🏾‍🌾 E12.1 farmer: medium-dark skin tone
+1F9D1 1F3FF 200D 1F33E                                 ; fully-qualified     # 🧑🏿‍🌾 E12.1 farmer: dark skin tone
+1F9D1 200D 1F373                                       ; fully-qualified     # 🧑‍🍳 E12.1 cook
+1F9D1 1F3FB 200D 1F373                                 ; fully-qualified     # 🧑🏻‍🍳 E12.1 cook: light skin tone
+1F9D1 1F3FC 200D 1F373                                 ; fully-qualified     # 🧑🏼‍🍳 E12.1 cook: medium-light skin tone
+1F9D1 1F3FD 200D 1F373                                 ; fully-qualified     # 🧑🏽‍🍳 E12.1 cook: medium skin tone
+1F9D1 1F3FE 200D 1F373                                 ; fully-qualified     # 🧑🏾‍🍳 E12.1 cook: medium-dark skin tone
+1F9D1 1F3FF 200D 1F373                                 ; fully-qualified     # 🧑🏿‍🍳 E12.1 cook: dark skin tone
+1F9D1 200D 1F527                                       ; fully-qualified     # 🧑‍🔧 E12.1 mechanic
+1F9D1 1F3FB 200D 1F527                                 ; fully-qualified     # 🧑🏻‍🔧 E12.1 mechanic: light skin tone
+1F9D1 1F3FC 200D 1F527                                 ; fully-qualified     # 🧑🏼‍🔧 E12.1 mechanic: medium-light skin tone
+1F9D1 1F3FD 200D 1F527                                 ; fully-qualified     # 🧑🏽‍🔧 E12.1 mechanic: medium skin tone
+1F9D1 1F3FE 200D 1F527                                 ; fully-qualified     # 🧑🏾‍🔧 E12.1 mechanic: medium-dark skin tone
+1F9D1 1F3FF 200D 1F527                                 ; fully-qualified     # 🧑🏿‍🔧 E12.1 mechanic: dark skin tone
+1F9D1 200D 1F3ED                                       ; fully-qualified     # 🧑‍🏭 E12.1 factory worker
+1F9D1 1F3FB 200D 1F3ED                                 ; fully-qualified     # 🧑🏻‍🏭 E12.1 factory worker: light skin tone
+1F9D1 1F3FC 200D 1F3ED                                 ; fully-qualified     # 🧑🏼‍🏭 E12.1 factory worker: medium-light skin tone
+1F9D1 1F3FD 200D 1F3ED                                 ; fully-qualified     # 🧑🏽‍🏭 E12.1 factory worker: medium skin tone
+1F9D1 1F3FE 200D 1F3ED                                 ; fully-qualified     # 🧑🏾‍🏭 E12.1 factory worker: medium-dark skin tone
+1F9D1 1F3FF 200D 1F3ED                                 ; fully-qualified     # 🧑🏿‍🏭 E12.1 factory worker: dark skin tone
+1F9D1 200D 1F4BC                                       ; fully-qualified     # 🧑‍💼 E12.1 office worker
+1F9D1 1F3FB 200D 1F4BC                                 ; fully-qualified     # 🧑🏻‍💼 E12.1 office worker: light skin tone
+1F9D1 1F3FC 200D 1F4BC                                 ; fully-qualified     # 🧑🏼‍💼 E12.1 office worker: medium-light skin tone
+1F9D1 1F3FD 200D 1F4BC                                 ; fully-qualified     # 🧑🏽‍💼 E12.1 office worker: medium skin tone
+1F9D1 1F3FE 200D 1F4BC                                 ; fully-qualified     # 🧑🏾‍💼 E12.1 office worker: medium-dark skin tone
+1F9D1 1F3FF 200D 1F4BC                                 ; fully-qualified     # 🧑🏿‍💼 E12.1 office worker: dark skin tone
+1F9D1 200D 1F52C                                       ; fully-qualified     # 🧑‍🔬 E12.1 scientist
+1F9D1 1F3FB 200D 1F52C                                 ; fully-qualified     # 🧑🏻‍🔬 E12.1 scientist: light skin tone
+1F9D1 1F3FC 200D 1F52C                                 ; fully-qualified     # 🧑🏼‍🔬 E12.1 scientist: medium-light skin tone
+1F9D1 1F3FD 200D 1F52C                                 ; fully-qualified     # 🧑🏽‍🔬 E12.1 scientist: medium skin tone
+1F9D1 1F3FE 200D 1F52C                                 ; fully-qualified     # 🧑🏾‍🔬 E12.1 scientist: medium-dark skin tone
+1F9D1 1F3FF 200D 1F52C                                 ; fully-qualified     # 🧑🏿‍🔬 E12.1 scientist: dark skin tone
+1F9D1 200D 1F4BB                                       ; fully-qualified     # 🧑‍💻 E12.1 technologist
+1F9D1 1F3FB 200D 1F4BB                                 ; fully-qualified     # 🧑🏻‍💻 E12.1 technologist: light skin tone
+1F9D1 1F3FC 200D 1F4BB                                 ; fully-qualified     # 🧑🏼‍💻 E12.1 technologist: medium-light skin tone
+1F9D1 1F3FD 200D 1F4BB                                 ; fully-qualified     # 🧑🏽‍💻 E12.1 technologist: medium skin tone
+1F9D1 1F3FE 200D 1F4BB                                 ; fully-qualified     # 🧑🏾‍💻 E12.1 technologist: medium-dark skin tone
+1F9D1 1F3FF 200D 1F4BB                                 ; fully-qualified     # 🧑🏿‍💻 E12.1 technologist: dark skin tone
+1F9D1 200D 1F3A4                                       ; fully-qualified     # 🧑‍🎤 E12.1 singer
+1F9D1 1F3FB 200D 1F3A4                                 ; fully-qualified     # 🧑🏻‍🎤 E12.1 singer: light skin tone
+1F9D1 1F3FC 200D 1F3A4                                 ; fully-qualified     # 🧑🏼‍🎤 E12.1 singer: medium-light skin tone
+1F9D1 1F3FD 200D 1F3A4                                 ; fully-qualified     # 🧑🏽‍🎤 E12.1 singer: medium skin tone
+1F9D1 1F3FE 200D 1F3A4                                 ; fully-qualified     # 🧑🏾‍🎤 E12.1 singer: medium-dark skin tone
+1F9D1 1F3FF 200D 1F3A4                                 ; fully-qualified     # 🧑🏿‍🎤 E12.1 singer: dark skin tone
+1F9D1 200D 1F3A8                                       ; fully-qualified     # 🧑‍🎨 E12.1 artist
+1F9D1 1F3FB 200D 1F3A8                                 ; fully-qualified     # 🧑🏻‍🎨 E12.1 artist: light skin tone
+1F9D1 1F3FC 200D 1F3A8                                 ; fully-qualified     # 🧑🏼‍🎨 E12.1 artist: medium-light skin tone
+1F9D1 1F3FD 200D 1F3A8                                 ; fully-qualified     # 🧑🏽‍🎨 E12.1 artist: medium skin tone
+1F9D1 1F3FE 200D 1F3A8                                 ; fully-qualified     # 🧑🏾‍🎨 E12.1 artist: medium-dark skin tone
+1F9D1 1F3FF 200D 1F3A8                                 ; fully-qualified     # 🧑🏿‍🎨 E12.1 artist: dark skin tone
+1F9D1 200D 2708 FE0F                                   ; fully-qualified     # 🧑‍✈️ E12.1 pilot
+1F9D1 1F3FB 200D 2708 FE0F                             ; fully-qualified     # 🧑🏻‍✈️ E12.1 pilot: light skin tone
+1F9D1 1F3FC 200D 2708 FE0F                             ; fully-qualified     # 🧑🏼‍✈️ E12.1 pilot: medium-light skin tone
+1F9D1 1F3FD 200D 2708 FE0F                             ; fully-qualified     # 🧑🏽‍✈️ E12.1 pilot: medium skin tone
+1F9D1 1F3FE 200D 2708 FE0F                             ; fully-qualified     # 🧑🏾‍✈️ E12.1 pilot: medium-dark skin tone
+1F9D1 1F3FF 200D 2708 FE0F                             ; fully-qualified     # 🧑🏿‍✈️ E12.1 pilot: dark skin tone
+1F9D1 200D 1F680                                       ; fully-qualified     # 🧑‍🚀 E12.1 astronaut
+1F9D1 1F3FB 200D 1F680                                 ; fully-qualified     # 🧑🏻‍🚀 E12.1 astronaut: light skin tone
+1F9D1 1F3FC 200D 1F680                                 ; fully-qualified     # 🧑🏼‍🚀 E12.1 astronaut: medium-light skin tone
+1F9D1 1F3FD 200D 1F680                                 ; fully-qualified     # 🧑🏽‍🚀 E12.1 astronaut: medium skin tone
+1F9D1 1F3FE 200D 1F680                                 ; fully-qualified     # 🧑🏾‍🚀 E12.1 astronaut: medium-dark skin tone
+1F9D1 1F3FF 200D 1F680                                 ; fully-qualified     # 🧑🏿‍🚀 E12.1 astronaut: dark skin tone
+1F9D1 200D 1F692                                       ; fully-qualified     # 🧑‍🚒 E12.1 firefighter
+1F9D1 1F3FB 200D 1F692                                 ; fully-qualified     # 🧑🏻‍🚒 E12.1 firefighter: light skin tone
+1F9D1 1F3FC 200D 1F692                                 ; fully-qualified     # 🧑🏼‍🚒 E12.1 firefighter: medium-light skin tone
+1F9D1 1F3FD 200D 1F692                                 ; fully-qualified     # 🧑🏽‍🚒 E12.1 firefighter: medium skin tone
+1F9D1 1F3FE 200D 1F692                                 ; fully-qualified     # 🧑🏾‍🚒 E12.1 firefighter: medium-dark skin tone
+1F9D1 1F3FF 200D 1F692                                 ; fully-qualified     # 🧑🏿‍🚒 E12.1 firefighter: dark skin tone
+1F977                                                  ; fully-qualified     # 🥷 E13.0 ninja
+1F977 1F3FB                                            ; fully-qualified     # 🥷🏻 E13.0 ninja: light skin tone
+1F977 1F3FC                                            ; fully-qualified     # 🥷🏼 E13.0 ninja: medium-light skin tone
+1F977 1F3FD                                            ; fully-qualified     # 🥷🏽 E13.0 ninja: medium skin tone
+1F977 1F3FE                                            ; fully-qualified     # 🥷🏾 E13.0 ninja: medium-dark skin tone
+1F977 1F3FF                                            ; fully-qualified     # 🥷🏿 E13.0 ninja: dark skin tone
+1F9D5                                                  ; fully-qualified     # 🧕 E5.0 woman with headscarf
+1F9D5 1F3FB                                            ; fully-qualified     # 🧕🏻 E5.0 woman with headscarf: light skin tone
+1F9D5 1F3FC                                            ; fully-qualified     # 🧕🏼 E5.0 woman with headscarf: medium-light skin tone
+1F9D5 1F3FD                                            ; fully-qualified     # 🧕🏽 E5.0 woman with headscarf: medium skin tone
+1F9D5 1F3FE                                            ; fully-qualified     # 🧕🏾 E5.0 woman with headscarf: medium-dark skin tone
+1F9D5 1F3FF                                            ; fully-qualified     # 🧕🏿 E5.0 woman with headscarf: dark skin tone
+1F9D1 200D 1F37C                                       ; fully-qualified     # 🧑‍🍼 E13.0 person feeding baby
+1F9D1 1F3FB 200D 1F37C                                 ; fully-qualified     # 🧑🏻‍🍼 E13.0 person feeding baby: light skin tone
+1F9D1 1F3FC 200D 1F37C                                 ; fully-qualified     # 🧑🏼‍🍼 E13.0 person feeding baby: medium-light skin tone
+1F9D1 1F3FD 200D 1F37C                                 ; fully-qualified     # 🧑🏽‍🍼 E13.0 person feeding baby: medium skin tone
+1F9D1 1F3FE 200D 1F37C                                 ; fully-qualified     # 🧑🏾‍🍼 E13.0 person feeding baby: medium-dark skin tone
+1F9D1 1F3FF 200D 1F37C                                 ; fully-qualified     # 🧑🏿‍🍼 E13.0 person feeding baby: dark skin tone
+1F9D1 200D 1F384                                       ; fully-qualified     # 🧑‍🎄 E13.0 mx claus
+1F9D1 1F3FB 200D 1F384                                 ; fully-qualified     # 🧑🏻‍🎄 E13.0 mx claus: light skin tone
+1F9D1 1F3FC 200D 1F384                                 ; fully-qualified     # 🧑🏼‍🎄 E13.0 mx claus: medium-light skin tone
+1F9D1 1F3FD 200D 1F384                                 ; fully-qualified     # 🧑🏽‍🎄 E13.0 mx claus: medium skin tone
+1F9D1 1F3FE 200D 1F384                                 ; fully-qualified     # 🧑🏾‍🎄 E13.0 mx claus: medium-dark skin tone
+1F9D1 1F3FF 200D 1F384                                 ; fully-qualified     # 🧑🏿‍🎄 E13.0 mx claus: dark skin tone
+1F9B8                                                  ; fully-qualified     # 🦸 E11.0 superhero
+1F9B8 1F3FB                                            ; fully-qualified     # 🦸🏻 E11.0 superhero: light skin tone
+1F9B8 1F3FC                                            ; fully-qualified     # 🦸🏼 E11.0 superhero: medium-light skin tone
+1F9B8 1F3FD                                            ; fully-qualified     # 🦸🏽 E11.0 superhero: medium skin tone
+1F9B8 1F3FE                                            ; fully-qualified     # 🦸🏾 E11.0 superhero: medium-dark skin tone
+1F9B8 1F3FF                                            ; fully-qualified     # 🦸🏿 E11.0 superhero: dark skin tone
+1F9B8 200D 2642 FE0F                                   ; fully-qualified     # 🦸‍♂️ E11.0 man superhero
+1F9B8 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🦸🏻‍♂️ E11.0 man superhero: light skin tone
+1F9B8 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🦸🏼‍♂️ E11.0 man superhero: medium-light skin tone
+1F9B8 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🦸🏽‍♂️ E11.0 man superhero: medium skin tone
+1F9B8 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🦸🏾‍♂️ E11.0 man superhero: medium-dark skin tone
+1F9B8 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🦸🏿‍♂️ E11.0 man superhero: dark skin tone
+1F9B8 200D 2640 FE0F                                   ; fully-qualified     # 🦸‍♀️ E11.0 woman superhero
+1F9B8 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🦸🏻‍♀️ E11.0 woman superhero: light skin tone
+1F9B8 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🦸🏼‍♀️ E11.0 woman superhero: medium-light skin tone
+1F9B8 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🦸🏽‍♀️ E11.0 woman superhero: medium skin tone
+1F9B8 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🦸🏾‍♀️ E11.0 woman superhero: medium-dark skin tone
+1F9B8 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🦸🏿‍♀️ E11.0 woman superhero: dark skin tone
+1F9B9                                                  ; fully-qualified     # 🦹 E11.0 supervillain
+1F9B9 1F3FB                                            ; fully-qualified     # 🦹🏻 E11.0 supervillain: light skin tone
+1F9B9 1F3FC                                            ; fully-qualified     # 🦹🏼 E11.0 supervillain: medium-light skin tone
+1F9B9 1F3FD                                            ; fully-qualified     # 🦹🏽 E11.0 supervillain: medium skin tone
+1F9B9 1F3FE                                            ; fully-qualified     # 🦹🏾 E11.0 supervillain: medium-dark skin tone
+1F9B9 1F3FF                                            ; fully-qualified     # 🦹🏿 E11.0 supervillain: dark skin tone
+1F9B9 200D 2642 FE0F                                   ; fully-qualified     # 🦹‍♂️ E11.0 man supervillain
+1F9B9 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🦹🏻‍♂️ E11.0 man supervillain: light skin tone
+1F9B9 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🦹🏼‍♂️ E11.0 man supervillain: medium-light skin tone
+1F9B9 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🦹🏽‍♂️ E11.0 man supervillain: medium skin tone
+1F9B9 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🦹🏾‍♂️ E11.0 man supervillain: medium-dark skin tone
+1F9B9 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🦹🏿‍♂️ E11.0 man supervillain: dark skin tone
+1F9B9 200D 2640 FE0F                                   ; fully-qualified     # 🦹‍♀️ E11.0 woman supervillain
+1F9B9 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🦹🏻‍♀️ E11.0 woman supervillain: light skin tone
+1F9B9 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🦹🏼‍♀️ E11.0 woman supervillain: medium-light skin tone
+1F9B9 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🦹🏽‍♀️ E11.0 woman supervillain: medium skin tone
+1F9B9 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🦹🏾‍♀️ E11.0 woman supervillain: medium-dark skin tone
+1F9B9 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🦹🏿‍♀️ E11.0 woman supervillain: dark skin tone
+1F9D9                                                  ; fully-qualified     # 🧙 E5.0 mage
+1F9D9 1F3FB                                            ; fully-qualified     # 🧙🏻 E5.0 mage: light skin tone
+1F9D9 1F3FC                                            ; fully-qualified     # 🧙🏼 E5.0 mage: medium-light skin tone
+1F9D9 1F3FD                                            ; fully-qualified     # 🧙🏽 E5.0 mage: medium skin tone
+1F9D9 1F3FE                                            ; fully-qualified     # 🧙🏾 E5.0 mage: medium-dark skin tone
+1F9D9 1F3FF                                            ; fully-qualified     # 🧙🏿 E5.0 mage: dark skin tone
+1F9D9 200D 2642 FE0F                                   ; fully-qualified     # 🧙‍♂️ E5.0 man mage
+1F9D9 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧙🏻‍♂️ E5.0 man mage: light skin tone
+1F9D9 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧙🏼‍♂️ E5.0 man mage: medium-light skin tone
+1F9D9 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧙🏽‍♂️ E5.0 man mage: medium skin tone
+1F9D9 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧙🏾‍♂️ E5.0 man mage: medium-dark skin tone
+1F9D9 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧙🏿‍♂️ E5.0 man mage: dark skin tone
+1F9D9 200D 2640 FE0F                                   ; fully-qualified     # 🧙‍♀️ E5.0 woman mage
+1F9D9 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧙🏻‍♀️ E5.0 woman mage: light skin tone
+1F9D9 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧙🏼‍♀️ E5.0 woman mage: medium-light skin tone
+1F9D9 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧙🏽‍♀️ E5.0 woman mage: medium skin tone
+1F9D9 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧙🏾‍♀️ E5.0 woman mage: medium-dark skin tone
+1F9D9 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧙🏿‍♀️ E5.0 woman mage: dark skin tone
+1F9DA                                                  ; fully-qualified     # 🧚 E5.0 fairy
+1F9DA 1F3FB                                            ; fully-qualified     # 🧚🏻 E5.0 fairy: light skin tone
+1F9DA 1F3FC                                            ; fully-qualified     # 🧚🏼 E5.0 fairy: medium-light skin tone
+1F9DA 1F3FD                                            ; fully-qualified     # 🧚🏽 E5.0 fairy: medium skin tone
+1F9DA 1F3FE                                            ; fully-qualified     # 🧚🏾 E5.0 fairy: medium-dark skin tone
+1F9DA 1F3FF                                            ; fully-qualified     # 🧚🏿 E5.0 fairy: dark skin tone
+1F9DA 200D 2642 FE0F                                   ; fully-qualified     # 🧚‍♂️ E5.0 man fairy
+1F9DA 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧚🏻‍♂️ E5.0 man fairy: light skin tone
+1F9DA 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧚🏼‍♂️ E5.0 man fairy: medium-light skin tone
+1F9DA 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧚🏽‍♂️ E5.0 man fairy: medium skin tone
+1F9DA 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧚🏾‍♂️ E5.0 man fairy: medium-dark skin tone
+1F9DA 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧚🏿‍♂️ E5.0 man fairy: dark skin tone
+1F9DA 200D 2640 FE0F                                   ; fully-qualified     # 🧚‍♀️ E5.0 woman fairy
+1F9DA 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧚🏻‍♀️ E5.0 woman fairy: light skin tone
+1F9DA 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧚🏼‍♀️ E5.0 woman fairy: medium-light skin tone
+1F9DA 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧚🏽‍♀️ E5.0 woman fairy: medium skin tone
+1F9DA 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧚🏾‍♀️ E5.0 woman fairy: medium-dark skin tone
+1F9DA 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧚🏿‍♀️ E5.0 woman fairy: dark skin tone
+1F9DB                                                  ; fully-qualified     # 🧛 E5.0 vampire
+1F9DB 1F3FB                                            ; fully-qualified     # 🧛🏻 E5.0 vampire: light skin tone
+1F9DB 1F3FC                                            ; fully-qualified     # 🧛🏼 E5.0 vampire: medium-light skin tone
+1F9DB 1F3FD                                            ; fully-qualified     # 🧛🏽 E5.0 vampire: medium skin tone
+1F9DB 1F3FE                                            ; fully-qualified     # 🧛🏾 E5.0 vampire: medium-dark skin tone
+1F9DB 1F3FF                                            ; fully-qualified     # 🧛🏿 E5.0 vampire: dark skin tone
+1F9DB 200D 2642 FE0F                                   ; fully-qualified     # 🧛‍♂️ E5.0 man vampire
+1F9DB 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧛🏻‍♂️ E5.0 man vampire: light skin tone
+1F9DB 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧛🏼‍♂️ E5.0 man vampire: medium-light skin tone
+1F9DB 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧛🏽‍♂️ E5.0 man vampire: medium skin tone
+1F9DB 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧛🏾‍♂️ E5.0 man vampire: medium-dark skin tone
+1F9DB 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧛🏿‍♂️ E5.0 man vampire: dark skin tone
+1F9DB 200D 2640 FE0F                                   ; fully-qualified     # 🧛‍♀️ E5.0 woman vampire
+1F9DB 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧛🏻‍♀️ E5.0 woman vampire: light skin tone
+1F9DB 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧛🏼‍♀️ E5.0 woman vampire: medium-light skin tone
+1F9DB 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧛🏽‍♀️ E5.0 woman vampire: medium skin tone
+1F9DB 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧛🏾‍♀️ E5.0 woman vampire: medium-dark skin tone
+1F9DB 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧛🏿‍♀️ E5.0 woman vampire: dark skin tone
+1F9DC                                                  ; fully-qualified     # 🧜 E5.0 merperson
+1F9DC 1F3FB                                            ; fully-qualified     # 🧜🏻 E5.0 merperson: light skin tone
+1F9DC 1F3FC                                            ; fully-qualified     # 🧜🏼 E5.0 merperson: medium-light skin tone
+1F9DC 1F3FD                                            ; fully-qualified     # 🧜🏽 E5.0 merperson: medium skin tone
+1F9DC 1F3FE                                            ; fully-qualified     # 🧜🏾 E5.0 merperson: medium-dark skin tone
+1F9DC 1F3FF                                            ; fully-qualified     # 🧜🏿 E5.0 merperson: dark skin tone
+1F9DC 200D 2642 FE0F                                   ; fully-qualified     # 🧜‍♂️ E5.0 merman
+1F9DC 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧜🏻‍♂️ E5.0 merman: light skin tone
+1F9DC 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧜🏼‍♂️ E5.0 merman: medium-light skin tone
+1F9DC 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧜🏽‍♂️ E5.0 merman: medium skin tone
+1F9DC 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧜🏾‍♂️ E5.0 merman: medium-dark skin tone
+1F9DC 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧜🏿‍♂️ E5.0 merman: dark skin tone
+1F9DC 200D 2640 FE0F                                   ; fully-qualified     # 🧜‍♀️ E5.0 mermaid
+1F9DC 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧜🏻‍♀️ E5.0 mermaid: light skin tone
+1F9DC 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧜🏼‍♀️ E5.0 mermaid: medium-light skin tone
+1F9DC 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧜🏽‍♀️ E5.0 mermaid: medium skin tone
+1F9DC 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧜🏾‍♀️ E5.0 mermaid: medium-dark skin tone
+1F9DC 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧜🏿‍♀️ E5.0 mermaid: dark skin tone
+1F9DD                                                  ; fully-qualified     # 🧝 E5.0 elf
+1F9DD 1F3FB                                            ; fully-qualified     # 🧝🏻 E5.0 elf: light skin tone
+1F9DD 1F3FC                                            ; fully-qualified     # 🧝🏼 E5.0 elf: medium-light skin tone
+1F9DD 1F3FD                                            ; fully-qualified     # 🧝🏽 E5.0 elf: medium skin tone
+1F9DD 1F3FE                                            ; fully-qualified     # 🧝🏾 E5.0 elf: medium-dark skin tone
+1F9DD 1F3FF                                            ; fully-qualified     # 🧝🏿 E5.0 elf: dark skin tone
+1F9DD 200D 2642 FE0F                                   ; fully-qualified     # 🧝‍♂️ E5.0 man elf
+1F9DD 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧝🏻‍♂️ E5.0 man elf: light skin tone
+1F9DD 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧝🏼‍♂️ E5.0 man elf: medium-light skin tone
+1F9DD 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧝🏽‍♂️ E5.0 man elf: medium skin tone
+1F9DD 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧝🏾‍♂️ E5.0 man elf: medium-dark skin tone
+1F9DD 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧝🏿‍♂️ E5.0 man elf: dark skin tone
+1F9DD 200D 2640 FE0F                                   ; fully-qualified     # 🧝‍♀️ E5.0 woman elf
+1F9DD 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧝🏻‍♀️ E5.0 woman elf: light skin tone
+1F9DD 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧝🏼‍♀️ E5.0 woman elf: medium-light skin tone
+1F9DD 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧝🏽‍♀️ E5.0 woman elf: medium skin tone
+1F9DD 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧝🏾‍♀️ E5.0 woman elf: medium-dark skin tone
+1F9DD 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧝🏿‍♀️ E5.0 woman elf: dark skin tone
+1F9DE                                                  ; fully-qualified     # 🧞 E5.0 genie
+1F9DE 200D 2642 FE0F                                   ; fully-qualified     # 🧞‍♂️ E5.0 man genie
+1F9DE 200D 2640 FE0F                                   ; fully-qualified     # 🧞‍♀️ E5.0 woman genie
+1F9DF                                                  ; fully-qualified     # 🧟 E5.0 zombie
+1F9DF 200D 2642 FE0F                                   ; fully-qualified     # 🧟‍♂️ E5.0 man zombie
+1F9DF 200D 2640 FE0F                                   ; fully-qualified     # 🧟‍♀️ E5.0 woman zombie
+1F9CC                                                  ; fully-qualified     # 🧌 E14.0 troll
+1F9CD                                                  ; fully-qualified     # 🧍 E12.0 person standing
+1F9CD 1F3FB                                            ; fully-qualified     # 🧍🏻 E12.0 person standing: light skin tone
+1F9CD 1F3FC                                            ; fully-qualified     # 🧍🏼 E12.0 person standing: medium-light skin tone
+1F9CD 1F3FD                                            ; fully-qualified     # 🧍🏽 E12.0 person standing: medium skin tone
+1F9CD 1F3FE                                            ; fully-qualified     # 🧍🏾 E12.0 person standing: medium-dark skin tone
+1F9CD 1F3FF                                            ; fully-qualified     # 🧍🏿 E12.0 person standing: dark skin tone
+1F9CD 200D 2642 FE0F                                   ; fully-qualified     # 🧍‍♂️ E12.0 man standing
+1F9CD 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧍🏻‍♂️ E12.0 man standing: light skin tone
+1F9CD 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧍🏼‍♂️ E12.0 man standing: medium-light skin tone
+1F9CD 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧍🏽‍♂️ E12.0 man standing: medium skin tone
+1F9CD 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧍🏾‍♂️ E12.0 man standing: medium-dark skin tone
+1F9CD 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧍🏿‍♂️ E12.0 man standing: dark skin tone
+1F9CD 200D 2640 FE0F                                   ; fully-qualified     # 🧍‍♀️ E12.0 woman standing
+1F9CD 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧍🏻‍♀️ E12.0 woman standing: light skin tone
+1F9CD 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧍🏼‍♀️ E12.0 woman standing: medium-light skin tone
+1F9CD 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧍🏽‍♀️ E12.0 woman standing: medium skin tone
+1F9CD 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧍🏾‍♀️ E12.0 woman standing: medium-dark skin tone
+1F9CD 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧍🏿‍♀️ E12.0 woman standing: dark skin tone
+1F9CE                                                  ; fully-qualified     # 🧎 E12.0 person kneeling
+1F9CE 1F3FB                                            ; fully-qualified     # 🧎🏻 E12.0 person kneeling: light skin tone
+1F9CE 1F3FC                                            ; fully-qualified     # 🧎🏼 E12.0 person kneeling: medium-light skin tone
+1F9CE 1F3FD                                            ; fully-qualified     # 🧎🏽 E12.0 person kneeling: medium skin tone
+1F9CE 1F3FE                                            ; fully-qualified     # 🧎🏾 E12.0 person kneeling: medium-dark skin tone
+1F9CE 1F3FF                                            ; fully-qualified     # 🧎🏿 E12.0 person kneeling: dark skin tone
+1F9CE 200D 2642 FE0F                                   ; fully-qualified     # 🧎‍♂️ E12.0 man kneeling
+1F9CE 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧎🏻‍♂️ E12.0 man kneeling: light skin tone
+1F9CE 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧎🏼‍♂️ E12.0 man kneeling: medium-light skin tone
+1F9CE 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧎🏽‍♂️ E12.0 man kneeling: medium skin tone
+1F9CE 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧎🏾‍♂️ E12.0 man kneeling: medium-dark skin tone
+1F9CE 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧎🏿‍♂️ E12.0 man kneeling: dark skin tone
+1F9CE 200D 2640 FE0F                                   ; fully-qualified     # 🧎‍♀️ E12.0 woman kneeling
+1F9CE 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧎🏻‍♀️ E12.0 woman kneeling: light skin tone
+1F9CE 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧎🏼‍♀️ E12.0 woman kneeling: medium-light skin tone
+1F9CE 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧎🏽‍♀️ E12.0 woman kneeling: medium skin tone
+1F9CE 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧎🏾‍♀️ E12.0 woman kneeling: medium-dark skin tone
+1F9CE 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧎🏿‍♀️ E12.0 woman kneeling: dark skin tone
+1F9D1 200D 1F9AF                                       ; fully-qualified     # 🧑‍🦯 E12.1 person with white cane
+1F9D1 1F3FB 200D 1F9AF                                 ; fully-qualified     # 🧑🏻‍🦯 E12.1 person with white cane: light skin tone
+1F9D1 1F3FC 200D 1F9AF                                 ; fully-qualified     # 🧑🏼‍🦯 E12.1 person with white cane: medium-light skin tone
+1F9D1 1F3FD 200D 1F9AF                                 ; fully-qualified     # 🧑🏽‍🦯 E12.1 person with white cane: medium skin tone
+1F9D1 1F3FE 200D 1F9AF                                 ; fully-qualified     # 🧑🏾‍🦯 E12.1 person with white cane: medium-dark skin tone
+1F9D1 1F3FF 200D 1F9AF                                 ; fully-qualified     # 🧑🏿‍🦯 E12.1 person with white cane: dark skin tone
+1F9D1 200D 1F9BC                                       ; fully-qualified     # 🧑‍🦼 E12.1 person in motorized wheelchair
+1F9D1 1F3FB 200D 1F9BC                                 ; fully-qualified     # 🧑🏻‍🦼 E12.1 person in motorized wheelchair: light skin tone
+1F9D1 1F3FC 200D 1F9BC                                 ; fully-qualified     # 🧑🏼‍🦼 E12.1 person in motorized wheelchair: medium-light skin tone
+1F9D1 1F3FD 200D 1F9BC                                 ; fully-qualified     # 🧑🏽‍🦼 E12.1 person in motorized wheelchair: medium skin tone
+1F9D1 1F3FE 200D 1F9BC                                 ; fully-qualified     # 🧑🏾‍🦼 E12.1 person in motorized wheelchair: medium-dark skin tone
+1F9D1 1F3FF 200D 1F9BC                                 ; fully-qualified     # 🧑🏿‍🦼 E12.1 person in motorized wheelchair: dark skin tone
+1F9D1 200D 1F9BD                                       ; fully-qualified     # 🧑‍🦽 E12.1 person in manual wheelchair
+1F9D1 1F3FB 200D 1F9BD                                 ; fully-qualified     # 🧑🏻‍🦽 E12.1 person in manual wheelchair: light skin tone
+1F9D1 1F3FC 200D 1F9BD                                 ; fully-qualified     # 🧑🏼‍🦽 E12.1 person in manual wheelchair: medium-light skin tone
+1F9D1 1F3FD 200D 1F9BD                                 ; fully-qualified     # 🧑🏽‍🦽 E12.1 person in manual wheelchair: medium skin tone
+1F9D1 1F3FE 200D 1F9BD                                 ; fully-qualified     # 🧑🏾‍🦽 E12.1 person in manual wheelchair: medium-dark skin tone
+1F9D1 1F3FF 200D 1F9BD                                 ; fully-qualified     # 🧑🏿‍🦽 E12.1 person in manual wheelchair: dark skin tone
+1F9D6                                                  ; fully-qualified     # 🧖 E5.0 person in steamy room
+1F9D6 1F3FB                                            ; fully-qualified     # 🧖🏻 E5.0 person in steamy room: light skin tone
+1F9D6 1F3FC                                            ; fully-qualified     # 🧖🏼 E5.0 person in steamy room: medium-light skin tone
+1F9D6 1F3FD                                            ; fully-qualified     # 🧖🏽 E5.0 person in steamy room: medium skin tone
+1F9D6 1F3FE                                            ; fully-qualified     # 🧖🏾 E5.0 person in steamy room: medium-dark skin tone
+1F9D6 1F3FF                                            ; fully-qualified     # 🧖🏿 E5.0 person in steamy room: dark skin tone
+1F9D6 200D 2642 FE0F                                   ; fully-qualified     # 🧖‍♂️ E5.0 man in steamy room
+1F9D6 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧖🏻‍♂️ E5.0 man in steamy room: light skin tone
+1F9D6 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧖🏼‍♂️ E5.0 man in steamy room: medium-light skin tone
+1F9D6 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧖🏽‍♂️ E5.0 man in steamy room: medium skin tone
+1F9D6 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧖🏾‍♂️ E5.0 man in steamy room: medium-dark skin tone
+1F9D6 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧖🏿‍♂️ E5.0 man in steamy room: dark skin tone
+1F9D6 200D 2640 FE0F                                   ; fully-qualified     # 🧖‍♀️ E5.0 woman in steamy room
+1F9D6 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧖🏻‍♀️ E5.0 woman in steamy room: light skin tone
+1F9D6 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧖🏼‍♀️ E5.0 woman in steamy room: medium-light skin tone
+1F9D6 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧖🏽‍♀️ E5.0 woman in steamy room: medium skin tone
+1F9D6 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧖🏾‍♀️ E5.0 woman in steamy room: medium-dark skin tone
+1F9D6 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧖🏿‍♀️ E5.0 woman in steamy room: dark skin tone
+1F9D7                                                  ; fully-qualified     # 🧗 E5.0 person climbing
+1F9D7 1F3FB                                            ; fully-qualified     # 🧗🏻 E5.0 person climbing: light skin tone
+1F9D7 1F3FC                                            ; fully-qualified     # 🧗🏼 E5.0 person climbing: medium-light skin tone
+1F9D7 1F3FD                                            ; fully-qualified     # 🧗🏽 E5.0 person climbing: medium skin tone
+1F9D7 1F3FE                                            ; fully-qualified     # 🧗🏾 E5.0 person climbing: medium-dark skin tone
+1F9D7 1F3FF                                            ; fully-qualified     # 🧗🏿 E5.0 person climbing: dark skin tone
+1F9D7 200D 2642 FE0F                                   ; fully-qualified     # 🧗‍♂️ E5.0 man climbing
+1F9D7 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧗🏻‍♂️ E5.0 man climbing: light skin tone
+1F9D7 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧗🏼‍♂️ E5.0 man climbing: medium-light skin tone
+1F9D7 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧗🏽‍♂️ E5.0 man climbing: medium skin tone
+1F9D7 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧗🏾‍♂️ E5.0 man climbing: medium-dark skin tone
+1F9D7 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧗🏿‍♂️ E5.0 man climbing: dark skin tone
+1F9D7 200D 2640 FE0F                                   ; fully-qualified     # 🧗‍♀️ E5.0 woman climbing
+1F9D7 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧗🏻‍♀️ E5.0 woman climbing: light skin tone
+1F9D7 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧗🏼‍♀️ E5.0 woman climbing: medium-light skin tone
+1F9D7 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧗🏽‍♀️ E5.0 woman climbing: medium skin tone
+1F9D7 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧗🏾‍♀️ E5.0 woman climbing: medium-dark skin tone
+1F9D7 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧗🏿‍♀️ E5.0 woman climbing: dark skin tone
+1F9D8                                                  ; fully-qualified     # 🧘 E5.0 person in lotus position
+1F9D8 1F3FB                                            ; fully-qualified     # 🧘🏻 E5.0 person in lotus position: light skin tone
+1F9D8 1F3FC                                            ; fully-qualified     # 🧘🏼 E5.0 person in lotus position: medium-light skin tone
+1F9D8 1F3FD                                            ; fully-qualified     # 🧘🏽 E5.0 person in lotus position: medium skin tone
+1F9D8 1F3FE                                            ; fully-qualified     # 🧘🏾 E5.0 person in lotus position: medium-dark skin tone
+1F9D8 1F3FF                                            ; fully-qualified     # 🧘🏿 E5.0 person in lotus position: dark skin tone
+1F9D8 200D 2642 FE0F                                   ; fully-qualified     # 🧘‍♂️ E5.0 man in lotus position
+1F9D8 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🧘🏻‍♂️ E5.0 man in lotus position: light skin tone
+1F9D8 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🧘🏼‍♂️ E5.0 man in lotus position: medium-light skin tone
+1F9D8 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🧘🏽‍♂️ E5.0 man in lotus position: medium skin tone
+1F9D8 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🧘🏾‍♂️ E5.0 man in lotus position: medium-dark skin tone
+1F9D8 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🧘🏿‍♂️ E5.0 man in lotus position: dark skin tone
+1F9D8 200D 2640 FE0F                                   ; fully-qualified     # 🧘‍♀️ E5.0 woman in lotus position
+1F9D8 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🧘🏻‍♀️ E5.0 woman in lotus position: light skin tone
+1F9D8 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🧘🏼‍♀️ E5.0 woman in lotus position: medium-light skin tone
+1F9D8 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🧘🏽‍♀️ E5.0 woman in lotus position: medium skin tone
+1F9D8 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🧘🏾‍♀️ E5.0 woman in lotus position: medium-dark skin tone
+1F9D8 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🧘🏿‍♀️ E5.0 woman in lotus position: dark skin tone
+1F9D1 200D 1F91D 200D 1F9D1                            ; fully-qualified     # 🧑‍🤝‍🧑 E12.0 people holding hands
+1F9D1 1F3FB 200D 1F91D 200D 1F9D1 1F3FB                ; fully-qualified     # 🧑🏻‍🤝‍🧑🏻 E12.0 people holding hands: light skin tone
+1F9D1 1F3FB 200D 1F91D 200D 1F9D1 1F3FC                ; fully-qualified     # 🧑🏻‍🤝‍🧑🏼 E12.1 people holding hands: light skin tone, medium-light skin tone
+1F9D1 1F3FB 200D 1F91D 200D 1F9D1 1F3FD                ; fully-qualified     # 🧑🏻‍🤝‍🧑🏽 E12.1 people holding hands: light skin tone, medium skin tone
+1F9D1 1F3FB 200D 1F91D 200D 1F9D1 1F3FE                ; fully-qualified     # 🧑🏻‍🤝‍🧑🏾 E12.1 people holding hands: light skin tone, medium-dark skin tone
+1F9D1 1F3FB 200D 1F91D 200D 1F9D1 1F3FF                ; fully-qualified     # 🧑🏻‍🤝‍🧑🏿 E12.1 people holding hands: light skin tone, dark skin tone
+1F9D1 1F3FC 200D 1F91D 200D 1F9D1 1F3FB                ; fully-qualified     # 🧑🏼‍🤝‍🧑🏻 E12.0 people holding hands: medium-light skin tone, light skin tone
+1F9D1 1F3FC 200D 1F91D 200D 1F9D1 1F3FC                ; fully-qualified     # 🧑🏼‍🤝‍🧑🏼 E12.0 people holding hands: medium-light skin tone
+1F9D1 1F3FC 200D 1F91D 200D 1F9D1 1F3FD                ; fully-qualified     # 🧑🏼‍🤝‍🧑🏽 E12.1 people holding hands: medium-light skin tone, medium skin tone
+1F9D1 1F3FC 200D 1F91D 200D 1F9D1 1F3FE                ; fully-qualified     # 🧑🏼‍🤝‍🧑🏾 E12.1 people holding hands: medium-light skin tone, medium-dark skin tone
+1F9D1 1F3FC 200D 1F91D 200D 1F9D1 1F3FF                ; fully-qualified     # 🧑🏼‍🤝‍🧑🏿 E12.1 people holding hands: medium-light skin tone, dark skin tone
+1F9D1 1F3FD 200D 1F91D 200D 1F9D1 1F3FB                ; fully-qualified     # 🧑🏽‍🤝‍🧑🏻 E12.0 people holding hands: medium skin tone, light skin tone
+1F9D1 1F3FD 200D 1F91D 200D 1F9D1 1F3FC                ; fully-qualified     # 🧑🏽‍🤝‍🧑🏼 E12.0 people holding hands: medium skin tone, medium-light skin tone
+1F9D1 1F3FD 200D 1F91D 200D 1F9D1 1F3FD                ; fully-qualified     # 🧑🏽‍🤝‍🧑🏽 E12.0 people holding hands: medium skin tone
+1F9D1 1F3FD 200D 1F91D 200D 1F9D1 1F3FE                ; fully-qualified     # 🧑🏽‍🤝‍🧑🏾 E12.1 people holding hands: medium skin tone, medium-dark skin tone
+1F9D1 1F3FD 200D 1F91D 200D 1F9D1 1F3FF                ; fully-qualified     # 🧑🏽‍🤝‍🧑🏿 E12.1 people holding hands: medium skin tone, dark skin tone
+1F9D1 1F3FE 200D 1F91D 200D 1F9D1 1F3FB                ; fully-qualified     # 🧑🏾‍🤝‍🧑🏻 E12.0 people holding hands: medium-dark skin tone, light skin tone
+1F9D1 1F3FE 200D 1F91D 200D 1F9D1 1F3FC                ; fully-qualified     # 🧑🏾‍🤝‍🧑🏼 E12.0 people holding hands: medium-dark skin tone, medium-light skin tone
+1F9D1 1F3FE 200D 1F91D 200D 1F9D1 1F3FD                ; fully-qualified     # 🧑🏾‍🤝‍🧑🏽 E12.0 people holding hands: medium-dark skin tone, medium skin tone
+1F9D1 1F3FE 200D 1F91D 200D 1F9D1 1F3FE                ; fully-qualified     # 🧑🏾‍🤝‍🧑🏾 E12.0 people holding hands: medium-dark skin tone
+1F9D1 1F3FE 200D 1F91D 200D 1F9D1 1F3FF                ; fully-qualified     # 🧑🏾‍🤝‍🧑🏿 E12.1 people holding hands: medium-dark skin tone, dark skin tone
+1F9D1 1F3FF 200D 1F91D 200D 1F9D1 1F3FB                ; fully-qualified     # 🧑🏿‍🤝‍🧑🏻 E12.0 people holding hands: dark skin tone, light skin tone
+1F9D1 1F3FF 200D 1F91D 200D 1F9D1 1F3FC                ; fully-qualified     # 🧑🏿‍🤝‍🧑🏼 E12.0 people holding hands: dark skin tone, medium-light skin tone
+1F9D1 1F3FF 200D 1F91D 200D 1F9D1 1F3FD                ; fully-qualified     # 🧑🏿‍🤝‍🧑🏽 E12.0 people holding hands: dark skin tone, medium skin tone
+1F9D1 1F3FF 200D 1F91D 200D 1F9D1 1F3FE                ; fully-qualified     # 🧑🏿‍🤝‍🧑🏾 E12.0 people holding hands: dark skin tone, medium-dark skin tone
+1F9D1 1F3FF 200D 1F91D 200D 1F9D1 1F3FF                ; fully-qualified     # 🧑🏿‍🤝‍🧑🏿 E12.0 people holding hands: dark skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FC ; fully-qualified     # 🧑🏻‍❤️‍💋‍🧑🏼 E13.1 kiss: person, person, light skin tone, medium-light skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FD ; fully-qualified     # 🧑🏻‍❤️‍💋‍🧑🏽 E13.1 kiss: person, person, light skin tone, medium skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FE ; fully-qualified     # 🧑🏻‍❤️‍💋‍🧑🏾 E13.1 kiss: person, person, light skin tone, medium-dark skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FF ; fully-qualified     # 🧑🏻‍❤️‍💋‍🧑🏿 E13.1 kiss: person, person, light skin tone, dark skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FB ; fully-qualified     # 🧑🏼‍❤️‍💋‍🧑🏻 E13.1 kiss: person, person, medium-light skin tone, light skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FD ; fully-qualified     # 🧑🏼‍❤️‍💋‍🧑🏽 E13.1 kiss: person, person, medium-light skin tone, medium skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FE ; fully-qualified     # 🧑🏼‍❤️‍💋‍🧑🏾 E13.1 kiss: person, person, medium-light skin tone, medium-dark skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FF ; fully-qualified     # 🧑🏼‍❤️‍💋‍🧑🏿 E13.1 kiss: person, person, medium-light skin tone, dark skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FB ; fully-qualified     # 🧑🏽‍❤️‍💋‍🧑🏻 E13.1 kiss: person, person, medium skin tone, light skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FC ; fully-qualified     # 🧑🏽‍❤️‍💋‍🧑🏼 E13.1 kiss: person, person, medium skin tone, medium-light skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FE ; fully-qualified     # 🧑🏽‍❤️‍💋‍🧑🏾 E13.1 kiss: person, person, medium skin tone, medium-dark skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FF ; fully-qualified     # 🧑🏽‍❤️‍💋‍🧑🏿 E13.1 kiss: person, person, medium skin tone, dark skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FB ; fully-qualified     # 🧑🏾‍❤️‍💋‍🧑🏻 E13.1 kiss: person, person, medium-dark skin tone, light skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FC ; fully-qualified     # 🧑🏾‍❤️‍💋‍🧑🏼 E13.1 kiss: person, person, medium-dark skin tone, medium-light skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FD ; fully-qualified     # 🧑🏾‍❤️‍💋‍🧑🏽 E13.1 kiss: person, person, medium-dark skin tone, medium skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FF ; fully-qualified     # 🧑🏾‍❤️‍💋‍🧑🏿 E13.1 kiss: person, person, medium-dark skin tone, dark skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FB ; fully-qualified     # 🧑🏿‍❤️‍💋‍🧑🏻 E13.1 kiss: person, person, dark skin tone, light skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FC ; fully-qualified     # 🧑🏿‍❤️‍💋‍🧑🏼 E13.1 kiss: person, person, dark skin tone, medium-light skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FD ; fully-qualified     # 🧑🏿‍❤️‍💋‍🧑🏽 E13.1 kiss: person, person, dark skin tone, medium skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F48B 200D 1F9D1 1F3FE ; fully-qualified     # 🧑🏿‍❤️‍💋‍🧑🏾 E13.1 kiss: person, person, dark skin tone, medium-dark skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F9D1 1F3FC            ; fully-qualified     # 🧑🏻‍❤️‍🧑🏼 E13.1 couple with heart: person, person, light skin tone, medium-light skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F9D1 1F3FD            ; fully-qualified     # 🧑🏻‍❤️‍🧑🏽 E13.1 couple with heart: person, person, light skin tone, medium skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F9D1 1F3FE            ; fully-qualified     # 🧑🏻‍❤️‍🧑🏾 E13.1 couple with heart: person, person, light skin tone, medium-dark skin tone
+1F9D1 1F3FB 200D 2764 FE0F 200D 1F9D1 1F3FF            ; fully-qualified     # 🧑🏻‍❤️‍🧑🏿 E13.1 couple with heart: person, person, light skin tone, dark skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F9D1 1F3FB            ; fully-qualified     # 🧑🏼‍❤️‍🧑🏻 E13.1 couple with heart: person, person, medium-light skin tone, light skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F9D1 1F3FD            ; fully-qualified     # 🧑🏼‍❤️‍🧑🏽 E13.1 couple with heart: person, person, medium-light skin tone, medium skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F9D1 1F3FE            ; fully-qualified     # 🧑🏼‍❤️‍🧑🏾 E13.1 couple with heart: person, person, medium-light skin tone, medium-dark skin tone
+1F9D1 1F3FC 200D 2764 FE0F 200D 1F9D1 1F3FF            ; fully-qualified     # 🧑🏼‍❤️‍🧑🏿 E13.1 couple with heart: person, person, medium-light skin tone, dark skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F9D1 1F3FB            ; fully-qualified     # 🧑🏽‍❤️‍🧑🏻 E13.1 couple with heart: person, person, medium skin tone, light skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F9D1 1F3FC            ; fully-qualified     # 🧑🏽‍❤️‍🧑🏼 E13.1 couple with heart: person, person, medium skin tone, medium-light skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F9D1 1F3FE            ; fully-qualified     # 🧑🏽‍❤️‍🧑🏾 E13.1 couple with heart: person, person, medium skin tone, medium-dark skin tone
+1F9D1 1F3FD 200D 2764 FE0F 200D 1F9D1 1F3FF            ; fully-qualified     # 🧑🏽‍❤️‍🧑🏿 E13.1 couple with heart: person, person, medium skin tone, dark skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F9D1 1F3FB            ; fully-qualified     # 🧑🏾‍❤️‍🧑🏻 E13.1 couple with heart: person, person, medium-dark skin tone, light skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F9D1 1F3FC            ; fully-qualified     # 🧑🏾‍❤️‍🧑🏼 E13.1 couple with heart: person, person, medium-dark skin tone, medium-light skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F9D1 1F3FD            ; fully-qualified     # 🧑🏾‍❤️‍🧑🏽 E13.1 couple with heart: person, person, medium-dark skin tone, medium skin tone
+1F9D1 1F3FE 200D 2764 FE0F 200D 1F9D1 1F3FF            ; fully-qualified     # 🧑🏾‍❤️‍🧑🏿 E13.1 couple with heart: person, person, medium-dark skin tone, dark skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F9D1 1F3FB            ; fully-qualified     # 🧑🏿‍❤️‍🧑🏻 E13.1 couple with heart: person, person, dark skin tone, light skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F9D1 1F3FC            ; fully-qualified     # 🧑🏿‍❤️‍🧑🏼 E13.1 couple with heart: person, person, dark skin tone, medium-light skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F9D1 1F3FD            ; fully-qualified     # 🧑🏿‍❤️‍🧑🏽 E13.1 couple with heart: person, person, dark skin tone, medium skin tone
+1F9D1 1F3FF 200D 2764 FE0F 200D 1F9D1 1F3FE            ; fully-qualified     # 🧑🏿‍❤️‍🧑🏾 E13.1 couple with heart: person, person, dark skin tone, medium-dark skin tone
+1F98D                                                  ; fully-qualified     # 🦍 E3.0 gorilla
+1F9A7                                                  ; fully-qualified     # 🦧 E12.0 orangutan
+1F9AE                                                  ; fully-qualified     # 🦮 E12.0 guide dog
+1F98A                                                  ; fully-qualified     # 🦊 E3.0 fox
+1F99D                                                  ; fully-qualified     # 🦝 E11.0 raccoon
+1F981                                                  ; fully-qualified     # 🦁 E1.0 lion
+1F984                                                  ; fully-qualified     # 🦄 E1.0 unicorn
+1F993                                                  ; fully-qualified     # 🦓 E5.0 zebra
+1F98C                                                  ; fully-qualified     # 🦌 E3.0 deer
+1F9AC                                                  ; fully-qualified     # 🦬 E13.0 bison
+1F999                                                  ; fully-qualified     # 🦙 E11.0 llama
+1F992                                                  ; fully-qualified     # 🦒 E5.0 giraffe
+1F9A3                                                  ; fully-qualified     # 🦣 E13.0 mammoth
+1F98F                                                  ; fully-qualified     # 🦏 E3.0 rhinoceros
+1F99B                                                  ; fully-qualified     # 🦛 E11.0 hippopotamus
+1F9AB                                                  ; fully-qualified     # 🦫 E13.0 beaver
+1F994                                                  ; fully-qualified     # 🦔 E5.0 hedgehog
+1F987                                                  ; fully-qualified     # 🦇 E3.0 bat
+1F9A5                                                  ; fully-qualified     # 🦥 E12.0 sloth
+1F9A6                                                  ; fully-qualified     # 🦦 E12.0 otter
+1F9A8                                                  ; fully-qualified     # 🦨 E12.0 skunk
+1F998                                                  ; fully-qualified     # 🦘 E11.0 kangaroo
+1F9A1                                                  ; fully-qualified     # 🦡 E11.0 badger
+1F983                                                  ; fully-qualified     # 🦃 E1.0 turkey
+1F985                                                  ; fully-qualified     # 🦅 E3.0 eagle
+1F986                                                  ; fully-qualified     # 🦆 E3.0 duck
+1F9A2                                                  ; fully-qualified     # 🦢 E11.0 swan
+1F989                                                  ; fully-qualified     # 🦉 E3.0 owl
+1F9A4                                                  ; fully-qualified     # 🦤 E13.0 dodo
+1F9A9                                                  ; fully-qualified     # 🦩 E12.0 flamingo
+1F99A                                                  ; fully-qualified     # 🦚 E11.0 peacock
+1F99C                                                  ; fully-qualified     # 🦜 E11.0 parrot
+1F98E                                                  ; fully-qualified     # 🦎 E3.0 lizard
+1F995                                                  ; fully-qualified     # 🦕 E5.0 sauropod
+1F996                                                  ; fully-qualified     # 🦖 E5.0 T-Rex
+1F9AD                                                  ; fully-qualified     # 🦭 E13.0 seal
+1F988                                                  ; fully-qualified     # 🦈 E3.0 shark
+1F98B                                                  ; fully-qualified     # 🦋 E3.0 butterfly
+1F997                                                  ; fully-qualified     # 🦗 E5.0 cricket
+1F982                                                  ; fully-qualified     # 🦂 E1.0 scorpion
+1F99F                                                  ; fully-qualified     # 🦟 E11.0 mosquito
+1F9A0                                                  ; fully-qualified     # 🦠 E11.0 microbe
+1F96D                                                  ; fully-qualified     # 🥭 E11.0 mango
+1F95D                                                  ; fully-qualified     # 🥝 E3.0 kiwi fruit
+1F965                                                  ; fully-qualified     # 🥥 E5.0 coconut
+1F951                                                  ; fully-qualified     # 🥑 E3.0 avocado
+1F954                                                  ; fully-qualified     # 🥔 E3.0 potato
+1F955                                                  ; fully-qualified     # 🥕 E3.0 carrot
+1F952                                                  ; fully-qualified     # 🥒 E3.0 cucumber
+1F96C                                                  ; fully-qualified     # 🥬 E11.0 leafy green
+1F966                                                  ; fully-qualified     # 🥦 E5.0 broccoli
+1F9C4                                                  ; fully-qualified     # 🧄 E12.0 garlic
+1F9C5                                                  ; fully-qualified     # 🧅 E12.0 onion
+1F95C                                                  ; fully-qualified     # 🥜 E3.0 peanuts
+1F950                                                  ; fully-qualified     # 🥐 E3.0 croissant
+1F956                                                  ; fully-qualified     # 🥖 E3.0 baguette bread
+1F968                                                  ; fully-qualified     # 🥨 E5.0 pretzel
+1F96F                                                  ; fully-qualified     # 🥯 E11.0 bagel
+1F95E                                                  ; fully-qualified     # 🥞 E3.0 pancakes
+1F9C7                                                  ; fully-qualified     # 🧇 E12.0 waffle
+1F9C0                                                  ; fully-qualified     # 🧀 E1.0 cheese wedge
+1F969                                                  ; fully-qualified     # 🥩 E5.0 cut of meat
+1F953                                                  ; fully-qualified     # 🥓 E3.0 bacon
+1F96A                                                  ; fully-qualified     # 🥪 E5.0 sandwich
+1F959                                                  ; fully-qualified     # 🥙 E3.0 stuffed flatbread
+1F9C6                                                  ; fully-qualified     # 🧆 E12.0 falafel
+1F95A                                                  ; fully-qualified     # 🥚 E3.0 egg
+1F958                                                  ; fully-qualified     # 🥘 E3.0 shallow pan of food
+1F963                                                  ; fully-qualified     # 🥣 E5.0 bowl with spoon
+1F957                                                  ; fully-qualified     # 🥗 E3.0 green salad
+1F9C8                                                  ; fully-qualified     # 🧈 E12.0 butter
+1F9C2                                                  ; fully-qualified     # 🧂 E11.0 salt
+1F96B                                                  ; fully-qualified     # 🥫 E5.0 canned food
+1F96E                                                  ; fully-qualified     # 🥮 E11.0 moon cake
+1F95F                                                  ; fully-qualified     # 🥟 E5.0 dumpling
+1F960                                                  ; fully-qualified     # 🥠 E5.0 fortune cookie
+1F961                                                  ; fully-qualified     # 🥡 E5.0 takeout box
+1F980                                                  ; fully-qualified     # 🦀 E1.0 crab
+1F99E                                                  ; fully-qualified     # 🦞 E11.0 lobster
+1F990                                                  ; fully-qualified     # 🦐 E3.0 shrimp
+1F991                                                  ; fully-qualified     # 🦑 E3.0 squid
+1F9AA                                                  ; fully-qualified     # 🦪 E12.0 oyster
+1F9C1                                                  ; fully-qualified     # 🧁 E11.0 cupcake
+1F967                                                  ; fully-qualified     # 🥧 E5.0 pie
+1F95B                                                  ; fully-qualified     # 🥛 E3.0 glass of milk
+1F964                                                  ; fully-qualified     # 🥤 E5.0 cup with straw
+1F9CB                                                  ; fully-qualified     # 🧋 E13.0 bubble tea
+1F9C3                                                  ; fully-qualified     # 🧃 E12.0 beverage box
+1F9C9                                                  ; fully-qualified     # 🧉 E12.0 mate
+1F9CA                                                  ; fully-qualified     # 🧊 E12.0 ice
+1F962                                                  ; fully-qualified     # 🥢 E5.0 chopsticks
+1F9ED                                                  ; fully-qualified     # 🧭 E11.0 compass
+1F9F1                                                  ; fully-qualified     # 🧱 E11.0 brick
+1F9BD                                                  ; fully-qualified     # 🦽 E12.0 manual wheelchair
+1F9BC                                                  ; fully-qualified     # 🦼 E12.0 motorized wheelchair
+1F9F3                                                  ; fully-qualified     # 🧳 E11.0 luggage
+1F9E8                                                  ; fully-qualified     # 🧨 E11.0 firecracker
+1F9E7                                                  ; fully-qualified     # 🧧 E11.0 red envelope
+1F9E9                                                  ; fully-qualified     # 🧩 E11.0 puzzle piece
+1F9F8                                                  ; fully-qualified     # 🧸 E11.0 teddy bear
+1F9F5                                                  ; fully-qualified     # 🧵 E11.0 thread
+1F9F6                                                  ; fully-qualified     # 🧶 E11.0 yarn
+1F97D                                                  ; fully-qualified     # 🥽 E11.0 goggles
+1F97C                                                  ; fully-qualified     # 🥼 E11.0 lab coat
+1F9BA                                                  ; fully-qualified     # 🦺 E12.0 safety vest
+1F9E3                                                  ; fully-qualified     # 🧣 E5.0 scarf
+1F9E4                                                  ; fully-qualified     # 🧤 E5.0 gloves
+1F9E5                                                  ; fully-qualified     # 🧥 E5.0 coat
+1F9E6                                                  ; fully-qualified     # 🧦 E5.0 socks
+1F97B                                                  ; fully-qualified     # 🥻 E12.0 sari
+1F97E                                                  ; fully-qualified     # 🥾 E11.0 hiking boot
+1F97F                                                  ; fully-qualified     # 🥿 E11.0 flat shoe
+1F9E2                                                  ; fully-qualified     # 🧢 E5.0 billed cap
+1F9EE                                                  ; fully-qualified     # 🧮 E11.0 abacus
+1F9FE                                                  ; fully-qualified     # 🧾 E11.0 receipt
+1F9AF                                                  ; fully-qualified     # 🦯 E12.0 white cane
+1F9F0                                                  ; fully-qualified     # 🧰 E11.0 toolbox
+1F9F2                                                  ; fully-qualified     # 🧲 E11.0 magnet
+1F9EA                                                  ; fully-qualified     # 🧪 E11.0 test tube
+1F9EB                                                  ; fully-qualified     # 🧫 E11.0 petri dish
+1F9EC                                                  ; fully-qualified     # 🧬 E11.0 dna
+1F9F4                                                  ; fully-qualified     # 🧴 E11.0 lotion bottle
+1F9F7                                                  ; fully-qualified     # 🧷 E11.0 safety pin
+1F9F9                                                  ; fully-qualified     # 🧹 E11.0 broom
+1F9FA                                                  ; fully-qualified     # 🧺 E11.0 basket
+1F9FB                                                  ; fully-qualified     # 🧻 E11.0 roll of paper
+1F9FC                                                  ; fully-qualified     # 🧼 E11.0 soap
+1F9FD                                                  ; fully-qualified     # 🧽 E11.0 sponge
+1F9EF                                                  ; fully-qualified     # 🧯 E11.0 fire extinguisher
+1F9FF                                                  ; fully-qualified     # 🧿 E11.0 nazar amulet

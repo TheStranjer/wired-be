@@ -54,7 +54,7 @@ const NO_EXTRA_QUERY: [(String, String); 0] = [];
 /// The 403 body `GET /api/v1/accounts/{id}/statuses` answers an anonymous
 /// request while the instance keeps the account's profile area restricted
 /// (Pleroma's `EnsureAuthenticatedPlug` wording, the one [`crate::auth`]
-/// renders for an app-only token and [`crate::api::feeds`] for its feeds).
+/// renders for an app-only token).
 const USER_REQUIRED: &str = "This API requires an authenticated user";
 
 /// The `RESTRICT_UNAUTHENTICATED` area of this instance's own accounts'

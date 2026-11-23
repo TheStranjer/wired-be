@@ -7,32 +7,16 @@ use chrono::TimeDelta;
 use super::*;
 use crate::{
     config::Config,
-    http_client::HttpClient,
     jobs::test_support::{
-        HANDLER_RAN, LAST_ATTEMPT, discard_handler, job_row, lazy_pool, marking_handler,
-        reporting_handler, retry_after_handler, retry_handler, run_until_state, test_job,
-        worker_for,
+        HANDLER_RAN, LAST_ATTEMPT, discard_handler, job_row, marking_handler, reporting_handler,
+        retry_after_handler, retry_handler, run_until_state, test_job, worker_for,
     },
     models::job::enqueue,
-    uploads::UploaderBackend,
 };
 
 #[tokio::test]
 async fn dispatch_runs_the_registered_handler() {
-    let config = Arc::new(Config::for_tests());
-    let db = lazy_pool();
-    let state = AppState {
-        hub: crate::streaming::hub::Hub::new(&db),
-        db,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    };
+    let state = AppState::lazy_for_tests(Config::for_tests());
     let mut registry = JobRegistry::new();
     registry.register("flaky", retry_handler);
     let outcome = dispatch_handler(&registry, &state, &job_row("flaky")).await;
@@ -45,20 +29,7 @@ async fn dispatch_runs_the_registered_handler() {
 
 #[tokio::test]
 async fn dispatch_discards_unknown_kinds() {
-    let config = Arc::new(Config::for_tests());
-    let db = lazy_pool();
-    let state = AppState {
-        hub: crate::streaming::hub::Hub::new(&db),
-        db,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    };
+    let state = AppState::lazy_for_tests(Config::for_tests());
     let registry = JobRegistry::new();
     let outcome = dispatch_handler(&registry, &state, &job_row("mystery")).await;
     match outcome {
@@ -122,20 +93,7 @@ async fn retry_error_makes_the_job_retryable_later() {
 
 #[tokio::test]
 async fn dispatch_tells_the_handler_which_attempt_it_is() {
-    let config = Arc::new(Config::for_tests());
-    let db = lazy_pool();
-    let state = AppState {
-        hub: crate::streaming::hub::Hub::new(&db),
-        db,
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    };
+    let state = AppState::lazy_for_tests(Config::for_tests());
     let mut registry = JobRegistry::new();
     registry.register("greet", reporting_handler);
     let job = Job {

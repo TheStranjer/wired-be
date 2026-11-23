@@ -2,20 +2,20 @@
 
 Rules for anyone (human or AI) changing this codebase.
 
-## The gate, and what you run before it
+## The gate, and what you do before it
 
 `scripts/ci.sh` runs every check: a tracked-file length gate, `cargo fmt --check`, Clippy, the whole test suite, and rustdoc with warnings denied. It takes 10–20 minutes. It keeps going after a failure, so one run reports everything that's broken, and it exits 0 only when all checks pass. `.github/workflows/ci.yml` runs this same script. To add a check, add it to the script, not the workflow.
 
-**The full gate runs once, at the end, and not by you.** The harness runs it after you finish (CI runs it again on the push). A change is only done when that run is green, but **you do not run `scripts/ci.sh` or the unfiltered `cargo test` yourself**: it would duplicate the run that is coming anyway, and every extra full run costs minutes on a shared machine.
+**The gate runs at the end, and not by you.** The harness runs it after you finish (CI runs it again on the push). A change is only done when that run is green, but **you never compile, test or lint the code yourself**: no `scripts/ci.sh`, no `cargo check`, `cargo build`, `cargo test`, `cargo clippy` or `cargo doc`, filtered or not. Every worktree on this machine shares one build directory and one build lock, so each of those runs stalls every other agent; the gate does all of it anyway.
 
-Your job is to make that run pass the first time, with the least work:
+Your job is to make that run pass the first time, by reading rather than running:
 
-1. **Run only the tests you reason will matter.** Name the code you changed and the behaviour that could break around it: its own unit tests, the `tests/api/<area>.rs` module for any endpoint it serves, and any test that exercises a function you changed or a caller of it. Run those with filters (see "Running checks" below). Err toward a few more related tests, not the whole suite. If a change is wide (a shared helper, `AppState`, the router, a migration), widen the filter to the areas that depend on it.
+1. **Do not build or run tests.** Write the tests your change needs (see "Testing") and reason through the code you changed and its callers instead of compiling it. If a change is wide (a shared helper, `AppState`, the router, a migration), read the areas that depend on it before you finish.
 2. **Do not run Clippy.** The harness runs it as part of the gate. Write code that satisfies the lints (see "Linting"); if the gate hands you diagnostics, fix them.
 3. **Keep files within the length limit, but do not measure it.** The harness runs `wc -l` on every tracked file as part of the gate, and you must not run it yourself. No tracked file may exceed 1,000 lines (`Cargo.lock` is exempt as generated); new code should aim for ≤500. If a file you changed is getting long, split it into submodules, never add an exemption.
 4. **Run `cargo fmt` once** before you finish.
 
-These runs also compile the code, so the gate's later build mostly reuses it. They don't replace the gate: a failure you didn't predict is expected to turn up there. If the harness hands you a failing gate output, fix what it reports, then re-run only the tests that failed and the ones around your fix.
+A failure you didn't predict is expected to turn up in the gate. If the harness hands you a failing gate output, fix what it reports and finish; the harness runs the gate again.
 
 ## Commands you may run
 
@@ -25,9 +25,7 @@ You may run only the commands in the allowlist below, from the repository root. 
 
 | Purpose | Allowed |
 |---|---|
-| Build and check | `cargo check`, `cargo build` (add `--locked`) |
-| Tests (always filtered) | `cargo test --locked --all-features <filter>`, `cargo test --locked --all-features --lib <filter>`, `cargo test --locked --all-features --test api <filter>`, `cargo test --locked --all-features --test config_docs` |
-| Format, docs | `cargo fmt`, `cargo fmt --check`, `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features` (docs: only if you added or changed intra-doc links) |
+| Format | `cargo fmt`, `cargo fmt --check` |
 | Dependencies | `cargo add <crate>` |
 | Migrations | `sqlx migrate add <name>` |
 | Read files (if no tool exists) | `ls`, `cat`, `head`, `tail` (never `-f`), `diff`, `find` (read-only), `grep`/`rg` |
@@ -35,7 +33,7 @@ You may run only the commands in the allowlist below, from the repository root. 
 | Git, write | `git switch -c <branch>`, `git add <paths>`, `git commit` |
 | Inspect the dev database | `psql "$DATABASE_URL" -c '<single SELECT>'`, read-only |
 
-Everything else is forbidden. The whole gate (`scripts/ci.sh`) and the unfiltered `cargo test` are the harness's to run, not yours. In particular, never run:
+Everything else is forbidden. The gate (`scripts/ci.sh`) and every command that compiles the crate (`cargo check`, `cargo build`, `cargo test`, `cargo clippy`, `cargo doc`) are the harness's to run, not yours. In particular, never run:
 
 - **Process hunting or control**: `pgrep`, `pkill`, `kill`, `killall`, `ps`, `top`, `lsof`, `fuser`, `jobs`, `wait`. `pgrep -f <text>` and `ps | grep <text>` match their *own* command line, so they always find something and any loop around them never ends. You don't need to find processes because you never start any (see below).
 - **Sleeping and polling**: `sleep`, `timeout`, `watch`, `tail -f`, `while`/`until`/`for` loops that re-check a condition, and any retry loop. Never wait for time to pass.
@@ -44,13 +42,10 @@ Everything else is forbidden. The whole gate (`scripts/ci.sh`) and the unfiltere
 - **Destructive or history-rewriting commands**: `rm` in any form, `cargo clean`, `git push`, `git reset --hard`, `git checkout -- <path>`, `git clean`, `git stash`, `git rebase`, `git commit --amend`, `--force`, `--no-verify`, `sqlx database drop`, `psql` with anything but a `SELECT`.
 - **Escape hatches**: `eval`, `bash -c`, `sh -c`, `xargs` into other commands, `python`/`perl`/`node` one-liners, and `sed -i`/`awk` to edit files. Edit files with the editing tool.
 
-### Running checks
+### Running commands
 
-- **Use exactly the flags in the allowlist.** `--locked --all-features` are what the gate uses, so a test run with them builds the same artifacts the gate will and the gate reuses that build. A run with different flags compiles everything twice.
-- **Run each command once per change and read its whole output.** Don't re-run the same command to "check again", to see if a failure is flaky, or hoping the result changes; re-run after you change code. If the output is long, redirect it to a file under `target/` and read the file; don't pipe `cargo` into `head` (it can kill the build with SIGPIPE) and don't hide failures with `| grep`.
-- **One cargo command at a time.** Never start a second `cargo` run while another is going; they queue on the same build lock and fight for the same cores and disk.
-- **Never run tests (or any other check) in the background.** No `run_in_background`, no `&`, no detached or backgrounded shell sessions, no "start it and look at the output later". Either run `cargo test <filter>` in the foreground and wait for it to return, or don't run it. Never start a run you won't read to completion.
-- **Waiting is not a task.** If a command is slow, let it finish. A foreground command that returns has finished; one that doesn't return is hung, so stop and report it rather than polling around it.
+- **Run each command once and read its whole output.** Don't re-run the same command to "check again" or hoping the result changes.
+- **Nothing in the background.** No `run_in_background`, no `&`, no detached or backgrounded shell sessions. A foreground command that doesn't return is hung, so stop and report it rather than polling around it.
 - **Two strikes.** If the same fix fails twice, stop and report what you tried and what the output said. Don't try a third variation of the same idea and never work around a block with a command from the forbidden list.
 - **Don't weaken the gate.** Never edit `scripts/ci.sh`, `.github/workflows/ci.yml`, `clippy.toml` or the `[lints]` table to make a failure go away; never `#[ignore]`, delete or loosen a failing test to get green; fix the code.
 - **Stay in the repo.** Don't create files outside it, and don't leave scratch files in it. Commit only when asked.
@@ -60,8 +55,7 @@ Everything else is forbidden. The whole gate (`scripts/ci.sh`) and the unfiltere
 
 - Never sleep (`std::thread::sleep`, `tokio::time::sleep`) in a test to wait for a job, expiry, token or timeout to elapse. Make time controllable instead: take a timestamp or clock as a parameter, back-date rows in the database (`expires_at` in the past), or call the job's run function directly. If a test must wait for an async effect, await the specific future or channel that signals it, with a bounded `tokio::time::timeout` as a failsafe, never a fixed delay.
 - Every code path you add or change must be covered by tests: success paths, error paths, and edge cases.
-- Run the tests that cover what you changed and what depends on it (see "The gate, and what you run before it"); the ones you run must pass. Don't run the whole suite: the gate does that.
-- A filtered run that matches nothing proves nothing. If `cargo test` reports `0 passed` for your filter, the filter is wrong; fix it.
+- Don't run tests, filtered or not: the gate runs the whole suite (see "The gate, and what you do before it"). If it reports a failing test, fix the code or the test it names.
 - A test that needs the database takes a slot from the fixture in `src/test_db.rs`
   (decision 13) — `let db = common::test_db().await;` in `tests/`,
   `crate::test_db::test_db().await` in `src/` — and keeps `db` alive while its

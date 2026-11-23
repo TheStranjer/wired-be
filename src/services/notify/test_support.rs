@@ -5,8 +5,6 @@
 //!
 //! [`AppState`]: crate::state::AppState
 
-use std::sync::Arc;
-
 use chrono::Utc;
 use serde_json::json;
 use sqlx::PgPool;
@@ -14,7 +12,6 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    http_client::HttpClient,
     models::{
         emoji_reaction::{self, NewReaction},
         follow::{self, Follow},
@@ -28,8 +25,6 @@ use crate::{
     },
     services::notify::on_reaction_changed,
     state::AppState,
-    streaming::hub::Hub,
-    uploads::UploaderBackend,
 };
 
 /// The fixed test config's instance origin.
@@ -37,19 +32,7 @@ pub(super) const BASE: &str = crate::config::TEST_BASE_URL;
 
 /// An [`AppState`] over `pool`: the one the job handlers are tested with.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// A local user named `nickname`.

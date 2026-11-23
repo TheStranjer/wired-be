@@ -1,0 +1,569 @@
+1F600                                                  ; fully-qualified     # 😀 E1.0 grinning face
+1F603                                                  ; fully-qualified     # 😃 E0.6 grinning face with big eyes
+1F604                                                  ; fully-qualified     # 😄 E0.6 grinning face with smiling eyes
+1F601                                                  ; fully-qualified     # 😁 E0.6 beaming face with smiling eyes
+1F606                                                  ; fully-qualified     # 😆 E0.6 grinning squinting face
+1F605                                                  ; fully-qualified     # 😅 E0.6 grinning face with sweat
+1F602                                                  ; fully-qualified     # 😂 E0.6 face with tears of joy
+1F642                                                  ; fully-qualified     # 🙂 E1.0 slightly smiling face
+1F643                                                  ; fully-qualified     # 🙃 E1.0 upside-down face
+1F609                                                  ; fully-qualified     # 😉 E0.6 winking face
+1F60A                                                  ; fully-qualified     # 😊 E0.6 smiling face with smiling eyes
+1F607                                                  ; fully-qualified     # 😇 E1.0 smiling face with halo
+1F60D                                                  ; fully-qualified     # 😍 E0.6 smiling face with heart-eyes
+1F618                                                  ; fully-qualified     # 😘 E0.6 face blowing a kiss
+1F617                                                  ; fully-qualified     # 😗 E1.0 kissing face
+1F61A                                                  ; fully-qualified     # 😚 E0.6 kissing face with closed eyes
+1F619                                                  ; fully-qualified     # 😙 E1.0 kissing face with smiling eyes
+1F60B                                                  ; fully-qualified     # 😋 E0.6 face savoring food
+1F61B                                                  ; fully-qualified     # 😛 E1.0 face with tongue
+1F61C                                                  ; fully-qualified     # 😜 E0.6 winking face with tongue
+1F61D                                                  ; fully-qualified     # 😝 E0.6 squinting face with tongue
+1F610                                                  ; fully-qualified     # 😐 E0.7 neutral face
+1F611                                                  ; fully-qualified     # 😑 E1.0 expressionless face
+1F636                                                  ; fully-qualified     # 😶 E1.0 face without mouth
+1F636 200D 1F32B FE0F                                  ; fully-qualified     # 😶‍🌫️ E13.1 face in clouds
+1F60F                                                  ; fully-qualified     # 😏 E0.6 smirking face
+1F612                                                  ; fully-qualified     # 😒 E0.6 unamused face
+1F644                                                  ; fully-qualified     # 🙄 E1.0 face with rolling eyes
+1F62C                                                  ; fully-qualified     # 😬 E1.0 grimacing face
+1F62E 200D 1F4A8                                       ; fully-qualified     # 😮‍💨 E13.1 face exhaling
+1F60C                                                  ; fully-qualified     # 😌 E0.6 relieved face
+1F614                                                  ; fully-qualified     # 😔 E0.6 pensive face
+1F62A                                                  ; fully-qualified     # 😪 E0.6 sleepy face
+1F634                                                  ; fully-qualified     # 😴 E1.0 sleeping face
+1F637                                                  ; fully-qualified     # 😷 E0.6 face with medical mask
+1F635                                                  ; fully-qualified     # 😵 E0.6 face with crossed-out eyes
+1F635 200D 1F4AB                                       ; fully-qualified     # 😵‍💫 E13.1 face with spiral eyes
+1F60E                                                  ; fully-qualified     # 😎 E1.0 smiling face with sunglasses
+1F615                                                  ; fully-qualified     # 😕 E1.0 confused face
+1F61F                                                  ; fully-qualified     # 😟 E1.0 worried face
+1F641                                                  ; fully-qualified     # 🙁 E1.0 slightly frowning face
+1F62E                                                  ; fully-qualified     # 😮 E1.0 face with open mouth
+1F62F                                                  ; fully-qualified     # 😯 E1.0 hushed face
+1F632                                                  ; fully-qualified     # 😲 E0.6 astonished face
+1F633                                                  ; fully-qualified     # 😳 E0.6 flushed face
+1F626                                                  ; fully-qualified     # 😦 E1.0 frowning face with open mouth
+1F627                                                  ; fully-qualified     # 😧 E1.0 anguished face
+1F628                                                  ; fully-qualified     # 😨 E0.6 fearful face
+1F630                                                  ; fully-qualified     # 😰 E0.6 anxious face with sweat
+1F625                                                  ; fully-qualified     # 😥 E0.6 sad but relieved face
+1F622                                                  ; fully-qualified     # 😢 E0.6 crying face
+1F62D                                                  ; fully-qualified     # 😭 E0.6 loudly crying face
+1F631                                                  ; fully-qualified     # 😱 E0.6 face screaming in fear
+1F616                                                  ; fully-qualified     # 😖 E0.6 confounded face
+1F623                                                  ; fully-qualified     # 😣 E0.6 persevering face
+1F61E                                                  ; fully-qualified     # 😞 E0.6 disappointed face
+1F613                                                  ; fully-qualified     # 😓 E0.6 downcast face with sweat
+1F629                                                  ; fully-qualified     # 😩 E0.6 weary face
+1F62B                                                  ; fully-qualified     # 😫 E0.6 tired face
+1F624                                                  ; fully-qualified     # 😤 E0.6 face with steam from nose
+1F621                                                  ; fully-qualified     # 😡 E0.6 enraged face
+1F620                                                  ; fully-qualified     # 😠 E0.6 angry face
+1F608                                                  ; fully-qualified     # 😈 E1.0 smiling face with horns
+1F63A                                                  ; fully-qualified     # 😺 E0.6 grinning cat
+1F638                                                  ; fully-qualified     # 😸 E0.6 grinning cat with smiling eyes
+1F639                                                  ; fully-qualified     # 😹 E0.6 cat with tears of joy
+1F63B                                                  ; fully-qualified     # 😻 E0.6 smiling cat with heart-eyes
+1F63C                                                  ; fully-qualified     # 😼 E0.6 cat with wry smile
+1F63D                                                  ; fully-qualified     # 😽 E0.6 kissing cat
+1F640                                                  ; fully-qualified     # 🙀 E0.6 weary cat
+1F63F                                                  ; fully-qualified     # 😿 E0.6 crying cat
+1F63E                                                  ; fully-qualified     # 😾 E0.6 pouting cat
+1F648                                                  ; fully-qualified     # 🙈 E0.6 see-no-evil monkey
+1F649                                                  ; fully-qualified     # 🙉 E0.6 hear-no-evil monkey
+1F64A                                                  ; fully-qualified     # 🙊 E0.6 speak-no-evil monkey
+1F5A4                                                  ; fully-qualified     # 🖤 E3.0 black heart
+1F573 FE0F                                             ; fully-qualified     # 🕳️ E0.7 hole
+1F5E8 FE0F                                             ; fully-qualified     # 🗨️ E2.0 left speech bubble
+1F5EF FE0F                                             ; fully-qualified     # 🗯️ E0.7 right anger bubble
+1F590 FE0F                                             ; fully-qualified     # 🖐️ E0.7 hand with fingers splayed
+1F590 1F3FB                                            ; fully-qualified     # 🖐🏻 E1.0 hand with fingers splayed: light skin tone
+1F590 1F3FC                                            ; fully-qualified     # 🖐🏼 E1.0 hand with fingers splayed: medium-light skin tone
+1F590 1F3FD                                            ; fully-qualified     # 🖐🏽 E1.0 hand with fingers splayed: medium skin tone
+1F590 1F3FE                                            ; fully-qualified     # 🖐🏾 E1.0 hand with fingers splayed: medium-dark skin tone
+1F590 1F3FF                                            ; fully-qualified     # 🖐🏿 E1.0 hand with fingers splayed: dark skin tone
+1F596                                                  ; fully-qualified     # 🖖 E1.0 vulcan salute
+1F596 1F3FB                                            ; fully-qualified     # 🖖🏻 E1.0 vulcan salute: light skin tone
+1F596 1F3FC                                            ; fully-qualified     # 🖖🏼 E1.0 vulcan salute: medium-light skin tone
+1F596 1F3FD                                            ; fully-qualified     # 🖖🏽 E1.0 vulcan salute: medium skin tone
+1F596 1F3FE                                            ; fully-qualified     # 🖖🏾 E1.0 vulcan salute: medium-dark skin tone
+1F596 1F3FF                                            ; fully-qualified     # 🖖🏿 E1.0 vulcan salute: dark skin tone
+1F595                                                  ; fully-qualified     # 🖕 E1.0 middle finger
+1F595 1F3FB                                            ; fully-qualified     # 🖕🏻 E1.0 middle finger: light skin tone
+1F595 1F3FC                                            ; fully-qualified     # 🖕🏼 E1.0 middle finger: medium-light skin tone
+1F595 1F3FD                                            ; fully-qualified     # 🖕🏽 E1.0 middle finger: medium skin tone
+1F595 1F3FE                                            ; fully-qualified     # 🖕🏾 E1.0 middle finger: medium-dark skin tone
+1F595 1F3FF                                            ; fully-qualified     # 🖕🏿 E1.0 middle finger: dark skin tone
+1F64C                                                  ; fully-qualified     # 🙌 E0.6 raising hands
+1F64C 1F3FB                                            ; fully-qualified     # 🙌🏻 E1.0 raising hands: light skin tone
+1F64C 1F3FC                                            ; fully-qualified     # 🙌🏼 E1.0 raising hands: medium-light skin tone
+1F64C 1F3FD                                            ; fully-qualified     # 🙌🏽 E1.0 raising hands: medium skin tone
+1F64C 1F3FE                                            ; fully-qualified     # 🙌🏾 E1.0 raising hands: medium-dark skin tone
+1F64C 1F3FF                                            ; fully-qualified     # 🙌🏿 E1.0 raising hands: dark skin tone
+1F64F                                                  ; fully-qualified     # 🙏 E0.6 folded hands
+1F64F 1F3FB                                            ; fully-qualified     # 🙏🏻 E1.0 folded hands: light skin tone
+1F64F 1F3FC                                            ; fully-qualified     # 🙏🏼 E1.0 folded hands: medium-light skin tone
+1F64F 1F3FD                                            ; fully-qualified     # 🙏🏽 E1.0 folded hands: medium skin tone
+1F64F 1F3FE                                            ; fully-qualified     # 🙏🏾 E1.0 folded hands: medium-dark skin tone
+1F64F 1F3FF                                            ; fully-qualified     # 🙏🏿 E1.0 folded hands: dark skin tone
+1F64D                                                  ; fully-qualified     # 🙍 E0.6 person frowning
+1F64D 1F3FB                                            ; fully-qualified     # 🙍🏻 E1.0 person frowning: light skin tone
+1F64D 1F3FC                                            ; fully-qualified     # 🙍🏼 E1.0 person frowning: medium-light skin tone
+1F64D 1F3FD                                            ; fully-qualified     # 🙍🏽 E1.0 person frowning: medium skin tone
+1F64D 1F3FE                                            ; fully-qualified     # 🙍🏾 E1.0 person frowning: medium-dark skin tone
+1F64D 1F3FF                                            ; fully-qualified     # 🙍🏿 E1.0 person frowning: dark skin tone
+1F64D 200D 2642 FE0F                                   ; fully-qualified     # 🙍‍♂️ E4.0 man frowning
+1F64D 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🙍🏻‍♂️ E4.0 man frowning: light skin tone
+1F64D 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🙍🏼‍♂️ E4.0 man frowning: medium-light skin tone
+1F64D 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🙍🏽‍♂️ E4.0 man frowning: medium skin tone
+1F64D 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🙍🏾‍♂️ E4.0 man frowning: medium-dark skin tone
+1F64D 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🙍🏿‍♂️ E4.0 man frowning: dark skin tone
+1F64D 200D 2640 FE0F                                   ; fully-qualified     # 🙍‍♀️ E4.0 woman frowning
+1F64D 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🙍🏻‍♀️ E4.0 woman frowning: light skin tone
+1F64D 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🙍🏼‍♀️ E4.0 woman frowning: medium-light skin tone
+1F64D 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🙍🏽‍♀️ E4.0 woman frowning: medium skin tone
+1F64D 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🙍🏾‍♀️ E4.0 woman frowning: medium-dark skin tone
+1F64D 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🙍🏿‍♀️ E4.0 woman frowning: dark skin tone
+1F64E                                                  ; fully-qualified     # 🙎 E0.6 person pouting
+1F64E 1F3FB                                            ; fully-qualified     # 🙎🏻 E1.0 person pouting: light skin tone
+1F64E 1F3FC                                            ; fully-qualified     # 🙎🏼 E1.0 person pouting: medium-light skin tone
+1F64E 1F3FD                                            ; fully-qualified     # 🙎🏽 E1.0 person pouting: medium skin tone
+1F64E 1F3FE                                            ; fully-qualified     # 🙎🏾 E1.0 person pouting: medium-dark skin tone
+1F64E 1F3FF                                            ; fully-qualified     # 🙎🏿 E1.0 person pouting: dark skin tone
+1F64E 200D 2642 FE0F                                   ; fully-qualified     # 🙎‍♂️ E4.0 man pouting
+1F64E 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🙎🏻‍♂️ E4.0 man pouting: light skin tone
+1F64E 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🙎🏼‍♂️ E4.0 man pouting: medium-light skin tone
+1F64E 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🙎🏽‍♂️ E4.0 man pouting: medium skin tone
+1F64E 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🙎🏾‍♂️ E4.0 man pouting: medium-dark skin tone
+1F64E 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🙎🏿‍♂️ E4.0 man pouting: dark skin tone
+1F64E 200D 2640 FE0F                                   ; fully-qualified     # 🙎‍♀️ E4.0 woman pouting
+1F64E 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🙎🏻‍♀️ E4.0 woman pouting: light skin tone
+1F64E 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🙎🏼‍♀️ E4.0 woman pouting: medium-light skin tone
+1F64E 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🙎🏽‍♀️ E4.0 woman pouting: medium skin tone
+1F64E 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🙎🏾‍♀️ E4.0 woman pouting: medium-dark skin tone
+1F64E 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🙎🏿‍♀️ E4.0 woman pouting: dark skin tone
+1F645                                                  ; fully-qualified     # 🙅 E0.6 person gesturing NO
+1F645 1F3FB                                            ; fully-qualified     # 🙅🏻 E1.0 person gesturing NO: light skin tone
+1F645 1F3FC                                            ; fully-qualified     # 🙅🏼 E1.0 person gesturing NO: medium-light skin tone
+1F645 1F3FD                                            ; fully-qualified     # 🙅🏽 E1.0 person gesturing NO: medium skin tone
+1F645 1F3FE                                            ; fully-qualified     # 🙅🏾 E1.0 person gesturing NO: medium-dark skin tone
+1F645 1F3FF                                            ; fully-qualified     # 🙅🏿 E1.0 person gesturing NO: dark skin tone
+1F645 200D 2642 FE0F                                   ; fully-qualified     # 🙅‍♂️ E4.0 man gesturing NO
+1F645 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🙅🏻‍♂️ E4.0 man gesturing NO: light skin tone
+1F645 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🙅🏼‍♂️ E4.0 man gesturing NO: medium-light skin tone
+1F645 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🙅🏽‍♂️ E4.0 man gesturing NO: medium skin tone
+1F645 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🙅🏾‍♂️ E4.0 man gesturing NO: medium-dark skin tone
+1F645 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🙅🏿‍♂️ E4.0 man gesturing NO: dark skin tone
+1F645 200D 2640 FE0F                                   ; fully-qualified     # 🙅‍♀️ E4.0 woman gesturing NO
+1F645 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🙅🏻‍♀️ E4.0 woman gesturing NO: light skin tone
+1F645 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🙅🏼‍♀️ E4.0 woman gesturing NO: medium-light skin tone
+1F645 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🙅🏽‍♀️ E4.0 woman gesturing NO: medium skin tone
+1F645 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🙅🏾‍♀️ E4.0 woman gesturing NO: medium-dark skin tone
+1F645 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🙅🏿‍♀️ E4.0 woman gesturing NO: dark skin tone
+1F646                                                  ; fully-qualified     # 🙆 E0.6 person gesturing OK
+1F646 1F3FB                                            ; fully-qualified     # 🙆🏻 E1.0 person gesturing OK: light skin tone
+1F646 1F3FC                                            ; fully-qualified     # 🙆🏼 E1.0 person gesturing OK: medium-light skin tone
+1F646 1F3FD                                            ; fully-qualified     # 🙆🏽 E1.0 person gesturing OK: medium skin tone
+1F646 1F3FE                                            ; fully-qualified     # 🙆🏾 E1.0 person gesturing OK: medium-dark skin tone
+1F646 1F3FF                                            ; fully-qualified     # 🙆🏿 E1.0 person gesturing OK: dark skin tone
+1F646 200D 2642 FE0F                                   ; fully-qualified     # 🙆‍♂️ E4.0 man gesturing OK
+1F646 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🙆🏻‍♂️ E4.0 man gesturing OK: light skin tone
+1F646 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🙆🏼‍♂️ E4.0 man gesturing OK: medium-light skin tone
+1F646 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🙆🏽‍♂️ E4.0 man gesturing OK: medium skin tone
+1F646 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🙆🏾‍♂️ E4.0 man gesturing OK: medium-dark skin tone
+1F646 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🙆🏿‍♂️ E4.0 man gesturing OK: dark skin tone
+1F646 200D 2640 FE0F                                   ; fully-qualified     # 🙆‍♀️ E4.0 woman gesturing OK
+1F646 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🙆🏻‍♀️ E4.0 woman gesturing OK: light skin tone
+1F646 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🙆🏼‍♀️ E4.0 woman gesturing OK: medium-light skin tone
+1F646 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🙆🏽‍♀️ E4.0 woman gesturing OK: medium skin tone
+1F646 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🙆🏾‍♀️ E4.0 woman gesturing OK: medium-dark skin tone
+1F646 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🙆🏿‍♀️ E4.0 woman gesturing OK: dark skin tone
+1F64B                                                  ; fully-qualified     # 🙋 E0.6 person raising hand
+1F64B 1F3FB                                            ; fully-qualified     # 🙋🏻 E1.0 person raising hand: light skin tone
+1F64B 1F3FC                                            ; fully-qualified     # 🙋🏼 E1.0 person raising hand: medium-light skin tone
+1F64B 1F3FD                                            ; fully-qualified     # 🙋🏽 E1.0 person raising hand: medium skin tone
+1F64B 1F3FE                                            ; fully-qualified     # 🙋🏾 E1.0 person raising hand: medium-dark skin tone
+1F64B 1F3FF                                            ; fully-qualified     # 🙋🏿 E1.0 person raising hand: dark skin tone
+1F64B 200D 2642 FE0F                                   ; fully-qualified     # 🙋‍♂️ E4.0 man raising hand
+1F64B 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🙋🏻‍♂️ E4.0 man raising hand: light skin tone
+1F64B 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🙋🏼‍♂️ E4.0 man raising hand: medium-light skin tone
+1F64B 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🙋🏽‍♂️ E4.0 man raising hand: medium skin tone
+1F64B 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🙋🏾‍♂️ E4.0 man raising hand: medium-dark skin tone
+1F64B 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🙋🏿‍♂️ E4.0 man raising hand: dark skin tone
+1F64B 200D 2640 FE0F                                   ; fully-qualified     # 🙋‍♀️ E4.0 woman raising hand
+1F64B 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🙋🏻‍♀️ E4.0 woman raising hand: light skin tone
+1F64B 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🙋🏼‍♀️ E4.0 woman raising hand: medium-light skin tone
+1F64B 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🙋🏽‍♀️ E4.0 woman raising hand: medium skin tone
+1F64B 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🙋🏾‍♀️ E4.0 woman raising hand: medium-dark skin tone
+1F64B 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🙋🏿‍♀️ E4.0 woman raising hand: dark skin tone
+1F647                                                  ; fully-qualified     # 🙇 E0.6 person bowing
+1F647 1F3FB                                            ; fully-qualified     # 🙇🏻 E1.0 person bowing: light skin tone
+1F647 1F3FC                                            ; fully-qualified     # 🙇🏼 E1.0 person bowing: medium-light skin tone
+1F647 1F3FD                                            ; fully-qualified     # 🙇🏽 E1.0 person bowing: medium skin tone
+1F647 1F3FE                                            ; fully-qualified     # 🙇🏾 E1.0 person bowing: medium-dark skin tone
+1F647 1F3FF                                            ; fully-qualified     # 🙇🏿 E1.0 person bowing: dark skin tone
+1F647 200D 2642 FE0F                                   ; fully-qualified     # 🙇‍♂️ E4.0 man bowing
+1F647 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🙇🏻‍♂️ E4.0 man bowing: light skin tone
+1F647 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🙇🏼‍♂️ E4.0 man bowing: medium-light skin tone
+1F647 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🙇🏽‍♂️ E4.0 man bowing: medium skin tone
+1F647 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🙇🏾‍♂️ E4.0 man bowing: medium-dark skin tone
+1F647 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🙇🏿‍♂️ E4.0 man bowing: dark skin tone
+1F647 200D 2640 FE0F                                   ; fully-qualified     # 🙇‍♀️ E4.0 woman bowing
+1F647 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🙇🏻‍♀️ E4.0 woman bowing: light skin tone
+1F647 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🙇🏼‍♀️ E4.0 woman bowing: medium-light skin tone
+1F647 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🙇🏽‍♀️ E4.0 woman bowing: medium skin tone
+1F647 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🙇🏾‍♀️ E4.0 woman bowing: medium-dark skin tone
+1F647 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🙇🏿‍♀️ E4.0 woman bowing: dark skin tone
+1F575 FE0F                                             ; fully-qualified     # 🕵️ E0.7 detective
+1F575 1F3FB                                            ; fully-qualified     # 🕵🏻 E2.0 detective: light skin tone
+1F575 1F3FC                                            ; fully-qualified     # 🕵🏼 E2.0 detective: medium-light skin tone
+1F575 1F3FD                                            ; fully-qualified     # 🕵🏽 E2.0 detective: medium skin tone
+1F575 1F3FE                                            ; fully-qualified     # 🕵🏾 E2.0 detective: medium-dark skin tone
+1F575 1F3FF                                            ; fully-qualified     # 🕵🏿 E2.0 detective: dark skin tone
+1F575 FE0F 200D 2642 FE0F                              ; fully-qualified     # 🕵️‍♂️ E4.0 man detective
+1F575 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🕵🏻‍♂️ E4.0 man detective: light skin tone
+1F575 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🕵🏼‍♂️ E4.0 man detective: medium-light skin tone
+1F575 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🕵🏽‍♂️ E4.0 man detective: medium skin tone
+1F575 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🕵🏾‍♂️ E4.0 man detective: medium-dark skin tone
+1F575 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🕵🏿‍♂️ E4.0 man detective: dark skin tone
+1F575 FE0F 200D 2640 FE0F                              ; fully-qualified     # 🕵️‍♀️ E4.0 woman detective
+1F575 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🕵🏻‍♀️ E4.0 woman detective: light skin tone
+1F575 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🕵🏼‍♀️ E4.0 woman detective: medium-light skin tone
+1F575 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🕵🏽‍♀️ E4.0 woman detective: medium skin tone
+1F575 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🕵🏾‍♀️ E4.0 woman detective: medium-dark skin tone
+1F575 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🕵🏿‍♀️ E4.0 woman detective: dark skin tone
+1F6B6                                                  ; fully-qualified     # 🚶 E0.6 person walking
+1F6B6 1F3FB                                            ; fully-qualified     # 🚶🏻 E1.0 person walking: light skin tone
+1F6B6 1F3FC                                            ; fully-qualified     # 🚶🏼 E1.0 person walking: medium-light skin tone
+1F6B6 1F3FD                                            ; fully-qualified     # 🚶🏽 E1.0 person walking: medium skin tone
+1F6B6 1F3FE                                            ; fully-qualified     # 🚶🏾 E1.0 person walking: medium-dark skin tone
+1F6B6 1F3FF                                            ; fully-qualified     # 🚶🏿 E1.0 person walking: dark skin tone
+1F6B6 200D 2642 FE0F                                   ; fully-qualified     # 🚶‍♂️ E4.0 man walking
+1F6B6 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🚶🏻‍♂️ E4.0 man walking: light skin tone
+1F6B6 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🚶🏼‍♂️ E4.0 man walking: medium-light skin tone
+1F6B6 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🚶🏽‍♂️ E4.0 man walking: medium skin tone
+1F6B6 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🚶🏾‍♂️ E4.0 man walking: medium-dark skin tone
+1F6B6 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🚶🏿‍♂️ E4.0 man walking: dark skin tone
+1F6B6 200D 2640 FE0F                                   ; fully-qualified     # 🚶‍♀️ E4.0 woman walking
+1F6B6 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🚶🏻‍♀️ E4.0 woman walking: light skin tone
+1F6B6 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🚶🏼‍♀️ E4.0 woman walking: medium-light skin tone
+1F6B6 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🚶🏽‍♀️ E4.0 woman walking: medium skin tone
+1F6B6 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🚶🏾‍♀️ E4.0 woman walking: medium-dark skin tone
+1F6B6 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🚶🏿‍♀️ E4.0 woman walking: dark skin tone
+1F57A                                                  ; fully-qualified     # 🕺 E3.0 man dancing
+1F57A 1F3FB                                            ; fully-qualified     # 🕺🏻 E3.0 man dancing: light skin tone
+1F57A 1F3FC                                            ; fully-qualified     # 🕺🏼 E3.0 man dancing: medium-light skin tone
+1F57A 1F3FD                                            ; fully-qualified     # 🕺🏽 E3.0 man dancing: medium skin tone
+1F57A 1F3FE                                            ; fully-qualified     # 🕺🏾 E3.0 man dancing: medium-dark skin tone
+1F57A 1F3FF                                            ; fully-qualified     # 🕺🏿 E3.0 man dancing: dark skin tone
+1F574 FE0F                                             ; fully-qualified     # 🕴️ E0.7 person in suit levitating
+1F574 1F3FB                                            ; fully-qualified     # 🕴🏻 E4.0 person in suit levitating: light skin tone
+1F574 1F3FC                                            ; fully-qualified     # 🕴🏼 E4.0 person in suit levitating: medium-light skin tone
+1F574 1F3FD                                            ; fully-qualified     # 🕴🏽 E4.0 person in suit levitating: medium skin tone
+1F574 1F3FE                                            ; fully-qualified     # 🕴🏾 E4.0 person in suit levitating: medium-dark skin tone
+1F574 1F3FF                                            ; fully-qualified     # 🕴🏿 E4.0 person in suit levitating: dark skin tone
+1F6A3                                                  ; fully-qualified     # 🚣 E1.0 person rowing boat
+1F6A3 1F3FB                                            ; fully-qualified     # 🚣🏻 E1.0 person rowing boat: light skin tone
+1F6A3 1F3FC                                            ; fully-qualified     # 🚣🏼 E1.0 person rowing boat: medium-light skin tone
+1F6A3 1F3FD                                            ; fully-qualified     # 🚣🏽 E1.0 person rowing boat: medium skin tone
+1F6A3 1F3FE                                            ; fully-qualified     # 🚣🏾 E1.0 person rowing boat: medium-dark skin tone
+1F6A3 1F3FF                                            ; fully-qualified     # 🚣🏿 E1.0 person rowing boat: dark skin tone
+1F6A3 200D 2642 FE0F                                   ; fully-qualified     # 🚣‍♂️ E4.0 man rowing boat
+1F6A3 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🚣🏻‍♂️ E4.0 man rowing boat: light skin tone
+1F6A3 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🚣🏼‍♂️ E4.0 man rowing boat: medium-light skin tone
+1F6A3 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🚣🏽‍♂️ E4.0 man rowing boat: medium skin tone
+1F6A3 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🚣🏾‍♂️ E4.0 man rowing boat: medium-dark skin tone
+1F6A3 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🚣🏿‍♂️ E4.0 man rowing boat: dark skin tone
+1F6A3 200D 2640 FE0F                                   ; fully-qualified     # 🚣‍♀️ E4.0 woman rowing boat
+1F6A3 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🚣🏻‍♀️ E4.0 woman rowing boat: light skin tone
+1F6A3 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🚣🏼‍♀️ E4.0 woman rowing boat: medium-light skin tone
+1F6A3 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🚣🏽‍♀️ E4.0 woman rowing boat: medium skin tone
+1F6A3 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🚣🏾‍♀️ E4.0 woman rowing boat: medium-dark skin tone
+1F6A3 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🚣🏿‍♀️ E4.0 woman rowing boat: dark skin tone
+1F6B4                                                  ; fully-qualified     # 🚴 E1.0 person biking
+1F6B4 1F3FB                                            ; fully-qualified     # 🚴🏻 E1.0 person biking: light skin tone
+1F6B4 1F3FC                                            ; fully-qualified     # 🚴🏼 E1.0 person biking: medium-light skin tone
+1F6B4 1F3FD                                            ; fully-qualified     # 🚴🏽 E1.0 person biking: medium skin tone
+1F6B4 1F3FE                                            ; fully-qualified     # 🚴🏾 E1.0 person biking: medium-dark skin tone
+1F6B4 1F3FF                                            ; fully-qualified     # 🚴🏿 E1.0 person biking: dark skin tone
+1F6B4 200D 2642 FE0F                                   ; fully-qualified     # 🚴‍♂️ E4.0 man biking
+1F6B4 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🚴🏻‍♂️ E4.0 man biking: light skin tone
+1F6B4 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🚴🏼‍♂️ E4.0 man biking: medium-light skin tone
+1F6B4 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🚴🏽‍♂️ E4.0 man biking: medium skin tone
+1F6B4 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🚴🏾‍♂️ E4.0 man biking: medium-dark skin tone
+1F6B4 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🚴🏿‍♂️ E4.0 man biking: dark skin tone
+1F6B4 200D 2640 FE0F                                   ; fully-qualified     # 🚴‍♀️ E4.0 woman biking
+1F6B4 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🚴🏻‍♀️ E4.0 woman biking: light skin tone
+1F6B4 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🚴🏼‍♀️ E4.0 woman biking: medium-light skin tone
+1F6B4 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🚴🏽‍♀️ E4.0 woman biking: medium skin tone
+1F6B4 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🚴🏾‍♀️ E4.0 woman biking: medium-dark skin tone
+1F6B4 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🚴🏿‍♀️ E4.0 woman biking: dark skin tone
+1F6B5                                                  ; fully-qualified     # 🚵 E1.0 person mountain biking
+1F6B5 1F3FB                                            ; fully-qualified     # 🚵🏻 E1.0 person mountain biking: light skin tone
+1F6B5 1F3FC                                            ; fully-qualified     # 🚵🏼 E1.0 person mountain biking: medium-light skin tone
+1F6B5 1F3FD                                            ; fully-qualified     # 🚵🏽 E1.0 person mountain biking: medium skin tone
+1F6B5 1F3FE                                            ; fully-qualified     # 🚵🏾 E1.0 person mountain biking: medium-dark skin tone
+1F6B5 1F3FF                                            ; fully-qualified     # 🚵🏿 E1.0 person mountain biking: dark skin tone
+1F6B5 200D 2642 FE0F                                   ; fully-qualified     # 🚵‍♂️ E4.0 man mountain biking
+1F6B5 1F3FB 200D 2642 FE0F                             ; fully-qualified     # 🚵🏻‍♂️ E4.0 man mountain biking: light skin tone
+1F6B5 1F3FC 200D 2642 FE0F                             ; fully-qualified     # 🚵🏼‍♂️ E4.0 man mountain biking: medium-light skin tone
+1F6B5 1F3FD 200D 2642 FE0F                             ; fully-qualified     # 🚵🏽‍♂️ E4.0 man mountain biking: medium skin tone
+1F6B5 1F3FE 200D 2642 FE0F                             ; fully-qualified     # 🚵🏾‍♂️ E4.0 man mountain biking: medium-dark skin tone
+1F6B5 1F3FF 200D 2642 FE0F                             ; fully-qualified     # 🚵🏿‍♂️ E4.0 man mountain biking: dark skin tone
+1F6B5 200D 2640 FE0F                                   ; fully-qualified     # 🚵‍♀️ E4.0 woman mountain biking
+1F6B5 1F3FB 200D 2640 FE0F                             ; fully-qualified     # 🚵🏻‍♀️ E4.0 woman mountain biking: light skin tone
+1F6B5 1F3FC 200D 2640 FE0F                             ; fully-qualified     # 🚵🏼‍♀️ E4.0 woman mountain biking: medium-light skin tone
+1F6B5 1F3FD 200D 2640 FE0F                             ; fully-qualified     # 🚵🏽‍♀️ E4.0 woman mountain biking: medium skin tone
+1F6B5 1F3FE 200D 2640 FE0F                             ; fully-qualified     # 🚵🏾‍♀️ E4.0 woman mountain biking: medium-dark skin tone
+1F6B5 1F3FF 200D 2640 FE0F                             ; fully-qualified     # 🚵🏿‍♀️ E4.0 woman mountain biking: dark skin tone
+1F6C0                                                  ; fully-qualified     # 🛀 E0.6 person taking bath
+1F6C0 1F3FB                                            ; fully-qualified     # 🛀🏻 E1.0 person taking bath: light skin tone
+1F6C0 1F3FC                                            ; fully-qualified     # 🛀🏼 E1.0 person taking bath: medium-light skin tone
+1F6C0 1F3FD                                            ; fully-qualified     # 🛀🏽 E1.0 person taking bath: medium skin tone
+1F6C0 1F3FE                                            ; fully-qualified     # 🛀🏾 E1.0 person taking bath: medium-dark skin tone
+1F6C0 1F3FF                                            ; fully-qualified     # 🛀🏿 E1.0 person taking bath: dark skin tone
+1F6CC                                                  ; fully-qualified     # 🛌 E1.0 person in bed
+1F6CC 1F3FB                                            ; fully-qualified     # 🛌🏻 E4.0 person in bed: light skin tone
+1F6CC 1F3FC                                            ; fully-qualified     # 🛌🏼 E4.0 person in bed: medium-light skin tone
+1F6CC 1F3FD                                            ; fully-qualified     # 🛌🏽 E4.0 person in bed: medium skin tone
+1F6CC 1F3FE                                            ; fully-qualified     # 🛌🏾 E4.0 person in bed: medium-dark skin tone
+1F6CC 1F3FF                                            ; fully-qualified     # 🛌🏿 E4.0 person in bed: dark skin tone
+1F5E3 FE0F                                             ; fully-qualified     # 🗣️ E0.7 speaking head
+1F54A FE0F                                             ; fully-qualified     # 🕊️ E0.7 dove
+1F577 FE0F                                             ; fully-qualified     # 🕷️ E0.7 spider
+1F578 FE0F                                             ; fully-qualified     # 🕸️ E0.7 spider web
+1F52A                                                  ; fully-qualified     # 🔪 E0.6 kitchen knife
+1F5FA FE0F                                             ; fully-qualified     # 🗺️ E0.7 world map
+1F5FE                                                  ; fully-qualified     # 🗾 E0.6 map of Japan
+1F5FB                                                  ; fully-qualified     # 🗻 E0.6 mount fuji
+1F6D6                                                  ; fully-qualified     # 🛖 E13.0 hut
+1F5FC                                                  ; fully-qualified     # 🗼 E0.6 Tokyo tower
+1F5FD                                                  ; fully-qualified     # 🗽 E0.6 Statue of Liberty
+1F54C                                                  ; fully-qualified     # 🕌 E1.0 mosque
+1F6D5                                                  ; fully-qualified     # 🛕 E12.0 hindu temple
+1F54D                                                  ; fully-qualified     # 🕍 E1.0 synagogue
+1F54B                                                  ; fully-qualified     # 🕋 E1.0 kaaba
+1F6DD                                                  ; fully-qualified     # 🛝 E14.0 playground slide
+1F682                                                  ; fully-qualified     # 🚂 E1.0 locomotive
+1F683                                                  ; fully-qualified     # 🚃 E0.6 railway car
+1F684                                                  ; fully-qualified     # 🚄 E0.6 high-speed train
+1F685                                                  ; fully-qualified     # 🚅 E0.6 bullet train
+1F686                                                  ; fully-qualified     # 🚆 E1.0 train
+1F687                                                  ; fully-qualified     # 🚇 E0.6 metro
+1F688                                                  ; fully-qualified     # 🚈 E1.0 light rail
+1F689                                                  ; fully-qualified     # 🚉 E0.6 station
+1F68A                                                  ; fully-qualified     # 🚊 E1.0 tram
+1F69D                                                  ; fully-qualified     # 🚝 E1.0 monorail
+1F69E                                                  ; fully-qualified     # 🚞 E1.0 mountain railway
+1F68B                                                  ; fully-qualified     # 🚋 E1.0 tram car
+1F68C                                                  ; fully-qualified     # 🚌 E0.6 bus
+1F68D                                                  ; fully-qualified     # 🚍 E0.7 oncoming bus
+1F68E                                                  ; fully-qualified     # 🚎 E1.0 trolleybus
+1F690                                                  ; fully-qualified     # 🚐 E1.0 minibus
+1F691                                                  ; fully-qualified     # 🚑 E0.6 ambulance
+1F692                                                  ; fully-qualified     # 🚒 E0.6 fire engine
+1F693                                                  ; fully-qualified     # 🚓 E0.6 police car
+1F694                                                  ; fully-qualified     # 🚔 E0.7 oncoming police car
+1F695                                                  ; fully-qualified     # 🚕 E0.6 taxi
+1F696                                                  ; fully-qualified     # 🚖 E1.0 oncoming taxi
+1F697                                                  ; fully-qualified     # 🚗 E0.6 automobile
+1F698                                                  ; fully-qualified     # 🚘 E0.7 oncoming automobile
+1F699                                                  ; fully-qualified     # 🚙 E0.6 sport utility vehicle
+1F6FB                                                  ; fully-qualified     # 🛻 E13.0 pickup truck
+1F69A                                                  ; fully-qualified     # 🚚 E0.6 delivery truck
+1F69B                                                  ; fully-qualified     # 🚛 E1.0 articulated lorry
+1F69C                                                  ; fully-qualified     # 🚜 E1.0 tractor
+1F6F5                                                  ; fully-qualified     # 🛵 E3.0 motor scooter
+1F6FA                                                  ; fully-qualified     # 🛺 E12.0 auto rickshaw
+1F6B2                                                  ; fully-qualified     # 🚲 E0.6 bicycle
+1F6F4                                                  ; fully-qualified     # 🛴 E3.0 kick scooter
+1F6F9                                                  ; fully-qualified     # 🛹 E11.0 skateboard
+1F6FC                                                  ; fully-qualified     # 🛼 E13.0 roller skate
+1F68F                                                  ; fully-qualified     # 🚏 E0.6 bus stop
+1F6E3 FE0F                                             ; fully-qualified     # 🛣️ E0.7 motorway
+1F6E4 FE0F                                             ; fully-qualified     # 🛤️ E0.7 railway track
+1F6E2 FE0F                                             ; fully-qualified     # 🛢️ E0.7 oil drum
+1F6DE                                                  ; fully-qualified     # 🛞 E14.0 wheel
+1F6A8                                                  ; fully-qualified     # 🚨 E0.6 police car light
+1F6A5                                                  ; fully-qualified     # 🚥 E0.6 horizontal traffic light
+1F6A6                                                  ; fully-qualified     # 🚦 E1.0 vertical traffic light
+1F6D1                                                  ; fully-qualified     # 🛑 E3.0 stop sign
+1F6A7                                                  ; fully-qualified     # 🚧 E0.6 construction
+1F6DF                                                  ; fully-qualified     # 🛟 E14.0 ring buoy
+1F6F6                                                  ; fully-qualified     # 🛶 E3.0 canoe
+1F6A4                                                  ; fully-qualified     # 🚤 E0.6 speedboat
+1F6F3 FE0F                                             ; fully-qualified     # 🛳️ E0.7 passenger ship
+1F6E5 FE0F                                             ; fully-qualified     # 🛥️ E0.7 motor boat
+1F6A2                                                  ; fully-qualified     # 🚢 E0.6 ship
+1F6E9 FE0F                                             ; fully-qualified     # 🛩️ E0.7 small airplane
+1F6EB                                                  ; fully-qualified     # 🛫 E1.0 airplane departure
+1F6EC                                                  ; fully-qualified     # 🛬 E1.0 airplane arrival
+1F681                                                  ; fully-qualified     # 🚁 E1.0 helicopter
+1F69F                                                  ; fully-qualified     # 🚟 E1.0 suspension railway
+1F6A0                                                  ; fully-qualified     # 🚠 E1.0 mountain cableway
+1F6A1                                                  ; fully-qualified     # 🚡 E1.0 aerial tramway
+1F6F0 FE0F                                             ; fully-qualified     # 🛰️ E0.7 satellite
+1F680                                                  ; fully-qualified     # 🚀 E0.6 rocket
+1F6F8                                                  ; fully-qualified     # 🛸 E5.0 flying saucer
+1F6CE FE0F                                             ; fully-qualified     # 🛎️ E0.7 bellhop bell
+1F570 FE0F                                             ; fully-qualified     # 🕰️ E0.7 mantelpiece clock
+1F55B                                                  ; fully-qualified     # 🕛 E0.6 twelve o’clock
+1F567                                                  ; fully-qualified     # 🕧 E0.7 twelve-thirty
+1F550                                                  ; fully-qualified     # 🕐 E0.6 one o’clock
+1F55C                                                  ; fully-qualified     # 🕜 E0.7 one-thirty
+1F551                                                  ; fully-qualified     # 🕑 E0.6 two o’clock
+1F55D                                                  ; fully-qualified     # 🕝 E0.7 two-thirty
+1F552                                                  ; fully-qualified     # 🕒 E0.6 three o’clock
+1F55E                                                  ; fully-qualified     # 🕞 E0.7 three-thirty
+1F553                                                  ; fully-qualified     # 🕓 E0.6 four o’clock
+1F55F                                                  ; fully-qualified     # 🕟 E0.7 four-thirty
+1F554                                                  ; fully-qualified     # 🕔 E0.6 five o’clock
+1F560                                                  ; fully-qualified     # 🕠 E0.7 five-thirty
+1F555                                                  ; fully-qualified     # 🕕 E0.6 six o’clock
+1F561                                                  ; fully-qualified     # 🕡 E0.7 six-thirty
+1F556                                                  ; fully-qualified     # 🕖 E0.6 seven o’clock
+1F562                                                  ; fully-qualified     # 🕢 E0.7 seven-thirty
+1F557                                                  ; fully-qualified     # 🕗 E0.6 eight o’clock
+1F563                                                  ; fully-qualified     # 🕣 E0.7 eight-thirty
+1F558                                                  ; fully-qualified     # 🕘 E0.6 nine o’clock
+1F564                                                  ; fully-qualified     # 🕤 E0.7 nine-thirty
+1F559                                                  ; fully-qualified     # 🕙 E0.6 ten o’clock
+1F565                                                  ; fully-qualified     # 🕥 E0.7 ten-thirty
+1F55A                                                  ; fully-qualified     # 🕚 E0.6 eleven o’clock
+1F566                                                  ; fully-qualified     # 🕦 E0.7 eleven-thirty
+1F525                                                  ; fully-qualified     # 🔥 E0.6 fire
+1F6F7                                                  ; fully-qualified     # 🛷 E5.0 sled
+1F52B                                                  ; fully-qualified     # 🔫 E0.6 water pistol
+1F52E                                                  ; fully-qualified     # 🔮 E0.6 crystal ball
+1F579 FE0F                                             ; fully-qualified     # 🕹️ E0.7 joystick
+1F5BC FE0F                                             ; fully-qualified     # 🖼️ E0.7 framed picture
+1F576 FE0F                                             ; fully-qualified     # 🕶️ E0.7 sunglasses
+1F6CD FE0F                                             ; fully-qualified     # 🛍️ E0.7 shopping bags
+1F507                                                  ; fully-qualified     # 🔇 E1.0 muted speaker
+1F508                                                  ; fully-qualified     # 🔈 E0.7 speaker low volume
+1F509                                                  ; fully-qualified     # 🔉 E1.0 speaker medium volume
+1F50A                                                  ; fully-qualified     # 🔊 E0.6 speaker high volume
+1F514                                                  ; fully-qualified     # 🔔 E0.6 bell
+1F515                                                  ; fully-qualified     # 🔕 E1.0 bell with slash
+1F50B                                                  ; fully-qualified     # 🔋 E0.6 battery
+1F50C                                                  ; fully-qualified     # 🔌 E0.6 electric plug
+1F5A5 FE0F                                             ; fully-qualified     # 🖥️ E0.7 desktop computer
+1F5A8 FE0F                                             ; fully-qualified     # 🖨️ E0.7 printer
+1F5B1 FE0F                                             ; fully-qualified     # 🖱️ E0.7 computer mouse
+1F5B2 FE0F                                             ; fully-qualified     # 🖲️ E0.7 trackball
+1F50D                                                  ; fully-qualified     # 🔍 E0.6 magnifying glass tilted left
+1F50E                                                  ; fully-qualified     # 🔎 E0.6 magnifying glass tilted right
+1F56F FE0F                                             ; fully-qualified     # 🕯️ E0.7 candle
+1F526                                                  ; fully-qualified     # 🔦 E0.6 flashlight
+1F5DE FE0F                                             ; fully-qualified     # 🗞️ E0.7 rolled-up newspaper
+1F516                                                  ; fully-qualified     # 🔖 E0.6 bookmark
+1F5F3 FE0F                                             ; fully-qualified     # 🗳️ E0.7 ballot box with ballot
+1F58B FE0F                                             ; fully-qualified     # 🖋️ E0.7 fountain pen
+1F58A FE0F                                             ; fully-qualified     # 🖊️ E0.7 pen
+1F58C FE0F                                             ; fully-qualified     # 🖌️ E0.7 paintbrush
+1F58D FE0F                                             ; fully-qualified     # 🖍️ E0.7 crayon
+1F5C2 FE0F                                             ; fully-qualified     # 🗂️ E0.7 card index dividers
+1F5D2 FE0F                                             ; fully-qualified     # 🗒️ E0.7 spiral notepad
+1F5D3 FE0F                                             ; fully-qualified     # 🗓️ E0.7 spiral calendar
+1F587 FE0F                                             ; fully-qualified     # 🖇️ E0.7 linked paperclips
+1F5C3 FE0F                                             ; fully-qualified     # 🗃️ E0.7 card file box
+1F5C4 FE0F                                             ; fully-qualified     # 🗄️ E0.7 file cabinet
+1F5D1 FE0F                                             ; fully-qualified     # 🗑️ E0.7 wastebasket
+1F512                                                  ; fully-qualified     # 🔒 E0.6 locked
+1F513                                                  ; fully-qualified     # 🔓 E0.6 unlocked
+1F50F                                                  ; fully-qualified     # 🔏 E0.6 locked with pen
+1F510                                                  ; fully-qualified     # 🔐 E0.6 locked with key
+1F511                                                  ; fully-qualified     # 🔑 E0.6 key
+1F5DD FE0F                                             ; fully-qualified     # 🗝️ E0.7 old key
+1F528                                                  ; fully-qualified     # 🔨 E0.6 hammer
+1F6E0 FE0F                                             ; fully-qualified     # 🛠️ E0.7 hammer and wrench
+1F5E1 FE0F                                             ; fully-qualified     # 🗡️ E0.7 dagger
+1F6E1 FE0F                                             ; fully-qualified     # 🛡️ E0.7 shield
+1F527                                                  ; fully-qualified     # 🔧 E0.6 wrench
+1F529                                                  ; fully-qualified     # 🔩 E0.6 nut and bolt
+1F5DC FE0F                                             ; fully-qualified     # 🗜️ E0.7 clamp
+1F517                                                  ; fully-qualified     # 🔗 E0.6 link
+1F52C                                                  ; fully-qualified     # 🔬 E1.0 microscope
+1F52D                                                  ; fully-qualified     # 🔭 E1.0 telescope
+1F6AA                                                  ; fully-qualified     # 🚪 E0.6 door
+1F6D7                                                  ; fully-qualified     # 🛗 E13.0 elevator
+1F6CF FE0F                                             ; fully-qualified     # 🛏️ E0.7 bed
+1F6CB FE0F                                             ; fully-qualified     # 🛋️ E0.7 couch and lamp
+1F6BD                                                  ; fully-qualified     # 🚽 E0.6 toilet
+1F6BF                                                  ; fully-qualified     # 🚿 E1.0 shower
+1F6C1                                                  ; fully-qualified     # 🛁 E1.0 bathtub
+1F6D2                                                  ; fully-qualified     # 🛒 E3.0 shopping cart
+1F6AC                                                  ; fully-qualified     # 🚬 E0.6 cigarette
+1F5FF                                                  ; fully-qualified     # 🗿 E0.6 moai
+1F6AE                                                  ; fully-qualified     # 🚮 E1.0 litter in bin sign
+1F6B0                                                  ; fully-qualified     # 🚰 E1.0 potable water
+1F6B9                                                  ; fully-qualified     # 🚹 E0.6 men’s room
+1F6BA                                                  ; fully-qualified     # 🚺 E0.6 women’s room
+1F6BB                                                  ; fully-qualified     # 🚻 E0.6 restroom
+1F6BC                                                  ; fully-qualified     # 🚼 E0.6 baby symbol
+1F6BE                                                  ; fully-qualified     # 🚾 E0.6 water closet
+1F6C2                                                  ; fully-qualified     # 🛂 E1.0 passport control
+1F6C3                                                  ; fully-qualified     # 🛃 E1.0 customs
+1F6C4                                                  ; fully-qualified     # 🛄 E1.0 baggage claim
+1F6C5                                                  ; fully-qualified     # 🛅 E1.0 left luggage
+1F6B8                                                  ; fully-qualified     # 🚸 E1.0 children crossing
+1F6AB                                                  ; fully-qualified     # 🚫 E0.6 prohibited
+1F6B3                                                  ; fully-qualified     # 🚳 E1.0 no bicycles
+1F6AD                                                  ; fully-qualified     # 🚭 E0.6 no smoking
+1F6AF                                                  ; fully-qualified     # 🚯 E1.0 no littering
+1F6B1                                                  ; fully-qualified     # 🚱 E1.0 non-potable water
+1F6B7                                                  ; fully-qualified     # 🚷 E1.0 no pedestrians
+1F51E                                                  ; fully-qualified     # 🔞 E0.6 no one under eighteen
+1F503                                                  ; fully-qualified     # 🔃 E0.6 clockwise vertical arrows
+1F504                                                  ; fully-qualified     # 🔄 E1.0 counterclockwise arrows button
+1F519                                                  ; fully-qualified     # 🔙 E0.6 BACK arrow
+1F51A                                                  ; fully-qualified     # 🔚 E0.6 END arrow
+1F51B                                                  ; fully-qualified     # 🔛 E0.6 ON! arrow
+1F51C                                                  ; fully-qualified     # 🔜 E0.6 SOON arrow
+1F51D                                                  ; fully-qualified     # 🔝 E0.6 TOP arrow
+1F6D0                                                  ; fully-qualified     # 🛐 E1.0 place of worship
+1F549 FE0F                                             ; fully-qualified     # 🕉️ E0.7 om
+1F54E                                                  ; fully-qualified     # 🕎 E1.0 menorah
+1F52F                                                  ; fully-qualified     # 🔯 E0.6 dotted six-pointed star
+1F500                                                  ; fully-qualified     # 🔀 E1.0 shuffle tracks button
+1F501                                                  ; fully-qualified     # 🔁 E1.0 repeat button
+1F502                                                  ; fully-qualified     # 🔂 E1.0 repeat single button
+1F53C                                                  ; fully-qualified     # 🔼 E0.6 upwards button
+1F53D                                                  ; fully-qualified     # 🔽 E0.6 downwards button
+1F505                                                  ; fully-qualified     # 🔅 E1.0 dim button
+1F506                                                  ; fully-qualified     # 🔆 E1.0 bright button
+1F6DC                                                  ; fully-qualified     # 🛜 E15.0 wireless
+1F7F0                                                  ; fully-qualified     # 🟰 E14.0 heavy equals sign
+1F531                                                  ; fully-qualified     # 🔱 E0.6 trident emblem
+1F530                                                  ; fully-qualified     # 🔰 E0.6 Japanese symbol for beginner
+1F51F                                                  ; fully-qualified     # 🔟 E0.6 keycap: 10
+1F520                                                  ; fully-qualified     # 🔠 E0.6 input latin uppercase
+1F521                                                  ; fully-qualified     # 🔡 E0.6 input latin lowercase
+1F522                                                  ; fully-qualified     # 🔢 E0.6 input numbers
+1F523                                                  ; fully-qualified     # 🔣 E0.6 input symbols
+1F524                                                  ; fully-qualified     # 🔤 E0.6 input latin letters
+1F534                                                  ; fully-qualified     # 🔴 E0.6 red circle
+1F7E0                                                  ; fully-qualified     # 🟠 E12.0 orange circle
+1F7E1                                                  ; fully-qualified     # 🟡 E12.0 yellow circle
+1F7E2                                                  ; fully-qualified     # 🟢 E12.0 green circle
+1F535                                                  ; fully-qualified     # 🔵 E0.6 blue circle
+1F7E3                                                  ; fully-qualified     # 🟣 E12.0 purple circle
+1F7E4                                                  ; fully-qualified     # 🟤 E12.0 brown circle
+1F7E5                                                  ; fully-qualified     # 🟥 E12.0 red square
+1F7E7                                                  ; fully-qualified     # 🟧 E12.0 orange square
+1F7E8                                                  ; fully-qualified     # 🟨 E12.0 yellow square
+1F7E9                                                  ; fully-qualified     # 🟩 E12.0 green square
+1F7E6                                                  ; fully-qualified     # 🟦 E12.0 blue square
+1F7EA                                                  ; fully-qualified     # 🟪 E12.0 purple square
+1F7EB                                                  ; fully-qualified     # 🟫 E12.0 brown square
+1F536                                                  ; fully-qualified     # 🔶 E0.6 large orange diamond
+1F537                                                  ; fully-qualified     # 🔷 E0.6 large blue diamond
+1F538                                                  ; fully-qualified     # 🔸 E0.6 small orange diamond
+1F539                                                  ; fully-qualified     # 🔹 E0.6 small blue diamond
+1F53A                                                  ; fully-qualified     # 🔺 E0.6 red triangle pointed up
+1F53B                                                  ; fully-qualified     # 🔻 E0.6 red triangle pointed down
+1F518                                                  ; fully-qualified     # 🔘 E0.6 radio button
+1F533                                                  ; fully-qualified     # 🔳 E0.6 white square button
+1F532                                                  ; fully-qualified     # 🔲 E0.6 black square button
+1F6A9                                                  ; fully-qualified     # 🚩 E0.6 triangular flag

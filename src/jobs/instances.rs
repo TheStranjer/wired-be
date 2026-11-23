@@ -203,8 +203,6 @@ mod tests {
         http_client::HttpClient,
         jobs::{QUEUE_BACKGROUND, scheduler::periodic_jobs},
         models::user::{NewUser, insert, local_ap_id},
-        streaming::hub::Hub,
-        uploads::UploaderBackend,
     };
 
     /// `User-Agent` of the probe client the tests run.
@@ -234,18 +232,9 @@ mod tests {
     /// (guard disabled), so the probe's requests reach `http://127.0.0.1`
     /// targets.
     fn app_state(pool: &PgPool) -> AppState {
-        let config = Arc::new(Config::for_tests());
         AppState {
-            db: pool.clone(),
-            hub: Hub::new(pool),
-            config: Arc::clone(&config),
             http_client: HttpClient::new_for_tests(TEST_UA),
-            uploader: UploaderBackend::from(config.as_ref()),
-            instance_stats_cache: Arc::default(),
-            mrf_config_cache: Arc::default(),
-            translation_languages_cache: Arc::default(),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-            mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+            ..AppState::for_tests(pool.clone(), Config::for_tests())
         }
     }
 

@@ -371,7 +371,7 @@ async fn following_creates_the_tag_and_unfollowing_does_not() {
     let cleared = get(&app, &bearer, FOLLOWED).await;
     assert_eq!(cleared.text(), "[]", "and the follow really went");
 
-    let unknown = tag_request(&app, Some(&bearer), "never-made", "/unfollow").await;
+    let unknown = tag_request(&app, Some(&bearer), "nevermade", "/unfollow").await;
     assert_eq!(
         unknown.status,
         StatusCode::NOT_FOUND,
@@ -379,7 +379,7 @@ async fn following_creates_the_tag_and_unfollowing_does_not() {
     );
     assert_eq!(unknown.json_value()["error"], NOT_FOUND);
     assert!(
-        hashtag::get_by_name(&pool, "never-made")
+        hashtag::get_by_name(&pool, "nevermade")
             .await
             .unwrap()
             .is_none(),
@@ -397,7 +397,15 @@ async fn the_writes_refuse_invalid_hashtags() {
     let app = common::test_app(pool.clone());
     let long = "t".repeat(MAX_NAME + 1);
 
-    for name in ["%23", "%20", "%23%20", long.as_str()] {
+    for name in [
+        "%23",
+        "%20",
+        "%23%20",
+        "foo%20bar",
+        "a%3Fb",
+        "123",
+        long.as_str(),
+    ] {
         for suffix in ["/follow", "/unfollow"] {
             let refused = tag_request(&app, Some(&bearer), name, suffix).await;
             assert_eq!(

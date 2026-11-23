@@ -337,6 +337,31 @@ mod tests {
     }
 
     #[test]
+    fn an_emoji_react_of_any_fully_qualified_emoji_folds_into_a_reaction() {
+        for emoji in ["\u{2B50}", "\u{1F7E5}", "\u{1F7E2}", "\u{231B}", "\u{2764}"] {
+            let react = view(
+                "EmojiReact",
+                "star",
+                BOB,
+                json!("https://test.example/objects/x"),
+                json!({"content": emoji}),
+            );
+            let content = react.raw.get("content").and_then(Value::as_str);
+            let reaction = content
+                .and_then(|content| reaction_of(&react.raw, content))
+                .expect("the content is one emoji, not an Ignored fold");
+            assert_eq!(reaction.emoji, emoji, "the stored spelling is the sender's");
+            assert_eq!(reaction.url, None, "a unicode reaction carries no image");
+        }
+        for text in ["a\u{1F3FB}", "ab", "\u{2B50}\u{2B50}"] {
+            assert!(
+                reaction_of(&json!({}), text).is_none(),
+                "{text:?} is not one emoji"
+            );
+        }
+    }
+
+    #[test]
     fn a_shortcode_reaction_needs_its_emoji_tag() {
         let tagged = json!({
             "content": ":railroad_track:",

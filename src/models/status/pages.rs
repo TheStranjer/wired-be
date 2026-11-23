@@ -1,5 +1,5 @@
-//! The paging reads over stored statuses: the author's feed page
-//! ([`newest_public_posts`]) and outbox page ([`outbox_page`]), the backup
+//! The paging reads over stored statuses: the author's outbox page
+//! ([`outbox_page`]), the backup
 //! export walk ([`backup_page`]), the replies collection count and page
 //! ([`public_replies_count`], [`public_replies_page`]) and the admin's
 //! visibility counters ([`status_visibility_counts`]).
@@ -10,20 +10,6 @@ use uuid::Uuid;
 use crate::{error::AppResult, pagination::PageParams};
 
 use super::{Status, StatusVisibilityCounts};
-
-/// [`newest_public_posts`]: one author's live `public` root posts (a reply
-/// or a reblog is neither), newest id first (decision 4), optionally a
-/// keyset page older than the cursor. `$2` is bound `NULL` on a first page,
-/// which keeps every row.
-const NEWEST_PUBLIC_POSTS_SQL: &str = "SELECT * FROM statuses
-   WHERE user_id = $1
-     AND visibility = 'public'
-     AND deleted_at IS NULL
-     AND in_reply_to_id IS NULL
-     AND reblog_of_id IS NULL
-     AND ($2::uuid IS NULL OR id < $2)
-ORDER BY id DESC
-    LIMIT $3";
 
 /// [`outbox_page`]: the head of the author's outbox statement, up to (and
 /// including) the placeholder [`outbox_page`] pushes the author's id into;
@@ -66,36 +52,6 @@ const PUBLIC_REPLIES_COUNT_SQL: &str = "SELECT count(*) FROM statuses s
       WHERE s.in_reply_to_id = $1
         AND s.deleted_at IS NULL
         AND s.visibility IN ('public', 'unlisted')";
-
-/// The newest `limit` live, `public`, root posts of author `user_id`,
-/// newest first (decision 4): the page the account's `Atom`/`RSS` feeds
-/// ([`crate::api::feeds`]) enumerate.
-///
-/// A root post is neither a reply nor a reblog — the feed carries what the
-/// account itself said, not its side of a conversation or its boosts — and
-/// `public` is the only visibility that is (an `unlisted` post is public to
-/// timelines but not advertised, `private`, `direct` and `local` are not
-/// public at all). `max_id`, when given, is the keyset cursor: only posts
-/// strictly older than it are returned.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn newest_public_posts(
-    pool: &PgPool,
-    user_id: Uuid,
-    max_id: Option<Uuid>,
-    limit: i64,
-) -> AppResult<Vec<Status>> {
-    let statuses = sqlx::query_as::<_, Status>(NEWEST_PUBLIC_POSTS_SQL)
-        .bind(user_id)
-        .bind(max_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-    Ok(statuses)
-}
 
 /// The `user_id`'s outbox page: their publicly visible rows, newest first.
 ///

@@ -82,7 +82,10 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
+    api::{
+        helpers::{distinct, distinct_ids},
+        notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
+    },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -474,16 +477,7 @@ impl DestroyParams {
     /// are not id text are skipped — they can name no row anyway.
     fn parsed_ids(&self) -> Vec<Uuid> {
         let values = self.ids.as_ref().map_or_else(Vec::new, IdList::values);
-        let mut ids: Vec<Uuid> = Vec::new();
-        for value in values {
-            let Some(id) = parse_id(value) else {
-                continue;
-            };
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        ids
+        distinct_ids(values).0
     }
 }
 
@@ -651,8 +645,8 @@ pub(crate) async fn render_notifications(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let actor_ids = distinct_ids(rows.iter().map(|row| row.from_account_id));
-    let status_ids = distinct_ids(rows.iter().filter_map(|row| row.status_id));
+    let actor_ids = distinct(rows.iter().map(|row| row.from_account_id));
+    let status_ids = distinct(rows.iter().filter_map(|row| row.status_id));
     let users = user::get_many(&state.db, &actor_ids)
         .await?
         .into_iter()
@@ -719,7 +713,7 @@ async fn rendered_chat_messages(
     rows: &[NotificationRow],
 ) -> AppResult<HashMap<Uuid, Value>> {
     let mut rendered = HashMap::new();
-    for message_id in distinct_ids(rows.iter().filter_map(|row| row.chat_message_id)) {
+    for message_id in distinct(rows.iter().filter_map(|row| row.chat_message_id)) {
         let Some(value) = chat_message_entity(state, viewer.id, message_id).await? else {
             continue;
         };
@@ -838,17 +832,6 @@ async fn visible_statuses(
         rendered,
         hidden_by_filter: all_ids,
     })
-}
-
-/// The values in order, each named once.
-fn distinct_ids(values: impl Iterator<Item = Uuid>) -> Vec<Uuid> {
-    let mut ids: Vec<Uuid> = Vec::new();
-    for id in values {
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    ids
 }
 
 #[cfg(test)]

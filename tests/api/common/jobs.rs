@@ -75,10 +75,14 @@ async fn run_one(state: &AppState, registry: &JobRegistry, job: Job) {
 /// If the terminal write fails.
 async fn record_outcome(state: &AppState, id: Uuid, attempts: i32, outcome: Result<(), JobError>) {
     let stored = match outcome {
-        Ok(()) => complete(&state.db, id).await,
-        Err(JobError::Retry(detail)) => fail(&state.db, id, &detail, Some(backoff(attempts))).await,
-        Err(JobError::RetryAfter(delay, detail)) => fail(&state.db, id, &detail, Some(delay)).await,
-        Err(JobError::Discard(detail)) => fail(&state.db, id, &detail, None).await,
+        Ok(()) => complete(&state.db, id, attempts).await,
+        Err(JobError::Retry(detail)) => {
+            fail(&state.db, id, attempts, &detail, Some(backoff(attempts))).await
+        }
+        Err(JobError::RetryAfter(delay, detail)) => {
+            fail(&state.db, id, attempts, &detail, Some(delay)).await
+        }
+        Err(JobError::Discard(detail)) => fail(&state.db, id, attempts, &detail, None).await,
     };
-    stored.expect("the terminal job write runs");
+    let _written = stored.expect("the terminal job write runs");
 }

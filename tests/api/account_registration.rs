@@ -668,9 +668,12 @@ async fn every_refused_invite_is_a_400_invalid_token() {
     let expired_answer = register_with_invite(&app, &pool, "nobody3", &expired.token).await;
 
     let used = mint_invite(&pool, &InviteParams::one_time()).await;
-    invite_token::consume(&pool, used.id)
-        .await
-        .expect("the model spends the invite");
+    assert!(
+        invite_token::consume(&pool, used.id)
+            .await
+            .expect("the model spends the invite"),
+        "the fresh one-time invite is spent"
+    );
     let used_answer = register_with_invite(&app, &pool, "nobody4", &used.token).await;
 
     let exhausted = mint_invite(
@@ -681,9 +684,12 @@ async fn every_refused_invite_is_a_400_invalid_token() {
         },
     )
     .await;
-    invite_token::consume(&pool, exhausted.id)
-        .await
-        .expect("the model reaches the cap");
+    assert!(
+        invite_token::consume(&pool, exhausted.id)
+            .await
+            .expect("the model reaches the cap"),
+        "the capped invite's only use is served"
+    );
     let exhausted_answer = register_with_invite(&app, &pool, "nobody5", &exhausted.token).await;
 
     common::assert_all_refused(
