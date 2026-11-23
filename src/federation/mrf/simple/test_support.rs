@@ -121,6 +121,18 @@ pub(super) fn delete() -> Value {
     })
 }
 
+/// An activity of `kind` by alice whose `object` is the bare reference
+/// `object`.
+pub(super) fn reacting(kind: &str, object: &str) -> Value {
+    json!({
+        "id": format!("https://{PEER}/activities/7"),
+        "type": kind,
+        "actor": ALICE,
+        "to": [PUBLIC],
+        "object": object,
+    })
+}
+
 /// A `Flag` (a report) by alice.
 pub(super) fn flag() -> Value {
     json!({
