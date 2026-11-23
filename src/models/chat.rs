@@ -231,11 +231,10 @@ pub struct ChatFilter {
     /// `Some(true)` for pinned chats only, `Some(false)` for the unpinned rest,
     /// `None` for both.
     pub pinned: Option<bool>,
-    /// Whether chats with accounts the user has muted are included.
+    /// Whether chats with accounts the user has muted (live mutes only: an
+    /// expired one hides nothing) are included.
     ///
-    /// Nothing is excluded by it yet: mutes — and blocks, which Pleroma leaves
-    /// out of the list unconditionally — arrive with their own tables and
-    /// tickets, which wire this flag up to them. Until then every chat of the
-    /// user is listed, muted accounts included.
+    /// Chats with accounts the user has blocked are left out whatever this says,
+    /// as in Pleroma; an account that blocked the user does not hide its chat.
     pub with_muted: bool,
 }

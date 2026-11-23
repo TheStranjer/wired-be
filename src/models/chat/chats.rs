@@ -360,7 +360,7 @@ mod tests {
                 .unwrap(),
             ),
             vec![with_bob.id],
-            "the unpinned filter gets the rest; with_muted excludes nothing yet"
+            "the unpinned filter gets the rest; with_muted hides nothing here, no mutes exist"
         );
         assert!(
             !stored_chat(&pool, bobs_side.id).await.pinned,
