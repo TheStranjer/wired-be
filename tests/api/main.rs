@@ -117,6 +117,10 @@ mod ap_activities;
 /// twin `GET /users/{nickname}/statuses/{uuid}` and `GET /notice/{id}`.
 mod ap_objects;
 
+/// Public-post reads of `/objects/{uuid}` and `/activities/{uuid}` are
+/// decided by `can_view` for the signer: blocked signers get the 404.
+mod ap_public_reads;
+
 /// Announcements over HTTP (`/api/v1/announcements`).
 mod announcements;
 
