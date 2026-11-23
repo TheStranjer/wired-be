@@ -3,8 +3,6 @@
 //! [`check_body`] runners, the idempotency and preview row counters, and
 //! the reply, media and poll body builders the themed children post with.
 
-use std::sync::Arc;
-
 use axum::{
     http::StatusCode,
     response::{IntoResponse as _, Response},
@@ -18,15 +16,12 @@ use crate::{
     config::{Config, TEST_BASE_URL},
     entities::status::Status,
     error::AppError,
-    http_client::HttpClient,
-    mailer::MemoryTransport,
     models::{
         media_attachment::{self, NewMediaAttachment},
         status::{self, NewStatus},
         user::{NewUser, User, insert as insert_user, local_ap_id},
     },
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 /// The instance origin the fixtures post under.
@@ -35,19 +30,7 @@ pub(super) const BASE: &str = TEST_BASE_URL;
 /// The state under test: `pool` and the test config, with the
 /// collaborators the service never touches.
 pub(super) fn state(pool: &PgPool) -> AppState {
-    let config = Arc::new(Config::for_tests());
-    AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
-        http_client: HttpClient::from(config.as_ref()),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(MemoryTransport::new()),
-    }
+    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// A local user named `nickname`.

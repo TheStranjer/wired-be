@@ -19,7 +19,6 @@ use crate::{
     http_client::HttpClient,
     models::user::{NewUser, User, insert, local_ap_id},
     state::AppState,
-    uploads::UploaderBackend,
 };
 
 use super::interaction::subscribe_url_for;
@@ -126,20 +125,9 @@ pub(super) async fn url_against(app: Router, target: &str) -> Option<String> {
 /// SSRF guard is off, so the subscribe lookup may reach the loopback
 /// mock (the shape [`crate::api::search`]'s tests build).
 pub(super) fn test_state(pool: &PgPool) -> AppState {
-    let config = std::sync::Arc::new(Config::for_tests());
     AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: std::sync::Arc::clone(&config),
         http_client: HttpClient::new_for_tests(TEST_UA),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: std::sync::Arc::default(),
-        mrf_config_cache: std::sync::Arc::default(),
-        translation_languages_cache: std::sync::Arc::default(),
-        rate_limiter: std::sync::Arc::new(crate::rate_limit::RateLimiter::from_config(
-            config.as_ref(),
-        )),
-        mailer: std::sync::Arc::new(crate::mailer::MemoryTransport::new()),
+        ..AppState::for_tests(pool.clone(), Config::for_tests())
     }
 }
 

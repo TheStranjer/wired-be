@@ -37,7 +37,6 @@ use crate::{
         user::{NewUser, User, insert, local_ap_id},
     },
     state::AppState,
-    uploads::UploaderBackend,
     util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
 };
 
@@ -63,18 +62,9 @@ pub(super) fn test_state(pool: &PgPool) -> AppState {
 /// The state under test: `pool` over `config`, with a client that may
 /// reach the loopback mocks.
 pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {
-    let config = Arc::new(config);
     AppState {
-        db: pool.clone(),
-        hub: crate::streaming::hub::Hub::new(pool),
-        config: Arc::clone(&config),
         http_client: HttpClient::new_for_tests(TEST_UA),
-        uploader: UploaderBackend::from(config.as_ref()),
-        instance_stats_cache: Arc::default(),
-        mrf_config_cache: Arc::default(),
-        translation_languages_cache: Arc::default(),
-        rate_limiter: Arc::new(crate::rate_limit::RateLimiter::from_config(config.as_ref())),
-        mailer: Arc::new(crate::mailer::MemoryTransport::new()),
+        ..AppState::for_tests(pool.clone(), config)
     }
 }
 
