@@ -12,7 +12,7 @@ use crate::{error::AppResult, pagination::PageParams};
 
 use super::{
     GroupSelector,
-    flat_page::{NotificationFilters, push_scope},
+    flat_page::{NotificationFilters, push_visible_scope},
     grouping::{UNGROUNDED_PREFIX, sample_slice},
 };
 
@@ -85,6 +85,9 @@ pub struct GroupPageParams<'a> {
     pub grouped_types: Vec<&'a str>,
     /// The client's `types[]` / `exclude_types[]` / `account_id` filters.
     pub filters: NotificationFilters<'a>,
+    /// Whether notifications whose cause the recipient muted stay in the
+    /// page (`with_muted`); blocked actors and domains stay hidden either way.
+    pub with_muted: bool,
     /// The cursor page over groups, keyed on each group's `most_recent_id`.
     pub page: PageParams,
 }
@@ -104,7 +107,7 @@ fn push_keyed_groups(qb: &mut QueryBuilder<Postgres>, params: &GroupPageParams<'
         .push(") THEN n.group_key ELSE '")
         .push(UNGROUNDED_PREFIX)
         .push("' || n.id::text END AS key FROM notifications n");
-    push_scope(qb, params.user_id);
+    push_visible_scope(qb, params.user_id, params.with_muted);
     params.filters.push(qb);
     let slice = sample_slice();
     let _grouped: &mut _ = qb
@@ -209,7 +212,7 @@ async fn single_info(pool: &PgPool, user_id: Uuid, id: Uuid) -> AppResult<Option
          AS latest_page_notification_at, n.status_id, \
          ARRAY[n.from_account_id]::uuid[] AS sample_account_ids FROM notifications n",
     );
-    push_scope(&mut qb, user_id);
+    push_visible_scope(&mut qb, user_id, false);
     let _id: &mut _ = qb.push(" AND n.id = ").push_bind(id);
     let row = qb
         .build_query_as::<GroupInfo>()
@@ -228,7 +231,7 @@ async fn keyed_info(pool: &PgPool, user_id: Uuid, key: &str) -> AppResult<Option
         .push(" (array_agg(from_account_id ORDER BY id DESC))")
         .push(&slice)
         .push(" AS sample_account_ids FROM notifications n");
-    push_scope(&mut qb, user_id);
+    push_visible_scope(&mut qb, user_id, false);
     let _key: &mut _ = qb.push(" AND n.group_key = ").push_bind(key.to_owned());
     let _grouped: &mut _ = qb.push(" GROUP BY n.group_key");
     let row = qb
@@ -253,7 +256,7 @@ pub async fn group_actor_ids(
     selector: &GroupSelector,
 ) -> AppResult<Vec<Uuid>> {
     let mut qb = QueryBuilder::<Postgres>::new("SELECT n.from_account_id FROM notifications n");
-    push_scope(&mut qb, user_id);
+    push_visible_scope(&mut qb, user_id, false);
     match selector {
         GroupSelector::Notification(id) => {
             let _id: &mut _ = qb.push(" AND n.id = ").push_bind(*id);
@@ -267,4 +270,138 @@ pub async fn group_actor_ids(
     }
     let ids = qb.build_query_scalar::<Uuid>().fetch_all(pool).await?;
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        config::TEST_BASE_URL,
+        models::{
+            block, domain_block,
+            mute::{self, MuteOptions},
+            notification::{
+                UnreadParams,
+                test_support::{note, solo, trio},
+                unread_count,
+            },
+            user,
+        },
+    };
+
+    /// The remote actor `mallory@evil.example`.
+    async fn mallory(pool: &PgPool) -> user::User {
+        user::insert(
+            pool,
+            &user::NewUser {
+                nickname: "mallory@evil.example".to_owned(),
+                ap_id: "https://evil.example/users/mallory".to_owned(),
+                domain: Some("evil.example".to_owned()),
+                name: "mallory".to_owned(),
+                ..user::NewUser::default()
+            },
+        )
+        .await
+        .expect("remote user fixture")
+    }
+
+    /// The page parameters with everything open but `with_muted`.
+    fn open(user_id: Uuid, with_muted: bool) -> GroupPageParams<'static> {
+        use crate::{models::notification::GROUPABLE_TYPES, pagination::MAX_LIMIT};
+        GroupPageParams {
+            user_id,
+            grouped_types: GROUPABLE_TYPES.to_vec(),
+            filters: NotificationFilters::default(),
+            with_muted,
+            page: PageParams::from_query(Some(""), MAX_LIMIT).expect("the default page parses"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_grouped_reads_hide_blocked_domain_blocked_and_muted_actors() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (alice, normal, status_id) = trio(pool).await;
+        let me = user::get_by_id(pool, alice)
+            .await
+            .expect("alice reads")
+            .expect("alice exists");
+        let blocked = solo(pool, "group-blocked").await;
+        let muted = solo(pool, "group-muted").await;
+        let remote = mallory(pool).await;
+        let _edge = block::block(pool, TEST_BASE_URL, &me, &blocked)
+            .await
+            .expect("the block lands");
+        let _mute = mute::mute(pool, &me, &muted, MuteOptions::default())
+            .await
+            .expect("the mute lands");
+        domain_block::block_domain(pool, alice, "evil.example")
+            .await
+            .expect("the domain block lands");
+
+        let from_blocked = note(pool, alice, blocked.id, "mention", None).await;
+        let _from_muted = note(pool, alice, muted.id, "mention", None).await;
+        let _from_domain = note(pool, alice, remote.id, "mention", None).await;
+        let kept = note(pool, alice, normal, "mention", None).await;
+        let shared_a = note(pool, alice, normal, "favourite", Some(status_id)).await;
+        let _shared_b = note(pool, alice, blocked.id, "favourite", Some(status_id)).await;
+
+        let groups = group_page(pool, &open(alice, false))
+            .await
+            .expect("the page reads");
+        let counts: Vec<(Uuid, i64)> = groups
+            .iter()
+            .map(|entry| (entry.info.most_recent_id, entry.info.notifications_count))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![(shared_a.id, 1), (kept.id, 1)],
+            "only the normal actor's groups remain, the mixed group shrinks to one"
+        );
+        let with_muted = group_page(pool, &open(alice, true))
+            .await
+            .expect("the page reads");
+        assert_eq!(
+            with_muted.len(),
+            3,
+            "the muted actor returns, the blocked do not"
+        );
+
+        let count = unread_count(
+            pool,
+            &UnreadParams {
+                user_id: alice,
+                filters: NotificationFilters::default(),
+                with_muted: false,
+                marker: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("the count reads");
+        assert_eq!(count, 2, "unread counts only the normal actor's rows");
+
+        let single = group_info(pool, alice, &GroupSelector::Notification(from_blocked.id))
+            .await
+            .expect("the read runs");
+        assert!(single.is_none(), "a blocked actor's ungrouped key is gone");
+        let key = shared_a.group_key.clone().expect("a favourite is keyed");
+        let ids = group_actor_ids(pool, alice, &GroupSelector::GroupKey(key.clone()))
+            .await
+            .expect("the read runs");
+        assert_eq!(
+            ids,
+            vec![normal],
+            "the mixed group names only the normal actor"
+        );
+        let info = group_info(pool, alice, &GroupSelector::GroupKey(key))
+            .await
+            .expect("the read runs")
+            .expect("the mixed group still exists");
+        assert_eq!(
+            info.notifications_count, 1,
+            "its count skips the blocked row"
+        );
+    }
 }

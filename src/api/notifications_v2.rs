@@ -84,7 +84,7 @@ use crate::{
         status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
-    extract::ApiParams,
+    extract::{ApiParams, flex},
     models::{
         marker::{self, Marker},
         notification::{self, GroupEntry, GroupInfo, GroupPageParams, NotificationFilters},
@@ -174,6 +174,10 @@ struct ListParams {
     /// enum (see the [module docs](self) for what both modes render).
     #[serde(default)]
     expand_accounts: Option<String>,
+    /// `with_muted`: whether the caller's mutes (actor and thread) hide
+    /// nothing; absent means `false`. Blocks hide either way.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    with_muted: Option<bool>,
 }
 
 impl ListParams {
@@ -224,6 +228,10 @@ struct UnreadCountParams {
     /// `account_id`: count only notifications caused by this account.
     #[serde(default)]
     account_id: Option<String>,
+    /// `with_muted`: count what the caller's mutes hide too; absent means
+    /// `false`. Blocks hide either way.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    with_muted: Option<bool>,
 }
 
 impl UnreadCountParams {
@@ -290,6 +298,7 @@ async fn list_groups(
             user_id: auth.0.id,
             grouped_types: params.grouped_types(),
             filters,
+            with_muted: params.with_muted.unwrap_or_default(),
             page,
         },
     )
@@ -337,6 +346,7 @@ async fn unread_count(
         &notification::UnreadParams {
             user_id: auth.0.id,
             filters,
+            with_muted: params.with_muted.unwrap_or_default(),
             marker,
             limit: page.limit,
         },
