@@ -1,14 +1,13 @@
 //! Who an outgoing activity addresses: the addressing properties it
 //! carries, the expansion of the actor's followers collection and of every
-//! directly named recipient into candidate inboxes, and the two questions
-//! that decide whether relays see it too — does it address the public, and
-//! is it the actor's own `Delete`, `Undo` or `Update`.
+//! directly named recipient into candidate inboxes, and the question that
+//! decides whether relays see it too — does it address the public.
 
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{ADDRESSING_FIELDS, SELF_BROADCAST_TYPES};
+use super::ADDRESSING_FIELDS;
 use crate::{
     error::AppResult,
     federation::{delivery::best_inbox, json, note_parser::PUBLIC_RECIPIENTS},
@@ -90,7 +89,7 @@ fn may_receive(recipient: &User, actor: &User) -> bool {
         && recipient.nickname != INSTANCE_ACTOR_NICKNAME
 }
 
-/// Whether any address in `addresses` is the public address — the
+/// Whether any address in `addresses` is the public address — the only
 /// condition that makes relays eligible for the activity.
 pub(super) fn includes_public(addresses: &[String]) -> bool {
     addresses.iter().any(|address| is_public(address))
@@ -100,24 +99,6 @@ pub(super) fn includes_public(addresses: &[String]) -> bool {
 /// [`PUBLIC_RECIPIENTS`] spellings.
 fn is_public(address: &str) -> bool {
     PUBLIC_RECIPIENTS.contains(&address)
-}
-
-/// Whether `activity` is the actor's own `Delete`, `Undo` or `Update` — the
-/// self-broadcasts relays must see beside public activities.
-pub(super) fn relays_should_see(activity: &Value, actor_ap_id: &str) -> bool {
-    let is_self_broadcast = activity
-        .get("type")
-        .and_then(json::first_type)
-        .is_some_and(|kind| SELF_BROADCAST_TYPES.contains(&kind.as_str()));
-    is_self_broadcast && names_reference(activity.get("actor"), actor_ap_id)
-}
-
-/// Whether `value` references `ap_id` — a string equal to it or an object
-/// whose `id` (or `href`/`url`) is.
-fn names_reference(value: Option<&Value>, ap_id: &str) -> bool {
-    value
-        .and_then(json::value_or_id)
-        .is_some_and(|reference| reference == ap_id)
 }
 
 #[cfg(test)]
@@ -173,39 +154,6 @@ mod tests {
         assert!(
             !includes_public(&["https://peer.example/users/bob".to_owned()]),
             "a private set does not"
-        );
-    }
-
-    /// Relays qualify on the actor's own `Delete`/`Undo`/`Update` and on
-    /// nothing else: another actor's self-broadcast and ordinary creates
-    /// stay out.
-    #[test]
-    fn the_relay_rule_covers_self_broadcasts() {
-        const ME: &str = "https://test.example/users/alice";
-        for kind in SELF_BROADCAST_TYPES {
-            assert!(
-                relays_should_see(&json!({"type": kind, "actor": ME}), ME),
-                "the actor's own `{kind}` reaches relays"
-            );
-        }
-        assert!(
-            relays_should_see(&json!({"type": ["Update"], "actor": {"id": ME}}), ME),
-            "array types and object actors read the same"
-        );
-        assert!(
-            !relays_should_see(&json!({"type": "Create", "actor": ME}), ME),
-            "a Create is not a self-broadcast"
-        );
-        assert!(
-            !relays_should_see(
-                &json!({"type": "Update", "actor": "https://peer.example/users/bob"}),
-                ME
-            ),
-            "another actor's Update is not alice's"
-        );
-        assert!(
-            !relays_should_see(&json!({"type": "Delete"}), ME),
-            "an activity naming no actor broadcasts nothing"
         );
     }
 }
