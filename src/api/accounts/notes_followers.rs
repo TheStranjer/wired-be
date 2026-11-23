@@ -45,7 +45,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::visible_account_or_404,
     auth::AuthUser,
     entities::relationship::Relationship,
     error::{AppError, AppResult},
@@ -88,7 +88,7 @@ pub(super) struct NoteParams {
 /// caller's note on the target, a blank one deletes it (Pleroma's
 /// `UserNote.create` stores blanks, this endpoint's ticket deletes on
 /// them; both read back as the same relationship). The account is resolved
-/// by [`account_or_404`], and noting yourself is allowed — unlike
+/// by [`visible_account_or_404`], and noting yourself is allowed — unlike
 /// Pleroma's follow-side checks, `note` has no self guard. The
 /// [`Relationship::load_many`] after the write is the render of Pleroma's
 /// `relationship.json`: it reads the row back, so the answer states the
@@ -115,7 +115,7 @@ pub(super) async fn set_note(
             "Validation failed: Comment is too long (maximum is {MAX_COMMENT_CHARS} characters)"
         )));
     }
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, Some(&auth.0)).await?;
     account_note::set(&state.db, auth.0.id, target.id, &params.comment).await?;
     one_relationship(&state, auth.0.id, target.id).await
 }
@@ -149,7 +149,7 @@ pub(super) async fn remove_from_followers(
     Path(id): Path<String>,
 ) -> AppResult<Json<Relationship>> {
     auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
-    let follower = account_or_404(&state, &id).await?;
+    let follower = visible_account_or_404(&state, &id, Some(&auth.0)).await?;
     if follower.id == auth.0.id {
         return Err(AppError::Unprocessable(SELF_REMOVE.to_owned()));
     }

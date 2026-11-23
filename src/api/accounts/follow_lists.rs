@@ -32,7 +32,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::visible_account_or_404,
     auth::MaybeAuthUser,
     config::Config,
     entities::{
@@ -102,7 +102,7 @@ pub(super) async fn list_followers(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require_user_scope(READ_ACCOUNTS)?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0.as_ref();
     if target.hide_followers.get() && !viewer_is(viewer, &target) {
         return Ok(empty_page());
@@ -130,7 +130,7 @@ pub(super) async fn list_following(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require_user_scope(READ_ACCOUNTS)?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0.as_ref();
     if target.hide_follows.get() && !viewer_is(viewer, &target) {
         return Ok(empty_page());
