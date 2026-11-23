@@ -4,11 +4,11 @@
 //! the rest of the parse works from.
 
 use serde_json::Value;
-use url::Url;
 
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::user::User,
+    util::url::{http_host, is_http_url},
 };
 
 use super::{MAX_NOTE_BYTES, OBJECT_TYPES, ParseError};
@@ -79,21 +79,6 @@ pub(super) fn check_containment(
         )));
     }
     Ok(())
-}
-
-/// The host of an absolute `http(s)` URL, `None` for anything else; URL
-/// parsing lowercases the host, so hosts compare case-insensitively.
-fn http_host(text: &str) -> Option<String> {
-    let parsed = Url::parse(text).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    parsed.host_str().map(str::to_owned)
-}
-
-/// True when `text` is an absolute `http(s)` URL with a host.
-pub(super) fn is_http_url(text: &str) -> bool {
-    http_host(text).is_some()
 }
 
 /// The human-facing url: the first string or `Link` `href` of `url` when it

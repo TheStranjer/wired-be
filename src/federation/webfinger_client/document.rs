@@ -4,9 +4,9 @@
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use url::Url;
 
 use super::{ACTIVITY_JSON, LD_JSON, SELF_REL};
+use crate::util::url::is_http_url;
 
 /// One `Link` element or object of a `WebFinger` document: JRD objects
 /// deserialize straight into it, and the XRD reader fills the same shape
@@ -95,13 +95,6 @@ fn is_activity_media_type(candidate: &str) -> bool {
         .trim()
         .to_ascii_lowercase();
     media_type == ACTIVITY_JSON || media_type == LD_JSON
-}
-
-/// Whether `text` parses as an absolute URL whose scheme is `http` or
-/// `https` and that has a host.
-fn is_http_url(text: &str) -> bool {
-    Url::parse(text)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
 }
 
 #[cfg(test)]

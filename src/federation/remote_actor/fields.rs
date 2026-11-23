@@ -3,7 +3,6 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use url::Url;
 
 use super::{
     ActorError, MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_FIELDS,
@@ -12,7 +11,7 @@ use super::{
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::user::Flag,
-    util::time::parse_time,
+    util::{time::parse_time, url::is_http_url},
 };
 
 /// The required URL of a field (`inbox`): a string or reference object
@@ -30,14 +29,6 @@ pub(super) fn optional_http_url(json: &Value, field: &str) -> Option<String> {
     json.get(field)
         .and_then(value_or_id)
         .filter(|url| is_http_url(url))
-}
-
-/// True when `text` parses as an absolute URL whose scheme is `http` or
-/// `https` and that has a host. The raw text, not the re-rendered URL, is
-/// what callers store.
-pub(super) fn is_http_url(text: &str) -> bool {
-    Url::parse(text)
-        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
 }
 
 /// A text field (`name`, `summary`): the string under `field`, empty for

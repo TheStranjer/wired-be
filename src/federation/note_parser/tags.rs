@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::{hashtag::normalize_name, user::User},
-    util::emoji,
+    util::{emoji, url::is_http_url},
 };
 
 /// The longest emoji shortcode kept, in bytes (the name is ASCII once it
@@ -15,7 +15,6 @@ const MAX_SHORTCODE_BYTES: usize = 128;
 
 use super::{
     MAX_TAGS,
-    envelope::is_http_url,
     types::{RemoteEmoji, TagSets},
 };
 
