@@ -45,12 +45,17 @@ use serde_json::{Map, Value};
 use tracing::debug;
 
 use crate::{
+    api::accounts::after_follow_changed,
     auth::AuthUser,
     error::{AppError, AppResult},
     extract::ApiParams,
-    models::domain_block::{self, DomainBlock},
+    models::{
+        domain_block::{self, DomainBlock},
+        follow,
+    },
     oauth::scopes::{FOLLOW, READ_BLOCKS, WRITE_BLOCKS},
     pagination::{PageParams, link_header, set_link_header},
+    services::federation_out,
     state::AppState,
 };
 
@@ -129,6 +134,13 @@ async fn list_domain_blocks(
 /// key), and the canonical spelling means every client-side spelling of
 /// a domain lands on it.
 ///
+/// Blocking also severs every follow between the caller and the remote
+/// accounts on the domain, as Mastodon does: followers there are removed
+/// (a `Reject` of their stored `Follow` goes to their inbox), the caller's
+/// follows of accounts there are withdrawn (an `Undo Follow`), and pending
+/// requests either way are dropped. Unblocking restores nothing, and a
+/// repeated block finds nothing left to sever.
+///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
@@ -144,11 +156,20 @@ async fn create_domain_block(
     auth.require_any(&[WRITE_BLOCKS, FOLLOW])?;
     let domain = requested_domain(params.domain.as_deref())?;
     domain_block::block_domain(&state.db, auth.0.id, &domain).await?;
+    let severed = follow::sever_with_domain(&state.db, auth.0.id, &domain).await?;
     debug!(
         domain = %domain,
         user = %auth.0.id,
+        followers = severed.followers.len(),
+        followees = severed.followees.len(),
         "domain blocked"
     );
+    for (removed, _follower) in &severed.followers {
+        federation_out::after_follower_removed(&state, &auth.0, removed).await;
+    }
+    for (removed, target) in &severed.followees {
+        after_follow_changed(&state, &auth.0, target, Some(removed), false).await;
+    }
     Ok(empty_answer())
 }
 
