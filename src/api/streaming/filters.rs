@@ -1,7 +1,9 @@
 //! What a reader does not want to see, read once when the socket opens and
 //! refreshed every [`FILTER_TTL`]: the suppression sets of [`Filters`], the
-//! fifth of them the reader's active irreversible word filters, and the two
-//! helpers that read an entity's text and JSON for them.
+//! fifth of them the reader's active word filters, and the helper that
+//! serializes a rendered entity. The phrase matching itself is
+//! [`services::filter`](crate::services::filter)'s, run on each rendered
+//! entity by the delivery step.
 //!
 //! Pleroma recomputes the same sets per event in `Streamer.filtered_by_user?`
 //! (`lib/pleroma/web/streamer.ex`) against its cache; one set per connection
@@ -13,9 +15,8 @@
 use std::collections::HashSet;
 
 use serde::Serialize;
-use serde_json::Value;
 use sqlx::PgPool;
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -27,8 +28,7 @@ use super::facts::Facts;
 
 /// What a reader does not want to see, read once when the socket opens and
 /// refreshed every [`FILTER_TTL`]: the accounts it blocked and muted, the
-/// domains it blocked, the threads it muted, and its active irreversible
-/// word filters in the streaming contexts.
+/// domains it blocked, the threads it muted, and its active word filters.
 ///
 /// Pleroma recomputes the same sets per event in `Streamer.filtered_by_user?`
 /// (`lib/pleroma/web/streamer.ex`) against its cache; one set per connection
@@ -45,19 +45,12 @@ pub(super) struct Filters {
     pub(super) domains: HashSet<String>,
     /// Threads the reader muted (`conversation_mutes`).
     pub(super) threads: HashSet<Uuid>,
-    /// The reader's active, irreversible word filters in the streaming
-    /// contexts ([`STREAMING_CONTEXTS`]), verbatim [`filter::Filter`] rows
-    /// for [`filter::matches`] to run.
+    /// The reader's active word filters, every context and both actions,
+    /// verbatim [`filter::Filter`] rows for
+    /// [`apply_to_entity`](crate::services::filter::apply_to_entity) to
+    /// scope to the stream an entity is delivered on.
     pub(super) words: Vec<filter::Filter>,
 }
-
-/// The filter contexts streaming answers: `home` for the reader's own,
-/// direct and list timelines, `notifications` for the notification stream
-/// and `public` for the public, media, remote and hashtag timelines. A
-/// filter active in any one of them judges every entity a socket renders;
-/// the `thread` and `account` contexts belong to the HTTP reads that name
-/// them, not to a stream.
-const STREAMING_CONTEXTS: [&str; 3] = ["home", "notifications", "public"];
 
 impl Filters {
     /// The suppression sets of `reader`, read in five queries. An anonymous
@@ -74,7 +67,7 @@ impl Filters {
         let muted = mute::muted_ids(pool, reader).await?;
         let domains = domain_block::blocked_domains(pool, reader).await?;
         let threads = conversation_mute::muted_ids(pool, reader).await?;
-        let words = word_filters(pool, reader).await?;
+        let words = filter::list_active(pool, reader).await?;
         Ok(Self {
             blocked: blocked.into_iter().collect(),
             muted: muted.into_iter().collect(),
@@ -125,39 +118,6 @@ impl Filters {
             .iter()
             .any(|author| self.blocked.contains(author) || self.muted.contains(author))
     }
-
-    /// Whether the text a rendered entity carries matches one of the
-    /// reader's active irreversible word filters — the streaming drop for
-    /// a phrase the reader refuses to see even once. Only rendered
-    /// entities are weighed: a pre-serialized payload event stays with
-    /// [`Filters::suppresses`], the suppression it has always had.
-    pub(super) fn suppresses_words(&self, payload: &str) -> bool {
-        if self.words.is_empty() {
-            return false;
-        }
-        let texts = entity_texts(payload);
-        texts
-            .iter()
-            .any(|text| self.words.iter().any(|word| filter::matches(word, text)))
-    }
-}
-
-/// The reader's active word filters that apply to streaming: the
-/// [`filter::list_active`] rows that are irreversible (a warn filter only
-/// tells the client to cover the post, it never drops it) and name at
-/// least one of the [`STREAMING_CONTEXTS`].
-async fn word_filters(pool: &PgPool, reader: Uuid) -> AppResult<Vec<filter::Filter>> {
-    let active = filter::list_active(pool, reader).await?;
-    Ok(active
-        .into_iter()
-        .filter(|row| {
-            row.irreversible
-                && row
-                    .context
-                    .iter()
-                    .any(|context| STREAMING_CONTEXTS.contains(&context.as_str()))
-        })
-        .collect())
 }
 
 /// The serialized entity JSON of a rendered hint, `None` with a log when
@@ -169,44 +129,6 @@ pub(super) fn entity_json<T: Serialize>(entity: &T, id: Uuid) -> Option<String> 
             warn!(%err, %id, "a streamed entity could not be serialized");
             None
         }
-    }
-}
-
-/// The filterable text a rendered entity payload states: every
-/// `content` and `spoiler_text` string it carries, nested entities
-/// included — a reblog's original, a notification's status, a chat's last
-/// message. A payload that is no JSON object, or holds neither key,
-/// states no text and matches nothing.
-fn entity_texts(payload: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        debug!("streaming render payload is no JSON");
-        return Vec::new();
-    };
-    let mut texts = Vec::new();
-    collect_texts(&value, &mut texts);
-    texts
-}
-
-/// Records the `content` / `spoiler_text` strings of `value`, walking
-/// every nested object and array so one pass reaches the whole entity.
-fn collect_texts(value: &Value, texts: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for key in ["content", "spoiler_text"] {
-                if let Some(text) = map.get(key).and_then(Value::as_str) {
-                    texts.push(text.to_owned());
-                }
-            }
-            for nested in map.values() {
-                collect_texts(nested, texts);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_texts(item, texts);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -262,12 +184,13 @@ mod tests {
         );
     }
 
-    /// The fifth read keeps only what streaming hides outright: an
-    /// irreversible filter of a streaming context. A warn filter stays out
-    /// (it covers a post, it never drops one) and so does an irreversible
-    /// filter of a non-streaming context.
+    /// The fifth read keeps every active filter, whatever its action or
+    /// contexts: scoping to the stream is [`apply_to_entity`]'s job. Only
+    /// an expired row stays out.
+    ///
+    /// [`apply_to_entity`]: crate::services::filter::apply_to_entity
     #[tokio::test]
-    async fn the_word_filter_read_keeps_irreversible_streaming_rows() {
+    async fn the_word_filter_read_keeps_every_active_row() {
         let (_db, state) = state().await;
         let reader = account(&state, "wordfilter-loader").await;
         seed_word_filter(&state, &reader, "spoilers", "home", true).await;
@@ -291,14 +214,16 @@ mod tests {
             .await
             .expect("the five reads run");
 
+        let mut phrases = filters
+            .words
+            .iter()
+            .map(|row| row.phrase.as_str())
+            .collect::<Vec<&str>>();
+        phrases.sort_unstable();
         assert_eq!(
-            filters
-                .words
-                .iter()
-                .map(|row| row.phrase.as_str())
-                .collect::<Vec<&str>>(),
-            ["spoilers"],
-            "the irreversible streaming row, newest-first as [`filter::list_active`] reads it"
+            phrases,
+            ["maybe", "profile-only", "spoilers"],
+            "every active row, warn or irreversible, in any context; the expired one is out"
         );
         let anonymous = Filters::load(&state.db, None)
             .await
@@ -309,37 +234,13 @@ mod tests {
         );
     }
 
-    /// The word filter reads the whole rendered entity, not just its top
-    /// level: the status's own content and spoiler, a reblog's original,
-    /// a notification's status and a chat's last message all state text.
     #[test]
-    fn the_filterable_text_reaches_every_nested_entity() {
-        let payload = r#"{"id":"1","content":"outer","spoiler_text":"subject",
-             "reblog":{"content":"inner"},
-             "pleroma":{"content":{"text/plain":"raw"},"conversation_id":"c"},
-             "status":{"spoiler_text":"nested subject"},
-             "last_message":{"content":"chat text"},
-             "media_attachments":[{"description":"not filterable"}]}"#;
-
-        let mut texts = entity_texts(payload);
-        texts.sort();
-
+    fn an_entity_serializes_to_its_json() {
+        let json = entity_json(&serde_json::json!({"id": "1"}), Uuid::now_v7());
         assert_eq!(
-            texts,
-            ["chat text", "inner", "nested subject", "outer", "subject"],
-            "content and spoiler_text at every depth, and nothing else"
-        );
-    }
-
-    #[test]
-    fn a_payload_with_no_entity_states_no_text() {
-        assert!(
-            entity_texts("\"just-a-status-id\"").is_empty(),
-            "a delete's id payload matches no phrase"
-        );
-        assert!(
-            entity_texts("not json at all").is_empty(),
-            "and neither does a body that is no JSON"
+            json.as_deref(),
+            Some(r#"{"id":"1"}"#),
+            "the entity's own JSON, compact"
         );
     }
 }

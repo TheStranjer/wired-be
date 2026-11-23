@@ -149,6 +149,31 @@ pub fn apply_filters(
     statuses
 }
 
+/// Applies `filters` to one rendered `status` in `context`, `false` when it
+/// must be dropped.
+///
+/// This is [`apply_filters`]' per-status step for a caller that renders one
+/// entity at a time (the streaming delivery): the same context scoping,
+/// expiry test, own-status exemption and text, over the unscoped `filters`
+/// list. `false` means an `irreversible` filter matched; `true` keeps the
+/// status, with its `filtered` array set to the warning filters that matched.
+#[must_use]
+pub fn apply_to_entity(
+    status: &mut StatusEntity,
+    filters: &[Filter],
+    context: FilterContext,
+    viewer_id: Option<Uuid>,
+) -> bool {
+    let scoped: Vec<&Filter> = filters
+        .iter()
+        .filter(|filter| applies_in(filter, context))
+        .collect();
+    if scoped.is_empty() {
+        return true;
+    }
+    apply_to_status(status, &scoped, viewer_id)
+}
+
 /// Whether `filter` governs `context` right now: it lists that context
 /// among its own and is not past its expiry.
 fn applies_in(filter: &Filter, context: FilterContext) -> bool {

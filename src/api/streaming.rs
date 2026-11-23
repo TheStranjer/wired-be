@@ -26,9 +26,10 @@
 //!   endpoint's builder, a hinted chat through the chats endpoint's builder
 //!   and a hinted conversation through the conversations endpoint's one.
 //!   A hint the socket cannot answer for its reader — no row, not visible,
-//!   a deactivated actor, or text one of the reader's irreversible word
-//!   filters matches — drops the event rather than sending an
-//!   entity-less frame. The socket's viewer is its authenticated [`User`]
+//!   a deactivated actor, or text one of the reader's irreversible phrase
+//!   filters of the stream's context matches (`services::filter`, the REST
+//!   timelines' own rules; a warn match annotates `filtered` instead) —
+//!   drops the event rather than sending an entity-less frame. The socket's viewer is its authenticated [`User`]
 //!   row, loaded once when the socket opens or authenticates.
 //! - **its own subscription set**, opened at the handshake by `stream` (plus
 //!   `tag` / `list` / `instance`) and changed afterwards by the `subscribe`

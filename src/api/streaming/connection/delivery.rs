@@ -1,18 +1,21 @@
 //! The gate one hub event passes before this connection writes it: the
 //! audience and `local_only` checks, the payload the event arrives with (its
 //! own body, or the entity a render hint answers to for this socket's
-//! viewer), and the word-filter read of that rendered payload.
+//! viewer), and the filter context its phrase filters judge it in.
 //!
 //! [`Connection::frame_for`] is the entry point that calls these; the
 //! per-kind renders are the four `*_hints` children's.
 
-use tracing::debug;
-
 use crate::{
-    api::streaming::connection::{
-        Connection, chat_hints::render_hinted_chat, conversation_hints::render_hinted_conversation,
-        notification_hints::render_hinted_notification, status_hints::render_hinted_status,
+    api::streaming::{
+        connection::{
+            Connection, chat_hints::render_hinted_chat,
+            conversation_hints::render_hinted_conversation,
+            notification_hints::render_hinted_notification, status_hints::render_hinted_status,
+        },
+        names::{DIRECT, HASHTAG, LIST, PUBLIC, USER, USER_NOTIFICATION, USER_PLEROMA_CHAT},
     },
+    services::filter::FilterContext,
     streaming::hub::{Audience, RenderSpec, StreamEvent},
 };
 
@@ -36,21 +39,74 @@ pub(super) async fn payload_for(
     let Some(render) = event.render.as_ref() else {
         return Some(None);
     };
-    let payload = render_hint(connection, render).await?;
-    if connection.filters.suppresses_words(&payload) {
-        debug!("a streamed render hint matches the reader's irreversible word filters");
-        return None;
+    let context = filter_context(connection, event);
+    render_hint(connection, render, context).await.map(Some)
+}
+
+/// The [`FilterContext`] this socket's reader judges `event` in.
+///
+/// It is the context of the streams the event reached this socket on:
+/// `user`, `list` and `direct` streams are [`FilterContext::Home`], the
+/// `user:notification` stream is [`FilterContext::Notifications`], the
+/// `public*` and `hashtag*` streams are [`FilterContext::Public`]. A socket
+/// holding several of them judges in that order of precedence; a chat
+/// stream, or an event on none of them, has no context and no phrase
+/// filter.
+fn filter_context(connection: &Connection, event: &StreamEvent) -> Option<FilterContext> {
+    [
+        FilterContext::Home,
+        FilterContext::Notifications,
+        FilterContext::Public,
+    ]
+    .into_iter()
+    .find(|context| {
+        event
+            .streams
+            .iter()
+            .filter(|stream| connection.subscriptions.contains(stream))
+            .any(|stream| stream_context(stream) == Some(*context))
+    })
+}
+
+/// The filter context of one hub stream name, `None` for the streams no
+/// timeline filter governs.
+///
+/// The names are `user:<id>`, `public:local`, `hashtag:rust` and the like.
+fn stream_context(stream: &str) -> Option<FilterContext> {
+    if stream.starts_with(USER_NOTIFICATION) {
+        Some(FilterContext::Notifications)
+    } else if stream.starts_with(USER_PLEROMA_CHAT) {
+        None
+    } else if [USER, LIST, DIRECT]
+        .iter()
+        .any(|name| stream.starts_with(name))
+    {
+        Some(FilterContext::Home)
+    } else if [PUBLIC, HASHTAG]
+        .iter()
+        .any(|name| stream.starts_with(name))
+    {
+        Some(FilterContext::Public)
+    } else {
+        None
     }
-    Some(Some(payload))
 }
 
 /// The entity JSON a [`RenderSpec`] hint answers to for this socket's
-/// viewer: each kind built by its own endpoint's render path, so one
-/// hub event becomes every reader's own view. `None` — the drop
+/// viewer.
+///
+/// Each kind is built by its own endpoint's render path, so one hub event
+/// becomes every reader's own view. A status is judged by the
+/// reader's phrase filters in `context` and a notification in the
+/// notifications context, both inside their own render. `None` — the drop
 /// signal — when this socket cannot be shown the entity at all.
-async fn render_hint(connection: &Connection, render: &RenderSpec) -> Option<String> {
+async fn render_hint(
+    connection: &Connection,
+    render: &RenderSpec,
+    context: Option<FilterContext>,
+) -> Option<String> {
     match render {
-        RenderSpec::Status(id) => render_hinted_status(connection, *id).await,
+        RenderSpec::Status(id) => render_hinted_status(connection, *id, context).await,
         RenderSpec::Notification(id) => render_hinted_notification(connection, *id).await,
         RenderSpec::Chat(id) => render_hinted_chat(connection, *id).await,
         RenderSpec::Conversation(id) => render_hinted_conversation(connection, *id).await,
@@ -99,6 +155,53 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_stream_maps_to_the_filter_context_it_is_judged_in() {
+        let id = Uuid::now_v7();
+        for (stream, expected) in [
+            (format!("{USER}:{id}"), Some(FilterContext::Home)),
+            (format!("{DIRECT}:{id}"), Some(FilterContext::Home)),
+            (format!("{LIST}:{id}"), Some(FilterContext::Home)),
+            (
+                format!("{USER_NOTIFICATION}:{id}"),
+                Some(FilterContext::Notifications),
+            ),
+            (PUBLIC.to_owned(), Some(FilterContext::Public)),
+            ("public:local:media".to_owned(), Some(FilterContext::Public)),
+            ("hashtag:rust".to_owned(), Some(FilterContext::Public)),
+            (format!("{USER_PLEROMA_CHAT}:{id}"), None),
+            ("nonsense".to_owned(), None),
+        ] {
+            assert_eq!(
+                stream_context(&stream),
+                expected,
+                "`{stream}` is judged in its own context"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_is_judged_in_the_context_of_the_streams_the_socket_holds() {
+        let (_db, state) = state().await;
+        let connection = watching(&state, &["hashtag:rust", "user:one"]).await;
+
+        assert_eq!(
+            filter_context(&connection, &event(&["public", "hashtag:rust"], "{}")),
+            Some(FilterContext::Public),
+            "only the held stream counts, not the whole event's list"
+        );
+        assert_eq!(
+            filter_context(&connection, &event(&["hashtag:rust", "user:one"], "{}")),
+            Some(FilterContext::Home),
+            "a socket holding a home stream and a public one judges at home"
+        );
+        assert_eq!(
+            filter_context(&connection, &event(&["public"], "{}")),
+            None,
+            "an event on no held stream has no context"
+        );
+    }
 
     #[tokio::test]
     async fn a_public_event_is_rendered_the_mastodon_way() {
