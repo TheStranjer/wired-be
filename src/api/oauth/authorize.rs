@@ -236,7 +236,7 @@ pub(crate) async fn mfa_detour(
     scopes: &Scopes,
     delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
-    let challenge = mfa::start_challenge(state, user, app, scopes).await?;
+    let challenge = mfa::start_challenge(state, user, app, scopes, delivery.redirect_uri).await?;
     let scope_text = scopes.to_string();
     let mut params: Vec<(&str, &str)> = vec![
         ("mfa_token", challenge.as_str()),
@@ -495,8 +495,14 @@ pub(crate) async fn grant_code(
     scopes: &Scopes,
     delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
-    let authorization =
-        oauth_token::create_authorization(&state.db, user.id, app.id, &scopes.to_string()).await?;
+    let authorization = oauth_token::create_authorization(
+        &state.db,
+        user.id,
+        app.id,
+        &scopes.to_string(),
+        delivery.redirect_uri,
+    )
+    .await?;
     deliver_code(&authorization, delivery)
 }
 

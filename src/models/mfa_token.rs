@@ -207,7 +207,7 @@ mod tests {
         let pool = db.pool().clone();
         let alice = insert_user(&pool, "alice").await;
         let app = insert_app(&pool, "Client").await;
-        let authorization = oauth_token::create_authorization(&pool, alice.id, app.id, "read")
+        let authorization = oauth_token::create_authorization(&pool, alice.id, app.id, "read", "")
             .await
             .unwrap();
         let token = create(&pool, alice.id, Some(authorization.id))
@@ -282,7 +282,7 @@ mod tests {
         let pool = db.pool().clone();
         let dave = insert_user(&pool, "dave").await;
         let app = insert_app(&pool, "Cascade").await;
-        let authorization = oauth_token::create_authorization(&pool, dave.id, app.id, "read")
+        let authorization = oauth_token::create_authorization(&pool, dave.id, app.id, "read", "")
             .await
             .unwrap();
         let linked = create(&pool, dave.id, Some(authorization.id))

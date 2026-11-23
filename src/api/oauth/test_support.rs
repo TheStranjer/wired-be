@@ -29,6 +29,7 @@ pub(super) fn params_with_grant(grant: Option<&str>) -> TokenParams {
         client_secret: None,
         refresh_token: None,
         code: None,
+        redirect_uri: None,
     }
 }
 
