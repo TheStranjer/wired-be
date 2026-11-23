@@ -23,8 +23,8 @@
 //! Optional fields that are present but malformed — a non-http `outbox`, an
 //! unparseable `published`, an `icon` without a usable `url` — are dropped
 //! rather than rejected, so one broken field cannot lose the whole profile.
-//! Fields that the `users` table has no column for (`alsoKnownAs`,
-//! `movedTo`, `capabilities.acceptsChatMessages`, `published`) are still
+//! Fields that the upsert does not store (`movedTo`,
+//! `capabilities.acceptsChatMessages`, `published`) are still
 //! extracted onto [`NewRemoteUser`]: the fetch and move tickets consume
 //! them, and parsing them here is what validates their shape.
 //!
@@ -59,12 +59,14 @@ const PROPERTY_VALUE_TYPE: &str = "PropertyValue";
 ///
 /// The field set is what [`parse_actor`] validates and extracts: the
 /// [`User`](crate::models::user::User) columns a document can fill, plus the
-/// four fields [`upsert_remote_user`] does not store yet ([`also_known_as`](Self::also_known_as),
-/// [`moved_to`](Self::moved_to),
+/// three fields [`upsert_remote_user`] does not store yet
+/// ([`moved_to`](Self::moved_to),
 /// [`accepts_chat_messages`](Self::accepts_chat_messages),
-/// [`published`](Self::published)). The first three have `users` columns
+/// [`published`](Self::published)). The first two have `users` columns
 /// since the Pleroma extension migration, `published` has none at all;
-/// storing any of them belongs to the alias, move and chat tickets.
+/// storing any of them belongs to the move and chat tickets.
+/// [`also_known_as`](Self::also_known_as) is stored: the `Move` handler
+/// reads it off the mirror.
 #[derive(Clone, Debug)]
 pub struct NewRemoteUser {
     /// `{preferredUsername}@{host of ap_id}`, decision 7.
@@ -112,7 +114,7 @@ pub struct NewRemoteUser {
     pub featured_url: Option<String>,
     /// The required `publicKey.publicKeyPem` signing key.
     pub public_key: String,
-    /// The `alsoKnownAs` entries (the column exists; the upsert does not write it).
+    /// The `alsoKnownAs` entries, stored by the upsert on every fetch.
     pub also_known_as: Vec<String>,
     /// The `movedTo` actor id (the column exists; the upsert does not write it).
     pub moved_to: Option<String>,
