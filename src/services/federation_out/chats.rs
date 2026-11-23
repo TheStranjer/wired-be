@@ -9,9 +9,11 @@
 
 use serde_json::{Value, json};
 use tracing::warn;
+use uuid::Uuid;
 
 use super::queue_activity;
 use crate::{
+    config::Config,
     federation::note,
     models::{
         chat::ChatMessageReference,
@@ -114,19 +116,24 @@ fn chat_create_document(
 /// reference (the shape the inbound fold's `delete_by_object_type` route
 /// reads — a bare-id `Delete` declares no type and would fall past it),
 /// under the deterministic `{BASE_URL}/activities/delete-{message id}` id
-/// and the same one-address line as the `Create` it takes back.
-fn chat_delete_document(state: &AppState, delivery: &ChatDelivery<'_>) -> Value {
+/// and the same one-address line as the `Create` it takes back. The sender's
+/// own withdrawal and the admin's tombstone both build it here, so the same
+/// message always names the same `Delete`.
+pub(super) fn chat_delete_json(
+    config: &Config,
+    message_id: Uuid,
+    actor_ap_id: &str,
+    object_ap_id: &str,
+    recipient_ap_id: &str,
+) -> Value {
     json!({
-        "@context": note::json_ld_context(&state.config),
-        "id": format!(
-            "{}/activities/delete-{}",
-            state.config.base_url, delivery.message.message_id
-        ),
+        "@context": note::json_ld_context(config),
+        "id": format!("{}/activities/delete-{message_id}", config.base_url),
         "type": "Delete",
-        "actor": delivery.sender_ap_id,
-        "to": [delivery.recipient_ap_id],
+        "actor": actor_ap_id,
+        "to": [recipient_ap_id],
         "cc": [],
-        "object": { "id": delivery.ap_id, "type": "ChatMessage" },
+        "object": { "id": object_ap_id, "type": "ChatMessage" },
     })
 }
 
@@ -196,13 +203,13 @@ pub async fn after_chat_message_deleted(
     let Some(ap_id) = message.ap_id.as_deref() else {
         return; // nothing was announced, so there is nothing to withdraw
     };
-    let delivery = ChatDelivery {
+    let document = chat_delete_json(
+        &state.config,
+        message.message_id,
+        &user.ap_id,
         ap_id,
-        message,
-        sender_ap_id: &user.ap_id,
-        recipient_ap_id: &other.ap_id,
-    };
-    let document = chat_delete_document(state, &delivery);
+        &other.ap_id,
+    );
     queue_activity(state, user, &document, "chat message withdrawal").await;
 }
 
@@ -218,8 +225,7 @@ mod tests {
         services::federation_out::{
             after_chat_message_deleted_by_admin,
             test_support::{
-                app_state, assert_fresh_activity_id, job_count, local, publish_jobs, remote,
-                state_with, unfederated,
+                app_state, job_count, local, publish_jobs, remote, state_with, unfederated,
             },
         },
         util::id::new_id,
@@ -340,7 +346,62 @@ mod tests {
         assert_eq!(activity["to"], json!([bob.ap_id]));
         assert_eq!(activity["object"]["id"], object_ap_id);
         assert_eq!(activity["object"]["type"], "ChatMessage");
-        assert_fresh_activity_id(activity["id"].as_str().expect("the delete has an id"));
+        assert_eq!(
+            activity["id"],
+            format!("{TEST_BASE_URL}/activities/delete-{}", reference.message_id),
+            "the admin's delete carries the deterministic id the sender's own does"
+        );
+        assert_eq!(activity["cc"], json!([]));
+    }
+
+    /// The `Delete` document for one message id is the same on every call
+    /// (a deterministic `delete-{message id}` id, no fresh uuid) and names
+    /// the peer in `to` with an empty `cc`.
+    #[test]
+    fn the_chat_delete_document_is_stable_for_a_message_id() {
+        let config = Config::for_tests();
+        let message_id = new_id();
+        let build = || {
+            chat_delete_json(
+                &config,
+                message_id,
+                "https://test.example/users/alice",
+                "https://test.example/objects/chat-1",
+                "https://remote.example/users/bob",
+            )
+        };
+
+        let document = build();
+        assert_eq!(
+            document,
+            build(),
+            "the same message builds the same document"
+        );
+        assert_eq!(
+            document["id"],
+            format!("{TEST_BASE_URL}/activities/delete-{message_id}")
+        );
+        assert_eq!(document["type"], "Delete");
+        assert_eq!(document["actor"], "https://test.example/users/alice");
+        assert_eq!(document["to"], json!(["https://remote.example/users/bob"]));
+        assert_eq!(
+            document["cc"],
+            json!([]),
+            "the cc line is present and empty"
+        );
+        assert_eq!(
+            document["object"],
+            json!({ "id": "https://test.example/objects/chat-1", "type": "ChatMessage" })
+        );
+        assert!(
+            document["@context"].is_array(),
+            "the shared json-ld header rides along"
+        );
+        assert_ne!(
+            document["id"],
+            chat_delete_json(&config, new_id(), "a", "b", "c")["id"],
+            "another message names another activity"
+        );
     }
 
     /// The silences: a message that never carried an id, one whose id is a
