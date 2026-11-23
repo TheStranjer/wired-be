@@ -62,6 +62,7 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::{
+        block, follow, mention,
         status::{self, Status, Visibility},
         user::User,
     },
@@ -77,23 +78,6 @@ use crate::{
 /// that already has a `WHERE`.
 pub const ACTIVE_AUTHOR: &str =
     " AND EXISTS (SELECT 1 FROM users au WHERE au.id = s.user_id AND au.is_active)";
-
-/// Whether the status's author blocked the viewer: the two ids, in the
-/// block's direction, into [`AUTHOR_BLOCKED_SQL`].
-const AUTHOR_BLOCKED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM blocks \
-     WHERE blocker_id = $1 AND blocked_id = $2)";
-
-/// Whether the first id has an **accepted** follow of the second: exactly
-/// the follower relation rule 5 grants, and a pending or rejected row is
-/// not it.
-const ACCEPTED_FOLLOWER_SQL: &str = "SELECT EXISTS (SELECT 1 FROM follows \
-     WHERE follower_id = $1 AND followee_id = $2 AND state = 'accepted')";
-
-/// Whether the first id is among the second's @-mentions: the `direct`
-/// audience of rule 6 and the mentionee arm of rule 5, as
-/// [`crate::models::mention`] stores it.
-const VIEWER_MENTIONED_SQL: &str = "SELECT EXISTS (SELECT 1 FROM status_mentions \
-     WHERE user_id = $1 AND status_id = $2)";
 
 /// The prefix of [`filter_visible`]'s statement: the candidate ids come as
 /// one array bind, then [`push_visibility_clause`] closes the parenthesis
@@ -214,7 +198,7 @@ async fn author_blocked_viewer(
     let Some(viewer) = viewer else {
         return Ok(false);
     };
-    exists_between(pool, AUTHOR_BLOCKED_SQL, status.user_id, viewer.id).await
+    block::is_blocking(pool, status.user_id, viewer.id).await
 }
 
 /// Rules 3 to 6: whether this status's own visibility admits `viewer`
@@ -247,10 +231,10 @@ async fn author_follower_or_mentioned(
     if viewer.id == status.user_id {
         return Ok(true);
     }
-    if exists_between(pool, ACCEPTED_FOLLOWER_SQL, viewer.id, status.user_id).await? {
+    if follow::has_accepted_follow(pool, viewer.id, status.user_id).await? {
         return Ok(true);
     }
-    exists_between(pool, VIEWER_MENTIONED_SQL, viewer.id, status.id).await
+    mention::is_mentioned(pool, viewer.id, status.id).await
 }
 
 /// Rule 6: `viewer` is the author, or is among the mentioned accounts.
@@ -265,23 +249,7 @@ async fn author_or_mentioned(
     if viewer.id == status.user_id {
         return Ok(true);
     }
-    exists_between(pool, VIEWER_MENTIONED_SQL, viewer.id, status.id).await
-}
-
-/// Runs one two-argument `SELECT EXISTS` statement — the three
-/// `*_SQL` constants above — and answers whether it found the edge.
-async fn exists_between(
-    pool: &PgPool,
-    sql: &'static str,
-    first: Uuid,
-    second: Uuid,
-) -> AppResult<bool> {
-    let row: (bool,) = sqlx::query_as(sql)
-        .bind(first)
-        .bind(second)
-        .fetch_one(pool)
-        .await?;
-    Ok(row.0)
+    mention::is_mentioned(pool, viewer.id, status.id).await
 }
 
 /// Pushes the whole parenthesised visibility expression for `alias` that
