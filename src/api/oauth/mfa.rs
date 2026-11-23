@@ -57,7 +57,9 @@ use serde::Deserialize;
 use super::{
     TokenResponse, authorize,
     authorize::{AuthorizeReply, Delivery},
-    issue_token, no_cache_headers, validate_app,
+    issue_token, no_cache_headers,
+    params::ClientCredentials,
+    validate_app,
 };
 use crate::{
     error::{AppError, AppResult},
@@ -189,7 +191,7 @@ async fn run_challenge(
     headers: &HeaderMap,
     params: &ChallengeParams,
 ) -> AppResult<Json<TokenResponse>> {
-    let app = match validate_app(state, headers, params.body_credentials()).await {
+    let app = match validate_app(state, headers, params.client.pair()).await {
         Ok(app) => app,
         // Credential refusals answer alike; a database failure stays one.
         Err(AppError::BadRequest(_)) => return Err(invalid_code()),
@@ -446,17 +448,13 @@ struct ChallengeParams {
     /// The submitted code. Never in `Debug` output.
     #[serde(default)]
     code: Option<String>,
-    /// The public OAuth client id, when not presented through HTTP Basic.
-    #[serde(default)]
-    client_id: Option<String>,
-    /// The OAuth client secret, when not presented through HTTP Basic.
-    /// Never in `Debug` output.
-    #[serde(default)]
-    client_secret: Option<String>,
+    /// The client credentials, when not presented through HTTP Basic.
+    #[serde(flatten)]
+    client: ClientCredentials,
 }
 
-/// [`mfa_token`](Self::mfa_token), [`code`](Self::code) and
-/// [`client_secret`](Self::client_secret) are secret material and render
+/// [`mfa_token`](Self::mfa_token), [`code`](Self::code) and the
+/// [`client`](Self::client) secret are secret material and render
 /// as `<redacted>`; the challenge type and client id show.
 impl fmt::Debug for ChallengeParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -464,19 +462,12 @@ impl fmt::Debug for ChallengeParams {
             .field("mfa_token", &"<redacted>")
             .field("challenge_type", &self.challenge_type)
             .field("code", &"<redacted>")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
+            .field("client", &self.client)
             .finish()
     }
 }
 
 impl ChallengeParams {
-    /// The `client_id`/`client_secret` body fields as a pair, `None`
-    /// unless both are present.
-    fn body_credentials(&self) -> Option<(&str, &str)> {
-        Some((self.client_id.as_deref()?, self.client_secret.as_deref()?))
-    }
-
     /// The submitted challenge type, verbatim.
     fn challenge_type(&self) -> Option<&str> {
         self.challenge_type.as_deref()
@@ -789,12 +780,23 @@ mod tests {
     }
 
     #[test]
-    fn challenge_body_credentials_need_both_fields() {
+    fn json_and_form_bodies_fill_the_challenge_credentials() {
         let none: ChallengeParams = crate::extract::into_params(json!({})).unwrap();
-        assert_eq!(none.body_credentials(), None, "nothing sent");
-        let both: ChallengeParams =
-            crate::extract::into_params(json!({"client_id": "id", "client_secret": "s"})).unwrap();
-        assert_eq!(both.body_credentials(), Some(("id", "s")), "the pair");
+        assert_eq!(none.client.pair(), None, "nothing sent");
+        let from_json: ChallengeParams = serde_json::from_str(
+            r#"{"mfa_token":"t","code":"1","client_id":"id","client_secret":"s"}"#,
+        )
+        .unwrap();
+        assert_eq!(from_json.client.pair(), Some(("id", "s")), "a JSON body");
+        let from_form: ChallengeParams = crate::extract::into_params(json!({
+            "mfa_token": "t",
+            "code": "1",
+            "client_id": "id",
+            "client_secret": "s",
+        }))
+        .unwrap();
+        assert_eq!(from_form.client.pair(), Some(("id", "s")), "a form body");
+        assert_eq!(from_form.code.as_deref(), Some("1"), "the siblings fill");
     }
 
     #[test]
