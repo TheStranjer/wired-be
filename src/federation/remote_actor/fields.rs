@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{ActorError, PROPERTY_VALUE_TYPE};
+use super::{
+    ActorError, MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_FIELDS,
+    PROPERTY_VALUE_TYPE, truncate_chars,
+};
 use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::user::Flag,
@@ -79,6 +82,7 @@ pub(super) fn parse_fields(json: &Value) -> Value {
         .map_or_default(as_array)
         .iter()
         .filter_map(property_value)
+        .take(MAX_REMOTE_FIELDS)
         .collect();
     Value::Array(properties)
 }
@@ -91,7 +95,10 @@ fn property_value(entry: &Value) -> Option<Value> {
     }
     let name = entry.get("name").and_then(Value::as_str)?;
     let value = entry.get("value").and_then(Value::as_str)?;
-    Some(json!({ "name": name, "value": value }))
+    Some(json!({
+        "name": truncate_chars(name, MAX_FIELD_NAME_CHARS),
+        "value": truncate_chars(value, MAX_FIELD_VALUE_CHARS),
+    }))
 }
 
 /// The `alsoKnownAs` aliases as strings: a single string or an array,
@@ -102,6 +109,7 @@ pub(super) fn parse_also_known_as(json: &Value) -> Vec<String> {
         .map_or_default(as_array)
         .iter()
         .filter_map(Value::as_str)
+        .take(MAX_ALIASES)
         .map(str::to_owned)
         .collect()
 }
