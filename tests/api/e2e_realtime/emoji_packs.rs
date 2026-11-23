@@ -18,6 +18,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use wired_be::api::instance::sha256_hex_bytes;
 
 use super::server::{
     BASE, Part, SCOPES, Server, Verb, call, expect, get_value, png_fixture, post_multipart,
@@ -301,7 +302,11 @@ async fn a_pack_downloads_from_a_mock_remote() {
         ("cat.png", cat_png.as_slice()),
     ]);
     let listing = json!({
-        "pack": {"license": "MIT", "share-files": true},
+        "pack": {
+            "license": "MIT",
+            "share-files": true,
+            "download-sha256": sha256_hex_bytes(&archive).to_uppercase(),
+        },
         "files": {"cat": "cat.png"},
         "files_count": 1,
     });

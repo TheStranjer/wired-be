@@ -72,7 +72,8 @@ pub(super) enum Input {
     Bus(Result<Arc<StreamEvent>, broadcast::error::RecvError>),
     /// The heartbeat period elapsed.
     Ping,
-    /// The suppression sets went stale.
+    /// The refresh period elapsed: the credential is re-checked and the
+    /// suppression sets are read again.
     Refresh,
 }
 
@@ -92,6 +93,12 @@ pub(super) struct Connection {
     /// which is what turns every private stream into a
     /// [`Refusal::Unauthorized`] subscription.
     pub(super) scopes: Scopes,
+    /// The id of the `oauth_tokens` row the socket authenticated with, `None`
+    /// while it is anonymous. The refresh tick re-reads this row, and its
+    /// user, so a revoked or expired token (or a deactivated account) closes
+    /// the socket instead of streaming on from a credential cached at the
+    /// handshake.
+    pub(super) token_id: Option<Uuid>,
     /// The hub stream names this socket holds, in the order they were opened,
     /// capped at [`MAX_SUBSCRIPTIONS`].
     ///
@@ -119,9 +126,15 @@ impl Connection {
         state: AppState,
         credential: Option<auth::AuthContext>,
     ) -> AppResult<Self> {
-        let (reader, scopes) = credential.map_or_else(
-            || (None, Scopes::parse("")),
-            |found| (found.user.map(Arc::new), Scopes::parse(&found.token.scopes)),
+        let (reader, scopes, token_id) = credential.map_or_else(
+            || (None, Scopes::parse(""), None),
+            |found| {
+                (
+                    found.user.map(Arc::new),
+                    Scopes::parse(&found.token.scopes),
+                    Some(found.token.id),
+                )
+            },
         );
         let filters = Filters::load(&state.db, reader.as_ref().map(|user| user.id)).await?;
         let now = tokio::time::Instant::now();
@@ -130,6 +143,7 @@ impl Connection {
             state,
             reader,
             scopes,
+            token_id,
             subscriptions: Vec::new(),
             filters,
             awaiting_pong: false,

@@ -526,12 +526,15 @@ async fn the_refresh_grant_refuses_an_unready_account() {
         .send(&http)
         .await;
     assert_login_refused(&response, APPROVAL_ERROR, "awaiting_approval");
-    assert!(
-        wired_be::models::oauth_token::get_by_refresh_token(&pool, &pair.refresh_token)
+    let standing: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM oauth_tokens WHERE refresh_token = $1")
+            .bind(&pair.refresh_token)
+            .fetch_one(&pool)
             .await
-            .expect("the lookup runs")
-            .is_some(),
-        "a refused rotation leaves the old pair standing"
+            .expect("the lookup runs");
+    assert_eq!(
+        standing, 1,
+        "a refused rotation rolls back and leaves the old pair standing"
     );
 
     let unknown = common::TestRequest::post("/oauth/token")

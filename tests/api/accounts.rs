@@ -17,6 +17,7 @@
 #![cfg(test)]
 
 mod lookup;
+mod pending;
 mod show;
 mod support;
 mod verify_credentials;

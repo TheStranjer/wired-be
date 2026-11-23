@@ -40,7 +40,7 @@
 //! frontend that renders the consent page itself) does: `GET` with
 //! `Accept: application/json` describes the request, and `POST` with a
 //! bearer token and a JSON body approves or denies it, but only for a
-//! token whose own app is trusted. **WiredFE's own app must therefore
+//! token whose own app is trusted. **`WiredFE`'s own app must therefore
 //! be marked `trusted`.**
 
 use std::fmt;
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn query_deserializes_every_wire_field() {
-        let query: AuthorizeQuery = crate::extract::into_params(json!({
+        let query: AuthorizeQuery = into_params(json!({
             "response_type": "code",
             "client_id": "client-id",
             "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
@@ -805,7 +805,7 @@ mod tests {
         // `extract::parse_form` turns the posted `authorization[name]`
         // keys into exactly this shape (its own tests cover that step);
         // this test covers the struct reading it back.
-        let form: AuthorizeForm = crate::extract::into_params(json!({
+        let form: AuthorizeForm = into_params(json!({
             "authorization": {
                 "name": "alice",
                 "password": "pw",
@@ -828,7 +828,7 @@ mod tests {
         );
         assert!(attrs.deny.is_some(), "the deny marker survives");
 
-        let empty: AuthorizeForm = crate::extract::into_params(json!({})).unwrap();
+        let empty: AuthorizeForm = into_params(json!({})).unwrap();
         assert_eq!(
             empty.authorization.client_id, None,
             "an absent form reads as all-absent fields"
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn form_debug_redacts_the_password() {
-        let form: AuthorizeForm = crate::extract::into_params(json!({
+        let form: AuthorizeForm = into_params(json!({
             "authorization": { "name": "alice", "password": "s3cr3t" }
         }))
         .unwrap();

@@ -49,7 +49,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, is_true, requested_ids},
+    api::helpers::{is_true, requested_ids, visible_account_or_404, visible_to},
     auth::{AuthUser, MaybeAuthUser},
     entities::{account::Account, relationship::Relationship},
     error::{AppError, AppResult},
@@ -66,7 +66,9 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or
 /// remote. An id that is not `UUID` text is a 404, not a 400, like every
-/// other miss (see [`account_or_404`]).
+/// other miss (see [`visible_account_or_404`]); so is an account the viewer
+/// may not see (one awaiting approval or email confirmation, see
+/// [`visible_to`]).
 ///
 /// The viewer behind an optional token is the account the entity is
 /// rendered for; without one the anonymous view is answered. A viewer who
@@ -75,7 +77,8 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 ///
 /// # Errors
 ///
-/// [`AppError::NotFound`] for a malformed, unknown or deactivated id;
+/// [`AppError::NotFound`] for a malformed, unknown, deactivated or (to this
+/// viewer) invisible id;
 /// [`AppError::Unauthorized`] from the extractor for an invalid token.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 pub(super) async fn show_account(
@@ -83,7 +86,7 @@ pub(super) async fn show_account(
     MaybeAuthUser(viewer, _): MaybeAuthUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Account>> {
-    let found = account_or_404(&state, &id).await?;
+    let found = visible_account_or_404(&state, &id, viewer.as_ref()).await?;
     Ok(Json(render_account(&state, viewer.as_ref(), &found).await?))
 }
 
@@ -156,11 +159,11 @@ pub(super) async fn lookup_account(
     let viewer = auth.0.as_ref();
     let stored = user::get_by_acct(&state.db, &state.config, &asked)
         .await?
-        .filter(|found| found.is_active.get());
+        .filter(|found| visible_to(found, viewer));
     let found = match stored {
         Some(found) => found,
         None if query.resolves() && viewer.is_some() => {
-            resolve_actor_or_fetch(&state, &asked).await?
+            resolve_actor_or_fetch(&state, &asked, viewer).await?
         }
         None => return Err(AppError::NotFound),
     };

@@ -42,7 +42,9 @@ use url::Url;
 
 pub use self::{fetch::fetch_card, parse::parse_card};
 
-use crate::{config::Config, http_client::HttpError, models::link_card::LinkCard};
+use crate::{
+    config::Config, http_client::HttpError, models::link_card::LinkCard, services::media_proxy,
+};
 
 /// Maximum number of characters kept from a card title.
 const MAX_CARD_TITLE: usize = 255;
@@ -133,17 +135,28 @@ const STATUS_OK: &str = "ok";
 /// The status entity JSON behind one [`link_card`] cache row.
 ///
 /// The fetch job stores [`card_json`]'s own output in
-/// [`LinkCard::card`], so an `ok` row answers its cached JSON verbatim;
-/// a `failed` row — the remembered dead URL — and a row that stores no
-/// card answer `None`, which renders as JSON `null`. The status
+/// [`LinkCard::card`], so an `ok` row answers its cached JSON, with one
+/// render-time rewrite: a string `image` goes through
+/// [`media_proxy::proxy_url`], so a reader's client never fetches the
+/// linked page's image directly while the media proxy is enabled (a no-op
+/// when it is off, and for local, blacklisted or non-`http(s)` URLs). The
+/// stored row stays proxy-agnostic, so toggling the proxy takes effect
+/// at once. A `failed` row — the remembered dead URL — and a row that
+/// stores no card answer `None`, which renders as JSON `null`. The status
 /// entity's `card` key and the deprecated
 /// `GET /api/v1/statuses/{id}/card` endpoint share this one reading of
 /// the cache, so the two can never disagree.
 ///
 /// [`link_card`]: crate::models::link_card
 #[must_use]
-pub fn stored_card_json(card: &LinkCard) -> Option<Value> {
-    card.card.clone().filter(|_card| card.status == STATUS_OK)
+pub fn stored_card_json(card: &LinkCard, config: &Config) -> Option<Value> {
+    let mut json = card.card.clone().filter(|_card| card.status == STATUS_OK)?;
+    if let Some(image) = json.get_mut("image")
+        && let Some(url) = image.as_str()
+    {
+        *image = Value::String(media_proxy::proxy_url(config, url));
+    }
+    Some(json)
 }
 
 /// The host of `url` for [`card_json`]'s `provider_name` fallback; "" when
@@ -310,26 +323,115 @@ mod tests {
             "title": "Example",
             "pleroma": { "opengraph": {} },
         });
+        let config = Config::for_tests();
         let ok = cache_row("ok", Some(stored.clone()));
         assert_eq!(
-            stored_card_json(&ok).as_ref(),
+            stored_card_json(&ok, &config).as_ref(),
             Some(&stored),
             "an ok row's card renders exactly as stored"
         );
         assert_eq!(
-            stored_card_json(&cache_row("ok", None)),
+            stored_card_json(&cache_row("ok", None), &config),
             None,
             "a row that parsed no card renders nothing"
         );
         assert_eq!(
-            stored_card_json(&cache_row("failed", None)),
+            stored_card_json(&cache_row("failed", None), &config),
             None,
             "a remembered dead fetch renders nothing"
         );
         assert_eq!(
-            stored_card_json(&cache_row("failed", Some(stored))),
+            stored_card_json(&cache_row("failed", Some(stored)), &config),
             None,
             "and even a card stored under a failure never renders"
+        );
+    }
+
+    /// A signing secret comfortably past the 32-character minimum.
+    const PROXY_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// The remote image the proxy tests cache.
+    const REMOTE_IMAGE: &str = "https://remote.example/a.png";
+
+    /// A test [`Config`] with the media proxy switched on.
+    fn proxy_config() -> Config {
+        let mut config = Config::for_tests();
+        config.media_proxy.enabled = true;
+        config.media_proxy.secret = Some(PROXY_SECRET.to_owned());
+        config
+    }
+
+    /// A stored card JSON whose image is `image`.
+    fn card_with_image(image: &Value) -> Value {
+        json!({ "url": "https://example.test", "title": "T", "image": image })
+    }
+
+    /// With the proxy on, an `ok` row's remote image becomes a signed
+    /// proxy link that decodes back to the original.
+    #[test]
+    fn stored_card_json_proxies_the_image_when_the_proxy_is_enabled() {
+        let config = proxy_config();
+        let row = cache_row("ok", Some(card_with_image(&json!(REMOTE_IMAGE))));
+        let rendered = stored_card_json(&row, &config).expect("an ok row renders");
+        let image = rendered["image"]
+            .as_str()
+            .expect("the image stays a string");
+        assert!(
+            image.starts_with(&format!("{}/proxy/", config.base_url)),
+            "the image is a proxy link: {image}"
+        );
+        let (_, tail) = image.split_once("/proxy/").expect("a proxy path");
+        let mut segments = tail.split('/');
+        let sig = segments.next().expect("a signature segment");
+        let encoded = segments.next().expect("an encoded url segment");
+        assert_eq!(
+            media_proxy::decode(&config, sig, encoded).as_deref(),
+            Ok(REMOTE_IMAGE),
+            "the link decodes back to the stored image"
+        );
+        assert_eq!(rendered["title"], json!("T"), "other fields are untouched");
+        assert_eq!(
+            row.card,
+            Some(card_with_image(&json!(REMOTE_IMAGE))),
+            "the stored row stays proxy-agnostic"
+        );
+    }
+
+    /// With the proxy off, the image is left as the page named it.
+    #[test]
+    fn stored_card_json_leaves_the_image_when_the_proxy_is_disabled() {
+        let row = cache_row("ok", Some(card_with_image(&json!(REMOTE_IMAGE))));
+        let rendered = stored_card_json(&row, &Config::for_tests()).expect("an ok row renders");
+        assert_eq!(
+            rendered["image"],
+            json!(REMOTE_IMAGE),
+            "a disabled proxy rewrites nothing"
+        );
+    }
+
+    /// A null image stays null, an absent one stays absent, and a failed
+    /// row still answers nothing under an enabled proxy.
+    #[test]
+    fn stored_card_json_keeps_null_images_and_failed_rows() {
+        let config = proxy_config();
+        let null_row = cache_row("ok", Some(card_with_image(&Value::Null)));
+        assert_eq!(
+            stored_card_json(&null_row, &config).expect("renders")["image"],
+            Value::Null,
+            "a null image stays null"
+        );
+        let bare = json!({ "url": "https://example.test", "title": "T" });
+        let bare_row = cache_row("ok", Some(bare.clone()));
+        assert_eq!(
+            stored_card_json(&bare_row, &config),
+            Some(bare),
+            "a card with no image key gains none"
+        );
+        let failed = cache_row("failed", Some(card_with_image(&json!(REMOTE_IMAGE))));
+        assert_eq!(
+            stored_card_json(&failed, &config),
+            None,
+            "a failed row still answers None"
         );
     }
 

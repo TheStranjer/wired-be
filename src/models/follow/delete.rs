@@ -1,42 +1,11 @@
-//! Sweeping a departed account's rows: [`delete_all_for_user`] takes every
-//! relationship naming the account and leaves the counters alone,
-//! [`delete_all_for_user_with_counts`] takes them and steps the counters of
-//! the peers it leaves behind.
+//! Sweeping a departed account's rows: [`delete_all_for_user_with_counts`]
+//! takes every relationship naming the account and steps the counters of the
+//! peers it leaves behind, for local and remote deletions alike.
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::AppResult;
-
-/// The `DELETE` behind [`delete_all_for_user`]: every relationship naming
-/// the account, either side.
-const DELETE_ALL_FOR_USER_SQL: &str =
-    "DELETE FROM follows WHERE follower_id = $1 OR followee_id = $1";
-
-/// Removes every follow relationship that names user `user_id`: the
-/// account-deletion job's follow step.
-///
-/// Both sides go — the rows where the account is the follower and the
-/// rows where it is the followee, in any state — Pleroma's per-follower
-/// and per-followed `unfollow` loop of `User.perform(:delete)` cut down to
-/// the one statement the departing account needs. The denormalised
-/// counters of the peers are left alone: Pleroma's purge deactivates the
-/// account first, so no listing still reads them, and one clamped step per
-/// row would cost a query per relationship to fix a number nobody shows.
-///
-/// Returns how many rows went.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
-    let deleted = sqlx::query(DELETE_ALL_FOR_USER_SQL)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(deleted.rows_affected())
-}
 
 /// [`delete_all_for_user_with_counts`]: every *accepted* relationship naming
 /// the account, together with the counters those rows fed, in one statement
@@ -71,22 +40,21 @@ const DELETE_ACCEPTED_AND_UNCOUNT_SQL: &str = "WITH removed AS (
 
 /// [`delete_all_for_user_with_counts`]'s second statement: the rows that
 /// never fed a counter — a `pending` request and a mirrored `rejected` one,
-/// the other two states [`delete_all_for_user`] sweeps up beside the
-/// accepted rows — so nothing here owes a step.
+/// the other two states [`delete_all_for_user_with_counts`] sweeps up beside
+/// the accepted rows — so nothing here owes a step.
 const DELETE_REST_FOR_USER_SQL: &str =
     "DELETE FROM follows WHERE (follower_id = $1 OR followee_id = $1) AND state <> 'accepted'";
 
 /// Removes every follow relationship that names user `user_id` *and* steps
 /// the denormalised counters the accepted ones fed.
 ///
-/// This is the relationship removal of a remote account's deletion
-/// ([`users.delete_remote`](crate::jobs::deletion::KIND_DELETE_REMOTE)),
-/// whose peers stay live, so their follower and following counts have to
-/// describe what is left of each of them.
-///
-/// [`delete_all_for_user`] is the same sweep for a *local* deletion, which
-/// leaves the numbers alone because the account behind them is purged. Here
-/// every accepted row is worth one step, taken in the same transaction as
+/// This is the relationship removal of both account deletions, a local one
+/// ([`users.delete`](crate::jobs::deletion::KIND_DELETE)) and a remote one
+/// ([`users.delete_remote`](crate::jobs::deletion::KIND_DELETE_REMOTE)).
+/// The peers stay live and render their follower and following counts on
+/// every account entity, so those counts have to describe what is left of
+/// each of them — Pleroma's `unfollow` loop in `User.perform(:delete)`. Every
+/// accepted row is worth one step, taken in the same transaction as
 /// the delete so a crash cannot leave a counted relationship without its row
 /// or a row without its counters — the pairing [`remove_follower`](super::remove_follower) and
 /// [`sever_between`](super::sever_between) keep for the relationships they take. Both directions

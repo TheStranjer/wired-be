@@ -62,7 +62,10 @@ use serde::Deserialize;
 use tracing::debug;
 
 use crate::{
-    api::{helpers::account_or_404, pleroma_account_settings::looks_like_ap_id},
+    api::{
+        helpers::{visible_account_or_404, visible_to},
+        pleroma_account_settings::looks_like_ap_id,
+    },
     auth::AuthUser,
     entities::{account::Account, relationship::Relationship},
     error::{AppError, AppResult},
@@ -125,7 +128,7 @@ impl FollowParams {
 /// follow of a pair is how a client rewrites its flags (Pleroma's `follow`
 /// does the same: the second call changes nothing but the toggles).
 ///
-/// The account is resolved by [`account_or_404`] before the write, so a
+/// The account is resolved by [`visible_account_or_404`] before the write, so a
 /// malformed, unknown or deactivated id is the shared 404 whatever the body
 /// asked for; following the caller's own account is the model's 422 (its
 /// wording, Pleroma's `Can not follow yourself`). A pair blocked either way is
@@ -146,7 +149,7 @@ pub(super) async fn follow_account(
     ApiParams(params): ApiParams<FollowParams>,
 ) -> AppResult<Json<Relationship>> {
     auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, Some(&auth.0)).await?;
     let toggles = params.into_toggles();
     let created = follow::follow(&state.db, &state.config.base_url, &auth.0, &target).await?;
     let stored = store_toggles(&state, created, toggles).await?;
@@ -258,7 +261,7 @@ pub(super) async fn follow_by_uri(
     else {
         return Err(AppError::BadRequest(MISSING_URI.to_owned()));
     };
-    let target = resolve_actor_or_fetch(&state, uri).await?;
+    let target = resolve_actor_or_fetch(&state, uri, Some(&auth.0)).await?;
     let toggles = params.into_toggles();
     let created = follow::follow(&state.db, &state.config.base_url, &auth.0, &target).await?;
     let stored = store_toggles(&state, created, toggles).await?;
@@ -284,10 +287,15 @@ pub(super) async fn follow_by_uri(
 /// unresolvable handle, an unreachable or invalid actor, an unknown local
 /// URL — and a row that resolves but is deactivated is the same shared
 /// [`AppError::NotFound`] the id-keyed routes give through
-/// [`account_or_404`]; the fetcher's own reason is logged, never sent
-/// (decision 8). This is the shared federation arm of `POST
+/// [`visible_account_or_404`] — as is one `viewer` may not see
+/// ([`visible_to`]: awaiting approval or email confirmation); the fetcher's
+/// own reason is logged, never sent (decision 8). This is the shared federation arm of `POST
 /// /api/v1/follows` and of `GET /api/v1/accounts/lookup?resolve=true`.
-pub(super) async fn resolve_actor_or_fetch(state: &AppState, uri: &str) -> AppResult<User> {
+pub(super) async fn resolve_actor_or_fetch(
+    state: &AppState,
+    uri: &str,
+    viewer: Option<&User>,
+) -> AppResult<User> {
     let fetched = if looks_like_ap_id(uri) {
         get_or_fetch_by_ap_id(state, uri).await
     } else {
@@ -297,7 +305,7 @@ pub(super) async fn resolve_actor_or_fetch(state: &AppState, uri: &str) -> AppRe
         debug!(%err, uri, "follow target could not be resolved");
         AppError::NotFound
     })?;
-    if resolved.is_active.get() {
+    if visible_to(&resolved, viewer) {
         Ok(resolved)
     } else {
         Err(AppError::NotFound)
@@ -327,7 +335,7 @@ pub(super) async fn unfollow_account(
     Path(id): Path<String>,
 ) -> AppResult<Json<Relationship>> {
     auth.require_any(&[WRITE_FOLLOWS, FOLLOW])?;
-    let target = account_or_404(&state, &id).await?;
+    let target = visible_account_or_404(&state, &id, Some(&auth.0)).await?;
     // The row the delete removes is read while it still exists: the `Undo` the
     // federation hook will one day send names the `Follow` activity the
     // relationship holds, and `unfollow` reports only whether a row was there.

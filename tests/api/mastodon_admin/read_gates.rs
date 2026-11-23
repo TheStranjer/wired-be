@@ -1,26 +1,52 @@
-//! The gate in front of the admin account reads over HTTP (WBE-210): every
-//! route is a staff user's holding the accounts read scope, and the refusals
-//! are the shared 401 and 403 bodies.
+//! The gate in front of the admin account reads over HTTP (WBE-210, WBE-460):
+//! every route is an admin's holding the accounts read scope, and the
+//! refusals are the shared 401 and 403 bodies.
 
+use axum::http::StatusCode;
 use serde_json::json;
 
 use super::support::{
-    INVALID_TOKEN, LISTED, NO_ADMIN_READ, NO_TOKEN, NOT_STAFF, USER_REQUIRED, V1, V2, listed, read,
-    seed,
+    ENTITY_KEYS, INVALID_TOKEN, LISTED, NO_ADMIN_READ, NO_TOKEN, USER_REQUIRED, V1, V2, keys,
+    listed, read, seed,
 };
+use super::write_support::NOT_ADMIN;
 use crate::common::{self, TestRequest};
 
-/// Every route is staff's: no token, an unknown token and an app-only token are
-/// refused, and so is a valid user token whose account holds neither role —
-/// while a moderator gets the very same answers as the admin who seeded them.
+/// Every route is an admin's: no token, an unknown token and an app-only token
+/// are refused, and so are a moderator and a plain account, each holding the
+/// accounts read scope — the email and addresses the entity carries are no
+/// staff member's to read — while an admin gets the listings and the entity.
 #[tokio::test]
-async fn the_gate_demands_a_staff_user() {
+async fn the_gate_demands_an_admin_user() {
     let db = common::test_db().await;
     let seeded = seed(&db).await;
     let pool = db.pool().clone();
-    let moderator = common::create_app_and_token(&pool, &seeded.moddy, "admin:read").await;
-    let stranger = common::create_app_and_token(&pool, &seeded.plain, "admin:read").await;
+    let moderator = common::create_app_and_token(&pool, &seeded.moddy, "admin:read:accounts").await;
+    let stranger = common::create_app_and_token(&pool, &seeded.plain, "admin:read:accounts").await;
     let app_only = common::create_app_only_token(&pool, "admin:read").await;
+    let show = format!("{V1}/{}", seeded.root.id);
+
+    for (credential, who) in [(&moderator, "a moderator"), (&stranger, "a plain account")] {
+        for route in [V1, V2, show.as_str()] {
+            let refused = TestRequest::get(route)
+                .bearer(credential)
+                .send(&seeded.app)
+                .await;
+            common::assert_answer(
+                &refused,
+                StatusCode::FORBIDDEN,
+                &format!("{who} on {route}"),
+            );
+            common::assert_error(&refused, NOT_ADMIN, &format!("{who} on {route}"));
+        }
+    }
+
+    let shown = read(&seeded.app, &seeded.token, &show).await;
+    assert_eq!(
+        keys(&shown),
+        ENTITY_KEYS.to_vec(),
+        "an admin reads the pinned entity shape"
+    );
 
     for (prefix, label) in [(V1, "the v1 listing"), (V2, "the v2 listing")] {
         let anonymous = TestRequest::get(prefix).send(&seeded.app).await;
@@ -39,29 +65,14 @@ async fn the_gate_demands_a_staff_user() {
             USER_REQUIRED,
             &format!("an app-only token on {label}"),
         );
-        let outsider = TestRequest::get(prefix)
-            .bearer(&stranger)
-            .send(&seeded.app)
-            .await;
-        common::assert_error(
-            &outsider,
-            NOT_STAFF,
-            &format!("a non-staff token on {label}"),
-        );
-        let answered = read(&seeded.app, &moderator, prefix).await;
+        let answered = read(&seeded.app, &seeded.token, prefix).await;
         assert_eq!(
             listed(&answered),
             LISTED.to_vec(),
-            "a moderator reads what an admin reads on {label}"
+            "an admin reads the whole page on {label}"
         );
     }
 
-    let show = format!("{V1}/{}", seeded.root.id);
-    let outsider = TestRequest::get(&show)
-        .bearer(&stranger)
-        .send(&seeded.app)
-        .await;
-    common::assert_error(&outsider, NOT_STAFF, "a non-staff token on the show route");
     let anonymous = TestRequest::get(&show).send(&seeded.app).await;
     common::assert_error(&anonymous, NO_TOKEN, "no token on the show route");
 }

@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     api::helpers::{QueryPairs, link_query},
-    auth::admin::StaffUser,
+    auth::admin::AdminUser,
     entities::mastodon_admin::AdminAccount,
     error::{AppError, AppResult},
     models::user::{
@@ -30,17 +30,17 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:read` gate; [`AppError::BadRequest`] for a malformed
 /// pagination cursor; [`AppError::Database`] from the listing read; and
 /// [`set_link_header`] reports a `Link` value that is not header-safe as
 /// [`AppError::Internal`].
 pub(super) async fn list_accounts(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<AdminAccount>>)> {
-    staff.require(CLASS_READ, AREA_ACCOUNTS)?;
+    admin.require(CLASS_READ, AREA_ACCOUNTS)?;
     page_response(&state, &uri, v1_params(uri.query())).await
 }
 
@@ -53,10 +53,10 @@ pub(super) async fn list_accounts(
 /// Exactly those of [`list_accounts`].
 pub(super) async fn list_accounts_v2(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<AdminAccount>>)> {
-    staff.require(CLASS_READ, AREA_ACCOUNTS)?;
+    admin.require(CLASS_READ, AREA_ACCOUNTS)?;
     page_response(&state, &uri, v2_params(uri.query())).await
 }
 
@@ -69,15 +69,15 @@ pub(super) async fn list_accounts_v2(
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:read` gate; [`AppError::NotFound`] as described;
 /// [`AppError::Database`] from the lookup.
 pub(super) async fn show_account(
     State(state): State<AppState>,
-    staff: StaffUser,
+    admin: AdminUser,
     Path(raw): Path<String>,
 ) -> AppResult<Json<AdminAccount>> {
-    staff.require(CLASS_READ, AREA_ACCOUNTS)?;
+    admin.require(CLASS_READ, AREA_ACCOUNTS)?;
     let account = named_account(&state, &raw).await?;
     debug!(
         account = %account.id,
