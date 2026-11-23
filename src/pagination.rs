@@ -25,11 +25,17 @@ use axum::{
     extract::FromRequestParts,
     http::{HeaderMap, HeaderValue, header::LINK, request::Parts},
 };
-use sqlx::{QueryBuilder, postgres::Postgres};
+use sqlx::{
+    FromRow, PgPool, QueryBuilder,
+    postgres::{PgRow, Postgres},
+};
 use url::form_urlencoded;
 use uuid::Uuid;
 
-use crate::{error::AppError, util::id::parse_id};
+use crate::{
+    error::{AppError, AppResult},
+    util::id::parse_id,
+};
 
 /// Default page size when `limit` is absent, not a number, or not positive
 /// (Pleroma's `@default_limit`).
@@ -202,6 +208,57 @@ where
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         future::ready(Self::with_cap(MAX_LIMIT, parts))
     }
+}
+
+/// Runs one keyset page of the statement `builder` holds: appends `page`'s
+/// cursors, ordering and `LIMIT` on `column` with
+/// [`PageParams::apply_keyset`], fetches every row as `T` and hands them
+/// through [`PageParams::finish`], so a `min_id` page comes back flipped to
+/// newest-first like every other.
+///
+/// The builder must already end in a `WHERE` predicate the cursors can
+/// continue with `AND` (callers push their own filters before the call).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`].
+pub async fn keyset_page<T>(
+    pool: &PgPool,
+    mut builder: QueryBuilder<Postgres>,
+    column: &str,
+    page: &PageParams,
+) -> AppResult<Vec<T>>
+where
+    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+{
+    page.apply_keyset(&mut builder, column);
+    let rows = builder.build_query_as::<T>().fetch_all(pool).await?;
+    Ok(page.finish(rows))
+}
+
+/// [`keyset_page`] over a statement whose text `stem` stops at a placeholder:
+/// builds the [`QueryBuilder`] over `stem`, binds `bound` as that
+/// placeholder, then pages on `column`.
+///
+/// # Errors
+///
+/// As [`keyset_page`].
+pub async fn keyset_page_by<T>(
+    pool: &PgPool,
+    stem: &str,
+    bound: Uuid,
+    column: &str,
+    page: &PageParams,
+) -> AppResult<Vec<T>>
+where
+    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(stem);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(bound);
+    keyset_page(pool, builder, column, page).await
 }
 
 /// The pagination parameters of a listing whose keyset column is a `bigint`

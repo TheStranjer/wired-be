@@ -2,6 +2,7 @@
 //! child modules.
 
 mod keyset_links;
+mod keyset_page;
 mod ordinal;
 mod params;
 

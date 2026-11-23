@@ -407,7 +407,7 @@ mod tests {
 
     /// The rows of a page in the order [`page_link`] receives them: `ids`
     /// verbatim, newest id first.
-    fn page_rows(ids: &[&str]) -> Vec<StoredRow> {
+    fn stored_page(ids: &[&str]) -> Vec<StoredRow> {
         ids.iter()
             .map(|id| StoredRow {
                 id: Uuid::parse_str(id).expect("the fixture ids are ids"),
@@ -591,7 +591,7 @@ mod tests {
         let middle = "01934567-89ab-7cde-f012-3456789abcdf";
         let oldest = "01934567-89ab-7cde-f012-3456789abcde";
         let path = "/api/v1/scheduled_statuses";
-        let link = page_link(TEST_BASE_URL, path, &page_rows(&[newest, middle, oldest]))
+        let link = page_link(TEST_BASE_URL, path, &stored_page(&[newest, middle, oldest]))
             .expect("a full page links");
         assert_eq!(
             link,
@@ -612,7 +612,7 @@ mod tests {
         );
         let only = "01934567-89ab-7cde-f012-3456789abcde";
         let link =
-            page_link(TEST_BASE_URL, "/p", &page_rows(&[only])).expect("a one-row page links");
+            page_link(TEST_BASE_URL, "/p", &stored_page(&[only])).expect("a one-row page links");
         assert!(
             link.contains(&format!("max_id={only}")) && link.contains(&format!("min_id={only}")),
             "and its single id is both cursors: {link}"
