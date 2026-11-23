@@ -317,3 +317,42 @@ async fn status_search_pages_by_limit_cursors_and_offset() {
         "an offset past the end answers nothing"
     );
 }
+
+/// A suspended (deactivated) author's public post leaves the `statuses`
+/// search of an authenticated viewer, while an active author's post stays.
+#[tokio::test]
+async fn status_search_excludes_deactivated_authors() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "viewer", "read").await;
+    let active = common::create_local_user(&pool, "activepal").await;
+    let suspended = common::create_local_user(&pool, "suspendedpal").await;
+    let kept = common::create_status(&pool, &active, "keyword active", Visibility::Public).await;
+    let gone =
+        common::create_status(&pool, &suspended, "keyword suspended", Visibility::Public).await;
+    let url = format!("{V2_SEARCH}?q=keyword&type=statuses");
+
+    let before = statuses_of(&get(&app, Some(&token), &url).await.json_value());
+    assert!(
+        before.contains(&gone.id.to_string()),
+        "while active, the author's post is found: {before:?}"
+    );
+
+    let flipped = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+        .bind(suspended.id)
+        .execute(&pool)
+        .await
+        .expect("the suspension lands");
+    assert_eq!(flipped.rows_affected(), 1, "and it hit the fixture user");
+
+    let after = statuses_of(&get(&app, Some(&token), &url).await.json_value());
+    assert!(
+        !after.contains(&gone.id.to_string()),
+        "a deactivated author's post is gone from search: {after:?}"
+    );
+    assert!(
+        after.contains(&kept.id.to_string()),
+        "an active author's post stays: {after:?}"
+    );
+}

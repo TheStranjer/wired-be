@@ -27,7 +27,9 @@
 //! search hides what the viewer asked to stop seeing, the way Pleroma's
 //! `maybe_restrict_blocked` drops blocked authors from every search page.
 //! (The clause already drops the other direction: an author who blocked
-//! the viewer is out of it.)
+//! the viewer is out of it.) Authors on a domain the viewer blocked are out
+//! too, and so is every author whose account is no longer active
+//! ([`ACTIVE_AUTHOR`]) — for anonymous viewers as well.
 //!
 //! Paging is keyset on the id ([`PageParams::apply_keyset`]) with the
 //! `offset` the endpoint also accepts, ordered `id DESC`; the caller owns
@@ -38,7 +40,11 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::{status::Status, status_visibility::push_visibility_clause, user::User},
+    models::{
+        status::Status,
+        status_visibility::{ACTIVE_AUTHOR, push_visibility_clause},
+        user::User,
+    },
     pagination::PageParams,
 };
 
@@ -82,7 +88,10 @@ pub async fn search_statuses(
         return Ok(Vec::new());
     }
     let mut builder = QueryBuilder::<Postgres>::new(BASE_SQL);
-    let _match: &mut _ = builder.push_bind(needle.to_owned()).push(")");
+    let _match: &mut _ = builder
+        .push_bind(needle.to_owned())
+        .push(")")
+        .push(ACTIVE_AUTHOR);
     push_visibility_clause(&mut builder, viewer, "s");
     push_viewer_exclusions(&mut builder, viewer);
     if let Some(account_id) = account_id {
@@ -96,9 +105,11 @@ pub async fn search_statuses(
     Ok(page.finish(rows))
 }
 
-/// Appends the viewer-side exclusions: authors the viewer blocked, and
-/// authors under one of the viewer's unexpired mutes. An anonymous viewer
-/// has neither, so an anonymous request gains no condition here.
+/// Appends the viewer-side exclusions: authors the viewer blocked, authors
+/// under one of the viewer's unexpired mutes, and authors on a domain the
+/// viewer blocked (`user_domain_blocks`, the arm the timelines apply too).
+/// An anonymous viewer has none of these, so an anonymous request gains no
+/// condition here.
 fn push_viewer_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>) {
     let Some(viewer) = viewer else {
         return;
@@ -112,6 +123,14 @@ fn push_viewer_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&
         .push_bind(viewer.id)
         .push(" AND m.muted_id = s.user_id")
         .push(MUTE_LIVE_ARMS);
+    let _domain: &mut _ = builder
+        .push(
+            " AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb \
+               JOIN users d ON d.id = s.user_id \
+               WHERE udb.user_id = ",
+        )
+        .push_bind(viewer.id)
+        .push(" AND udb.domain = d.domain)");
 }
 
 #[cfg(test)]
@@ -124,7 +143,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
-            block, follow,
+            block, domain_block, follow,
             mute::{self, MuteOptions},
             status::{self, NewStatus, Visibility},
             user::{NewUser, insert as insert_user, local_ap_id},
@@ -362,6 +381,102 @@ mod tests {
             id_set(&[kept.id]),
             "and the author's own block of the viewer keeps them out too, \
              as the visibility clause's rule 2 says"
+        );
+    }
+
+    /// Flips `author`'s `is_active` flag to `active`.
+    async fn set_active(pool: &PgPool, author: &User, active: bool) {
+        let flipped = sqlx::query("UPDATE users SET is_active = $2 WHERE id = $1")
+            .bind(author.id)
+            .bind(active)
+            .execute(pool)
+            .await
+            .expect("the activity flag flips");
+        assert_eq!(flipped.rows_affected(), 1, "and it hit the fixture user");
+    }
+
+    #[tokio::test]
+    async fn deactivated_authors_are_excluded_for_everyone() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let viewer = user(&pool, "viewer").await;
+        let active = user(&pool, "activepal").await;
+        let suspended = user(&pool, "suspendedpal").await;
+        let kept = post(&pool, &active, Visibility::Public, "keyword active").await;
+        let gone = post(&pool, &suspended, Visibility::Public, "keyword suspended").await;
+
+        for (who, searcher) in [("anonymous", None), ("authenticated", Some(&viewer))] {
+            assert_eq!(
+                id_set(&ids(&search(&pool, searcher, "keyword").await)),
+                id_set(&[kept.id, gone.id]),
+                "before the suspension both posts are found ({who})"
+            );
+        }
+        set_active(&pool, &suspended, false).await;
+        for (who, searcher) in [("anonymous", None), ("authenticated", Some(&viewer))] {
+            assert_eq!(
+                ids(&search(&pool, searcher, "keyword").await),
+                vec![kept.id],
+                "a deactivated author's post is not found ({who})"
+            );
+        }
+        set_active(&pool, &suspended, true).await;
+        assert_eq!(
+            id_set(&ids(&search(&pool, None, "keyword").await)),
+            id_set(&[kept.id, gone.id]),
+            "and it comes back with the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_blocked_authors_are_excluded_for_the_blocker_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let viewer = user(&pool, "viewer").await;
+        let other = user(&pool, "other").await;
+        let carol = insert_user(
+            &pool,
+            &NewUser {
+                nickname: "carol@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/carol".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+        let remote_post = status::insert(
+            &pool,
+            BASE,
+            &NewStatus {
+                uri: Some("https://remote.example/objects/1".to_owned()),
+                user_id: carol.id,
+                raw_text: "keyword from carol".to_owned(),
+                ..NewStatus::default()
+            },
+        )
+        .await
+        .expect("the remote status inserts");
+        let local = post(&pool, &other, Visibility::Public, "keyword local").await;
+
+        domain_block::block_domain(&pool, viewer.id, "remote.example")
+            .await
+            .expect("the viewer blocks the domain");
+
+        assert_eq!(
+            ids(&search(&pool, Some(&viewer), "keyword").await),
+            vec![local.id],
+            "the blocker no longer finds the blocked domain's author"
+        );
+        assert_eq!(
+            id_set(&ids(&search(&pool, Some(&other), "keyword").await)),
+            id_set(&[remote_post.id, local.id]),
+            "another viewer still finds carol"
+        );
+        assert_eq!(
+            id_set(&ids(&search(&pool, None, "keyword").await)),
+            id_set(&[remote_post.id, local.id]),
+            "so does an anonymous one"
         );
     }
 

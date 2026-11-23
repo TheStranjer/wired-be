@@ -50,7 +50,11 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::{
     error::AppResult,
-    models::{status::Status, status_visibility::push_visibility_clause, user::User},
+    models::{
+        status::Status,
+        status_visibility::{ACTIVE_AUTHOR, push_visibility_clause},
+        user::User,
+    },
     pagination::PageParams,
 };
 
@@ -72,10 +76,10 @@ use arms::push_source;
 use visibility_arms::push_moderation_exclusions;
 
 /// The head of every [`TimelineQuery::fetch`] statement: the live rows
-/// (`deleted_at IS NULL`, always applied) of `statuses` whose author's
-/// account is active, aliased `s` for the fragments
-/// [`push_visibility_clause`] and the keyset paging take. Every clause
-/// below appends its own ` AND ` to this.
+/// (`deleted_at IS NULL`, always applied) of `statuses`, aliased `s` for the
+/// fragments [`push_visibility_clause`] and the keyset paging take.
+/// [`fetch`](TimelineQuery::fetch) pushes [`ACTIVE_AUTHOR`] right after it,
+/// and every clause below appends its own ` AND `.
 ///
 /// The author check is Pleroma's `Activity.restrict_deactivated_users`
 /// (`lib/pleroma/activity.ex`), which `fetch_activities` folds into every
@@ -83,8 +87,7 @@ use visibility_arms::push_moderation_exclusions;
 /// deactivated account's posts leave every timeline while the flag stands,
 /// and come back with it. The admin surfaces read through
 /// [`crate::models::status::admin`] instead and keep seeing everything.
-const SELECT_SQL: &str = "SELECT s.* FROM statuses s WHERE s.deleted_at IS NULL \
-     AND EXISTS (SELECT 1 FROM users au WHERE au.id = s.user_id AND au.is_active)";
+const SELECT_SQL: &str = "SELECT s.* FROM statuses s WHERE s.deleted_at IS NULL";
 
 /// The author of the original a reblog row boosts, as a scalar subquery over
 /// `s`: `NULL` when `s` is not a reblog, which no `= ` comparison ever
@@ -153,6 +156,7 @@ impl TimelineQuery {
         }
         let viewer = self.viewer.as_ref();
         let mut builder = QueryBuilder::<Postgres>::new(SELECT_SQL);
+        let _active: &mut _ = builder.push(ACTIVE_AUTHOR);
         push_source(&mut builder, &self.source, viewer);
         self.filters.push_clauses(&mut builder, viewer);
         if !self.filters.with_muted.get() {
