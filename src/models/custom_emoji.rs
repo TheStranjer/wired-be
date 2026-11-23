@@ -151,6 +151,43 @@ pub async fn upsert(pool: &PgPool, emoji: &NewCustomEmoji) -> AppResult<CustomEm
     Ok(row)
 }
 
+/// The `INSERT` behind [`upsert_remote`]: a new row takes the column
+/// defaults, an existing one gets only its image and `updated_at` changed,
+/// so the operator's `disabled`, `visible_in_picker`, `category` and `tags`
+/// survive every post that uses the emoji.
+const UPSERT_REMOTE_SQL: &str = "INSERT INTO custom_emojis (id, shortcode, domain, image_url)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (shortcode, (coalesce(domain, ''))) DO UPDATE SET
+     image_url = EXCLUDED.image_url,
+     updated_at = now()";
+
+/// Records an emoji a remote post announced.
+///
+/// A new `(shortcode, domain)` is inserted with the column defaults; a
+/// stored one has only `image_url` and `updated_at` updated, leaving the
+/// moderation flags, pack and tags alone (Mastodon likewise only refreshes
+/// `image_remote_url`).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn upsert_remote(
+    pool: &PgPool,
+    shortcode: &str,
+    domain: Option<&str>,
+    image_url: &str,
+) -> AppResult<()> {
+    let _written = sqlx::query(UPSERT_REMOTE_SQL)
+        .bind(new_id())
+        .bind(shortcode)
+        .bind(domain)
+        .bind(image_url)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Fetches every local (`domain IS NULL`), enabled emoji, ordered by
 /// category then shortcode — the list `GET /api/v1/custom_emojis` serves.
 ///
@@ -473,6 +510,51 @@ mod tests {
             Some(theirs.image_url.as_str()),
             "and was not rewritten by the local upsert"
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_remote_inserts_defaults_then_updates_only_the_image() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let domain = Some("remote.example");
+        upsert_remote(&pool, "wave", domain, "https://remote.example/1.png")
+            .await
+            .unwrap();
+        let first = get_by_shortcodes(&pool, &["wave".to_owned()], domain)
+            .await
+            .unwrap();
+        let [first] = first.as_slice() else {
+            panic!("one row expected, got {}", first.len());
+        };
+        assert!(!first.disabled && first.visible_in_picker, "the defaults");
+
+        let flagged = NewCustomEmoji {
+            domain: domain.map(str::to_owned),
+            image_url: first.image_url.clone(),
+            shortcode: "wave".to_owned(),
+            category: Some("pack".to_owned()),
+            tags: vec!["hi".to_owned()],
+            visible_in_picker: false,
+            disabled: true,
+            ..NewCustomEmoji::default()
+        };
+        seed(&pool, &flagged).await;
+        upsert_remote(&pool, "wave", domain, "https://remote.example/2.png")
+            .await
+            .unwrap();
+
+        let after = get_by_shortcodes(&pool, &["wave".to_owned()], domain)
+            .await
+            .unwrap();
+        let [after] = after.as_slice() else {
+            panic!("one row expected, got {}", after.len());
+        };
+        assert_eq!(after.id, first.id, "the row is updated in place");
+        assert_eq!(after.image_url, "https://remote.example/2.png", "new image");
+        assert!(after.disabled, "still disabled");
+        assert!(!after.visible_in_picker, "still hidden from the picker");
+        assert_eq!(after.category.as_deref(), Some("pack"), "pack kept");
+        assert_eq!(after.tags, ["hi"], "tags kept");
     }
 
     #[tokio::test]
