@@ -175,9 +175,9 @@ pub(super) async fn create_account(
 /// The route is open — no token, no scope — because it is what a registrant
 /// who cannot log in yet has to click. Pleroma's answer is `redirect(conn,
 /// to: "/")` on the success path and its `errors` fallback on every other;
-/// this API-only server has no frontend to land on (decision 1), so the
-/// ticket pins one answer for both: 302 with `Location: {BASE_URL}/`. The
-/// row changes only when [`confirm`] matches — a malformed id, an unknown
+/// this API-only server serves no page at `/` (decision 1), so the ticket
+/// pins one answer for both: 302 with `Location: {FRONTEND_BASE_URL}/`
+/// ([`Config::frontend_base_url`]). The row changes only when [`confirm`] matches — a malformed id, an unknown
 /// account, an already-confirmed address or a stale token all redirect
 /// without confirming anything, so the reply leaks nothing about which of
 /// them arrived.
@@ -200,17 +200,18 @@ pub(super) async fn confirm_email(
 }
 
 /// The one answer both halves of the confirmation flow give: a 302 to the
-/// root of [`Config::base_url`], the page Pleroma's frontend is served on.
+/// root of [`Config::frontend_base_url`], the page the frontend is served on
+/// (this server serves nothing at its own `/`).
 ///
 /// Assembled by hand rather than through axum's `Redirect`, because
 /// `Redirect::to` answers 303 `See Other` and Pleroma's
 /// `redirect(conn, to: "/")` — which this ticket pins — is a 302.
 ///
-/// [`Config::base_url`]: Config::base_url
+/// [`Config::frontend_base_url`]: Config::frontend_base_url
 fn redirect_home(config: &Config) -> Response {
     (
         StatusCode::FOUND,
-        [(LOCATION, format!("{}/", config.base_url))],
+        [(LOCATION, format!("{}/", config.frontend_base_url))],
     )
         .into_response()
 }

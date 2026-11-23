@@ -17,7 +17,7 @@
 //! unapproved account fails the bearer extractor with the same refusal.
 //!
 //! `GET /api/account/confirm_email/{user_id}/{token}` confirms the address and
-//! redirects to `{BASE_URL}/` — the same 302 whether or not the pairing was
+//! redirects to `{FRONTEND_BASE_URL}/` — the same 302 whether or not the pairing was
 //! right — and `POST /api/v1/pleroma/accounts/confirmation_resend` re-mails an
 //! unconfirmed account and answers 204 whatever it was asked, so it cannot
 //! probe the address book. The instance endpoints and `NodeInfo` report both
