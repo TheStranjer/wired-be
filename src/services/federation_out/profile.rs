@@ -12,7 +12,10 @@ use tracing::{debug, warn};
 use super::PUBLIC;
 use crate::{
     federation::{activities::activity_id, actor::actor_json, note, publisher},
-    models::{follow, user::User},
+    models::{
+        follow, relay,
+        user::{self, User},
+    },
     state::AppState,
     util::id::new_id,
 };
@@ -82,6 +85,14 @@ fn update_document(state: &AppState, account: &User, followers_collection: &str)
 /// remote followers' and remote followees' inboxes itself and hands the set
 /// to the publisher as `extra_inboxes`, so both sides of every relationship
 /// the account had learn it is gone.
+///
+/// Instances that hold the account's posts without any follow — through
+/// boosts, replies, mentions or a relay — must learn it too (Mastodon's
+/// `DeleteAccountService`). The accepted relays' inboxes join the follow
+/// peers in the first publish; every other known remote inbox
+/// ([`user::all_remote_inboxes`]) not already named goes in a second, so
+/// the peers are not queued behind the long tail. The publisher drops
+/// unreachable hosts when each job runs.
 pub async fn after_account_deleted(state: &AppState, account: &User) {
     if !state.config.federation_enabled.get() {
         return;
@@ -102,22 +113,47 @@ pub async fn after_account_deleted(state: &AppState, account: &User) {
             warn!(%err, actor = %account.ap_id, "could not read the followees for Delete federation");
         }
     }
-    if recipients.is_empty() {
-        return; // nobody on another instance ever knew this account
+    match relay::accepted_inboxes(&state.db).await {
+        Ok(relays) => recipients.extend(relays),
+        Err(err) => {
+            warn!(%err, actor = %account.ap_id, "could not read the relays for Delete federation");
+        }
     }
     // Two remote accounts on one instance name one shared inbox; the
     // snapshot POSTs there once.
     recipients.sort_unstable();
     recipients.dedup();
-    let document = delete_document(state, account);
-    match publisher::publish_in_background(state, account.id, &document, &recipients, None).await {
-        Ok(()) => debug!(
-            actor = %account.ap_id,
-            inboxes = recipients.len(),
-            "queued account Delete federation"
+    // Every other inbox this instance has ever stored: the long tail that
+    // learns of the deletion behind the follow peers, never ahead of them.
+    let mut long_tail: Vec<String> = Vec::new();
+    match user::all_remote_inboxes(&state.db).await {
+        Ok(known) => long_tail.extend(
+            known
+                .into_iter()
+                .filter(|inbox| recipients.binary_search(inbox).is_err()),
         ),
         Err(err) => {
-            warn!(%err, actor = %account.ap_id, "could not queue account Delete federation");
+            warn!(%err, actor = %account.ap_id, "could not read the known inboxes for Delete federation");
+        }
+    }
+    if recipients.is_empty() && long_tail.is_empty() {
+        return; // nobody on another instance ever knew this account
+    }
+    let document = delete_document(state, account);
+    for (batch, priority) in [(&recipients, "peers"), (&long_tail, "long tail")] {
+        if batch.is_empty() {
+            continue;
+        }
+        match publisher::publish_in_background(state, account.id, &document, batch, None).await {
+            Ok(()) => debug!(
+                actor = %account.ap_id,
+                inboxes = batch.len(),
+                priority,
+                "queued account Delete federation"
+            ),
+            Err(err) => {
+                warn!(%err, actor = %account.ap_id, priority, "could not queue account Delete federation");
+            }
         }
     }
 }
@@ -309,6 +345,106 @@ mod tests {
         after_account_disabled(&state, &alice);
 
         assert_eq!(job_count(&pool).await, 0, "a deactivation queues nothing");
+    }
+
+    /// A remote mirror on `host` with a shared inbox and no relationship.
+    async fn mirror_on(pool: &sqlx::PgPool, name: &str, host: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("{name}@{host}"),
+                ap_id: format!("https://{host}/users/{name}"),
+                local: Flag::new(false),
+                domain: Some(host.to_owned()),
+                inbox: Some(format!("https://{host}/users/{name}/inbox")),
+                shared_inbox: Some(format!("https://{host}/inbox")),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the mirror fixture inserts")
+    }
+
+    /// The `extra_inboxes` of one queued publish job, sorted.
+    fn inboxes_of(args: &Value) -> Vec<String> {
+        let mut inboxes: Vec<String> = args["extra_inboxes"]
+            .as_array()
+            .expect("the snapshot rides along")
+            .iter()
+            .filter_map(|inbox| inbox.as_str().map(str::to_owned))
+            .collect();
+        inboxes.sort_unstable();
+        inboxes
+    }
+
+    /// The `Delete` reaches the follower and the accepted relay in the
+    /// first publish and an unrelated mirror in a second; a mirror sharing
+    /// the follower's inbox and a still-pending relay add nothing, and
+    /// every inbox is named exactly once.
+    #[tokio::test]
+    async fn the_delete_reaches_relays_and_unrelated_inboxes_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let fan = mirror_on(&pool, "fan", "a.example").await;
+        let _twin = mirror_on(&pool, "twin", "a.example").await;
+        let _stranger = mirror_on(&pool, "stranger", "b.example").await;
+        accepted_follow(&pool, &fan, &alice).await;
+        let _relay = relay::upsert(
+            &pool,
+            "https://relay.example/actor",
+            "https://relay.example/inbox",
+        )
+        .await
+        .expect("the relay stores");
+        let _moved = relay::mark_accepted(&pool, "https://relay.example/actor")
+            .await
+            .expect("the relay grants");
+        let _pending = relay::upsert(
+            &pool,
+            "https://pending.example/actor",
+            "https://pending.example/inbox",
+        )
+        .await
+        .expect("the pending relay stores");
+        let state = app_state(&pool);
+
+        after_account_deleted(&state, &alice).await;
+
+        let jobs = publish_jobs(&pool).await;
+        assert_eq!(jobs.len(), 2, "peers first, the long tail second");
+        assert_eq!(
+            inboxes_of(&jobs[0].0),
+            vec![
+                "https://a.example/inbox".to_owned(),
+                "https://relay.example/inbox".to_owned(),
+            ]
+        );
+        assert_eq!(
+            inboxes_of(&jobs[1].0),
+            vec!["https://b.example/inbox".to_owned()]
+        );
+        assert_eq!(jobs[0].0["activity"], jobs[1].0["activity"]);
+    }
+
+    /// An account with no follow peers still tells every known remote
+    /// inbox, in a single long-tail publish.
+    #[tokio::test]
+    async fn a_follower_less_account_still_announces_the_delete() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let _stranger = mirror_on(&pool, "stranger", "b.example").await;
+        let state = app_state(&pool);
+
+        after_account_deleted(&state, &alice).await;
+
+        let jobs = publish_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "no peers, so only the long tail publishes");
+        assert_eq!(
+            inboxes_of(&jobs[0].0),
+            vec!["https://b.example/inbox".to_owned()]
+        );
     }
 
     /// The Delete snapshot reaches a followee that publishes no shared
