@@ -14,6 +14,7 @@ use super::{
     aliases::resolve_alias, error_body, password_accepted, success_body,
 };
 use crate::{
+    api::accounts::after_follow_changed,
     auth::AuthUser,
     entities::relationship::Relationship,
     error::{AppError, AppResult},
@@ -204,7 +205,10 @@ fn moved_within_cooldown(last_move_at: Option<DateTime<Utc>>) -> bool {
 /// follower's own `following_count` ends unchanged (up with the target,
 /// down with the origin). A follower whose re-follow failed keeps its
 /// original relationship untouched: nothing about the move is applied
-/// half-way.
+/// half-way. Each write then runs [`after_follow_changed`], so a remote
+/// target is sent the `Follow` (Pleroma's `CommonAPI.follow`), a locked
+/// local one gets its request notification, and the origin's side of the
+/// unfollow stays consistent with the interactive unfollow.
 ///
 /// # Errors
 ///
@@ -214,14 +218,18 @@ fn moved_within_cooldown(last_move_at: Option<DateTime<Utc>>) -> bool {
 /// and skip.
 async fn transfer_followers(state: &AppState, origin: &User, target: &User) -> AppResult<()> {
     for follower in follow::move_followers_of(&state.db, origin.id).await? {
-        if let Err(err) = follow::follow(&state.db, &state.config.base_url, &follower, target).await
-        {
-            debug!(%err, follower = %follower.nickname, "skipped during follower transfer");
-            continue;
+        let created =
+            match follow::follow(&state.db, &state.config.base_url, &follower, target).await {
+                Ok(row) => row,
+                Err(err) => {
+                    debug!(%err, follower = %follower.nickname, "skipped during follower transfer");
+                    continue;
+                }
+            };
+        after_follow_changed(state, &follower, target, Some(&created), true).await;
+        if follow::unfollow(&state.db, &follower, origin).await? {
+            after_follow_changed(state, &follower, origin, None, false).await;
         }
-        follow::unfollow(&state.db, &follower, origin)
-            .await
-            .map(drop)?;
     }
     Ok(())
 }

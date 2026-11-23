@@ -27,5 +27,6 @@ mod aliases;
 mod credentials;
 mod departures;
 mod mastodon_move;
+mod move_follows;
 mod moves;
 mod support;
