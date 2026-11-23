@@ -351,8 +351,8 @@ mod tests {
         );
         assert_eq!(
             unread_count(&pool, bobs_ref.chat_id).await.unwrap(),
-            1,
-            "the dangling reference is counted until bob clears it"
+            0,
+            "the dangling reference is not counted: its message is a tombstone"
         );
         assert_eq!(
             count(&pool, "SELECT count(*) FROM chat_message_references").await,
