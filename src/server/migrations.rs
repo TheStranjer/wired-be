@@ -16,6 +16,8 @@ mod chats;
 #[cfg(test)]
 mod push;
 #[cfg(test)]
+mod sweep_indexes;
+#[cfg(test)]
 mod users;
 
 /// One foreign key of the three tables: its name, the table it
