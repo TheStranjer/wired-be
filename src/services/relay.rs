@@ -19,8 +19,13 @@
 //! follower of this instance and nothing fans out beyond that one POST.
 //! The relay's `Accept` grants the `follows` row through the existing
 //! [`Accept` handler](crate::federation::handlers::follow), which also
-//! turns the relay row accepted; a relay that never answers stays
-//! `pending` and its inbox joins no fan-out.
+//! turns the relay row accepted — but only when the granted follow is the
+//! instance actor's own; a local user's follow of the relay actor leaves
+//! the subscription alone. A relay that never answers stays `pending` and
+//! its inbox joins no fan-out; a relay that answers with a `Reject` (how
+//! relays revoke a subscription) has the instance actor's `follows` row
+//! removed and the relay row put back to `pending`, so its inbox leaves
+//! the fan-out again.
 //!
 //! [`follow_relay`] accepts the relay actor's URL directly or a bare
 //! host, which names the conventional relay actor at
