@@ -64,7 +64,9 @@ mod test_support;
 pub use chat_page::page_for_user;
 pub use chats::{get_by_id, get_or_create, get_owned, set_pinned};
 pub use idempotency::sender_reference_for_key;
-pub use messages::{message_by_ap_id, messages_page, render_chat_content, withdraw};
+pub use messages::{
+    message_by_ap_id, messages_page, render_chat_content, withdraw, withdraw_all_from_sender,
+};
 pub use read_state::{mark_message_read, mark_read, unread_count};
 pub use references::{delete_message_for, message_reference, message_reference_for_user};
 pub use send::add_message;
