@@ -28,11 +28,15 @@ pub(super) struct Incoming {
     pub(super) activity: Value,
     /// The `users.id` of the actor whose key authenticated the delivery.
     pub(super) signer_id: Uuid,
+    /// The `users.id` of the local account whose personal inbox received
+    /// the delivery; `None` for the shared inboxes.
+    pub(super) inbox_owner: Option<Uuid>,
 }
 
 /// Reads [`Incoming`] out of the job args; an args object that does not
 /// describe a delivery no inbox route enqueued is discarded, not retried,
-/// because no retry can make it one.
+/// because no retry can make it one. A null, missing or unparseable
+/// `inbox_owner` reads as a shared-inbox delivery.
 pub(super) fn extract_incoming(args: &Value) -> Result<Incoming, JobError> {
     let discard = |why: &str| JobError::Discard(format!("unusable {KIND_INCOMING} args: {why}"));
     let activity = args.get("activity").ok_or_else(|| discard("no activity"))?;
@@ -41,9 +45,14 @@ pub(super) fn extract_incoming(args: &Value) -> Result<Incoming, JobError> {
         .and_then(Value::as_str)
         .and_then(|text| Uuid::parse_str(text).ok())
         .ok_or_else(|| discard("no signer id"))?;
+    let inbox_owner = args
+        .get("inbox_owner")
+        .and_then(Value::as_str)
+        .and_then(|text| Uuid::parse_str(text).ok());
     Ok(Incoming {
         activity: activity.clone(),
         signer_id,
+        inbox_owner,
     })
 }
 
@@ -99,10 +108,11 @@ async fn process(
         }
         mrf::MrfDecision::Accept(value) => value,
     };
-    let Some(processed) = ActivityView::parse(&accepted) else {
+    let Some(mut processed) = ActivityView::parse(&accepted) else {
         debug!("the policy pipeline accepted a document that does not parse; dropping");
         return Ok(());
     };
+    processed.inbox_owner = view.inbox_owner;
     if policy_rejects(state, &processed).await? {
         debug!("instance policy rejects the actor's domain");
         return Ok(());
@@ -144,6 +154,32 @@ mod tests {
     /// The rejecting policy fake.
     fn reject_mrf(_state: AppState, _view: &ActivityView) -> BoxFuture<'static, MrfDecision> {
         Box::pin(async { MrfDecision::Reject("test policy".to_owned()) })
+    }
+
+    /// The `inbox_owner` arg: a uuid string is read, anything else is a
+    /// shared-inbox delivery.
+    #[test]
+    fn the_inbox_owner_is_read_when_present_and_none_otherwise() {
+        let owner = Uuid::now_v7();
+        let base = |owner_arg: Option<Value>| {
+            let mut args =
+                json!({"activity": {"id": "x"}, "signer_id": Uuid::now_v7().to_string()});
+            if let Some(value) = owner_arg {
+                args["inbox_owner"] = value;
+            }
+            extract_incoming(&args)
+                .expect("the args are usable")
+                .inbox_owner
+        };
+
+        assert_eq!(
+            base(Some(json!(owner.to_string()))),
+            Some(owner),
+            "a personal-inbox delivery names its owner"
+        );
+        assert_eq!(base(Some(Value::Null)), None, "null is a shared inbox");
+        assert_eq!(base(None), None, "a missing key is a shared inbox");
+        assert_eq!(base(Some(json!("not-a-uuid"))), None, "so is junk");
     }
 
     /// The MRF reject path: a rejected activity is dropped, with the

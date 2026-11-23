@@ -12,7 +12,7 @@ use super::{AccountStatus, Flag};
 
 /// One row of `users`: a local account or a mirror of a remote actor
 /// (decision 7).
-#[derive(sqlx::FromRow)]
+#[derive(Clone, sqlx::FromRow)]
 pub struct User {
     /// `UUIDv7` primary key, minted by [`insert`](super::insert) (decision 4).
     pub id: Uuid,
