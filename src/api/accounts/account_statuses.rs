@@ -248,7 +248,7 @@ mod tests {
             on.exclude_replies.get(),
             "`exclude_replies` is case-insensitive"
         );
-        assert!(!on.exclude_reblogs.get(), "`yes` is not true here");
+        assert!(on.exclude_reblogs.get(), "`yes` is a true spelling");
         assert!(on.with_muted.get(), "`with_muted=true`");
         assert_eq!(on.tagged, None, "no `tagged` names no tag");
         assert_eq!(

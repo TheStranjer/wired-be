@@ -467,7 +467,8 @@ async fn the_listing_filters_select_their_own_rows() {
     let cases: &[(&str, &[Uuid])] = &[
         ("", &open),
         ("resolved=false", &open),
-        ("resolved=yes", &open),
+        ("resolved=maybe", &open),
+        ("resolved=yes", &acted),
         ("resolved=true", &acted),
         ("resolved=1", &acted),
         (&format!("account_id={}", alice.id), &[open_by_alice.id]),

@@ -19,7 +19,8 @@
 //!   accounts last, `new` on newest account; any other spelling is the
 //!   default, as Pleroma's exact
 //!   match on `"new"` makes it. `local` is accepted and honoured the way
-//!   Pleroma's `exclude_remote` is: `true` restricts the listing to
+//!   Pleroma's `exclude_remote` is: a true spelling (`true`, `1`, `yes`, …)
+//!   restricts the listing to
 //!   accounts this instance owns, anything else — the default — leaves the
 //!   remote mirrors in.
 //! - `GET /api/v1/suggestions` and `GET /api/v2/suggestions` are Pleroma's
@@ -77,11 +78,10 @@ use chrono::{Datelike as _, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tracing::debug;
-use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, requested_ids},
+    api::helpers::{QueryPairs, account_or_404, is_true, requested_ids},
     auth::{AuthUser, MaybeAuthUser},
     entities::account::{Account, AccountViewer},
     error::{AppError, AppResult},
@@ -426,8 +426,9 @@ async fn birthdays(
 /// number or not in its calendar range.
 fn birthday_on(query: Option<&str>) -> AppResult<(i32, i32)> {
     let (today_month, today_day) = today_parts();
-    let month = int_param(query, "month", MONTH_RANGE)?.unwrap_or(today_month);
-    let day = int_param(query, "day", DAY_RANGE)?.unwrap_or(today_day);
+    let pairs = QueryPairs::parse(query);
+    let month = int_param(&pairs, "month", MONTH_RANGE)?.unwrap_or(today_month);
+    let day = int_param(&pairs, "day", DAY_RANGE)?.unwrap_or(today_day);
     Ok((month, day))
 }
 
@@ -443,13 +444,13 @@ fn today_parts() -> (i32, i32) {
     (month, day)
 }
 
-/// One integer query parameter of `query`: `Ok(None)` when `name` is
-/// absent, `Ok(Some(value))` when it is a number within `range`, and
-/// [`AppError::BadRequest`] naming the parameter when it is either not a
-/// number or outside its range.
-fn int_param(query: Option<&str>, name: &str, range: (i32, i32)) -> AppResult<Option<i32>> {
+/// One integer query parameter of `pairs`: `Ok(None)` when `name` is
+/// absent or empty, `Ok(Some(value))` when it is a number within `range`,
+/// and [`AppError::BadRequest`] naming the parameter when it is either not
+/// a number or outside its range.
+fn int_param(pairs: &QueryPairs, name: &str, range: (i32, i32)) -> AppResult<Option<i32>> {
     let invalid = || AppError::BadRequest(format!("{INVALID_PARAMETER}{name}"));
-    let Some(text) = param_value(query, name) else {
+    let Some(text) = pairs.value(name) else {
         return Ok(None);
     };
     let value = text.parse::<i32>().map_err(|_err| invalid())?;
@@ -457,21 +458,6 @@ fn int_param(query: Option<&str>, name: &str, range: (i32, i32)) -> AppResult<Op
         return Ok(Some(value));
     }
     Err(invalid())
-}
-
-/// The value of the query parameter `name`, percent-decoded, the last
-/// occurrence winning — how a query-param map folds duplicates, which is
-/// what Pleroma's `conn.query_params` is and how [`PageParams`] reads them.
-fn param_value(query: Option<&str>, name: &str) -> Option<String> {
-    let mut found = None;
-    if let Some(query) = query {
-        for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-            if key == name {
-                found = Some(value.into_owned());
-            }
-        }
-    }
-    found
 }
 
 /// The two directory filters a request asked for: the sort order and the
@@ -482,34 +468,25 @@ struct DirectoryFilters {
     /// said `new` (Pleroma matches that one word and treats anything else
     /// as the default).
     order: user::DirectoryOrder,
-    /// The `local` parameter: `true` only for the `true`/`1` spellings, so
-    /// an absent or junk value lists local and remote accounts alike.
+    /// The `local` parameter: `true` only for a true spelling
+    /// ([`is_true`]), so an absent or junk value lists local and remote
+    /// accounts alike.
     local_only: bool,
 }
 
 impl DirectoryFilters {
     /// Reads `order` and `local` out of a raw query string.
     fn parse(query: Option<&str>) -> Self {
-        let order = match param_value(query, "order").as_deref() {
+        let pairs = QueryPairs::parse(query);
+        let order = match pairs.value("order").as_deref() {
             Some("new") => user::DirectoryOrder::New,
             _ => user::DirectoryOrder::default(),
         };
         Self {
             order,
-            local_only: is_true(param_value(query, "local").as_deref()),
+            local_only: pairs.value("local").as_deref().is_some_and(is_true),
         }
     }
-}
-
-/// Whether a query parameter's text spells a true boolean: the two
-/// spellings this repo's configuration accepts for a `true`, matched
-/// case-insensitively; anything else — absent, empty, `false`, `0`, junk —
-/// is `false`.
-fn is_true(text: Option<&str>) -> bool {
-    text.is_some_and(|value| {
-        let value = value.trim();
-        value.eq_ignore_ascii_case("true") || value == "1"
-    })
 }
 
 /// The whole answer of the three [`Account`] listings: every row rendered
@@ -541,50 +518,31 @@ mod tests {
         AppError::BadRequest(format!("{INVALID_PARAMETER}{name}"))
     }
 
-    /// `query`'s value for `name`, or the message this module answers when
-    /// there is none.
-    fn param(query: Option<&str>, name: &str) -> String {
-        param_value(query, name).expect("the parameter is there")
-    }
-
-    #[test]
-    fn param_values_are_read_last_wins_and_percent_decoded() {
-        assert_eq!(param(Some("order=new"), "order"), "new", "a lone pair");
-        assert_eq!(
-            param(Some("a=1&order=new&b=2"), "order"),
-            "new",
-            "any position works"
-        );
-        assert_eq!(
-            param(Some("order=active&order=new"), "order"),
-            "new",
-            "the last occurrence wins, as a query-param map folds them"
-        );
-        assert_eq!(
-            param(Some("local=%74rue"), "local"),
-            "true",
-            "the value is percent-decoded"
-        );
-        assert_eq!(param(Some("order="), "order"), "", "present but blank");
-        assert!(
-            param_value(Some("order=new"), "local").is_none(),
-            "a name that is not there has no value"
-        );
-        assert!(
-            param_value(None, "order").is_none(),
-            "and neither has a request with no query at all"
-        );
+    /// [`int_param`] over a raw query string.
+    fn int(query: Option<&str>, name: &str, range: (i32, i32)) -> AppResult<Option<i32>> {
+        int_param(&QueryPairs::parse(query), name, range)
     }
 
     #[test]
     fn only_the_true_spellings_of_local_are_true() {
-        for text in ["true", "TRUE", " true ", "1"] {
-            assert!(is_true(Some(text)), "`{text}` asks for local accounts");
-        }
-        for text in [None, Some(""), Some("false"), Some("0"), Some("yes")] {
+        for text in ["true", "TRUE", " true ", "1", "yes", "on"] {
+            let query = format!("local={text}");
             assert!(
-                !is_true(text),
-                "`{text:?}` is not a true flag, so the listing stays open to \
+                DirectoryFilters::parse(Some(&query)).local_only,
+                "`{text}` asks for local accounts"
+            );
+        }
+        for query in [
+            "",
+            "local=",
+            "local=false",
+            "local=0",
+            "local=no",
+            "local=junk",
+        ] {
+            assert!(
+                !DirectoryFilters::parse(Some(query)).local_only,
+                "`{query}` is not a true flag, so the listing stays open to \
                  remote accounts"
             );
         }
@@ -643,31 +601,60 @@ mod tests {
     #[test]
     fn an_integer_param_is_optional_and_ranged() {
         assert_eq!(
-            int_param(None, "month", MONTH_RANGE).unwrap(),
+            int(None, "month", MONTH_RANGE).unwrap(),
             None,
             "absent is nobody's opinion"
         );
         assert_eq!(
-            int_param(Some("month=2"), "month", MONTH_RANGE).unwrap(),
+            int(Some("month=2"), "month", MONTH_RANGE).unwrap(),
             Some(2),
             "a number in range is read"
         );
         assert_eq!(
-            int_param(Some("month=12&day=31"), "day", DAY_RANGE).unwrap(),
+            int(Some("month=12&day=31"), "day", DAY_RANGE).unwrap(),
             Some(31),
             "among other parameters, and at the top of its range"
         );
         assert_eq!(
-            int_param(Some("month=01"), "month", MONTH_RANGE).unwrap(),
+            int(Some("month=01"), "month", MONTH_RANGE).unwrap(),
             Some(1),
             "a leading zero is the same number"
         );
     }
 
     #[test]
+    fn an_empty_param_is_absent_not_a_bad_request() {
+        assert_eq!(
+            int(Some("day="), "day", DAY_RANGE).unwrap(),
+            None,
+            "`?day=` names nothing, as Pleroma's `not_empty_string` guard reads it"
+        );
+        let (month, day) = today();
+        assert_eq!(
+            birthday_on(Some("day=")).unwrap(),
+            (month, day),
+            "so a birthday query with an empty day asks about today"
+        );
+        assert_eq!(
+            birthday_on(Some("month=&day=")).unwrap(),
+            (month, day),
+            "and so does one with both parts empty"
+        );
+    }
+
+    #[test]
+    fn the_last_occurrence_of_a_param_wins() {
+        assert_eq!(
+            int(Some("day=3&day=4"), "day", DAY_RANGE).unwrap(),
+            Some(4),
+            "a repeated parameter folds to its last value"
+        );
+    }
+
+    #[test]
     fn a_param_that_is_not_a_valid_calendar_part_is_a_bad_request() {
-        for query in ["month=x", "month=", "month=13", "month=0", "month=-1"] {
-            let err = int_param(Some(query), "month", MONTH_RANGE)
+        for query in ["month=x", "month=13", "month=0", "month=-1"] {
+            let err = int(Some(query), "month", MONTH_RANGE)
                 .expect_err("a month outside the calendar is refused");
             assert_eq!(
                 err.to_string(),
@@ -677,7 +664,7 @@ mod tests {
         }
         for query in ["day=32", "day=0"] {
             assert_eq!(
-                int_param(Some(query), "day", DAY_RANGE)
+                int(Some(query), "day", DAY_RANGE)
                     .expect_err("a bad day is refused")
                     .to_string(),
                 invalid("day").to_string(),

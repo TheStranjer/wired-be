@@ -189,8 +189,10 @@ fn the_trusted_filter_reads_booleans_only() {
         ("true", Some(true)),
         ("TRUE", Some(true)),
         ("1", Some(true)),
+        ("yes", Some(true)),
         ("false", Some(false)),
         ("0", Some(false)),
+        ("no", Some(false)),
     ] {
         let mut one = HashMap::new();
         let replaced = one.insert("trusted".to_owned(), text.to_owned());
@@ -202,10 +204,10 @@ fn the_trusted_filter_reads_booleans_only() {
         );
     }
     let mut junk = HashMap::new();
-    let replaced = junk.insert("trusted".to_owned(), "yes".to_owned());
+    let replaced = junk.insert("trusted".to_owned(), "maybe".to_owned());
     drop(replaced);
     let err = query_trusted(&junk).expect_err("junk is refused");
-    assert_eq!(err.to_string(), "trusted must be a boolean, not yes");
+    assert_eq!(err.to_string(), "trusted must be a boolean, not maybe");
 }
 
 /// The listing window: the admin defaults, the shared cap, and the
