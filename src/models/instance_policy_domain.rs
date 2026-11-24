@@ -21,9 +21,11 @@ use crate::error::AppResult;
 const LIST_SQL: &str = "SELECT * FROM instance_policy_domains ORDER BY domain";
 
 /// [`is_rejected`]: the one fact, asked as an existence check, so a domain
-/// that is not on the list costs a `false` and not a scanned table.
+/// that is not on the list costs a `false` and not a scanned table. `$1` is
+/// the host and each of its parent domains ([`host_and_parents`]), matched
+/// against the primary key's index.
 const REJECT_EXISTS_SQL: &str = "SELECT EXISTS (SELECT 1 FROM instance_policy_domains \
-                                 WHERE domain = $1 AND action = 'reject')";
+                                 WHERE domain = ANY($1) AND action = 'reject')";
 
 /// One row of `instance_policy_domains`: a domain the instance's own
 /// policy restricts.
@@ -53,12 +55,31 @@ pub async fn list(pool: &PgPool) -> AppResult<Vec<InstancePolicyDomain>> {
     Ok(rows)
 }
 
-/// Whether instance policy rejects `domain` outright: a row for it whose
-/// action is `reject`.
+/// `host` lowercased, then each parent domain below it, longest first:
+/// `A.b.c` → `[a.b.c, b.c, c]`. Matching these against the rows' primary key
+/// needs no `LIKE` escaping, and `notevil.example` never yields
+/// `evil.example`.
+fn host_and_parents(host: &str) -> Vec<String> {
+    let host = host.to_ascii_lowercase();
+    let mut names = Vec::new();
+    let mut rest = host.as_str();
+    loop {
+        names.push(rest.to_owned());
+        match rest.split_once('.') {
+            Some((_, parent)) if !parent.is_empty() => rest = parent,
+            _ => break,
+        }
+    }
+    names
+}
+
+/// Whether instance policy rejects `domain` outright: a `reject` row for it
+/// or for any parent domain (a row for `evil.example` covers
+/// `a.evil.example`, as Mastodon's `DomainBlock.rule_for` does).
 ///
-/// `domain` is compared exactly, so callers pass the canonical spelling the
-/// rows hold: lowercase, no scheme, no port (a URL's host already is that —
-/// see [`crate::federation::delivery`]). Softer actions (`silence`,
+/// `domain` is case-folded before matching; callers pass it without scheme
+/// or port (a URL's host already is that — see
+/// [`crate::federation::delivery`]). Softer actions (`silence`,
 /// `media_removal`) are not rejections: they restrict what is done with a
 /// domain's content, not whether this instance talks to it.
 ///
@@ -68,7 +89,7 @@ pub async fn list(pool: &PgPool) -> AppResult<Vec<InstancePolicyDomain>> {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn is_rejected(pool: &PgPool, domain: &str) -> AppResult<bool> {
     let rejected = sqlx::query_scalar::<_, bool>(REJECT_EXISTS_SQL)
-        .bind(domain)
+        .bind(host_and_parents(domain))
         .fetch_one(pool)
         .await?;
     Ok(rejected)
@@ -138,7 +159,69 @@ mod tests {
         );
     }
 
-    /// `is_rejected` answers only for a `reject` row on the exact host.
+    /// `host_and_parents` lowercases and walks up to the last label.
+    #[test]
+    fn host_and_parents_lists_the_host_then_each_parent() {
+        assert_eq!(
+            host_and_parents("A.b.c"),
+            vec!["a.b.c", "b.c", "c"],
+            "longest first, case-folded"
+        );
+        assert_eq!(host_and_parents("solo"), vec!["solo"], "one label");
+        assert_eq!(host_and_parents(""), vec![""], "empty stays one empty name");
+        assert_eq!(
+            host_and_parents("a."),
+            vec!["a."],
+            "a trailing dot adds no empty parent"
+        );
+    }
+
+    /// A `reject` row for a domain covers every host beneath it.
+    #[tokio::test]
+    async fn a_reject_row_covers_its_subdomains() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        insert(&pool, "evil.example", "reject", "").await;
+        insert(&pool, "quiet.example", "silence", "").await;
+
+        for host in [
+            "evil.example",
+            "a.evil.example",
+            "x.y.evil.example",
+            "A.Evil.Example",
+        ] {
+            assert!(
+                is_rejected(&pool, host).await.unwrap(),
+                "`{host}` is covered by the `evil.example` row"
+            );
+        }
+        assert!(
+            !is_rejected(&pool, "a.quiet.example").await.unwrap(),
+            "a silence row covers no subdomain as a rejection"
+        );
+    }
+
+    /// A reject row is a domain boundary, not a string suffix.
+    #[tokio::test]
+    async fn a_reject_row_does_not_cover_a_lookalike_suffix() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        insert(&pool, "evil.example", "reject", "").await;
+
+        for host in [
+            "notevil.example",
+            "evil.example.org",
+            "example",
+            "a.notevil.example",
+        ] {
+            assert!(
+                !is_rejected(&pool, host).await.unwrap(),
+                "`{host}` is not under `evil.example`"
+            );
+        }
+    }
+
+    /// `is_rejected` answers only for a `reject` row on the host or a parent.
     #[tokio::test]
     async fn only_a_reject_row_makes_a_domain_rejected() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -157,7 +240,7 @@ mod tests {
                 "`{domain}` is restricted, not rejected"
             );
         }
-        for domain in ["SPAM.example", "sub.spam.example", "unknown.example", ""] {
+        for domain in ["unknown.example", "example", ""] {
             assert!(
                 !is_rejected(&pool, domain).await.unwrap(),
                 "`{domain}` names no reject row"

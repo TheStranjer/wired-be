@@ -10,8 +10,8 @@ use tracing::debug;
 
 use crate::{
     error::AppResult,
-    federation::{delivery::is_local_inbox, mrf},
-    models::{instance, instance_policy_domain, user::User},
+    federation::{delivery::is_local_inbox, mrf, policy::host_refused_with},
+    models::{instance, user::User},
     util::url::parse_http_url,
 };
 
@@ -38,8 +38,7 @@ pub(super) async fn deliverable_inboxes(
         let Some(host) = deliverable_host(&candidate, &actor.ap_id) else {
             continue;
         };
-        if instance_policy_domain::is_rejected(pool, &host).await?
-            || policy.rejected(&host)
+        if host_refused_with(pool, policy, &host).await?
             || instance::is_host_unreachable(pool, &host, grace).await?
         {
             debug!(inbox = %candidate, "delivery target dropped: the host is refused");
