@@ -15,7 +15,9 @@ use tracing::debug;
 
 use super::{AREA_APPS, CLASS_WRITE};
 use crate::{
-    api::apps::{RedirectUris, normalize_redirect_uris},
+    api::apps::{
+        RedirectUris, check_name, check_redirect_uris, check_website, normalize_redirect_uris,
+    },
     auth::admin::AdminUser,
     entities::admin::{AdminOauthApp, AdminOauthAppPage},
     error::{AppError, AppResult},
@@ -140,15 +142,16 @@ struct Prepared {
 }
 
 /// Validates and normalizes a body: the trim/blank gate on `name`, the
-/// registration normalization on `redirect_uris`, and the scope parse
-/// and [`Scopes::validate`] check — every refusal joining one
+/// registration normalization on `redirect_uris`, the length and shape
+/// limits registration enforces (see [`crate::api::apps`]), and the scope
+/// parse and [`Scopes::validate`] check — every refusal joining one
 /// `{"errors": …}` answer. `on_create` decides whether an absent field
 /// is a refusal or simply nothing to write.
 ///
 /// # Errors
 ///
-/// [`AppsError::Invalid`] with the `can't be blank` and `invalid
-/// scopes` refusals the body earns.
+/// [`AppsError::Invalid`] with the `can't be blank`, length or shape and
+/// `invalid scopes` refusals the body earns.
 fn prepare(body: AppBody, on_create: bool) -> Result<Prepared, AppsError> {
     let name_sent = body.name.is_some();
     let uris_sent = body.redirect_uris.is_some();
@@ -180,6 +183,15 @@ fn prepare(body: AppBody, on_create: bool) -> Result<Prepared, AppsError> {
     }
     if redirect_uris.is_none() && (on_create || uris_sent) {
         refusals.push(("redirect_uris", CANNOT_BE_BLANK.to_owned()));
+    }
+    if let Some(Err(reason)) = name.as_deref().map(check_name) {
+        refusals.push(("name", reason));
+    }
+    if let Some(Err(reason)) = redirect_uris.as_deref().map(check_redirect_uris) {
+        refusals.push(("redirect_uris", reason));
+    }
+    if let Some(Err(reason)) = body.website.as_deref().map(check_website) {
+        refusals.push(("website", reason));
     }
     if !refusals.is_empty() {
         return Err(AppsError::Invalid(refusals));
