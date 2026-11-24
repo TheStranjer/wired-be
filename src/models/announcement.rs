@@ -364,11 +364,7 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        models::user::{NewUser, User, insert, local_ap_id},
-        util::time::parse_time,
-    };
+    use crate::{test_fixtures::local_user as user, util::time::parse_time};
 
     /// An instant from its ISO 8601 text, for a window bound that has to
     /// survive the database's microsecond resolution unchanged.
@@ -416,16 +412,6 @@ mod tests {
         ends_at: Option<DateTime<Utc>>,
     ) {
         let _row: Announcement = notice(pool, content, starts_at, ends_at).await;
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
     }
 
     /// The `(body, read)` pairs of `rows`, in row order — what the dismissal

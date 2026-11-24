@@ -136,8 +136,9 @@ mod tests {
             block, domain_block, follow,
             mute::{self, MuteOptions},
             status::{self, NewStatus, Visibility},
-            user::{NewUser, insert as insert_user, local_ap_id},
+            user::{NewUser, insert as insert_user},
         },
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures pretend to serve.
@@ -145,16 +146,6 @@ mod tests {
     /// A limit above every fixture page this module asks for, so a "full"
     /// page really is the whole answer.
     const EVERY: i64 = 80;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
 
     /// Inserts `text` as `author`'s status of `visibility`.
     async fn post(pool: &PgPool, author: &User, visibility: Visibility, text: &str) -> Status {

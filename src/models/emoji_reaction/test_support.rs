@@ -9,10 +9,12 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         status::{NewStatus, insert},
-        user::{NewUser, User, insert as insert_user, local_ap_id},
+        user::User,
     },
     util::time::parse_time,
 };
+
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// The instance origin the fixtures react on.
 pub(super) const BASE: &str = TEST_BASE_URL;
@@ -26,16 +28,6 @@ pub(super) const HEART: &str = "❤️";
 pub(super) const CAT: &str = ":cat:";
 /// The image URL stored beside [`CAT`].
 pub(super) const CAT_URL: &str = "https://test.example/emoji/cats/cat.png";
-
-/// A local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the fixture user inserts")
-}
 
 /// A public post by `author`, as its id.
 pub(super) async fn post(pool: &PgPool, author: &User) -> Uuid {

@@ -305,22 +305,13 @@ mod tests {
             domain_block::block_domain,
             follow,
             mute::{self, MuteOptions},
-            user::{Flag, INSTANCE_ACTOR_NICKNAME, NewUser, insert, local_ap_id},
+            user::{Flag, INSTANCE_ACTOR_NICKNAME, NewUser, insert},
         },
+        test_fixtures::{local_new, local_user as user},
     };
 
     /// The instance origin the fixtures pretend to serve.
     const BASE: &str = TEST_BASE_URL;
-
-    /// A local active user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
 
     /// A local user named `nickname` with display name `name`.
     async fn named(pool: &PgPool, nickname: &str, name: &str) -> User {
@@ -328,7 +319,7 @@ mod tests {
             pool,
             &NewUser {
                 name: name.to_owned(),
-                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+                ..local_new(nickname)
             },
         )
         .await
@@ -718,7 +709,7 @@ mod tests {
             pool,
             &NewUser {
                 approval_pending: Flag::new(true),
-                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+                ..local_new(nickname)
             },
         )
         .await
@@ -731,7 +722,7 @@ mod tests {
             pool,
             &NewUser {
                 email_confirmed: Flag::new(false),
-                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+                ..local_new(nickname)
             },
         )
         .await
@@ -816,7 +807,7 @@ mod tests {
             pool,
             &NewUser {
                 actor_type: actor_type.to_owned(),
-                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+                ..local_new(nickname)
             },
         )
         .await

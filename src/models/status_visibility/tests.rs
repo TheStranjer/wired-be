@@ -8,8 +8,9 @@ use crate::{
     models::{
         block, follow,
         status::{NewStatus, Visibility, insert as insert_status, soft_delete},
-        user::{Flag, NewUser, insert as insert_user, local_ap_id},
+        user::{Flag, NewUser, insert as insert_user},
     },
+    test_fixtures::{local_new, local_user as local},
 };
 
 /// Rule 1b: a deactivated author's statuses are visible to nobody.
@@ -18,16 +19,6 @@ mod deactivated;
 /// The instance origin the fixtures pretend to serve.
 const BASE: &str = TEST_BASE_URL;
 
-/// Inserts a local user named `nickname`.
-async fn local(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
-
 /// Inserts a local user named `nickname` whose account is locked, so a
 /// follow of it waits for an answer and never grants one.
 async fn locked_local(pool: &PgPool, nickname: &str) -> User {
@@ -35,7 +26,7 @@ async fn locked_local(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+            ..local_new(nickname)
         },
     )
     .await

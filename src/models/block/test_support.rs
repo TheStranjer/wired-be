@@ -8,21 +8,14 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, FollowState},
-        user::{Flag, NewUser, User, get_by_id, insert, local_ap_id},
+        user::{Flag, NewUser, User, get_by_id, insert},
     },
     pagination::{MAX_LIMIT, PageParams},
+    test_fixtures::local_new,
     util::id::assert_local_activity_id,
 };
 
-/// Inserts a local, unlocked user named `nickname`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
+pub(super) use crate::test_fixtures::local_user;
 
 /// Inserts a local user named `nickname` whose account is locked, so a
 /// follow of it waits for an answer.
@@ -31,7 +24,7 @@ pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await

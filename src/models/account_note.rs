@@ -111,20 +111,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        models::user::{NewUser, User, insert, local_ap_id},
-    };
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
+    use crate::{models::user::User, test_fixtures::local_user as user};
 
     /// The single note of `owner` on `target`, or `None` — the map a
     /// one-target [`get_many`] answers, unwrapped for the assertions.

@@ -2,23 +2,11 @@
 
 use std::slice;
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{
-    config::TEST_BASE_URL,
-    models::user::{NewUser, User, insert, local_ap_id},
-};
+use crate::models::user::User;
 
-/// An inserted local user named `nickname`.
-pub(super) async fn stored(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the user fixture inserts")
-}
+pub(super) use crate::test_fixtures::local_user as stored;
 
 /// The nickname list every sentence test reads.
 pub(super) fn names(texts: &[&str]) -> Vec<String> {

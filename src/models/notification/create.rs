@@ -158,7 +158,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::models::notification::{TYPE_FAVOURITE, test_support::trio};
+    use crate::{
+        models::notification::{TYPE_FAVOURITE, test_support::trio},
+        test_fixtures::local_user as solo_user,
+    };
 
     #[tokio::test]
     async fn create_stores_the_computed_group_key() {
@@ -580,17 +583,6 @@ mod tests {
                 .expect("the read runs"),
             "the poll closing on one's own post is never refused"
         );
-    }
-
-    /// A plain local user named `nickname`.
-    async fn solo_user(pool: &PgPool, nickname: &str) -> user::User {
-        use crate::{config::TEST_BASE_URL, models::user::local_ap_id};
-        user::insert(
-            pool,
-            &user::NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("local user fixture")
     }
 
     #[tokio::test]

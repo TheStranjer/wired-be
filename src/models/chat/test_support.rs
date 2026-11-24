@@ -8,10 +8,12 @@ use uuid::Uuid;
 use crate::{
     config::TEST_BASE_URL,
     error::AppError,
-    models::user::{NewUser, User, insert, local_ap_id},
+    models::user::{NewUser, User, insert},
     pagination::{MAX_LIMIT, PageParams},
     util::id::new_id,
 };
+
+pub(super) use crate::test_fixtures::local_user as local;
 
 use super::{
     Chat, ChatFilter, ChatMessage, ChatMessageReference, NewChatMessage, add_message,
@@ -20,16 +22,6 @@ use super::{
 
 /// The whole list in one page.
 pub(super) const ALL: &str = "limit=40";
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn local(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("fixture user inserts")
-}
 
 /// Inserts a mirror of `nickname` on `remote.example`.
 pub(super) async fn remote(pool: &PgPool, nickname: &str) -> User {

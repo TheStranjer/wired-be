@@ -149,13 +149,7 @@ pub async fn page(pool: &PgPool, user_id: Uuid, page: OrdinalPageParams) -> AppR
 #[cfg(test)]
 mod tests {
     use crate::{
-        config::TEST_BASE_URL,
-        error::AppError,
-        models::{
-            hashtag,
-            user::{NewUser, insert as insert_user, local_ap_id},
-        },
-        pagination::MAX_LIMIT,
+        error::AppError, models::hashtag, pagination::MAX_LIMIT, test_fixtures::local_user,
     };
 
     use super::*;
@@ -176,15 +170,9 @@ mod tests {
             .expect("the fixture name is usable")
     }
 
-    /// A local user named `nickname`.
+    /// The id of a local user named `nickname`.
     async fn user(pool: &PgPool, nickname: &str) -> Uuid {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("fixture user inserts")
-        .id
+        local_user(pool, nickname).await.id
     }
 
     /// The page parameters of `query`, for the ordinal page tests.

@@ -338,25 +338,16 @@ mod tests {
         models::{
             bookmark_folder,
             status::{NewStatus, insert, soft_delete},
-            user::{NewUser, User, insert as insert_user, local_ap_id},
+            user::User,
         },
         pagination::MAX_LIMIT,
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
     /// How many bookmarks the page tests seed.
     const PAGE_SEED: usize = 3;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// A public post by `author`, as its row.
     async fn post(pool: &PgPool, author: &User) -> Status {

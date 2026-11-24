@@ -9,7 +9,7 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         status::{self, NewStatus},
-        user::{NewUser, User, insert, local_ap_id},
+        user::{NewUser, User, insert},
     },
     pagination::{MAX_LIMIT, PageParams},
     util::id::assert_local_activity_id,
@@ -17,15 +17,7 @@ use crate::{
 
 use super::{Category, NewReport, Report, create, get};
 
-/// Inserts a local, unlocked user named `nickname`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
+pub(super) use crate::test_fixtures::local_user;
 
 /// Inserts a mirror of `nickname` on `remote.example`: the account this
 /// instance does not own, whose `Flag` activity id is not ours to mint.
