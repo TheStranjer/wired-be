@@ -64,9 +64,9 @@ use crate::{
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
-        relationship::{Relationship, RelationshipMap},
+        relationship::Relationship,
     },
-    error::{AppError, AppResult},
+    error::AppResult,
     models::{block, block::Block, user::User},
     oauth::scopes::{FOLLOW, READ_BLOCKS, WRITE_BLOCKS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
@@ -101,11 +101,11 @@ pub fn router() -> Router<AppState> {
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
-/// the `write:blocks | follow` check; [`AppError::NotFound`] for a malformed,
-/// unknown or deactivated account id; [`AppError::Unprocessable`] with
+/// [`AppError::Unauthorized`](crate::error::AppError::Unauthorized) / [`AppError::Forbidden`](crate::error::AppError::Forbidden) from [`AuthUser`] and
+/// the `write:blocks | follow` check; [`AppError::NotFound`](crate::error::AppError::NotFound) for a malformed,
+/// unknown or deactivated account id; [`AppError::Unprocessable`](crate::error::AppError::Unprocessable) with
 /// `"Can not block yourself"` when the id names the caller. Any database
-/// failure arrives through `?` as [`AppError::Database`].
+/// failure arrives through `?` as [`AppError::Database`](crate::error::AppError::Database).
 async fn block_account(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -121,7 +121,9 @@ async fn block_account(
         "account blocked"
     );
     after_block_changed(&state, &block, true).await;
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// `POST /api/v1/accounts/{id}/unblock` — lift the caller's block on the
@@ -140,7 +142,7 @@ async fn block_account(
 /// Those of [`block_account`] minus the self guard: an id naming the caller
 /// is a pair no block row can exist for, so it answers the unchanged
 /// [`Relationship`] like any other unblocked account. Any database failure
-/// arrives through `?` as [`AppError::Database`].
+/// arrives through `?` as [`AppError::Database`](crate::error::AppError::Database).
 async fn unblock_account(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -158,7 +160,9 @@ async fn unblock_account(
         );
         after_block_changed(&state, block, false).await;
     }
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// `GET /api/v1/blocks` — the accounts the caller blocks, newest block
@@ -172,12 +176,12 @@ async fn unblock_account(
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] from [`AuthUser`] without a valid user token;
-/// [`AppError::Forbidden`] when the token does not grant `read:blocks`;
-/// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor. Any
-/// database failure arrives through `?` as [`AppError::Database`], and
+/// [`AppError::Unauthorized`](crate::error::AppError::Unauthorized) from [`AuthUser`] without a valid user token;
+/// [`AppError::Forbidden`](crate::error::AppError::Forbidden) when the token does not grant `read:blocks`;
+/// [`AppError::BadRequest`](crate::error::AppError::BadRequest) from [`PageParams`] for a malformed cursor. Any
+/// database failure arrives through `?` as [`AppError::Database`](crate::error::AppError::Database), and
 /// [`set_link_header`] reports a `Link` value that is not header-safe as
-/// [`AppError::Internal`].
+/// [`AppError::Internal`](crate::error::AppError::Internal).
 async fn list_blocks(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -195,32 +199,9 @@ async fn list_blocks(
     page_response(&state, viewer, &entries, uri.path()).await
 }
 
-/// The caller's [`Relationship`] to one account, rendered after a block
-/// write: [`Relationship::load_many`] over the single target, so the answer
-/// states the stored fact rather than trusting the request (the write-behind
-/// read of Pleroma's `relationship.json`, the shape
-/// [`crate::api::endorsements`] uses for its writes).
-///
-/// # Errors
-///
-/// Any database failure arrives through `?` as [`AppError::Database`]; the
-/// [`AppError::Internal`] arm only documents that the loader answers one row
-/// per requested id, which a single-target batch always does.
-async fn one_relationship(
-    state: &AppState,
-    viewer_id: Uuid,
-    target_id: Uuid,
-) -> AppResult<Json<Relationship>> {
-    let loaded = Relationship::load_many(&state.db, viewer_id, &[target_id]).await?;
-    let relationship = loaded.into_iter().next().ok_or_else(|| {
-        AppError::Internal("the relationship loader skipped its only target".to_owned())
-    })?;
-    Ok(Json(relationship))
-}
-
 /// Renders one fetched blocked page for `viewer`: every entry's [`User`] as
 /// an [`Account`] with the viewer's relationship embedded where one is
-/// preloaded (see [`preload_page_relationships`]), under the `Link` header
+/// preloaded (see [`Relationship::load_map`]), under the `Link` header
 /// [`keyset_link`] derives from the block row ids.
 async fn page_response(
     state: &AppState,
@@ -228,7 +209,8 @@ async fn page_response(
     entries: &[(Block, User)],
     path: &str,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let relationships = preload_page_relationships(state, viewer, entries).await?;
+    let targets: Vec<Uuid> = entries.iter().map(|(_, blocked)| blocked.id).collect();
+    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
     // The cursors key on the `blocks` row ([`Block::id`]), not on the
     // blocked accounts.
     let link = keyset_link(
@@ -247,28 +229,6 @@ async fn page_response(
         })
         .collect();
     Ok((headers, Json(accounts)))
-}
-
-/// The [`RelationshipMap`] for one blocked page: the viewer's relationship to
-/// every listed account in a single batched [`Relationship::load_many`],
-/// keyed by target id (which is how [`Account::from_user_for`] reads its
-/// preload).
-async fn preload_page_relationships(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[(Block, User)],
-) -> AppResult<Option<RelationshipMap>> {
-    let Some(who) = viewer else {
-        return Ok(None);
-    };
-    let targets: Vec<Uuid> = entries.iter().map(|(_, blocked)| blocked.id).collect();
-    let loaded = Relationship::load_many(&state.db, who.id, &targets).await?;
-    let map = loaded
-        .into_iter()
-        .zip(targets)
-        .map(|(relationship, target)| (target, relationship))
-        .collect();
-    Ok(Some(map))
 }
 
 /// Post-write hook of both block routes: hands the write to

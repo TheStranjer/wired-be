@@ -1,7 +1,7 @@
 //! The private note and the follower removal:
 //! `POST /api/v1/accounts/{id}/note` and `…/{id}/remove_from_followers`,
 //! both answered with the caller's relationship rendered off the row
-//! ([`one_relationship`]).
+//! ([`Relationship::load_one`]).
 //!
 //! `POST /api/v1/accounts/{id}/note` is Pleroma's `AccountController.note`
 //! (`lib/pleroma/web/mastodon_api/controllers/account_controller.ex`) over
@@ -42,7 +42,6 @@ use axum::{
 };
 use serde::Deserialize;
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::{
     api::helpers::visible_account_or_404,
@@ -117,7 +116,9 @@ pub(super) async fn set_note(
     }
     let target = visible_account_or_404(&state, &id, Some(&auth.0)).await?;
     account_note::set(&state.db, auth.0.id, target.id, &params.comment).await?;
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// `POST /api/v1/accounts/{id}/remove_from_followers` — drop the account
@@ -162,30 +163,9 @@ pub(super) async fn remove_from_followers(
         );
         after_follower_removed(&state, &auth.0, row).await;
     }
-    one_relationship(&state, auth.0.id, follower.id).await
-}
-
-/// The caller's [`Relationship`] to one account, rendered after a write:
-/// [`Relationship::load_many`] over the single target, so the answer states
-/// the stored fact rather than trusting the request (the write-behind read
-/// of Pleroma's `relationship.json`). Shared by [`set_note`] and
-/// [`remove_from_followers`].
-///
-/// # Errors
-///
-/// Any database failure arrives through `?` as [`AppError::Database`]; the
-/// [`AppError::Internal`] arm only documents that the loader answers one row
-/// per requested id, which a single-target batch always does.
-pub(super) async fn one_relationship(
-    state: &AppState,
-    viewer_id: Uuid,
-    target_id: Uuid,
-) -> AppResult<Json<Relationship>> {
-    let loaded = Relationship::load_many(&state.db, viewer_id, &[target_id]).await?;
-    let relationship = loaded.into_iter().next().ok_or_else(|| {
-        AppError::Internal("the relationship loader skipped its only target".to_owned())
-    })?;
-    Ok(Json(relationship))
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, follower.id).await?,
+    ))
 }
 
 /// Post-removal hook of [`remove_from_followers`], run once per actually

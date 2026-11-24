@@ -261,7 +261,9 @@ async fn subscription(
         notify,
         "subscription updated"
     );
-    relationship_for(state, subscriber, &target).await
+    Ok(Json(
+        Relationship::load_one(&state.db, subscriber.id, target.id).await?,
+    ))
 }
 
 /// `GET /api/v1/pleroma/outgoing_follow_requests` — the accounts the caller
@@ -319,27 +321,6 @@ async fn outgoing(
         .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
         .collect();
     Ok((headers, Json(accounts)))
-}
-
-/// The [`Relationship`] a subscription route answers: [`Relationship::load_many`]
-/// from the subscriber's perspective over the single target, so `notifying`
-/// and its `subscribing` alias reflect exactly what the write stored.
-///
-/// # Errors
-///
-/// Any database failure arrives through `?` as [`AppError::Database`]; the
-/// [`AppError::Internal`] arm only documents that the loader answers one row
-/// per requested id, which a single-target batch always does.
-async fn relationship_for(
-    state: &AppState,
-    subscriber: &User,
-    target: &User,
-) -> AppResult<Json<Relationship>> {
-    let loaded = Relationship::load_many(&state.db, subscriber.id, &[target.id]).await?;
-    let relationship = loaded.into_iter().next().ok_or_else(|| {
-        AppError::Internal("the relationship loader skipped its only target".to_owned())
-    })?;
-    Ok(Json(relationship))
 }
 
 /// `GET /api/v1/pleroma/accounts/{id}/favourites` — the statuses account

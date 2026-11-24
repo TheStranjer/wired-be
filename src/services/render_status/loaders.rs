@@ -1,7 +1,7 @@
 //! The batched preload queries of a page render that read statuses, their
 //! authors and the per-viewer flags — one id-keyed read per part, each
-//! skipping the database when its id list is empty. The poll, card and
-//! relationship loaders live in [`super::loaders_polls_cards`].
+//! skipping the database when its id list is empty. The poll and card
+//! loaders live in [`super::loaders_polls_cards`].
 
 use std::collections::{HashMap, HashSet};
 
