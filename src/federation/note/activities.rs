@@ -225,10 +225,10 @@ pub fn delete_activity_json(deletion: &NoteDeletion<'_>) -> Value {
 /// (decision 6), so this is that row spoken as an activity of `author`
 /// boosting `original_uri` by `original_author_ap_id`.
 ///
-/// The addressing is Pleroma's `make_announce_data`: a public or unlisted
-/// boost goes to the booster's followers and the boosted author with the
-/// public collection in `cc`, a private or direct one only to the
-/// followers — and a `local` reblog is never announced at all (`None`).
+/// The addressing is [`boost_addressing`]'s, and this is the one renderer
+/// of a boost: the outbound hook delivers it, the `/activities/{id}` route
+/// and the outbox serve it, so a peer's re-fetch reads what was delivered.
+/// A `local` reblog is never announced at all (`None`).
 #[must_use]
 pub fn announce_activity_json(
     reblog: &Status,
@@ -237,25 +237,49 @@ pub fn announce_activity_json(
     original_author_ap_id: &str,
     config: &Config,
 ) -> Option<Value> {
-    let followers_addr = json!(followers(&author.ap_id));
-    let (to, cc) = match reblog.visibility {
-        Visibility::Public | Visibility::Unlisted => (
-            json!([followers_addr, original_author_ap_id]),
-            json!([AS_PUBLIC]),
-        ),
-        Visibility::Private | Visibility::Direct => (json!([followers_addr]), json!([])),
-        Visibility::Local => return None,
-    };
+    if reblog.visibility == Visibility::Local {
+        return None;
+    }
+    let followers_addr = author
+        .followers_url
+        .clone()
+        .unwrap_or_else(|| followers(&author.ap_id));
+    let (to, cc) = boost_addressing(reblog.visibility, &followers_addr, original_author_ap_id);
     Some(json!({
         "@context": json_ld_context(config),
         "id": &reblog.uri,
         "type": TYPE_ANNOUNCE,
         "actor": &author.ap_id,
         "object": original_uri,
+        "published": mastodon_time(&reblog.inserted_at),
         "to": to,
         "cc": cc,
-        "published": mastodon_time(&reblog.inserted_at),
     }))
+}
+
+/// The `to` and `cc` lines a boost of `visibility` travels under, as
+/// Mastodon's `TagManager` writes them.
+///
+/// A public boost names the world in `to` and the booster's followers
+/// collection plus the boosted status' author in `cc`; an unlisted one the
+/// followers in `to` and the author plus the world in `cc`; a private or
+/// direct one (and, for want of a federated shape, a `local` one) the
+/// followers in `to` and the author alone in `cc`.
+#[must_use]
+pub fn boost_addressing(
+    visibility: Visibility,
+    booster_followers: &str,
+    original_author: &str,
+) -> (Vec<String>, Vec<String>) {
+    let followers = booster_followers.to_owned();
+    let author = original_author.to_owned();
+    match visibility {
+        Visibility::Public => (vec![AS_PUBLIC.to_owned()], vec![followers, author]),
+        Visibility::Unlisted => (vec![followers], vec![author, AS_PUBLIC.to_owned()]),
+        Visibility::Private | Visibility::Direct | Visibility::Local => {
+            (vec![followers], vec![author])
+        }
+    }
 }
 
 /// The `Tombstone` a soft-deleted status is served as.
@@ -407,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn a_public_reblog_announces_pleroma_style() {
+    fn a_public_reblog_announces_to_the_world() {
         let reblog = base_status(Visibility::Public);
         let config = Config::for_tests();
         let activity = announce_activity_json(&reblog, &author(), PARENT_URI, BOB_AP, &config)
@@ -433,12 +457,36 @@ mod tests {
         assert_eq!(activity["type"], "Announce", "the activity type");
         assert_eq!(activity["actor"], AUTHOR_AP, "the booster acts");
         assert_eq!(activity["object"], PARENT_URI, "the boosted object");
+        assert_eq!(activity["to"], json!([AS_PUBLIC]), "the world is addressed");
+        assert_eq!(
+            activity["cc"],
+            json!([format!("{AUTHOR_AP}/followers"), BOB_AP]),
+            "the followers and the boosted author ride cc"
+        );
+        assert_eq!(
+            activity["@context"],
+            json_ld_context(&config),
+            "the shared note context"
+        );
+        assert_eq!(activity["published"], PUBLISHED, "the reblog row's time");
+    }
+
+    #[test]
+    fn an_unlisted_reblog_announces_to_the_followers() {
+        let reblog = base_status(Visibility::Unlisted);
+        let config = Config::for_tests();
+        let activity = announce_activity_json(&reblog, &author(), PARENT_URI, BOB_AP, &config)
+            .expect("an unlisted announce renders");
         assert_eq!(
             activity["to"],
-            json!([format!("{AUTHOR_AP}/followers"), BOB_AP]),
-            "followers and the boosted author are addressed"
+            json!([format!("{AUTHOR_AP}/followers")]),
+            "only the followers"
         );
-        assert_eq!(activity["cc"], json!([AS_PUBLIC]), "the world is cc-ed");
+        assert_eq!(
+            activity["cc"],
+            json!([BOB_AP, AS_PUBLIC]),
+            "the author and the world ride cc"
+        );
     }
 
     #[test]
@@ -452,7 +500,54 @@ mod tests {
             json!([format!("{AUTHOR_AP}/followers")]),
             "only the followers"
         );
-        assert_eq!(activity["cc"], json!([]), "cc stays empty");
+        assert_eq!(
+            activity["cc"],
+            json!([BOB_AP]),
+            "the boosted author alone rides cc"
+        );
+    }
+
+    #[test]
+    fn an_announce_names_the_stored_followers_collection() {
+        let reblog = base_status(Visibility::Private);
+        let config = Config::for_tests();
+        let mut booster = author();
+        booster.followers_url = Some("https://test.example/custom/followers".to_owned());
+        let activity = announce_activity_json(&reblog, &booster, PARENT_URI, BOB_AP, &config)
+            .expect("a private announce renders");
+        assert_eq!(
+            activity["to"],
+            json!(["https://test.example/custom/followers"]),
+            "a stored followers_url wins over the constructed one"
+        );
+    }
+
+    #[test]
+    fn boost_addressing_follows_the_boosts_visibility() {
+        let followers = "https://test.example/users/alice/followers";
+        let owned = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            boost_addressing(Visibility::Public, followers, BOB_AP),
+            (owned(&[AS_PUBLIC]), owned(&[followers, BOB_AP])),
+            "public: the world in to, followers and author in cc"
+        );
+        assert_eq!(
+            boost_addressing(Visibility::Unlisted, followers, BOB_AP),
+            (owned(&[followers]), owned(&[BOB_AP, AS_PUBLIC])),
+            "unlisted: followers in to, author and world in cc"
+        );
+        for visibility in [Visibility::Private, Visibility::Direct] {
+            assert_eq!(
+                boost_addressing(visibility, followers, BOB_AP),
+                (owned(&[followers]), owned(&[BOB_AP])),
+                "{visibility:?}: followers in to, the author alone in cc"
+            );
+        }
     }
 
     #[test]

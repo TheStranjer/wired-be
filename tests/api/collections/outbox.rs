@@ -151,13 +151,13 @@ async fn the_outbox_items_are_the_federated_activities() {
     assert_eq!(announce["actor"], fixture.alice.ap_id, "the booster speaks");
     assert_eq!(
         announce["to"],
-        json!([format!("{BASE}/users/alice/followers"), fixture.bob.ap_id]),
-        "Pleroma's announce addressing: the booster's followers and the boosted author"
+        json!([AS_PUBLIC]),
+        "a public boost names the world in to, as it was delivered"
     );
     assert_eq!(
         announce["cc"],
-        json!([AS_PUBLIC]),
-        "and the public collection on cc"
+        json!([format!("{BASE}/users/alice/followers"), fixture.bob.ap_id]),
+        "and the booster's followers and the boosted author in cc"
     );
 
     let create = &items[1];
