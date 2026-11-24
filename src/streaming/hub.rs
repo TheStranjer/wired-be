@@ -13,11 +13,15 @@
 //! `publish` — so no event is delivered twice on its origin instance.
 //!
 //! Postgres caps a `NOTIFY` payload at 8 kB, so an envelope larger than
-//! [`MAX_NOTIFY_BYTES`] cannot ride the channel whole: the payload body
-//! goes into the `UNLOGGED` `stream_event_payloads` table (see
-//! `migrations/1791930000_stream_event_payloads.sql`) and the envelope
-//! names it with a `{"ref": "<uuid>"}` object instead. Listener processes
-//! read the body back before re-broadcasting; the rows outlive that read
+//! [`MAX_NOTIFY_BYTES`] cannot ride the channel whole: the whole inline
+//! envelope JSON (its `streams` and `audience` grow with the recipients,
+//! so the payload alone is not what makes it big) goes into the
+//! `UNLOGGED` `stream_event_payloads` table (see
+//! `migrations/1791930000_stream_event_payloads.sql`) and the `NOTIFY`
+//! carries only `{"process": "<uuid>", "envelope_ref": "<uuid>"}`. Older
+//! versions spilled just the payload under a `{"ref": "<uuid>"}` payload
+//! object; that form is still read. Listener processes
+//! read the envelope back before re-broadcasting; the rows outlive that read
 //! on purpose (every instance's listener needs them) and are deleted once
 //! older than [`PAYLOAD_TTL`] by the [`KIND_CLEANUP`] scheduled job.
 //!
@@ -38,7 +42,7 @@ use tokio::{runtime::Handle, sync::broadcast};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use self::bridge::{Envelope, bridge_publish};
+use self::bridge::{Inbound, bridge_publish};
 pub use self::{
     events::{
         Audience, RenderSpec, StreamEvent, matched_streams, public_stream_name, stream_matches,
@@ -152,17 +156,28 @@ impl Hub {
     /// payload row the [`KIND_CLEANUP`] sweep took before this instance
     /// read it. Each costs a log line, nothing else.
     async fn ingest(&self, raw: &str) {
-        let envelope: Envelope = match serde_json::from_str(raw) {
-            Ok(envelope) => envelope,
+        let inbound: Inbound = match serde_json::from_str(raw) {
+            Ok(inbound) => inbound,
             Err(err) => {
                 warn!(%err, "dropping unparseable streaming envelope");
                 return;
             }
         };
-        if envelope.process == self.process {
+        if inbound.process() == self.process {
             debug!("dropping envelope published by this process");
             return;
         }
+        let envelope = match inbound.into_envelope(&self.db).await {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                warn!("dropping cross-process event whose referenced envelope expired");
+                return;
+            }
+            Err(err) => {
+                warn!(%err, "dropping malformed streaming envelope");
+                return;
+            }
+        };
         match envelope.into_stream_event(&self.db).await {
             Ok(Some(event)) => {
                 let _sent = self.tx.send(Arc::new(event));
@@ -180,7 +195,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::streaming::hub::test_support::{event_on, lazy_pool, update_event};
+    use crate::streaming::hub::{
+        bridge::Envelope,
+        test_support::{event_on, lazy_pool, update_event},
+    };
 
     #[tokio::test]
     async fn publish_reaches_every_subscriber() {

@@ -137,7 +137,7 @@ mod tests {
     use super::*;
     use crate::streaming::hub::{
         MAX_NOTIFY_BYTES, RenderSpec,
-        bridge::{fetch_payload, store_payload},
+        bridge::{Envelope, fetch_payload, store_payload},
         test_support::{
             BRIDGE_WAIT, assert_single_delivery, await_payload, lazy_pool, render_event, settle,
             spawn_listener, update_event, warm_up,
@@ -269,12 +269,13 @@ mod tests {
         assert_eq!(
             stored.len(),
             1,
-            "the oversized body spilled to exactly one reference row"
+            "the oversized envelope spilled to exactly one reference row"
         );
+        let envelope: Envelope = serde_json::from_str(stored.first().unwrap()).unwrap();
         assert_eq!(
-            stored.first().unwrap().as_str(),
-            big.as_str(),
-            "and it holds the payload verbatim for every listener"
+            envelope.payload,
+            Value::String(big),
+            "and it holds the whole inline envelope, payload verbatim, for every listener"
         );
 
         drop(stop_a);
