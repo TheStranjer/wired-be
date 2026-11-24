@@ -279,7 +279,7 @@ async fn import_writes_manifests_for_loose_pack_directories() {
     std::fs::write(dir.path().join(".secret/x.png"), PNG_BYTES).unwrap();
     std::fs::write(dir.path().join("stray.png"), PNG_BYTES).unwrap();
     let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
-    let token = admin_token(&pool, "packimporter", "admin:read").await;
+    let token = admin_token(&pool, "packimporter", "admin:write").await;
 
     let response = common::TestRequest::get("/api/v1/pleroma/emoji/packs/import")
         .bearer(&token)
