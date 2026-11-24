@@ -11,19 +11,18 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{is_true, timeline_response},
+    api::{
+        helpers::{is_true, timeline_response},
+        lists::owned_list,
+    },
     auth::AuthUser,
     entities::status::Status as StatusEntity,
-    error::{AppError, AppResult},
-    models::{
-        list,
-        user::{Flag, User},
-    },
+    error::AppResult,
+    models::user::{Flag, User},
     oauth::scopes::{READ_LISTS, READ_STATUSES},
     pagination::PageParams,
     services::timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     state::AppState,
-    util::id::parse_id,
 };
 
 /// `GET /api/v1/timelines/direct` — the `direct` statuses the viewer
@@ -40,11 +39,11 @@ use crate::{
 ///
 /// # Errors
 ///
-/// [`AppError::Forbidden`] from [`AuthUser::require`] when the token lacks
-/// `read:statuses`; [`AppError::BadRequest`] from [`PageParams`] for a
+/// [`AppError::Forbidden`](crate::error::AppError::Forbidden) from [`AuthUser::require`] when the token lacks
+/// `read:statuses`; [`AppError::BadRequest`](crate::error::AppError::BadRequest) from [`PageParams`] for a
 /// malformed cursor. Any database failure arrives through `?` as
-/// [`AppError::Database`], and [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value
-/// that is not header-safe as [`AppError::Internal`].
+/// [`AppError::Database`](crate::error::AppError::Database), and [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value
+/// that is not header-safe as [`AppError::Internal`](crate::error::AppError::Internal).
 pub(super) async fn direct_timeline(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -115,14 +114,14 @@ impl DirectParams {
 ///
 /// # Errors
 ///
-/// [`AppError::Forbidden`] from [`AuthUser::require`] when the token lacks
-/// `read:lists`; [`AppError::NotFound`] when `list_id` is malformed, names
-/// no list or names another account's (see [`owned_list_id`], Pleroma
+/// [`AppError::Forbidden`](crate::error::AppError::Forbidden) from [`AuthUser::require`] when the token lacks
+/// `read:lists`; [`AppError::NotFound`](crate::error::AppError::NotFound) when `list_id` is malformed, names
+/// no list or names another account's (see [`owned_list`], Pleroma
 /// answering a foreign `fetch_activities` list with its generic 404);
-/// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor.
-/// Any database failure arrives through `?` as [`AppError::Database`], and
+/// [`AppError::BadRequest`](crate::error::AppError::BadRequest) from [`PageParams`] for a malformed cursor.
+/// Any database failure arrives through `?` as [`AppError::Database`](crate::error::AppError::Database), and
 /// [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value that is not header-safe as
-/// [`AppError::Internal`].
+/// [`AppError::Internal`](crate::error::AppError::Internal).
 pub(super) async fn list_timeline(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -131,27 +130,9 @@ pub(super) async fn list_timeline(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     auth.require(READ_LISTS)?;
-    let list_id = owned_list_id(&state, auth.0.id, &raw_id).await?;
+    let list_id = owned_list(&state, auth.0.id, &raw_id).await?;
     let query = ListParams::parse(uri.query()).into_timeline(list_id, auth.0, page);
     timeline_response(&state, &query, &uri).await
-}
-
-/// Resolves the `{list_id}` path segment to the id of a list `viewer_id`
-/// owns: [`parse_id`]'s malformed spelling, an unknown id and a foreign
-/// list are one and the same [`AppError::NotFound`] — Pleroma's
-/// `FallbackController` answer, and the same rule every list route in
-/// [`crate::api::lists`] lives by.
-async fn owned_list_id(state: &AppState, viewer_id: Uuid, raw: &str) -> AppResult<Uuid> {
-    let Some(list_id) = parse_id(raw) else {
-        return Err(AppError::NotFound);
-    };
-    if list::get_owned(&state.db, viewer_id, list_id)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound);
-    }
-    Ok(list_id)
 }
 
 /// The list timeline's request parameters beyond the [`PageParams`] page
@@ -186,7 +167,7 @@ impl ListParams {
     /// Assembles the [`TimelineQuery`] the request asks for:
     /// [`TimelineSource::List`] of `list_id` as `viewer` — who is always
     /// present because the route requires authentication, and whose list
-    /// `list_id` names because [`owned_list_id`] proved it — with the two
+    /// `list_id` names because [`owned_list`] proved it — with the two
     /// toggles set from the query.
     fn into_timeline(self, list_id: Uuid, viewer: User, page: PageParams) -> TimelineQuery {
         TimelineQuery {

@@ -308,7 +308,7 @@ async fn list_list_accounts(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require(READ_LISTS)?;
-    let list_id = owned_list(&state, &auth, &id).await?;
+    let list_id = owned_list(&state, auth.0.id, &id).await?;
     let page = OrdinalPageParams::from_query(uri.query(), MAX_LIMIT)?;
     let entries = list::members_page(&state.db, list_id, page).await?;
     debug!(
@@ -356,7 +356,7 @@ async fn add_list_accounts(
     ApiBody(body): ApiBody<MemberParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
-    let list_id = owned_list(&state, &auth, &id).await?;
+    let list_id = owned_list(&state, auth.0.id, &id).await?;
     let members = requested_accounts(&state, &body.account_ids).await?;
     ensure_followed(&state, auth.0.id, &members).await?;
     let added = list::add_members(&state.db, list_id, &members).await?;
@@ -392,7 +392,7 @@ async fn remove_list_accounts(
     ApiParams(params): ApiParams<MemberParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
-    let list_id = owned_list(&state, &auth, &id).await?;
+    let list_id = owned_list(&state, auth.0.id, &id).await?;
     let (members, _unknown_ignored) = distinct_ids(params.account_ids.iter().map(String::as_str));
     let removed = list::remove_members(&state.db, list_id, &members).await?;
     debug!(
@@ -404,23 +404,21 @@ async fn remove_list_accounts(
     Ok(empty_object())
 }
 
-/// The `{id}` path segment of a list route, resolved to the caller's list:
-/// [`AppError::NotFound`] for an id that is malformed, names no list or names
-/// one of another account — Pleroma's `list_by_id_and_user` plug, which
-/// answers all three the same way before any action runs.
+/// The `{id}` path segment of a list route, resolved to the list `owner`
+/// owns: [`AppError::NotFound`] for an id that is malformed, names no list or
+/// names one of another account — Pleroma's `list_by_id_and_user` plug, which
+/// answers all three the same way before any action runs. The list timeline
+/// resolves its `{list_id}` the same way.
 ///
 /// # Errors
 ///
 /// [`AppError::NotFound`] as described; any database failure arrives through
 /// `?` as [`AppError::Database`].
-async fn owned_list(state: &AppState, auth: &AuthUser, id: &str) -> AppResult<Uuid> {
+pub(crate) async fn owned_list(state: &AppState, owner: Uuid, id: &str) -> AppResult<Uuid> {
     let Some(list_id) = parse_id(id) else {
         return Err(AppError::NotFound);
     };
-    if list::get_owned(&state.db, auth.0.id, list_id)
-        .await?
-        .is_none()
-    {
+    if list::get_owned(&state.db, owner, list_id).await?.is_none() {
         return Err(AppError::NotFound);
     }
     Ok(list_id)
