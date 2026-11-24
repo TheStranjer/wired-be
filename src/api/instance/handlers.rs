@@ -5,16 +5,13 @@
 use axum::{Json, extract::State};
 use chrono::Utc;
 use serde_json::{Map, Value};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::PgPool;
 
 use crate::{
     config::Config,
     error::AppResult,
     federation::mrf::{self, Transparency},
-    models::{
-        instance_rule,
-        user::{NOT_INSTANCE_ACTOR, User},
-    },
+    models::{instance_rule, user::User},
     services::{
         instance_meta::{self, Federation, PLEROMA_COMPATIBILITY_VERSION},
         runtime_config::RuntimeConfig,
@@ -25,10 +22,10 @@ use crate::{
 };
 
 use super::{
-    FIRST_ADMIN_SQL, InstanceStats, MASTODON_API_LEVEL, PEER_LIMIT, PEERS_SQL, STATS_SQL_LOCAL,
-    STATS_SQL_REST,
+    FIRST_ADMIN_SQL, MASTODON_API_LEVEL, PEER_LIMIT, PEERS_SQL,
     domain_blocks::{DomainBlock, ExtendedDescription},
     pleroma::PleromaBlock,
+    stats::stats,
     v1::{Instance, Rule},
     v2::InstanceV2,
 };
@@ -41,15 +38,8 @@ use super::{
 /// Any database failure arrives through `?` as
 /// [`AppError::Database`](crate::error::AppError).
 pub(super) async fn show_instance(State(state): State<AppState>) -> AppResult<Json<Instance>> {
-    let now = Utc::now();
     let config = effective_instance_config(&state).await?;
-    let counters = if let Some(cached) = state.instance_stats_cache.get(now) {
-        cached
-    } else {
-        let fresh = read_stats(&state.db).await?;
-        state.instance_stats_cache.insert(now, fresh);
-        fresh
-    };
+    let counters = stats(&state).await?;
     let rules = instance_rule::list(&state.db).await?;
     let contact = read_first_admin(&state.db).await?;
     let vapid_key = vapid::vapid_public_key(&state.db).await?;
@@ -72,22 +62,6 @@ pub(super) async fn show_instance(State(state): State<AppState>) -> AppResult<Js
 /// and [`crate::api::nodeinfo`] builds its block from the same answer.
 async fn federation_block(state: &AppState) -> Federation {
     Federation::with_mrf(&mrf::describe(state).await)
-}
-
-/// The [`Instance`] `stats` counters, read live.
-///
-/// # Errors
-///
-/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
-async fn read_stats(pool: &PgPool) -> AppResult<InstanceStats> {
-    let mut builder = QueryBuilder::<Postgres>::new(STATS_SQL_LOCAL);
-    let _exclude: &mut _ = builder.push(NOT_INSTANCE_ACTOR);
-    let _rest: &mut _ = builder.push(STATS_SQL_REST);
-    let stats = builder
-        .build_query_as::<InstanceStats>()
-        .fetch_one(pool)
-        .await?;
-    Ok(stats)
 }
 
 /// The `Instance::contact_account` user row: the first active local

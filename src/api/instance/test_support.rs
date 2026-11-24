@@ -37,6 +37,8 @@ pub(super) fn empty_document() -> Value {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     serde_json::to_value(Instance::build(
         &config,

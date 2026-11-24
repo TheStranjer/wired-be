@@ -170,6 +170,8 @@ fn the_thumbnail_hangs_off_the_frontend_origin() {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     let v1 = serde_json::to_value(Instance::build(
         &config,
@@ -207,6 +209,8 @@ fn invites_enabled_mirrors_the_config() {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     let mut config = Config::for_tests();
     config.invites_enabled = Toggle::new(true);
@@ -244,6 +248,8 @@ fn registration_modes_mirror_the_config() {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     let mut config = Config::for_tests();
     for (approval, activation) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -355,6 +361,8 @@ fn limits_and_identity_follow_the_config() {
         users: 7,
         statuses: 11,
         domains: 3,
+        active_month: 2,
+        active_halfyear: 4,
     };
     let document = serde_json::to_value(Instance::build(
         &config,
@@ -425,6 +433,8 @@ fn empty_document_with_rules(rules: &[InstanceRule]) -> Instance {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     Instance::build(&config, &stats, rules, None, pleroma_block(&config))
 }
