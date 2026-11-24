@@ -28,8 +28,9 @@ async fn a_public_status_streams_create_edit_and_delete() {
     let id = id_of(&entity);
     let created = next_json(&mut client).await;
     assert_eq!(created["event"], "update", "the create arrives as update");
-    assert!(
-        streams_of(&created).contains(&"public"),
+    assert_eq!(
+        streams_of(&created),
+        ["public"],
         "it rides the public stream: {created}"
     );
     let payload = frame_payload(&created);
@@ -107,8 +108,9 @@ async fn hashtag_frames_subscribe_and_unsubscribe_a_live_socket() {
     let first = id_of(&post_status(&srv, &author_token, "#Alpha one", "public").await);
     let arrived = next_json(&mut client).await;
     assert_eq!(arrived["event"], "update", "the tagged post arrives");
-    assert!(
-        streams_of(&arrived).contains(&"hashtag:alpha"),
+    assert_eq!(
+        streams_of(&arrived),
+        ["hashtag", "alpha"],
         "on the tag its query string opened: {arrived}"
     );
 
@@ -193,8 +195,9 @@ async fn public_local_carries_local_posts_to_authenticated_unfiltered_viewers() 
     let local_id = id_of(&local_post);
     let seen = next_json(&mut watcher_socket).await;
     assert_eq!(seen["event"], "update", "the local viewer sees the post");
-    assert!(
-        streams_of(&seen).contains(&"public:local"),
+    assert_eq!(
+        streams_of(&seen),
+        ["public:local"],
         "on the local timeline: {seen}"
     );
     assert!(
@@ -268,14 +271,24 @@ async fn home_and_list_sockets_stream_the_followed_and_listed_post() {
     let id = id_of(&post_status(&srv, &author_token, "for home and list", "public").await);
     let home_frame = read_until_json(&mut home, &id).await;
     assert_eq!(home_frame["event"], "update", "the home socket sees it");
+    assert_eq!(
+        streams_of(&home_frame),
+        ["user"],
+        "riding the follower's own user stream, by its public name: {home_frame}"
+    );
     assert!(
-        streams_of(&home_frame).contains(&held_home.as_str()),
-        "riding the follower's own user stream: {home_frame}"
+        !home_frame.to_string().contains(held_home.as_str()),
+        "and never the internal uuid-named one: {home_frame}"
     );
     let list_frame = read_until_json(&mut list_socket, &id).await;
     assert_eq!(list_frame["event"], "update", "the list socket sees it too");
+    assert_eq!(
+        streams_of(&list_frame),
+        ["list", list_id.to_string().as_str()],
+        "on its list stream, as `[\"list\", id]`: {list_frame}"
+    );
     assert!(
-        streams_of(&list_frame).contains(&held_list.as_str()),
-        "on its list stream: {list_frame}"
+        !list_frame.to_string().contains(held_list.as_str()),
+        "not under the internal `list:<id>` name: {list_frame}"
     );
 }

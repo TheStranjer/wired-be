@@ -66,7 +66,7 @@ mod tests {
     use crate::{
         api::streaming::{
             names::DIRECT,
-            test_support::{account, for_reader, frame_payload, state},
+            test_support::{FrameFor as _, account, for_reader, frame_payload, state},
         },
         config::TEST_BASE_URL,
         models::{

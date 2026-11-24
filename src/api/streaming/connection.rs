@@ -29,7 +29,7 @@ use crate::{
     models::{list, user::User},
     oauth::scopes::{READ_LISTS, Scopes},
     state::AppState,
-    streaming::hub::{StreamEvent, stream_matches},
+    streaming::hub::{StreamEvent, matched_streams, public_stream_name},
 };
 
 use super::{
@@ -274,11 +274,15 @@ impl Connection {
         self.reader.as_ref().map(Arc::as_ref)
     }
 
-    /// The frame to write for `event`, `None` when this connection may not
-    /// see it: no subscribed stream, an audience it is outside, a
-    /// `local_only` event with no reader to be local for, a reader whose
-    /// filters suppress the entity, or a [`RenderSpec`] hint this
-    /// socket cannot answer for its own viewer.
+    /// The frames to write for `event`: one per subscription of this socket
+    /// the event belongs to, each naming only that subscription in its
+    /// public form (`["user"]`, `["hashtag","rust"]`, …, see
+    /// [`public_stream_name`]) — never the event's internal routing list.
+    /// Empty when this connection may not see the event: no subscribed
+    /// stream, an audience it is outside, a `local_only` event with no
+    /// reader to be local for, a reader whose filters suppress the entity,
+    /// or a [`RenderSpec`] hint this socket cannot answer for its own
+    /// viewer.
     ///
     /// An event that carries its entity as `payload` is written as it is.
     /// An event that carries a [`RenderSpec`] hint instead — what
@@ -296,29 +300,30 @@ impl Connection {
     /// [`status_created`]: crate::services::streaming::status_created
     /// [`status_edited`]: crate::services::streaming::status_edited
     /// [`RenderSpec`]: crate::streaming::hub::RenderSpec
-    pub(super) async fn frame_for(&self, event: &StreamEvent) -> Option<String> {
-        if !stream_matches(&self.subscriptions, event)
-            || !audience_allows(self, event)
-            || !local_allows(self, event)
-        {
-            return None;
+    pub(super) async fn frames_for(&self, event: &StreamEvent) -> Vec<String> {
+        let matched = matched_streams(&self.subscriptions, event);
+        if matched.is_empty() || !audience_allows(self, event) || !local_allows(self, event) {
+            return Vec::new();
         }
-        let payload = payload_for(self, event).await?;
-        if self.filters.suppresses(payload.as_deref()) {
-            return None;
-        }
-        let frame = Frame {
-            stream: event.streams.as_slice(),
-            event: event.event.as_str(),
-            payload: payload.as_deref(),
+        let Some(payload) = payload_for(self, event).await else {
+            return Vec::new();
         };
-        match serde_json::to_string(&frame) {
-            Ok(text) => Some(text),
-            Err(err) => {
-                warn!(%err, "streaming frame could not be serialized");
-                None
+        if self.filters.suppresses(payload.as_deref()) {
+            return Vec::new();
+        }
+        let mut frames = Vec::with_capacity(matched.len());
+        for internal in matched {
+            let frame = Frame {
+                stream: public_stream_name(internal),
+                event: event.event.as_str(),
+                payload: payload.as_deref(),
+            };
+            match serde_json::to_string(&frame) {
+                Ok(text) => frames.push(text),
+                Err(err) => warn!(%err, "streaming frame could not be serialized"),
             }
         }
+        frames
     }
 }
 

@@ -116,12 +116,14 @@ impl ClientMessage {
 }
 
 /// One frame written to the socket, in the shape Mastodon's streaming clients
-/// read: the streams the event belongs to, the event name, and the entity as a
+/// read: the stream the frame is for, the event name, and the entity as a
 /// JSON *string* the client parses again.
 #[derive(Debug, Serialize)]
 pub(super) struct Frame<'event> {
-    /// The event's own stream names, as published (Mastodon's `stream` array).
-    pub(super) stream: &'event [String],
+    /// The public name of the one subscription this frame answers
+    /// (Mastodon's `stream` array: `["user"]`, `["hashtag","rust"]`, …) —
+    /// never the internal per-reader hub name.
+    pub(super) stream: Vec<String>,
     /// `update`, `delete`, `notification`, `status.update`, …
     pub(super) event: &'event str,
     /// The entity as its JSON text; a `delete` event carries the deleted

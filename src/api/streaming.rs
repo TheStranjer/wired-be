@@ -12,8 +12,12 @@
 //! - **a reader of the hub**. Every connection takes a
 //!   [`Hub::subscribe`](crate::streaming::hub::Hub::subscribe) receiver and
 //!   forwards the events it may see as Mastodon's text frame,
-//!   `{"stream":["user:<reader uuid>"],"event":"update","payload":"<json
-//!   string>"}`. An event passes when [`stream_matches`] finds one of the
+//!   `{"stream":["user"],"event":"update","payload":"<json string>"}`. The
+//!   frame's `stream` is the public name ([`public_stream_name`]) of the one
+//!   subscription it answers — an event on several of the socket's
+//!   subscriptions is written once per subscription, and never carries the
+//!   hub's per-reader `user:<uuid>` names. An event passes when
+//!   [`stream_matches`] finds one of the
 //!   connection's subscriptions on it, its [`Audience`] covers the socket's
 //!   reader (a `Users` event reaches those users only), a `local_only` event
 //!   has a reader at all — an anonymous socket never sees one — and the
@@ -61,6 +65,7 @@
 //! together. `test_support` holds the fixtures the unit tests share.
 //!
 //! [`stream_matches`]: crate::streaming::hub::stream_matches
+//! [`public_stream_name`]: crate::streaming::hub::public_stream_name
 //! [`Audience`]: crate::streaming::hub::Audience
 //! [`User`]: crate::models::user::User
 //! [`render_status`]: crate::services::render_status::render_status
