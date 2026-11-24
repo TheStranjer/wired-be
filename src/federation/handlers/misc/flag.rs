@@ -65,7 +65,7 @@ async fn apply_flag(
             "a Flag whose object names no local account",
         ));
     };
-    let status_ids = cited_statuses(&state.db, &objects, account_index)
+    let status_ids = cited_statuses(&state.db, &objects, account_index, &target)
         .await
         .map_err(|err| {
             FederationError::transient("could not fold the remote activity's cited statuses", &err)
@@ -106,22 +106,32 @@ async fn apply_flag(
     Ok(Outcome::Handled)
 }
 
-/// The stored statuses a `Flag` cites: every object id but the reported
-/// account's that is the `uri` of a status this instance keeps
-/// ([`status::get_by_uri`], the uri-as-identity rule of decision 6). An id
-/// nothing stores is silently dropped — the fetch ticket gives unknown
-/// statuses a home later; a report's context only ever names what is here.
+/// How many of a `Flag`'s object ids are looked up at most: the object list
+/// is remote-controlled and each id costs a query, so ids past this many are
+/// ignored.
+const MAX_FLAG_OBJECTS: usize = 100;
+
+/// The stored statuses a `Flag` cites: among the first [`MAX_FLAG_OBJECTS`]
+/// object ids, every one but the reported account's that is the `uri` of a
+/// status this instance keeps ([`status::get_by_uri`], the uri-as-identity
+/// rule of decision 6) and that `target` authored — a status of anyone else
+/// is not the reported account's and never joins the report. An id nothing
+/// stores is silently dropped — the fetch ticket gives unknown statuses a
+/// home later; a report's context only ever names what is here.
 async fn cited_statuses(
     pool: &PgPool,
     ids: &[String],
     account_index: usize,
+    target: &User,
 ) -> AppResult<Vec<Uuid>> {
     let mut cited = Vec::new();
-    for (index, id) in ids.iter().enumerate() {
+    for (index, id) in ids.iter().enumerate().take(MAX_FLAG_OBJECTS) {
         if index == account_index {
             continue;
         }
-        if let Some(stored) = status::get_by_uri(pool, id).await? {
+        if let Some(stored) = status::get_by_uri(pool, id).await?
+            && stored.user_id == target.id
+        {
             cited.push(stored.id);
         }
     }
@@ -229,6 +239,81 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "the bystander's status is not cited"
+        );
+    }
+
+    /// A `Flag` citing the target's post beside another local account's:
+    /// only the target's own status is attached to the report.
+    #[tokio::test]
+    async fn a_flag_citing_another_accounts_status_attaches_only_the_targets_own() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = remote_signer(&pool).await;
+        let target = local_user(&pool, "flag-own-target").await;
+        let other = local_user(&pool, "flag-own-other").await;
+        let own = local_post(&pool, &target, "the target's post").await;
+        let foreign = local_post(&pool, &other, "someone else's post").await;
+
+        let filed = handle_flag(
+            state,
+            view(
+                "Flag",
+                "flag-6",
+                ALICE,
+                json!({ "object": [target.ap_id.clone(), foreign.uri.clone(), own.uri.clone()] }),
+            ),
+            alice,
+        )
+        .await;
+        assert_handled(&filed);
+
+        let rows = stored_reports(&pool).await;
+        assert_eq!(rows.len(), 1, "the Flag files one report");
+        assert_eq!(rows[0].target_id, target.id, "about the local account");
+        assert_eq!(
+            report::statuses_for(&pool, rows[0].id).await.unwrap(),
+            vec![own.id],
+            "only the target's own status is attached"
+        );
+    }
+
+    /// A `Flag` listing more objects than the cap looks up no id past it:
+    /// the target's post inside the cap is cited, the one beyond is not.
+    #[tokio::test]
+    async fn a_flag_with_more_than_the_cap_objects_attaches_at_most_the_cap() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = remote_signer(&pool).await;
+        let target = local_user(&pool, "flag-cap-target").await;
+        let inside = local_post(&pool, &target, "inside the cap").await;
+        let beyond = local_post(&pool, &target, "beyond the cap").await;
+
+        let mut objects = vec![target.ap_id.clone(), inside.uri.clone()];
+        while objects.len() < MAX_FLAG_OBJECTS {
+            objects.push(format!(
+                "https://peer.example/posts/filler-{}",
+                objects.len()
+            ));
+        }
+        objects.push(beyond.uri.clone());
+        assert_eq!(objects.len(), MAX_FLAG_OBJECTS + 1, "one id past the cap");
+
+        let filed = handle_flag(
+            state,
+            view("Flag", "flag-7", ALICE, json!({ "object": objects })),
+            alice,
+        )
+        .await;
+        assert_handled(&filed);
+
+        let rows = stored_reports(&pool).await;
+        assert_eq!(rows.len(), 1, "the Flag files one report");
+        assert_eq!(
+            report::statuses_for(&pool, rows[0].id).await.unwrap(),
+            vec![inside.id],
+            "the id past the cap is never looked up"
         );
     }
 
