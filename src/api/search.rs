@@ -12,7 +12,8 @@
 //! [`crate::models::status_search`] and [`crate::models::hashtag`].
 //!
 //! Authentication is [`MaybeAuthUser`] with the `read:accounts` scope
-//! enforced on a presented user token
+//! (the combined `/api/v1/search` and `/api/v2/search` documents demand
+//! `read:search` instead) enforced on a presented user token
 //! ([`require_user_scope`](MaybeAuthUser::require_user_scope)), exactly
 //! Pleroma's `OAuthScopesPlug … fallback: :proceed_unauthenticated`: an
 //! anonymous request searches the stored, active accounts and the hashtag
@@ -110,7 +111,7 @@ use crate::{
     entities::{account::Account, status::Status as StatusEntity},
     error::{AppError, AppResult},
     models::user::User,
-    oauth::scopes::READ_ACCOUNTS,
+    oauth::scopes::{READ_ACCOUNTS, READ_SEARCH},
     state::AppState,
 };
 
@@ -336,14 +337,15 @@ async fn search_v2(
 ///
 /// # Errors
 ///
-/// Exactly those of [`account_search`].
+/// Exactly those of [`account_search`], except that a presented user token
+/// must grant `read:search` rather than `read:accounts`.
 async fn search_document(
     state: AppState,
     auth: MaybeAuthUser,
     uri: Uri,
     version: Version,
 ) -> AppResult<Json<SearchResults>> {
-    auth.require_user_scope(READ_ACCOUNTS)?;
+    auth.require_user_scope(READ_SEARCH)?;
     let params = SearchParams::parse(uri.query())?;
     refuse_anonymous_offset(&auth, &params)?;
     let viewer: Option<&User> = auth.0.as_ref();
