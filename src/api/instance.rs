@@ -3,8 +3,11 @@
 //!
 //! `GET /api/v1/instance` and `GET /api/v2/instance` serve the document —
 //! identity, limits, statistics and rules — while `peers`, `rules`,
-//! `domain_blocks`, `translation_languages`, `activity` and
-//! `extended_description` each serve one of its sub-resources.
+//! `domain_blocks`, `translation_languages`, `activity`,
+//! `extended_description` and `terms_of_service` each serve one of its
+//! sub-resources; `terms_of_service` answers the admin-uploaded
+//! `terms-of-service` instance document as JSON (`updated_at`,
+//! `content`).
 //!
 //! The reference is Pleroma's `InstanceController` and `InstanceView`
 //! (`lib/pleroma/web/mastodon_api/controllers/instance_controller.ex`,
@@ -46,9 +49,9 @@
 //! The module is split by concern: `handlers` holds the endpoint functions,
 //! `v1` the `/api/v1/instance` document, `v2` the `/api/v2/instance`
 //! document, `pleroma` the extension block both documents carry, `stats` the cached
-//! counters (shared with `NodeInfo`) and `domain_blocks` the domain-block and
-//! extended-description views. This file keeps the shared constants, the
-//! remaining SQL and the two routers.
+//! counters (shared with `NodeInfo`), `domain_blocks` the domain-block and
+//! extended-description views and `terms` the terms-of-service view. This
+//! file keeps the shared constants, the remaining SQL and the two routers.
 //!
 //! [`TimedCache`]: crate::util::cache::TimedCache
 //! [`LANGUAGES_TTL`]: crate::services::translate::LANGUAGES_TTL
@@ -61,6 +64,7 @@ mod domain_blocks;
 mod handlers;
 mod pleroma;
 mod stats;
+mod terms;
 #[cfg(test)]
 mod test_support;
 mod v1;
@@ -71,6 +75,7 @@ use handlers::{
     show_peers, show_rules, show_translation_languages,
 };
 pub use stats::{InstanceStats, InstanceStatsCache, STATS_TTL, stats, stats_at};
+use terms::show_terms_of_service;
 
 /// The Mastodon API level this endpoint claims compatibility with
 /// (Pleroma's `@mastodon_api_level`, `instance_view.ex`).
@@ -147,6 +152,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/instance/peers", get(show_peers))
         .route("/instance/rules", get(show_rules))
+        .route("/instance/terms_of_service", get(show_terms_of_service))
         .route(
             "/instance/translation_languages",
             get(show_translation_languages),

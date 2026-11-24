@@ -185,9 +185,4 @@ pub(super) const ROWS: &[RouteSpec] = &[
         path: "/emoji/:pack/:file",
         auth: AuthClass::Public,
     },
-    RouteSpec {
-        method: "GET",
-        path: "/instance/:name.html",
-        auth: AuthClass::Public,
-    },
 ];

@@ -52,9 +52,8 @@
 //! (`GET /users` and `GET /users/{nickname}`, WBE-195) as the [`users`]
 //! submodule, the OAuth-app maintenance and instance-document
 //! endpoints (`/oauth_app` and its `{id}` actions, the
-//! `/instance_document/{name}` trio, and — riding on [`crate::app`] at
-//! the root like the registration link — the public
-//! `GET /instance/{name}.html`, WBE-205) as the [`apps_docs`] submodule,
+//! `/instance_document/{name}` trio, WBE-205) as the [`apps_docs`]
+//! submodule,
 //! and the federation maintenance routes (the `/relay` ledger trio,
 //! `DELETE /instances/{instance}` and `POST /reload_emoji`, WBE-203) as
 //! the [`federation`] submodule, and the admin reports surface — the

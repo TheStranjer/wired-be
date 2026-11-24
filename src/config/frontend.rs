@@ -106,7 +106,7 @@ pub struct InstanceDocumentSettings {
     /// Directory the `<name>.html` documents are stored in, from
     /// `INSTANCE_DOCS_DIR`.
     pub dir: PathBuf,
-    /// The document names the admin and public routes serve, from
+    /// The document names the admin document routes accept, from
     /// `INSTANCE_DOCUMENT_NAMES`; the names outside this list are the
     /// routes' 404.
     pub names: Vec<String>,
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_documents_default_to_the_stock_pair_and_directory() {
+    fn instance_documents_default_to_the_terms_and_directory() {
         let config = config_with(&[]);
         assert_eq!(
             config.statics.documents.dir,
@@ -256,8 +256,8 @@ mod tests {
         );
         assert_eq!(
             config.statics.documents.names,
-            vec!["terms-of-service".to_owned(), "instance-panel".to_owned()],
-            "the two documents Pleroma's InstanceDocument map knows"
+            vec!["terms-of-service".to_owned()],
+            "only the document the JSON API reads"
         );
         let blank = config_with(&[(INSTANCE_DOCUMENT_NAMES_VAR, "  ")]);
         assert!(

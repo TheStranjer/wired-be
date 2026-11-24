@@ -131,9 +131,9 @@ async fn descriptions_answer_the_whitelist(app: &Router, token: &str) {
     );
 }
 
-/// The instance-document cycle: the multipart upload answers the public
-/// url, the public route serves the bytes with the document CSP, and the
-/// delete takes it back down.
+/// The instance-document cycle: the multipart upload answers the
+/// frontend url, the public JSON endpoint serves the text, the retired HTML
+/// route is the fallback 404, and the delete takes it back down.
 async fn instance_document_round_trip(world: &World) {
     let upload =
         common::TestRequest::patch(&format!("{P_ADMIN}/instance_document/terms-of-service"))
@@ -153,17 +153,18 @@ async fn instance_document_round_trip(world: &World) {
     assert_eq!(
         upload.json_value()["url"],
         json!(format!("{BASE}/instance/terms-of-service.html")),
-        "the answer names the public url"
+        "the answer names the frontend url"
     );
 
-    let served = common::api_get(&world.app, None, "/instance/terms-of-service.html").await;
+    let served = common::api_get(&world.app, None, "/api/v1/instance/terms_of_service").await;
     common::assert_answer(&served, StatusCode::OK, "the public document read");
-    assert_eq!(served.text(), "<h1>Terms</h1>", "the bytes round-trip");
     assert_eq!(
-        served.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "served as html"
+        served.json_value()["content"],
+        json!("<h1>Terms</h1>"),
+        "the text round-trips"
     );
+    let retired = common::api_get(&world.app, None, "/instance/terms-of-service.html").await;
+    common::assert_answer(&retired, StatusCode::NOT_FOUND, "no html page is served");
 
     let deleted = common::api_delete(
         &world.app,
@@ -173,7 +174,7 @@ async fn instance_document_round_trip(world: &World) {
     )
     .await;
     common::assert_answer(&deleted, StatusCode::OK, "the document delete");
-    let gone = common::api_get(&world.app, None, "/instance/terms-of-service.html").await;
+    let gone = common::api_get(&world.app, None, "/api/v1/instance/terms_of_service").await;
     common::assert_answer(
         &gone,
         StatusCode::NOT_FOUND,
