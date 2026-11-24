@@ -90,10 +90,8 @@ pub(crate) async fn fetch_document(
     let mut headers = vec![("accept", ACTOR_ACCEPT)];
     if let Some(signed) = &signed_request {
         // Host is sent explicitly so the peer sees exactly the host that
-        // was signed (see `HttpClient::signed_get`).
-        headers.push(("host", &signed.host));
-        headers.push(("date", &signed.date));
-        headers.push(("signature", &signed.signature));
+        // was signed.
+        headers.extend(signed.header_pairs());
     }
     let response = http.get_limited(url, &headers, max_bytes).await?;
     if response.status == STATUS_GONE {

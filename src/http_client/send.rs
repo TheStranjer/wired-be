@@ -14,7 +14,6 @@ mod tests {
 
     use crate::http_client::test_support::*;
     use crate::http_client::*;
-    use crate::util::keys::FIXTURE_PRIVATE_PKCS1_PEM;
 
     #[tokio::test]
     async fn get_sends_the_configured_user_agent() {
@@ -349,26 +348,6 @@ mod tests {
 
         let roomy = client.request(purge, &url, &[], 4096).await.unwrap();
         assert_eq!(roomy.body.len(), 2048, "the same answer fits a 4 KiB cap");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn signed_get_caps_the_response_body() {
-        let listener = bind().await;
-        let url = url_for(&listener, "/answer");
-        let server = spawn_server(listener, Router::new().route("/answer", get(two_kib)));
-        let client = HttpClient::new_for_tests(TEST_UA);
-
-        let tight = client
-            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM, 1024)
-            .await;
-        assert_eq!(tight.unwrap_err(), HttpError::TooLarge, "over the cap");
-
-        let roomy = client
-            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM, 4096)
-            .await
-            .unwrap();
-        assert_eq!(roomy.body.len(), 2048, "under the cap");
         server.abort();
     }
 }

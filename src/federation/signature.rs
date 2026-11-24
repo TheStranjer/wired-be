@@ -85,6 +85,23 @@ pub struct SignedHeaders {
     pub signature: String,
 }
 
+impl SignedHeaders {
+    /// The headers to put on the wire, as `(name, value)` pairs in this
+    /// order: `host`, `date`, `digest` (only when the request has a body)
+    /// and `signature`. `host` is sent explicitly so the peer sees exactly
+    /// the authority that was signed. The caller adds its own `accept` and,
+    /// for a body, `content-type`.
+    #[must_use]
+    pub fn header_pairs(&self) -> Vec<(&str, &str)> {
+        let mut pairs = vec![("host", self.host.as_str()), ("date", self.date.as_str())];
+        if let Some(digest) = self.digest.as_deref() {
+            pairs.push(("digest", digest));
+        }
+        pairs.push(("signature", self.signature.as_str()));
+        pairs
+    }
+}
+
 /// Computes the `Digest` header value for `body`:
 /// `SHA-256=<base64 of the SHA-256 hash>`, the only digest form Mastodon
 /// and Pleroma accept.
@@ -382,6 +399,49 @@ mod tests {
         assert!(
             !verify_sha256(&keys().public_pem, tampered.as_bytes(), &signature),
             "a different digest invalidates the signature"
+        );
+    }
+
+    #[test]
+    fn header_pairs_of_a_post_carry_the_signed_values_in_order() {
+        let signed = sign_request(
+            "POST",
+            "http://peer.example:4436/inbox",
+            Some(BODY),
+            &signing_key(&keys().private_pem),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            signed.header_pairs(),
+            vec![
+                ("host", "peer.example:4436"),
+                ("date", NOW_FIXDATE),
+                ("digest", HELLO_DIGEST),
+                ("signature", signed.signature.as_str()),
+            ],
+            "host equals the signed host, then date, digest and signature"
+        );
+    }
+
+    #[test]
+    fn header_pairs_of_a_get_omit_the_digest() {
+        let signed = sign_request(
+            "GET",
+            "https://peer.example/users/alice",
+            None,
+            &signing_key(&keys().private_pem),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            signed.header_pairs(),
+            vec![
+                ("host", "peer.example"),
+                ("date", NOW_FIXDATE),
+                ("signature", signed.signature.as_str()),
+            ],
+            "a bodyless request sends no Digest"
         );
     }
 

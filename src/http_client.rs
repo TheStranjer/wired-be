@@ -12,7 +12,7 @@
 //! guard is on by default and is disabled only by
 //! `HTTP_ALLOW_PRIVATE_HOSTS` (see [`crate::config`]).
 //!
-//! The module is a tree: `headers` holds the header-map, signing and
+//! The module is a tree: `headers` holds the header-map and
 //! body-reading helpers, `response` the [`HttpResponse`] type and `error`
 //! the [`HttpError`] type. The [`HttpClient`] type keeps its one inherent
 //! `impl` block here, so `send` is the child carrying the request-sending
@@ -38,7 +38,7 @@ use url::Url;
 
 use crate::config::Config;
 
-use self::headers::{ap_headers, header_map, read_body, sign_for_send};
+use self::headers::{header_map, read_body};
 
 pub use self::{error::HttpError, response::HttpResponse, ssrf::is_blocked_ip};
 
@@ -56,9 +56,6 @@ pub const DEFAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 const ERROR_STATUS_MIN: u16 = 400;
 /// Product name the instance identifies itself with in `User-Agent`.
 const USER_AGENT_NAME: &str = "Wired";
-/// Media type federation peers speak: sent as `Content-Type` on signed
-/// POSTs and asked for via `Accept` on signed GETs.
-const ACTIVITY_JSON: &str = "application/activity+json";
 
 /// Formats the instance `User-Agent` header value:
 /// `Wired (<BASE_URL>)`, with `; contact <CONTACT_EMAIL>` appended when a
@@ -293,58 +290,6 @@ impl HttpClient {
             guard.check_target(&parsed).await?;
         }
         Ok(builder)
-    }
-
-    /// Fetches `url` with a `GET` HTTP-signed by the actor key
-    /// `key_id`/`private_pem` (see [`crate::federation::signature`]):
-    /// `Accept: application/activity+json` plus the signed `Host`, `Date`
-    /// and `Signature` headers. This is the shape of an authorized-fetch
-    /// or remote-actor dereference.
-    ///
-    /// # Errors
-    ///
-    /// [`HttpError::Connect`] if the request cannot be signed (`url` is not
-    /// a signable http(s) URL, or `private_pem` does not parse), otherwise
-    /// the same as [`HttpClient::get_limited`], with the response body
-    /// capped at `max_bytes`.
-    pub async fn signed_get(
-        &self,
-        url: &str,
-        key_id: &str,
-        private_pem: &str,
-        max_bytes: usize,
-    ) -> Result<HttpResponse, HttpError> {
-        let signed = sign_for_send("GET", url, None, key_id, private_pem)?;
-        self.get_limited(url, &ap_headers(&signed, false), max_bytes)
-            .await
-    }
-
-    /// Delivers `body` to `url` with a HTTP-signed `POST`:
-    /// `Accept` and `Content-Type` of `application/activity+json` plus the
-    /// signed `Host`, `Date`, `Digest` and `Signature` headers. This is the
-    /// shape of an inbox delivery.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`HttpClient::signed_get`] (with `url` also checked for
-    /// signability before anything is sent), then the same as
-    /// [`HttpClient::post_bytes`], the response body capped at
-    /// [`DEFAULT_RESPONSE_BYTES`].
-    pub async fn signed_post(
-        &self,
-        url: &str,
-        body: &[u8],
-        key_id: &str,
-        private_pem: &str,
-    ) -> Result<HttpResponse, HttpError> {
-        let signed = sign_for_send("POST", url, Some(body), key_id, private_pem)?;
-        self.post_bytes(
-            url,
-            &ap_headers(&signed, true),
-            body.to_vec(),
-            DEFAULT_RESPONSE_BYTES,
-        )
-        .await
     }
 }
 

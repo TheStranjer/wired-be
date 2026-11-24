@@ -22,6 +22,7 @@ mod tests {
         },
         signature::digest_header,
     };
+    use crate::util::url::{host_with_port, parse_http_url};
 
     #[tokio::test]
     async fn a_signed_delivery_verifies_at_the_peer_and_completes() {
@@ -126,9 +127,17 @@ mod tests {
             !header_text(&headers, "signature").is_empty(),
             "a Signature header"
         );
-        assert!(
-            !header_text(&headers, "host").is_empty(),
-            "the client fills Host, which is why it is not sent by hand"
+        let inbox_url = parse_http_url(&inbox).expect("the mock inbox is an http URL");
+        assert_eq!(
+            header_text(&headers, "host"),
+            host_with_port(&inbox_url),
+            "the Host header arrives and equals the host that was signed"
+        );
+        let body = observable.body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            header_text(&headers, "digest"),
+            digest_header(&body),
+            "the Digest header matches the body the peer received"
         );
     }
 }
