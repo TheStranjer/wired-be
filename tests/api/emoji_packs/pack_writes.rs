@@ -45,7 +45,11 @@ async fn create_writes_the_default_manifest_once_per_pack() {
         .json_value();
     assert_eq!(
         shown,
-        json!({"pack": {"share-files": false}, "files": {}, "files_count": 0}),
+        json!({
+            "pack": {"share-files": false, "can-download": false},
+            "files": {},
+            "files_count": 0,
+        }),
         "the fresh pack reads back empty and unshared"
     );
     let twice = common::TestRequest::post("/api/v1/pleroma/emoji/pack?name=fresh")
