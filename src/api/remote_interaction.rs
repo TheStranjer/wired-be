@@ -101,11 +101,9 @@ const REMOTE_SUBSCRIBE_PATH: &str = "/main/ostatus";
 /// The media type of every page this module renders.
 const PAGE_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 /// The `Content-Security-Policy` of every page: no scripts, inline CSS
-/// only and a form submit to this same origin. Unlike the API's helper
-/// pages (whose `default-src 'none'` with no `form-action` lives in
-/// [`crate::api::html_pages`]), these pages exist to submit a form, and
-/// a policy without the `form-action 'self'` arm would have the browser
-/// refuse it.
+/// only and a form submit to this same origin. These pages exist to
+/// submit a form, and a policy without the `form-action 'self'` arm would
+/// have the browser refuse it.
 const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
 /// The one inline stylesheet [`page_document`] embeds (the CSP allows no
 /// other).

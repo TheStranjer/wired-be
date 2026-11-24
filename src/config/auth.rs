@@ -1,6 +1,5 @@
-//! Reads the account settings: the HMAC signing secret, the registration
-//! gates that are not modes, the token lifetimes, and the external OAuth
-//! login providers.
+//! Reads the account settings: the registration gates that are not modes,
+//! the token lifetimes, and the external OAuth login providers.
 
 #[cfg(doc)]
 use super::Config;
@@ -14,24 +13,12 @@ use super::{
     error::ConfigError,
     federation_types::Toggle,
     integrations::OauthProvider,
-    parse::{boolean, number, trimmed},
+    parse::{boolean, number},
     vars::{
         ACCOUNTS_EMAIL_OPTIONAL_VAR, ALLOW_ACCOUNT_DELETION_VAR, MIN_PASSWORD_LENGTH_VAR,
         OAUTH_PROVIDERS_VAR, OAUTH_TOKEN_TTL_SECS_VAR, PASSWORD_RESET_TTL_SECS_VAR,
-        SECRET_KEY_BASE_VAR,
     },
 };
-
-/// Reads `SECRET_KEY_BASE`: the trimmed signing secret, `None` when the
-/// variable is unset or blank, in which case [`serve`](crate::serve)
-/// fills the field with a secret generated for the boot. Read through its
-/// own fn because [`Config::from_lookup`] has a size budget (AGENTS.md).
-pub(crate) fn secret_key_base<F>(lookup: &F) -> Option<String>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    trimmed(lookup, SECRET_KEY_BASE_VAR)
-}
 
 /// What [`auth_settings`] reads: the six settings that gate
 /// registration, token issuance, password resets, the external logins and
@@ -125,42 +112,17 @@ mod tests {
 
     use crate::config::test_support::{config_with, try_config_with};
 
+    /// No signing secret is configured or read any more: the config loads
+    /// from an empty environment (the old field no longer exists, which the
+    /// compiler checks) and its `Debug` document names no such field.
     #[test]
-    fn secret_key_base_defaults_to_unset() {
-        let config = config_with(&[]);
-        assert_eq!(
-            config.secret_key_base, None,
-            "no signing secret unless configured"
-        );
-    }
-
-    #[test]
-    fn reads_custom_secret_key_base() {
-        let config = config_with(&[(SECRET_KEY_BASE_VAR, "  a-signing-secret  ")]);
-        assert_eq!(
-            config.secret_key_base.as_deref(),
-            Some("a-signing-secret"),
-            "the secret is trimmed"
-        );
-    }
-
-    #[test]
-    fn blank_secret_key_base_reads_as_unset() {
-        let config = config_with(&[(SECRET_KEY_BASE_VAR, "   ")]);
-        assert_eq!(config.secret_key_base, None, "a blank secret is no secret");
-    }
-
-    #[test]
-    fn debug_redacts_the_secret_key_base() {
-        let config = config_with(&[(SECRET_KEY_BASE_VAR, "a-signing-secret")]);
-        let debug = format!("{config:?}");
+    fn config_loads_without_any_signing_secret() {
+        let config = try_config_with(&[]);
+        let loaded = config.expect("an empty environment still loads");
+        let debug = format!("{loaded:?}");
         assert!(
-            !debug.contains("a-signing-secret"),
-            "the signing secret must not leak: {debug}"
-        );
-        assert!(
-            debug.contains(r#"secret_key_base: Some("<redacted>")"#),
-            "the marker names the field: {debug}"
+            !debug.contains("secret_key"),
+            "no signing-secret field is left: {debug}"
         );
     }
 

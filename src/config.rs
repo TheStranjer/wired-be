@@ -23,7 +23,6 @@ use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf};
 use crate::jobs::DEFAULT_JOB_QUEUES;
 
 use self::{
-    auth::secret_key_base,
     exposure::{groups, translation_settings, vapid_settings},
     federation::{
         accept_unsolicited_public, federation_enabled, mrf_settings, rate_limit_settings,
@@ -152,7 +151,6 @@ impl Config {
             smtp_password: mail.password,
             smtp_tls: mail.tls,
             mail_from: mail.from,
-            secret_key_base: secret_key_base(&lookup),
             media_proxy: media_proxy_settings(&lookup)?,
             statics: statics_settings(&lookup)?,
             rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
@@ -308,7 +306,6 @@ impl Config {
             smtp_password: None,
             smtp_tls: SmtpTls::default(),
             mail_from: default_mail_from(domain_of(TEST_BASE_URL)),
-            secret_key_base: None,
             media_proxy: TEST_MEDIA_PROXY,
             statics: test_statics(),
             rich_media_ignore_hosts: comma_list(DEFAULT_RICH_MEDIA_IGNORE_HOSTS),

@@ -55,9 +55,8 @@ use crate::{
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
 /// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
 /// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
-/// top level, together with the HTML helper pages of
-/// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
-/// remote-interaction pages of [`api::remote_interaction`]
+/// top level, together with the remote-interaction pages of
+/// [`api::remote_interaction`]
 /// (`/authorize_interaction` and `/main/ostatus`)
 /// and the public instance documents of [`api::admin::apps_docs::public_router`]
 /// (`/instance/{name}.html`, the terms-of-service pages an admin
@@ -87,7 +86,6 @@ pub fn app(state: AppState) -> Router {
             .merge(media_proxy::router())
             .merge(api::emoji_packs::files_router())
             .merge(api::misc::router())
-            .merge(api::html_pages::router())
             .merge(api::remote_interaction::router())
             .merge(api::admin::apps_docs::public_router())
             .fallback(not_found)

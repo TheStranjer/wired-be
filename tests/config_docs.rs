@@ -243,7 +243,7 @@ fn env_var_constants_follow_the_naming_convention() {
 fn every_env_var_is_documented() {
     let root = manifest_dir();
     let declarations = scan_declarations(&root.join("src"));
-    for core in ["DATABASE_URL", "BASE_URL", "BIND_ADDR", "SECRET_KEY_BASE"] {
+    for core in ["DATABASE_URL", "BASE_URL", "BIND_ADDR"] {
         assert!(
             declarations.contains_key(core),
             "the scan must find the {core} declaration; a pattern change here \

@@ -192,9 +192,8 @@ const SET_EMAIL_NOTIFICATIONS_SQL: &str =
 /// flag, replacing what was there.
 ///
 /// This is the switch Pleroma's `User.switch_email_notifications`
-/// (`lib/pleroma/user.ex`) moves, and the write the HTML unsubscribe page
-/// (a later ticket) performs to clear it. Unknown ids match no row and
-/// change nothing.
+/// (`lib/pleroma/user.ex`) moves. Unknown ids match no row and change
+/// nothing.
 ///
 /// # Errors
 ///

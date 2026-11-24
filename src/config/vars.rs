@@ -169,12 +169,6 @@ pub const RESTRICT_UNAUTHENTICATED_AREAS: [&str; 6] = [
     "activities_local",
     "activities_remote",
 ];
-/// Environment variable holding the application-wide HMAC signing secret
-/// (`SECRET_KEY_BASE` in Pleroma's config).
-///
-/// When unset or blank, [`serve`](crate::serve) generates a random one per
-/// boot and warns, so links minted earlier stop validating after a restart.
-pub const SECRET_KEY_BASE_VAR: &str = "SECRET_KEY_BASE";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";

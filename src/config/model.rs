@@ -290,14 +290,6 @@ pub struct Config {
     /// The `From:` address every sent email carries, from `MAIL_FROM`;
     /// `noreply@<instance domain>` by default.
     pub mail_from: String,
-    /// The HMAC-SHA256 secret this instance signs its mail-unsubscribe
-    /// links with, from `SECRET_KEY_BASE` (Pleroma's `:pleroma,
-    /// Pleroma.Web.Endpoint` `secret_key_base`); `None` when the variable
-    /// is unset or blank, in which case [`serve`](crate::serve) generates
-    /// a random one per boot and warns, so links minted earlier stop
-    /// validating after a restart. Secret material: the manual `Debug`
-    /// impl below redacts it.
-    pub secret_key_base: Option<String>,
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
