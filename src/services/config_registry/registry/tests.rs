@@ -4,7 +4,7 @@
 use super::*;
 use crate::services::config_registry::types::ValueKind;
 
-/// The registry holds exactly the six `:pleroma` keys a runtime consumer
+/// The registry holds exactly the seven `:pleroma` keys a runtime consumer
 /// reads, in order, and each one resolves through [`find`].
 #[test]
 fn the_registry_carries_the_whitelisted_keys() {
@@ -18,10 +18,11 @@ fn the_registry_carries_the_whitelisted_keys() {
             KEY_MRF_KEYWORD,
             KEY_MRF_HELLTHREAD,
             KEY_MRF_OBJECT_AGE,
+            KEY_MRF_HASHTAG,
         ],
         "the whitelist, in the GET order"
     );
-    assert_eq!(entries().len(), 6, "six whitelisted entries");
+    assert_eq!(entries().len(), 7, "seven whitelisted entries");
     assert!(
         entries().iter().all(|entry| entry.group == GROUP_PLEROMA),
         "every entry lives in :pleroma"
@@ -92,6 +93,7 @@ fn subkeys_and_restart_flags_follow_the_ticket() {
         KEY_MRF_KEYWORD,
         KEY_MRF_HELLTHREAD,
         KEY_MRF_OBJECT_AGE,
+        KEY_MRF_HASHTAG,
     ] {
         let entry = find(GROUP_PLEROMA, key).expect("registered");
         assert!(entry.subkeys.is_empty(), "{key} is a whole value");
@@ -196,8 +198,9 @@ fn descriptions_document_every_whitelisted_key() {
             KEY_MRF_KEYWORD,
             KEY_MRF_HELLTHREAD,
             KEY_MRF_OBJECT_AGE,
+            KEY_MRF_HASHTAG,
         ],
-        "the whitelist's order, its six keys"
+        "the whitelist's order, its seven keys"
     );
     assert!(
         !keys.contains(&":media_proxy") && !keys.contains(&":restrict_unauthenticated"),

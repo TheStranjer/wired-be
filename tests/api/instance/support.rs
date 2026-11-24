@@ -128,7 +128,12 @@ pub(super) fn expected_pleroma(vapid_key: &str) -> Value {
             "features": EXPECTED_FEATURES,
             "federation": {
                 "enabled": true,
-                "mrf_policies": [],
+                "mrf_policies": ["HashtagPolicy"],
+                "mrf_hashtag": {
+                    "sensitive": ["nsfw"],
+                    "reject": [],
+                    "federated_timeline_removal": [],
+                },
                 "quarantined_instances": [],
                 "exclusions": false,
             },

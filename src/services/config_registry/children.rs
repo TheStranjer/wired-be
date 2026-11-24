@@ -194,3 +194,24 @@ pub(super) const MRF_OBJECT_AGE_CHILDREN: [ChildDescription; 2] = [
         ],
     ),
 ];
+
+/// The `:mrf_hashtag` children: the three tag lists, in the words of
+/// Pleroma's `MRFHashtag` knowledge doc.
+pub(super) const MRF_HASHTAG_CHILDREN: [ChildDescription; 3] = [
+    hinted(
+        "sensitive",
+        ValueKind::AtomList,
+        "A list of hashtags which result in the post being marked as sensitive (default: `nsfw`).",
+        &[Suggestion::Text("nsfw")],
+    ),
+    leaf(
+        "reject",
+        ValueKind::AtomList,
+        "A list of hashtags which result in the message being rejected.",
+    ),
+    leaf(
+        "federated_timeline_removal",
+        ValueKind::AtomList,
+        "A list of hashtags which result in the message being removed from the federated timeline (a.k.a. the whole known network).",
+    ),
+];
