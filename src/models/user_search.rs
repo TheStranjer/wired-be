@@ -51,6 +51,7 @@ use crate::{
         mute::push_not_muted,
         user::{NOT_INSTANCE_ACTOR_U, User},
     },
+    util::like,
 };
 
 /// The knobs of one [`search_accounts`] call: the page and the two flags
@@ -167,22 +168,6 @@ fn is_full_handle(needle: &str) -> bool {
     needle.contains('@')
 }
 
-/// The `ILIKE` pattern of a normalised query: the metacharacters it may
-/// hold (`%`, `_`, and the escape character itself) are backslash-escaped
-/// so a query spells what the user typed, and the trailing `%` makes it
-/// the prefix match the ticket names.
-fn like_pattern(needle: &str) -> String {
-    let mut pattern = String::with_capacity(needle.len() + 1);
-    for symbol in needle.chars() {
-        if matches!(symbol, '%' | '_' | '\\') {
-            pattern.push('\\');
-        }
-        pattern.push(symbol);
-    }
-    pattern.push('%');
-    pattern
-}
-
 /// Fills the match clause [`BASE_SQL`] opened and closes it: nickname or
 /// display name starting with the query, or trigram-similar to it at the
 /// threshold the transaction set (the two `%` arms ride the
@@ -190,7 +175,7 @@ fn like_pattern(needle: &str) -> String {
 /// why the citext nickname is cast exactly the way the index expression
 /// is), and — for a `nick@domain` query — the exact nickname.
 fn push_match_arms(builder: &mut QueryBuilder<Postgres>, needle: &str) {
-    let pattern = like_pattern(needle);
+    let pattern = like::prefix(needle);
     let _prefix: &mut _ = builder
         .push("u.nickname::text ILIKE ")
         .push_bind(pattern.clone())
@@ -446,15 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn the_prefix_pattern_escapes_the_like_metacharacters() {
-        assert_eq!(like_pattern("bob"), "bob%", "the plain case");
-        assert_eq!(like_pattern("50%"), r"50\%%", "a percent stays literal");
-        assert_eq!(like_pattern("a_b"), r"a\_b%", "an underscore stays literal");
-        assert_eq!(
-            like_pattern("a\\b"),
-            r"a\\b%",
-            "and so does the escape itself"
-        );
+    fn is_full_handle_spots_a_nick_at_domain() {
         assert!(is_full_handle("bob@remote.example"));
         assert!(!is_full_handle("bob"), "the leading @ was already stripped");
     }

@@ -6,9 +6,10 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use super::super::User;
 use super::criterion::{Criterion, push_criterion};
-use super::pleroma_filters::contains_pattern;
 use super::pleroma_list::LIST_SQL;
-use crate::{error::AppResult, models::user::NOT_INSTANCE_ACTOR, pagination::PageParams};
+use crate::{
+    error::AppResult, models::user::NOT_INSTANCE_ACTOR, pagination::PageParams, util::like,
+};
 
 /// The criteria of one [`mastodon_list`] call: the six booleans the two
 /// admin account listings share and the four text criteria they read off the
@@ -146,12 +147,12 @@ fn push_mastodon_text(builder: &mut QueryBuilder<Postgres>, params: &MastodonLis
     if let Some(needle) = &params.username {
         let _nick: &mut _ = builder
             .push(" AND nickname::text ILIKE ")
-            .push_bind(contains_pattern(needle));
+            .push_bind(like::contains(needle));
     }
     if let Some(needle) = &params.display_name {
         let _name: &mut _ = builder
             .push(" AND name ILIKE ")
-            .push_bind(contains_pattern(needle));
+            .push_bind(like::contains(needle));
     }
     if let Some(domain) = &params.domain {
         let _domain: &mut _ = builder.push(" AND domain = ").push_bind(domain.clone());
