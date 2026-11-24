@@ -285,6 +285,40 @@ fn parse_actor_drops_a_public_key_id_it_cannot_trust() {
 }
 
 #[test]
+fn a_pem_with_trailing_blank_lines_is_stored_with_one_newline() {
+    let body = "-----BEGIN PUBLIC KEY-----\nQUJD\n-----END PUBLIC KEY-----";
+    for (label, sent) in [
+        ("Pleroma's double newline", format!("{body}\n\n")),
+        (
+            "CRLF endings",
+            format!("{}\r\n", body.replace('\n', "\r\n")),
+        ),
+        ("surrounding spaces", format!("  {body} \n\n")),
+        ("no final newline", body.to_owned()),
+    ] {
+        let mut document = fixture(MASTODON);
+        document["publicKey"]["publicKeyPem"] = json!(sent);
+        let parsed = parse_actor(&document).unwrap();
+        assert_eq!(
+            parsed.public_key,
+            format!("{body}\n"),
+            "{label}: stored with exactly one trailing newline"
+        );
+    }
+}
+
+#[test]
+fn a_blank_pem_is_rejected() {
+    let mut document = fixture(MASTODON);
+    document["publicKey"]["publicKeyPem"] = json!(" \n\n");
+    let outcome = parse_actor(&document);
+    assert!(
+        matches!(&outcome, Err(ActorError::Invalid(field)) if field.contains("publicKeyPem")),
+        "whitespace alone is no key"
+    );
+}
+
+#[test]
 fn a_minimal_actor_gets_the_documented_defaults() {
     let document = json!({
         "id": "https://remote.example/users/carol",
@@ -308,8 +342,8 @@ fn a_minimal_actor_gets_the_documented_defaults() {
     assert_eq!(parsed.bio, "", "no note");
     assert_eq!(parsed.raw_bio, "", "no source note");
     assert_eq!(
-        parsed.public_key, "PEM-without-an-owner",
-        "owner may be absent"
+        parsed.public_key, "PEM-without-an-owner\n",
+        "owner may be absent; the PEM is normalized to one trailing newline"
     );
     assert_eq!(parsed.fields, json!([]), "no attachments");
     assert!(parsed.also_known_as.is_empty(), "no aliases");
