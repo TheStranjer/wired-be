@@ -25,6 +25,7 @@ use crate::{
     config::Config,
     entities::{
         account::{Account, AccountViewer, JsonBool},
+        custom_emoji::CustomEmoji,
         filter::FilterResult,
         media_attachment::MediaAttachment,
         mention::Mention,
@@ -33,8 +34,8 @@ use crate::{
         tag::Tag,
     },
     models::{
-        hashtag::Hashtag, media_attachment::MediaAttachment as AttachmentRow,
-        status::Status as StatusRow,
+        custom_emoji::CustomEmoji as EmojiRow, hashtag::Hashtag,
+        media_attachment::MediaAttachment as AttachmentRow, status::Status as StatusRow,
     },
     services::rich_media::stored_card_json,
     util::sanitize::strip_html,
@@ -90,9 +91,11 @@ pub struct Status {
     pub mentions: Vec<Mention>,
     /// The hashtags, in name order.
     pub tags: Vec<Tag>,
-    /// Custom emojis used in the post; `[]` until the emoji-in-statuses
-    /// ticket fills it from the rows the service already batch-loads.
-    pub emojis: Vec<Value>,
+    /// The custom emojis the post's content, warning or poll options use,
+    /// as [`CustomEmoji`] entities in the order they first appear; `[]` for
+    /// a post using none, and for a reblog row (its text is the nested
+    /// original's, which carries its own).
+    pub emojis: Vec<CustomEmoji>,
     /// How many times this post has been reblogged (stored counter).
     pub reblogs_count: i32,
     /// How many favourites this post has (stored counter).
@@ -198,6 +201,7 @@ impl Status {
             media,
             mentions,
             tags,
+            emojis,
             reactions,
             card,
             favourited,
@@ -226,7 +230,7 @@ impl Status {
             application: application_block(row),
             mentions: mentions.iter().map(Mention::from_user).collect(),
             tags: tag_entities(tags, config),
-            emojis: Vec::new(),
+            emojis: emoji_entities(emojis, config),
             reblogs_count: row.reblogs_count,
             favourites_count: row.favourites_count,
             replies_count: row.replies_count,
@@ -270,6 +274,15 @@ fn media_entities(media: &[AttachmentRow], config: &Config) -> Vec<MediaAttachme
     media
         .iter()
         .map(|attachment| MediaAttachment::from_model(attachment, config))
+        .collect()
+}
+
+/// The `emojis` key: one entity per custom emoji the batch found the post
+/// using, in the order it first uses them.
+fn emoji_entities(emojis: &[EmojiRow], config: &Config) -> Vec<CustomEmoji> {
+    emojis
+        .iter()
+        .map(|emoji| CustomEmoji::from_model(emoji, config))
         .collect()
 }
 

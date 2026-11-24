@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::{
     config::TEST_BASE_URL,
     models::{
+        custom_emoji::CustomEmoji as EmojiRow,
         hashtag::Hashtag,
         media_attachment::MediaAttachment as AttachmentRow,
         status::{Status as StatusRow, Visibility},
@@ -251,6 +252,24 @@ pub(super) fn attachment(url: &str, content_type: &str) -> AttachmentRow {
         focus_y: None,
         file_size: None,
         sensitive_hint: false,
+        inserted_at: stamped(),
+        updated_at: stamped(),
+    }
+}
+
+/// A stored local custom emoji row named `shortcode`, in the `cats` pack,
+/// with a still variant.
+pub(super) fn emoji_row(shortcode: &str) -> EmojiRow {
+    EmojiRow {
+        id: Uuid::now_v7(),
+        shortcode: shortcode.to_owned(),
+        domain: None,
+        image_url: format!("{BASE}/emoji/cats/{shortcode}.gif"),
+        static_url: Some(format!("{BASE}/emoji/cats/{shortcode}.png")),
+        category: Some("cats".to_owned()),
+        tags: Vec::new(),
+        visible_in_picker: true,
+        disabled: false,
         inserted_at: stamped(),
         updated_at: stamped(),
     }

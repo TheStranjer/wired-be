@@ -12,7 +12,7 @@
 //! originals, quoted originals and polls — with a FIXED set of batched
 //! queries, one per part, each keyed by an id list (`WHERE … = ANY($1)`),
 //! never a query per row. The count does not grow with the page size:
-//! nineteen statement groups whatever the batch —
+//! twenty statement groups whatever the batch —
 //!
 //! 1. reblogged originals — one [`status::get_many`];
 //! 2. quoted originals — one [`status::get_many`], the quoted rows' ids
@@ -77,7 +77,12 @@
 //! 19. the viewer's marks on the page's polls — one
 //!     [`poll::votes_by_status`] read over the same ids, run only for an
 //!     authenticated viewer; it answers every poll entity's `voted` flag
-//!     and `own_votes` array.
+//!     and `own_votes` array;
+//! 20. the page's custom emojis — one [`custom_emoji::get_by_shortcodes`]
+//!     read per distinct author domain on the page (none for a page whose
+//!     texts hold no `:shortcode:`), asked for the shortcodes the rendered
+//!     rows' content, warning and poll options use, reblogged originals and
+//!     visible quoted originals included.
 //!
 //! Loaders whose id list came out empty skip the database entirely, so a
 //! page of plain posts costs eight queries (the cards read rides with the
@@ -116,8 +121,13 @@
 //!   [`crate::entities::poll::Poll::build`] renders the poll row, its
 //!   options and the viewer's marks into the entity, and the row's own
 //!   absence from the poll read is the entity's `null`.
-//! - `emojis`: the custom emojis, one read keyed by the shortcodes the
-//!   content uses.
+//! - `emojis`: *filled by the emoji-in-statuses ticket* (step 20 above);
+//!   each row's emojis are the enabled `custom_emojis` rows of its
+//!   *author's* domain (`NULL` for a local author) whose shortcodes its
+//!   content, warning or poll options use, rendered as
+//!   [`CustomEmoji`](crate::entities::custom_emoji::CustomEmoji).
+//!   [`load_emojis`] is the one loader, shared with the status history and
+//!   the create preview.
 //! - `pleroma.emoji_reactions`: *filled by the reactions ticket* (step 8
 //!   above); it renders the roll-up
 //!   [`emoji_reaction::for_statuses`] answers, capped at
@@ -157,12 +167,16 @@
 //! [`poll::for_statuses`]: crate::models::poll::for_statuses
 //! [`poll::options_for_statuses`]: crate::models::poll::options_for_statuses
 //! [`poll::votes_by_status`]: crate::models::poll::votes_by_status
+//! [`custom_emoji::get_by_shortcodes`]: crate::models::custom_emoji::get_by_shortcodes
 
 mod batch;
 mod loaders;
+mod loaders_emojis;
 mod loaders_polls_cards;
 mod page_ids;
 
+#[cfg(test)]
+mod emoji_tests;
 #[cfg(test)]
 mod engagement_tests;
 #[cfg(test)]
@@ -186,6 +200,8 @@ use crate::{
 };
 
 use batch::Batch;
+
+pub use loaders_emojis::{EmojiText, load_emojis, row_texts};
 
 /// Renders `statuses` as the [`Status`] entity for `viewer` (see
 /// [`ViewerMode`]: whose account the per-viewer flags render from, and

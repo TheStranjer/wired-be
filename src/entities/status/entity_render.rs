@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::test_support::{
-    BASE, CARD_URL, EXPECTED_KEYS, PLEROMA_KEYS, Parts, attachment, base_row, base_user, hashtag,
-    json_keys, other_user, render, render_nested, stamped,
+    BASE, CARD_URL, EXPECTED_KEYS, PLEROMA_KEYS, Parts, attachment, base_row, base_user, emoji_row,
+    hashtag, json_keys, other_user, render, render_nested, stamped,
 };
 use crate::{entities::poll::Poll, models::user::Flag};
 
@@ -51,7 +51,7 @@ fn a_plain_status_emits_every_key_and_its_defaults() {
     assert_eq!(value["application"], Value::Null, "no generator, null");
     assert_eq!(value["mentions"], json!([]));
     assert_eq!(value["tags"], json!([]));
-    assert_eq!(value["emojis"], json!([]), "emojis are a later ticket");
+    assert_eq!(value["emojis"], json!([]), "none found, none rendered");
     assert_eq!(value["reblogs_count"], 0);
     assert_eq!(value["favourites_count"], 0);
     assert_eq!(value["replies_count"], 0);
@@ -396,5 +396,43 @@ fn media_mentions_and_tags_render_from_the_loaded_rows() {
             {"name": "rust", "url": format!("{BASE}/tags/rust")},
             {"name": "news", "url": format!("{BASE}/tags/news")},
         ])
+    );
+}
+
+#[test]
+fn the_batch_found_emojis_render_as_custom_emoji_entities() {
+    let alice = base_user("alice");
+    let row = base_row();
+    let value = render(
+        &row,
+        &Parts::of(&alice).with_emojis(vec![emoji_row("wiredcat"), emoji_row("blob")]),
+        None,
+    );
+    assert_eq!(
+        value["emojis"],
+        json!([
+            {
+                "shortcode": "wiredcat",
+                "url": format!("{BASE}/emoji/cats/wiredcat.gif"),
+                "static_url": format!("{BASE}/emoji/cats/wiredcat.png"),
+                "visible_in_picker": true,
+                "category": "cats",
+                "tags": [],
+            },
+            {
+                "shortcode": "blob",
+                "url": format!("{BASE}/emoji/cats/blob.gif"),
+                "static_url": format!("{BASE}/emoji/cats/blob.png"),
+                "visible_in_picker": true,
+                "category": "cats",
+                "tags": [],
+            },
+        ]),
+        "each found emoji is the CustomEmoji entity, in the batch's order"
+    );
+    assert_eq!(
+        json_keys(&value),
+        EXPECTED_KEYS,
+        "filling the slot leaves the entity's key set alone"
     );
 }

@@ -20,9 +20,9 @@ use crate::{
         status::{QuoteSlot, Status, StatusSource},
     },
     models::{
-        emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag, link_card::LinkCard,
-        media_attachment::MediaAttachment as AttachmentRow, status::Status as StatusRow,
-        user::User,
+        custom_emoji::CustomEmoji as EmojiRow, emoji_reaction::ReactionSummary as SummaryRow,
+        hashtag::Hashtag, link_card::LinkCard, media_attachment::MediaAttachment as AttachmentRow,
+        status::Status as StatusRow, user::User,
     },
 };
 
@@ -40,6 +40,8 @@ pub(in crate::entities::status) struct Parts<'a> {
     mentions: Vec<User>,
     /// The row's hashtags.
     tags: Vec<Hashtag>,
+    /// The custom emojis the row's texts use.
+    emojis: Vec<EmojiRow>,
     /// The row's emoji reactions.
     reactions: Vec<SummaryRow>,
     /// The row's cached link card, `None` when the batch's cards
@@ -86,6 +88,7 @@ impl<'a> Parts<'a> {
             media: Vec::new(),
             mentions: Vec::new(),
             tags: Vec::new(),
+            emojis: Vec::new(),
             reactions: Vec::new(),
             card: None,
             favourited: false,
@@ -129,6 +132,11 @@ impl<'a> Parts<'a> {
     /// Sets [`tags`](Self::tags).
     pub(in crate::entities::status) fn tagged(self, tags: Vec<Hashtag>) -> Self {
         Self { tags, ..self }
+    }
+
+    /// Sets [`emojis`](Self::emojis).
+    pub(in crate::entities::status) fn with_emojis(self, emojis: Vec<EmojiRow>) -> Self {
+        Self { emojis, ..self }
     }
 
     /// Sets [`media`](Self::media).
@@ -294,6 +302,7 @@ pub(in crate::entities::status) fn render(
         media: &parts.media,
         mentions: &parts.mentions,
         tags: &parts.tags,
+        emojis: &parts.emojis,
         reactions: &parts.reactions,
         card: parts.card.as_ref(),
         favourited: parts.favourited,
@@ -323,6 +332,7 @@ pub(in crate::entities::status) fn render_nested(row: &StatusRow, author: &User)
             media: &[],
             mentions: &[],
             tags: &[],
+            emojis: &[],
             reactions: &[],
             card: None,
             favourited: false,

@@ -10,8 +10,8 @@
 //! status gate, and the answer the [`StatusEdit`]
 //! array — the superseded versions oldest-authored-first with the current
 //! one last, each carrying its content, warning, flag, author, media, and
-//! the empty `emojis` and `poll` placeholders the status renderer still
-//! answers. A status nobody edited is the one-element array of its current
+//! the custom emojis its text used (one batched read per answer) and the
+//! `poll` placeholder the status renderer still answers. A status nobody edited is the one-element array of its current
 //! version.
 //!
 //! `GET /api/v1/statuses/{id}/source` is Pleroma's `show_source` with the
@@ -39,15 +39,20 @@ use crate::{
     config::Config,
     entities::{
         account::Account,
+        custom_emoji::CustomEmoji,
         media_attachment::MediaAttachment,
         status_edit::{StatusEdit, StatusEditSource},
     },
     error::{AppError, AppResult},
     models::{
+        custom_emoji::CustomEmoji as EmojiRow,
         media_attachment::{self, MediaAttachment as AttachmentRow},
-        status_edit, user,
+        status::Status as StatusRow,
+        status_edit,
+        user::{self, User},
     },
     oauth::scopes::READ_STATUSES,
+    services::render_status::{EmojiText, load_emojis, row_texts},
     state::AppState,
 };
 
@@ -95,6 +100,7 @@ pub(super) async fn get_status_history(
         .get(&row.id)
         .map_or_default(|rows| rows.iter().map(|attachment| attachment.id).collect());
     let attachments = history_attachments(&state, &revisions, &current).await?;
+    let emojis = history_emojis(&state, &author, &row, &revisions).await?;
     let mut history = Vec::with_capacity(revisions.len() + 1);
     for revision in &revisions {
         history.push(StatusEdit::from_source(StatusEditSource {
@@ -104,6 +110,7 @@ pub(super) async fn get_status_history(
             created_at: revision.created_at,
             account: Account::from_user_for(viewer, &author, &state.config, None),
             media: media_entities(&revision.media_ids, &attachments, &state.config),
+            emojis: emoji_entities(revision.id, &emojis, &state.config),
         }));
     }
     history.push(StatusEdit::from_source(StatusEditSource {
@@ -113,6 +120,7 @@ pub(super) async fn get_status_history(
         created_at: row.edited_at.unwrap_or(row.inserted_at),
         account: Account::from_user_for(viewer, &author, &state.config, None),
         media: media_entities(&current, &attachments, &state.config),
+        emojis: emoji_entities(row.id, &emojis, &state.config),
     }));
     debug!(
         status = %row.id,
@@ -146,6 +154,48 @@ async fn history_attachments(
     }
     let rows = media_attachment::get_many(&state.db, &asked).await?;
     Ok(rows.into_iter().map(|found| (found.id, found)).collect())
+}
+
+/// The custom emojis every version of one history answer uses: each
+/// revision's content and warning, and the live row's, looked up under the
+/// author's domain in one batch ([`load_emojis`]) and keyed by the
+/// revision's id — the live row by its own. A version using none has no
+/// entry.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn history_emojis(
+    state: &AppState,
+    author: &User,
+    row: &StatusRow,
+    revisions: &[status_edit::StatusEdit],
+) -> AppResult<HashMap<Uuid, Vec<EmojiRow>>> {
+    let wanted: Vec<EmojiText<'_>> = revisions
+        .iter()
+        .map(|revision| EmojiText {
+            key: revision.id,
+            domain: author.domain.as_deref(),
+            texts: vec![revision.content.as_str(), revision.spoiler_text.as_str()],
+        })
+        .chain(std::iter::once(row_texts(row, author, &[])))
+        .collect();
+    load_emojis(&state.db, &wanted).await
+}
+
+/// The `emojis` array of the history entry keyed `key`: the batch's rows as
+/// [`CustomEmoji`] entities, the empty array for a version using none.
+fn emoji_entities(
+    key: Uuid,
+    by_key: &HashMap<Uuid, Vec<EmojiRow>>,
+    config: &Config,
+) -> Vec<CustomEmoji> {
+    by_key.get(&key).map_or_default(|found| {
+        found
+            .iter()
+            .map(|emoji| CustomEmoji::from_model(emoji, config))
+            .collect()
+    })
 }
 
 /// The `media_attachments` array of one history entry: `ids` in their

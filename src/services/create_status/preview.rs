@@ -22,6 +22,7 @@ use crate::{
         status::{self, NewStatus},
         user::{self, User},
     },
+    services::render_status::{load_emojis, row_texts},
     state::AppState,
     util::id::{new_id, object_ap_id},
 };
@@ -49,7 +50,8 @@ use crate::{
 /// account included, since the rendered content is only honest if the
 /// mention links are — and the reply parent and quote target lookups. A
 /// body naming a `quote_id` has its target gated like a create's, but the
-/// in-memory row quotes nothing and no `quotes_count` moves.
+/// in-memory row quotes nothing and no `quotes_count` moves. One
+/// `custom_emojis` read fills `emojis` when the text holds a `:shortcode:`.
 ///
 /// # Errors
 ///
@@ -71,6 +73,8 @@ pub async fn preview_status(
     };
     let tags = preview_tags(&new.hashtags);
     let row = preview_row(&state.config.base_url, &new);
+    let wanted = [row_texts(&row, user, &[])];
+    let emojis = load_emojis(&state.db, &wanted).await?;
     debug!(
         status = %row.id,
         user = %user.id,
@@ -84,6 +88,7 @@ pub async fn preview_status(
             media: &[],
             mentions: &mentioned,
             tags: &tags,
+            emojis: emojis.get(&row.id).map_or(&[], Vec::as_slice),
             reactions: &[],
             card: None,
             favourited: false,
