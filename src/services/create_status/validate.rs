@@ -86,6 +86,9 @@ pub struct Checked<'a> {
 /// not here — it is the write's, made on the database inside the status's
 /// own transaction (see [`crate::models::status::insert`]).
 ///
+/// An edit of a media-only or poll-only post reaches the same rules through
+/// [`check_body_backed`], so its stored empty text is not refused.
+///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with `EMPTY_STATUS` (skipped when the body
@@ -103,12 +106,47 @@ pub fn check_body<'a>(
     default_sensitive: bool,
     params: &'a CreateStatusParams,
 ) -> AppResult<Checked<'a>> {
+    check_body_backed(
+        config,
+        default_scope,
+        default_sensitive,
+        params,
+        Backing::Body,
+    )
+}
+
+/// What may stand in for the text of a body beyond what the body carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backing {
+    /// Only the body's own `media_ids` and poll can stand in for the text:
+    /// create, preview and schedule.
+    Body,
+    /// The stored post already carries an attachment or a poll that the
+    /// body does not repeat: an edit of a media-only or poll-only post.
+    StoredPost,
+}
+
+/// [`check_body`] with the caller's word on what else stands behind the text.
+///
+/// [`Backing::StoredPost`] lets an empty text pass the way an attachment or
+/// a poll in the body would; [`Backing::Body`] is exactly [`check_body`].
+///
+/// # Errors
+///
+/// The refusals of [`check_body`].
+pub fn check_body_backed<'a>(
+    config: &Config,
+    default_scope: &str,
+    default_sensitive: bool,
+    params: &'a CreateStatusParams,
+    backing: Backing,
+) -> AppResult<Checked<'a>> {
     let media_ids = checked_media(config, params)?;
     let has_poll = params.poll.is_some();
     let text = check_text(
         config,
         params.status.as_deref().unwrap_or_default(),
-        !media_ids.is_empty() || has_poll,
+        backing == Backing::StoredPost || !media_ids.is_empty() || has_poll,
     )?;
     let poll = checked_poll(config, params)?;
     let spoiler_text = checked_spoiler(params.spoiler_text.as_deref())?;
