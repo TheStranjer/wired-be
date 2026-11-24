@@ -119,7 +119,7 @@ fn fixture_user(nickname: &str, ap_id: &str, local: bool) -> User {
 }
 
 /// The author: local `alice` at [`AUTHOR_AP`].
-pub(super) fn author() -> User {
+pub(crate) fn author() -> User {
     fixture_user("alice", AUTHOR_AP, true)
 }
 

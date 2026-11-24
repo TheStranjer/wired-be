@@ -6,10 +6,10 @@
 //! `id` and `created_at` beside the `Audio` object's `title`, `artist`,
 //! `album`, `length` and `externalLink`, and the listener as the Mastodon
 //! `Account` entity. The eight keys are declared in the order the ticket
-//! lists them, with two differences from the view it fixes: `external_link`
-//! is the one spelling (the view's deprecated `externalLink` duplicate is not
-//! emitted) and `id` is the row's `UUIDv7` as lowercase hyphenated text, not
-//! Pleroma's integer (decision 4). `created_at` is the row's `inserted_at` in
+//! lists them, plus the camelCase `externalLink` duplicate the view also
+//! emits (Pleroma-FE reads it), and `id` is the row's `UUIDv7` as lowercase
+//! hyphenated text, not Pleroma's integer (decision 4). `created_at` is the
+//! row's `inserted_at` in
 //! the Mastodon time format (decision 5), Pleroma's `Utils.to_masto_date` of
 //! the activity's `published`.
 //!
@@ -35,8 +35,8 @@ use crate::{
 /// The Pleroma `Scrobble` entity.
 ///
 /// Build one with [`Scrobble::from_row`]; its [`Serialize`] impl emits `id`,
-/// `account`, `title`, `artist`, `album`, `length`, `external_link` and
-/// `created_at`.
+/// `account`, `title`, `artist`, `album`, `length`, `external_link`,
+/// `externalLink` and `created_at`.
 #[derive(Debug, Serialize)]
 pub struct Scrobble {
     /// The scrobble id as the hyphenated lowercase `UUIDv7` string
@@ -56,6 +56,10 @@ pub struct Scrobble {
     pub length: Option<i32>,
     /// The URL referencing the media, `null` when the client sent none.
     pub external_link: Option<String>,
+    /// The same URL under Pleroma's camelCase spelling, which Pleroma-FE
+    /// reads.
+    #[serde(rename = "externalLink")]
+    pub external_link_camel: Option<String>,
     /// When the listen was scrobbled, in the Mastodon time format
     /// (decision 5).
     #[serde(with = "crate::util::time::serde_mastodon_time")]
@@ -86,6 +90,7 @@ impl Scrobble {
             album: row.album.clone(),
             length: row.length,
             external_link: row.external_link.clone(),
+            external_link_camel: row.external_link.clone(),
             created_at: row.inserted_at,
         }
     }
@@ -114,11 +119,12 @@ mod tests {
     const STAMPED: &str = "2024-01-31T12:34:56.789Z";
     /// Every JSON key the entity must emit, sorted, for an exact key-set
     /// check.
-    const EXPECTED_KEYS: [&str; 8] = [
+    const EXPECTED_KEYS: [&str; 9] = [
         "account",
         "album",
         "artist",
         "created_at",
+        "externalLink",
         "external_link",
         "id",
         "length",
@@ -216,6 +222,7 @@ mod tests {
     fn row(visibility: Visibility) -> ScrobbleRow {
         ScrobbleRow {
             id: Uuid::parse_str(SCROBBLE_ID).expect("the fixture id is an id"),
+            ap_id: Some(format!("{TEST_BASE_URL}/activities/{SCROBBLE_ID}")),
             user_id: owner().id,
             title: "Midnight City".to_owned(),
             artist: Some("M83".to_owned()),
@@ -254,11 +261,11 @@ mod tests {
         assert_eq!(value["length"], 243_000, "the length in milliseconds");
         assert_eq!(
             value["external_link"], "https://example.test/midnight-city",
-            "the external link, snake_case only"
+            "the external link, snake_case"
         );
-        assert!(
-            value.get("externalLink").is_none(),
-            "and not the deprecated camelCase duplicate"
+        assert_eq!(
+            value["externalLink"], "https://example.test/midnight-city",
+            "and the camelCase duplicate Pleroma-FE reads"
         );
         assert_eq!(
             value["created_at"], STAMPED,
@@ -308,7 +315,7 @@ mod tests {
         let value = render(&bare, None);
 
         assert_eq!(value["title"], "just a title", "the title is never null");
-        for key in ["artist", "album", "length", "external_link"] {
+        for key in ["artist", "album", "length", "external_link", "externalLink"] {
             assert!(value[key].is_null(), "`{key}` renders as null: {value}");
         }
     }

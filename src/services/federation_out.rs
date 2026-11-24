@@ -68,6 +68,10 @@
 //!   the content, delivered to the target's inbox alone (Mastodon's
 //!   forwarded-report convention). A local target or a filing that asked
 //!   for no forwarding stays with our own moderators;
+//! - [`after_scrobble_created`]: the `Listen` (wrapping an `Audio` object)
+//!   a fresh scrobble is, addressed by the scrobble's own visibility and
+//!   delivered to the listener's remote followers; a `direct` scrobble
+//!   addresses nobody and sends nothing;
 //! - [`after_poll_vote`]: the answers a ballot on a REMOTE status's poll
 //!   becomes — one `Create` per chosen option, its object a bodyless `Note`
 //!   naming the option title and answering the question's uri (the shape
@@ -143,7 +147,7 @@
 //!
 //! The children hold the arms — `blocks`, `boosts`, `chat_admin_deletes`,
 //! `chats`, `collections`, `follow_requests`, `follows`, `likes`, `moves`,
-//! `notes`, `polls`, `profile`, `reactions`, `reports`, `statuses` and
+//! `notes`, `polls`, `profile`, `reactions`, `reports`, `scrobbles`, `statuses` and
 //! `withdrawals` — while this root keeps the plumbing they share:
 //! `StatusAction` and `status_action`, the row readers `load_status` and
 //! `load_user`, the two publisher hands
@@ -184,6 +188,7 @@ mod polls;
 mod profile;
 mod reactions;
 mod reports;
+mod scrobbles;
 mod statuses;
 #[cfg(test)]
 mod test_support;
@@ -202,6 +207,7 @@ pub use polls::{after_local_poll_changed, after_poll_vote};
 pub use profile::{after_account_deleted, after_account_disabled, after_profile_updated};
 pub use reactions::after_reaction_changed;
 pub use reports::after_report_created;
+pub use scrobbles::after_scrobble_created;
 pub use statuses::{after_status_created, after_status_edited};
 pub use withdrawals::after_status_deleted;
 

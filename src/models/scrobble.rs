@@ -6,9 +6,10 @@
 //! `docs/ARCHITECTURE.md` decision 6 that object becomes columns here, like
 //! statuses: the object's `title`/`artist`/`album`/`length`/`externalLink`
 //! are `title`/`artist`/`album`/`length`/`external_link`, its actor is
-//! `user_id` and its `published` time is `inserted_at`. Nothing federates,
-//! so there is no `ap_id` (decision 6 lists what needs one) and, since a
-//! scrobble is never edited, no `updated_at` either.
+//! `user_id` and its `published` time is `inserted_at`. A scrobble federates as a
+//! `Listen` whose id is `ap_id` (`{BASE_URL}/activities/{id}`, decision 6)
+//! around an `Audio` object at `{BASE_URL}/objects/{id}`; since a scrobble
+//! is never edited it has no `updated_at`.
 //!
 //! Visibility is the same four-valued thing a status has, so this module
 //! reuses [`Visibility`] rather than minting a second enum; `local` is a
@@ -25,15 +26,22 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
-    error::AppResult, models::status::Visibility, pagination::PageParams, util::id::new_id,
+    error::AppResult,
+    models::status::Visibility,
+    pagination::PageParams,
+    util::id::{activity_ap_id, new_id},
 };
 
-/// [`insert`]: the id this module mints (decision 4), the owner and what the
-/// caller decided, with `inserted_at` left to the column default.
-/// `RETURNING *` brings the row back with that stamp.
+/// [`insert`]: the id this module mints (decision 4) and the `Listen` id
+/// built from it, the owner and what the caller decided, with `inserted_at`
+/// left to the column default. `RETURNING *` brings the row back with that
+/// stamp.
 const INSERT_SQL: &str = "INSERT INTO scrobbles (
-     id, user_id, title, artist, album, length, external_link, visibility
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *";
+     id, ap_id, user_id, title, artist, album, length, external_link, visibility
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *";
+
+/// [`get_by_id`]: one scrobble by its primary key.
+const GET_SQL: &str = "SELECT * FROM scrobbles WHERE id = $1";
 
 /// The start of [`page_for_user`]'s statement: one account's scrobbles, the
 /// owner bound next and the page's conditions appended after it.
@@ -52,6 +60,9 @@ pub struct Scrobble {
     /// the creation order the API lists scrobbles in and the cursor
     /// [`PageParams`] compares.
     pub id: Uuid,
+    /// The `Listen` activity's id, `{BASE_URL}/activities/{id}`; `None` for
+    /// a row that predates federation.
+    pub ap_id: Option<String>,
     /// The account that listened; every read and write is scoped to it.
     pub user_id: Uuid,
     /// The title of the media playing, verbatim as the client sent it.
@@ -113,15 +124,23 @@ impl Default for NewScrobble {
 /// Inserts `scrobble` for `user_id` and returns the stored row.
 ///
 /// The primary key is minted here (decision 4), so a scrobble's place in the
-/// newest-first listing is its creation time.
+/// newest-first listing is its creation time, and the row's `ap_id` is the
+/// `Listen` id [`activity_ap_id`] builds from it under `base_url`.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn insert(pool: &PgPool, user_id: Uuid, scrobble: &NewScrobble) -> AppResult<Scrobble> {
+pub async fn insert(
+    pool: &PgPool,
+    base_url: &str,
+    user_id: Uuid,
+    scrobble: &NewScrobble,
+) -> AppResult<Scrobble> {
+    let id = new_id();
     let row = sqlx::query_as::<_, Scrobble>(INSERT_SQL)
-        .bind(new_id())
+        .bind(id)
+        .bind(activity_ap_id(base_url, id))
         .bind(user_id)
         .bind(&scrobble.title)
         .bind(scrobble.artist.as_deref())
@@ -130,6 +149,20 @@ pub async fn insert(pool: &PgPool, user_id: Uuid, scrobble: &NewScrobble) -> App
         .bind(scrobble.external_link.as_deref())
         .bind(scrobble.visibility)
         .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
+/// The scrobble with primary key `id`, `None` when there is none.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<Scrobble>> {
+    let row = sqlx::query_as::<_, Scrobble>(GET_SQL)
+        .bind(id)
+        .fetch_optional(pool)
         .await?;
     Ok(row)
 }
@@ -169,7 +202,7 @@ pub async fn page_for_user(
 mod tests {
     use super::*;
     use crate::{
-        error::AppError, models::user::User, pagination::MAX_LIMIT,
+        config::TEST_BASE_URL, error::AppError, models::user::User, pagination::MAX_LIMIT,
         test_fixtures::local_user as user,
     };
 
@@ -191,14 +224,14 @@ mod tests {
 
     /// Inserts a scrobble of `title` for `owner` and returns its row.
     async fn seed(pool: &PgPool, owner: &User, title: &str) -> Scrobble {
-        insert(pool, owner.id, &titled(title))
+        insert(pool, TEST_BASE_URL, owner.id, &titled(title))
             .await
             .expect("the fixture scrobble inserts")
     }
 
     /// Inserts a scrobble of `title` and `visibility` for `owner`.
     async fn seed_visible(pool: &PgPool, owner: &User, title: &str, visibility: Visibility) {
-        let _stored: Scrobble = insert(pool, owner.id, &visible(title, visibility))
+        let _stored: Scrobble = insert(pool, TEST_BASE_URL, owner.id, &visible(title, visibility))
             .await
             .expect("the fixture scrobble inserts");
     }
@@ -233,6 +266,7 @@ mod tests {
         let alice = user(&pool, "alice").await;
         let stored = insert(
             &pool,
+            TEST_BASE_URL,
             alice.id,
             &NewScrobble {
                 title: "Midnight City".to_owned(),
@@ -274,6 +308,32 @@ mod tests {
             stored.inserted_at <= Utc::now(),
             "the creation stamp is now or earlier"
         );
+        assert_eq!(
+            stored.ap_id,
+            Some(format!("{TEST_BASE_URL}/activities/{}", stored.id)),
+            "the Listen id is minted from the row id"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_by_id_reads_the_row_back_or_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let stored = seed(&pool, &alice, "Midnight City").await;
+
+        let found = get_by_id(&pool, stored.id)
+            .await
+            .expect("the read succeeds")
+            .expect("the row exists");
+        assert_eq!(found, stored, "the row comes back whole");
+        assert!(
+            get_by_id(&pool, new_id())
+                .await
+                .expect("the read succeeds")
+                .is_none(),
+            "an unknown id is None"
+        );
     }
 
     #[tokio::test]
@@ -281,7 +341,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
-        let stored = insert(&pool, alice.id, &titled("only a title"))
+        let stored = insert(&pool, TEST_BASE_URL, alice.id, &titled("only a title"))
             .await
             .expect("a title-only scrobble inserts");
 
@@ -301,9 +361,14 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
-        let err = insert(&pool, alice.id, &visible("nope", Visibility::Local))
-            .await
-            .expect_err("`local` is not a scrobble visibility");
+        let err = insert(
+            &pool,
+            TEST_BASE_URL,
+            alice.id,
+            &visible("nope", Visibility::Local),
+        )
+        .await
+        .expect_err("`local` is not a scrobble visibility");
         assert!(
             matches!(err, AppError::Database(_)),
             "the database itself refuses it: {err}"

@@ -6,7 +6,8 @@
 //! `Reject` behind the tables of `docs/ARCHITECTURE.md` decision 6 —
 //! favourites, reactions, boosts, follows and blocks — other than notes,
 //! plus the `Move`, `Flag` and `Add`/`Remove` behind the account
-//! lifecycle and moderation writes.
+//! lifecycle and moderation writes, and the `Listen` of a scrobble with the
+//! `Audio` object it wraps ([`listen_json`], [`audio_json`]).
 //!
 //! These are the counterparts of Pleroma's
 //! `lib/pleroma/web/activity_pub/views/*_view.ex` renderers, and pure
@@ -61,6 +62,7 @@ use crate::{config::Config, util::id::activity_ap_id};
 
 mod contexts;
 mod interactions;
+mod listen;
 mod relations;
 #[cfg(test)]
 mod test_support;
@@ -70,11 +72,16 @@ pub use contexts::{
     TargetedActivityContext,
 };
 pub use interactions::{emoji_react_json, like_json, undo_json};
+pub use listen::{audio_json, listen_json};
 pub use relations::{
     FollowActivity, accept_json, add_json, block_json, flag_json, follow_json, follow_json_to,
     move_json, reject_json, remove_json,
 };
 
+/// The activity type of a scrobble.
+const TYPE_LISTEN: &str = "Listen";
+/// The object type of a scrobble's media.
+const TYPE_AUDIO: &str = "Audio";
 /// The activity type of a favourite.
 const TYPE_LIKE: &str = "Like";
 /// The activity type of an emoji reaction.
