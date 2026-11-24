@@ -1,7 +1,9 @@
-//! Resolving a `keyId` to the signer: the actor lookup behind the
-//! extractor's step 5 — the mirror, the on-the-fly fetch, the standalone
-//! key object's `owner`, the gone actor's self-`Delete` — plus the
-//! once-per-window key-refetch throttle its step 6 retries through.
+//! Resolving a `keyId` to the signer.
+//!
+//! The actor lookup behind the extractor's step 5 — the mirror, the
+//! on-the-fly fetch, the standalone key object's `owner`, the gone actor's
+//! self-`Delete` — plus the once-per-window key-refetch throttle its step 6
+//! retries through.
 
 use std::{
     collections::BTreeMap,
@@ -12,11 +14,12 @@ use std::{
 use serde_json::Value;
 use tracing::debug;
 
-use super::{DELETE_TYPE, InboxAuthError, KEY_REFETCH_WINDOW, body::strip_fragment};
+use super::{DELETE_TYPE, InboxAuthError, KEY_REFETCH_WINDOW};
 use crate::{
     federation::{
         fetch_actor::{FetchError, fetch_actor_json, get_or_fetch_by_ap_id},
         json::{as_array, value_or_id},
+        signature::verify::key_id_actor,
     },
     models::user::{User, get_by_ap_id},
     state::AppState,
@@ -28,19 +31,24 @@ use crate::{
 /// the same recovery as [`crate::util::cache::TimedCache`].
 static KEY_REFETCH_STAMPS: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
 
-/// Resolves the `keyId` to the actor whose key must verify the signature
-/// (step 5 of the [module docs](super)): the mirror of the fragment-stripped
-/// URL answers; a miss fetches that actor; a fetch that fails on a
-/// document that is not an actor retries the `keyId` itself as a key
-/// object, following its `owner`. A `410 Gone` for a self-`Delete` is
-/// [`Discarded`](InboxAuthError::Discarded); anything unresolved is 401
-/// `Unknown key`.
-pub(super) async fn resolve_signer(
+/// Resolves the `keyId` to the actor whose key must verify the signature.
+///
+/// This is step 5 of the [module docs](super): the mirror of the
+/// fragment-stripped URL answers; a miss fetches that actor; a fetch that
+/// fails on a document that is not an actor retries the `keyId` itself as a
+/// key object, following its `owner`.
+///
+/// # Errors
+///
+/// [`InboxAuthError::Discarded`] for a `410 Gone` answer to a self-`Delete`;
+/// 401 `Unknown key` for anything else unresolved; database failures arrive
+/// as [`InboxAuthError::Rejected`].
+pub async fn resolve_signer(
     state: &AppState,
     key_id: &str,
     json: &Value,
 ) -> Result<User, InboxAuthError> {
-    let actor_url = strip_fragment(key_id);
+    let actor_url = key_id_actor(key_id);
     if let Some(stored) = get_by_ap_id(&state.db, actor_url).await? {
         return Ok(stored);
     }

@@ -120,10 +120,7 @@ fn date_header(now: DateTime<Utc>) -> String {
 /// space, then the URL's path with its query when it has one.
 #[must_use]
 fn request_target(method: &str, url: &Url) -> String {
-    let path_with_query = url.query().map_or_else(
-        || url.path().to_owned(),
-        |query| format!("{}?{query}", url.path()),
-    );
+    let path_with_query = verify::target_text(url.path(), url.query());
     format!("{} {path_with_query}", method.to_lowercase())
 }
 

@@ -1,7 +1,9 @@
-//! The signature gates: the domain reject lists (step 3 of the
-//! [module docs](super)), checked before anything is fetched, then after
-//! resolution the cryptographic verification and its once-per-window
-//! refetch retry (step 6) and the signer-containment rule (step 7).
+//! The signature gates.
+//!
+//! The domain reject lists (step 3 of the [module docs](super)), checked
+//! before anything is fetched, then after resolution the cryptographic
+//! verification and its once-per-window refetch retry (step 6) and the
+//! signer-containment rule (step 7).
 
 use chrono::Utc;
 use serde_json::Value;
@@ -22,54 +24,77 @@ use crate::{
     state::AppState,
 };
 
-/// Verifies the signature against the signer's stored key, retrying once
-/// after a key refetch on failure (step 6 of the [module docs](super)).
+/// Why [`verify_with_refetch`] gave up on a signer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefetchOutcome {
+    /// Neither the stored key nor the refetched one verified the
+    /// signature, the refetch window was closed, or the refetch failed.
+    Invalid,
+    /// The refetch answered `410 Gone`: the actor no longer exists.
+    Gone,
+}
+
+/// Verifies a signature against the signer's key, refetching it once.
+///
+/// `check` takes a public PEM; on failure the key is refetched and checked
+/// again (step 6 of the [module docs](super)). The authorized-fetch gate
+/// runs the very same retry.
 ///
 /// The retry refetches `signer`'s actor document — the peer may have
 /// rotated its key since the mirror was written — but at most once per
-/// actor per [`KEY_REFETCH_WINDOW`], so a flood of bad signatures cannot
-/// turn into a fetch storm. The retried verification uses the refreshed
-/// mirror, which the successful caller then receives.
+/// actor per 60 s window, so a flood of bad signatures cannot turn into a
+/// fetch storm. The retried check uses the refreshed mirror, which the
+/// successful caller then receives.
 ///
-/// [`KEY_REFETCH_WINDOW`]: super::KEY_REFETCH_WINDOW
+/// # Errors
+///
+/// [`RefetchOutcome::Gone`] when the refetch proved the actor gone;
+/// [`RefetchOutcome::Invalid`] for every other way of not verifying.
+pub async fn verify_with_refetch<F>(
+    state: &AppState,
+    signer: User,
+    check: F,
+) -> Result<User, RefetchOutcome>
+where
+    F: Fn(&str) -> bool + Send,
+{
+    if let Some(pem) = signer.public_key.as_deref()
+        && check(pem)
+    {
+        return Ok(signer);
+    }
+    if !key_refetch_allowed(&signer.ap_id) {
+        debug!(actor = %signer.ap_id, "signature failed; refetch window still closed");
+        return Err(RefetchOutcome::Invalid);
+    }
+    match refresh_user(state, &signer).await {
+        Ok(refreshed) => match refreshed.public_key.as_deref() {
+            Some(pem) if check(pem) => Ok(refreshed),
+            Some(_) | None => Err(RefetchOutcome::Invalid),
+        },
+        Err(FetchError::Gone) => Err(RefetchOutcome::Gone),
+        Err(_err) => Err(RefetchOutcome::Invalid),
+    }
+}
+
+/// Verifies the inbox signature through [`verify_with_refetch`] and maps
+/// its outcome: 401 `Invalid signature`, or the dropped 202 when the
+/// refetch proved the actor gone and the activity is its own `Delete`.
 pub(super) async fn verify_signature(
     state: &AppState,
     inbound: &Inbound<'_>,
     signer: User,
 ) -> Result<User, InboxAuthError> {
     let request = inbound.signed_request();
-    if let Some(pem) = signer.public_key.as_deref()
-        && verifies(inbound, &request, pem)
-    {
-        return Ok(signer);
-    }
-    retry_after_refetch(state, inbound, &request, &signer).await
-}
-
-/// The retry arm of [`verify_signature`]: refetch once per window, check
-/// the fresh key, and map every remaining outcome to 401 `Invalid
-/// signature` — or to the dropped 202 when the refetch proved the actor
-/// deleted itself.
-async fn retry_after_refetch(
-    state: &AppState,
-    inbound: &Inbound<'_>,
-    request: &SignedRequestParts<'_>,
-    signer: &User,
-) -> Result<User, InboxAuthError> {
-    if !key_refetch_allowed(&signer.ap_id) {
-        debug!(actor = %signer.ap_id, "inbox signature failed; refetch window still closed");
-        return Err(InboxAuthError::invalid_signature());
-    }
-    match refresh_user(state, signer).await {
-        Ok(refreshed) => match refreshed.public_key.as_deref() {
-            Some(pem) if verifies(inbound, request, pem) => Ok(refreshed),
-            Some(_) | None => Err(InboxAuthError::invalid_signature()),
-        },
-        Err(FetchError::Gone) if is_self_delete(inbound.json, &signer.ap_id) => {
-            Err(InboxAuthError::Discarded)
-        }
-        Err(_err) => Err(InboxAuthError::invalid_signature()),
-    }
+    let signer_id = signer.ap_id.clone();
+    verify_with_refetch(state, signer, |pem| verifies(inbound, &request, pem))
+        .await
+        .map_err(|outcome| match outcome {
+            RefetchOutcome::Gone if is_self_delete(inbound.json, &signer_id) => {
+                InboxAuthError::Discarded
+            }
+            RefetchOutcome::Gone | RefetchOutcome::Invalid => InboxAuthError::invalid_signature(),
+        })
 }
 
 /// The cryptographic check at the current moment; [`verify`] owns the
