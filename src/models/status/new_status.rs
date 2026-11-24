@@ -77,6 +77,11 @@ pub struct NewStatus {
     pub reblog_of_id: Option<Uuid>,
     /// Original being quoted.
     pub quote_of_id: Option<Uuid>,
+    /// The `uri` of the object a remote status quotes, kept so an unlinked
+    /// quote can be linked once that object is stored (see
+    /// [`link_quotes_of`](super::link_quotes_of)); `None` for local
+    /// statuses and statuses that quote nothing.
+    pub quote_uri: Option<String>,
     /// Accounts this status @-mentions, in mention order: [`insert`] links
     /// them to the new row in its transaction (see
     /// [`crate::models::mention`]); empty in the default.
@@ -141,6 +146,7 @@ impl Default for NewStatus {
             direct_conversation_id: None,
             reblog_of_id: None,
             quote_of_id: None,
+            quote_uri: None,
             mentioned_user_ids: Vec::new(),
             hashtags: Vec::new(),
             media_ids: Vec::new(),
@@ -194,10 +200,10 @@ const INSERT_SQL: &str = "INSERT INTO statuses (
      in_reply_to_account_id, in_reply_to_ap_id, conversation_id,
      direct_conversation_id, reblog_of_id, quote_of_id, local,
      application_name, application_website, edited_at, expires_at,
-     ap_context, inserted_at
+     ap_context, inserted_at, quote_uri
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-     $17, $18, $19, $20, $21, $22, $23, $24, COALESCE($25, now())
+     $17, $18, $19, $20, $21, $22, $23, $24, COALESCE($25, now()), $26
 ) RETURNING *";
 
 /// The conversation the status being replied to belongs to, read from the
@@ -371,6 +377,7 @@ async fn write_status(
         .bind(new_status.expires_at)
         .bind(new_status.ap_context.as_deref())
         .bind(new_status.inserted_at)
+        .bind(new_status.quote_uri.as_deref())
         .fetch_one(conn)
         .await?;
     Ok(status)

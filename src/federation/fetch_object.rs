@@ -42,6 +42,12 @@
 //! ancestors are reached. A parent that turns out to be gone (404 or 410)
 //! completes the job quietly: threads legitimately start mid-air.
 //!
+//! `federator.quote_backfill` does the same for quotes: a remote quote of an
+//! object this instance does not have keeps the object's id in `quote_uri`,
+//! and the job resolves it ([`resolve_quoted_status`]) and links the quote.
+//! The quoted object is ingested without a backfill of its own, so quotes
+//! cost one fetch and never chain.
+//!
 //! Every dereference runs against a per-run budget of
 //! [`FetchLimits::max_fetches_per_activity`](crate::config::FetchLimits::max_fetches_per_activity)
 //! fetches: one incoming activity (or one backfill job) fans out at most
@@ -52,6 +58,7 @@
 
 mod backfill;
 mod fetch;
+mod quote_backfill;
 mod resolve;
 #[cfg(test)]
 mod tests;
@@ -67,13 +74,23 @@ use crate::{federation::fetch_actor::FetchError as ActorError, http_client::Http
 pub use self::{
     backfill::{BACKFILL_MAX_ATTEMPTS, backfill_key, handle, handle_backfill},
     fetch::fetch_object_json,
-    resolve::{resolve_status, resolve_status_as_actor, resolve_status_at_depth},
+    quote_backfill::{
+        QUOTE_BACKFILL_MAX_ATTEMPTS, handle_quote, handle_quote_backfill, quote_backfill_key,
+    },
+    resolve::{
+        resolve_quoted_status, resolve_status, resolve_status_as_actor, resolve_status_at_depth,
+    },
 };
 
 /// The [`JobRegistry`](crate::jobs::JobRegistry) key of the thread-backfill
 /// job: one deferred reply link per run, args
 /// `{"status_id": "<uuid>", "depth": <n>}`.
 pub const KIND_BACKFILL: &str = "federator.backfill";
+
+/// The [`JobRegistry`](crate::jobs::JobRegistry) key of the quote-backfill
+/// job: fetches the object an unlinked remote quote names and links the
+/// quote to it, args `{"status_id": "<uuid>"}`.
+pub const KIND_QUOTE_BACKFILL: &str = "federator.quote_backfill";
 
 /// How fetching a remote object can fail.
 #[derive(Debug)]

@@ -55,6 +55,7 @@ pub(super) fn build_new_status(
             .map(|parent| parent.conversation_id)
             .or(reply.context_conversation),
         quote_of_id,
+        quote_uri: parsed.quote_uri.clone(),
         ..parsed.status.clone()
     }
 }
@@ -63,6 +64,9 @@ pub(super) fn build_new_status(
 /// transaction, so the row goes visible with everything it shows or not at
 /// all. The [module docs](crate::services::ingest) own the ordering rules
 /// each arm keeps.
+///
+/// The stored quotes that were waiting for the new row's `uri` are linked to
+/// it on the same transaction (step 12).
 ///
 /// # Errors
 ///
@@ -78,11 +82,17 @@ pub(super) async fn write_ingested(
         .begin()
         .await
         .map_err(|err| FederationError::transient("the ingest transaction failed", &err))?;
-    let row = status::insert_conn(&mut tx, &state.config.base_url, new)
+    let mut row = status::insert_conn(&mut tx, &state.config.base_url, new)
         .await
         .map_err(|err| FederationError::transient("the status insert failed", &err))?;
     insert_media(&mut tx, row.id, &parsed.attachments).await?;
     insert_poll(&mut tx, row.id, parsed.poll.as_ref()).await?;
+    let waiting = status::link_quotes_of(&mut tx, row.id, &row.uri)
+        .await
+        .map_err(|err| FederationError::transient("the waiting quote link failed", &err))?;
+    row.quotes_count = row
+        .quotes_count
+        .saturating_add(i32::try_from(waiting).unwrap_or(i32::MAX));
     tx.commit()
         .await
         .map_err(|err| FederationError::transient("the ingest commit failed", &err))?;

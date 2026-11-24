@@ -17,7 +17,7 @@ use crate::{
         status::{self, Status},
         user::User,
     },
-    services::ingest::{self, IngestOutcome},
+    services::ingest::{self, IngestDepth, IngestOutcome},
     state::AppState,
     util::{
         id::{object_ap_id, parse_id},
@@ -82,7 +82,30 @@ pub async fn resolve_status_at_depth(
     backfill_depth: i64,
 ) -> Result<Option<Status>, FederationError> {
     let budget = FetchBudget::new(state.config.fetch.limits.max_fetches_per_activity);
-    resolve_uri(state, uri, None, &budget, backfill_depth).await
+    resolve_uri(state, uri, None, &budget, IngestDepth::walk(backfill_depth)).await
+}
+
+/// [`resolve_status`] for the object an unlinked quote names.
+///
+/// The fetched object is ingested as a leaf: it queues neither a quote
+/// backfill (a quote of a quote is not chased) nor a thread backfill (the
+/// depth starts at the thread-fetch limit), so one quote costs one run's
+/// fetch budget and nothing further.
+///
+/// # Errors
+///
+/// The same [`FederationError`] arms as [`resolve_status`].
+pub async fn resolve_quoted_status(
+    state: &AppState,
+    uri: &str,
+) -> Result<Option<Status>, FederationError> {
+    let budget = FetchBudget::new(state.config.fetch.limits.max_fetches_per_activity);
+    let limit = i64::try_from(state.config.fetch.limits.thread_fetch_depth).unwrap_or(i64::MAX);
+    let leaf = IngestDepth {
+        backfill: limit,
+        follow_quotes: false,
+    };
+    resolve_uri(state, uri, None, &budget, leaf).await
 }
 
 /// [`resolve_status`] for the `Create` handler: the fetched object is
@@ -102,20 +125,20 @@ pub async fn resolve_status_as_actor(
     actor: &User,
 ) -> Result<Option<Status>, FederationError> {
     let budget = FetchBudget::new(state.config.fetch.limits.max_fetches_per_activity);
-    resolve_uri(state, uri, Some(actor), &budget, 0).await
+    resolve_uri(state, uri, Some(actor), &budget, IngestDepth::walk(0)).await
 }
 
 /// The whole resolver: local mirror, containment-checked fetch, `Note`
 /// family check, authoring, ingest. `as_actor` selects whose post may be
 /// folded — the object's own author's mirror, or only the named
-/// [`User`]'s (see [`resolve_status_as_actor`]). `backfill_depth` is the
-/// depth the ingested row's backfill job is queued at.
+/// [`User`]'s (see [`resolve_status_as_actor`]). `depth` says where the
+/// ingested row's backfill jobs are queued.
 async fn resolve_uri(
     state: &AppState,
     uri: &str,
     as_actor: Option<&User>,
     budget: &FetchBudget,
-    backfill_depth: i64,
+    depth: IngestDepth,
 ) -> Result<Option<Status>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
@@ -187,7 +210,7 @@ async fn resolve_uri(
         mirror = get_or_fetch_actor(state, &attributed).await?;
         &mirror
     };
-    let outcome = ingest::ingest_note_at_depth(state, author, &document, backfill_depth).await?;
+    let outcome = ingest::ingest_note_with(state, author, &document, depth).await?;
     Ok(match outcome {
         IngestOutcome::Created(row) | IngestOutcome::Existing(row) => Some(row),
         IngestOutcome::Ignored(reason) => {
