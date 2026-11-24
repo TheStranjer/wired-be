@@ -18,8 +18,13 @@
 //! is `{BASE_URL}/api/v1/pleroma/password_reset/{token}`; the endpoint
 //! counts every call into the `password_reset` rate-limit bucket.
 //!
-//! The two `/api/v1/pleroma` pages are HTML, not JSON (decision 8 is about
-//! API errors; these are browser-facing pages like `/oauth/authorize`): the
+//! The two `/api/v1/pleroma` routes answer HTML pages to a browser
+//! (decision 8 is about API errors; these are browser-facing pages like
+//! `/oauth/authorize`) and JSON to a client that asks for it: the token
+//! page with `Accept: application/json` answers 200 `{"nickname"}` or 404
+//! `{"error": "Invalid Token"}`, and the completion `POST` with a JSON body
+//! or that `Accept` answers 204 or 422 `{"error"}`. The HTML description
+//! follows: the
 //! token page renders the form when the token is valid and an
 //! "Invalid Token" page when it is not — used, lapsed or never minted, the
 //! three are deliberately not told apart. Completion validates token,
@@ -39,18 +44,22 @@
 use std::fmt;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::Html,
+    http::{
+        HeaderMap, StatusCode,
+        header::{ACCEPT, CONTENT_TYPE},
+    },
+    response::{Html, IntoResponse as _, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
+use serde_json::json;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     extract::ApiBody,
     mailer::{self, templates},
     models::{
@@ -155,20 +164,26 @@ async fn enqueue_reset_mail(state: &AppState, target: &User) -> AppResult<()> {
 /// opens: the reset form when the token is unused and unexpired, the
 /// "Invalid Token" page otherwise. Both answers are 200, like Pleroma's
 /// `reset/2`, which renders `invalid_token.html` for every failed match.
+///
+/// With `Accept: application/json` the answer is 200 `{"nickname": ...}`
+/// for a live token and 404 `{"error": "Invalid Token"}` otherwise.
 async fn reset_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(token): Path<String>,
-) -> AppResult<Html<String>> {
-    let page = match password_reset::get_valid(&state.db, &token, state.config.password_reset_ttl())
-        .await?
-    {
-        Some(record) => match user::get_by_id(&state.db, record.user_id).await? {
-            Some(target) => reset_form_page(Some(&target.nickname), &token, None),
-            None => invalid_token_page(),
-        },
+) -> AppResult<Response> {
+    let live = live_reset(&state, &token).await?;
+    if accepts_json(&headers) {
+        return match live {
+            Some((_, target)) => Ok(Json(json!({"nickname": target.nickname})).into_response()),
+            None => Err(AppError::NotFoundMessage(INVALID_TOKEN.to_owned())),
+        };
+    }
+    let page = match live {
+        Some((_, target)) => reset_form_page(Some(&target.nickname), &token, None),
         None => invalid_token_page(),
     };
-    Ok(Html(page))
+    Ok(Html(page).into_response())
 }
 
 /// One field of the completion form, in either of the shapes the endpoint
@@ -255,54 +270,119 @@ const fn nested_or<'a>(nested: &'a str, flat: &'a str) -> &'a str {
     if nested.is_empty() { flat } else { nested }
 }
 
-/// `POST /api/v1/pleroma/password_reset` — complete the reset. Every
-/// answer is a 200 HTML page (Pleroma's `do_reset` renders, it never
+/// `POST /api/v1/pleroma/password_reset` — complete the reset. A browser
+/// form post answers a 200 HTML page (Pleroma's `do_reset` renders, it never
 /// errors at the transport): "Password changed!" on success, the form
-/// again with the failure's message on anything else.
+/// again with the failure's message on anything else. A request that asks
+/// for JSON (see [`post_wants_json`]) gets 204 on success and 422
+/// `{"error": message}` on a failure instead; both run the same
+/// [`reset_attempt`].
 async fn do_reset(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ApiBody(submission): ApiBody<ResetSubmission>,
-) -> AppResult<Html<String>> {
-    let page = reset_attempt(
+) -> AppResult<Response> {
+    let token = submission.token();
+    let outcome = reset_attempt(
         &state,
-        submission.token(),
+        token,
         submission.password(),
         submission.password_confirmation(),
     )
     .await?;
-    Ok(Html(page))
+    if post_wants_json(&headers) {
+        return match outcome {
+            ResetOutcome::Changed => Ok(StatusCode::NO_CONTENT.into_response()),
+            ResetOutcome::Refused(message) => Err(AppError::Unprocessable(message.to_owned())),
+        };
+    }
+    let page = match outcome {
+        ResetOutcome::Changed => success_page(),
+        ResetOutcome::Refused(message) => reset_form_page(None, token, Some(message)),
+    };
+    Ok(Html(page).into_response())
+}
+
+/// How a completion attempt ended, before it is rendered as a page or as
+/// JSON.
+#[derive(Debug, PartialEq, Eq)]
+enum ResetOutcome {
+    /// The password changed and the token was spent.
+    Changed,
+    /// Nothing changed; the message says why.
+    Refused(&'static str),
+}
+
+/// Whether `value` names `application/json`: its media type (parameters
+/// dropped) compared case-insensitively, exactly.
+fn is_json_media_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Whether the `Accept` header lists exactly `application/json`.
+fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(is_json_media_type)
+}
+
+/// Whether a completion `POST` wants the JSON answers: it asks for them in
+/// `Accept`, or its body is JSON.
+fn post_wants_json(headers: &HeaderMap) -> bool {
+    accepts_json(headers)
+        || headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_json_media_type)
 }
 
 /// The completion, in order: the token (unused, unexpired, and naming a
 /// living account), the password length, the confirmation — then the
 /// transaction that changes the password and burns every credential the
-/// old one opened. A failed step re-renders the form with its message.
+/// old one opened. The HTML and JSON answers both come from this one
+/// function, so the token is spent identically.
 async fn reset_attempt(
     state: &AppState,
     token: &str,
     password: &str,
     confirmation: &str,
-) -> AppResult<String> {
-    let Some(record) =
-        password_reset::get_valid(&state.db, token, state.config.password_reset_ttl()).await?
-    else {
-        return Ok(reset_form_page(None, token, Some(INVALID_TOKEN)));
-    };
-    let Some(target) = user::get_by_id(&state.db, record.user_id).await? else {
-        return Ok(reset_form_page(None, token, Some(INVALID_TOKEN)));
+) -> AppResult<ResetOutcome> {
+    let Some((record, target)) = live_reset(state, token).await? else {
+        return Ok(ResetOutcome::Refused(INVALID_TOKEN));
     };
     if password.chars().count() < state.config.min_password_length {
-        return Ok(reset_form_page(None, token, Some(PASSWORD_TOO_SHORT)));
+        return Ok(ResetOutcome::Refused(PASSWORD_TOO_SHORT));
     }
     if password != confirmation {
-        return Ok(reset_form_page(None, token, Some(PASSWORD_MISMATCH)));
+        return Ok(ResetOutcome::Refused(PASSWORD_MISMATCH));
     }
     let new_hash = hash_password(password)?;
     if !complete_reset(state, &target, record.id, &new_hash).await? {
-        return Ok(reset_form_page(None, token, Some(INVALID_TOKEN)));
+        return Ok(ResetOutcome::Refused(INVALID_TOKEN));
     }
     debug!(account = %target.nickname, "password reset: password changed");
-    Ok(success_page())
+    Ok(ResetOutcome::Changed)
+}
+
+/// The token's row and its account when the token is unused, unexpired and
+/// names a living account.
+async fn live_reset(
+    state: &AppState,
+    token: &str,
+) -> AppResult<Option<(password_reset::PasswordResetToken, User)>> {
+    let Some(record) =
+        password_reset::get_valid(&state.db, token, state.config.password_reset_ttl()).await?
+    else {
+        return Ok(None);
+    };
+    let target = user::get_by_id(&state.db, record.user_id).await?;
+    Ok(target.map(|target| (record, target)))
 }
 
 /// The write half, as one transaction: the token's spend, the new hash
@@ -505,6 +585,44 @@ mod tests {
         );
     }
 
+    /// Headers carrying each `(name, value)` pair.
+    fn headers_of(pairs: &[(axum::http::HeaderName, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            let _already_present =
+                headers.append(name.clone(), value.parse().expect("a valid header value"));
+        }
+        headers
+    }
+
+    #[test]
+    fn accepts_json_reads_the_accept_list() {
+        assert!(accepts_json(&headers_of(&[(ACCEPT, "application/json")])));
+        assert!(accepts_json(&headers_of(&[(
+            ACCEPT,
+            "text/html, Application/JSON; q=0.9"
+        )])));
+        assert!(!accepts_json(&headers_of(&[(ACCEPT, "text/html,*/*")])));
+        assert!(!accepts_json(&HeaderMap::new()), "no header, no JSON");
+    }
+
+    #[test]
+    fn post_wants_json_by_accept_or_json_body() {
+        assert!(post_wants_json(&headers_of(&[(
+            CONTENT_TYPE,
+            "application/json; charset=utf-8"
+        )])));
+        assert!(post_wants_json(&headers_of(&[(
+            ACCEPT,
+            "application/json"
+        )])));
+        assert!(!post_wants_json(&headers_of(&[(
+            CONTENT_TYPE,
+            "application/x-www-form-urlencoded"
+        )])));
+        assert!(!post_wants_json(&HeaderMap::new()));
+    }
+
     #[test]
     fn nested_or_prefers_a_non_empty_nested_value() {
         assert_eq!(nested_or("a", "b"), "a", "nested wins");
@@ -598,7 +716,7 @@ mod tests {
         )
         .await
         .expect("the first completion runs");
-        assert!(first.contains("Password changed!"), "{first}");
+        assert_eq!(first, ResetOutcome::Changed, "the first reset lands");
         let landed = stored_hash(&state, target.id).await;
         assert!(landed.is_some(), "the first reset set a password");
 
@@ -610,7 +728,7 @@ mod tests {
         )
         .await
         .expect("the replay runs");
-        assert!(second.contains("Invalid Token"), "{second}");
+        assert_eq!(second, ResetOutcome::Refused(INVALID_TOKEN), "the replay");
         assert_eq!(
             stored_hash(&state, target.id).await,
             landed,
