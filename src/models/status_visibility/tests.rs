@@ -12,6 +12,9 @@ use crate::{
     },
 };
 
+/// Rule 1b: a deactivated author's statuses are visible to nobody.
+mod deactivated;
+
 /// The instance origin the fixtures pretend to serve.
 const BASE: &str = TEST_BASE_URL;
 

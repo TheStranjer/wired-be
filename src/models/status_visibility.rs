@@ -20,6 +20,17 @@
 //!
 //! 1. a deleted status (a tombstone) is visible to nobody, not even its
 //!    author;
+//!
+//! 1b. (between rules 1 and 2) a status whose author's account is
+//! deactivated (`users.is_active` false, a suspension) is visible to
+//! nobody, not even that author, until the account is reactivated —
+//! Pleroma's `Activity.restrict_deactivated_users`
+//! (`lib/pleroma/activity.ex`, which its search and every timeline apply)
+//! and Mastodon's `return false if author.unavailable?`
+//! (`app/policies/status_policy.rb:5`). The admin readers in
+//! [`crate::models::status::admin`] do not go through this module and
+//! keep seeing everything.
+//!
 //! 2. an author who blocked the viewer sees nothing of theirs, and sees
 //!    none of it, shown to the viewer — except their own posts;
 //! 3. `public` and `unlisted` are visible to anyone, anonymous included;
@@ -33,9 +44,9 @@
 //! 6. `direct` is visible to the author and to the accounts the status
 //!    @-mentions (`status_mentions`);
 //! 7. a reblog row is visible only if its own visibility allows it **and**
-//!    the original it reblogs is itself visible to the viewer — rules 1
-//!    and 2 apply to the original too, so a tombstoned or
-//!    author-blocked original hides every reblog of it.
+//!    the original it reblogs is itself visible to the viewer — rules 1,
+//!    1b and 2 apply to the original too, so a tombstoned, deactivated-author
+//!    or author-blocked original hides every reblog of it.
 //!
 //! In the SQL shape, rule 7 recurses one level (the reblogged original is
 //! checked with the same clause, minus its own original check): a reblog
@@ -79,6 +90,10 @@ use crate::{
 pub const ACTIVE_AUTHOR: &str =
     " AND EXISTS (SELECT 1 FROM users au WHERE au.id = s.user_id AND au.is_active)";
 
+/// Whether the author with the given id exists and is active: rule 1b.
+/// No row answers no rows, which [`author_is_active`] reads as "not active".
+const AUTHOR_ACTIVE_SQL: &str = "SELECT is_active FROM users WHERE id = $1";
+
 /// The prefix of [`filter_visible`]'s statement: the candidate ids come as
 /// one array bind, then [`push_visibility_clause`] closes the parenthesis
 /// and appends the clause under alias `s`.
@@ -116,15 +131,19 @@ pub async fn can_view(pool: &PgPool, status: &Status, viewer: Option<&User>) -> 
     }
 }
 
-/// Rules 1 to 6 for the one status in hand: not a tombstone, the author
-/// has not blocked the viewer, and the status's own visibility admits
-/// them. Rule 7's chain is [`can_view`]'s loop around this.
+/// Rules 1 to 6 for the one status in hand: not a tombstone, the author's
+/// account is active, the author has not blocked the viewer, and the
+/// status's own visibility admits them. Rule 7's chain is [`can_view`]'s
+/// loop around this.
 async fn one_status_admits(
     pool: &PgPool,
     status: &Status,
     viewer: Option<&User>,
 ) -> AppResult<bool> {
     if status.deleted_at.is_some() {
+        return Ok(false);
+    }
+    if !author_is_active(pool, status).await? {
         return Ok(false);
     }
     if author_blocked_viewer(pool, status, viewer).await? {
@@ -139,7 +158,8 @@ async fn one_status_admits(
 ///
 /// The group answers the rules of the [module docs](self) for every row of
 /// the aliased `statuses` table: `deleted_at IS NULL` (rule 1), a `NOT
-/// EXISTS` over `blocks` (rule 2), the visibility `OR` arms (rules 3 to 6,
+/// EXISTS` over `blocks` (rule 2), an `EXISTS` over the active author
+/// (rule 1b), the visibility `OR` arms (rules 3 to 6,
 /// the `local` arm only for a viewer this instance owns) and, for a
 /// reblog, an `EXISTS` over the original row under the same group minus
 /// its own original check (rule 7). Anonymous requests — `viewer` is
@@ -186,6 +206,25 @@ pub async fn filter_visible(
         .into_iter()
         .filter(|status| visible.contains(&status.id))
         .collect())
+}
+
+/// Rule 1b: whether `status`'s author exists and is active. A missing
+/// user row counts as inactive.
+///
+/// [`can_view`] applies this to every link of a chain; the `ActivityPub`
+/// reads, which serve `public` and `unlisted` rows without a full
+/// [`can_view`], call it directly.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn author_is_active(pool: &PgPool, status: &Status) -> AppResult<bool> {
+    let row: Option<(bool,)> = sqlx::query_as(AUTHOR_ACTIVE_SQL)
+        .bind(status.user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some_and(|(active,)| active))
 }
 
 /// Rule 2: whether `status`'s author blocked `viewer`. An anonymous
@@ -254,7 +293,8 @@ async fn author_or_mentioned(
 
 /// Pushes the whole parenthesised visibility expression for `alias` that
 /// [`push_visibility_clause`] wraps its ` AND ` around: the tombstone
-/// condition (rule 1), the author's block of the viewer (rule 2, bound
+/// condition (rule 1), the author-is-active `EXISTS` over `users` under
+/// alias `<alias>_author` (rule 1b), the author's block of the viewer (rule 2, bound
 /// viewers only), the visibility arms ([`push_visibility_arms`]) and —
 /// when `check_original` — rule 7 as an `EXISTS` over the original row
 /// under alias `rb`, checked with the same expression one level down.
@@ -264,7 +304,18 @@ fn push_visible_expression(
     alias: &str,
     check_original: bool,
 ) {
+    let author = format!("{alias}_author");
     let _tombstone: &mut _ = qb.push("( ").push(alias).push(".deleted_at IS NULL");
+    let _active: &mut _ = qb
+        .push(" AND EXISTS (SELECT 1 FROM users ")
+        .push(&author)
+        .push(" WHERE ")
+        .push(&author)
+        .push(".id = ")
+        .push(alias)
+        .push(".user_id AND ")
+        .push(&author)
+        .push(".is_active)");
     if let Some(viewer) = viewer {
         let _unblocked: &mut _ = qb
             .push(

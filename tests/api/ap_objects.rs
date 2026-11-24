@@ -483,6 +483,41 @@ async fn a_local_status_is_never_a_document() {
     );
 }
 
+/// A public status of a deactivated author is no document: the unscoped
+/// read answers the plain 404 until the account is reactivated.
+#[tokio::test]
+async fn a_deactivated_authors_note_is_not_served() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let note = common::create_status(&pool, &alice, "going dark", Visibility::Public).await;
+    let app = common::test_app(pool.clone());
+    let path = object_path(&note);
+
+    let _deactivated: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .expect("the account deactivates");
+    assert_not_found(
+        &fetch_ap(&app, &path).await,
+        "an anonymous read of a deactivated author's note",
+    );
+
+    let _reactivated: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE users SET is_active = true WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .expect("the account reactivates");
+    assert_eq!(
+        fetch_ap(&app, &path).await.status,
+        StatusCode::OK,
+        "the reactivated author is served again"
+    );
+}
+
 /// A soft-deleted status answers 410, and the body is the `Tombstone`
 /// document — the reserved id, the type it lived as, and the moment it
 /// went — not the generic `{"error":"Gone"}` JSON.
