@@ -418,7 +418,9 @@ mod tests {
         after_status_deleted(&state, &own).await;
         after_block_changed(&state, &row, false).await;
         after_profile_updated(&state, &alice).await;
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
         after_favourite_changed(&state, &fav, true).await;
         after_reaction_changed(&state, &reaction, true).await;
         after_reblog_changed(&state, &reblog, true).await;

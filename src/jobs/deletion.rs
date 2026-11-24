@@ -55,7 +55,8 @@
 //! [`crate::services::federation_out::after_account_deleted`] runs between
 //! loading the account and clearing its rows, because the fan-out to the
 //! remote followers and followees reads the relationships the clear step
-//! deletes.
+//! deletes. A failure to read the recipients or queue the `Delete` retries
+//! the job before anything is cleared.
 
 use serde::Deserialize;
 use serde_json::{Value, json};

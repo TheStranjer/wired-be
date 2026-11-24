@@ -20,12 +20,18 @@ use crate::{
 ///
 /// A vanished user row or an unparsable payload is discarded — no retry
 /// can fix either; everything else that fails is a database failure over
-/// work that is idempotent, and retries.
+/// work that is idempotent, and retries. That includes queueing the actor
+/// `Delete`: it happens before the follow rows go, so a failed attempt
+/// leaves the recipients in place for the next one.
 pub fn handle_delete(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
         let user_id = parse_args(&args)?;
         let account = load_account(&state, user_id).await?;
-        crate::services::federation_out::after_account_deleted(&state, &account).await;
+        // A failure here retries before `clear_data` deletes the follow rows
+        // the recipient list is built from.
+        crate::services::federation_out::after_account_deleted(&state, &account)
+            .await
+            .map_err(|err| retry(&err))?;
         clear_data(&state, &account).await?;
         user::purge_personal_data(&state.db, account.id)
             .await
@@ -140,6 +146,9 @@ async fn clear_backups(state: &AppState, user_id: Uuid) -> Result<usize, JobErro
     }
     Ok(rows.len())
 }
+
+#[cfg(test)]
+mod announce_tests;
 
 #[cfg(test)]
 mod tests {
