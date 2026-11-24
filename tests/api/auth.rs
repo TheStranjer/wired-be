@@ -16,6 +16,7 @@ use wired_be::{
     error::AppError,
     models::user::{Flag, NewUser},
     state::AppState,
+    util::token::sha256_hex,
 };
 
 use crate::common::{self, TestRequest};
@@ -96,7 +97,7 @@ async fn expire_token(pool: &PgPool, token: &str) {
     let outcome = sqlx::query(
         "UPDATE oauth_tokens SET valid_until = now() - interval '1 hour' WHERE token = $1",
     )
-    .bind(token)
+    .bind(sha256_hex(token))
     .execute(pool)
     .await
     .expect("the expiry update runs");

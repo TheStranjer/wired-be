@@ -107,9 +107,9 @@ async fn a_follow_wakes_the_subscription_with_a_signed_encrypted_payload() {
         web_push::decrypt_payload(&captured_body(&s.seen), &s.keys.private_key, &s.keys.auth)
             .expect("the body is a record the client's keys read");
     let payload: Value = serde_json::from_slice(&decrypted).expect("the payload is JSON");
-    assert_eq!(
-        payload["access_token"], s.recipient.token.token,
-        "the wake token is the subscription's own"
+    assert!(
+        payload.get("access_token").is_none(),
+        "the payload carries no credential: only digests are stored"
     );
     assert_eq!(payload["notification_id"], s.note.id.to_string());
     assert_eq!(payload["notification_type"], notification::TYPE_FOLLOW);

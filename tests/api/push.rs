@@ -21,6 +21,7 @@ use wired_be::{
     },
     entities::push_subscription::ALERT_TYPES,
     services::vapid,
+    util::token::sha256_hex,
 };
 
 use crate::common;
@@ -75,14 +76,15 @@ async fn subscription_count(pool: &PgPool) -> i64 {
 }
 
 /// The stored keys of the token `bearer`'s subscription, as
-/// `(key_p256dh, key_auth)`.
+/// `(key_p256dh, key_auth)`. The token table holds the bearer's SHA-256
+/// digest, so that is what the join matches.
 async fn stored_keys(pool: &PgPool, bearer: &str) -> (String, String) {
     sqlx::query_as(
         "SELECT s.key_p256dh, s.key_auth FROM web_push_subscriptions s
            JOIN oauth_tokens t ON t.id = s.token_id
           WHERE t.token = $1",
     )
-    .bind(bearer)
+    .bind(sha256_hex(bearer))
     .fetch_one(pool)
     .await
     .expect("the token's subscription row reads")

@@ -115,7 +115,7 @@ async fn policy_permits(
 }
 
 /// The delivery itself: assemble the payload from the actor, the
-/// recipient's settings, the status text and the token string, sign the
+/// recipient's settings and the status text, sign the
 /// VAPID header, and send. A `Gone` answer retires the subscription and
 /// completes; a `Retryable` one becomes the queue's retry.
 ///
@@ -146,10 +146,10 @@ async fn send_note(
     let found = oauth_token::get_by_id(pool, subscription.token_id)
         .await
         .map_err(|err| retry(&err))?;
-    let Some(token) = found else {
+    if found.is_none() {
         debug!(token = %subscription.token_id, "the subscription's token is gone");
         return Ok(());
-    };
+    }
     let body = body_text(pool, &recipient, note).await?;
     let icon = profile_image(
         &actor,
@@ -159,7 +159,6 @@ async fn send_note(
     );
     let title_name = plain_display_name(&actor);
     let payload = web_push::payload_json(&web_push::PushPayload {
-        access_token: &token.token,
         notification_id: note.id,
         notification_type: &note.event_type,
         icon: &icon,
