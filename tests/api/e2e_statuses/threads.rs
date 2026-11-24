@@ -11,7 +11,7 @@ use super::thread_support::{
 use crate::common;
 
 /// The author reads their own thread whole, from every leg: ancestors
-/// root-first, descendants in flat chronological order, and every
+/// root-first, descendants in thread order, and every
 /// descendant's `parent_visible` true because the chain's direct parents
 /// all came back (or are the named status itself).
 #[tokio::test]
@@ -34,7 +34,7 @@ async fn the_author_reads_their_whole_thread_back_in_both_arms() {
         assert_eq!(
             descendants,
             vec![thread.reply.clone(), thread.deep.clone()],
-            "the descent is flat and chronological"
+            "the descent follows the thread: reply, then the answer under it"
         );
         assert!(
             parent_visible(&body, &thread.reply),

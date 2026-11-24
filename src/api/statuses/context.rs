@@ -9,8 +9,9 @@
 //! at most [`MAX_CONTEXT_DEPTH`] hops, root first, the named status never —
 //! and *descendants* are the walk down through every reply of it, across
 //! every branch — at most [`MAX_CONTEXT_DEPTH`] hops and
-//! [`MAX_CONTEXT_DESCENDANTS`] rows, in flat chronological thread order
-//! (id ascending), the named status never. Both walks run raw and both
+//! [`MAX_CONTEXT_DESCENDANTS`] rows, in thread order (depth first,
+//! siblings by `inserted_at`, which for a remote status is its author's
+//! `published` time, never by local id), the named status never. Both walks run raw and both
 //! answers run through [`filter_visible`], so an invisible row is *skipped
 //! but walked past*: it drops out of the arrays and the thread on the far
 //! side of it still arrives. Descendants lose one more class: statuses by
@@ -70,8 +71,9 @@ use super::{MAX_CONTEXT_DEPTH, MAX_CONTEXT_DESCENDANTS};
 /// an invisible link is *skipped but walked past* — and [`filter_visible`]
 /// narrows each raw chain to what the viewer may see afterwards, keeping
 /// the order the walk produced: ancestors root-first (oldest first) and
-/// descendants in flat chronological thread order, exactly like Pleroma's
-/// context read. Descendants additionally drop what the viewer's own blocks
+/// descendants in thread order (depth first, siblings by publish time, as
+/// Mastodon's `descendants` answers them), so a thread backfilled newest
+/// reply first still reads root to leaf. Descendants additionally drop what the viewer's own blocks
 /// and mutes silence ([`is_silenced`]), the named status's id counts as
 /// shown, and each descendant's `pleroma.parent_visible` is then set to
 /// whether its own direct parent came back in this answer
@@ -141,7 +143,8 @@ async fn visible_ancestors(
     retain_open_to_viewer(state, viewer, visible).await
 }
 
-/// The descendants array's rows: the raw tree below `status_id` (id order),
+/// The descendants array's rows: the raw tree below `status_id` (thread
+/// order),
 /// narrowed to what `viewer` may see and then to what their eye still
 /// allows. The second step is the one the visibility model does not carry:
 /// [`filter_visible`] shuts out an author who blocked the *viewer* (its
@@ -230,8 +233,8 @@ pub(super) struct StatusContext {
     /// chain, narrowed to what the viewer may see, the named status
     /// excluded.
     ancestors: Vec<Status>,
-    /// Everything below it, every branch, in flat chronological thread
-    /// order (id ascending) — narrowed the same way and then further by
+    /// Everything below it, every branch, in thread order (depth first,
+    /// siblings by publish time) — narrowed the same way and then further by
     /// the viewer's blocks, mutes and the [`MAX_CONTEXT_DESCENDANTS`]
     /// row cap, the named status excluded. Each entry's
     /// `pleroma.parent_visible` says whether its direct parent is in this

@@ -1,11 +1,13 @@
 //! `GET /api/v1/statuses/{id}/context`: Pleroma's thread read — ancestors
-//! root-first, descendants flat and chronological, invisible, deleted and
+//! root-first, descendants in thread order (depth first, siblings by publish
+//! time, never by local id), invisible, deleted and
 //! silenced links skipped but walked past, `parent_visible` on every entry,
 //! and the optional-auth gate on the route itself. The local helpers below
 //! build and read the thread fixtures; the route wrapper and the id reader
 //! live in `support` because the quoting tests page through a context too.
 
 use axum::http::StatusCode;
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use wired_be::{
@@ -152,11 +154,11 @@ async fn a_linear_thread_answers_both_ways_around_its_named_status() {
 }
 
 /// A branching thread answers every branch below the named status in one
-/// flat, id-ascending (chronological) list — the second hop of the left
-/// branch follows the right branch's root reply, not its own parent — and
-/// each entry's `parent_visible` names whoever it really answered.
+/// list in thread order — depth first, so the second hop of the left branch
+/// follows its own parent, before the right branch's younger root reply —
+/// and each entry's `parent_visible` names whoever it really answered.
 #[tokio::test]
-async fn a_branching_thread_answers_a_flat_chronological_descendants_list() {
+async fn a_branching_thread_answers_a_depth_first_descendants_list() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
@@ -172,8 +174,8 @@ async fn a_branching_thread_answers_a_flat_chronological_descendants_list() {
     let from_root = context(&app, None, &root.id.to_string()).await.json_value();
     assert_eq!(
         context_ids(&from_root, "descendants"),
-        ids_of(&[&left, &right, &deep]),
-        "creation order across branches: `deep` last, though it answers `left`"
+        ids_of(&[&left, &deep, &right]),
+        "depth first: `deep` right after the `left` it answers, then `right`"
     );
     for reply in [&left, &right, &deep] {
         assert!(
@@ -194,6 +196,96 @@ async fn a_branching_thread_answers_a_flat_chronological_descendants_list() {
     assert!(
         context_ids(&from_right, "descendants").is_empty(),
         "the other branch is not below this reply"
+    );
+}
+
+/// Inserts `author`'s `text` as a reply to `parent` published at
+/// `published`, and returns its row.
+async fn reply_published(
+    pool: &PgPool,
+    author: &User,
+    parent: &Status,
+    text: &str,
+    published: DateTime<Utc>,
+) -> Status {
+    status::insert(
+        pool,
+        TEST_BASE_URL,
+        &NewStatus {
+            in_reply_to_id: Some(parent.id),
+            in_reply_to_account_id: Some(parent.user_id),
+            inserted_at: Some(published),
+            ..NewStatus::local(author, text)
+        },
+    )
+    .await
+    .expect("a dated reply fixture inserts")
+}
+
+/// A thread stored deepest-first (what backfill does, so the ids run
+/// against the thread) still answers root to leaf: the order follows the
+/// replies' `inserted_at`, not their ids.
+#[tokio::test]
+async fn backfilled_replies_with_reversed_ids_answer_in_thread_order() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool.clone());
+    let root = common::create_status(&pool, &alice, "root", Visibility::Public).await;
+    let base = Utc::now() - Duration::hours(1);
+    // Each row is stored before its parent exists, then linked, newest first.
+    let mut stored = Vec::new();
+    for (minutes, text) in [(30, "r3"), (20, "r2"), (10, "r1")] {
+        let row = status::insert(
+            &pool,
+            TEST_BASE_URL,
+            &NewStatus {
+                inserted_at: Some(base + Duration::minutes(minutes)),
+                ..NewStatus::local(&alice, text)
+            },
+        )
+        .await
+        .expect("an unlinked reply fixture inserts");
+        stored.push(row);
+    }
+    let [r3, r2, r1] = <[Status; 3]>::try_from(stored).expect("three rows");
+    assert!(r3.id < r2.id && r2.id < r1.id, "ids run against the thread");
+    for (child, parent) in [(&r3, &r2), (&r2, &r1), (&r1, &root)] {
+        let linked = status::link_backfilled_reply(&pool, child.id, parent)
+            .await
+            .expect("the link write runs");
+        assert!(linked, "the deferred link closes");
+    }
+
+    let from_root = context(&app, None, &root.id.to_string()).await.json_value();
+    assert_eq!(
+        context_ids(&from_root, "descendants"),
+        ids_of(&[&r1, &r2, &r3]),
+        "root to leaf despite the reversed ids"
+    );
+}
+
+/// Siblings are ordered by publish time and each is followed by its own
+/// subtree, whatever order the rows were stored in: `A` (older, stored
+/// last), its child `A1`, then `B`.
+#[tokio::test]
+async fn siblings_answer_by_publish_time_each_followed_by_its_subtree() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool.clone());
+    let root = common::create_status(&pool, &alice, "root", Visibility::Public).await;
+    let base = Utc::now() - Duration::hours(1);
+    let newer = reply_published(&pool, &alice, &root, "B", base + Duration::minutes(20)).await;
+    let older = reply_published(&pool, &alice, &root, "A", base + Duration::minutes(10)).await;
+    let child = reply_published(&pool, &alice, &older, "A1", base + Duration::minutes(30)).await;
+    assert!(newer.id < older.id, "the younger sibling has the older id");
+
+    let from_root = context(&app, None, &root.id.to_string()).await.json_value();
+    assert_eq!(
+        context_ids(&from_root, "descendants"),
+        ids_of(&[&older, &child, &newer]),
+        "A, then its child A1, then B"
     );
 }
 
@@ -318,9 +410,10 @@ async fn a_silenced_author_vanishes_from_the_descendants() {
         .json_value();
     assert_eq!(
         context_ids(&for_carol, "descendants"),
-        ids_of(&[&own, &under]),
+        ids_of(&[&under, &own]),
         "the blocked and muted authors' rows are out; the viewer's own row \
-         stays, and so does the live reply under the silenced one"
+         stays, and so does the live reply under the silenced one (which \
+         follows its parent's place in the thread, ahead of `own`)"
     );
     assert!(
         parent_visible(&for_carol, "descendants", &own.id.to_string()),
@@ -345,7 +438,7 @@ async fn a_silenced_author_vanishes_from_the_descendants() {
     let anon = context(&app, None, &root.id.to_string()).await.json_value();
     assert_eq!(
         context_ids(&anon, "descendants"),
-        ids_of(&[&blocked, &muted, &own, &under]),
+        ids_of(&[&blocked, &under, &muted, &own]),
         "nobody is silenced for the anonymous caller"
     );
     assert!(
