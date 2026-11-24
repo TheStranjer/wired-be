@@ -76,7 +76,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, distinct_ids},
+    api::helpers::{account_or_404, capped_distinct_ids},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -345,8 +345,10 @@ async fn list_list_accounts(
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:lists` check; [`AppError::Unprocessable`] when the body has no
-/// `account_ids` array (the extractor's 422) or names an account the caller
-/// does not follow; [`AppError::NotFound`] for a list that is malformed,
+/// `account_ids` array (the extractor's 422), names an account the caller
+/// does not follow, or names more than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids
+/// (`Too many ids`, refused before any read); [`AppError::NotFound`] for a list that is malformed,
 /// unknown or foreign, and for an account id that is malformed or names no
 /// account. Any database failure arrives through `?` as [`AppError::Database`].
 async fn add_list_accounts(
@@ -356,8 +358,9 @@ async fn add_list_accounts(
     ApiBody(body): ApiBody<MemberParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
+    let (ids, all_ids) = capped_distinct_ids(body.account_ids.iter().map(String::as_str))?;
     let list_id = owned_list(&state, &auth, &id).await?;
-    let members = requested_accounts(&state, &body.account_ids).await?;
+    let members = requested_accounts(&state, ids, all_ids).await?;
     ensure_followed(&state, auth.0.id, &members).await?;
     let added = list::add_members(&state.db, list_id, &members).await?;
     debug!(
@@ -382,7 +385,9 @@ async fn add_list_accounts(
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:lists` check; [`AppError::Unprocessable`] when neither the body
-/// nor the query carries an `account_ids` array; [`AppError::NotFound`] for a
+/// nor the query carries an `account_ids` array, or it names more than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids
+/// (`Too many ids`, refused before any read); [`AppError::NotFound`] for a
 /// list that is malformed, unknown or foreign. Any database failure arrives
 /// through `?` as [`AppError::Database`].
 async fn remove_list_accounts(
@@ -392,8 +397,9 @@ async fn remove_list_accounts(
     ApiParams(params): ApiParams<MemberParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
+    let (members, _unknown_ignored) =
+        capped_distinct_ids(params.account_ids.iter().map(String::as_str))?;
     let list_id = owned_list(&state, &auth, &id).await?;
-    let (members, _unknown_ignored) = distinct_ids(params.account_ids.iter().map(String::as_str));
     let removed = list::remove_members(&state.db, list_id, &members).await?;
     debug!(
         removed,
@@ -435,8 +441,11 @@ async fn owned_list(state: &AppState, auth: &AuthUser, id: &str) -> AppResult<Uu
 ///
 /// [`AppError::NotFound`] as described; any database failure arrives through
 /// `?` as [`AppError::Database`].
-async fn requested_accounts(state: &AppState, texts: &[String]) -> AppResult<Vec<Uuid>> {
-    let (ids, all_ids) = distinct_ids(texts.iter().map(String::as_str));
+async fn requested_accounts(
+    state: &AppState,
+    ids: Vec<Uuid>,
+    all_ids: bool,
+) -> AppResult<Vec<Uuid>> {
     if !all_ids {
         return Err(AppError::NotFound);
     }
@@ -603,6 +612,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::api::helpers::distinct_ids;
 
     /// Parses `value` as the endpoint's parameters and validates them as a
     /// create would.

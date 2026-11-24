@@ -78,7 +78,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        helpers::{distinct, distinct_ids},
+        helpers::{capped_distinct_ids, distinct, distinct_ids},
         notifications_v2::{NO_EXTRA_QUERY, StringList, names_of},
     },
     auth::AuthUser,
@@ -344,7 +344,9 @@ struct RecipientsParams {
 /// The auth errors of [`mark_read`]; the same 404 [`show`] renders for an
 /// unreadable participation or a refused recipient;
 /// [`Unprocessable`](crate::error::AppError::Unprocessable) from the
-/// extractor for a body without `recipients`.
+/// extractor for a body without `recipients`, and `Too many ids` for more
+/// than [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct
+/// recipients, before anything is read.
 async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -352,8 +354,9 @@ async fn update(
     ApiBody(body): ApiBody<RecipientsParams>,
 ) -> AppResult<Json<Conversation>> {
     auth.require(WRITE_CONVERSATIONS)?;
+    let requested = requested_recipients(&body.recipients)?;
     let row = owned_participation(&state, auth.0.id, &id).await?;
-    let recipients = kept_recipients(requested_recipients(&body.recipients)?, auth.0.id);
+    let recipients = kept_recipients(requested, auth.0.id);
     if !all_are_accounts(&state, &recipients).await? {
         return Err(unknown_conversation());
     }
@@ -374,10 +377,12 @@ async fn update(
 ///
 /// # Errors
 ///
-/// [`NotFoundMessage`](crate::error::AppError::NotFoundMessage) when any
-/// value is not id text.
+/// [`Unprocessable`](crate::error::AppError::Unprocessable) when more than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids are
+/// named; [`NotFoundMessage`](crate::error::AppError::NotFoundMessage) when
+/// any value is not id text.
 fn requested_recipients(list: &StringList) -> AppResult<Vec<Uuid>> {
-    let (ids, all_ids) = distinct_ids(list.names());
+    let (ids, all_ids) = capped_distinct_ids(list.names())?;
     if all_ids {
         Ok(ids)
     } else {
