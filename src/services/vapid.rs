@@ -13,8 +13,10 @@
 //! generates on first read, the same idempotence the
 //! [`instance_actor`](super::instance_actor) service follows. An operator
 //! who pins their own material through [`VapidConfig`](crate::config::VapidConfig)
-//! (`VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY`) overwrites the stored pair
-//! at every startup, so config is the last word.
+//! (`VAPID_PRIVATE_KEY`, with an optional `VAPID_PUBLIC_KEY` that must be
+//! its derived public half) overwrites the stored pair at every startup,
+//! so config is the last word. The stored public half is always derived
+//! from the stored private half.
 //!
 //! The private half is secret: it is never formatted into a log line or
 //! an error message, and only [`vapid_public_key`] — the public half —
@@ -146,30 +148,46 @@ fn public_key_of_private_pem(pem: &str) -> AppResult<String> {
 /// pair answers untouched, so restarts keep the key peers and clients
 /// already know.
 ///
+/// The stored public half is always the one derived from the stored
+/// private half: a configured `VAPID_PUBLIC_KEY` is only checked against
+/// the key derived from `VAPID_PRIVATE_KEY`, and a pair that disagrees (or
+/// a public key with no private one) refuses startup before anything is
+/// written. A pair that does not verify would make every push delivery fail
+/// with 401/403.
+///
 /// # Errors
 ///
-/// [`AppError::Internal`] for an unparseable configured private key, and
-/// any database failure arrives through `?` as
-/// [`AppError::Database`](crate::error::AppError).
+/// [`AppError::Internal`] for an unparseable configured private key, a
+/// configured public key that does not match the private one, or a public
+/// key configured without a private one; any database failure arrives
+/// through `?` as [`AppError::Database`](crate::error::AppError).
 pub async fn ensure_instance_keypair(pool: &PgPool, config: &Config) -> AppResult<String> {
-    if let Some(private_pem) = config.vapid.private_key.as_deref() {
-        let public = match config.vapid.public_key.as_deref() {
-            Some(key) => key.to_owned(),
-            None => public_key_of_private_pem(private_pem)?,
-        };
-        instance_secret::set(pool, VAPID_PRIVATE_NAME, private_pem).await?;
-        instance_secret::set(pool, VAPID_PUBLIC_NAME, &public).await?;
-        return Ok(public);
+    let Some(private_pem) = config.vapid.private_key.as_deref() else {
+        if config.vapid.public_key.is_some() {
+            return Err(AppError::Internal(
+                "VAPID_PUBLIC_KEY is set without VAPID_PRIVATE_KEY".to_owned(),
+            ));
+        }
+        return ensure_generated(pool).await;
+    };
+    let derived = public_key_of_private_pem(private_pem)?;
+    if let Some(configured) = config.vapid.public_key.as_deref()
+        && !same_public_point(configured, &derived)
+    {
+        return Err(AppError::Internal(
+            "VAPID_PUBLIC_KEY does not match VAPID_PRIVATE_KEY".to_owned(),
+        ));
     }
-    let public = ensure_generated(pool).await?;
-    if let Some(key) = config.vapid.public_key.as_deref() {
-        // A pinned public half with no private key beside it: the
-        // generated pair keeps the row usable and the configured text
-        // becomes the advertised one.
-        instance_secret::set(pool, VAPID_PUBLIC_NAME, key).await?;
-        return Ok(key.to_owned());
-    }
-    Ok(public)
+    instance_secret::set(pool, VAPID_PRIVATE_NAME, private_pem).await?;
+    instance_secret::set(pool, VAPID_PUBLIC_NAME, &derived).await?;
+    Ok(derived)
+}
+
+/// Whether the URL-safe base64 texts `configured` and `derived` decode to
+/// the same bytes; a `configured` text that is not base64 differs.
+fn same_public_point(configured: &str, derived: &str) -> bool {
+    let decode = |text: &str| URL_SAFE_NO_PAD.decode(text.trim_end_matches('=')).ok();
+    matches!((decode(configured), decode(derived)), (Some(a), Some(b)) if a == b)
 }
 
 /// The instance's VAPID public key, generating the pair on first use.
@@ -192,11 +210,12 @@ pub async fn vapid_public_key(pool: &PgPool) -> AppResult<String> {
 }
 
 /// Reads the stored pair and returns its public half, seeding what is
-/// missing: a complete pair answers as it stands, a stored private half
-/// with no public one gets its public half derived and stored, and with
-/// nothing stored a fresh pair is generated. Every write yields to a
-/// concurrent one, and the public key finally reported is the row that
-/// survived — one instance, one key pair.
+/// missing: a complete pair answers as it stands; otherwise the private
+/// half is generated if absent (yielding to a concurrent writer's row),
+/// re-read, and the public half is derived from the private row that
+/// survived and stored. A locally generated public key is never stored
+/// itself, so two instances starting together cannot leave one's private
+/// half beside the other's public half.
 ///
 /// # Errors
 ///
@@ -205,41 +224,26 @@ pub async fn vapid_public_key(pool: &PgPool) -> AppResult<String> {
 async fn ensure_generated(pool: &PgPool) -> AppResult<String> {
     let stored_private = instance_secret::get(pool, VAPID_PRIVATE_NAME).await?;
     let public_row = instance_secret::get(pool, VAPID_PUBLIC_NAME).await?;
-    if let Some(public) = public_row.filter(|_| stored_private.is_some()) {
+    if stored_private.is_some()
+        && let Some(public) = public_row
+    {
         return Ok(public);
     }
-    if let Some(pem) = stored_private {
-        // A stored private half with no public one: derive the advertised
-        // half, so an operator-pinned key still advertises a matching key.
-        let derived = public_key_of_private_pem(&pem)?;
-        let _seeded: bool =
-            instance_secret::insert_if_absent(pool, VAPID_PUBLIC_NAME, &derived).await?;
-        return stored_public(pool).await;
+    if stored_private.is_none() {
+        let pair = generate_pair()?;
+        let _private_seeded: bool =
+            instance_secret::insert_if_absent(pool, VAPID_PRIVATE_NAME, &pair.private_pem).await?;
     }
-    // Nothing usable stored: generate a fresh pair, each half yielding to
-    // a concurrent writer's row.
-    let pair = generate_pair()?;
-    let _private_seeded: bool =
-        instance_secret::insert_if_absent(pool, VAPID_PRIVATE_NAME, &pair.private_pem).await?;
-    let _public_seeded: bool =
-        instance_secret::insert_if_absent(pool, VAPID_PUBLIC_NAME, &pair.public_key).await?;
-    stored_public(pool).await
-}
-
-/// The stored public half, with the failure that can only mean the row
-/// vanished between writing and reading it.
-///
-/// # Errors
-///
-/// As [`vapid_public_key`].
-async fn stored_public(pool: &PgPool) -> AppResult<String> {
-    instance_secret::get(pool, VAPID_PUBLIC_NAME)
+    let winner = instance_secret::get(pool, VAPID_PRIVATE_NAME)
         .await?
         .ok_or_else(|| {
             AppError::Internal(format!(
-                "the {VAPID_PUBLIC_NAME} instance secret is missing after seeding"
+                "the {VAPID_PRIVATE_NAME} instance secret is missing after seeding"
             ))
-        })
+        })?;
+    let derived = public_key_of_private_pem(&winner)?;
+    instance_secret::set(pool, VAPID_PUBLIC_NAME, &derived).await?;
+    Ok(derived)
 }
 
 #[cfg(test)]
@@ -404,43 +408,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_configured_public_key_wins_over_the_derived_one() {
+    async fn a_matching_configured_public_key_is_accepted_and_stored_as_derived() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool();
         let mine = generate_pair().unwrap();
-        let config = config_with(Some(&mine.private_pem), Some("pinned-public-key"));
+        // The same point with the base64 padding some tools append.
+        let padded = format!("{}=", mine.public_key);
+        for public in [mine.public_key.as_str(), padded.as_str()] {
+            let config = config_with(Some(&mine.private_pem), Some(public));
 
-        let advertised = ensure_instance_keypair(pool, &config)
-            .await
-            .expect("the pinned pair applies");
+            let advertised = ensure_instance_keypair(pool, &config)
+                .await
+                .expect("the matching pair applies");
 
-        assert_eq!(advertised, "pinned-public-key", "verbatim");
-        let (private, public) = stored_pair(pool).await;
-        assert_eq!(
-            private.as_deref(),
-            Some(mine.private_pem.trim()),
-            "the configured PEM is stored trimmed"
-        );
-        assert_eq!(public.as_deref(), Some("pinned-public-key"));
+            assert_eq!(
+                advertised, mine.public_key,
+                "the derived text is advertised"
+            );
+            let (private, stored_public) = stored_pair(pool).await;
+            assert_eq!(
+                private.as_deref(),
+                Some(mine.private_pem.trim()),
+                "the configured PEM is stored trimmed"
+            );
+            assert_eq!(
+                stored_public.as_deref(),
+                Some(mine.public_key.as_str()),
+                "the stored public half is the derived one"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn a_pinned_public_key_without_a_private_one_replaces_the_advertised_half() {
+    async fn a_mismatching_configured_public_key_refuses_startup_and_writes_nothing() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool();
-        let config = config_with(None, Some("pinned-only-public"));
-
-        let advertised = ensure_instance_keypair(pool, &config)
+        let generated = ensure_instance_keypair(pool, &Config::for_tests())
             .await
-            .expect("the pin applies");
+            .expect("the generated pair starts");
+        let before = stored_pair(pool).await;
+        let mine = generate_pair().unwrap();
+        let other = generate_pair().unwrap();
+        for wrong in [other.public_key.as_str(), "not-a-point!"] {
+            let config = config_with(Some(&mine.private_pem), Some(wrong));
 
+            let err = ensure_instance_keypair(pool, &config)
+                .await
+                .expect_err("a public key that is not the private key's half must refuse");
+
+            assert!(
+                err.to_string()
+                    .contains("VAPID_PUBLIC_KEY does not match VAPID_PRIVATE_KEY"),
+                "the error says what is wrong: {err}"
+            );
+            assert!(
+                !err.to_string().contains(&mine.private_pem),
+                "and never quotes the private key"
+            );
+        }
+        assert_eq!(stored_pair(pool).await, before, "nothing was overwritten");
         assert_eq!(
-            advertised, "pinned-only-public",
-            "the public row is the pin"
+            before.1.as_deref(),
+            Some(generated.as_str()),
+            "the previous pair stands"
         );
+    }
+
+    #[tokio::test]
+    async fn a_public_key_without_a_private_one_refuses_startup_and_writes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        // `Config` parsing refuses this combination, so the service-level
+        // guard is reached by building the config directly.
+        let mut config = Config::for_tests();
+        config.vapid.public_key = Some("pinned-only-public".to_owned());
+
+        let err = ensure_instance_keypair(pool, &config)
+            .await
+            .expect_err("a public key with no private half must refuse");
+
+        assert!(
+            err.to_string()
+                .contains("VAPID_PUBLIC_KEY is set without VAPID_PRIVATE_KEY"),
+            "the error says what is wrong: {err}"
+        );
+        assert_eq!(
+            stored_pair(pool).await,
+            (None, None),
+            "nothing was seeded either"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_private_half_without_a_public_one_gets_its_own_derived_half() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        // The state a lost race leaves: another instance's private row won
+        // before this one's seeding reached the public row.
+        let winner = generate_pair().unwrap();
+        instance_secret::set(pool, VAPID_PRIVATE_NAME, &winner.private_pem)
+            .await
+            .expect("the winner's private row is stored");
+
+        let advertised = vapid_public_key(pool).await.expect("the seeding runs");
+
+        assert_eq!(advertised, winner.public_key, "derived from the stored key");
         let (private, public) = stored_pair(pool).await;
-        assert!(private.is_some(), "a private half still exists");
-        assert_eq!(public.as_deref(), Some("pinned-only-public"));
+        assert_eq!(private.as_deref(), Some(winner.private_pem.as_str()));
+        assert_eq!(public.as_deref(), Some(winner.public_key.as_str()));
+        assert_eq!(
+            public_key_of_private_pem(private.as_deref().unwrap_or_default()).ok(),
+            public,
+            "the stored halves describe one key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_public_row_without_a_private_one_is_replaced_by_a_matching_pair() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let stranger = generate_pair().unwrap();
+        instance_secret::set(pool, VAPID_PUBLIC_NAME, &stranger.public_key)
+            .await
+            .expect("the orphan public row is stored");
+
+        let advertised = ensure_instance_keypair(pool, &Config::for_tests())
+            .await
+            .expect("the seeding runs");
+
+        assert_ne!(advertised, stranger.public_key, "the orphan is not kept");
+        let (private, public) = stored_pair(pool).await;
+        assert_eq!(public.as_deref(), Some(advertised.as_str()));
+        assert_eq!(
+            private
+                .as_deref()
+                .and_then(|pem| public_key_of_private_pem(pem).ok()),
+            public,
+            "the stored public half derives from the stored private half"
+        );
     }
 
     #[tokio::test]

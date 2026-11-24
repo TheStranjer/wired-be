@@ -8,7 +8,7 @@ use super::{
     defaults::MIN_MEDIA_PROXY_SECRET_CHARS,
     vars::{
         BASE_URL_VAR, BIND_ADDR_VAR, FRONTENDS_AVAILABLE_VAR, OAUTH_PROVIDERS_VAR, RATE_LIMITS_VAR,
-        RESTRICT_UNAUTHENTICATED_AREAS, RESTRICT_UNAUTHENTICATED_VAR,
+        RESTRICT_UNAUTHENTICATED_AREAS, RESTRICT_UNAUTHENTICATED_VAR, VAPID_PRIVATE_KEY_VAR,
     },
 };
 
@@ -48,6 +48,10 @@ pub enum ConfigError {
     /// `RESTRICT_UNAUTHENTICATED` names an area outside
     /// [`RESTRICT_UNAUTHENTICATED_AREAS`]; the value is the name it read.
     InvalidRestrictUnauthenticated(String),
+    /// `VAPID_PUBLIC_KEY` is set without `VAPID_PRIVATE_KEY`: a public key
+    /// the instance holds no private half for can never verify a push
+    /// signature; the value is the public key's variable name.
+    VapidPublicWithoutPrivate(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -89,6 +93,11 @@ impl fmt::Display for ConfigError {
                 "invalid {RESTRICT_UNAUTHENTICATED_VAR}: `{area}` is not one of {}",
                 RESTRICT_UNAUTHENTICATED_AREAS.join(", ")
             ),
+            Self::VapidPublicWithoutPrivate(var) => write!(
+                f,
+                "invalid {var}: it is set without {VAPID_PRIVATE_KEY_VAR}, and a public key \
+                 with no matching private key can never verify a push signature"
+            ),
         }
     }
 }
@@ -107,7 +116,8 @@ impl Error for ConfigError {
             | Self::ShortMediaProxySecret(_)
             | Self::InvalidFrontends(_)
             | Self::InvalidRateLimits(_)
-            | Self::InvalidRestrictUnauthenticated(_) => None,
+            | Self::InvalidRestrictUnauthenticated(_)
+            | Self::VapidPublicWithoutPrivate(_) => None,
         }
     }
 }
