@@ -3,7 +3,7 @@
 
 use super::{
     INSTANCE_LIMIT,
-    types::{ChildDescription, Suggestion, ValueKind, hinted, leaf, nested},
+    types::{ChildDescription, Suggestion, ValueKind, hinted, leaf},
 };
 
 /// The `:instance` children: the nine whitelisted subkeys ([`RegistryEntry::subkeys`]),
@@ -192,81 +192,5 @@ pub(super) const MRF_OBJECT_AGE_CHILDREN: [ChildDescription; 2] = [
             Suggestion::Text("strip_followers"),
             Suggestion::Text("reject"),
         ],
-    ),
-];
-
-/// The `:media_proxy` children: the three reported subkeys.
-pub(super) const MEDIA_PROXY_CHILDREN: [ChildDescription; 3] = [
-    leaf(
-        "enabled",
-        ValueKind::Boolean,
-        "Enables proxying of remote media via the instance's proxy",
-    ),
-    leaf(
-        "blacklist",
-        ValueKind::AtomList,
-        "List of hosts the proxy refuses to fetch media from",
-    ),
-    hinted(
-        "max_bytes",
-        ValueKind::Integer,
-        "Maximum file size (in bytes) allowed through the proxy",
-        &[Suggestion::Count(25_000_000)],
-    ),
-];
-
-/// The booleans under `:restrict_unauthenticated`'s `timelines` map.
-const RESTRICT_TIMELINES_CHILDREN: [ChildDescription; 3] = [
-    leaf(
-        "local",
-        ValueKind::Boolean,
-        "Disallow view public timeline.",
-    ),
-    leaf(
-        "federated",
-        ValueKind::Boolean,
-        "Disallow view federated timeline.",
-    ),
-    leaf(
-        "remote",
-        ValueKind::Boolean,
-        "Disallow viewing remote users' profiles' timelines.",
-    ),
-];
-
-/// The booleans under the `profiles` and `activities` maps.
-const RESTRICT_HALFS_CHILDREN: [ChildDescription; 2] = [
-    leaf(
-        "local",
-        ValueKind::Boolean,
-        "Disallow view local content in this area.",
-    ),
-    leaf(
-        "remote",
-        ValueKind::Boolean,
-        "Disallow view remote content in this area.",
-    ),
-];
-
-/// The `:restrict_unauthenticated` children: Pleroma's three nested
-/// maps, spelled out.
-pub(super) const RESTRICT_UNAUTHENTICATED_CHILDREN: [ChildDescription; 3] = [
-    nested(
-        "timelines",
-        ValueKind::Map,
-        "Settings for public and federated timelines.",
-        &RESTRICT_TIMELINES_CHILDREN,
-    ),
-    nested(
-        "profiles",
-        ValueKind::Map,
-        "Settings for user profiles.",
-        &RESTRICT_HALFS_CHILDREN,
-    ),
-    nested(
-        "activities",
-        ValueKind::Map,
-        "Settings for statuses.",
-        &RESTRICT_HALFS_CHILDREN,
     ),
 ];
