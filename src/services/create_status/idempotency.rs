@@ -1,13 +1,17 @@
-//! The `Idempotency-Key` arm of `POST /api/v1/statuses`.
+//! The one status write path, and its `Idempotency-Key` arm.
 //!
-//! [`create_status_idempotent`] restates the status a claimed key already
-//! created, or claims the key inside the create's own transaction — losing
-//! a race rolls the write back with `discard` and answers the winner
-//! through `replayed_entity`.
+//! [`create_status_with_key`] holds the whole create — prepare, insert, poll,
+//! commit, entity — and, when it is handed a key, restates the status a
+//! claimed key already created, or claims the key inside the create's own
+//! transaction: losing a race rolls the write back with `discard` and
+//! answers the winner through `replayed_entity`. [`create_status_idempotent`]
+//! is its keyed wrapper; [`create_status`] is the keyless one.
 //!
 //! [`create_status`]: crate::services::create_status::create_status
 
+use sqlx::PgConnection;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::{
     CreateStatusParams,
@@ -25,12 +29,35 @@ use crate::{
 /// Creates the status `params` describes under the request's
 /// `Idempotency-Key`, or restates the one that key already created.
 ///
-/// When the pair `(user, key)` already names a live status, that status's
-/// entity is the whole answer (200 for the endpoint as everywhere here):
-/// nothing is checked beyond the key, nothing is written, and no hook fires
-/// a second time. Otherwise the create runs exactly as
-/// [`crate::services::create_status::create_status`]
-/// does, with one more statement on its transaction: the key is claimed
+/// Exactly [`create_status_with_key`] with `Some(key)`; see there.
+///
+/// # Errors
+///
+/// Those of [`create_status_with_key`].
+pub async fn create_status_idempotent(
+    state: &AppState,
+    user: &User,
+    app: Option<&OauthApp>,
+    params: CreateStatusParams,
+    key: &str,
+) -> AppResult<Status> {
+    create_status_with_key(state, user, app, params, Some(key)).await
+}
+
+/// Creates the status `params` describes, optionally under an
+/// `Idempotency-Key`, and answers its [`Status`] entity as the author sees it.
+///
+/// With `key` of `None` this is the plain create — see
+/// [`crate::services::create_status::create_status`] for the body's rules:
+/// the row, its mention and hashtag links, its claimed attachments, its poll
+/// and the author's moved counters are written on one transaction, and no
+/// `idempotency_keys` row is touched.
+///
+/// With `Some(key)`, when the pair `(user, key)` already names a live status,
+/// that status's entity is the whole answer (200 for the endpoint as
+/// everywhere here): nothing is checked beyond the key, nothing is written,
+/// and no hook fires a second time. Otherwise the create runs exactly as
+/// above, with one more statement on its transaction: the key is claimed
 /// around the freshly written status with `ON CONFLICT DO NOTHING` (see
 /// [`idempotency_key::claim`]), so two requests racing under one key
 /// serialize on that insert. The winner commits its own status — and its
@@ -50,14 +77,14 @@ use crate::{
 /// Those of [`crate::services::create_status::create_status`], plus [`AppError::NotFound`] for the one row
 /// a replayed render cannot answer (a status deleted in the window between
 /// the key read and the render).
-pub async fn create_status_idempotent(
+pub async fn create_status_with_key(
     state: &AppState,
     user: &User,
     app: Option<&OauthApp>,
     params: CreateStatusParams,
-    key: &str,
+    key: Option<&str>,
 ) -> AppResult<Status> {
-    if let Some(row) = idempotency_key::live_status(&state.db, user.id, key).await? {
+    if let Some(row) = live_for_key(state, user, key).await? {
         debug!(
             status = %row.id,
             user = %user.id,
@@ -69,14 +96,7 @@ pub async fn create_status_idempotent(
     let mut tx = state.db.begin().await?;
     let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
     store_poll(&mut tx, row.id, poll.as_ref()).await?;
-    if idempotency_key::claim(&mut tx, user.id, key, row.id).await? {
-        tx.commit().await?;
-        return created_entity(state, user, row).await;
-    }
-    // The pair is taken — by a create that raced this one, or by a status
-    // since deleted. Whichever, the re-read on this open transaction says
-    // which, because a skipped `DO NOTHING` only ever names committed rows.
-    if let Some(winner) = idempotency_key::live_status_conn(&mut tx, user.id, key).await? {
+    if let Some(winner) = settle_key(&mut tx, user.id, key, row.id).await? {
         // Ours never happened: the racing create's row is the key's answer,
         // and our uncommitted write goes back with this rollback.
         discard(tx).await;
@@ -87,9 +107,57 @@ pub async fn create_status_idempotent(
         );
         return replayed_entity(state, user, &winner).await;
     }
-    idempotency_key::reassign(&mut tx, user.id, key, row.id).await?;
     tx.commit().await?;
     created_entity(state, user, row).await
+}
+
+/// The live status `key` already names for `user`, read before anything is
+/// prepared or written; a create without a key has none.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn live_for_key(
+    state: &AppState,
+    user: &User,
+    key: Option<&str>,
+) -> AppResult<Option<status::Status>> {
+    match key {
+        Some(key) => idempotency_key::live_status(&state.db, user.id, key).await,
+        None => Ok(None),
+    }
+}
+
+/// Claims `key` for the row `status_id` just written on `conn`'s open
+/// transaction, answering the winner's row when this create lost the race.
+///
+/// `None` for a create without a key (nothing is claimed) and for a claim
+/// that stood. When the pair is taken — by a create that raced this one, or
+/// by a status since deleted — the re-read on this open transaction says
+/// which, because a skipped `DO NOTHING` only ever names committed rows: a
+/// live one is returned for the caller to restate, a dead one is moved onto
+/// `status_id` and this create goes on to commit.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn settle_key(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    key: Option<&str>,
+    status_id: Uuid,
+) -> AppResult<Option<status::Status>> {
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    if idempotency_key::claim(conn, user_id, key, status_id).await? {
+        return Ok(None);
+    }
+    let winner = idempotency_key::live_status_conn(conn, user_id, key).await?;
+    if winner.is_none() {
+        idempotency_key::reassign(conn, user_id, key, status_id).await?;
+    }
+    Ok(winner)
 }
 
 /// Rolls back the transaction of a create that lost its key race, logging a
@@ -190,6 +258,25 @@ mod tests {
             .unwrap()
             .expect("the author exists");
         assert_eq!(counted.statuses_count, 1, "counted once");
+    }
+
+    #[tokio::test]
+    async fn no_key_writes_the_status_and_no_idempotency_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "keyless").await;
+
+        let first = create_status_with_key(&app_state, &alice, None, posted("same body"), None)
+            .await
+            .expect("the keyless create posts");
+        let second = create_status_with_key(&app_state, &alice, None, posted("same body"), None)
+            .await
+            .expect("a second keyless create posts too");
+
+        assert_ne!(first.id, second.id, "with no key nothing replays");
+        assert_eq!(live_ids(pool).await.len(), 2, "both statuses stand");
+        assert_eq!(key_rows(pool).await, 0, "and no key was ever claimed");
     }
 
     #[tokio::test]
