@@ -181,14 +181,16 @@ impl Federation {
             published: true,
             ..mrf::ChainTransparency::default()
         };
-        Self::with_mrf(&published)
+        Self::with_mrf(true, &published)
     }
 
-    /// The block of an instance whose chain published `described`.
+    /// The block of an instance whose chain published `described`;
+    /// `federating` is its `FEDERATION_ENABLED` switch, which `enabled`
+    /// reports as Pleroma does with `[:instance, :federating]`.
     #[must_use]
-    pub fn with_mrf(described: &mrf::ChainTransparency) -> Self {
+    pub fn with_mrf(federating: bool, described: &mrf::ChainTransparency) -> Self {
         Self {
-            enabled: true,
+            enabled: federating,
             mrf_policies: described.policies.clone(),
             quarantined_instances: described.quarantined_instances(),
             exclusions: described.exclusions,
@@ -526,6 +528,20 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Federation::federating()).unwrap(),
             json!({"enabled": true, "mrf_policies": [], "quarantined_instances": [], "exclusions": false})
+        );
+    }
+
+    /// `federating = false` serializes `"enabled":false`; the chain's own
+    /// transparency answer is untouched.
+    #[test]
+    fn a_non_federating_block_reports_enabled_false() {
+        let published = mrf::ChainTransparency {
+            published: true,
+            ..mrf::ChainTransparency::default()
+        };
+        assert_eq!(
+            serde_json::to_value(Federation::with_mrf(false, &published)).unwrap(),
+            json!({"enabled": false, "mrf_policies": [], "quarantined_instances": [], "exclusions": false})
         );
     }
 }
