@@ -6,7 +6,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
 
-use super::{NO_INNER_ID, NO_TARGET, UNDO_LOCAL_SIGNER, target::resolve_target, transient};
+use super::{NO_INNER_ID, NO_TARGET, UNDO_LOCAL_SIGNER, target::resolve_target};
 use crate::{
     api::statuses::after_reblog_changed,
     federation::{
@@ -74,7 +74,9 @@ pub(super) async fn apply_announce(
     };
     let reblog = status::insert(&state.db, &state.config.base_url, &new)
         .await
-        .map_err(|err| transient("boost", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's boost", &err)
+        })?;
     after_reblog_changed(&state, &reblog, true).await;
     debug!(
         status = %target.id,
@@ -101,7 +103,9 @@ pub(super) async fn apply_undo_announce(
     };
     let stored = status::get_by_uri(&state.db, announce_id)
         .await
-        .map_err(|err| transient("boost lookup", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's boost lookup", &err)
+        })?;
     let claim = stored.filter(|row| row.user_id == signer.id && row.deleted_at.is_none());
     let Some(reblog) = claim else {
         debug!(announce_id, "an Undo naming no live boost of its actor");
@@ -114,7 +118,12 @@ pub(super) async fn apply_undo_announce(
     };
     let removed = status::remove_reblog(&state.db, signer.id, original_id)
         .await
-        .map_err(|err| transient("boost withdrawal", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's boost withdrawal",
+                &err,
+            )
+        })?;
     let Some(tombstone) = removed else {
         return Ok(Outcome::Ignored("that boost is already withdrawn"));
     };
@@ -144,7 +153,12 @@ const fn boostable(visibility: Visibility) -> bool {
 async fn is_accepted_relay(state: &AppState, signer: &User) -> Result<bool, FederationError> {
     relay::is_accepted(&state.db, &signer.ap_id)
         .await
-        .map_err(|err| transient("the relay read", &err))
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's the relay read",
+                &err,
+            )
+        })
 }
 
 /// Whether this `Announce` is already folded: the pair holds a live reblog
@@ -164,13 +178,21 @@ async fn boost_stands(
 ) -> Result<bool, FederationError> {
     let pair = status::reblogged_status_ids(db, signer.id, std::slice::from_ref(&target.id))
         .await
-        .map_err(|err| transient("the boost read", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's the boost read",
+                &err,
+            )
+        })?;
     if pair.contains(&target.id) {
         return Ok(true);
     }
-    let same_id = status::get_by_uri(db, announce_id)
-        .await
-        .map_err(|err| transient("the boost uri read", &err))?;
+    let same_id = status::get_by_uri(db, announce_id).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote interaction's the boost uri read",
+            &err,
+        )
+    })?;
     Ok(same_id.is_some())
 }
 

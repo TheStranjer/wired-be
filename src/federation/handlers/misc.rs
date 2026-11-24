@@ -66,8 +66,8 @@
 use sqlx::PgPool;
 
 use crate::{
-    error::{AppError, AppResult},
-    federation::dispatch::{ActivityView, FederationError, Handlers},
+    error::AppResult,
+    federation::dispatch::{ActivityView, Handlers},
     models::user::{self, User},
 };
 
@@ -123,15 +123,6 @@ async fn find_local_account(pool: &PgPool, ids: &[String]) -> AppResult<Option<(
     Ok(None)
 }
 
-/// The retry arm every database failure in these handlers maps onto: the
-/// writes here are idempotent, so the queue's next attempt can run the
-/// same activity again.
-fn transient(what: &str, err: &AppError) -> FederationError {
-    FederationError::Transient(format!(
-        "could not fold the remote activity's {what}: {err}"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -152,7 +143,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        federation::handlers::misc::test_support::*,
+        federation::{dispatch::FederationError, handlers::misc::test_support::*},
         http_client::HttpClient,
         models::{
             block, pinned_status,

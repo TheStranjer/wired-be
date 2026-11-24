@@ -4,7 +4,7 @@
 use serde_json::Value;
 use tracing::debug;
 
-use super::{NO_INNER_ID, NO_TARGET, UNDO_LOCAL_SIGNER, target::resolve_target, transient};
+use super::{NO_INNER_ID, NO_TARGET, UNDO_LOCAL_SIGNER, target::resolve_target};
 use crate::{
     api::{emoji_reactions::after_reaction_changed, statuses::after_favourite_changed},
     federation::{
@@ -105,14 +105,21 @@ pub(super) async fn apply_undo_like(
     };
     let row = favourite::get_by_ap_id(&state.db, signer.id, like_id)
         .await
-        .map_err(|err| transient("like lookup", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's like lookup", &err)
+        })?;
     let Some(row) = row else {
         debug!(like_id, "an Undo naming no Like of its actor");
         return Ok(Outcome::Ignored("an Undo of a Like its actor never made"));
     };
     let removed = favourite::unfavourite(&state.db, signer.id, row.status_id)
         .await
-        .map_err(|err| transient("like withdrawal", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's like withdrawal",
+                &err,
+            )
+        })?;
     let Some(removed) = removed else {
         return Ok(Outcome::Ignored("that Like is already withdrawn"));
     };
@@ -140,7 +147,12 @@ pub(super) async fn apply_undo_emoji_react(
     };
     let row = emoji_reaction::get_by_ap_id(&state.db, signer.id, react_id)
         .await
-        .map_err(|err| transient("reaction lookup", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's reaction lookup",
+                &err,
+            )
+        })?;
     let Some(row) = row else {
         debug!(react_id, "an Undo naming no EmojiReact of its actor");
         return Ok(Outcome::Ignored(
@@ -149,7 +161,12 @@ pub(super) async fn apply_undo_emoji_react(
     };
     let removed = emoji_reaction::unreact(&state.db, signer.id, row.status_id, &row.emoji)
         .await
-        .map_err(|err| transient("reaction withdrawal", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's reaction withdrawal",
+                &err,
+            )
+        })?;
     let Some(removed) = removed else {
         return Ok(Outcome::Ignored("that reaction is already withdrawn"));
     };
@@ -176,7 +193,9 @@ async fn fold_favourite(
     };
     let created = favourite::favourite_like(&state.db, signer.id, target.id, &view.id)
         .await
-        .map_err(|err| transient("like", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's like", &err)
+        })?;
     let Some(row) = created else {
         debug!(status = %target.id, "this actor's like of that status stands already");
         return Ok(Outcome::Ignored(
@@ -214,7 +233,9 @@ async fn fold_reaction(
     };
     let row = emoji_reaction::react_with_ap_id(&state.db, &new, &view.id)
         .await
-        .map_err(|err| transient("reaction", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's reaction", &err)
+        })?;
     after_reaction_changed(state, &row, true).await;
     debug!(
         status = %target.id,

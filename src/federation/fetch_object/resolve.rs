@@ -1,8 +1,6 @@
 //! The policy half of the object fetcher: resolve a URI to a stored status,
 //! from the local mirror first and a contained remote fetch second.
 
-use std::fmt;
-
 use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
@@ -101,14 +99,14 @@ async fn resolve_uri(
 ) -> Result<Option<Status>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     if let Some(row) = stored {
         return Ok(live_or_deleted(row));
     }
     if let Some(alias) = local_object_uri(&state.config, uri) {
         let aliased = status::get_by_uri(&state.db, &alias)
             .await
-            .map_err(|err| transient("the status object-id read", &err))?;
+            .map_err(|err| FederationError::transient("the status object-id read failed", &err))?;
         if let Some(row) = aliased {
             return Ok(live_or_deleted(row));
         }
@@ -231,10 +229,4 @@ fn federation_error(err: FetchError) -> FederationError {
         FetchError::Gone | FetchError::NotFound => FederationError::Permanent(err.to_string()),
         FetchError::Invalid(detail) => FederationError::Permanent(detail),
     }
-}
-
-/// Shapes a database failure into the retryable arm of the dispatcher's
-/// error vocabulary, naming the read or write that failed.
-fn transient(what: &str, err: &impl fmt::Display) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
 }

@@ -20,7 +20,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{find_local_account, transient};
+use super::find_local_account;
 
 /// The `Flag` route: file the forwarded report a remote instance sends
 /// about a local account.
@@ -57,7 +57,9 @@ async fn apply_flag(
         .map_or_else(Vec::new, json::references);
     let account = find_local_account(&state.db, &objects)
         .await
-        .map_err(|err| transient("report target", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's report target", &err)
+        })?;
     let Some((account_index, target)) = account else {
         return Ok(Outcome::Ignored(
             "a Flag whose object names no local account",
@@ -65,7 +67,9 @@ async fn apply_flag(
     };
     let status_ids = cited_statuses(&state.db, &objects, account_index)
         .await
-        .map_err(|err| transient("cited statuses", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's cited statuses", &err)
+        })?;
     let comment = view
         .raw
         .get("content")
@@ -81,10 +85,17 @@ async fn apply_flag(
     };
     let row = report::create(&state.db, &state.config.base_url, &signer, &target, &new)
         .await
-        .map_err(|err| transient("report", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's report", &err)
+        })?;
     report::set_ap_id(&state.db, row.id, &view.id)
         .await
-        .map_err(|err| transient("report activity id", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote activity's report activity id",
+                &err,
+            )
+        })?;
     after_report_created(&state, &row).await;
     debug!(
         report = %row.id,

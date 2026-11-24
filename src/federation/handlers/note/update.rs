@@ -11,7 +11,6 @@ use super::update_note;
 use super::{
     CLOCK_SKEW,
     media_poll::{media_replacement_needed, refresh_poll, replace_media, stored_media},
-    permanent, transient,
 };
 use crate::{
     api::statuses::after_status_edited,
@@ -56,7 +55,7 @@ pub(super) async fn apply_update(
     };
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     match stored.filter(|row| row.user_id == signer.id && row.deleted_at.is_none()) {
         Some(row) => fold_edit(&state, object, &signer, &row).await,
         None => ingest_the_rest(&state, &signer, object).await,
@@ -113,16 +112,16 @@ async fn fold_edit(
         ));
     }
     let parsed = note_parser::parse_note(object, signer, now)
-        .map_err(|err| permanent("the updated object is not parseable", &err))?;
+        .map_err(|err| FederationError::permanent("the updated object is not parseable", &err))?;
     let mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
     let media = stored_media(&state.db, stored.id)
         .await
-        .map_err(|err| transient("the attachment read", &err))?;
+        .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
     let media_changed = media_replacement_needed(&media, &parsed.attachments);
     let params = edit_params(&parsed, stored, &mentioned, media_changed);
     let Some(updated) = status_edit::update_status(&state.db, stored.id, params)
         .await
-        .map_err(|err| transient("the status edit", &err))?
+        .map_err(|err| FederationError::transient("the status edit failed", &err))?
     else {
         return Ok(Outcome::Ignored("the status was deleted under its edit"));
     };

@@ -58,7 +58,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    error::{AppError, AppResult},
+    error::AppResult,
     federation::{
         dispatch::{ActivityView, FederationError, Handlers, Outcome},
         json,
@@ -178,7 +178,12 @@ async fn apply_follow(
     };
     let stored = user::get_by_ap_id(&state.db, object_id)
         .await
-        .map_err(|err| transient("follow target", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's follow target",
+                &err,
+            )
+        })?;
     let Some(target) = stored.filter(|found| found.local.get() && found.is_active.get()) else {
         return Ok(Outcome::Ignored(
             "a Follow whose object is not a stored active local account",
@@ -190,11 +195,14 @@ async fn apply_follow(
     };
     if block::blocked_between(&state.db, signer.id, target.id)
         .await
-        .map_err(|err| transient("block check", &err))?
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's block check",
+                &err,
+            )
+        })?
     {
-        let _deliveries = federation_out::reject_follow(&state, &target, &answer)
-            .await
-            .map_err(|err| transient("follow reject", &err))?;
+        reject(&state, &target, &answer).await?;
         debug!(
             follower = %signer.nickname,
             followee = %target.nickname,
@@ -205,13 +213,16 @@ async fn apply_follow(
     let blocked_domain = match json::http_host(&signer.ap_id) {
         Some(host) => domain_block::is_domain_blocked(&state.db, target.id, &host)
             .await
-            .map_err(|err| transient("domain block check", &err))?,
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote follow activity's domain block check",
+                    &err,
+                )
+            })?,
         None => false,
     };
     if blocked_domain || target.moved_to_ap_id.is_some() {
-        let _deliveries = federation_out::reject_follow(&state, &target, &answer)
-            .await
-            .map_err(|err| transient("follow reject", &err))?;
+        reject(&state, &target, &answer).await?;
         debug!(
             follower = %signer.nickname,
             followee = %target.nickname,
@@ -220,20 +231,63 @@ async fn apply_follow(
         );
         return Ok(Outcome::Handled);
     }
-    let row = follow::follow(&state.db, &state.config.base_url, &signer, &target)
+    store_follow(&state, &view, &signer, &target, &answer).await
+}
+
+/// Queues the `Reject` answering a refused `Follow`; a failed enqueue is the
+/// retry arm, since the dispatcher releases the ledger row for another try.
+async fn reject(
+    state: &AppState,
+    target: &User,
+    answer: &FollowAnswer<'_>,
+) -> Result<(), FederationError> {
+    let _deliveries = federation_out::reject_follow(state, target, answer)
         .await
-        .map_err(|err| transient("follow", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's follow reject",
+                &err,
+            )
+        })?;
+    Ok(())
+}
+
+/// The tail of [`apply_follow`] for a follow nothing refused: writes the
+/// relationship with its mirror id, notifies the followee, and answers a
+/// granted follow with an `Accept`.
+async fn store_follow(
+    state: &AppState,
+    view: &ActivityView,
+    signer: &User,
+    target: &User,
+    answer: &FollowAnswer<'_>,
+) -> Result<Outcome, FederationError> {
+    let row = follow::follow(&state.db, &state.config.base_url, signer, target)
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote follow activity's follow", &err)
+        })?;
     if row.ap_id.as_deref() != Some(view.id.as_str()) {
         follow::set_ap_id(&state.db, row.id, &view.id)
             .await
-            .map_err(|err| transient("follow activity id", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote follow activity's follow activity id",
+                    &err,
+                )
+            })?;
     }
-    notify::on_follow(&state, &signer, &target, Some(&row), true).await;
+    notify::on_follow(state, signer, target, Some(&row), true).await;
     let granted = row.state == FollowState::Accepted;
     if granted {
-        let _deliveries = federation_out::accept_follow(&state, &target, &answer)
+        let _deliveries = federation_out::accept_follow(state, target, answer)
             .await
-            .map_err(|err| transient("follow accept", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote follow activity's follow accept",
+                    &err,
+                )
+            })?;
     }
     debug!(
         follower = %signer.nickname,
@@ -256,9 +310,12 @@ async fn apply_accept(
             "an Accept signed by an account this instance owns",
         ));
     }
-    let row = answered_follow(&state.db, &view)
-        .await
-        .map_err(|err| transient("follow lookup", &err))?;
+    let row = answered_follow(&state.db, &view).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote follow activity's follow lookup",
+            &err,
+        )
+    })?;
     let Some(row) = row else {
         return Ok(Outcome::Ignored(
             "an Accept naming no follow this instance stores",
@@ -269,9 +326,12 @@ async fn apply_accept(
             "an Accept from an account that is not the followed one",
         ));
     }
-    let _granted = follow::accept(&state.db, row.id)
-        .await
-        .map_err(|err| transient("follow acceptance", &err))?;
+    let _granted = follow::accept(&state.db, row.id).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote follow activity's follow acceptance",
+            &err,
+        )
+    })?;
     // The relay arm (see `crate::services::relay`): when the granted follow
     // is the instance actor's own follow of a relay, the subscription turns
     // accepted, opening the relay's inbox to the publisher's fan-out. A
@@ -279,11 +339,21 @@ async fn apply_accept(
     // nothing here.
     if follower_is_instance_actor(&state.db, row.follower_id)
         .await
-        .map_err(|err| transient("instance actor lookup", &err))?
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's instance actor lookup",
+                &err,
+            )
+        })?
     {
         let relay_granted = relay::mark_accepted(&state.db, &signer.ap_id)
             .await
-            .map_err(|err| transient("relay acceptance", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote follow activity's relay acceptance",
+                    &err,
+                )
+            })?;
         if relay_granted {
             debug!(
                 relay = %signer.ap_id,
@@ -313,9 +383,12 @@ async fn apply_reject(
             "a Reject signed by an account this instance owns",
         ));
     }
-    let row = answered_follow(&state.db, &view)
-        .await
-        .map_err(|err| transient("follow lookup", &err))?;
+    let row = answered_follow(&state.db, &view).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote follow activity's follow lookup",
+            &err,
+        )
+    })?;
     let Some(row) = row else {
         return Ok(Outcome::Ignored(
             "a Reject naming no follow this instance stores",
@@ -326,20 +399,33 @@ async fn apply_reject(
             "a Reject from an account that is not the followed one",
         ));
     }
-    let _removed = follow::reject(&state.db, row.id)
-        .await
-        .map_err(|err| transient("follow rejection", &err))?;
+    let _removed = follow::reject(&state.db, row.id).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote follow activity's follow rejection",
+            &err,
+        )
+    })?;
     // The relay arm: a relay revokes (or refuses) a subscription with a
     // `Reject` of the instance actor's follow. The `follows` row is gone, so
     // the subscription goes back to pending and the relay's inbox leaves
     // the fan-out. A local user's follow of the relay actor changes nothing.
     if follower_is_instance_actor(&state.db, row.follower_id)
         .await
-        .map_err(|err| transient("instance actor lookup", &err))?
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's instance actor lookup",
+                &err,
+            )
+        })?
     {
         let relay_revoked = relay::mark_pending(&state.db, &signer.ap_id)
             .await
-            .map_err(|err| transient("relay revocation", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote follow activity's relay revocation",
+                    &err,
+                )
+            })?;
         if relay_revoked {
             debug!(
                 relay = %signer.ap_id,
@@ -382,9 +468,12 @@ async fn apply_undo_follow(
             "an Undo of a Follow whose actor is somebody else's",
         ));
     }
-    let row = answered_follow(&state.db, &view)
-        .await
-        .map_err(|err| transient("follow lookup", &err))?;
+    let row = answered_follow(&state.db, &view).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote follow activity's follow lookup",
+            &err,
+        )
+    })?;
     let Some(row) = row else {
         return Ok(Outcome::Ignored(
             "an Undo naming no follow this instance stores",
@@ -395,7 +484,12 @@ async fn apply_undo_follow(
     }
     let Some(target) = user::get_by_id(&state.db, row.followee_id)
         .await
-        .map_err(|err| transient("followee read", &err))?
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's followee read",
+                &err,
+            )
+        })?
     else {
         return Ok(Outcome::Ignored(
             "an Undo of a Follow whose followee is gone",
@@ -403,10 +497,20 @@ async fn apply_undo_follow(
     };
     let _withdrawn = follow::unfollow(&state.db, &signer, &target)
         .await
-        .map_err(|err| transient("follow withdrawal", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's follow withdrawal",
+                &err,
+            )
+        })?;
     let _untold = forget_follow_tellings(&state.db, &target, &signer)
         .await
-        .map_err(|err| transient("follow tellings cleanup", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's follow tellings cleanup",
+                &err,
+            )
+        })?;
     debug!(
         follower = %signer.nickname,
         followee = %target.nickname,
@@ -479,15 +583,6 @@ async fn forget_follow_tellings(pool: &PgPool, target: &User, follower: &User) -
         notification::delete_matching(pool, target.id, follower.id, TYPE_FOLLOW_REQUEST, None)
             .await?;
     Ok(granted + requested)
-}
-
-/// The retry arm every database failure in these handlers maps onto: the
-/// writes here are idempotent, so the queue's next attempt can run the
-/// same activity again.
-fn transient(what: &str, err: &AppError) -> FederationError {
-    FederationError::Transient(format!(
-        "could not fold the remote follow activity's {what}: {err}"
-    ))
 }
 
 #[cfg(test)]
