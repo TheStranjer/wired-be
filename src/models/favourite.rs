@@ -85,9 +85,11 @@ const FLAGGED_IDS_SQL: &str = "SELECT status_id FROM favourites
 /// keys on. The text stops where its one placeholder belongs, because that
 /// is where [`keyset_page_by`] pushes its bind and the builder is what numbers
 /// it `$1`; the keyset it then appends runs on the favourite id `f.id`.
+/// Deactivated accounts (`u.is_active` false) are left out, the way
+/// Mastodon's `without_suspended` scope drops them.
 const USERS_PAGE_SQL: &str = "SELECT f.id AS favourite_id, u.* FROM favourites f
     JOIN users u ON u.id = f.user_id
-     WHERE f.status_id = ";
+     WHERE u.is_active AND f.status_id = ";
 
 /// [`page_for_user`]: one account's favourites, the full [`Favourite`]
 /// row leading — the id the page keys on, which the endpoint's `Link`

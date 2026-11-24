@@ -83,7 +83,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{FAVOURITED_BY_MAX_LIMIT, action_target_id, current_entity};
+use super::{FAVOURITED_BY_MAX_LIMIT, action_target_id, current_entity, without_blocked};
 
 /// `POST /api/v1/statuses/{id}/favourite` — favourite the status `id` and
 /// answer it as the caller sees it: `favourited` true and
@@ -174,6 +174,11 @@ pub(super) async fn unfavourite_status(
 /// favourited a post of theirs (Mastodon's rule, and Pleroma's
 /// `favourited_by` never consults it).
 ///
+/// Deactivated accounts are left out by the query, and the accounts the
+/// presented viewer has blocked by [`without_blocked`] (Pleroma's own
+/// filter); the `Link` header is built from the unfiltered page so paging
+/// never stalls on a page the filter emptied.
+///
 /// # Errors
 ///
 /// [`AppError::Forbidden`] when a presented user token lacks
@@ -206,6 +211,9 @@ pub(super) async fn list_favourited_by(
     )?;
     // The list names no relationship of the viewer to the favouriters;
     // Pleroma's `favourited_by` renders plain `show.json` accounts.
+    // The `Link` above came from the raw page; the viewer's blocked
+    // accounts leave only the rendered list.
+    let entries = without_blocked(&state, auth.0.as_ref(), entries, |entry| entry.user.id).await?;
     let viewer: AccountViewer<'_> = auth.0.as_ref();
     let accounts = entries
         .iter()
