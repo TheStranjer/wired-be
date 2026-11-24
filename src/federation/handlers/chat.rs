@@ -52,7 +52,6 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::PgConnection;
-use std::fmt;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -170,7 +169,9 @@ async fn apply_create(
     }
     let stored = chat::message_by_ap_id(&state.db, ap_id)
         .await
-        .map_err(|err| transient("the dedupe read", &err))?;
+        .map_err(|err| {
+            FederationError::transient("the chat message fold failed at the dedupe read", &err)
+        })?;
     if let Some(message) = stored {
         debug!(message = %message.id, "a Create restates an already delivered chat message");
         return Ok(restatement_of(&message));
@@ -385,7 +386,9 @@ async fn recipient_of(
 ) -> Result<Decision, FederationError> {
     let Some(recipient) = user::get_by_ap_id(&state.db, &incoming.recipient_ap_id)
         .await
-        .map_err(|err| transient("the recipient read", &err))?
+        .map_err(|err| {
+            FederationError::transient("the chat message fold failed at the recipient read", &err)
+        })?
     else {
         return Ok(Decision::Refuse(
             "a chat message addressed to an account this instance does not store",
@@ -396,7 +399,9 @@ async fn recipient_of(
     }
     if block::is_blocking(&state.db, recipient.id, sender.id)
         .await
-        .map_err(|err| transient("the blocks read", &err))?
+        .map_err(|err| {
+            FederationError::transient("the chat message fold failed at the blocks read", &err)
+        })?
     {
         return Ok(Decision::Refuse(
             "a chat message from an account its recipient has blocked",
@@ -479,11 +484,12 @@ async fn store(
     sender: &User,
     recipient: &User,
 ) -> Result<Written, FederationError> {
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|err| transient("the delivery transaction", &err))?;
+    let mut tx = state.db.begin().await.map_err(|err| {
+        FederationError::transient(
+            "the chat message fold failed at the delivery transaction",
+            &err,
+        )
+    })?;
     let attachment_media_id = match &incoming.attachment {
         Some(attachment) => Some(attach_media(&mut tx, attachment).await?),
         None => None,
@@ -507,10 +513,15 @@ async fn store(
     .map_err(|err| delivery_refusal(&err))?;
     let _told = notification::create(&mut *tx, &chat_mention(sender, recipient, message.id))
         .await
-        .map_err(|err| transient("the chat mention notification", &err))?;
-    tx.commit()
-        .await
-        .map_err(|err| transient("the delivery commit", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "the chat message fold failed at the chat mention notification",
+                &err,
+            )
+        })?;
+    tx.commit().await.map_err(|err| {
+        FederationError::transient("the chat message fold failed at the delivery commit", &err)
+    })?;
     Ok(Written {
         message,
         sender_reference,
@@ -542,7 +553,12 @@ async fn attach_media(
     };
     let row = media_attachment::insert(&mut *conn, &new)
         .await
-        .map_err(|err| transient("the attachment insert", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "the chat message fold failed at the attachment insert",
+                &err,
+            )
+        })?;
     Ok(row.id)
 }
 
@@ -574,7 +590,7 @@ fn delivery_refusal(err: &AppError) -> FederationError {
     if let AppError::Unprocessable(why) = err {
         return FederationError::Permanent(why.clone());
     }
-    transient("the message write", err)
+    FederationError::transient("the chat message fold failed at the message write", err)
 }
 
 /// The body of [`delete_chat_message`]: resolve the object id to the stored
@@ -592,7 +608,9 @@ async fn apply_delete(
     };
     let Some(message) = chat::message_by_ap_id(&state.db, ap_id)
         .await
-        .map_err(|err| transient("the message read", &err))?
+        .map_err(|err| {
+            FederationError::transient("the chat message fold failed at the message read", &err)
+        })?
     else {
         debug!(
             ap_id,
@@ -611,27 +629,22 @@ async fn apply_delete(
             "a chat message Delete by an account that is not its sender",
         ));
     }
-    let withdrawn = chat::withdraw(&state.db, message.id)
-        .await
-        .map_err(|err| transient("the message withdrawal", &err))?;
+    let withdrawn = chat::withdraw(&state.db, message.id).await.map_err(|err| {
+        FederationError::transient(
+            "the chat message fold failed at the message withdrawal",
+            &err,
+        )
+    })?;
     let removed = notification::delete_for_chat_message(&state.db, message.id)
         .await
-        .map_err(|err| transient("the mention cleanup", &err))?;
+        .map_err(|err| {
+            FederationError::transient("the chat message fold failed at the mention cleanup", &err)
+        })?;
     debug!(
         message = %message.id,
         withdrawn, removed, "a remote sender withdrew its chat message"
     );
     Ok(Outcome::Handled)
-}
-
-/// The retry arm every database failure in these handlers maps onto: the
-/// writes here are idempotent (the dedupe read answers a redelivered `Create`,
-/// the tombstone and the cleanup answer a redelivered `Delete`), so the
-/// queue's next attempt can run the same activity again. The failure arrives
-/// as either error type the model functions speak — `AppError` or the raw
-/// `sqlx::Error` of a transaction boundary — and both display the same way.
-fn transient<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Transient(format!("the chat message fold failed at {what}: {err}"))
 }
 
 #[cfg(test)]

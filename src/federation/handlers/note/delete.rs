@@ -5,7 +5,6 @@ use tracing::debug;
 
 #[cfg(doc)]
 use super::delete_note;
-use super::transient;
 use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
@@ -35,7 +34,7 @@ pub(super) async fn apply_delete(
     }
     let stored = status::get_by_uri(&state.db, object_id)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     withdraw(&state, &signer, object_id, stored).await
 }
 
@@ -65,7 +64,7 @@ async fn withdraw(
         Some(row) => {
             let deleted = delete_status::delete_status(state, &row)
                 .await
-                .map_err(|err| transient("the status delete", &err))?;
+                .map_err(|err| FederationError::transient("the status delete failed", &err))?;
             if deleted {
                 debug!(status = %row.id, "a Delete folded a remote status withdrawal");
                 Ok(Outcome::Handled)
@@ -86,7 +85,9 @@ async fn withdraw(
             }
             let reserved = status::insert_tombstone(&state.db, uri, signer.id)
                 .await
-                .map_err(|err| transient("the tombstone reservation", &err))?;
+                .map_err(|err| {
+                    FederationError::transient("the tombstone reservation failed", &err)
+                })?;
             match reserved {
                 Some(row) => {
                     debug!(

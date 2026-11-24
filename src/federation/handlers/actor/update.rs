@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::debug;
 
-use super::{MIN_UPDATE_INTERVAL, transient};
+use super::MIN_UPDATE_INTERVAL;
 use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
@@ -83,7 +83,10 @@ fn within_update_interval(stamp: Option<DateTime<Utc>>) -> bool {
 /// can fix.
 fn refused(err: ActorError) -> Result<Outcome, FederationError> {
     match err {
-        ActorError::Failed(err) => Err(transient("actor mirror", &err)),
+        ActorError::Failed(err) => Err(FederationError::transient(
+            "could not store the remote actor's actor mirror",
+            &err,
+        )),
         ActorError::Invalid(_) => {
             debug!(%err, "an Update's embedded document is not a usable actor");
             Ok(Outcome::Ignored(
@@ -113,12 +116,16 @@ async fn store_move_fields(
     if parsed.moved_to != stored.moved_to_ap_id {
         user::set_moved_to(pool, stored.id, parsed.moved_to.as_deref())
             .await
-            .map_err(|err| transient("move target", &err))?;
+            .map_err(|err| {
+                FederationError::transient("could not store the remote actor's move target", &err)
+            })?;
     }
     if parsed.also_known_as != stored.also_known_as {
         user::set_also_known_as(pool, stored.id, &parsed.also_known_as)
             .await
-            .map_err(|err| transient("aliases", &err))?;
+            .map_err(|err| {
+                FederationError::transient("could not store the remote actor's aliases", &err)
+            })?;
     }
     Ok(())
 }

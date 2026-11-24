@@ -32,6 +32,22 @@ impl fmt::Display for FederationError {
 
 impl Error for FederationError {}
 
+impl FederationError {
+    /// A retryable failure, reading `"{what}: {err}"`: `what` names the read
+    /// or write that failed, `err` is the database or network error behind it.
+    #[must_use]
+    pub fn transient<E: fmt::Display>(what: &str, err: &E) -> Self {
+        Self::Transient(format!("{what}: {err}"))
+    }
+
+    /// A failure no retry can fix, reading `"{what}: {err}"`: `what` names
+    /// the refused part of the activity, `err` is the reason.
+    #[must_use]
+    pub fn permanent<E: fmt::Display>(what: &str, err: &E) -> Self {
+        Self::Permanent(format!("{what}: {err}"))
+    }
+}
+
 /// Whether the worker will run the job again, which is exactly when the
 /// ledger row must not stand in its way.
 pub(super) const fn is_retryable(err: &JobError) -> bool {
@@ -62,6 +78,21 @@ mod tests {
         },
         mrf,
     };
+
+    /// The constructors pick the variant and join context and cause.
+    #[test]
+    fn transient_and_permanent_carry_their_context() {
+        let cause = "connection reset";
+
+        assert_eq!(
+            FederationError::transient("the status read", &cause),
+            FederationError::Transient("the status read: connection reset".to_owned())
+        );
+        assert_eq!(
+            FederationError::permanent("the object", &cause),
+            FederationError::Permanent("the object: connection reset".to_owned())
+        );
+    }
 
     /// A permanent failure discards the job and keeps the ledger row: a
     /// redelivery of a refused activity must not run it again.

@@ -91,7 +91,7 @@
 //! inbound edit handler calls are re-exported here, so an outside path
 //! stays `crate::services::ingest::…`.
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -298,7 +298,7 @@ async fn seen_before(
 ) -> Result<Option<IngestOutcome>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     Ok(stored.map(|row| {
         if row.deleted_at.is_some() {
             IngestOutcome::Ignored("tombstoned")
@@ -339,7 +339,7 @@ async fn drops_unsolicited(
     }
     let solicited = follow::has_local_followers(&state.db, author.id)
         .await
-        .map_err(|err| transient("the follower gate read", &err))?;
+        .map_err(|err| FederationError::transient("the follower gate read failed", &err))?;
     Ok(!solicited)
 }
 
@@ -348,12 +348,6 @@ async fn drops_unsolicited(
 /// a number nobody can vote into being true.
 fn whole(count: i64) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
-}
-
-/// Shapes a database failure into the retryable arm of the dispatcher's
-/// error vocabulary, naming the read or write that failed.
-fn transient<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{ReplyLink, transient, whole};
+use super::{ReplyLink, whole};
 
 /// Steps 4 to 8 as data: the [`NewStatus`] the parsed document plus the
 /// resolved references describe.
@@ -77,15 +77,15 @@ pub(super) async fn write_ingested(
         .db
         .begin()
         .await
-        .map_err(|err| transient("the ingest transaction", &err))?;
+        .map_err(|err| FederationError::transient("the ingest transaction failed", &err))?;
     let row = status::insert_conn(&mut tx, &state.config.base_url, new)
         .await
-        .map_err(|err| transient("the status insert", &err))?;
+        .map_err(|err| FederationError::transient("the status insert failed", &err))?;
     insert_media(&mut tx, row.id, &parsed.attachments).await?;
     insert_poll(&mut tx, row.id, parsed.poll.as_ref()).await?;
     tx.commit()
         .await
-        .map_err(|err| transient("the ingest commit", &err))?;
+        .map_err(|err| FederationError::transient("the ingest commit failed", &err))?;
     Ok(row)
 }
 
@@ -126,7 +126,7 @@ pub(crate) async fn insert_media(
         media_attachment::insert(&mut *conn, &new)
             .await
             .map(drop)
-            .map_err(|err| transient("the media insert", &err))?;
+            .map_err(|err| FederationError::transient("the media insert failed", &err))?;
     }
     Ok(())
 }
@@ -172,7 +172,7 @@ pub(crate) async fn insert_poll(
     };
     poll::create(conn, status_id, &params)
         .await
-        .map_err(|err| transient("the poll insert", &err))
+        .map_err(|err| FederationError::transient("the poll insert failed", &err))
         .map(drop)
 }
 

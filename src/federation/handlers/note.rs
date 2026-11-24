@@ -64,8 +64,6 @@
 //! the announce ticket's, not this module's; nothing here sends anything
 //! anywhere.
 
-use std::fmt;
-
 use chrono::TimeDelta;
 use futures::future::BoxFuture;
 
@@ -166,18 +164,6 @@ pub fn delete_note(
 /// update over a number nobody can vote into being true.
 fn whole(count: i64) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
-}
-
-/// Shapes a database failure into the retryable arm of the dispatcher's
-/// error vocabulary, naming the read or write that failed.
-fn transient<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
-}
-
-/// Shapes a refusal no retry can outlive into the dispatcher's discardable
-/// arm.
-fn permanent<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Permanent(format!("{what}: {err}"))
 }
 
 #[cfg(test)]
