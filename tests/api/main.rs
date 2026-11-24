@@ -505,6 +505,9 @@ mod rate_limit;
 /// `…/reblogged_by` lists only distributable (public / unlisted) boosts.
 mod reblogged_by_visibility;
 
+/// `…/reblogged_by` drops deactivated and viewer-blocked accounts.
+mod reblogged_by_filters;
+
 /// Reblogs over HTTP (`/api/v1/statuses/{id}/reblog`, its `…/unreblog`
 /// twin and the `…/reblogged_by` listing).
 mod reblogs;

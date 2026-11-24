@@ -70,7 +70,7 @@
 //! [`Account`]: crate::entities::account::Account
 //! [`Translation`]: crate::entities::translation::Translation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
@@ -81,7 +81,7 @@ use uuid::Uuid;
 use crate::{
     entities::status::Status,
     error::{AppError, AppResult},
-    models::{status, user::User},
+    models::{block, status, user::User},
     services::render_status::{ViewerMode, render_status},
     state::AppState,
 };
@@ -302,6 +302,40 @@ async fn current_entity(state: &AppState, viewer: &User, id: Uuid) -> AppResult<
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(entity))
+}
+
+/// `entries` without the accounts `viewer` has blocked, in the same order;
+/// `account_id` names the account behind one entry. An anonymous viewer has
+/// no blocks, so the list comes back as it was (Pleroma's `favourited_by`
+/// and `reblogged_by` drop the viewer's blocked accounts the same way).
+///
+/// The listings call it *after* the `Link` header is computed from the raw
+/// page, so a page emptied by the filter still names its cursors and the
+/// walk does not stall.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn without_blocked<T>(
+    state: &AppState,
+    viewer: Option<&User>,
+    entries: Vec<T>,
+    account_id: impl Fn(&T) -> Uuid,
+) -> AppResult<Vec<T>> {
+    let Some(viewer) = viewer else {
+        return Ok(entries);
+    };
+    let blocked: HashSet<Uuid> = block::blocked_ids(&state.db, viewer.id)
+        .await?
+        .into_iter()
+        .collect();
+    if blocked.is_empty() {
+        return Ok(entries);
+    }
+    Ok(entries
+        .into_iter()
+        .filter(|entry| !blocked.contains(&account_id(entry)))
+        .collect())
 }
 
 /// The status a like or a boost lands on: `row` itself for a plain post,
