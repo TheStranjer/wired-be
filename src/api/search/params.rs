@@ -85,6 +85,29 @@ pub(super) struct SearchParams {
     /// `account_id`: restrict the status search to that one author; an
     /// absent, empty or unusable value narrows nothing.
     pub(super) account_id: Option<Uuid>,
+    /// Whether the raw query carries a non-blank `offset` (last occurrence
+    /// wins), whether or not it parses as a usable number.
+    offset: OffsetParam,
+}
+
+/// Whether a request carries an `offset` parameter worth paging by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OffsetParam {
+    /// No `offset`, or one that is empty or blank.
+    Absent,
+    /// A non-blank `offset`, usable as a number or not.
+    Present,
+}
+
+impl OffsetParam {
+    /// Reads one raw `offset` value: blank is [`OffsetParam::Absent`].
+    fn of(text: &str) -> Self {
+        if text.trim().is_empty() {
+            Self::Absent
+        } else {
+            Self::Present
+        }
+    }
 }
 
 impl SearchParams {
@@ -104,9 +127,11 @@ impl SearchParams {
             resolve: false,
             resource: Resource::default(),
             account_id: None,
+            offset: OffsetParam::Absent,
         };
         for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
             match key.as_ref() {
+                "offset" => found.offset = OffsetParam::of(&value),
                 "q" => found.q = value.into_owned(),
                 "following" => found.following = is_true(&value),
                 "resolve" => found.resolve = is_true(&value),
@@ -128,6 +153,12 @@ impl SearchParams {
             following_only: self.following,
             resolve: self.resolve,
         }
+    }
+
+    /// Whether the request asked to page by `offset`: the raw query carries
+    /// a non-blank value for it (Mastodon's `params[:offset].present?`).
+    pub(super) fn has_offset(&self) -> bool {
+        self.offset == OffsetParam::Present
     }
 
     /// Whether the query opens with the hashtag sigil: `#tag` (any
@@ -319,6 +350,22 @@ mod tests {
             None,
             "and junk means the first page"
         );
+    }
+
+    #[test]
+    fn an_offset_is_present_when_its_value_is_not_blank() {
+        for (query, want) in [
+            ("q=a&offset=20", true),
+            ("q=a&offset=junk", true),
+            ("q=a&offset=0", true),
+            ("q=a&offset=", false),
+            ("q=a&offset=%20", false),
+            ("q=a", false),
+            ("q=a&offset=3&offset=", false),
+            ("q=a&offset=&offset=3", true),
+        ] {
+            assert_eq!(parse(query).has_offset(), want, "`{query}`");
+        }
     }
 
     #[test]
