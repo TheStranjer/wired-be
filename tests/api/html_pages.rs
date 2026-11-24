@@ -1,6 +1,6 @@
 //! Tests for the HTML helper pages of `src/api/html_pages.rs` (WBE-220):
-//! the `GET`/`POST` pair on `/frontend_switcher`, the pick-list shape and
-//! its empty case, the cookie-carrying redirect, the 422 refusals, the
+//! the retired `GET`/`POST` pair on `/frontend_switcher` (now answered by
+//! the fallback alone), the
 //! `GET /embed/{id}` status card (public and unlisted statuses, remote
 //! handles, media attachments, escaping, and the one 404 page every
 //! refusal shares), the `GET /notice/{id}/embed_player` bare media player
@@ -10,13 +10,11 @@
 //! flag it clears in the database) and the module headers every answer
 //! carries.
 //!
-//! The switcher endpoints read [`Config::available_frontends`] only, never
-//! the database; the embed card and the player read statuses, authors and
+//! The embed card and the player read statuses, authors and
 //! attachments; the unsubscribe page signs against
 //! [`Config::secret_key_base`] and writes the `email_notifications` flag.
 //! Every test leases a slot so the full router can be mounted.
 //!
-//! [`Config::available_frontends`]: wired_be::config::Config::available_frontends
 //! [`Config::secret_key_base`]: wired_be::config::Config::secret_key_base
 
 #![cfg(test)]
@@ -40,14 +38,6 @@ const PAGE_CSP: &str =
 /// The media type every page in the module must answer with.
 const PAGE_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 
-/// The real router with `AVAILABLE_FRONTENDS` set to `frontends`, over
-/// `pool`.
-fn switcher_app(pool: PgPool, frontends: &[&str]) -> Router {
-    let mut config = common::test_config();
-    config.available_frontends = frontends.iter().map(|name| (*name).to_owned()).collect();
-    common::test_app_with_config(pool, config)
-}
-
 /// The module headers `response` must carry: HTML media type, the CSP and
 /// `X-Frame-Options: DENY` (every page here is a protected one).
 fn assert_module_headers(response: &common::TestResponse, who: &str) {
@@ -68,50 +58,10 @@ fn assert_module_headers(response: &common::TestResponse, who: &str) {
     );
 }
 
-/// `GET /frontend_switcher` renders one labelled radio per configured
-/// frontend, in configuration order, inside a form posting back to the
-/// switcher, with the module headers on the page.
+/// `GET /frontend_switcher` is not routed: the app-wide fallback answers
+/// 404 and marks it with `x-wired-fallback: 1`.
 #[tokio::test]
-async fn the_switcher_page_lists_each_configured_frontend() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = switcher_app(pool, &["pleroma-fe", "mochi-pub"]);
-    let response = common::TestRequest::get("/frontend_switcher")
-        .send(&app)
-        .await;
-    assert_eq!(response.status, StatusCode::OK, "the pick-list page");
-    assert_module_headers(&response, "the GET page");
-    let html = response.text();
-    assert!(
-        html.starts_with("<!DOCTYPE html>"),
-        "a full HTML document: {html}"
-    );
-    assert!(
-        html.contains("<form method=\"post\" action=\"/frontend_switcher\">"),
-        "the form posts back to the switcher: {html}"
-    );
-    assert_eq!(
-        html.matches("type=\"radio\" name=\"frontend\"").count(),
-        2,
-        "one labelled radio per configured frontend: {html}"
-    );
-    let first = html
-        .find("value=\"pleroma-fe\"")
-        .expect("the first frontend is listed");
-    let second = html
-        .find("value=\"mochi-pub\"")
-        .expect("the second frontend is listed");
-    assert!(first < second, "the radios follow the configuration order");
-    assert!(
-        html.contains(">mochi-pub</label>"),
-        "each radio is labelled with the frontend's own name"
-    );
-}
-
-/// With `AVAILABLE_FRONTENDS` empty (the test default), the page says no
-/// alternative frontends are installed and offers no form and no radios.
-#[tokio::test]
-async fn the_switcher_page_offers_nothing_when_nothing_is_installed() {
+async fn get_frontend_switcher_is_answered_by_the_fallback() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool);
@@ -120,122 +70,40 @@ async fn the_switcher_page_offers_nothing_when_nothing_is_installed() {
         .await;
     assert_eq!(
         response.status,
-        StatusCode::OK,
-        "an empty list is still a page"
+        StatusCode::NOT_FOUND,
+        "the switcher page is gone"
     );
-    assert_module_headers(&response, "the empty GET page");
-    let html = response.text();
-    assert!(
-        html.contains("No alternative frontends are installed"),
-        "the page says so: {html}"
-    );
-    assert!(!html.contains("<form"), "there is no form to fill: {html}");
-    assert!(
-        !html.contains("type=\"radio\""),
-        "and no radio to pick: {html}"
+    assert_eq!(
+        response.header("x-wired-fallback"),
+        Some("1"),
+        "only the fallback answers the path"
     );
 }
 
-/// A frontend name containing markup arrives escaped on the page, in its
-/// attribute and in its label.
+/// `POST /frontend_switcher` is not routed either: 404 from the fallback.
 #[tokio::test]
-async fn frontend_names_on_the_page_are_html_escaped() {
+async fn post_frontend_switcher_is_answered_by_the_fallback() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let app = switcher_app(pool, &[r#"<script>alert("xss")</script>"#]);
-    let response = common::TestRequest::get("/frontend_switcher")
+    let app = common::test_app(pool);
+    let response = common::TestRequest::post("/frontend_switcher")
+        .form(&[("frontend", "pleroma-fe")])
         .send(&app)
         .await;
     assert_eq!(
         response.status,
-        StatusCode::OK,
-        "a hostile name is still a page"
+        StatusCode::NOT_FOUND,
+        "the switcher pick is gone"
     );
-    let html = response.text();
-    assert!(
-        !html.contains("<script>"),
-        "the name cannot open a tag: {html}"
-    );
-    assert!(
-        html.contains("value=\"&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;\""),
-        "the attribute value is escaped: {html}"
-    );
-    assert!(
-        html.contains(">&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;</label>"),
-        "the label text is escaped too: {html}"
-    );
-}
-
-/// `POST /frontend_switcher` with a pick on the list answers 302 to `/`
-/// with the year-long `preferred_frontend` cookie and the module headers
-/// on the redirect.
-#[tokio::test]
-async fn a_valid_pick_sets_the_cookie_and_redirects_home() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = switcher_app(pool, &["pleroma-fe", "mochi-pub"]);
-    let response = common::TestRequest::post("/frontend_switcher")
-        .form(&[("frontend", "mochi-pub")])
-        .send(&app)
-        .await;
-    assert_eq!(response.status, StatusCode::FOUND, "the pick redirects");
     assert_eq!(
-        response.header("location"),
-        Some("/"),
-        "to the instance root"
+        response.header("x-wired-fallback"),
+        Some("1"),
+        "only the fallback answers the path"
     );
     assert_eq!(
         response.header("set-cookie"),
-        Some("preferred_frontend=mochi-pub; Path=/; Max-Age=31536000; SameSite=Lax"),
-        "the year-long frontend cookie, exactly"
-    );
-    assert_module_headers(&response, "the redirect");
-}
-
-/// A name that is not on the configured list is a 422 `Invalid frontend`
-/// HTML page, headers included.
-#[tokio::test]
-async fn a_pick_off_the_list_is_refused_with_an_html_page() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = switcher_app(pool, &["pleroma-fe"]);
-    let response = common::TestRequest::post("/frontend_switcher")
-        .form(&[("frontend", "not-installed")])
-        .send(&app)
-        .await;
-    assert_eq!(
-        response.status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "an unlisted pick is 422"
-    );
-    assert_module_headers(&response, "the refused pick");
-    assert!(
-        response.text().contains("Invalid frontend"),
-        "the page names the failure: {}",
-        response.text()
-    );
-}
-
-/// A POST without a `frontend` field at all is the same 422 HTML page.
-#[tokio::test]
-async fn a_missing_pick_is_refused_with_the_same_html_page() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = switcher_app(pool, &["pleroma-fe"]);
-    let response = common::TestRequest::post("/frontend_switcher")
-        .form(&[])
-        .send(&app)
-        .await;
-    assert_eq!(
-        response.status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "no pick is 422"
-    );
-    assert_module_headers(&response, "the missing pick");
-    assert!(
-        response.text().contains("Invalid frontend"),
-        "the page names the failure: {}",
-        response.text()
+        None,
+        "no frontend cookie is set"
     );
 }
 

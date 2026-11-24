@@ -1,8 +1,8 @@
 //! Top-level HTML helper pages: the small standalone documents this
 //! server serves outside `/api`.
 //!
-//! This module ships all four of its pages: the frontend switcher, the
-//! embeddable status card, the media player for one attachment of a
+//! This module ships all three of its pages: the embeddable status card,
+//! the media player for one attachment of a
 //! status (`GET /notice/{id}/embed_player`, Pleroma's `notice_player` in
 //! `lib/pleroma/web/o_status/o_status_controller.ex`) and the mailer
 //! unsubscribe page (`GET /mailer/unsubscribe/{token}`, Pleroma's
@@ -13,31 +13,25 @@
 //! The contract every response this module answers keeps:
 //!
 //! - `content-type: text/html; charset=utf-8`.
-//! - Every dynamic value — a frontend name, a message, a title — goes
-//!   through [`escape_html`], so nothing a request or a config carries can
-//!   open a tag or an attribute.
+//! - Every dynamic value — a message, a title — goes through
+//!   [`escape_html`], so nothing a request or a config carries can open a
+//!   tag or an attribute.
 //! - `content-security-policy: default-src 'none'; style-src
-//!   'unsafe-inline'; img-src * data:; media-src *` — Pleroma's switcher
+//!   'unsafe-inline'; img-src * data:; media-src *` — Pleroma's helper-page
 //!   CSP, spelled by `PAGE_CSP`: the pages load no scripts, no external
 //!   CSS and no fonts, only the one inline `PAGE_STYLE` sheet, images and
 //!   media.
 //! - `x-frame-options: DENY` on every page that is not made for embedding;
 //!   embed pages omit the header so they can be iframed (see `Framing`).
 //!
-//! The reference for the endpoint pair is Pleroma's
-//! `FrontendSwitcherController`
-//! (`lib/pleroma/web/frontend_switcher/frontend_switcher_controller.ex`):
-//! `index` renders the pick-list of the configured frontends, `update`
-//! validates the pick, sets the year-long `preferred_frontend` cookie (the
-//! shape [`crate::api::pleroma_settings`] mirrors) and sends the browser
-//! back to `/`.
+//! Pleroma's `/frontend_switcher` pair is deliberately not served: Wired is
+//! API-only, so the path falls through to the app-wide fallback.
 //!
-//! This module is a tree. `switcher` holds the switcher form, handlers
-//! and body builders, `embed` the status card and the media elements the
-//! player shares, `player` the media player page and `unsubscribe` the
-//! mailer link and its HMAC tokens; this root keeps the router, the
-//! shared constants and header statics, `Framing` and the page helpers
-//! every child answers through. `test_support` holds the unit-test
+//! This module is a tree. `embed` holds the status card and the media
+//! elements the player shares, `player` the media player page and
+//! `unsubscribe` the mailer link and its HMAC tokens; this root keeps the
+//! router, the shared constants and header statics, `Framing` and the page
+//! helpers every child answers through. `test_support` holds the unit-test
 //! fixtures the children share.
 
 use axum::{
@@ -51,25 +45,18 @@ use sha2_011::Sha256;
 
 use crate::{state::AppState, util::sanitize::escape_html};
 
-use self::{
-    embed::embed,
-    player::embed_player,
-    switcher::{switcher_index, switcher_update},
-    unsubscribe::unsubscribe,
-};
+use self::{embed::embed, player::embed_player, unsubscribe::unsubscribe};
 
 pub use self::unsubscribe::{unsubscribe_token, unsubscribe_user_id};
 
 mod embed;
 mod player;
-mod switcher;
 #[cfg(test)]
 mod test_support;
 mod unsubscribe;
 
-/// The one CSP every page in this module sends, Pleroma's
-/// `FrontendSwitcherController` `@csp`: no scripts, inline CSS only, any
-/// image or media source.
+/// The one CSP every page in this module sends, Pleroma's helper-page
+/// `@csp`: no scripts, inline CSS only, any image or media source.
 const PAGE_CSP: &str =
     "default-src 'none'; style-src 'unsafe-inline'; img-src * data:; media-src *";
 /// The media type of every page: [`page`] renders full HTML documents.
@@ -81,40 +68,9 @@ const PAGE_STYLE: &str = "body{margin:0;min-height:100vh;display:flex;\
     font-family:system-ui,sans-serif;color:#28242d}\
     main{background:#fff;border-radius:8px;padding:2rem;max-width:30rem;\
     box-shadow:0 2px 10px rgba(40,36,45,0.12)}\
-    h1{font-size:1.3rem;margin-top:0}\
-    div.frontend{margin:0.75rem 0}\
-    div.frontend label{display:block}\
-    input[type=submit]{padding:0.5rem 1rem;border-radius:4px;\
-    border:1px solid #7c8a52;background:#7c8a52;color:#fff;cursor:pointer}";
+    h1{font-size:1.3rem;margin-top:0}";
 /// The `X-Frame-Options` header [`Framing::Deny`] puts up.
 static FRAME_OPTIONS_HEADER: HeaderName = HeaderName::from_static("x-frame-options");
-/// The path of the switcher, `GET` to list and `POST` to pick.
-const SWITCHER_PATH: &str = "/frontend_switcher";
-/// The title of the switcher page.
-const SWITCHER_TITLE: &str = "Frontend switcher";
-/// The name the radio inputs — and the POST — carry the pick under
-/// (Pleroma's `%{"frontend" => name}`).
-const FRONTEND_FIELD: &str = "frontend";
-/// The body of the switcher page when [`Config::available_frontends`] is
-/// empty: nothing to pick, so nothing is offered.
-///
-/// [`Config::available_frontends`]: crate::config::Config::available_frontends
-const NO_FRONTENDS_MESSAGE: &str = "No alternative frontends are installed";
-/// The 422 page title and body for a pick off the list (or no pick at all),
-/// the message the ticket fixes.
-const INVALID_FRONTEND: &str = "Invalid frontend";
-/// The path a valid pick is sent to: the instance root, where the frontend
-/// the cookie names takes over.
-const REDIRECT_PATH: &str = "/";
-/// The body of the redirect page; browsers follow the `Location` and never
-/// show it.
-const SWITCHING_MESSAGE: &str = "Switching frontend";
-/// Name of the cookie a valid pick sets (the one
-/// [`crate::api::pleroma_settings`] mirrors for stored choices).
-const FRONTEND_COOKIE: &str = "preferred_frontend";
-/// `Max-Age` of that cookie, in seconds: one year, the shape
-/// [`crate::api::pleroma_settings`] uses.
-const COOKIE_MAX_AGE: &str = "31536000";
 /// The path of the embed card, `{id}` the status's primary key.
 const EMBED_PATH: &str = "/embed/{id}";
 /// The title of the embed card page.
@@ -155,12 +111,11 @@ enum Framing {
 
 /// The HTML helper-pages router, merged at the root by [`crate::app`].
 ///
-/// Mounts `/frontend_switcher`, `/embed/{id}`, `/notice/{id}/embed_player`
-/// and `/mailer/unsubscribe/{token}`. Do not call [`Router::fallback`] on
+/// Mounts `/embed/{id}`, `/notice/{id}/embed_player` and
+/// `/mailer/unsubscribe/{token}`. Do not call [`Router::fallback`] on
 /// it: unmatched paths must reach the app-wide fallback in [`crate::app`].
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route(SWITCHER_PATH, get(switcher_index).post(switcher_update))
         .route(EMBED_PATH, get(embed))
         .route(PLAYER_PATH, get(embed_player))
         .route(UNSUBSCRIBE_PATH, get(unsubscribe))

@@ -506,6 +506,7 @@ Routes Pleroma has and Wired deliberately does not:
 | `/phoenix/live_dashboard/*path`, and the `/pleroma/live_dashboard` and `/pleroma/oban` pages it redirects to | `Phoenix.LiveDashboard` and `Oban.Web.Router`: HTML UIs over BEAM process and job metrics, with no meaning outside that runtime. |
 | The SPA fallbacks `GET /:maybe_nickname_or_id` and `GET /*path` (and the `OPTIONS /*path` pair) | They hand an unknown path to the frontend's JavaScript router, or answer its preflight. Wired is API-only (see the top of this file), so an unmatched path is the JSON 404 — under `/api` Pleroma's own `api_not_implemented`, elsewhere its plain "Not found". |
 | `GET /users/:nickname/feed` (and its `.atom`/`.rss` forms) and `GET /tags/:tag` | Atom/RSS syndication, not API. Pleroma serves them from its HTML/XML pipeline; Wired is API-only, so the frontend owns HTML and feeds and these paths fall through to the JSON 404. `GET /users/:nickname` still negotiates the `ActivityPub` actor JSON. |
+| `GET/POST /frontend_switcher` | Pleroma's `FrontendSwitcherController`: an HTML radio-list of installed frontends whose POST sets a year-long `preferred_frontend` cookie and redirects to `/`. Wired is API-only and serves no frontend at `/`, so the cookie would select nothing; both methods fall through to the JSON 404. |
 | The Shout channels socket (`GET /socket`) | Pleroma's browser-notification WebSocket. Wired delivers the same events on `/api/v1/streaming` and over Web Push. |
 
 ## Development
