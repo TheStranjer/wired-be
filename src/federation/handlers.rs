@@ -11,7 +11,8 @@
 //! `Remove` and `Move` that ride beside them, [`interactions`] for the
 //! `Like`, `EmojiReact` and `Announce` (and their `Undo`s) that land on a
 //! status, [`quotes`] for the `QuoteRequest` a remote account sends to quote
-//! a local post, [`follow`] for the `Follow`, `Accept`, `Reject` and `Undo` of a
+//! a local post, [`quote_answers`] for the answers to the `QuoteRequest` this
+//! instance sends (they ride the `Accept`, `Reject` and `Delete` routes), [`follow`] for the `Follow`, `Accept`, `Reject` and `Undo` of a
 //! `Follow` that carry the follow handshake across the wire, with the
 //! create and note tickets adding their files in turn, and [`listen`] for the
 //! `Listen` (and its `Undo`) that carries a remote account's scrobble.
@@ -38,6 +39,7 @@ pub mod interactions;
 pub mod listen;
 pub mod misc;
 pub mod note;
+pub mod quote_answers;
 pub mod quotes;
 #[cfg(test)]
 mod test_support;

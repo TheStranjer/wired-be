@@ -11,6 +11,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
+    entities::status::QuoteSlot,
     error::AppResult,
     models::{
         bookmark, conversation, conversation_mute,
@@ -19,6 +20,7 @@ use crate::{
         hashtag::{self, Hashtag},
         media_attachment::{self, MediaAttachment as AttachmentRow},
         mention, pinned_status,
+        quote_request::{self, QuoteRequestState},
         status::{self, Status as StatusRow},
         status_visibility,
         user::{self, User},
@@ -90,6 +92,25 @@ pub(super) async fn load_quotes(
         "quoted originals batch-loaded; the visible ones render nested, one level deep"
     );
     Ok((quoted, visible_quotes))
+}
+
+/// The quotes among `quoting_ids` whose author said no, as render slots.
+///
+/// A refused request or a withdrawn grant becomes the [`QuoteSlot`] that
+/// renders it. One read per page; an empty list asks nothing.
+pub(super) async fn load_quote_denials(
+    pool: &PgPool,
+    quoting_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, QuoteSlot>> {
+    let denied = quote_request::denied_for_statuses(pool, quoting_ids).await?;
+    Ok(denied
+        .into_iter()
+        .filter_map(|(id, state)| match state {
+            QuoteRequestState::Rejected => Some((id, QuoteSlot::Rejected)),
+            QuoteRequestState::Revoked => Some((id, QuoteSlot::Revoked)),
+            QuoteRequestState::Pending | QuoteRequestState::Accepted => None,
+        })
+        .collect())
 }
 
 /// The ids among `parent_ids` — the `in_reply_to_id`s the page names —

@@ -61,6 +61,7 @@ use crate::{
     error::AppResult,
     federation::{
         dispatch::{ActivityView, FederationError, Handlers, Outcome},
+        handlers::quote_answers,
         json,
     },
     models::{
@@ -298,7 +299,8 @@ async fn store_follow(
     Ok(Outcome::Handled)
 }
 
-/// The body of [`handle_accept`]: resolve our own follow, honour only the
+/// The body of [`handle_accept`]: an answer to a `QuoteRequest` goes to
+/// [`quote_answers`], otherwise resolve our own follow, honour only the
 /// followee's answer, and grant it through the model's transition.
 async fn apply_accept(
     state: AppState,
@@ -309,6 +311,9 @@ async fn apply_accept(
         return Ok(Outcome::Ignored(
             "an Accept signed by an account this instance owns",
         ));
+    }
+    if let Some(outcome) = quote_answers::fold_accept(&state, &view, &signer).await? {
+        return Ok(outcome);
     }
     let row = answered_follow(&state.db, &view).await.map_err(|err| {
         FederationError::transient(
@@ -369,8 +374,8 @@ async fn apply_accept(
     Ok(Outcome::Handled)
 }
 
-/// The body of [`handle_reject`]: the same resolution and the same
-/// followee honour, then [`follow::reject`] — the `pending` request is
+/// The body of [`handle_reject`]: the same quote-answer hand-off, then the
+/// same resolution and the same followee honour, then [`follow::reject`] — the `pending` request is
 /// withdrawn, an accepted relationship the remote revokes goes with its
 /// counters.
 async fn apply_reject(
@@ -382,6 +387,9 @@ async fn apply_reject(
         return Ok(Outcome::Ignored(
             "a Reject signed by an account this instance owns",
         ));
+    }
+    if let Some(outcome) = quote_answers::fold_reject(&state, &view, &signer).await? {
+        return Ok(outcome);
     }
     let row = answered_follow(&state.db, &view).await.map_err(|err| {
         FederationError::transient(

@@ -8,6 +8,7 @@
 
 use super::notes::{NoteActivity, note_document, note_publisher};
 use super::queue_activity;
+use super::quotes::request_quote;
 use crate::{models::status::Status, state::AppState};
 
 /// Announce the status the caller just posted: the `Create` activity
@@ -23,6 +24,10 @@ use crate::{models::status::Status, state::AppState};
 /// arm, because the parent's author rides in the mention list the note's
 /// addressing is built from, and a `direct` status addresses its mentionees
 /// alone, so the followers never hear it.
+///
+/// A quote of a REMOTE post also asks its author for consent: the
+/// `QuoteRequest` of `request_quote`, sent to that author alone after the
+/// `Create`.
 ///
 /// Silence is the answer of a mirrored row (a remote post belongs to its
 /// origin's `Create`), of a reblog row (decision 6 gives it the `Announce`
@@ -43,6 +48,7 @@ pub async fn after_status_created(state: &AppState, status: &Status) {
         return;
     };
     queue_activity(state, &author, &document, "note").await;
+    request_quote(state, status, &author).await;
 }
 
 /// Announce the edit the caller just wrote: the `Update` activity carrying

@@ -19,7 +19,7 @@ use crate::{
         custom_emoji::{self, CustomEmoji},
         hashtag,
         media_attachment::{self, MediaAttachment},
-        mention, poll,
+        mention, poll, quote_request,
         status::{self, Status},
         user::{self, User},
     },
@@ -62,6 +62,7 @@ pub async fn load_note_context(
     let poll_data = load_poll(pool, &status).await?;
     let emojis = load_emojis(pool, &status, poll_data.as_ref()).await?;
     let quote_uri = load_quote_uri(pool, &status).await?;
+    let quote_authorization = quote_request::accepted_authorization(pool, status.id).await?;
     Ok(NoteContext {
         status,
         author,
@@ -72,6 +73,7 @@ pub async fn load_note_context(
         emojis,
         poll: poll_data,
         quote_uri,
+        quote_authorization,
         config: config.clone(),
     })
 }

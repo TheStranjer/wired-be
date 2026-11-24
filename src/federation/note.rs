@@ -136,6 +136,10 @@ pub struct NoteContext {
     pub poll: Option<PollData>,
     /// The quoted status's object id; `None` for anything but a quote.
     pub quote_uri: Option<String>,
+    /// The `QuoteAuthorization` address the quoted author granted this
+    /// quote; `None` until an `Accept` of its `QuoteRequest` names one, and
+    /// again once the grant is revoked.
+    pub quote_authorization: Option<String>,
     /// The instance whose origin, schema route and language default the
     /// document is built from.
     pub config: Config,

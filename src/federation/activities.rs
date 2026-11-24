@@ -74,7 +74,7 @@ pub use contexts::{
 };
 pub use interactions::{emoji_react_json, like_json, undo_json};
 pub use listen::{audio_json, listen_json};
-pub use quotes::accept_quote_json;
+pub use quotes::{QuoteRequestContext, accept_quote_json, quote_request_json};
 pub use relations::{
     FollowActivity, accept_json, add_json, block_json, flag_json, follow_json, follow_json_to,
     move_json, reject_json, remove_json,

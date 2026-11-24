@@ -297,7 +297,7 @@ fn tag_entities(tags: &[Hashtag], config: &Config) -> Vec<Tag> {
 /// and, when the viewer may see it, the quoted status.
 #[derive(Debug, Serialize)]
 pub struct QuoteEntity {
-    /// `accepted`, `unauthorized` or `deleted`.
+    /// `accepted`, `unauthorized`, `deleted`, `rejected` or `revoked`.
     pub state: &'static str,
     /// The bare quoted status for `accepted`, `null` otherwise.
     pub quoted_status: Option<Value>,
@@ -335,6 +335,14 @@ impl StatusQuote {
             }),
             Some(QuoteSlot::Hidden) => Self::Entity(QuoteEntity {
                 state: "unauthorized",
+                quoted_status: None,
+            }),
+            Some(QuoteSlot::Rejected) => Self::Entity(QuoteEntity {
+                state: "rejected",
+                quoted_status: None,
+            }),
+            Some(QuoteSlot::Revoked) => Self::Entity(QuoteEntity {
+                state: "revoked",
                 quoted_status: None,
             }),
             Some(QuoteSlot::Linked) => Self::reference("accepted", quoted_id),

@@ -13,7 +13,10 @@ use super::test_support::{
     BASE, CARD_URL, EXPECTED_KEYS, PLEROMA_KEYS, Parts, attachment, base_row, base_user, emoji_row,
     hashtag, json_keys, other_user, render, render_nested, stamped,
 };
-use crate::{entities::poll::Poll, models::user::Flag};
+use crate::{
+    entities::{poll::Poll, status::QuoteSlot},
+    models::user::Flag,
+};
 
 #[test]
 fn a_hidden_parent_renders_parent_visible_false() {
@@ -262,6 +265,28 @@ fn a_quote_that_is_gone_is_deleted() {
             "a quote the batch could not find (or never handed over) is deleted"
         );
         assert_eq!(value["quote_id"], quoted_id.to_string());
+        assert_eq!(value["pleroma"]["quote"], Value::Null);
+        assert_eq!(value["pleroma"]["quote_visible"], false);
+    }
+}
+
+#[test]
+fn a_refused_or_revoked_quote_names_its_state_and_withholds_the_status() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    for (slot, state) in [
+        (QuoteSlot::Rejected, "rejected"),
+        (QuoteSlot::Revoked, "revoked"),
+    ] {
+        let value = render(&row, &Parts::of(&alice).quoting_slot(slot), None);
+        assert_eq!(
+            value["quote"],
+            json!({ "state": state, "quoted_status": null }),
+            "the author's answer is the quote's state"
+        );
+        assert_eq!(value["quote_id"], quoted_id.to_string(), "the target stays");
         assert_eq!(value["pleroma"]["quote"], Value::Null);
         assert_eq!(value["pleroma"]["quote_visible"], false);
     }

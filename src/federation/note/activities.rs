@@ -117,8 +117,18 @@ pub fn litepub_context_json() -> Value {
             "@type": "@id"
         },
     });
-    if let (Some(target), Value::Object(extra)) = (terms.as_object_mut(), linked) {
-        target.extend(extra);
+    // Kept apart so each `json!` stays under the macro recursion limit.
+    let quotes = json!({
+        "quote": { "@id": "https://w3id.org/fep/044f#quote", "@type": "@id" },
+        "quoteAuthorization": {
+            "@id": "https://w3id.org/fep/044f#quoteAuthorization",
+            "@type": "@id"
+        },
+    });
+    for extra in [linked, quotes] {
+        if let (Some(target), Value::Object(entries)) = (terms.as_object_mut(), extra) {
+            target.extend(entries);
+        }
     }
     json!({ "@context": terms })
 }
@@ -369,6 +379,16 @@ mod tests {
         assert_eq!(
             context["QuoteRequest"], "https://w3id.org/fep/044f#QuoteRequest",
             "the quote request type"
+        );
+        assert_eq!(
+            context["quote"],
+            json!({"@id": "https://w3id.org/fep/044f#quote", "@type": "@id"}),
+            "the FEP-044f quote reference"
+        );
+        assert_eq!(
+            context["quoteAuthorization"],
+            json!({"@id": "https://w3id.org/fep/044f#quoteAuthorization", "@type": "@id"}),
+            "the FEP-044f authorization reference"
         );
     }
 

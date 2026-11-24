@@ -43,6 +43,10 @@ pub enum QuoteSlot {
     Hidden,
     /// The quoted row is gone.
     Deleted,
+    /// The quoted author refused the quote request (`rejected`).
+    Rejected,
+    /// The quoted author withdrew the grant (`revoked`).
+    Revoked,
     /// Nested reference to a quote the viewer may see (`accepted`).
     Linked,
     /// Nested reference to a quote hidden from the viewer
@@ -56,7 +60,12 @@ impl QuoteSlot {
     pub fn into_rendered(self) -> Option<Value> {
         match self {
             Self::Visible(rendered) => Some(rendered),
-            Self::Hidden | Self::Deleted | Self::Linked | Self::LinkedHidden => None,
+            Self::Hidden
+            | Self::Deleted
+            | Self::Rejected
+            | Self::Revoked
+            | Self::Linked
+            | Self::LinkedHidden => None,
         }
     }
 }

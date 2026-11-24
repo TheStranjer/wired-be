@@ -10,6 +10,7 @@ use super::{
     test_support::{BASE, post, test_state, user},
 };
 use crate::models::{
+    quote_request::{self, NewQuoteRequest, QuoteRequestState},
     status::{NewStatus, Status as StatusRow, Visibility, insert},
     user::User,
 };
@@ -249,4 +250,57 @@ async fn a_reblog_nests_the_original_and_keeps_its_own_identity() {
         .await
         .unwrap();
     assert_eq!(counted.0, 1, "the original is the one counted");
+}
+
+/// The quoted author's answer decides the quote's state: a refusal or a
+/// revocation renders `rejected` or `revoked` with no status nested, a
+/// pending or granted request keeps the ordinary `accepted` render, and the
+/// quote's target id stays in every case.
+#[tokio::test]
+async fn the_quoted_authors_answer_is_the_quotes_state() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = test_state(&pool);
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let source = post(&pool, &bob, "the source").await;
+    let quoting = quote(&pool, &alice, &source, Visibility::Public).await;
+    let request = quote_request::insert(
+        &pool,
+        &NewQuoteRequest {
+            quoting_status_id: quoting.id,
+            quoted_status_id: source.id,
+            quoted_user_id: bob.id,
+            request_uri: "https://test.example/activities/quote-answer",
+        },
+    )
+    .await
+    .expect("the request writes");
+
+    for (answer, expected) in [
+        (QuoteRequestState::Pending, "accepted"),
+        (QuoteRequestState::Rejected, "rejected"),
+        (QuoteRequestState::Revoked, "revoked"),
+        (QuoteRequestState::Accepted, "accepted"),
+    ] {
+        quote_request::set_state(&pool, request.id, answer)
+            .await
+            .expect("the answer stores");
+        let rendered = render_status(&state, ViewerMode::ANONYMOUS, &quoting)
+            .await
+            .expect("the quote renders")
+            .expect("a live row renders");
+        let value = serde_json::to_value(&rendered).expect("it serializes");
+        assert_eq!(value["quote"]["state"], expected, "{answer:?}");
+        assert_eq!(
+            value["quote_id"],
+            source.id.to_string(),
+            "the target stays for {answer:?}"
+        );
+        assert_eq!(
+            value["quote"]["quoted_status"].is_null(),
+            expected != "accepted",
+            "the status is nested only for an accepted quote ({answer:?})"
+        );
+    }
 }
