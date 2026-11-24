@@ -114,10 +114,10 @@ pub(crate) const PUBLIC_RECIPIENTS: [&str; 3] = [
     "Public",
 ];
 
-/// The quote-reference fields, tried in order: Mastodon's and Fedibird's
-/// `quoteUrl`/`quoteUri` and Misskey's `_misskey_quote` (Pleroma's
-/// `CommonFixes.fix_quote_url`).
-const QUOTE_KEYS: [&str; 3] = ["quoteUrl", "quoteUri", "_misskey_quote"];
+/// The quote-reference fields, tried in order: the FEP-044f `quote`,
+/// Mastodon's and Fedibird's `quoteUrl`/`quoteUri` and Misskey's
+/// `_misskey_quote` (Pleroma's `CommonFixes.fix_quote_url`).
+const QUOTE_KEYS: [&str; 4] = ["quote", "quoteUrl", "quoteUri", "_misskey_quote"];
 
 /// The thread-reference fields, tried in order: `context`, the generic
 /// `conversation`, and the `ostatus:conversation` Pleroma writes (whose
@@ -218,6 +218,8 @@ pub fn parse_note(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use crate::{federation::note_parser::test_support::*, models::status::Visibility};
 
     #[test]
@@ -345,6 +347,63 @@ mod tests {
         assert_eq!(
             parsed.emojis[0].shortcode, "plainname",
             "colons are optional"
+        );
+    }
+
+    #[test]
+    fn the_fep_044f_quote_feeds_the_quote() {
+        let mut note = minimal_note();
+        note["quote"] = json!("https://a.example/x");
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/x"),
+            "a bare quote property is the reference"
+        );
+    }
+
+    #[test]
+    fn the_fep_044f_quote_wins_over_the_legacy_keys() {
+        let mut note = minimal_note();
+        note["quote"] = json!("https://a.example/new");
+        note["quoteUrl"] = json!("https://a.example/old");
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/new"),
+            "quote is tried first"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_quote_falls_back_to_the_next_key() {
+        let mut note = minimal_note();
+        note["quote"] = json!({"type": "Tombstone", "id": "https://a.example/gone"});
+        note["quoteUrl"] = json!("https://a.example/live");
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/live"),
+            "the Tombstone is skipped for quoteUrl"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_quote_alone_references_nothing() {
+        let mut note = minimal_note();
+        note["quote"] = json!({"type": ["Tombstone"], "id": "https://a.example/gone"});
+        assert_eq!(
+            parse(&note).quote_uri,
+            None,
+            "a Tombstone (even typed by array) is no quote"
+        );
+    }
+
+    #[test]
+    fn a_non_tombstone_quote_object_reads_its_id() {
+        let mut note = minimal_note();
+        note["quote"] = json!({"type": "Note", "id": "https://a.example/obj"});
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/obj"),
+            "an embedded object references its id"
         );
     }
 }

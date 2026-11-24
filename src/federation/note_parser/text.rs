@@ -134,11 +134,23 @@ pub(super) fn parse_sensitive(json: &Value, has_spoiler: bool) -> bool {
 /// The reference carried by the first of `keys` that yields one: values are
 /// read through [`value_or_id`], so a `null` (or any reference-less value)
 /// under an earlier key falls through to a later one, like Pleroma's `||`
-/// chains in `fix_object_defaults` and `fix_quote_url` do.
+/// chains in `fix_object_defaults` and `fix_quote_url` do. An object value
+/// of `type` `Tombstone` (a deleted target) is no reference, so the next
+/// key is tried instead.
 pub(super) fn field_reference(json: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| json.get(*key))
+        .filter(|value| !is_tombstone(value))
         .find_map(value_or_id)
+}
+
+/// Whether `value` is an object whose `type` is, or lists, `Tombstone`.
+fn is_tombstone(value: &Value) -> bool {
+    match value.get("type") {
+        Some(Value::String(kind)) => kind == "Tombstone",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("Tombstone")),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
