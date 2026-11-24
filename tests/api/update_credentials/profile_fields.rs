@@ -29,11 +29,11 @@ async fn fields_attributes_update_through_every_body_shape() {
         json!([
             field(
                 "Site",
-                "<p><a href=\"https://example.com/a\" rel=\"ugc nofollow noopener noreferrer\">example.com/a</a></p>"
+                "<a href=\"https://example.com/a\" rel=\"ugc nofollow noopener noreferrer\">example.com/a</a>"
             ),
-            field("Motto", "<p>beep boop</p>"),
+            field("Motto", "beep boop"),
         ]),
-        "the JSON array renders: bare URL linked with the standard rel, plain text paragraphed"
+        "the JSON array renders: bare URL linked with the standard rel, plain text inline, no `<p>`"
     );
     assert_eq!(
         source_of(&via_json)["fields"],
@@ -57,7 +57,7 @@ async fn fields_attributes_update_through_every_body_shape() {
     );
     assert_eq!(
         via_index_map["fields"],
-        json!([field("first", "<p>one</p>"), field("second", "<p>two</p>")]),
+        json!([field("first", "one"), field("second", "two")]),
         "the index-object shape orders by the index as a number"
     );
 
@@ -79,9 +79,9 @@ async fn fields_attributes_update_through_every_body_shape() {
         json!([
             field(
                 "Form",
-                "<p><a href=\"https://form.example/x\" rel=\"ugc nofollow noopener noreferrer\">form.example/x</a></p>"
+                "<a href=\"https://form.example/x\" rel=\"ugc nofollow noopener noreferrer\">form.example/x</a>"
             ),
-            field("Bare", "<p>just words</p>"),
+            field("Bare", "just words"),
         ]),
         "the form's bracketed index keys fold into the same list"
     );
@@ -116,14 +116,14 @@ async fn fields_attributes_arrive_through_multipart() {
     );
     assert_eq!(
         via_multipart["fields"],
-        json!([field("Multi", "<p>hello</p>")]),
+        json!([field("Multi", "hello")]),
         "multipart text parts structure like urlencoded ones"
     );
 
     let row = stored(&pool, alice.id).await;
     assert_eq!(
         row.fields,
-        json!([{"name": "Multi", "value": "<p>hello</p>"}]),
+        json!([{"name": "Multi", "value": "hello"}]),
         "the `fields` column holds the rendered pair"
     );
     assert_eq!(
@@ -209,7 +209,7 @@ async fn empty_fields_attributes_clears_the_metadata() {
     );
     assert_eq!(
         refilled["fields"],
-        json!([field("Back", "<p>again</p>")]),
+        json!([field("Back", "again")]),
         "the metadata can be written again after clearing"
     );
     let empty_map = ok_body(&patch_json(&app, &token, &json!({"fields_attributes": {}})).await);
@@ -254,8 +254,8 @@ async fn entries_with_both_empty_name_and_value_are_dropped() {
         body["fields"],
         json!([
             field("NameOnly", ""),
-            field("", "<p>value only</p>"),
-            field("Kept", "<p>x</p>"),
+            field("", "value only"),
+            field("Kept", "x"),
         ]),
         "both-empty entries (and non-objects, which read as empty) go, half-entries stay in order"
     );

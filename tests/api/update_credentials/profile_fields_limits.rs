@@ -62,10 +62,10 @@ async fn too_many_fields_is_422() {
     assert_eq!(
         row.fields,
         json!([
-            {"name": "a", "value": "<p>1</p>"},
-            {"name": "b", "value": "<p>2</p>"},
-            {"name": "c", "value": "<p>3</p>"},
-            {"name": "d", "value": "<p>4</p>"},
+            {"name": "a", "value": "1"},
+            {"name": "b", "value": "2"},
+            {"name": "c", "value": "3"},
+            {"name": "d", "value": "4"},
         ]),
         "the refused write changed nothing"
     );
@@ -186,7 +186,7 @@ async fn field_name_and_value_length_limits_are_422() {
     let row = stored(&pool, alice.id).await;
     assert_eq!(
         row.fields,
-        json!([{"name": "x".repeat(255), "value": format!("<p>{}</p>", "y".repeat(2047))}]),
+        json!([{"name": "x".repeat(255), "value": "y".repeat(2047)}]),
         "only the accepted write is stored"
     );
     assert_eq!(
