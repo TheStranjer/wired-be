@@ -170,6 +170,27 @@ async fn fallback_covers_all_verbs() {
     );
 }
 
+/// `GET /api/openapi` is not routed (Pleroma serves no such document): the
+/// `/api` fallback answers 404 "Not implemented" and marks it.
+#[tokio::test]
+async fn openapi_document_is_not_routed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/api/openapi").send(&app).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "no such route");
+    assert_eq!(
+        error_message(&response).as_deref(),
+        Some("Not implemented"),
+        "the api_not_implemented body"
+    );
+    assert_eq!(
+        response.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback marks its answer"
+    );
+}
+
 /// Both fallback branches mark their answer with `x-wired-fallback: 1`, and a
 /// route the router matched does not carry it: that header is what
 /// `route_inventory.rs` reads to tell "no handler is routed here" from a
