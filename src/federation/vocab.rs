@@ -11,6 +11,7 @@
 use serde_json::Value;
 
 use super::json;
+use crate::util::media_type::essence;
 
 /// The `ActivityStreams` public addressing collection, the one recipient
 /// that means "everyone": the `to` of a public post, the `cc` of an
@@ -26,6 +27,25 @@ pub const PUBLIC_RECIPIENTS: [&str; 3] = [AS_PUBLIC, "as:Public", "Public"];
 
 /// The `ActivityStreams` core vocabulary, first entry of every `@context`.
 pub const AS_VOCABULARY: &str = "https://www.w3.org/ns/activitystreams";
+
+/// The `ActivityPub` media type Mastodon and Pleroma serve documents as.
+pub const ACTIVITY_JSON: &str = "application/activity+json";
+
+/// The JSON-LD media type, the second spelling of an `ActivityPub`
+/// document. Whether its `profile` parameter is checked is up to the caller.
+pub const LD_JSON: &str = "application/ld+json";
+
+/// The two media types that name an `ActivityPub` document, lowercase and
+/// without parameters.
+pub const AP_MEDIA_TYPES: [&str; 2] = [ACTIVITY_JSON, LD_JSON];
+
+/// Whether a `Content-Type`-style value names an `ActivityPub` media type:
+/// its [`essence`] (parameters dropped, trimmed, lowercased) is one of the
+/// [`AP_MEDIA_TYPES`].
+#[must_use]
+pub fn is_ap_media_type(content_type: &str) -> bool {
+    AP_MEDIA_TYPES.contains(&essence(content_type).as_str())
+}
 
 /// Whether `address` is the public addressing recipient in any of the
 /// [`PUBLIC_RECIPIENTS`] spellings.
@@ -76,6 +96,43 @@ mod tests {
             "a followers collection is not public"
         );
         assert!(!is_public_address(""), "the empty string is not public");
+    }
+
+    #[test]
+    fn both_activitypub_types_are_ap_media_types() {
+        for candidate in [
+            "application/activity+json",
+            "application/activity+json; charset=utf-8",
+            "APPLICATION/Activity+JSON",
+            " application/activity+json ; charset=utf-8 ",
+            "application/ld+json",
+            r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#,
+            "Application/LD+Json",
+        ] {
+            assert!(is_ap_media_type(candidate), "{candidate} names AP");
+        }
+    }
+
+    #[test]
+    fn other_media_types_are_not_ap_media_types() {
+        for candidate in [
+            "application/json",
+            "text/html",
+            "application/jrd+json",
+            "activity+json",
+            "",
+        ] {
+            assert!(!is_ap_media_type(candidate), "{candidate} does not name AP");
+        }
+    }
+
+    #[test]
+    fn the_list_holds_exactly_the_two_constants() {
+        assert_eq!(
+            AP_MEDIA_TYPES,
+            [ACTIVITY_JSON, LD_JSON],
+            "the pair, in order"
+        );
     }
 
     #[test]

@@ -94,9 +94,6 @@ pub const KIND_DELIVER: &str = "federator.deliver";
 /// [`backoff`](crate::jobs::backoff) keeps the last attempts hours apart.
 pub const MAX_ATTEMPTS: i32 = 7;
 
-/// The media type a delivery POST carries and asks for.
-const ACTIVITY_JSON: &str = "application/activity+json";
-
 /// The prefix of a delivery's deduplication key.
 const UNIQUE_KEY_PREFIX: &str = "deliver";
 
