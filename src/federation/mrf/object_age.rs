@@ -31,9 +31,11 @@
 //!   audience address either.
 //!
 //! Both rewrites apply to the activity and its embedded object alike, as
-//! everywhere else in the chain. An empty or absent `actions` list leaves
-//! even a prehistoric post standing; unknown action names are warned
-//! about and skipped.
+//! everywhere else in the chain. An absent `actions` key (or absent
+//! parameters altogether) means Pleroma's configured default,
+//! `[:delist, :strip_followers]`, so merely enabling the policy acts; an
+//! explicit empty `actions` list leaves even a prehistoric post standing.
+//! Unknown action names are warned about and skipped.
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
@@ -117,10 +119,12 @@ fn age_secs(now: DateTime<Utc>, published: DateTime<Utc>) -> i64 {
 }
 
 /// The configured actions, in configured order: every recognizable name,
-/// while anything unrecognizable warns and drops out.
+/// while anything unrecognizable warns and drops out. A missing `actions`
+/// key is Pleroma's default, [`Action::Delist`] and
+/// [`Action::StripFollowers`]; an explicit empty list is no actions.
 fn configured_actions(fields: Option<&Map<String, Value>>) -> Vec<Action> {
     let Some(value) = fields.and_then(|fields| fields.get("actions")) else {
-        return Vec::new();
+        return vec![Action::Delist, Action::StripFollowers];
     };
     let Value::Array(entries) = value else {
         warn!("the `actions` of the `object_age` MRF setting is not an array; no action runs");
@@ -181,14 +185,15 @@ pub struct ObjectAgePolicy {
 impl ObjectAgePolicy {
     /// The policy over the `object_age` key of the `mrf` setting (`None`
     /// when the setting carries none): the configured threshold and action
-    /// list, each defaulting to nothing-and-quiet when absent or unusable.
+    /// list, each defaulting to Pleroma's (a week; delist and strip the
+    /// followers) when absent or unusable.
     #[must_use]
     pub fn new(params: Option<Value>) -> Self {
         let fields = params.as_ref().and_then(Value::as_object);
         if params.is_some() && fields.is_none() {
             warn!(
                 "the `object_age` MRF setting is not a JSON object; \
-                 the policy runs with no actions"
+                 the policy runs with its default actions"
             );
         }
         let threshold_secs = configured_threshold(fields);
@@ -356,6 +361,18 @@ mod tests {
         expected
     }
 
+    /// The golden of the aged fixture under both rewrites: Public out of
+    /// `to` and into `cc`, the followers collection out of both, on both
+    /// documents.
+    fn delisted_and_stripped_aged(secs: i64) -> Value {
+        let mut expected = create_aged(secs);
+        expected["to"] = json!([]);
+        expected["cc"] = json!([BOB, PUBLIC]);
+        expected["object"]["to"] = json!([]);
+        expected["object"]["cc"] = json!([BOB, PUBLIC]);
+        expected
+    }
+
     /// The table: one configured block, one fixture, one golden answer.
     struct Case {
         /// What the case is about, for the assertion message.
@@ -477,10 +494,10 @@ mod tests {
 
     /// The default threshold is one week: an eight-day-old post falls
     /// under the actions with no `threshold` configured, a six-day-old
-    /// one stands, and no `actions` at all is the no-op even for the
-    /// eight-day-old.
+    /// one stands, and no `actions` key at all is Pleroma's default of
+    /// delisting and stripping the followers of the eight-day-old.
     #[test]
-    fn the_default_threshold_is_a_week_and_the_default_actions_are_none() {
+    fn the_default_threshold_is_a_week_and_the_default_actions_delist_and_strip() {
         let eight_days = DEFAULT_THRESHOLD_SECS + 86_400;
         let six_days = DEFAULT_THRESHOLD_SECS - 86_400;
         check_cases(&[
@@ -503,10 +520,47 @@ mod tests {
             let policy = ObjectAgePolicy::new(Some(config));
             assert_eq!(
                 policy.filter(&ctx(), create_aged(eight_days)),
-                Ok(create_aged(eight_days)),
-                "no actions configured, nothing runs"
+                Ok(delisted_and_stripped_aged(eight_days)),
+                "no `actions` key, the Pleroma default runs"
             );
         }
+    }
+
+    /// An unconfigured policy (`None` params) acts like Pleroma's default:
+    /// an eight-day-old `Create` is delisted and stripped of followers, a
+    /// six-day-old one stands; an explicit empty `actions` list is no
+    /// actions; and `["reject"]` refuses.
+    #[test]
+    fn absent_actions_default_while_an_explicit_list_is_honored() {
+        let eight_days = DEFAULT_THRESHOLD_SECS + 86_400;
+        let six_days = DEFAULT_THRESHOLD_SECS - 86_400;
+        let unconfigured = ObjectAgePolicy::new(None);
+        assert_eq!(
+            unconfigured.filter(&ctx(), create_aged(eight_days)),
+            Ok(delisted_and_stripped_aged(eight_days)),
+            "no params: delist and strip_followers"
+        );
+        assert_eq!(
+            unconfigured.filter(&ctx(), create_aged(six_days)),
+            Ok(create_aged(six_days)),
+            "no params, young post stands"
+        );
+        check_cases(&[
+            Case {
+                label: "an explicit empty list is no actions",
+                config: json!({"actions": []}),
+                activity: create_aged(eight_days),
+                expected: Ok(create_aged(eight_days)),
+            },
+            Case {
+                label: "an explicit reject refuses",
+                config: json!({"actions": ["reject"]}),
+                activity: create_aged(eight_days),
+                expected: Err(format!(
+                    "[ObjectAgePolicy] the object is 86400 seconds past its {DEFAULT_THRESHOLD_SECS} second threshold"
+                )),
+            },
+        ]);
     }
 
     /// A document the age check cannot read passes however armed the
@@ -604,18 +658,19 @@ mod tests {
         ]);
     }
 
-    /// The empty configuration is the no-op: no key, an empty object and
-    /// a non-object document all hand an eight-day-old post straight
-    /// through — nothing configured means nothing to run.
+    /// The empty configuration is Pleroma's default: no key, an empty
+    /// object and a non-object document all delist and strip the followers
+    /// of an eight-day-old post.
     #[test]
-    fn an_empty_configuration_governs_nothing() {
-        let old = create_aged(DEFAULT_THRESHOLD_SECS + 86_400);
+    fn an_empty_configuration_runs_the_default_actions() {
+        let secs = DEFAULT_THRESHOLD_SECS + 86_400;
+        let old = create_aged(secs);
         for config in [None, Some(json!({})), Some(json!("nope"))] {
             let policy = ObjectAgePolicy::new(config.clone());
             assert_eq!(
                 policy.filter(&ctx(), old.clone()),
-                Ok(old.clone()),
-                "config {config:?} is inert"
+                Ok(delisted_and_stripped_aged(secs)),
+                "config {config:?} runs the defaults"
             );
             let expected = match &config {
                 Some(block @ Value::Object(_)) => block.clone(),

@@ -384,7 +384,8 @@ strictly against two thresholds:
 `Create` activities whose embedded object `published` lies further in the
 past than `threshold` seconds (default `604800`, one week; the comparison is
 strict, and an unreadable or future timestamp is never old), and takes every
-action named in `actions`:
+action named in `actions` (Pleroma's default when the key is absent:
+`["delist", "strip_followers"]`; an explicit `[]` runs nothing):
 
 ```json
 { "policies": ["object_age"], "object_age": { "threshold": 604800, "actions": ["delist", "strip_followers"] } }
