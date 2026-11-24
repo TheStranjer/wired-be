@@ -261,6 +261,20 @@ fn object_url(base: &str, name: &str) -> String {
     format!("{base}/objects/{name}")
 }
 
+/// Stores the runtime MRF entry enabling the `simple` policy.
+///
+/// `lists` is its domain lists (`{"reject": [...]}` / `{"accept": [...]}`).
+async fn set_simple_lists(pool: &PgPool, lists: &Value) {
+    crate::services::runtime_config::write(
+        pool,
+        ":pleroma",
+        ":mrf",
+        &json!({"policies": ["simple"], "simple": lists}),
+    )
+    .await
+    .expect("the mrf entry writes");
+}
+
 /// Counts the `statuses` rows stored under `uri`.
 async fn rows_for_uri(pool: &PgPool, uri: &str) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = $1")

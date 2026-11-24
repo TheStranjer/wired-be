@@ -68,6 +68,30 @@ pub async fn filter_actor(state: &AppState, actor: Value) -> Value {
     build_chain(ctx.config.as_ref()).apply_actor(&ctx, actor)
 }
 
+/// Refuses an outbound fetch of `url` to a host the `simple` policy rejects.
+///
+/// A host is rejected when the `reject` list names it, or when the `accept`
+/// allowlist is in force without naming it, so nothing is dereferenced
+/// from, or mirrored out of, a domain the instance federates with no one
+/// at. Pleroma refuses before fetching the same way (`MRF.id_filter` in
+/// `Pleroma.Object.Fetcher`). A `url` with no http(s) host names nothing
+/// to refuse here: the fetch's own URL checks answer it.
+///
+/// # Errors
+///
+/// A client-safe message naming the refused host.
+pub async fn refuse_rejected(state: &AppState, url: &str) -> Result<(), String> {
+    let Some(host) = json::http_host(url) else {
+        return Ok(());
+    };
+    if load_config(state).await.rejected(&host) {
+        return Err(format!(
+            "this instance does not federate with `{host}`: it is rejected by the MRF policy"
+        ));
+    }
+    Ok(())
+}
+
 /// The context one pipeline run preloads: the current configuration beside
 /// the chain's single shared "now" and this instance's own domain. The
 /// per-actor facts stay at their unloaded defaults here — an activity run

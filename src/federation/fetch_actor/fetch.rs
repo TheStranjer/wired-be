@@ -167,6 +167,9 @@ fn document_id(document: &Value) -> Result<&str, FetchError> {
 /// actor's HTTP Signature, so peers in authorized-fetch mode answer; with
 /// it off the dereference goes out unsigned, like Pleroma's default.
 ///
+/// A host the `simple` MRF policy rejects (or its allowlist omits) is
+/// refused before anything is sent: [`FetchError::Invalid`].
+///
 /// The nickname the parser derives (`preferredUsername@<id host>`) is
 /// settled before the write as `naming` says: with [`Naming::Confirm`] it
 /// runs through [`confirm_nickname`], so a split-domain account keeps the
@@ -179,6 +182,9 @@ pub(super) async fn fetch_and_store(
     ap_id: &str,
     naming: Naming,
 ) -> Result<User, FetchError> {
+    mrf::refuse_rejected(state, ap_id)
+        .await
+        .map_err(FetchError::Invalid)?;
     let signer = fetch_signer(state).await?;
     let document = fetch_actor_json(&state.http_client, ap_id, signer.as_ref()).await?;
     let document = mrf::filter_actor(state, document).await;
@@ -287,6 +293,74 @@ mod tests {
             mirrored.banner_url.is_some(),
             "the banner no list names is stored"
         );
+    }
+
+    /// Dereferences the loopback mock's actor under an optional MRF config.
+    ///
+    /// The `simple` policy is configured by `lists` (no MRF entry at all
+    /// for `None`) and the fetch goes through [`get_or_fetch_by_ap_id`];
+    /// returns the answer and how many requests the mock saw.
+    async fn fetch_loopback_actor(lists: Option<&Value>) -> (Result<User, FetchError>, usize) {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        if let Some(lists) = lists {
+            runtime_config::write(
+                &pool,
+                ":pleroma",
+                ":mrf",
+                &json!({"policies": ["simple"], "simple": lists}),
+            )
+            .await
+            .expect("the mrf entry writes");
+        }
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let hits = Arc::clone(&peer.hits);
+        let server = spawn(
+            listener,
+            Router::new()
+                .route("/users/alice", get(self_actor))
+                .with_state(peer),
+        );
+        let state = test_state(pool);
+
+        let answer = get_or_fetch_by_ap_id(&state, &format!("{base}/users/alice")).await;
+        server.abort();
+        (answer, hits.load(Ordering::SeqCst))
+    }
+
+    /// A host the `simple` policy rejects — by its `reject` list or by an
+    /// allowlist that omits it — is refused before a request is sent, and
+    /// nothing is mirrored.
+    #[tokio::test]
+    async fn an_actor_of_a_rejected_host_is_not_fetched() {
+        for lists in [
+            json!({"reject": ["127.0.0.1"]}),
+            json!({"accept": ["friend.example"]}),
+        ] {
+            let (answer, hits) = fetch_loopback_actor(Some(&lists)).await;
+
+            let detail = invalid_detail(answer.expect_err("the policy refuses the host"));
+            assert!(
+                detail.contains("127.0.0.1"),
+                "the refusal names the host ({lists}): {detail}"
+            );
+            assert_eq!(hits, 0, "nothing was sent to the refused host ({lists})");
+        }
+    }
+
+    /// An allowlist that names the host, and no MRF configuration at all,
+    /// leave the fetch alone.
+    #[tokio::test]
+    async fn an_actor_of_an_allowed_host_is_fetched() {
+        for lists in [Some(json!({"accept": ["127.0.0.1"]})), None] {
+            let (answer, hits) = fetch_loopback_actor(lists.as_ref()).await;
+
+            let mirrored = answer.expect("the host is not refused");
+            assert_eq!(mirrored.name, "First", "the document was mirrored");
+            assert!(hits > 0, "the mock was asked ({lists:?})");
+        }
     }
 
     #[tokio::test]
