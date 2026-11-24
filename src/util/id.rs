@@ -27,6 +27,27 @@ pub fn activity_ap_id(base_url: &str, id: Uuid) -> String {
     format!("{base_url}/activities/{id}")
 }
 
+/// Path segment between the base url and the id of a local object id.
+pub const OBJECTS_PATH: &str = "/objects/";
+
+/// The object id for `id` on the instance at `base_url` (decision 6).
+///
+/// The shape is `{base_url}/objects/{id}`. Every place that mints a local
+/// object id builds it here, and [`local_object_uuid`] reads it back.
+#[must_use]
+pub fn object_ap_id(base_url: &str, id: Uuid) -> String {
+    format!("{base_url}{OBJECTS_PATH}{id}")
+}
+
+/// The id inside `ap_id` when it is an object id of the instance at
+/// `base_url`, `None` for a remote host, another path or a tail that
+/// [`parse_id`] does not read.
+#[must_use]
+pub fn local_object_uuid(base_url: &str, ap_id: &str) -> Option<Uuid> {
+    let tail = ap_id.strip_prefix(base_url)?.strip_prefix(OBJECTS_PATH)?;
+    parse_id(tail)
+}
+
 /// A freshly minted local activity id: [`activity_ap_id`] over a fresh
 /// [`new_id`].
 #[must_use]
@@ -142,6 +163,49 @@ mod tests {
             format!("https://h/activities/{id}"),
             "the id sits under the instance's activities path"
         );
+    }
+
+    #[test]
+    fn object_ap_id_joins_base_prefix_and_id() {
+        let id = new_id();
+        assert_eq!(
+            object_ap_id("https://h", id),
+            format!("https://h/objects/{id}"),
+            "the id sits under the instance's objects path"
+        );
+    }
+
+    #[test]
+    fn local_object_uuid_round_trips_object_ap_id() {
+        let base = "https://h";
+        let id = new_id();
+        assert_eq!(
+            local_object_uuid(base, &object_ap_id(base, id)),
+            Some(id),
+            "a minted object id reads back as its uuid"
+        );
+    }
+
+    #[test]
+    fn local_object_uuid_rejects_other_ids() {
+        let base = "https://h";
+        let id = new_id();
+        for ap_id in [
+            format!("https://remote.example/objects/{id}"),
+            format!("{base}/notice/{id}"),
+            format!("{base}/activities/{id}"),
+            format!("{base}/objects/chat-1"),
+            format!("{base}/objects/"),
+            format!("{base}/objects/{id}/replies"),
+            format!("{base}x/objects/{id}"),
+            id.to_string(),
+        ] {
+            assert_eq!(
+                local_object_uuid(base, &ap_id),
+                None,
+                "{ap_id} is not a local object id"
+            );
+        }
     }
 
     #[test]
