@@ -13,6 +13,7 @@ use crate::{error::AppResult, models::user::User};
 
 use super::{
     counters::step_counters,
+    dependents::clear_dependents,
     types::{Follow, FollowState},
 };
 
@@ -116,6 +117,7 @@ pub async fn remove_follower(
         return Ok(None);
     };
     step_counters(&mut tx, &follow, -1).await?;
+    clear_dependents(&mut tx, follow.follower_id, follow.followee_id).await?;
     tx.commit().await?;
     Ok(Some(follow))
 }
@@ -144,11 +146,11 @@ pub async fn sever_between(conn: &mut PgConnection, first: Uuid, second: Uuid) -
         .bind(second)
         .fetch_all(&mut *conn)
         .await?;
-    for follow in removed
-        .iter()
-        .filter(|row| row.state == FollowState::Accepted)
-    {
-        step_counters(conn, follow, -1).await?;
+    for follow in &removed {
+        if follow.state == FollowState::Accepted {
+            step_counters(conn, follow, -1).await?;
+        }
+        clear_dependents(conn, follow.follower_id, follow.followee_id).await?;
     }
     Ok(())
 }
