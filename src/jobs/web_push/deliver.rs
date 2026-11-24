@@ -5,11 +5,9 @@ use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{
-    retry,
-    text::{body_text, display_name, icon_for},
-};
+use super::{retry, text::body_text};
 use crate::{
+    entities::account::{DEFAULT_AVATAR_PATH, plain_display_name, profile_image},
     jobs::JobError,
     models::{
         follow,
@@ -153,13 +151,19 @@ async fn send_note(
         return Ok(());
     };
     let body = body_text(pool, &recipient, note).await?;
-    let icon = icon_for(state, &actor);
+    let icon = profile_image(
+        &actor,
+        &state.config,
+        actor.avatar_url.as_deref(),
+        DEFAULT_AVATAR_PATH,
+    );
+    let title_name = plain_display_name(&actor);
     let payload = web_push::payload_json(&web_push::PushPayload {
         access_token: &token.token,
         notification_id: note.id,
         notification_type: &note.event_type,
         icon: &icon,
-        actor_display_name: display_name(&actor),
+        actor_display_name: &title_name,
         body: &body,
     });
     let authorization = vapid_authorization(state, &subscription.endpoint).await?;

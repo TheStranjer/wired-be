@@ -1,18 +1,16 @@
-//! The notification text a push carries: the plain-text `body`, the
-//! actor's avatar as `icon` and the display name the title leads with.
+//! The notification text a push carries: the plain-text `body`. The
+//! `icon` and the title's display name come from the account helpers.
 
 use sqlx::PgPool;
 
 use super::retry;
 use crate::{
-    entities::account::DEFAULT_AVATAR_PATH,
     jobs::JobError,
     models::{
         notification::Notification,
         status,
         user::{User, notification_settings::NotificationSettings},
     },
-    state::AppState,
     util::{format, sanitize},
 };
 
@@ -59,58 +57,20 @@ pub(super) async fn body_text(
     Ok(format::truncate_chars(plain.trim(), BODY_CHARS))
 }
 
-/// The delivered `icon`: the actor's avatar URL, or the same instance
-/// default the [`Account`](crate::entities::account::Account) entity
-/// renders when the actor has none — under the frontend origin, where the
-/// file is actually served.
-pub(super) fn icon_for(state: &AppState, actor: &User) -> String {
-    actor
-        .avatar_url
-        .clone()
-        .unwrap_or_else(|| format!("{}{DEFAULT_AVATAR_PATH}", state.config.frontend_base_url))
-}
-
-/// The title's first half: the actor's display name, its nickname when the
-/// account never set one (what a client shows where a name belongs).
-pub(super) fn display_name(actor: &User) -> &str {
-    if actor.name.is_empty() {
-        &actor.nickname
-    } else {
-        &actor.name
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use super::super::test_support::{
-        Pref, account, app_state, app_state_with, captured_body, client_keys, local,
-        mock_push_service, note_about, open_pref, run, subscribe,
+        Pref, account, app_state, captured_body, client_keys, local, mock_push_service, note_about,
+        open_pref, run, subscribe,
     };
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::TEST_BASE_URL,
         models::{notification, user},
         services::web_push,
     };
-
-    #[tokio::test]
-    async fn the_default_icon_hangs_off_the_frontend_origin() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let mut config = Config::for_tests();
-        config.frontend_base_url = "https://fe.example".to_owned();
-        let state = app_state_with(&pool, config);
-        let actor = local(&pool, "iconalice", "Alice").await;
-
-        let icon = icon_for(&state, &actor);
-
-        assert!(
-            icon.starts_with("https://fe.example") && icon.ends_with(DEFAULT_AVATAR_PATH),
-            "the fallback icon is the default avatar on the frontend origin: {icon}"
-        );
-    }
 
     #[tokio::test]
     async fn a_mention_delivers_the_status_plain_text_under_a_nickname_title() {
