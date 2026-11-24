@@ -84,8 +84,8 @@ use uuid::Uuid;
 use crate::{
     api::{
         chats::message_of,
-        helpers::distinct,
-        notifications_v2::{StringList, account_filter, names_of},
+        helpers::{StringList, distinct},
+        notifications_v2::{account_filter, type_filters},
     },
     auth::AuthUser,
     entities::{
@@ -285,20 +285,14 @@ struct ListParams {
 }
 
 impl ListParams {
-    /// The kept type names: `types[]` when it came, else the
-    /// `include_types[]` alias, and neither means no restriction.
-    fn kept_types(&self) -> Vec<&str> {
-        names_of(self.types.as_ref().or(self.include_types.as_ref()))
-    }
-
-    /// The `types[]` / `exclude_types[]` half of the read filters; the
-    /// account half arrives through [`account_filter`].
+    /// The `types[]` / `exclude_types[]` half of the read filters: `types[]`
+    /// when it came, else the `include_types[]` alias, and neither means no
+    /// restriction. The account half arrives through [`account_filter`].
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: self.kept_types(),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(
+            self.types.as_ref().or(self.include_types.as_ref()),
+            self.exclude_types.as_ref(),
+        )
     }
 
     /// Whether muted causes stay in the page.

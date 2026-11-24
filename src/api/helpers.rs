@@ -18,6 +18,7 @@ use axum::{
     Json,
     http::{HeaderMap, Uri},
 };
+use serde::Deserialize;
 use tracing::debug;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -637,9 +638,48 @@ where
     Ok((ids, all_ids))
 }
 
+/// One name list of a repeated parameter: one value or a list (a JSON
+/// array, or `types[]=…` keys in a query string) — the two spellings
+/// Mastodon clients and forms both send.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StringList {
+    /// A lone name.
+    Single(String),
+    /// A list of names.
+    Multiple(Vec<String>),
+}
+
+impl StringList {
+    /// The names, borrowed, in the order sent.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Single(name) => vec![name.as_str()],
+            Self::Multiple(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// The names behind an optional list parameter, none when it was absent.
+pub(crate) fn names_of(list: Option<&StringList>) -> Vec<&str> {
+    list.map_or_else(Vec::new, StringList::names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_string_list_reads_a_lone_value_and_an_array() {
+        let lone: StringList =
+            serde_json::from_value(serde_json::json!("follow")).expect("a lone value");
+        assert_eq!(lone.names(), ["follow"], "one name");
+        let many: StringList =
+            serde_json::from_value(serde_json::json!(["a", "b"])).expect("an array");
+        assert_eq!(many.names(), ["a", "b"], "the names in the order sent");
+        assert!(names_of(None).is_empty(), "absent is no names");
+        assert_eq!(names_of(Some(&many)), ["a", "b"], "present is its names");
+    }
 
     /// One of the ids the fixtures pass around.
     const ID_A: &str = "01934567-89ab-7cde-f012-3456789abcde";
