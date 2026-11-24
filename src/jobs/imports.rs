@@ -43,13 +43,13 @@ use crate::{
     api::{accounts::after_follow_changed, blocks::after_block_changed},
     error::AppError,
     federation::fetch_actor::get_or_fetch_by_acct,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, parse_args},
+    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, load_user, parse_args},
     models::{
         block,
         follow::{self, FollowToggles},
         job::{NewJob, enqueue},
         mute::{self, MuteOptions},
-        user::{self, AccountStatus, User},
+        user::User,
     },
     state::AppState,
 };
@@ -179,7 +179,8 @@ async fn handle_chunked(
     kind: &'static str,
 ) -> Result<(), JobError> {
     let parsed = parse_args::<ImportArgs>(args, IMPORT_JOB)?.with_options_aligned();
-    let importer = load_importer(state, parsed.user_id).await?;
+    // A vanished user, or one that can no longer act, is permanent.
+    let importer = load_user(state, parsed.user_id, "import", true).await?;
     let head_count = parsed.accts.len().min(IMPORT_CHUNK);
     let mut head = parsed;
     let tail_accts = head.accts.split_off(head_count);
@@ -189,35 +190,6 @@ async fn handle_chunked(
         enqueue_next_chunk(state, kind, head.user_id, tail_accts, tail_options).await?;
     }
     Ok(())
-}
-
-/// The importer the job acts as. A vanished user, or one that can no
-/// longer act (deactivated, deleted, or awaiting approval), is permanent
-/// (discard); a database that cannot answer is a retry.
-///
-/// # Errors
-///
-/// [`JobError::Discard`] when the user row is gone or the account can no
-/// longer act, [`JobError::Retry`] on a database failure.
-async fn load_importer(state: &AppState, user_id: Uuid) -> Result<User, JobError> {
-    match user::get_by_id(&state.db, user_id).await {
-        Ok(Some(importer)) => {
-            let blocked = matches!(
-                importer.account_status(),
-                AccountStatus::Deactivated | AccountStatus::ApprovalPending
-            ) || importer.deleted_at.is_some();
-            if blocked {
-                return Err(JobError::Discard(format!(
-                    "the import job's user {user_id} can no longer act"
-                )));
-            }
-            Ok(importer)
-        }
-        Ok(None) => Err(JobError::Discard(format!(
-            "the import job's user {user_id} no longer exists"
-        ))),
-        Err(err) => Err(JobError::Retry(format!("import user read failed: {err}"))),
-    }
 }
 
 /// Runs `action` for every (acct, option) pair of `args`, in list order.

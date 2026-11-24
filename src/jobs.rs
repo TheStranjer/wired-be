@@ -41,12 +41,16 @@ use std::{error::Error, fmt, future::Future, pin::Pin, time::Duration};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use uuid::Uuid;
 
 pub use self::{
     registry::{JobRegistry, backoff},
     worker::Worker,
 };
-use crate::state::AppState;
+use crate::{
+    models::user::{self, AccountStatus, User},
+    state::AppState,
+};
 
 /// Queue for general-purpose jobs ([`crate::models::job`] callers that have
 /// no queue of their own).
@@ -152,9 +156,174 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Sen
 /// ```
 pub type HandlerFn = fn(AppState, AttemptInfo, Value) -> HandlerFuture;
 
+/// The user a job acts as, read once for every job module that needs one.
+///
+/// `job` names the job in the failure text (`"import"`, `"backup"`, ...). A
+/// vanished row is permanent: [`JobError::Discard`]. A database that cannot
+/// answer is transient: [`JobError::Retry`]. With `require_active`, an
+/// account that can no longer act — deactivated, deleted, or awaiting
+/// approval, the states the API refuses at token resolution — is a
+/// [`JobError::Discard`] too; jobs that must still run for such an account
+/// (the sweep that deletes it, the archive it asked for) pass `false`.
+///
+/// # Errors
+///
+/// [`JobError::Discard`] when the user row is gone, or when `require_active`
+/// is set and the account can no longer act; [`JobError::Retry`] on a
+/// database failure.
+pub(crate) async fn load_user(
+    state: &AppState,
+    id: Uuid,
+    job: &str,
+    require_active: bool,
+) -> Result<User, JobError> {
+    match user::get_by_id(&state.db, id).await {
+        Ok(Some(found)) => {
+            let barred = require_active
+                && (found.deleted_at.is_some()
+                    || matches!(
+                        found.account_status(),
+                        AccountStatus::Deactivated | AccountStatus::ApprovalPending
+                    ));
+            if barred {
+                return Err(JobError::Discard(format!(
+                    "the {job} job's user {id} can no longer act"
+                )));
+            }
+            Ok(found)
+        }
+        Ok(None) => Err(JobError::Discard(format!(
+            "the {job} job's user {id} no longer exists"
+        ))),
+        Err(err) => Err(JobError::Retry(format!("{job} user read failed: {err}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use sqlx::postgres::PgPoolOptions;
+
     use super::*;
+    use crate::{
+        config::{Config, TEST_BASE_URL},
+        models::user::{Flag, NewUser, insert, local_ap_id, mark_deleted, set_activation},
+    };
+
+    /// Inserts a local user named `nickname` with the given flags.
+    async fn user_with(state: &AppState, nickname: &str, approval_pending: bool) -> User {
+        let new = NewUser {
+            approval_pending: Flag::new(approval_pending),
+            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+        };
+        insert(&state.db, &new)
+            .await
+            .expect("the user fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn a_missing_user_discards_with_or_without_the_active_gate() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        let id = Uuid::now_v7();
+
+        for require_active in [false, true] {
+            let outcome = load_user(&state, id, "probe", require_active).await;
+            assert!(
+                matches!(&outcome, Err(JobError::Discard(detail))
+                    if detail.contains("probe") && detail.contains("no longer exists")),
+                "a vanished user discards (require_active={require_active}): {outcome:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_user_is_discarded_only_when_activity_is_required() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        let alice = user_with(&state, "alice", false).await;
+        set_activation(&state.db, alice.id, false)
+            .await
+            .expect("the user deactivates");
+
+        let gated = load_user(&state, alice.id, "probe", true).await;
+        assert!(
+            matches!(&gated, Err(JobError::Discard(detail)) if detail.contains("can no longer act")),
+            "a deactivated user is discarded under the gate: {gated:?}"
+        );
+        let open = load_user(&state, alice.id, "probe", false)
+            .await
+            .expect("without the gate the deactivated user loads");
+        assert_eq!(open.id, alice.id, "the same row comes back");
+    }
+
+    #[tokio::test]
+    async fn an_approval_pending_user_is_discarded_only_when_activity_is_required() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        let bob = user_with(&state, "bob", true).await;
+
+        let gated = load_user(&state, bob.id, "probe", true).await;
+        assert!(
+            matches!(&gated, Err(JobError::Discard(detail)) if detail.contains("can no longer act")),
+            "an unapproved user is discarded under the gate: {gated:?}"
+        );
+        assert!(
+            load_user(&state, bob.id, "probe", false).await.is_ok(),
+            "without the gate the unapproved user loads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_user_is_discarded_only_when_activity_is_required() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        let carol = user_with(&state, "carol", false).await;
+        mark_deleted(&state.db, carol.id)
+            .await
+            .expect("the user is marked deleted");
+
+        let gated = load_user(&state, carol.id, "probe", true).await;
+        assert!(
+            matches!(&gated, Err(JobError::Discard(detail)) if detail.contains("can no longer act")),
+            "a deleted user is discarded under the gate: {gated:?}"
+        );
+        assert!(
+            load_user(&state, carol.id, "probe", false).await.is_ok(),
+            "without the gate the deleted user loads"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_user_loads_with_or_without_the_active_gate() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        let dave = user_with(&state, "dave", false).await;
+
+        for require_active in [false, true] {
+            let loaded = load_user(&state, dave.id, "probe", require_active)
+                .await
+                .expect("an active user loads");
+            assert_eq!(
+                loaded.id, dave.id,
+                "the same row comes back (require_active={require_active})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_closed_pool_retries_naming_the_job() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .expect("a lazy pool needs no database");
+        pool.close().await;
+        let state = AppState::for_tests(pool, Config::for_tests());
+
+        let outcome = load_user(&state, Uuid::now_v7(), "probe", true).await;
+        assert!(
+            matches!(&outcome, Err(JobError::Retry(detail)) if detail.starts_with("probe user read failed")),
+            "a database failure retries: {outcome:?}"
+        );
+    }
 
     #[test]
     fn default_queues_list_names_every_constant() {
