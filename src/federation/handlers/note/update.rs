@@ -113,7 +113,11 @@ async fn fold_edit(
     }
     let parsed = note_parser::parse_note(object, signer, now)
         .map_err(|err| FederationError::permanent("the updated object is not parseable", &err))?;
-    let mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
+    let mut mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
+    ingest::merge_accounts(
+        &mut mentioned,
+        ingest::resolve_local_audience(state, &parsed.audience).await?,
+    );
     let media = stored_media(&state.db, stored.id)
         .await
         .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
@@ -291,6 +295,58 @@ mod tests {
             .await,
             1,
             "and the attachment the update named"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_links_a_local_user_addressed_without_a_mention_tag() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let alice = crate::models::user::insert(
+            &pool,
+            &crate::models::user::NewUser::local(
+                "alice",
+                &crate::models::user::local_ap_id(&state.config.base_url, "alice"),
+            ),
+        )
+        .await
+        .expect("the local account inserts");
+        let uri = "https://remote.example/users/bob/statuses/edit-audience";
+        let row = mirrored(&pool, &author, uri, "first words").await;
+
+        let outcome = update_note(
+            state,
+            view_of(
+                "Update",
+                note(
+                    uri,
+                    json!({
+                        "content": "<p>second words</p>",
+                        "updated": "2024-05-01T12:00:00.000Z",
+                        "to": [alice.ap_id],
+                        "tag": [],
+                    }),
+                ),
+                None,
+            ),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the edit is folded");
+        let mentioned: Vec<Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM status_mentions WHERE status_id = $1")
+                .bind(row.id)
+                .fetch_all(&pool)
+                .await
+                .expect("the mention rows read");
+        assert_eq!(
+            mentioned,
+            vec![alice.id],
+            "the addressed local user is linked"
         );
     }
 
