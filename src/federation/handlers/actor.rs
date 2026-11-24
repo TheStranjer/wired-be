@@ -20,9 +20,9 @@
 //!   `moved_to_ap_id` and `also_known_as`, whenever the document changed
 //!   them. It runs only when the object's `id` *is* the activity's `actor`
 //!   (an `Update` of somebody else's document is nothing to fold), and not
-//!   more often than once per `MIN_UPDATE_INTERVAL` per account, so a peer
-//!   stuck redelivering one profile change cannot make this instance rewrite
-//!   the mirror forever.
+//!   when the document's own `updated` is present and no newer than the
+//!   stored mirror's `updated_at`; a document without `updated` always
+//!   applies, and the dedupe ledger stops redelivery of the same activity.
 //! * [`delete_actor`] is the `Delete` route for the objects
 //!   `delete_by_object_type` does not claim, which is where a bare id has to
 //!   be resolved. When it names the sending actor's own account the account
@@ -38,7 +38,6 @@
 //! ([`crate::federation::dispatch`]), so the [`User`] a handler is handed
 //! *is* the account the activity speaks about.
 
-use chrono::TimeDelta;
 use futures::future::BoxFuture;
 
 use self::{delete::apply_delete, update::apply_update};
@@ -60,12 +59,6 @@ mod update;
 /// module's registrations "actor objects only" and leaves
 /// `update_by_object_type` free to gain `Note` with the status-edit ticket.
 const ACTOR_OBJECT_TYPES: [&str; 5] = ["Person", "Service", "Group", "Organization", "Application"];
-
-/// The flood guard: how long a mirror written by a fetch or by an earlier
-/// `Update` answers for itself. Ten seconds — far shorter than the fetcher's
-/// own refresh window, so it stops a peer repeating one profile change in a
-/// loop rather than delaying a legitimate edit.
-const MIN_UPDATE_INTERVAL: TimeDelta = TimeDelta::seconds(10);
 
 /// Folds this module's actor routes into the dispatcher's registry.
 ///
