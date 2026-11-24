@@ -61,7 +61,6 @@ mod test_support;
 pub(crate) use self::helpers::{full_nickname, nickname_part, plain_display_name, profile_image};
 pub use self::{
     entity::Account,
-    helpers::local_url,
     pleroma::PleromaMetadata,
     source::{AccountSource, AccountViewer, MuteExpiresAt, SourcePleroma},
 };

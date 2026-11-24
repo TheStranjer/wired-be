@@ -44,15 +44,6 @@ pub(super) const fn visible_following_count(user: &User, is_self: bool) -> i32 {
     }
 }
 
-/// The web profile URL of the local account `nickname` on this instance:
-/// `{base_url}/users/{nickname}`, the same shape as
-/// [`local_ap_id`](crate::models::user::local_ap_id) but built from the
-/// config instead of a raw base url.
-#[must_use]
-pub fn local_url(config: &Config, nickname: &str) -> String {
-    format!("{}/users/{nickname}", config.base_url)
-}
-
 /// The avatar/banner URL a remote user's profile renders with: the stored
 /// `stored_url`, or `{frontend_base_url}{default_path}` when unset, then
 /// through the media proxy helper — remote users only (ticket), so a local
@@ -240,16 +231,6 @@ mod tests {
             malformed["fields"],
             serde_json::json!([]),
             "jsonb of another shape renders as the empty list"
-        );
-    }
-
-    #[test]
-    fn local_url_builds_the_profile_url_from_the_config() {
-        let config = Config::for_tests();
-        assert_eq!(
-            local_url(&config, "alice"),
-            "https://test.example/users/alice",
-            "the profile url is the base url plus the users path and nickname"
         );
     }
 

@@ -80,7 +80,7 @@ pub(super) fn rendered_fields(
 ) -> RenderedFields {
     let urls: HashMap<String, String> = found
         .iter()
-        .map(|(mention, account)| (mention.key(), account.mention_url()))
+        .map(|(mention, account)| (mention.key(), account.profile_url_or_ap_id().to_owned()))
         .collect();
     let link = |mention: &MentionRef| urls.get(&mention.key()).cloned();
     let html = render_content(text, content_type);

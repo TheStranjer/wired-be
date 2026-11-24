@@ -83,10 +83,7 @@ impl Account {
             user.banner_url.as_deref(),
             DEFAULT_BANNER_PATH,
         );
-        let url = user
-            .profile_url
-            .clone()
-            .unwrap_or_else(|| user.ap_id.clone());
+        let url = user.profile_url_or_ap_id().to_owned();
         Self {
             id: user.id.to_string(),
             username: nickname_part(&user.nickname).to_owned(),
