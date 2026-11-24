@@ -10,12 +10,16 @@
 
 use serde::Deserialize;
 use tracing::debug;
+use uuid::Uuid;
 
-use super::{CreateStatusParams, render_status_fields, validate::check_body};
+use super::{
+    CreateStatusParams, POLL_WITH_MEDIA, TOO_MANY_ATTACHMENTS, render_status_fields,
+    validate::{Backing, check_body_backed},
+};
 use crate::{
     entities::status::Status,
-    error::AppResult,
-    models::{status, status_edit, user::User},
+    error::{AppError, AppResult},
+    models::{media_attachment, poll, status, status_edit, user::User},
     services::render_status::{ViewerMode, render_status},
     state::AppState,
     util::id::parse_id,
@@ -59,8 +63,8 @@ pub struct EditStatusParams {
 
 /// The edit body merged over the stored row: every [`CreateStatusParams`]
 /// field carrying the submitted value where the body presented one and the
-/// row's own value where it did not. The merged body is what [`check_body`]
-/// reads, so the create path's checks run on the post as it will stand —
+/// row's own value where it did not. The merged body is what
+/// [`check_body_backed`] reads, so the create path's checks run on the post as it will stand —
 /// and a field nobody edited can never fail a check it already passed.
 fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusParams {
     CreateStatusParams {
@@ -83,8 +87,9 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
         // which drops what the author may not attach instead of refusing
-        // it, so the merge carries none and [`check_body`] never sees the
-        // create's attachment rules.
+        // it, so the merge carries none: [`edit_status`] applies the count
+        // cap and the poll rule itself and tells [`check_body`] whether
+        // an attachment or poll stands behind an empty text.
         quote_id: None,
         preview: None,
         expires_in: None,
@@ -108,7 +113,7 @@ fn kept<T, F: FnOnce() -> T>(submitted: Option<T>, stored: F) -> Option<T> {
 /// reaching this function at all — sees the post after the write.
 ///
 /// `merged_body` resolves which parameters the body presented,
-/// [`check_body`] refuses the merge exactly as it refuses a creation
+/// [`check_body_backed`] refuses the merge exactly as it refuses a creation
 /// (422 `Cannot post an empty status without attachments`,
 /// `The status is over the character limit`, the spoiler and language
 /// length wordings, `Invalid content_type`), and [`render_status_fields`]
@@ -123,6 +128,14 @@ fn kept<T, F: FnOnce() -> T>(submitted: Option<T>, stored: F) -> Option<T> {
 /// this post survive to the write: rows nobody owns, rows another status
 /// claims and text that is no id at all name nothing and drop out, as
 /// Pleroma's `CommonAPI.Utils.attachments_from_ids` rejects its nils.
+///
+/// An edit that submits more `media_ids` than
+/// [`crate::config::Config::max_media_attachments`] is refused with 422
+/// `Too many attachments`, and one that leaves a polled post with any
+/// attachment with `Polls cannot have attachments`. A post whose
+/// attachments or poll are all that stand behind it may keep its empty text
+/// while its warning, flag or language change; dropping the last attachment
+/// without text is the empty-status refusal.
 ///
 /// `None` is the row a delete took between the endpoint's gate and this
 /// write; the endpoint answers that its shared 404.
@@ -139,16 +152,43 @@ pub async fn edit_status(
     params: EditStatusParams,
 ) -> AppResult<Option<Status>> {
     let merged = merged_body(row, &params);
-    let checked = check_body(
+    if params
+        .media_ids
+        .as_ref()
+        .is_some_and(|ids| ids.len() > state.config.max_media_attachments)
+    {
+        return Err(AppError::Unprocessable(TOO_MANY_ATTACHMENTS.to_owned()));
+    }
+    let media_ids: Option<Vec<Uuid>> = params
+        .media_ids
+        .as_ref()
+        .map(|ids| ids.iter().filter_map(|id| parse_id(id)).collect());
+    let has_poll = poll::for_statuses(&state.db, &[row.id])
+        .await?
+        .contains_key(&row.id);
+    let carries_attachment = match &media_ids {
+        Some(ids) => !ids.is_empty(),
+        None => media_attachment::for_statuses(&state.db, &[row.id])
+            .await?
+            .get(&row.id)
+            .is_some_and(|current| !current.is_empty()),
+    };
+    let backing = if carries_attachment || has_poll {
+        Backing::StoredPost
+    } else {
+        Backing::Body
+    };
+    let checked = check_body_backed(
         &state.config,
         row.visibility.as_str(),
         row.sensitive,
         &merged,
+        backing,
     )?;
+    if has_poll && carries_attachment {
+        return Err(AppError::Unprocessable(POLL_WITH_MEDIA.to_owned()));
+    }
     let fields = render_status_fields(state, checked.text, checked.content_type).await?;
-    let media_ids = params
-        .media_ids
-        .map(|ids| ids.iter().filter_map(|id| parse_id(id)).collect());
     let edit = status_edit::EditParams {
         content: fields.content,
         raw_text: checked.text.to_owned(),
@@ -182,8 +222,9 @@ mod tests {
         config::Config,
         models::status::Visibility,
         services::create_status::{
-            EMPTY_STATUS, INVALID_CONTENT_TYPE, MAX_SPOILER_CHARS,
-            test_support::{created, posted, state, user},
+            EMPTY_STATUS, INVALID_CONTENT_TYPE, MAX_SPOILER_CHARS, POLL_WITH_MEDIA,
+            TOO_MANY_ATTACHMENTS, check_body,
+            test_support::{created, media_row, polled, posted, state, upload, user, with_media},
         },
     };
     /// An edit body as `ApiBody` hands it over, from the JSON shape the
@@ -398,5 +439,141 @@ mod tests {
             .expect("the fixture post is stored");
         assert_eq!(stored.content, "<p>untouched</p>", "or moved the row");
         assert!(stored.edited_at.is_none(), "or stamped it either");
+    }
+
+    /// The stored row of the entity a fixture created.
+    async fn row_of(pool: &sqlx::PgPool, entity: &Status) -> status::Status {
+        let id = Uuid::parse_str(&entity.id).expect("the entity carries its id");
+        status::get_by_id(pool, id)
+            .await
+            .unwrap()
+            .expect("the fixture post is stored")
+    }
+
+    #[tokio::test]
+    async fn an_edit_over_the_attachment_cap_is_refused_and_attaches_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "overattacher").await;
+        let entity = created(&app_state, &alice, posted("a post")).await;
+        let row = row_of(pool, &entity).await;
+
+        let mut ids = Vec::new();
+        for _ in 0..=app_state.config.max_media_attachments {
+            ids.push(upload(pool, &alice).await.id);
+        }
+        let texts: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+        let err = edit_status(
+            &app_state,
+            &alice,
+            &row,
+            body(json!({"status": "a post", "media_ids": texts})),
+        )
+        .await
+        .expect_err("one over the cap is refused");
+        assert_eq!(err.to_string(), TOO_MANY_ATTACHMENTS);
+        for id in ids {
+            assert_eq!(media_row(pool, id).await.status_id, None, "nothing claimed");
+        }
+
+        let at_cap: Vec<String> = texts
+            .iter()
+            .take(app_state.config.max_media_attachments)
+            .cloned()
+            .collect();
+        let edited = edit_status(&app_state, &alice, &row, body(json!({"media_ids": at_cap})))
+            .await
+            .expect("the cap itself is attachable")
+            .expect("the status is live");
+        assert_eq!(edited.media_attachments.len(), at_cap.len());
+    }
+
+    #[tokio::test]
+    async fn an_edit_cannot_add_media_to_a_poll_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "pollmedia").await;
+        let entity = created(&app_state, &alice, polled("which?")).await;
+        let row = row_of(pool, &entity).await;
+        let media = upload(pool, &alice).await;
+
+        let err = edit_status(
+            &app_state,
+            &alice,
+            &row,
+            body(json!({"media_ids": [media.id.to_string()]})),
+        )
+        .await
+        .expect_err("a polled post carries no attachment");
+        assert_eq!(err.to_string(), POLL_WITH_MEDIA);
+        assert_eq!(media_row(pool, media.id).await.status_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_media_only_post_keeps_its_empty_text_through_a_warning_edit() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "mediaonly").await;
+        let media = upload(pool, &alice).await;
+        let id_text = media.id.to_string();
+        let entity = created(&app_state, &alice, with_media("", &[id_text.as_str()])).await;
+        let row = row_of(pool, &entity).await;
+        assert_eq!(row.raw_text, "", "the fixture is media-only");
+
+        let edited = edit_status(
+            &app_state,
+            &alice,
+            &row,
+            body(json!({"spoiler_text": "careful"})),
+        )
+        .await
+        .expect("a warning edit of a media-only post is accepted")
+        .expect("the status is live");
+        assert_eq!(edited.spoiler_text, "careful");
+        assert_eq!(edited.media_attachments.len(), 1, "the media stays");
+        assert_eq!(row_of(pool, &entity).await.spoiler_text, "careful");
+    }
+
+    #[tokio::test]
+    async fn a_poll_only_post_keeps_its_empty_text_through_a_sensitive_edit() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "pollonly").await;
+        let entity = created(&app_state, &alice, polled("")).await;
+        let row = row_of(pool, &entity).await;
+        assert_eq!(row.raw_text, "", "the fixture is poll-only");
+
+        let edited = edit_status(&app_state, &alice, &row, body(json!({"sensitive": true})))
+            .await
+            .expect("a flag edit of a poll-only post is accepted")
+            .expect("the status is live");
+        assert!(edited.sensitive.0);
+        assert!(row_of(pool, &entity).await.sensitive);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_attachment_of_a_media_only_post_is_an_empty_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "dropper").await;
+        let media = upload(pool, &alice).await;
+        let id_text = media.id.to_string();
+        let entity = created(&app_state, &alice, with_media("", &[id_text.as_str()])).await;
+        let row = row_of(pool, &entity).await;
+
+        let err = edit_status(&app_state, &alice, &row, body(json!({"media_ids": []})))
+            .await
+            .expect_err("nothing would stand behind the empty text");
+        assert_eq!(err.to_string(), EMPTY_STATUS);
+        assert_eq!(
+            media_row(pool, media.id).await.status_id,
+            Some(row.id),
+            "the refused edit left the attachment in place"
+        );
     }
 }
