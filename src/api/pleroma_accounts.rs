@@ -96,7 +96,7 @@ use crate::{
         user::{User, confirmation},
     },
     oauth::scopes::{FOLLOW, READ_FAVOURITES, READ_FOLLOWS, WRITE_FOLLOWS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::render_status::{ViewerMode, render_statuses},
     state::AppState,
 };
@@ -111,11 +111,6 @@ const NOT_FOLLOWING: &str = "Could not subscribe: You are not following this use
 /// favourites from the viewer: Pleroma's `AccountController.favourites`
 /// `hide_favorites` arm, in its exact (American-spelled) wording.
 const CANT_GET_FAVOURITES: &str = "Can't get favorites";
-
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// outgoing list has no filter to repeat on either link (the queue's
-/// constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/pleroma` account router, merged into [`crate::api::v1`].
 ///
@@ -304,7 +299,15 @@ async fn outgoing(
         user = %auth.0.id,
         "outgoing follow requests listed"
     );
-    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    // The cursors key on the `follows` row
+    // ([`follow::FollowPageEntry::follow_id`]), not on the accounts.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &entries,
+        |e| e.follow_id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     // Pleroma's `outgoing` renders through `FollowRequestView`, which
@@ -337,16 +340,6 @@ async fn relationship_for(
         AppError::Internal("the relationship loader skipped its only target".to_owned())
     })?;
     Ok(Json(relationship))
-}
-
-/// The `Link` header value for a fetched page of outgoing requests: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`follow::FollowPageEntry::follow_id`] — the cursors key on the `follows`
-/// row, not on the accounts — and `None` for an empty page.
-fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) -> Option<String> {
-    let newest = entries.first()?.follow_id.to_string();
-    let oldest = entries.last()?.follow_id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// `GET /api/v1/pleroma/accounts/{id}/favourites` — the statuses account
@@ -417,22 +410,18 @@ async fn favourites(
         "account favourites listed"
     );
     let mut headers = HeaderMap::new();
-    set_link_header(
-        &mut headers,
-        favourites_page_link(&state.config.base_url, uri.path(), &cursors).as_deref(),
-    )?;
+    // The cursors are the *favourite row ids* of the visible page — the shape
+    // `GET /api/v1/favourites` links in, keyed on the like rows.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &cursors,
+        |cursor| *cursor,
+    );
+    set_link_header(&mut headers, link.as_deref())?;
     Ok((
         headers,
         Json(render_statuses(&state, ViewerMode::User(viewer), &visible).await?),
     ))
-}
-
-/// The `Link` header value for a fetched page of one account's favourites:
-/// [`link_header`] over the first (newest) and last (oldest) *favourite row
-/// id* of the visible page — the shape `GET /api/v1/favourites` links in,
-/// keyed on the like rows like its cursors — and `None` for an empty page.
-fn favourites_page_link(base_url: &str, path: &str, cursors: &[Uuid]) -> Option<String> {
-    let newest = cursors.first()?.to_string();
-    let oldest = cursors.last()?.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }

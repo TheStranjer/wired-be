@@ -85,7 +85,7 @@ use crate::{
     api::{
         chats::message_of,
         helpers::{distinct, distinct_ids},
-        notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
+        notifications_v2::{StringList, account_filter, names_of},
     },
     auth::AuthUser,
     entities::{
@@ -106,7 +106,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::{
         filter::{FilterContext, apply_filters},
         render_status::{ViewerMode, render_statuses},
@@ -203,7 +203,14 @@ async fn list(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        page_link(&state.config.base_url, uri.path(), &rows).as_deref(),
+        keyset_link(
+            &state.config.base_url,
+            uri.path(),
+            &NO_EXTRA_QUERY,
+            &rows,
+            |row| row.id,
+        )
+        .as_deref(),
     )?;
     Ok((headers, Json(entities)))
 }
@@ -247,15 +254,6 @@ async fn show(
         .next()
         .map(Json)
         .ok_or(AppError::NotFound)
-}
-
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — the cursors the listing
-/// walks on — and `None` for an empty page.
-fn page_link(base_url: &str, path: &str, rows: &[NotificationRow]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// `GET /api/v1/notifications`' non-cursor parameters ([`ApiParams`],

@@ -79,7 +79,7 @@ use uuid::Uuid;
 use crate::{
     api::{
         helpers::{distinct, distinct_ids},
-        notifications_v2::{NO_EXTRA_QUERY, StringList, names_of},
+        notifications_v2::{StringList, names_of},
     },
     auth::AuthUser,
     entities::{
@@ -97,7 +97,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_STATUSES, WRITE_CONVERSATIONS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, link_for_page, set_link_header},
     services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
@@ -173,7 +173,15 @@ async fn list(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        participation_link(&state.config.base_url, uri.path(), &rows).as_deref(),
+        // The cursors are the participation ids the keyset walks.
+        keyset_link(
+            &state.config.base_url,
+            uri.path(),
+            &NO_EXTRA_QUERY,
+            &rows,
+            |row| row.id,
+        )
+        .as_deref(),
     )?;
     Ok((headers, Json(entities)))
 }
@@ -317,7 +325,11 @@ async fn list_statuses(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        status_link(&state.config.base_url, uri.path(), &entities).as_deref(),
+        // The cursors are the rendered entities' ids.
+        link_for_page(&state.config.base_url, uri.path(), &entities, |entity| {
+            entity.id.clone()
+        })
+        .as_deref(),
     )?;
     Ok((headers, Json(entities)))
 }
@@ -579,23 +591,6 @@ async fn visible_statuses(
         let _first = statuses.insert(id, value);
     }
     Ok(statuses)
-}
-
-/// The `Link` header value for one page of participations: [`link_header`]
-/// over the first and last row's participation id — the ids the keyset
-/// walks — and `None` for an empty page.
-fn participation_link(base_url: &str, path: &str, rows: &[Participation]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
-}
-
-/// The `Link` header value for one page of rendered statuses: the same
-/// [`link_header`] over the entities' ids.
-fn status_link(base_url: &str, path: &str, rows: &[StatusEntity]) -> Option<String> {
-    let newest = rows.first()?.id.clone();
-    let oldest = rows.last()?.id.clone();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 #[cfg(test)]

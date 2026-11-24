@@ -61,7 +61,7 @@ use crate::{
         status::Visibility,
     },
     oauth::scopes::WRITE,
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
     util::url::is_http_url,
 };
@@ -83,9 +83,6 @@ const TITLE_BLANK: &str = "title: can't be blank";
 const VISIBILITIES: [&str; 4] = ["public", "unlisted", "private", "direct"];
 /// 422 body for a visibility outside [`VISIBILITIES`], in the same wording.
 const VISIBILITY_INVALID: &str = "visibility: is not included in the list";
-/// The `Link` header's query parameters carry nothing but the cursor: this
-/// listing has no filter to repeat on either link.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/pleroma` scrobble router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -133,7 +130,7 @@ async fn create_scrobble(
 /// The entity's `account` is the listed account, rendered for whoever asks
 /// (Pleroma's `for: reading_user`), and `private`/`direct` rows appear only
 /// for their owner (see [`page_for_user`]). An empty page answers the empty
-/// array with no `Link` header, [`link_header`]'s rule.
+/// array with no `Link` header, [`keyset_link`]'s rule.
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
 /// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
@@ -165,7 +162,13 @@ async fn list_scrobbles(
         page,
     )
     .await?;
-    let link = page_link(&state.config.base_url, uri.path(), &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &rows,
+        |row| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(
@@ -181,15 +184,6 @@ async fn list_scrobbles(
                 .collect(),
         ),
     ))
-}
-
-/// The `Link` header value for a fetched page: Pleroma's `add_link_headers`
-/// over the first (newest) and last (oldest) row's id, `None` for an empty
-/// page.
-fn page_link(base_url: &str, path: &str, rows: &[scrobble::Scrobble]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The request parameters of `POST /api/v1/pleroma/scrobble`.
@@ -354,7 +348,7 @@ mod tests {
             .to_string()
     }
 
-    /// Three stored scrobbles of one account in the order [`page_link`]
+    /// Three stored scrobbles of one account in the order [`keyset_link`]
     /// receives them: newest first, ids ascending by text.
     fn rows() -> Vec<scrobble::Scrobble> {
         [NEWEST_ID, MIDDLE_ID, OLDEST_ID]
@@ -626,8 +620,14 @@ mod tests {
 
     #[test]
     fn the_link_header_walks_from_both_ends_of_the_page() {
-        let link = page_link("https://h", "/api/v1/pleroma/accounts/1/scrobbles", &rows())
-            .expect("a full page links");
+        let link = keyset_link(
+            "https://h",
+            "/api/v1/pleroma/accounts/1/scrobbles",
+            &NO_EXTRA_QUERY,
+            &rows(),
+            |row| row.id,
+        )
+        .expect("a full page links");
         assert_eq!(
             link,
             format!(
@@ -640,13 +640,17 @@ mod tests {
 
     #[test]
     fn an_empty_page_links_nowhere() {
+        let none: [scrobble::Scrobble; 0] = [];
         assert_eq!(
-            page_link("https://h", "/p", &[]),
+            keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &none, |row| row.id),
             None,
             "no rows, no Link header"
         );
         let oldest_only = vec![rows().pop().expect("the fixture has rows")];
-        let link = page_link("https://h", "/p", &oldest_only).expect("a one-row page links");
+        let link = keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &oldest_only, |row| {
+            row.id
+        })
+        .expect("a one-row page links");
         assert!(
             link.contains(&format!("max_id={OLDEST_ID}"))
                 && link.contains(&format!("min_id={OLDEST_ID}")),
